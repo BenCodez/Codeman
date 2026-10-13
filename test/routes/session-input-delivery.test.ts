@@ -1,12 +1,10 @@
 /**
  * @fileoverview A lost input must stay retryable.
  *
- * POST /api/sessions/:id/input answers 200 BEFORE the write is attempted — the mux
- * write is fire-and-forget so the HTTP response never waits on a tmux child. The
- * dedup bookkeeping, however, recorded the (clientId, seq) pair as applied at that
- * same moment. A write that then failed left the client with a 200, no message in
- * the pane, and a seq the server would reject as a duplicate on retry: the input was
- * unrecoverable by the very mechanism meant to make delivery reliable.
+ * Tagged POST fallback input must stay retryable until a write actually lands. The
+ * dedup bookkeeping records the (clientId, seq) pair before attempting the write;
+ * failures therefore have to roll that watermark back, and temporary recovery
+ * ownership has to return non-2xx so the browser retains the durable queue record.
  *
  * Observed in the wild: a prompt shown as sent in a chat client, a 200 in the proxy
  * log, and an empty prompt line in the pane.
@@ -154,6 +152,66 @@ describe('POST /api/sessions/:id/input rollback wiring', () => {
 
     expect(res.statusCode).toBe(200);
     expect(session.shouldApplyInput('c2', 5)).toBe(true);
+  });
+
+  it('returns a retryable failure and re-opens the seq while recovery owns input', async () => {
+    const session = harness.ctx.sessions.get('test-session-1')!;
+    session.recoveryInputReserved = true;
+    const viaMux = vi.spyOn(session, 'writeViaMux');
+    const direct = vi.spyOn(session, 'write');
+
+    const blocked = await post({ input: 'keep me\r', useMux: true, clientId: 'browser-1', seq: 9 });
+
+    expect(blocked.statusCode).toBe(422);
+    expect(blocked.json()).toMatchObject({ success: false, errorCode: 'OPERATION_FAILED' });
+    expect(viaMux).not.toHaveBeenCalled();
+    expect(direct).not.toHaveBeenCalled();
+    expect(session.shouldApplyInput('browser-1', 9)).toBe(true);
+
+    session.forgetInputSeq('browser-1', 9);
+    session.recoveryInputReserved = false;
+    const retried = await post({ input: 'keep me\r', useMux: true, clientId: 'browser-1', seq: 9 });
+    expect(retried.statusCode).toBe(200);
+    expect(session.writeBuffer).toContain('keep me\r');
+  });
+
+  it('does not disturb real recovery ownership or input proof tracking when rejecting the frame', async () => {
+    const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'codex' });
+    (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+    const internals = session as unknown as { _recoveryDelivering: boolean; _recoveryGeneration: number };
+    internals._recoveryDelivering = true;
+    const generation = internals._recoveryGeneration;
+    const recoveryInput = vi.fn();
+    const promptSubmitted = vi.fn();
+    session.on('recoveryUserInput', recoveryInput);
+    session.on('promptSubmitted', promptSubmitted);
+    const viaMux = vi.spyOn(session, 'writeViaMux');
+    const direct = vi.spyOn(session, 'write');
+
+    const blocked = await post({ input: 'preserve exact input\r', clientId: 'browser-2', seq: 3 });
+
+    expect(blocked.statusCode).toBe(422);
+    expect(viaMux).not.toHaveBeenCalled();
+    expect(direct).not.toHaveBeenCalled();
+    expect(internals._recoveryGeneration).toBe(generation);
+    expect(recoveryInput).not.toHaveBeenCalled();
+    expect(promptSubmitted).not.toHaveBeenCalled();
+    expect(session.shouldApplyInput('browser-2', 3)).toBe(true);
+  });
+
+  it('returns a retryable failure when recovery acquires input during an awaited mux write', async () => {
+    const session = harness.ctx.sessions.get('test-session-1')!;
+    vi.spyOn(session, 'writeViaMux').mockImplementationOnce(async () => {
+      session.recoveryInputReserved = true;
+      return false;
+    });
+
+    const blocked = await post({ input: 'race-safe\r', useMux: true, clientId: 'browser-3', seq: 4 });
+
+    expect(blocked.statusCode).toBe(422);
+    expect(blocked.json()).toMatchObject({ success: false, errorCode: 'OPERATION_FAILED' });
+    expect(session.writeBuffer).not.toContain('race-safe\r');
+    expect(session.shouldApplyInput('browser-3', 4)).toBe(true);
   });
 });
 

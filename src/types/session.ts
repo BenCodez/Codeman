@@ -735,7 +735,7 @@ export interface PaneExit {
 export interface SessionState {
   /** Durable, optional recovery state. Absent on existing sessions and other CLIs. */
   recovery?: import('../recovery/types.js').RecoveryState;
-  task?: import('../supervision/schema.js').TaskState;
+  task?: import('./task.js').SupervisionTaskState;
   /** Unique session identifier */
   id: string;
   /** Process ID of the PTY process, null if not running */

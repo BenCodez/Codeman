@@ -134,6 +134,20 @@ While the TUI is open and a session flips to NEEDS YOU: flash the row, ring BEL,
 
 ## 4. Architecture
 
+### Direct tmux input and recovery identity
+
+Before the supported dashboard attach and `codeman tui <n>` paths hand stdin to
+tmux for a Codex session, they ask the authenticated server to durably invalidate
+the session's previous reboot-recovery identity. The endpoint uses the normal
+owner-scoped session lookup and must succeed before tmux starts. This also covers
+remote Codex sessions if direct attach is enabled for them later.
+
+Attaching with a manually constructed `tmux attach-session` command bypasses the
+Codeman client and server entirely, so Codeman cannot observe or fence input from
+that path. Sessions driven that way may therefore be refused exact reboot restore
+until a later submission through a tracked Codeman input path establishes fresh
+identity evidence.
+
 ### A client of the server, not a second brain
 
 Everything live comes from the API the web UI already uses:

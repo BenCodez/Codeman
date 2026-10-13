@@ -4,6 +4,8 @@ import { resolve } from 'node:path';
 import vm from 'node:vm';
 import { JSDOM } from 'jsdom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { TaskController } from '../src/supervision/controller.js';
+import { initialTaskState } from '../src/supervision/schema.js';
 const root = resolve(import.meta.dirname, '../src/web/public');
 const read = (file: string) => readFileSync(resolve(root, file), 'utf8');
 const doms: JSDOM[] = [];
@@ -78,6 +80,90 @@ describe('Task supervision UI', () => {
     h.get('taskMaxRuntime').value = '0';
     await h.app.saveTaskConfiguration();
     expect(h.app._apiJson).toHaveBeenCalledTimes(2);
+  });
+  it('sends a config-only patch without resetting exact completed criteria or spent budgets', async () => {
+    const restored = initialTaskState();
+    restored.objective = 'Ship the verified fix';
+    restored.criteria = [
+      {
+        id: 'custom-command',
+        description: 'Unit tests pass',
+        kind: 'command',
+        command: 'npm test',
+        verified: true,
+        evidence: { source: 'command', at: 10001, commandHash: 'a'.repeat(64) },
+      },
+      {
+        id: 'custom-manual',
+        description: 'Owner approved release',
+        kind: 'manual',
+        verified: true,
+        evidence: { source: 'owner', at: 10002 },
+      },
+      {
+        id: 'custom-lint',
+        description: 'Lint checks pass',
+        kind: 'command',
+        command: 'npm run lint',
+        verified: true,
+        evidence: { source: 'command', at: 10003, commandHash: 'b'.repeat(64) },
+      },
+    ];
+    restored.config = { enabled: true, maxContinuations: 3, maxRuntimeMs: 900000 };
+    restored.outcome = 'unfinished';
+    restored.phase = 'watching';
+    restored.startedAt = 9000;
+    restored.configuredAt = 9000;
+    restored.kickoffAt = 9500;
+    restored.continuations = 2;
+    const controller = new TaskController(
+      {
+        observe: async () => {
+          throw new Error('Config-only updates must not observe the session');
+        },
+        act: async () => 'not-sent',
+        persist: async () => {},
+        changed: () => {},
+      },
+      restored
+    );
+    const before = controller.getStatus();
+    const h = harness(before);
+    h.app._apiJson = vi.fn(async (_url, options) =>
+      options?.method === 'PUT' ? controller.update(options.body) : controller.getStatus()
+    );
+    await h.open();
+    h.get('taskMaxContinuations').value = '5';
+
+    await h.app.saveTaskConfiguration();
+
+    const body = h.app._apiJson.mock.calls[1][1].body;
+    expect(body.objective).toBeUndefined();
+    expect(body.criteria).toBeUndefined();
+    const after = controller.getStatus();
+    expect(after.criteria).toEqual(before.criteria);
+    expect(after.criteria.map((criterion) => criterion.id)).toEqual(['custom-command', 'custom-manual', 'custom-lint']);
+    expect(after).toMatchObject({
+      outcome: 'completed',
+      phase: 'completed',
+      continuations: 2,
+      kickoffAt: 9500,
+      config: { enabled: true, maxContinuations: 5, maxRuntimeMs: 900000 },
+    });
+
+    h.get('taskManualCriteria').value += '\nSecurity review complete';
+    await h.app.saveTaskConfiguration();
+
+    expect(h.app._apiJson.mock.calls[2][1].body.criteria).toBeDefined();
+    const afterEdit = controller.getStatus();
+    expect(afterEdit).toMatchObject({ outcome: 'unknown', phase: 'watching', continuations: 0 });
+    expect(afterEdit.kickoffAt).toBeUndefined();
+    expect(afterEdit.criteria.every((criterion) => !criterion.verified)).toBe(true);
+    expect(afterEdit.criteria.find((criterion) => criterion.id === 'custom-command')).toMatchObject({
+      description: 'Unit tests pass',
+      command: 'npm test',
+    });
+    controller.stop();
   });
   it('submits owner verification only and guards exhausted, blocked and completed actions', async () => {
     const h = harness();

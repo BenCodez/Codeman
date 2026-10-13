@@ -146,7 +146,7 @@ import { hashCodexPrompt } from './recovery/codex-identity.js';
 import { CodexInputProofTracker, type CodexInputProof } from './recovery/codex-input-proof.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight } from './recovery/types.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
-import { RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
+import { readRebootIdentityFence, RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
 import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from './session-env-clamp.js';
 import {
   launchModelFor,
@@ -962,9 +962,12 @@ export class Session extends EventEmitter {
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this._muxSession = config.muxSession || null;
     this._preserveExitedPane = config.preserveExitedPane ?? false;
+    this._recoveryUntrackedInput =
+      getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
+      readRebootIdentityFence(this.id)?.untrackedInput === true;
     // Input while the server was down cannot be reconstructed from a launch resume id.
     // A fresh exact ordinary submission must re-verify the physical pane's current thread.
-    this._recoverySwitchPending = this._preserveExitedPane;
+    this._recoverySwitchPending = this._preserveExitedPane || this._recoveryUntrackedInput;
     if (this._preserveExitedPane) this._recoveryInputProofTracker.invalidate();
 
     // Apply Nice priority configuration if provided
@@ -2268,6 +2271,7 @@ export class Session extends EventEmitter {
   private _recoverySubmission?: { at: number; hash: string };
   private _recoveryIntentionalStopAt = 0;
   private _recoverySwitchPending = false;
+  private _recoveryUntrackedInput = false;
 
   get recoveryInputReserved(): boolean {
     return this._recoveryDelivering;
@@ -2288,6 +2292,7 @@ export class Session extends EventEmitter {
       submission: this._recoverySubmission,
       intentionalStopAt: this._recoveryIntentionalStopAt,
       switchPending: this._recoverySwitchPending,
+      untrackedInput: this._recoveryUntrackedInput,
       managed: this.paneExitApplies && !this._closing && !this._isStopped && !this._respawnBlocked,
       noDaemon:
         this._muxSession?.recoveryIsolated === true &&
@@ -4561,6 +4566,20 @@ export class Session extends EventEmitter {
     this._emitSubmittedPrompt(this._trackSubmit(data, { fromUser: true }));
   }
 
+  /**
+   * Commit a fail-closed identity veto before a supported client hands its
+   * terminal directly to tmux. Bytes typed during that attach bypass every
+   * Session write path, so no pre-attach conversation proof can remain valid.
+   * The recoveryIdentityChanged listener writes the fsynced private fence
+   * synchronously; an error therefore prevents the client from attaching.
+   */
+  fenceUntrackedInput(): void {
+    if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return;
+    this._recoveryUntrackedInput = true;
+    this._recoveryInputProofTracker.invalidate();
+    this._invalidateRecoverySubmission();
+  }
+
   private _invalidateRecoverySubmission(): void {
     this._recoverySubmission = undefined;
     this._recoverySwitchPending = true;
@@ -4590,7 +4609,10 @@ export class Session extends EventEmitter {
       const prompt = proof.prompts[0];
       if (prompt !== undefined && !prompt.trimStart().startsWith('/')) {
         this._recoverySubmission = { at: proof.at, hash: hashCodexPrompt(prompt) };
-        this._recoverySwitchPending = false;
+        // Direct tmux stdin remains concurrent and invisible for the lifetime of
+        // the handoff taint. A tracked browser prompt cannot prove that no later
+        // untracked /resume or edit changed the conversation underneath it.
+        this._recoverySwitchPending = this._recoveryUntrackedInput;
         this._publishRecoveryIdentityAfterDispatch();
       } else if (prompt !== undefined && /^\/exit\b/.test(prompt.trimStart())) {
         this._recoveryIntentionalStopAt = proof.at;

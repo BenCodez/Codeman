@@ -27,6 +27,7 @@ function fixture() {
   };
   const persist = vi.fn(async () => {});
   const act = vi.fn(async () => 'sent' as const);
+  const recover = vi.fn(async () => 'sent' as const);
   const observe = vi.fn(async () => observation);
   const controller = new TaskController({
     now: () => now,
@@ -34,6 +35,7 @@ function fixture() {
     persist,
     changed: () => {},
     act,
+    recover,
   });
   return {
     controller,
@@ -42,6 +44,7 @@ function fixture() {
     },
     persist,
     act,
+    recover,
     set: (o: Partial<TaskObservation['observation']>) => {
       observation = { ...observation, observation: { ...observation.observation, ...o } };
     },
@@ -70,6 +73,27 @@ describe('task supervision', () => {
     f.set({ activity: 'idle' });
     await f.controller.refresh();
     expect(f.act).not.toHaveBeenCalled();
+    f.controller.stop();
+  });
+  it('does not persist ordinary input while task automation is disabled', async () => {
+    const f = fixture();
+    for (let i = 0; i < 100; i++) f.controller.noteUserInput();
+    await f.controller.drain();
+    expect(f.persist).not.toHaveBeenCalled();
+    expect(f.controller.getStatus().phase).toBe('disabled');
+    f.controller.stop();
+  });
+  it('coalesces repeated input into one durable pause while task automation is enabled', async () => {
+    const f = fixture();
+    await configure(f.controller);
+    f.persist.mockClear();
+    for (let i = 0; i < 100; i++) f.controller.noteUserInput();
+    await f.controller.drain();
+    expect(f.persist).toHaveBeenCalledOnce();
+    for (let i = 0; i < 100; i++) f.controller.noteUserInput();
+    await f.controller.drain();
+    expect(f.persist).toHaveBeenCalledOnce();
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'paused', reason: 'user-input' });
     f.controller.stop();
   });
   it('journals reservation before delivery and sends only once per completed turn', async () => {
@@ -125,6 +149,22 @@ describe('task supervision', () => {
     expect(f.controller.getStatus().objective).toBe('Fix the bug');
     f.controller.stop();
   });
+  it.each(['objective', 'criteria'] as const)('preserves configured limits across a partial %s edit', async (field) => {
+    const f = fixture();
+    await configure(f.controller);
+    await f.controller.update({ config: { maxContinuations: 7, maxRuntimeMs: 123_000 } });
+    await f.controller.update(
+      field === 'objective'
+        ? { objective: 'Fix the other bug' }
+        : { criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }] }
+    );
+    expect(f.controller.getStatus().config).toEqual({
+      enabled: true,
+      maxContinuations: 7,
+      maxRuntimeMs: 123_000,
+    });
+    f.controller.stop();
+  });
   it('enforces zero continuation budget and runtime budget', async () => {
     const f = fixture();
     await configure(f.controller);
@@ -134,6 +174,86 @@ describe('task supervision', () => {
     expect(f.act).not.toHaveBeenCalled();
     f.controller.stop();
   });
+  it.each(['kickoff', 'continuation', 'recovery'] as const)(
+    'does not start %s delivery when its runtime expires while saving the reservation',
+    async (kind) => {
+      const f = fixture();
+      if (kind === 'kickoff') {
+        await f.controller.update({
+          objective: 'Review the fix',
+          criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+          config: { maxRuntimeMs: 1000 },
+        });
+      } else {
+        await configure(f.controller);
+        await f.controller.update({ config: { maxRuntimeMs: 1000 } });
+      }
+      if (kind === 'recovery')
+        f.set({ activity: 'crashed', safeToAct: true, evidenceKey: 'crash-after-deadline', at: 10001 });
+      f.persist.mockImplementationOnce(async () => f.clock(11001));
+
+      await (kind === 'kickoff' ? f.controller.resume() : f.controller.refresh());
+
+      expect(kind === 'recovery' ? f.recover : f.act).not.toHaveBeenCalled();
+      expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted' });
+      expect(f.controller.getStatus().inFlight).toBeUndefined();
+      if (kind === 'kickoff') expect(f.controller.getStatus().kickoffAt).toBeUndefined();
+      f.controller.stop();
+    }
+  );
+  it.each(['kickoff', 'continuation', 'recovery'] as const)(
+    'revokes %s adapter authority when its runtime expires while delivery is awaiting',
+    async (kind) => {
+      const f = fixture();
+      if (kind === 'kickoff') {
+        await f.controller.update({
+          objective: 'Review the fix',
+          criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+          config: { maxRuntimeMs: 1000 },
+        });
+      } else {
+        await configure(f.controller);
+        await f.controller.update({ config: { maxRuntimeMs: 1000 } });
+      }
+      if (kind === 'recovery')
+        f.set({ activity: 'crashed', safeToAct: true, evidenceKey: 'crash-at-deadline', at: 10001 });
+      const expire = async (isCurrent: () => boolean) => {
+        expect(isCurrent()).toBe(true);
+        f.clock(11001);
+        expect(isCurrent()).toBe(false);
+        return 'not-sent' as const;
+      };
+      if (kind === 'recovery') f.recover.mockImplementationOnce(async (_observation, isCurrent) => expire(isCurrent));
+      else f.act.mockImplementationOnce(async (_key, _conversationId, _prompt, isCurrent) => expire(isCurrent));
+
+      await (kind === 'kickoff' ? f.controller.resume() : f.controller.refresh());
+
+      expect(kind === 'recovery' ? f.recover : f.act).toHaveBeenCalledOnce();
+      expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted' });
+      expect(f.controller.getStatus().inFlight).toBeUndefined();
+      f.controller.stop();
+    }
+  );
+  it.each(['unknown', 'sent'] as const)(
+    'retains a possibly delivered reservation after a %s deadline result',
+    async (result) => {
+      const f = fixture();
+      await configure(f.controller);
+      await f.controller.update({ config: { maxRuntimeMs: 1000 } });
+      f.act.mockImplementationOnce(async (_key, _conversationId, _prompt, isCurrent) => {
+        expect(isCurrent()).toBe(true);
+        f.clock(11001);
+        expect(isCurrent()).toBe(false);
+        return result as 'sent';
+      });
+
+      await f.controller.refresh();
+
+      expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted' });
+      expect(f.controller.getStatus().inFlight).toBeDefined();
+      f.controller.stop();
+    }
+  );
   it.each(['kickoff', 'continuation'] as const)('observes completion after the final allowed %s', async (kind) => {
     const f = fixture();
     await configure(f.controller);
@@ -200,6 +320,35 @@ describe('task supervision', () => {
     expect(c.getStatus().inFlight).toBeUndefined();
     c.stop();
   });
+  it('restores fully verified acceptance criteria as completed without reopening work', async () => {
+    const state = initialTaskState();
+    state.objective = 'Previously completed work';
+    state.criteria = [
+      {
+        id: 'review',
+        description: 'Owner review',
+        kind: 'manual',
+        verified: true,
+        evidence: { source: 'owner', at: 10000 },
+      },
+    ];
+    state.config = { enabled: true, maxContinuations: 7, maxRuntimeMs: 123_000 };
+    state.outcome = 'unfinished';
+    state.phase = 'watching';
+    state.continuations = 3;
+    const act = vi.fn();
+    const c = new TaskController({ observe: vi.fn(), act, persist: async () => {}, changed: () => {} }, state);
+
+    expect(c.getStatus()).toMatchObject({
+      outcome: 'completed',
+      phase: 'completed',
+      continuations: 3,
+      config: { enabled: true, maxContinuations: 7, maxRuntimeMs: 123_000 },
+    });
+    await expect(c.resume()).rejects.toThrow('No unfinished task');
+    expect(act).not.toHaveBeenCalled();
+    c.stop();
+  });
   it('fails closed before dispatch when persistence fails', async () => {
     const f = fixture();
     await configure(f.controller);
@@ -212,11 +361,13 @@ describe('task supervision', () => {
   it('shares one action slot across actors', async () => {
     const arbiter = new SessionActionArbiter();
     let release!: () => void;
-    const p = arbiter.run(async () => {
+    const p = arbiter.run('task', async () => {
       await new Promise<void>((r) => (release = r));
       return 'sent';
     });
-    expect(await arbiter.run(async () => 'sent')).toBe('not-sent');
+    expect(await arbiter.run('recovery', async () => 'sent')).toBe('not-sent');
+    await expect(arbiter.reset('task')).rejects.toThrow('active');
+    await expect(arbiter.reset('recovery')).resolves.toBeUndefined();
     release();
     expect(await p).toBe('sent');
   });
@@ -238,21 +389,56 @@ describe('task supervision', () => {
     expect(f.controller.getStatus().reason).toBe('continuation-accepted');
     f.controller.stop();
   });
+  it('retains a kickoff reservation when owner progress lacks exact acceptance proof', async () => {
+    const f = fixture();
+    await f.controller.update({
+      objective: 'Review the fix',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+    });
+    f.set({ activity: 'idle', submissionKey: 'before-kickoff' });
+    await f.controller.resume();
+    const pending = f.controller.getStatus().inFlight!;
+    f.set({ activity: 'working', submissionKey: 'new-submission', submissionHash: 'wrong-prompt-hash' });
+
+    await f.controller.progress({ outcome: 'unfinished', verifiedCriteria: ['review'] });
+
+    expect(f.controller.getStatus()).toMatchObject({ outcome: 'completed', phase: 'completed', inFlight: pending });
+    await expect(f.controller.update({ objective: 'New work' })).rejects.toThrow('reset');
+    f.controller.stop();
+  });
   it('requires explicit reset for unresolved shared durable delivery after restart', async () => {
     let key: string | undefined;
     const a = new SessionActionArbiter(async (next) => {
       key = next;
     });
-    expect(await a.run(async () => 'unknown')).toBe('unknown');
+    expect(await a.run('task', async () => 'unknown')).toBe('unknown');
     expect(key).toBeTruthy();
     const restarted = new SessionActionArbiter(async (next) => {
       key = next;
-    }, !!key);
+    }, key);
     const act = vi.fn(async () => 'sent' as const);
-    expect(await restarted.run(act)).toBe('not-sent');
+    expect(await restarted.run('task', act)).toBe('not-sent');
     expect(act).not.toHaveBeenCalled();
-    await restarted.reset();
-    expect(await restarted.run(act)).toBe('sent');
+    await restarted.reset('task');
+    expect(await restarted.run('task', act)).toBe('sent');
+  });
+  it("does not let one actor reset another actor's unresolved reservation", async () => {
+    const arbiter = new SessionActionArbiter();
+    const act = vi.fn(async () => 'sent' as const);
+    expect(await arbiter.run('task', async () => 'unknown')).toBe('unknown');
+    await arbiter.reset('recovery');
+    expect(await arbiter.run('recovery', act)).toBe('not-sent');
+    expect(act).not.toHaveBeenCalled();
+    await arbiter.reset('task');
+    expect(await arbiter.run('recovery', act)).toBe('sent');
+  });
+  it('requires an explicit safe claim before clearing a legacy unowned reservation', async () => {
+    const arbiter = new SessionActionArbiter(undefined, 'bare-uuid');
+    const act = vi.fn(async () => 'sent' as const);
+    await arbiter.reset('task');
+    expect(await arbiter.run('task', act)).toBe('not-sent');
+    await arbiter.reset('task', true);
+    expect(await arbiter.run('task', act)).toBe('sent');
   });
   it('uses same authority for genuine crashes and bounds recovery', async () => {
     const f = fixture();
@@ -321,6 +507,59 @@ describe('task supervision', () => {
     await f.controller.refresh();
     expect(f.controller.getStatus().phase).toBe('completed');
     expect(f.controller.getStatus().criteria[0].evidence?.source).toBe('command');
+    expect(f.act).not.toHaveBeenCalled();
+    f.controller.stop();
+  });
+  it('treats fully verified command criteria as terminal despite an unfinished marker', async () => {
+    const f = fixture();
+    await configure(f.controller);
+    f.commands.set(commandHash('npm test'), 10001);
+    f.marker({
+      key: 'contradictory-marker',
+      submissionKey: 'fixture-submission',
+      at: 10002,
+      progress: {
+        outcome: 'unfinished',
+        checkpoint: 'All checks passed',
+        nextAction: 'Continue anyway',
+        verifiedCriteria: ['test'],
+      },
+    });
+
+    await f.controller.refresh();
+
+    expect(f.controller.getStatus()).toMatchObject({ outcome: 'completed', phase: 'completed' });
+    expect(f.controller.getStatus().criteria[0].evidence?.source).toBe('command');
+    expect(f.act).not.toHaveBeenCalled();
+
+    await f.controller.update({ config: { maxContinuations: 7 } });
+    expect(f.controller.getStatus()).toMatchObject({ outcome: 'completed', phase: 'completed' });
+    await expect(f.controller.resume()).rejects.toThrow('No unfinished task');
+    expect(f.act).not.toHaveBeenCalled();
+
+    await f.controller.update({ objective: 'Fix a newly discovered bug' });
+    expect(f.controller.getStatus()).toMatchObject({ outcome: 'unknown', phase: 'watching' });
+    expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+    f.controller.stop();
+  });
+  it('completes when the owner verifies the final manual criterion', async () => {
+    const f = fixture();
+    await f.controller.update({
+      objective: 'Review the fix',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { enabled: true },
+    });
+
+    await f.controller.progress({
+      outcome: 'unfinished',
+      checkpoint: 'Review passed',
+      nextAction: 'Continue anyway',
+      verifiedCriteria: ['review'],
+    });
+
+    expect(f.controller.getStatus()).toMatchObject({ outcome: 'completed', phase: 'completed' });
+    expect(f.controller.getStatus().criteria[0].evidence?.source).toBe('owner');
+    await f.controller.refresh();
     expect(f.act).not.toHaveBeenCalled();
     f.controller.stop();
   });
@@ -617,6 +856,69 @@ describe('task supervision', () => {
       c.stop();
     }
   );
+  it('does not reuse a pre-recovery checkpoint when fresh progress omits the next action', async () => {
+    const f = fixture();
+    await configure(f.controller);
+    const state = f.controller.getStatus();
+    f.controller.stop();
+    let observation: TaskObservation = {
+      observation: {
+        activity: 'interrupted',
+        reason: 'turn-interrupted',
+        at: 12001,
+        conversationId: id,
+        safeToAct: true,
+        evidenceKey: 'interrupted-with-incomplete-progress',
+        submissionKey: 'original-submission',
+      },
+      commands: new Map(),
+    };
+    const act = vi.fn(async () => 'sent' as const);
+    const c = new TaskController(
+      {
+        now: () => 12002,
+        observe: async () => observation,
+        recover: async () => 'sent',
+        act,
+        persist: async () => {},
+        changed: () => {},
+      },
+      state
+    );
+    await c.update({ config: { enabled: true } });
+    await c.refresh();
+    expect(c.getStatus()).toMatchObject({ outcome: 'unknown', checkpoint: '', nextAction: '' });
+    observation = {
+      observation: {
+        activity: 'completed',
+        reason: 'turn-completed',
+        at: 12003,
+        conversationId: id,
+        turnId: 'recovered-turn',
+        processReady: true,
+        safeToAct: false,
+        submissionKey: 'recovery-submission',
+        submissionHash: createHash('sha256').update(CONTINUATION_PROMPT).digest('hex'),
+      },
+      commands: new Map(),
+      marker: {
+        key: 'fresh-incomplete-progress',
+        at: 12003,
+        submissionKey: 'recovery-submission',
+        progress: { outcome: 'unfinished' },
+      },
+    };
+    await c.refresh();
+    expect(c.getStatus()).toMatchObject({
+      outcome: 'unfinished',
+      checkpoint: '',
+      nextAction: '',
+      phase: 'paused',
+      reason: 'task-evidence-unknown',
+    });
+    expect(act).not.toHaveBeenCalled();
+    c.stop();
+  });
   it('accepts fresh progress for the existing submission after a crash restart', async () => {
     const f = fixture();
     await configure(f.controller);

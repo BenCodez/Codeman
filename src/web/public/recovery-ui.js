@@ -3,6 +3,9 @@
  * @mixin Extends CodemanApp.prototype; loaded after app.js and before session-ui.js.
  * Only the open modal holds recovery state. Closing aborts reads; action replies
  * are guarded by the view identity so they cannot paint a different session.
+ * @dependency app.js (CodemanApp class, this.sessions, this.editingSessionId, showToast)
+ * @dependency api-client.js at runtime (this._apiJson; loaded later and called only after init)
+ * @loadorder 8.1, after respawn-ui.js, before supervision-ui.js
  */
 
 const RECOVERY_UI_FIELDS = Object.freeze({

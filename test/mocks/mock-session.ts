@@ -90,17 +90,18 @@ export class MockSession extends EventEmitter {
    * which is the state in which input used to disappear silently.
    */
   failWrites = false;
+  recoveryInputReserved = false;
 
   /** Direct PTY write (used by session.write()). Mirrors the real boolean return. */
   write(data: string): boolean {
-    if (this.failWrites) return false;
+    if (this.failWrites || this.recoveryInputReserved) return false;
     this.writeBuffer.push(data);
     return true;
   }
 
   /** Write via mux (used by respawn controller) */
   async writeViaMux(data: string): Promise<boolean> {
-    if (this.failWrites) return false;
+    if (this.failWrites || this.recoveryInputReserved) return false;
     this.writeBuffer.push(data);
     return true;
   }

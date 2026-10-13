@@ -29,6 +29,9 @@ export interface TaskDependencies {
   changed(state: TaskState): void;
   now?: () => number;
 }
+function acceptanceCriteriaComplete(state: TaskState): boolean {
+  return state.criteria.length > 0 && state.criteria.every((criterion) => criterion.verified);
+}
 export class TaskController {
   private state: TaskState;
   private lastPersisted: TaskState;
@@ -36,15 +39,23 @@ export class TaskController {
   private timer?: ReturnType<typeof setTimeout>;
   private revision = 0;
   private lastUserInputRevision = 0;
+  private userInputSaveQueued = false;
   private stopped = false;
   constructor(
     private readonly deps: TaskDependencies,
     restored?: TaskState
   ) {
     this.state = structuredClone(restored ?? initialTaskState());
-    if (this.state.config.enabled) {
+    if (acceptanceCriteriaComplete(this.state)) this.state.outcome = 'completed';
+    if (this.state.config.enabled && this.state.inFlight) {
       this.state.phase = 'paused';
-      this.state.reason = this.state.inFlight ? 'restart-in-flight' : 'restart-requires-resume';
+      this.state.reason = 'restart-in-flight';
+    } else if (this.state.outcome === 'completed') {
+      this.state.phase = 'completed';
+      this.state.reason = 'completed';
+    } else if (this.state.config.enabled) {
+      this.state.phase = 'paused';
+      this.state.reason = 'restart-requires-resume';
     }
     this.lastPersisted = structuredClone(this.state);
   }
@@ -92,16 +103,47 @@ export class TaskController {
       this.timer.unref?.();
     }
   }
+  private runtimeBudgetExpired(): boolean {
+    return this.state.startedAt !== undefined && this.now() - this.state.startedAt >= this.state.config.maxRuntimeMs;
+  }
+  private actionIsCurrent(revision: number): boolean {
+    return !this.stopped && this.revision === revision && !this.runtimeBudgetExpired();
+  }
   noteUserInput(): void {
     this.revision++;
     this.lastUserInputRevision = this.revision;
-    this.state.phase = this.state.config.enabled ? 'paused' : 'disabled';
+    const phase = this.state.config.enabled ? 'paused' : 'disabled';
+    this.state.phase = phase;
+    this.arm();
+    if ((!this.state.config.enabled && !this.state.inFlight) || this.userInputSaveQueued) return;
+    const flight = this.state.inFlight;
+    const persistedFlight = this.lastPersisted.inFlight;
+    if (
+      this.lastPersisted.phase === phase &&
+      this.lastPersisted.reason === 'user-input' &&
+      flight?.key === persistedFlight?.key &&
+      flight?.startedAt === persistedFlight?.startedAt
+    )
+      return;
+    this.userInputSaveQueued = true;
     void this.enqueue(() => {
       this.state.phase = this.state.config.enabled ? 'paused' : 'disabled';
       this.arm();
+      const currentFlight = this.state.inFlight;
+      const savedFlight = this.lastPersisted.inFlight;
+      if (
+        this.lastPersisted.phase === this.state.phase &&
+        this.lastPersisted.reason === 'user-input' &&
+        currentFlight?.key === savedFlight?.key &&
+        currentFlight?.startedAt === savedFlight?.startedAt
+      )
+        return Promise.resolve(this.getStatus());
       return this.save('user-input');
-    }).catch(() => {});
-    this.arm();
+    })
+      .catch(() => {})
+      .finally(() => {
+        this.userInputSaveQueued = false;
+      });
   }
   stop(): void {
     this.stopped = true;
@@ -111,7 +153,7 @@ export class TaskController {
   async drain(): Promise<void> {
     await this.queue;
   }
-  /** Delivery may finish after the Session input guard releases and a user types.
+  /** Delivery may finish after the Session input guard releases, user input, or the runtime deadline.
    * Keep any possibly delivered reservation unresolved and never re-arm stale authority.
    */
   private preserveCancelledDelivery(
@@ -119,14 +161,17 @@ export class TaskController {
     result: 'sent' | 'not-sent' | 'unknown',
     kickoff = false
   ): Promise<TaskState> | undefined {
-    if (!this.stopped && this.revision === revision) return undefined;
+    const deadlineExpired = !this.stopped && this.revision === revision && this.runtimeBudgetExpired();
+    if (!this.stopped && this.revision === revision && !deadlineExpired) return undefined;
     if (result === 'not-sent') {
       delete this.state.inFlight;
       if (kickoff) delete this.state.kickoffAt;
     }
     this.state.outcome = 'unknown';
-    this.state.phase = 'paused';
-    return this.save(this.lastUserInputRevision > revision ? 'user-input' : 'delivery-cancelled');
+    this.state.phase = deadlineExpired ? 'blocked' : 'paused';
+    return this.save(
+      this.lastUserInputRevision > revision ? 'user-input' : deadlineExpired ? 'budget-exhausted' : 'delivery-cancelled'
+    );
   }
   /** Persist freshness and submission attribution together with every delivery reservation. */
   private reserveProgressBoundary(
@@ -140,6 +185,20 @@ export class TaskController {
     this.state.submissionKey = newPrompt ? undefined : (observation.submissionKey ?? this.state.submissionKey);
     if (marker) this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
   }
+  /** Clear only a delivery whose exact prompt is visible under a new submission identity. */
+  private reconcileAcceptedFlight(state: TaskState, observation: RecoveryObservation): boolean {
+    const flight = state.inFlight;
+    if (
+      !flight?.promptHash ||
+      observation.submissionHash !== flight.promptHash ||
+      !observation.submissionKey ||
+      observation.submissionKey === flight.previousSubmissionKey
+    )
+      return false;
+    state.submissionKey = observation.submissionKey;
+    delete state.inFlight;
+    return true;
+  }
   private requireCurrent(revision: number): void {
     if (this.stopped || this.revision !== revision) throw new Error('Task action was superseded by session input');
   }
@@ -151,15 +210,24 @@ export class TaskController {
       const objective = patch.objective ?? this.state.objective;
       const criteria =
         patch.criteria ??
-        this.state.criteria.map(({ id, description, kind, command }) => ({ id, description, kind, command }));
+        this.state.criteria.map((c) =>
+          c.kind === 'command'
+            ? { id: c.id, description: c.description, kind: c.kind, command: c.command }
+            : { id: c.id, description: c.description, kind: c.kind }
+        );
       const changed =
         objective !== this.state.objective ||
         JSON.stringify(criteria) !==
           JSON.stringify(
-            this.state.criteria.map(({ id, description, kind, command }) => ({ id, description, kind, command }))
+            this.state.criteria.map((c) =>
+              c.kind === 'command'
+                ? { id: c.id, description: c.description, kind: c.kind, command: c.command }
+                : { id: c.id, description: c.description, kind: c.kind }
+            )
           );
       if (changed && this.state.inFlight) throw new Error('Unresolved delivery requires reset');
       const candidate = changed ? initialTaskState() : this.getStatus();
+      if (changed) candidate.config = { ...this.state.config };
       candidate.objective = objective;
       if (changed) {
         candidate.criteria = criteria.map((c) => ({ ...c, verified: false }));
@@ -170,7 +238,9 @@ export class TaskController {
       if (candidate.config.enabled && (!candidate.objective || !candidate.criteria.length))
         throw new Error('Task objective and criteria are required');
       if (candidate.inFlight && candidate.config.enabled) throw new Error('Unresolved delivery requires reset');
-      candidate.phase = candidate.config.enabled ? 'watching' : 'disabled';
+      if (acceptanceCriteriaComplete(candidate)) candidate.outcome = 'completed';
+      candidate.phase =
+        candidate.outcome === 'completed' ? 'completed' : candidate.config.enabled ? 'watching' : 'disabled';
       if (candidate.config.enabled) candidate.startedAt ??= this.now();
       this.state = candidate;
       const result = await this.save('configured');
@@ -188,6 +258,7 @@ export class TaskController {
       if (this.state.conversationId && observation.conversationId !== this.state.conversationId)
         throw new Error('Task conversation changed');
       const candidate = this.getStatus();
+      this.reconcileAcceptedFlight(candidate, observation);
       for (const id of patch.verifiedCriteria ?? []) {
         const c = candidate.criteria.find((c) => c.id === id);
         if (!c) throw new Error('Unknown criterion');
@@ -208,11 +279,11 @@ export class TaskController {
       candidate.submissionKey = observation.submissionKey;
       this.state = candidate;
       this.state.lastProgressAt = this.now();
-      this.state.outcome = patch.outcome;
+      this.state.outcome = acceptanceCriteriaComplete(this.state) ? 'completed' : patch.outcome;
       this.state.checkpoint = patch.checkpoint ?? this.state.checkpoint;
       this.state.nextAction = patch.nextAction ?? this.state.nextAction;
       this.state.phase =
-        patch.outcome === 'completed'
+        this.state.outcome === 'completed'
           ? 'completed'
           : patch.outcome === 'unfinished' && this.state.config.enabled
             ? 'watching'
@@ -275,12 +346,7 @@ export class TaskController {
       await this.save('kickoff-reserved');
       const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent', true);
       if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-      const delivered = await this.deps.act(
-        key,
-        o.conversationId,
-        this.prompt(),
-        () => !this.stopped && this.revision === revision
-      );
+      const delivered = await this.deps.act(key, o.conversationId, this.prompt(), () => this.actionIsCurrent(revision));
       const cancelled = this.preserveCancelledDelivery(revision, delivered, true);
       if (cancelled) return cancelled;
       if (delivered === 'not-sent') {
@@ -299,21 +365,21 @@ export class TaskController {
   reset(): Promise<TaskState> {
     this.revision++;
     return this.enqueue(async () => {
-      await this.deps.resetReservation?.();
       const old = this.state;
       this.state = initialTaskState();
       this.state.lastProgressAt = this.now();
       this.state.configuredAt = this.now();
       this.state.objective = old.objective;
-      this.state.criteria = old.criteria.map((c) => ({
-        id: c.id,
-        description: c.description,
-        kind: c.kind,
-        command: c.command,
-        verified: false,
-      }));
+      this.state.criteria = old.criteria.map((c) =>
+        c.kind === 'command'
+          ? { id: c.id, description: c.description, kind: c.kind, command: c.command, verified: false }
+          : { id: c.id, description: c.description, kind: c.kind, verified: false }
+      );
       this.arm();
-      return this.save('owner-reset');
+      const result = await this.save('owner-reset');
+      // Clear the shared reservation only after this controller's uncertainty is durably gone.
+      await this.deps.resetReservation?.();
+      return result;
     });
   }
   private prompt(): string {
@@ -334,13 +400,7 @@ export class TaskController {
       if (o.conversationId) this.state.conversationId = o.conversationId;
       if (this.state.inFlight?.promptHash) {
         const flight = this.state.inFlight;
-        if (
-          o.submissionHash === flight.promptHash &&
-          o.submissionKey &&
-          o.submissionKey !== flight.previousSubmissionKey
-        ) {
-          this.state.submissionKey = o.submissionKey;
-          delete this.state.inFlight;
+        if (this.reconcileAcceptedFlight(this.state, o)) {
           await this.save('continuation-accepted');
         } else if (['paused', 'blocked', 'unknown'].includes(o.activity) || this.now() - flight.startedAt >= 60000) {
           this.state.phase = o.activity === 'blocked' ? 'blocked' : 'paused';
@@ -387,8 +447,11 @@ export class TaskController {
               c.verified = true;
               c.evidence = { source: 'command', at: commands.get(hash)!, commandHash: hash };
             }
-            this.state.outcome =
-              p.outcome === 'completed' && !this.state.criteria.every((c) => c.verified) ? 'unknown' : p.outcome;
+            this.state.outcome = acceptanceCriteriaComplete(this.state)
+              ? 'completed'
+              : p.outcome === 'completed'
+                ? 'unknown'
+                : p.outcome;
             this.state.lastProgressAt = marker.at;
             this.state.checkpoint = p.checkpoint ?? this.state.checkpoint;
             this.state.nextAction = p.nextAction ?? this.state.nextAction;
@@ -400,6 +463,11 @@ export class TaskController {
           this.state.phase = 'paused';
           return this.save('task-evidence-unknown');
         }
+      }
+      if (this.state.outcome === 'completed' || acceptanceCriteriaComplete(this.state)) {
+        this.state.outcome = 'completed';
+        this.state.phase = 'completed';
+        return this.save('completed');
       }
       if (
         this.deps.recover &&
@@ -434,7 +502,7 @@ export class TaskController {
           await this.save('recovery-reserved');
           const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent');
           if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-          const result = await this.deps.recover(o, () => !this.stopped && this.revision === revision);
+          const result = await this.deps.recover(o, () => this.actionIsCurrent(revision));
           const cancelled = this.preserveCancelledDelivery(revision, result);
           if (cancelled) return cancelled;
           if (result === 'not-sent' || (result === 'sent' && o.activity === 'crashed')) delete this.state.inFlight;
@@ -442,6 +510,8 @@ export class TaskController {
             // Successful recovery invalidates the pre-recovery declaration of unfinished work.
             // A new marker or owner progress update must establish the next actionable checkpoint.
             this.state.outcome = 'unknown';
+            this.state.checkpoint = '';
+            this.state.nextAction = '';
             this.state.lastProgressAt = Math.max(this.state.lastProgressAt ?? 0, reservationAt);
           } else this.state.phase = 'paused';
           return this.save(
@@ -457,11 +527,6 @@ export class TaskController {
         this.state.phase = 'blocked';
         return this.save('task-blocked');
       }
-      if (this.state.outcome === 'completed') {
-        this.state.phase = 'completed';
-        return this.save('completed');
-      }
-
       // Limits prevent another dispatch; keep observing work already in progress
       // so its completion and verification evidence can still settle the task.
       if (o.activity === 'working' || o.activity === 'watching') return this.getStatus();
@@ -496,12 +561,7 @@ export class TaskController {
       await this.save('continuation-reserved');
       const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent');
       if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-      const result = await this.deps.act(
-        key,
-        o.conversationId,
-        prompt,
-        () => !this.stopped && this.revision === revision
-      );
+      const result = await this.deps.act(key, o.conversationId, prompt, () => this.actionIsCurrent(revision));
       const cancelled = this.preserveCancelledDelivery(revision, result);
       if (cancelled) return cancelled;
       if (result === 'unknown') {

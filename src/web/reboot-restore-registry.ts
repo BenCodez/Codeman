@@ -49,8 +49,40 @@ import type { RebootRestoreEntry } from '../reboot-restore.js';
  */
 const PLAN_TTL_MS = 24 * 60 * 60 * 1000;
 
+type ParkedEntry = { entry: RebootRestoreEntry; spender: string | undefined };
+type SnapshotWriter = (path: string, text: string) => void;
+
+function writeAtomicSnapshot(path: string, text: string): void {
+  const temporary = `${path}.tmp-${randomUUID()}`;
+  try {
+    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const fd = openSync(temporary, 'wx', 0o600);
+    try {
+      writeFileSync(fd, text);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(temporary, path);
+    const directory = openSync(dirname(path), 'r');
+    try {
+      fsyncSync(directory);
+    } finally {
+      closeSync(directory);
+    }
+  } finally {
+    try {
+      unlinkSync(temporary);
+    } catch {
+      /* already renamed */
+    }
+  }
+}
+
 export class RebootRestoreRegistry {
   private persistencePath?: string;
+
+  constructor(private readonly snapshotWriter: SnapshotWriter = writeAtomicSnapshot) {}
 
   /** Load the durable offer before pruning stale records. Bounded, private and versioned. */
   configurePersistence(path: string): void {
@@ -121,36 +153,21 @@ export class RebootRestoreRegistry {
     return held?.entry === entry && held.spender === spender;
   }
 
-  private persist(): void {
+  private persistState(
+    entries: ReadonlyMap<string, RebootRestoreEntry>,
+    parked: ReadonlyMap<string, ParkedEntry>,
+    builtAt: number
+  ): void {
     if (!this.persistencePath) return;
     const path = this.persistencePath;
-    const temporary = `${path}.tmp-${randomUUID()}`;
-    try {
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      const entries = [...this.entries.values(), ...[...this.parked.values()].map((held) => held.entry)];
-      const text = JSON.stringify({ version: 1, builtAt: this.builtAt, entries });
-      if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('Restore offer exceeds storage budget');
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(fd, text);
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
-      }
-      renameSync(temporary, path);
-      const directory = openSync(dirname(path), 'r');
-      try {
-        fsyncSync(directory);
-      } finally {
-        closeSync(directory);
-      }
-    } finally {
-      try {
-        unlinkSync(temporary);
-      } catch {
-        /* already renamed */
-      }
-    }
+    const outstanding = [...entries.values(), ...[...parked.values()].map((held) => held.entry)];
+    const text = JSON.stringify({ version: 1, builtAt, entries: outstanding });
+    if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('Restore offer exceeds storage budget');
+    this.snapshotWriter(path, text);
+  }
+
+  private persist(): void {
+    this.persistState(this.entries, this.parked, this.builtAt);
   }
 
   /** Keyed by session id, in the order the boot pass found them. */
@@ -169,7 +186,7 @@ export class RebootRestoreRegistry {
    * spending an entry need not be its owner: an admin may restore another user's
    * sessions, and then the spender and the owner are different keys.
    */
-  private parked = new Map<string, { entry: RebootRestoreEntry; spender: string | undefined }>();
+  private parked = new Map<string, ParkedEntry>();
   /**
    * Owners with a restore in flight, between its take and its last pane.
    * Keyed by owner so one user's restore does not turn another user's click into
@@ -258,19 +275,27 @@ export class RebootRestoreRegistry {
 
   /** Drop the entries a viewer can see. Returns how many went. */
   clear(canAccess: (owner: string | undefined) => boolean): number {
-    const removable = [...this.entries.values()].filter((entry) => canAccess(entry.owner));
-    for (const entry of removable) this.entries.delete(entry.sessionId);
+    const nextEntries = new Map(this.entries);
+    const nextParked = new Map(this.parked);
+    const removable = [...nextEntries.values()].filter((entry) => canAccess(entry.owner));
+    for (const entry of removable) nextEntries.delete(entry.sessionId);
     // Entries a restore is holding are dismissed by the same rule, so a dismiss
     // that lands mid-restore wins. Judged on the ENTRY's owner, exactly as above,
     // rather than on who happens to be restoring it.
     let parkedRemoved = 0;
-    for (const [sessionId, held] of [...this.parked]) {
+    for (const [sessionId, held] of [...nextParked]) {
       if (!canAccess(held.entry.owner)) continue;
-      this.parked.delete(sessionId);
+      nextParked.delete(sessionId);
       parkedRemoved += 1;
     }
-    if (this.entries.size === 0 && this.parked.size === 0) this.builtAt = 0;
-    this.persist();
+    const nextBuiltAt = nextEntries.size === 0 && nextParked.size === 0 ? 0 : this.builtAt;
+    // A dismiss is one transaction: the durable snapshot must commit before
+    // isHeld() can begin cancelling a concurrent restore. If storage fails,
+    // both the on-disk offer and all in-memory active/parked entries survive.
+    this.persistState(nextEntries, nextParked, nextBuiltAt);
+    this.entries = nextEntries;
+    this.parked = nextParked;
+    this.builtAt = nextBuiltAt;
     return removable.length + parkedRemoved;
   }
 

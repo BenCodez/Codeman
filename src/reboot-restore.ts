@@ -44,7 +44,7 @@
 
 import type { SessionState } from './types.js';
 import { getCli } from './config/cli-registry/registry.js';
-import { resolveCodexIdentity } from './recovery/codex-identity.js';
+import { resolveCodexIdentities, resolveCodexIdentity, type CodexIdentityRequest } from './recovery/codex-identity.js';
 import { readRebootIdentityFence } from './recovery/reboot-identity-fence.js';
 import { isCleanPaneExit } from './pane-exit-sweep.js';
 
@@ -300,35 +300,57 @@ export function newestPersistedActivity(persisted: Readonly<Record<string, Sessi
   return newest;
 }
 
-/** Revalidate an exact persisted UUID; never discover a replacement thread by cwd. */
-export async function verifyCodexRebootIdentity(state: SessionState): Promise<string | undefined> {
+interface CodexRebootIdentityCandidate {
+  request: CodexIdentityRequest;
+  expectedId?: string;
+}
+
+/** Build only from an exact saved UUID or an exact durable ordinary-submission proof. */
+function codexRebootIdentityCandidate(state: SessionState): CodexRebootIdentityCandidate | undefined {
   if (getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' || state.remote || state.docker)
     return undefined;
   const proof =
     readRebootIdentityFence(state.id) ??
     (
       state as SessionState & {
-        __codexRebootIdentity?: { switchPending?: boolean; submission?: { at: number; hash: string } };
+        __codexRebootIdentity?: {
+          switchPending?: boolean;
+          submission?: { at: number; hash: string };
+          untrackedInput?: boolean;
+        };
       }
     ).__codexRebootIdentity;
-  if (proof?.switchPending) return undefined;
+  if (proof?.switchPending || proof?.untrackedInput) return undefined;
   const id = state.recovery?.conversationId ?? state.codexConfig?.resumeSessionId;
   if (
-    !id ||
-    (state.recovery?.conversationId &&
-      state.codexConfig?.resumeSessionId &&
-      state.recovery.conversationId !== state.codexConfig.resumeSessionId)
+    state.recovery?.conversationId &&
+    state.codexConfig?.resumeSessionId &&
+    state.recovery.conversationId !== state.codexConfig.resumeSessionId
   )
     return undefined;
-  const identity = await resolveCodexIdentity({
-    sessionId: state.id,
-    workingDir: state.workingDir,
-    codexHome: (state as { __envOverrides?: Record<string, string> }).__envOverrides?.CODEX_HOME,
-    resumeId: id,
-    submission: proof?.submission,
-    noDaemon: state.codexConfig?.noDaemon === true,
-  });
-  return identity.reason === 'verified' && identity.conversationId === id ? id : undefined;
+  if (!id && !proof?.submission) return undefined;
+  return {
+    expectedId: id,
+    request: {
+      sessionId: state.id,
+      workingDir: state.workingDir,
+      codexHome: (state as { __envOverrides?: Record<string, string> }).__envOverrides?.CODEX_HOME,
+      resumeId: id,
+      submission: proof?.submission,
+      noDaemon: state.codexConfig?.noDaemon === true,
+    },
+  };
+}
+
+/** Revalidate saved exact evidence; cwd and timestamps alone never authorize a thread. */
+export async function verifyCodexRebootIdentity(state: SessionState): Promise<string | undefined> {
+  const candidate = codexRebootIdentityCandidate(state);
+  if (!candidate) return undefined;
+  const identity = await resolveCodexIdentity(candidate.request);
+  if (identity.reason !== 'verified' || !identity.conversationId) return undefined;
+  return candidate.expectedId === undefined || identity.conversationId === candidate.expectedId
+    ? identity.conversationId
+    : undefined;
 }
 
 /** Disk verification is bounded and serial; the pure planner remains usable by callers/tests. */
@@ -338,6 +360,7 @@ export async function planVerifiedRebootRestore(
   workspaceExists: (workingDir: string) => boolean
 ): Promise<RebootRestorePlan> {
   const verified = new Map<string, string>();
+  const candidates: Array<{ sessionId: string; identity: CodexRebootIdentityCandidate }> = [];
   for (const sessionId of deadSessionIds) {
     const state = persisted[sessionId];
     if (
@@ -353,8 +376,20 @@ export async function planVerifiedRebootRestore(
       !workspaceExists(state.workingDir)
     )
       continue;
-    const id = await verifyCodexRebootIdentity(state);
-    if (id) verified.set(sessionId, id);
+    const identity = codexRebootIdentityCandidate(state);
+    if (identity) candidates.push({ sessionId, identity });
+  }
+  const resolutions = await resolveCodexIdentities(candidates.map((candidate) => candidate.identity.request));
+  for (const [index, resolution] of resolutions.entries()) {
+    const candidate = candidates[index];
+    const id = resolution.conversationId;
+    if (
+      resolution.reason === 'verified' &&
+      id &&
+      (candidate.identity.expectedId === undefined || candidate.identity.expectedId === id)
+    ) {
+      verified.set(candidate.sessionId, id);
+    }
   }
   return planRebootRestore(deadSessionIds, persisted, workspaceExists, verified);
 }

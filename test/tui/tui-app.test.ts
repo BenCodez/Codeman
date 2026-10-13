@@ -9,11 +9,12 @@
  * full-screen loop itself is covered end-to-end under node-pty in
  * `tui-e2e.test.ts`.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   applyLiveMetrics,
   applyMuxNames,
   buildAttachBanner,
+  beginAttachHandoff,
   buildListLines,
   confirmKillStep,
   detachChord,
@@ -25,6 +26,7 @@ import {
   formatPrefixKey,
   helpKeysFor,
   isSelfSession,
+  needsDirectAttachFence,
   planAttach,
   planResume,
   previewIntervalMs,
@@ -39,7 +41,7 @@ import {
 } from '../../src/tui/tui-app.js';
 import { createTuiModel, stateSince } from '../../src/tui/tui-model.js';
 import { glyphsFor } from '../../src/tui/tui-render.js';
-import type { TuiLiveSessionMetrics, TuiTmuxSession } from '../../src/tui/tui-client.js';
+import type { TuiClient, TuiLiveSessionMetrics, TuiTmuxSession } from '../../src/tui/tui-client.js';
 import type { TuiConfirmState, TuiRow, TuiSessionRow } from '../../src/tui/tui-types.js';
 
 const GLYPHS = glyphsFor('unicode');
@@ -113,6 +115,102 @@ describe('planAttach', () => {
     const plan = planAttach('codeman-abcdef01', { socket: 'codeman' });
     if (plan.kind !== 'attach') throw new Error('expected an attach');
     expect(plan.args.some((arg) => arg.includes(' '))).toBe(false);
+  });
+});
+
+describe('direct attach recovery fence', () => {
+  it('is required for Codex rows, including future remote rows, without changing other modes', () => {
+    expect(needsDirectAttachFence({ mode: 'codex' })).toBe(true);
+    expect(needsDirectAttachFence({ mode: 'claude' })).toBe(false);
+    expect(needsDirectAttachFence({ mode: 'shell' })).toBe(false);
+    expect(needsDirectAttachFence({ mode: undefined })).toBe(false);
+  });
+
+  it('fences an Alt-switchable Codex target before attaching to an initial Claude row', async () => {
+    const fenceDirectAttach = vi.fn(async () => {});
+    const bindSwitchKey = vi.fn(async () => true);
+    const client = {
+      fenceDirectAttach,
+      readPrefixKey: vi.fn(async () => null),
+      readDetachKey: vi.fn(async () => null),
+      readPrefixBinding: vi.fn(async () => null),
+      bindDetachKey: vi.fn(async () => true),
+      bindSwitchKey,
+      readSessionOptions: vi.fn(async () => null),
+      applySessionOptions: vi.fn(async () => {}),
+      readWindowSizing: vi.fn(async () => null),
+      presizeWindow: vi.fn(async () => {}),
+      followAttachingClient: vi.fn(async () => true),
+      unbindSwitchKey: vi.fn(async () => {}),
+      unbindDetachKey: vi.fn(async () => {}),
+      restoreSessionOptions: vi.fn(async () => {}),
+      restoreWindowSizing: vi.fn(async () => {}),
+    } as unknown as TuiClient;
+
+    const handoff = await beginAttachHandoff(client, 'codeman-claude1', 'claude row', [
+      { index: 1, label: 'claude row', active: true, muxName: 'codeman-claude1' },
+      {
+        index: 2,
+        label: 'codex row',
+        active: false,
+        muxName: 'codeman-codex222',
+        requiresDirectAttachFence: true,
+        directAttachFenceSessionId: 'codex-session-id',
+      },
+    ]);
+
+    expect(fenceDirectAttach).toHaveBeenCalledOnce();
+    expect(fenceDirectAttach).toHaveBeenCalledWith('codex-session-id');
+    expect(fenceDirectAttach.mock.invocationCallOrder[0]).toBeLessThan(bindSwitchKey.mock.invocationCallOrder[0]);
+    expect(bindSwitchKey).toHaveBeenCalledWith('M-2', 'codeman-codex222');
+    await handoff.restore();
+  });
+
+  it('omits unfenced or unidentified Codex jumps without blocking an initial Claude attach', async () => {
+    const bindSwitchKey = vi.fn(async () => true);
+    const client = {
+      fenceDirectAttach: vi.fn(async () => {
+        throw new Error('server unavailable');
+      }),
+      readPrefixKey: vi.fn(async () => null),
+      readDetachKey: vi.fn(async () => null),
+      readPrefixBinding: vi.fn(async () => null),
+      bindDetachKey: vi.fn(async () => true),
+      bindSwitchKey,
+      readSessionOptions: vi.fn(async () => null),
+      applySessionOptions: vi.fn(async () => {}),
+      readWindowSizing: vi.fn(async () => null),
+      presizeWindow: vi.fn(async () => {}),
+      followAttachingClient: vi.fn(async () => true),
+      unbindSwitchKey: vi.fn(async () => {}),
+      unbindDetachKey: vi.fn(async () => {}),
+      restoreSessionOptions: vi.fn(async () => {}),
+      restoreWindowSizing: vi.fn(async () => {}),
+    } as unknown as TuiClient;
+
+    const handoff = await beginAttachHandoff(client, 'codeman-claude1', 'claude row', [
+      { index: 1, label: 'claude row', active: true, muxName: 'codeman-claude1' },
+      {
+        index: 2,
+        label: 'offline codex',
+        active: false,
+        muxName: 'codeman-codex222',
+        requiresDirectAttachFence: true,
+        directAttachFenceSessionId: 'offline-codex-id',
+      },
+      {
+        index: 3,
+        label: 'unknown codex',
+        active: false,
+        muxName: 'codeman-codex333',
+        requiresDirectAttachFence: true,
+      },
+    ]);
+
+    expect(bindSwitchKey).toHaveBeenCalledWith('M-1', 'codeman-claude1');
+    expect(bindSwitchKey).not.toHaveBeenCalledWith('M-2', expect.anything());
+    expect(bindSwitchKey).not.toHaveBeenCalledWith('M-3', expect.anything());
+    await handoff.restore();
   });
 });
 

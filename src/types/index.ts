@@ -15,7 +15,7 @@
  * |--------------|-----------------------------------------------------------------------|-------------------------------------------------|
  * | common       | Disposable, BufferConfig, CleanupRegistration, NiceConfig, ProcessStats | In-memory only                                 |
  * | session      | SessionState, SessionConfig, SessionStatus, SessionMode, ClaudeMode, OpenCodeConfig | `~/.codeman/state.json` → `GET /api/sessions`  |
- * | task         | TaskDefinition, TaskState, TaskStatus                                 | `~/.codeman/state.json` → `GET /api/tasks`     |
+ * | task         | TaskDefinition, TaskState, TaskStatus, SupervisionTaskState, TaskProgress, TaskUpdate | `~/.codeman/state.json` → `GET /api/tasks`; per-session supervision API |
  * | app-state    | AppState, AppConfig, GlobalStats, TokenStats, DEFAULT_CONFIG          | `~/.codeman/state.json` → `GET /api/status`    |
  * | respawn      | RespawnConfig, RespawnPreset, RespawnCycleMetrics, RalphLoopHealthScore, TimingHistory | Per-session in state.json → `GET /api/sessions/:id/respawn` |
  * | ralph        | RalphTrackerState, RalphTodoItem, CircuitBreakerStatus, RalphStatusBlock, RalphSessionState | Per-session → `GET /api/sessions/:id/ralph-state` |

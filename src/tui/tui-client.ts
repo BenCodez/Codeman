@@ -771,6 +771,11 @@ export class TuiClient {
     await this.requestData('DELETE', `/api/sessions/${encodeURIComponent(sessionId)}`);
   }
 
+  /** Durably invalidate recovery identity before stdin bypasses the server via tmux. */
+  async fenceDirectAttach(sessionId: string): Promise<void> {
+    await this.requestData('POST', `/api/sessions/${encodeURIComponent(sessionId)}/direct-attach-fence`, {});
+  }
+
   async search(query: string, limit?: number): Promise<SearchResponseData> {
     const params = new URLSearchParams({ q: query });
     if (limit !== undefined) params.set('limit', String(Math.max(1, Math.trunc(limit))));

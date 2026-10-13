@@ -112,6 +112,10 @@ const result = spawnSync(${JSON.stringify(REAL_GIT)}, args, { stdio: 'inherit', 
 if (args[0] === 'fetch' && result.status === 0 && process.env.CODEMAN_TEST_DIRTY_AFTER_FETCH === '1') {
   fs.writeFileSync(process.env.CODEMAN_TEST_REPO + '/concurrent-change.txt', 'keep concurrent work');
 }
+if (args[0] === 'fetch' && result.status === 0 && process.env.CODEMAN_TEST_PUSHURL_AFTER_FETCH === '1') {
+  const changed = spawnSync(${JSON.stringify(REAL_GIT)}, ['config', 'remote.origin.pushurl', 'https://git.example.invalid/old-push.git'], { stdio: 'inherit', env: process.env });
+  if (changed.status !== 0) process.exit(changed.status ?? 1);
+}
 process.exit(result.status ?? 1);
 `
   );
@@ -171,6 +175,31 @@ afterEach(() => {
 });
 
 describe('switch-to-fork preview and apply', () => {
+  it.each([{ args: [] }, { args: ['--apply'] }])('rejects separate origin push routing before any mutation: %j', ({ args }) => {
+    const h = fixture();
+    h.git(h.repo, 'config', 'remote.origin.pushurl', 'https://git.example.invalid/old-push.git');
+    const config = readFileSync(join(h.repo, '.git/config'), 'utf8');
+    const result = h.run(args);
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('separate push URL');
+    expect(readFileSync(join(h.repo, '.git/config'), 'utf8')).toBe(config);
+    expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.base);
+    expect(h.calls().some((call) => call.command === 'npm' || call.args[0] === 'fetch')).toBe(false);
+    h.assertPreserved();
+  });
+
+  it('rechecks separate push routing added while fetching before changing origin or HEAD', () => {
+    const h = fixture();
+    const result = h.run(['--apply'], { CODEMAN_TEST_PUSHURL_AFTER_FETCH: '1' });
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain('separate push URL');
+    expect(h.git(h.repo, 'config', '--get', 'remote.origin.pushurl')).toBe('https://git.example.invalid/old-push.git');
+    expect(h.git(h.repo, 'remote', 'get-url', 'origin')).toBe(UPSTREAM);
+    expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.base);
+    expect(h.calls().filter((call) => call.command === 'npm')).toEqual([]);
+    h.assertPreserved();
+  });
+
   it('defaults to a read-only preview with explicit source and build plan', () => {
     const h = fixture();
     const config = readFileSync(join(h.repo, '.git/config'), 'utf8');

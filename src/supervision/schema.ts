@@ -1,5 +1,7 @@
 /** @fileoverview Strict bounded task inputs and durable public state. */
 import { z } from 'zod';
+import type { SupervisionTaskState } from '../types/task.js';
+export type { SupervisionTaskState as TaskState, TaskProgress, TaskUpdate } from '../types/task.js';
 const Text = z.string().max(4000);
 export const TaskConfigSchema = z
   .object({
@@ -8,15 +10,20 @@ export const TaskConfigSchema = z
     maxRuntimeMs: z.number().int().min(1000).max(86_400_000),
   })
   .strict();
-export const CriterionSchema = z
-  .object({
-    id: z.string().regex(/^[\w-]{1,80}$/),
-    description: z.string().min(1).max(1000),
-    kind: z.enum(['manual', 'command']),
-    command: z.string().min(1).max(1000).optional(),
-  })
-  .strict()
-  .refine((c) => c.kind !== 'command' || !!c.command);
+const CriterionId = z.string().regex(/^[\w-]{1,80}$/);
+const CriterionDescription = z.string().min(1).max(1000);
+const CriterionCommand = z.string().min(1).max(1000);
+export const CriterionSchema = z.discriminatedUnion('kind', [
+  z.object({ id: CriterionId, description: CriterionDescription, kind: z.literal('manual') }).strict(),
+  z
+    .object({
+      id: CriterionId,
+      description: CriterionDescription,
+      kind: z.literal('command'),
+      command: CriterionCommand,
+    })
+    .strict(),
+]);
 const Criteria = z
   .array(CriterionSchema)
   .min(1)
@@ -47,23 +54,41 @@ export const TaskStateSchema = z
     objective: Text,
     criteria: z
       .array(
-        z
-          .object({
-            id: z.string().regex(/^[\w-]{1,80}$/),
-            description: z.string().min(1).max(1000),
-            kind: z.enum(['manual', 'command']),
-            command: z.string().min(1).max(1000).optional(),
-            verified: z.boolean(),
-            evidence: z
-              .object({
-                source: z.enum(['owner', 'command']),
-                at: z.number(),
-                commandHash: z.string().max(64).optional(),
-              })
-              .strict()
-              .optional(),
-          })
-          .strict()
+        z.discriminatedUnion('kind', [
+          z
+            .object({
+              id: CriterionId,
+              description: CriterionDescription,
+              kind: z.literal('manual'),
+              verified: z.boolean(),
+              evidence: z
+                .object({
+                  source: z.enum(['owner', 'command']),
+                  at: z.number(),
+                  commandHash: z.string().max(64).optional(),
+                })
+                .strict()
+                .optional(),
+            })
+            .strict(),
+          z
+            .object({
+              id: CriterionId,
+              description: CriterionDescription,
+              kind: z.literal('command'),
+              command: CriterionCommand,
+              verified: z.boolean(),
+              evidence: z
+                .object({
+                  source: z.enum(['owner', 'command']),
+                  at: z.number(),
+                  commandHash: z.string().max(64).optional(),
+                })
+                .strict()
+                .optional(),
+            })
+            .strict(),
+        ])
       )
       .max(30),
     checkpoint: Text,
@@ -92,10 +117,7 @@ export const TaskStateSchema = z
     history: z.array(z.object({ at: z.number(), reason: z.string().max(80) }).strict()).max(100),
   })
   .strict();
-export type TaskState = z.infer<typeof TaskStateSchema>;
-export type TaskProgress = z.infer<typeof TaskProgressSchema>;
-export type TaskUpdate = z.infer<typeof TaskUpdateSchema>;
-export function initialTaskState(): TaskState {
+export function initialTaskState(): SupervisionTaskState {
   return {
     version: 1,
     objective: '',
@@ -109,5 +131,5 @@ export function initialTaskState(): TaskState {
     reason: 'disabled',
     handledEvidence: [],
     history: [],
-  };
+  } satisfies SupervisionTaskState;
 }

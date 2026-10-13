@@ -185,6 +185,60 @@ describe('recovery action authority', () => {
     expect(f.act).not.toHaveBeenCalled();
   });
 
+  it.each([
+    ['classifier uncertainty', 'unknown', 'identity-unverified', 'working', 'turn-running'],
+    ['user veto', 'paused', 'user-interrupted', 'idle', 'turn-completed'],
+    ['resolved approval', 'paused', 'approval-required', 'working', 'turn-running'],
+    ['resolved provider block', 'blocked', 'usage-limit', 'watching', 'background-work'],
+  ] as const)(
+    'clears attention after %s resolves to normal activity and publishes the persisted state',
+    async (_label, blockedActivity, blockedReason, resolvedActivity, resolvedReason) => {
+      const f = fixture(enabledState());
+      f.observation = failure('temporary-veto', {
+        activity: blockedActivity,
+        reason: blockedReason,
+        safeToAct: false,
+      });
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({ phase: 'paused', needsAttention: true });
+
+      const changesBeforeResolution = f.changes.length;
+      f.observation = failure('resolved-veto', {
+        activity: resolvedActivity,
+        reason: resolvedReason,
+        safeToAct: false,
+      });
+      await f.controller.refresh();
+
+      expect(f.controller.getStatus()).toMatchObject({ phase: 'watching', needsAttention: false });
+      expect(f.journal.at(-1)).toMatchObject({
+        activity: resolvedActivity,
+        lastReason: resolvedReason,
+        needsAttention: false,
+      });
+      expect(f.changes.length).toBeGreaterThan(changesBeforeResolution);
+      expect(f.changes.at(-1)).toMatchObject({ needsAttention: false });
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['interrupted', 'crashed'] as const)(
+    'keeps attention sticky while an unresolved %s failure is still observed',
+    async (activity) => {
+      const f = fixture(enabledState({ phase: 'paused', needsAttention: true, lastReason: 'identity-unverified' }));
+      f.observation = failure('unresolved-failure', {
+        activity,
+        reason: activity === 'crashed' ? 'process-crashed' : 'turn-failed',
+        safeToAct: false,
+      });
+      await f.controller.refresh();
+      expect(f.controller.getStatus().needsAttention).toBe(true);
+      expect(f.journal.at(-1)?.needsAttention).toBe(true);
+      expect(f.changes.at(-1)?.needsAttention).toBe(true);
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  );
+
   it('does not treat a classified failure as authority without safeToAct', async () => {
     const f = fixture(enabledState());
     f.observation = failure('unsafe', { safeToAct: false });
@@ -207,6 +261,72 @@ describe('recovery action authority', () => {
     await f.controller.retry();
     expect(f.controller.getStatus().lastReason).toBe('identity-unverified');
     expect(f.act).not.toHaveBeenCalled();
+  });
+
+  it('reconciles a manual retry while automation is disabled, then stops observing', async () => {
+    const f = fixture();
+    await f.controller.retry();
+    expect(f.act).toHaveBeenCalledTimes(1);
+    expect(f.controller.getStatus()).toMatchObject({ config: { enabled: false }, phase: 'recovering' });
+    expect(f.controller.getStatus().inFlight).toBeDefined();
+
+    f.observation = acceptedSubmission();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.controller.getStatus()).toMatchObject({
+      config: { enabled: false },
+      phase: 'watching',
+      lastReason: 'recovery-accepted',
+    });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    const observed = f.observe.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.observe).toHaveBeenCalledTimes(observed);
+    expect(f.act).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps acceptance monitoring after automation is disabled following a dispatch', async () => {
+    const f = fixture(enabledState());
+    await f.controller.retry();
+    await f.controller.updateConfig({ enabled: false });
+    expect(f.controller.getStatus()).toMatchObject({ config: { enabled: false }, phase: 'recovering' });
+
+    f.observation = acceptedSubmission();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.controller.getStatus()).toMatchObject({
+      config: { enabled: false },
+      lastReason: 'recovery-accepted',
+    });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.act).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a status inspection reconcile a disabled in-flight retry without dispatching', async () => {
+    const f = fixture();
+    await f.controller.retry();
+    f.observation = acceptedSubmission();
+    await f.controller.inspect();
+    expect(f.controller.getStatus()).toMatchObject({
+      config: { enabled: false },
+      lastReason: 'recovery-accepted',
+    });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.act).toHaveBeenCalledTimes(1);
+  });
+
+  it('bounds disabled in-flight observation at the acceptance timeout', async () => {
+    const f = fixture();
+    await f.controller.retry();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.controller.getStatus()).toMatchObject({
+      config: { enabled: false },
+      phase: 'paused',
+      lastReason: 'acceptance-unverified',
+    });
+    expect(f.controller.getStatus().inFlight).toBeDefined();
+    const observed = f.observe.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.observe).toHaveBeenCalledTimes(observed);
+    expect(f.act).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -326,6 +446,44 @@ describe('durable reservation and serialization', () => {
     await restarted.controller.refresh();
     expect(restarted.act).not.toHaveBeenCalled();
     expect(restarted.controller.getStatus().inFlight).toEqual(saved.inFlight);
+  });
+
+  it('discards and durably disarms a restored pending action before polling', async () => {
+    vi.setSystemTime(NOW + 10_000);
+    const f = fixture(
+      enabledState({
+        phase: 'watching',
+        lastReason: 'scheduled',
+        pending: { key: 'failure-1', action: 'continue', conversationId: THREAD },
+        nextRetryAt: NOW + 1000,
+      })
+    );
+    f.observation = failure('failure-1', { at: NOW });
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.controller.getStatus().nextRetryAt).toBeUndefined();
+    await f.controller.drain();
+    expect(f.journal.at(-1)).toMatchObject({ armedAt: NOW + 10_000 });
+    expect(f.journal.at(-1)?.pending).toBeUndefined();
+
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.act).not.toHaveBeenCalled();
+  });
+
+  it('fails closed when a queued input cancellation cannot be persisted', async () => {
+    const f = fixture(enabledState());
+    await schedule(f);
+    f.persist.mockRejectedValueOnce(new Error('Disk unavailable'));
+    f.controller.noteUserInput();
+    await f.controller.drain();
+    expect(f.controller.getStatus()).toMatchObject({
+      pending: undefined,
+      nextRetryAt: undefined,
+      circuitOpen: true,
+      needsAttention: true,
+      lastReason: 'persistence-failed',
+    });
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.act).not.toHaveBeenCalled();
   });
 });
 

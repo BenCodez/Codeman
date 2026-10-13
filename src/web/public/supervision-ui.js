@@ -1,4 +1,10 @@
-/** Owner-bound task supervision controls. No task is enabled merely by opening this view. */
+/**
+ * @fileoverview Owner-bound task supervision configuration, progress evidence and controls.
+ * @dependency app.js (CodemanApp class, this.sessions, this.editingSessionId, showToast)
+ * @dependency api-client.js at runtime (this._apiJson; loaded later and called only after init)
+ * @dependency recovery-ui.js (taskUiReason falls back to RECOVERY_UI_REASONS)
+ * @loadorder 8.2, after recovery-ui.js, before ralph-panel.js
+ */
 const TASK_UI_PHASES = Object.freeze({
   disabled: 'Off',
   watching: 'Monitoring',
@@ -53,7 +59,15 @@ Object.assign(CodemanApp.prototype, {
     const rail = document.querySelector('#sessionOptionsModal [data-tab="task"]');
     if (rail) rail.style.display = supported ? '' : 'none';
     if (!supported) return false;
-    this._taskView = { sessionId, revision: 0, state: null, loading: false, busy: false, dirty: false };
+    this._taskView = {
+      sessionId,
+      revision: 0,
+      state: null,
+      loading: false,
+      busy: false,
+      dirty: false,
+      configurationBaseline: null,
+    };
     this._renderTaskStatus(true);
     this._taskView.timer = setInterval(() => this._updateTaskRuntime(), 1000);
     void this.loadTaskStatus();
@@ -171,16 +185,15 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('taskResetBtn').disabled = !available;
     if (force || !view.dirty) {
       document.getElementById('taskObjective').value = state?.objective ?? '';
-      document.getElementById('taskManualCriteria').value =
-        state?.criteria
-          .filter((c) => c.kind === 'manual')
-          .map((c) => c.description)
-          .join('\n') ?? '';
-      document.getElementById('taskCommandCriteria').value =
-        state?.criteria
-          .filter((c) => c.kind === 'command')
-          .map((c) => c.command)
-          .join('\n') ?? '';
+      const manualCriteria = state?.criteria.filter((c) => c.kind === 'manual').map((c) => c.description) ?? [];
+      const commandCriteria = state?.criteria.filter((c) => c.kind === 'command').map((c) => c.command) ?? [];
+      document.getElementById('taskManualCriteria').value = manualCriteria.join('\n');
+      document.getElementById('taskCommandCriteria').value = commandCriteria.join('\n');
+      view.configurationBaseline = {
+        objective: (state?.objective ?? '').trim(),
+        manual: manualCriteria.map((text) => text.trim()).filter(Boolean),
+        commands: commandCriteria.map((text) => text.trim()).filter(Boolean),
+      };
       document.getElementById('taskEnabled').checked = state?.config.enabled ?? false;
       document.getElementById('taskMaxContinuations').value = state?.config.maxContinuations ?? '';
       document.getElementById('taskMaxRuntime').value = state ? state.config.maxRuntimeMs / 1000 : '';
@@ -259,34 +272,39 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
     const usedIds = new Set();
-    const criteria = [
-      ...manual.map((description) => ({ description, kind: 'manual' })),
-      ...commands.map((command) => ({ description: command, command, kind: 'command' })),
-    ].map((c, i) => {
-      const id =
-        view.state.criteria.find(
-          (old) =>
-            !usedIds.has(old.id) &&
-            old.kind === c.kind &&
-            old.description === c.description &&
-            old.command === c.command
-        )?.id ?? `criterion-${Date.now()}-${i + 1}`;
-      usedIds.add(id);
-      return { ...c, id };
-    });
+    const baseline = view.configurationBaseline ?? {
+      objective: view.state.objective.trim(),
+      manual: view.state.criteria.filter((c) => c.kind === 'manual').map((c) => c.description.trim()),
+      commands: view.state.criteria.filter((c) => c.kind === 'command').map((c) => c.command.trim()),
+    };
+    const criteriaChanged =
+      JSON.stringify(manual) !== JSON.stringify(baseline.manual) ||
+      JSON.stringify(commands) !== JSON.stringify(baseline.commands);
+    const criteria = criteriaChanged
+      ? [
+          ...manual.map((description) => ({ description, kind: 'manual' })),
+          ...commands.map((command) => ({ description: command, command, kind: 'command' })),
+        ].map((criterion, i) => {
+          const old = view.state.criteria.find(
+            (candidate) =>
+              !usedIds.has(candidate.id) &&
+              candidate.kind === criterion.kind &&
+              (criterion.kind === 'command'
+                ? candidate.command === criterion.command
+                : candidate.description === criterion.description)
+          );
+          const id = old?.id ?? `criterion-${Date.now()}-${i + 1}`;
+          usedIds.add(id);
+          return {
+            ...criterion,
+            ...(old?.kind === 'command' && criterion.kind === 'command' ? { description: old.description } : {}),
+            id,
+          };
+        })
+      : undefined;
     await this._performTaskRequest('', 'PUT', {
-      ...(objective !== view.state.objective ? { objective } : {}),
-      ...(JSON.stringify(criteria) !==
-      JSON.stringify(
-        view.state.criteria.map(({ id, description, kind, command }) => ({
-          description,
-          ...(command ? { command } : {}),
-          kind,
-          id,
-        }))
-      )
-        ? { criteria }
-        : {}),
+      ...(objective !== baseline.objective ? { objective } : {}),
+      ...(criteria ? { criteria } : {}),
       config: {
         enabled: document.getElementById('taskEnabled').checked,
         maxContinuations: Number(max.value),

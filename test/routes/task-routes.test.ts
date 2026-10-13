@@ -58,6 +58,17 @@ describe('task routes ownership and bounded inputs', () => {
     }
     expect(controller.update).not.toHaveBeenCalled();
   });
+  it('rejects command text on owner-verified manual criteria', async () => {
+    const res = await h.app.inject({
+      method: 'PUT',
+      url: `/api/sessions/${h.ctx._sessionId}/task`,
+      payload: {
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual', command: 'npm test' }],
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(controller.update).not.toHaveBeenCalled();
+  });
   it('does not expose internal verification errors', async () => {
     controller.progress.mockRejectedValueOnce(new Error('/private/transcript'));
     const res = await h.app.inject({

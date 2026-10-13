@@ -49,6 +49,10 @@ export interface SessionPort {
    * Unlike {@link cleanupSession} it leaves the persisted record, the lifetime
    * token totals, the Ralph state and the workspace's own files untouched.
    */
-  discardPartiallyBuiltSession(sessionId: string): Promise<void>;
+  discardPartiallyBuiltSession(
+    sessionId: string,
+    expectedSession?: Session,
+    options?: { preserveCustomModelConfigDir?: boolean }
+  ): Promise<void>;
   getSessionStateWithRespawn(session: Session): unknown;
 }

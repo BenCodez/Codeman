@@ -6,9 +6,10 @@
  * originator authority. Neither cwd, file mtime nor a timestamp-only history match
  * authorizes recovery. A truncated, unreadable or over-budget store supplies no id.
  *
- * All filesystem work is asynchronous and serial within one home. An outstanding
- * operation retains its single-flight slot even after the caller's deadline expires,
- * so a stalled network filesystem cannot accumulate new workers on every tick.
+ * Single-session filesystem work is asynchronous and serial within one home. An
+ * outstanding lookup retains its single-flight slot after the caller's deadline,
+ * so a stalled network filesystem cannot accumulate workers on every tick. Boot
+ * planning shares one deadline and one rollout/history index across each home.
  */
 
 import { createHash } from 'node:crypto';
@@ -71,6 +72,11 @@ interface HistoryEntry {
   id: string;
   at: number;
   hash: string;
+}
+
+interface HistoryIndex {
+  entries: HistoryEntry[];
+  truncated: boolean;
 }
 
 class Budget {
@@ -254,12 +260,7 @@ async function scanRollouts(home: string, budget: Budget): Promise<RolloutIdenti
   return identities;
 }
 
-async function matchingHistory(
-  home: string,
-  request: CodexIdentityRequest,
-  budget: Budget
-): Promise<HistoryEntry | undefined> {
-  if (!request.submission) return undefined;
+async function readHistory(home: string, budget: Budget): Promise<HistoryIndex> {
   let window: { text: string; truncated: boolean };
   try {
     window = await readWindow(join(home, 'history.jsonl'), HISTORY_BYTES, true, budget);
@@ -290,9 +291,14 @@ async function matchingHistory(
     history.push({ id: entry.session_id, at: entry.ts * 1000, hash: hashCodexPrompt(entry.text) });
   }
   if (history.some((entry, i) => i > 0 && entry.at < history[i - 1].at)) throw new Refusal('unverified');
+  return { entries: history, truncated: window.truncated };
+}
+
+function matchingHistory(index: HistoryIndex, request: CodexIdentityRequest): HistoryEntry {
+  if (!request.submission) throw new Refusal('unverified');
   const lower = request.submission.at - HISTORY_WINDOW_MS;
-  if (window.truncated && (!history.length || history[0].at >= lower)) throw new Refusal('unverified');
-  const matches = history.filter(
+  if (index.truncated && (!index.entries.length || index.entries[0].at >= lower)) throw new Refusal('unverified');
+  const matches = index.entries.filter(
     (entry) =>
       entry.hash === request.submission!.hash && Math.abs(entry.at - request.submission!.at) <= HISTORY_WINDOW_MS
   );
@@ -301,14 +307,13 @@ async function matchingHistory(
   return matches[0];
 }
 
-async function resolveInternal(
+async function resolveFromIndex(
   request: CodexIdentityRequest,
-  home: string,
-  budget: Budget
+  identities: readonly RolloutIdentity[],
+  budget: Budget,
+  history: () => Promise<HistoryIndex>
 ): Promise<CodexIdentityResult> {
   try {
-    await validateHome(home, budget);
-    const identities = await scanRollouts(home, budget);
     const cwd = resolve(request.workingDir);
     const candidates = identities.filter((identity) => identity.cwd === cwd && !identity.subagent);
     const fresh = candidates
@@ -316,11 +321,11 @@ async function resolveInternal(
       .sort((a, b) => b.createdAt - a.createdAt);
     if (fresh.length > 1 && fresh[0].createdAt === fresh[1].createdAt) throw new Refusal('ambiguous');
     const newest = fresh[0];
-    const history = await matchingHistory(home, request, budget);
+    const historyMatch = request.submission ? matchingHistory(await history(), request) : undefined;
     let selected: RolloutIdentity | undefined;
-    if (history) {
-      selected = candidates.find((identity) => identity.id === history.id);
-      if (newest && newest.id !== history.id && newest.createdAt > request.submission!.at) {
+    if (historyMatch) {
+      selected = candidates.find((identity) => identity.id === historyMatch.id);
+      if (newest && newest.id !== historyMatch.id && newest.createdAt > request.submission!.at) {
         throw new Refusal('ambiguous');
       }
     } else if (request.resumeId) {
@@ -350,13 +355,31 @@ async function resolveInternal(
   }
 }
 
-async function beforeDeadline(promise: Promise<CodexIdentityResult>, deadline: number): Promise<CodexIdentityResult> {
+async function resolveInternal(
+  request: CodexIdentityRequest,
+  home: string,
+  budget: Budget
+): Promise<CodexIdentityResult> {
+  try {
+    await validateHome(home, budget);
+    const identities = await scanRollouts(home, budget);
+    let historyPromise: Promise<HistoryIndex> | undefined;
+    return await resolveFromIndex(request, identities, budget, () => {
+      historyPromise ??= readHistory(home, budget);
+      return historyPromise;
+    });
+  } catch (error) {
+    return { reason: error instanceof Refusal ? error.reason : isAbsent(error) ? 'unverified' : 'unreadable' };
+  }
+}
+
+async function beforeDeadline<T>(promise: Promise<T>, deadline: number, onTimeout: () => T): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       promise,
-      new Promise<CodexIdentityResult>((finish) => {
-        timer = setTimeout(() => finish({ reason: 'unreadable' }), Math.max(0, deadline - performance.now()));
+      new Promise<T>((finish) => {
+        timer = setTimeout(() => finish(onTimeout()), Math.max(0, deadline - performance.now()));
         timer.unref?.();
       }),
     ]);
@@ -365,8 +388,8 @@ async function beforeDeadline(promise: Promise<CodexIdentityResult>, deadline: n
   }
 }
 
-export async function resolveCodexIdentity(request: CodexIdentityRequest): Promise<CodexIdentityResult> {
-  if (!request.noDaemon) return { reason: 'managed-daemon' };
+function prepareRequest(request: CodexIdentityRequest): { home: string } | { result: CodexIdentityResult } {
+  if (!request.noDaemon) return { result: { reason: 'managed-daemon' } };
   if (
     !request.sessionId ||
     !isAbsolute(request.workingDir) ||
@@ -377,11 +400,17 @@ export async function resolveCodexIdentity(request: CodexIdentityRequest): Promi
         request.submission.at <= 0 ||
         !/^[a-f0-9]{64}$/.test(request.submission.hash)))
   ) {
-    return { reason: 'unverified' };
+    return { result: { reason: 'unverified' } };
   }
   const configuredHome = request.codexHome ?? process.env.CODEX_HOME ?? join(homedir(), '.codex');
-  if (!isAbsolute(configuredHome)) return { reason: 'unverified' };
-  const home = resolve(configuredHome);
+  if (!isAbsolute(configuredHome)) return { result: { reason: 'unverified' } };
+  return { home: resolve(configuredHome) };
+}
+
+export async function resolveCodexIdentity(request: CodexIdentityRequest): Promise<CodexIdentityResult> {
+  const prepared = prepareRequest(request);
+  if ('result' in prepared) return prepared.result;
+  const { home } = prepared;
   const key = JSON.stringify([
     request.sessionId,
     resolve(request.workingDir),
@@ -393,7 +422,7 @@ export async function resolveCodexIdentity(request: CodexIdentityRequest): Promi
   const existing = pendingHomes.get(home);
   if (existing) {
     if (existing.key !== key) return { reason: 'unverified' };
-    return beforeDeadline(existing.promise, existing.deadline);
+    return beforeDeadline(existing.promise, existing.deadline, () => ({ reason: 'unreadable' }));
   }
   if (pendingHomes.size >= MAX_PENDING_HOMES) return { reason: 'unverified' };
   const budget = new Budget();
@@ -402,5 +431,56 @@ export async function resolveCodexIdentity(request: CodexIdentityRequest): Promi
   void promise.finally(() => {
     if (pendingHomes.get(home)?.promise === promise) pendingHomes.delete(home);
   });
-  return beforeDeadline(promise, budget.deadline);
+  return beforeDeadline(promise, budget.deadline, () => ({ reason: 'unreadable' }));
+}
+
+/**
+ * Resolve a boot plan under one wall-clock budget, indexing each distinct home once.
+ * Results retain input order. A malformed home refuses every request that depends
+ * on it, while malformed history refuses only exact-submission requests.
+ */
+export async function resolveCodexIdentities(
+  requests: readonly CodexIdentityRequest[]
+): Promise<CodexIdentityResult[]> {
+  const results: Array<CodexIdentityResult | undefined> = new Array(requests.length);
+  const groups = new Map<string, Array<{ index: number; request: CodexIdentityRequest }>>();
+  for (const [index, request] of requests.entries()) {
+    const prepared = prepareRequest(request);
+    if ('result' in prepared) {
+      results[index] = prepared.result;
+      continue;
+    }
+    const { home } = prepared;
+    const group = groups.get(home) ?? [];
+    group.push({ index, request });
+    groups.set(home, group);
+  }
+
+  const budget = new Budget();
+  const work = (async () => {
+    for (const [home, group] of groups) {
+      try {
+        await validateHome(home, budget);
+        const identities = await scanRollouts(home, budget);
+        let historyPromise: Promise<HistoryIndex> | undefined;
+        const getHistory = () => {
+          historyPromise ??= readHistory(home, budget);
+          return historyPromise;
+        };
+        for (const item of group) {
+          results[item.index] = await resolveFromIndex(item.request, identities, budget, getHistory);
+        }
+      } catch (error) {
+        const refusal: CodexIdentityResult = {
+          reason: error instanceof Refusal ? error.reason : isAbsent(error) ? 'unverified' : 'unreadable',
+        };
+        for (const item of group) results[item.index] ??= refusal;
+      }
+    }
+    return Array.from({ length: requests.length }, (_, index) => results[index] ?? ({ reason: 'unreadable' } as const));
+  })();
+
+  return beforeDeadline(work, budget.deadline, () =>
+    Array.from({ length: requests.length }, (_, index) => results[index] ?? ({ reason: 'unreadable' } as const))
+  );
 }

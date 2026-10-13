@@ -23,9 +23,13 @@ import fastifyCookie from '@fastify/cookie';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { getDataDir } from '../../src/config/instance.js';
+import { writeCustomModelHosts, type CustomModelHost } from '../../src/custom-model-hosts.js';
+import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
 
 /** Set per test: whether the mocked `startInteractive()` rejects. */
 let startShouldThrow = false;
+let startBarrier: Promise<void> | undefined;
 /** Ordering log, so a test can assert what ran before the pane spawned. */
 const callOrder: string[] = [];
 const launchConfigs: Record<string, unknown>[] = [];
@@ -48,6 +52,7 @@ vi.mock('../../src/session.js', () => ({
     }
     async startInteractive() {
       callOrder.push('startInteractive');
+      await startBarrier;
       if (startShouldThrow) throw new Error('spawn claude ENOENT');
     }
     /** The mock route context projects a session through this on broadcast. */
@@ -114,12 +119,14 @@ async function createHarness(ctx: ReturnType<typeof createMockRouteContext>): Pr
 
 beforeEach(() => {
   startShouldThrow = false;
+  startBarrier = undefined;
   callOrder.length = 0;
   launchConfigs.length = 0;
 });
 
-afterEach(() => {
+afterEach(async () => {
   rebootRestoreRegistry.reset();
+  await writeCustomModelHosts(getDataDir(), []);
   vi.clearAllMocks();
 });
 
@@ -180,12 +187,13 @@ describe('a rebuild that fails after the session is registered', () => {
     await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
     // The session reached ctx.sessions via addSession; the route has to take it
     // back out, or the board shows a tab whose pane never existed.
-    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith('a');
+    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith('a', expect.objectContaining({ id: 'a' }));
     expect(ctx.sessions.has('a')).toBe(false);
+    expect(ctx.cleanupSession).not.toHaveBeenCalled();
+    expect(ctx.persistSessionState).not.toHaveBeenCalled();
     // NOT the user-initiated delete: that would bank this session's historical
     // tokens into the lifetime totals, demote a pinned record to `stopped`, and
     // delete the workspace's .codeman-uploads.
-    expect(ctx.cleanupSession).not.toHaveBeenCalled();
     await app.close();
   });
 
@@ -338,6 +346,76 @@ describe('a failure before any entry is considered', () => {
 });
 
 describe('a dismiss that lands while a restore is running', () => {
+  it('cancels and discards the exact tentative session when launch finishes after dismissal', async () => {
+    rebootRestoreRegistry.set([offerEntry('a')]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    let releaseStart!: () => void;
+    startBarrier = new Promise<void>((resolve) => {
+      releaseStart = resolve;
+    });
+    const app = await createHarness(ctx);
+
+    const restore = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+    await vi.waitFor(() => expect(callOrder).toContain('startInteractive'));
+    const dismiss = await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });
+    expect(dismiss.json().data.dismissed).toBe(1);
+    releaseStart();
+
+    const result = (await restore).json().data;
+    expect(result.restored).toEqual([]);
+    expect(result.skipped).toEqual([{ sessionId: 'a', reason: 'restore-cancelled' }]);
+    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith('a', expect.objectContaining({ id: 'a' }));
+    expect(ctx.sessions.has('a')).toBe(false);
+    expect(ctx.cleanupSession).not.toHaveBeenCalled();
+    expect(ctx.persistSessionState).not.toHaveBeenCalled();
+    expect(ctx.reapplyPersistedSessionState).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.anything(),
+      'after-spawn',
+      expect.anything()
+    );
+    expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
+    await app.close();
+  });
+
+  it('cancels while post-start state restoration is still finishing', async () => {
+    rebootRestoreRegistry.set([offerEntry('a')]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    let releaseAfterSpawn!: () => void;
+    const afterSpawnBarrier = new Promise<void>((resolve) => {
+      releaseAfterSpawn = resolve;
+    });
+    ctx.reapplyPersistedSessionState.mockImplementation(async (_session, _saved, phase) => {
+      if (phase === 'after-spawn') await afterSpawnBarrier;
+    });
+    const app = await createHarness(ctx);
+
+    const restore = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+    await vi.waitFor(() =>
+      expect(ctx.reapplyPersistedSessionState).toHaveBeenCalledWith(
+        expect.anything(),
+        expect.anything(),
+        'after-spawn',
+        {
+          rearmAutoResumeSchedule: false,
+        }
+      )
+    );
+    const dismiss = await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });
+    expect(dismiss.json().data.dismissed).toBe(1);
+    releaseAfterSpawn();
+
+    const result = (await restore).json().data;
+    expect(result.restored).toEqual([]);
+    expect(result.skipped).toEqual([{ sessionId: 'a', reason: 'restore-cancelled' }]);
+    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith('a', expect.objectContaining({ id: 'a' }));
+    expect(ctx.sessions.has('a')).toBe(false);
+    expect(ctx.persistSessionState).not.toHaveBeenCalled();
+    expect(ctx.broadcast).not.toHaveBeenCalled();
+    expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
+    await app.close();
+  });
+
   it('wins when an admin is restoring the entries and their owner dismisses', async () => {
     const theirs = offerEntry('theirs', 'bob');
     rebootRestoreRegistry.set([theirs]);
@@ -484,6 +562,113 @@ describe('Codex reboot launch and cancellation', () => {
     expect(rebootRestoreRegistry.list(() => true)).toHaveLength(1);
     await app.close();
   });
+  it('re-derives a regular owner custom-model home from the current admin endpoint', async () => {
+    const previousMultiuser = process.env.CODEMAN_MULTIUSER;
+    const previousSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+    const spaces = join(homedir(), 'regular-custom-model-spaces');
+    process.env.CODEMAN_MULTIUSER = '1';
+    process.env.CODEMAN_USER_SPACES_DIR = spaces;
+    const workspace = join(spaces, 'alice', 'cases', 'project');
+    mkdirSync(workspace, { recursive: true });
+    const endpoint: CustomModelHost = {
+      id: 'admin-endpoint',
+      label: 'admin endpoint',
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'server-owned-secret',
+      models: ['custom-model'],
+    };
+    await writeCustomModelHosts(getDataDir(), [endpoint]);
+
+    const entry = codexOffer();
+    entry.owner = 'alice';
+    entry.workingDir = workspace;
+    entry.state.owner = 'alice';
+    entry.state.workingDir = workspace;
+    const trustedHome = customModelConfigDir(entry.sessionId);
+    mkdirSync(join(trustedHome, 'sessions'), { recursive: true });
+    writeFileSync(
+      join(trustedHome, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`),
+      JSON.stringify({
+        type: 'session_meta',
+        timestamp: '2026-10-13T15:00:00Z',
+        payload: { id: uuid, cwd: workspace, originator: 'codeman_codex-original' },
+      }) + '\n'
+    );
+    (entry.state as unknown as Record<string, unknown>).__customModel = {
+      endpointId: endpoint.id,
+      modelId: 'custom-model',
+      envKeys: ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'],
+      configDir: trustedHome,
+    };
+    (entry.state as unknown as Record<string, unknown>).__envOverrides = {
+      CODEX_HOME: join(homedir(), 'attacker-controlled-home'),
+      CODEMAN_CUSTOM_MODEL_API_KEY: 'attacker-secret',
+      CODEX_OTHER: 'keep',
+    };
+    rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    const app = await createHarness(ctx);
+    try {
+      const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json()
+        .data;
+      expect(result.restored.map((item: { id: string }) => item.id)).toEqual(['codex-original']);
+      expect(launchConfigs[0].envOverrides).toEqual({
+        CODEX_OTHER: 'keep',
+        CODEX_HOME: trustedHome,
+        CODEMAN_CUSTOM_MODEL_API_KEY: 'server-owned-secret',
+      });
+    } finally {
+      await app.close();
+      if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+      else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+      if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+      else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
+    }
+  });
+  it('rejects a regular owner persisted CODEX_HOME when no current admin endpoint authorizes it', async () => {
+    const previousMultiuser = process.env.CODEMAN_MULTIUSER;
+    const previousSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+    const spaces = join(homedir(), 'untrusted-custom-model-spaces');
+    process.env.CODEMAN_MULTIUSER = '1';
+    process.env.CODEMAN_USER_SPACES_DIR = spaces;
+    const workspace = join(spaces, 'alice', 'cases', 'project');
+    mkdirSync(workspace, { recursive: true });
+    const entry = codexOffer();
+    entry.owner = 'alice';
+    entry.workingDir = workspace;
+    entry.state.owner = 'alice';
+    entry.state.workingDir = workspace;
+    const untrustedHome = (entry.state as unknown as { __envOverrides: Record<string, string> }).__envOverrides
+      .CODEX_HOME;
+    writeFileSync(
+      join(untrustedHome, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`),
+      JSON.stringify({
+        type: 'session_meta',
+        timestamp: '2026-10-13T15:00:00Z',
+        payload: { id: uuid, cwd: workspace, originator: 'codeman_codex-original' },
+      }) + '\n'
+    );
+    (entry.state as unknown as Record<string, unknown>).__customModel = {
+      endpointId: 'deleted-endpoint',
+      modelId: 'custom-model',
+      envKeys: ['CODEX_HOME'],
+    };
+    rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    const app = await createHarness(ctx);
+    try {
+      const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json()
+        .data;
+      expect(result.skipped).toEqual([{ sessionId: 'codex-original', reason: 'identity-unverified' }]);
+      expect(launchConfigs).toEqual([]);
+    } finally {
+      await app.close();
+      if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+      else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+      if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+      else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
+    }
+  });
   it('dismissal during pre-spawn preparation prevents launching and releases partial registration', async () => {
     const entry = codexOffer();
     rebootRestoreRegistry.set([entry]);
@@ -495,7 +680,10 @@ describe('Codex reboot launch and cancellation', () => {
     const res = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;
     expect(res.skipped).toEqual([{ sessionId: 'codex-original', reason: 'restore-cancelled' }]);
     expect(callOrder).not.toContain('startInteractive');
-    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith('codex-original');
+    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith(
+      'codex-original',
+      expect.objectContaining({ id: 'codex-original' })
+    );
     expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
     await app.close();
   });
