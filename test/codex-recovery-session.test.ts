@@ -11,6 +11,7 @@ const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const sessions: Session[] = [];
 afterEach(async () => {
   for (const session of sessions.splice(0)) await session.stop(false);
+  vi.useRealTimers();
 });
 
 function fixture(extra: Record<string, unknown> = {}) {
@@ -127,6 +128,19 @@ describe('the actual Session recovery boundary', () => {
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
     expect(f.mux.sendInput).toHaveBeenCalledExactlyOnceWith(SESSION, `${CONTINUATION_PROMPT}\r`);
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
+  });
+
+  it('never re-presses Enter for an unaccepted continuation or a subsequently edited draft', async () => {
+    vi.useFakeTimers();
+    const f = fixture();
+    Object.assign(f.pane, { dead: false, screen: '›\n  example-model high · /tmp\n' });
+    Object.assign(f.mux, { capturePaneText: vi.fn(() => `› ${CONTINUATION_PROMPT} edited draft\n`) });
+    f.flight.action = 'continue';
+    expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
+    await vi.advanceTimersByTimeAsync(2000);
+    f.session.trackUserInput(' edited draft');
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.mux.sendInput).toHaveBeenCalledExactlyOnceWith(SESSION, `${CONTINUATION_PROMPT}\r`);
   });
 
   it('cancels when user input or cleanup changes the generation during the fresh probe', async () => {

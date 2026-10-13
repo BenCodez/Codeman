@@ -2376,7 +2376,9 @@ export class Session extends EventEmitter {
         const sent = await this._mux!.sendInput(this.id, `${CONTINUATION_PROMPT}\r`);
         if (!sent) return 'unknown'; // text may have landed even when Enter failed
         this._lastSubmitAt = Date.now();
-        this._verifySubmitted(`${CONTINUATION_PROMPT}\r`);
+        // Recovery acceptance comes from structured journal evidence. Do not arm the
+        // generic submit verifier: its delayed Enter retries are separate input actions
+        // and could submit a draft recalled or edited after recovery lost authority.
         return 'sent';
       });
     } catch {
