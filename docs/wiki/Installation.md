@@ -138,6 +138,68 @@ at server start, so markup changes need a restart.
 
 See [Contributing](Contributing) for the rest of the development loop.
 
+### Switch an existing git installation to BenCodez/Codeman
+
+Keep the current checkout and deployment. Once this helper is available on
+[`BenCodez/Codeman` master](https://github.com/BenCodez/Codeman/tree/master), fetch it
+into a temporary file and preview the migration:
+
+```bash
+cd "${CODEMAN_INSTALL_DIR:-$HOME/.codeman/app}"
+codeman_fork_helper="$(mktemp "${TMPDIR:-/tmp}/codeman-fork-helper.XXXXXX")"
+git fetch --no-tags https://github.com/BenCodez/Codeman.git master &&
+git show FETCH_HEAD:scripts/switch-to-fork.sh > "$codeman_fork_helper" &&
+bash "$codeman_fork_helper" --repo "$PWD" --dry-run
+```
+
+For a custom installation path, change the first `cd` to that existing checkout.
+The helper's preview does not fetch, build, or change files or configuration. The
+preceding `git fetch` only downloads the helper's source; it leaves the worktree
+and `origin` unchanged.
+
+If the preview describes the checkout you intended, apply it:
+
+```bash
+bash "$codeman_fork_helper" --repo "$PWD" --apply
+rm -f -- "$codeman_fork_helper"
+```
+
+The helper requires a clean worktree and refuses diverging commits or an active
+branch other than `master`. An installation detached at a release tag can return
+to `master` only when both its current commit and any existing local `master`
+fast-forward safely to the fork. It preserves the previous source as the
+`codeman-before-fork` remote, points `origin` to the fork, and runs `npm ci` and
+`npm run build` with server auto-start disabled. Failed guards leave your commits
+and source selection intact; dependency or build failures leave the source
+updated and tell you to fix the build before restarting.
+
+Your existing data and settings, network binding, tmux socket, service units, and
+`codeman` launcher path stay in place. The helper prints the matching existing
+service restart command when it can identify it, and does not execute it. For a
+standard Linux installation, apply the successful build when convenient with:
+
+```bash
+systemctl --user restart codeman-web.service
+```
+
+Use your existing command for macOS, a custom instance, or a foreground install.
+There is no separate reinstall, new data directory, or agent-session restart.
+
+For later fork `master` updates, use the same helper from the checkout:
+
+```bash
+bash scripts/switch-to-fork.sh --repo "$PWD" --dry-run
+bash scripts/switch-to-fork.sh --repo "$PWD" --apply
+```
+
+**App Settings → Updates already follows `origin`.** Once switched, GitHub release
+checks and the fallback tag check both use the fork; other installations keep
+their configured source. This updater offers newer release tags, so untagged
+`master` commits still need the helper. Avoid re-running the upstream installer
+for fork updates: its default source is `Ark0N/Codeman` and it can point `origin`
+back there. `CODEMAN_REPO_URL` remains available when configuring an installer
+for a different source.
+
 ## Route D: Docker Compose
 
 Codeman itself can run in a container and spawn Docker cases as sibling containers through
