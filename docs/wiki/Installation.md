@@ -164,8 +164,10 @@ bash "$codeman_fork_helper" --repo "$PWD" --apply
 rm -f -- "$codeman_fork_helper"
 ```
 
-The helper requires a clean worktree and refuses diverging commits or an active
-branch other than `master`. An installation detached at a release tag can return
+The helper requires a clean worktree and refuses diverging commits, a separate
+`remote.origin.pushurl`, or an active branch other than `master`. Preserve or remove
+intentional push routing yourself before switching; the helper does not overwrite it.
+An installation detached at a release tag can return
 to `master` only when both its current commit and any existing local `master`
 fast-forward safely to the fork. It preserves the previous source as the
 `codeman-before-fork` remote, points `origin` to the fork, and runs `npm ci` and

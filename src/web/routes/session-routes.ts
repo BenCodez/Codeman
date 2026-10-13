@@ -1846,6 +1846,13 @@ export function registerSessionRoutes(
     if (duplicate && !wantsWait) {
       return {};
     }
+    if (!duplicate && session.recoveryInputReserved) {
+      // Recovery owns the pane until its delivery attempt is resolved. Both Session
+      // write paths reject during that interval; a 2xx would make the browser treat
+      // the rejected frame as ACKed and delete it from its durable queue.
+      if (tagged) session.forgetInputSeq(clientId as string, seq as number);
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');
+    }
 
     // Wake-on-LAN (remote-wake.ts): a wake-enabled remote host that suspended leaves
     // the local ssh pane STALLED, and `send-keys` succeeds against it — the bytes
@@ -1921,25 +1928,24 @@ export function registerSessionRoutes(
     }
     const stopDeathWatch = wantsWait ? watchForDeadWorker(ctx.mux, session, id) : () => {};
 
-    // Write input to PTY. Direct write is synchronous; writeViaMux
-    // (tmux send-keys) is fire-and-forget to avoid blocking the HTTP response.
+    // Write input to PTY. Direct write is synchronous; tagged fallback and wait
+    // requests await writeViaMux because their response reports delivery. Only an
+    // untagged explicit mux request remains fire-and-forget for legacy behavior.
     // Every write here is `fromUser`: this route carries a person's prompt, or an
     // agent's on their behalf, so it may name the tab (Ralph, respawn, cron and
     // approvals write through the session directly and never say so).
     //
-    // Because the response has already been sent by then, a failure there is the
-    // one case the caller can never learn about — so the dedup bookkeeping is
-    // rolled back. Otherwise the seq stays recorded as applied and a retry, the
-    // very mechanism reliable delivery exists for, is rejected as a duplicate.
+    // A failed write must roll dedup bookkeeping back. Otherwise the seq stays
+    // recorded as applied and the retry that reliable delivery exists for is
+    // rejected as a duplicate. Tagged POST writes below are awaited so their
+    // response can also keep the browser's queue record unacknowledged.
     const undoOnFailure = () => {
       if (tagged) session.forgetInputSeq(clientId as string, seq as number);
     };
 
-    // Whether the bytes actually reached a write path. Only meaningful on the wait
-    // path (the fire-and-forget branches return before the response is built), and
-    // reported there instead of the old `!duplicate`: a PTY that has exited fails
-    // BOTH writes, and telling the caller "delivered, but it timed out" points it at
-    // the wrong recovery — wait longer, when the truth is "restart the worker".
+    // Whether the bytes actually reached a write path. The tagged POST fallback is
+    // also awaited: its HTTP response is the browser's delivery ACK, so it cannot
+    // truthfully return 2xx before knowing whether recovery rejected both writes.
     let delivered = false;
 
     // A plain prompt (`<text>\r`) goes through the mux even when the caller did not
@@ -1964,15 +1970,18 @@ export function registerSessionRoutes(
         delivered = session.write(inputStr, { fromUser: true });
         if (!delivered) undoOnFailure();
       }
-    } else if (autoMux) {
+    } else if (autoMux || (useMux && tagged)) {
       // Awaited, unlike the explicit useMux branch below. This shape also reaches here
       // from the browser's POST fallback, which sends its frames one at a time and
       // waits for each 2xx; answering only once Enter has gone out is what keeps the
       // next keystroke from overtaking it.
       const ok = await session.writeViaMux(inputStr, { fromUser: true }).catch(() => false);
-      if (!ok) {
+      if (ok) {
+        delivered = true;
+      } else {
         console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-        if (!session.write(inputStr, { fromUser: true })) undoOnFailure();
+        delivered = session.write(inputStr, { fromUser: true });
+        if (!delivered) undoOnFailure();
       }
     } else if (useMux) {
       // Fire-and-forget: don't block the HTTP response on a tmux child process.
@@ -1997,7 +2006,15 @@ export function registerSessionRoutes(
       }
     }
 
-    if (!waitPromise) return {};
+    if (!waitPromise) {
+      // Recovery may acquire the pane while an awaited mux write is in progress.
+      // In that race the initial reservation check passed, but both guarded writes
+      // still return false. Keep a tagged browser frame retryable and unacknowledged.
+      if (!duplicate && tagged && !delivered && session.recoveryInputReserved) {
+        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');
+      }
+      return {};
+    }
 
     try {
       // `send-keys` SUCCEEDS against a dead pane — tmux is happy to write into a corpse

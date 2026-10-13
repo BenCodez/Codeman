@@ -1398,13 +1398,15 @@ export class WebServer extends EventEmitter {
     coordinateLayout = true
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
-    await this.stopRecoveryController(sessionId, killMux);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], () =>
         this._doCleanupSession(sessionId, killMux, reason, false)
       );
     }
+    // Layout preparation above may reject while the live session remains intact.
+    // Tear recovery down only after deletion has entered its irreversible action.
+    await this.stopRecoveryController(sessionId, killMux);
     const lifecycleLog = getLifecycleLog();
     lifecycleLog.log({
       event: killMux ? 'deleted' : 'detached',
