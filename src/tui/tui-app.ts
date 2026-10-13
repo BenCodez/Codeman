@@ -49,6 +49,7 @@ import { hostname as osHostname } from 'node:os';
 import chalk from 'chalk';
 import { palette, table, tint, type Tone } from '../cli-style.js';
 import { CODEMAN_INSTANCE, resolveTmuxSocketName } from '../config/instance.js';
+import { getCli } from '../config/cli-registry/registry.js';
 import { getErrorMessage } from '../types/api.js';
 import { dropSeveredEscape, foldPreviewGlyphs, toDisplayLines } from './tui-ansi.js';
 import { approvalAnswerForKey, newApprovalIds } from './tui-approvals.js';
@@ -246,6 +247,11 @@ export function planAttach(muxName: string | undefined, context: TuiAttachContex
   };
 }
 
+/** Only CLIs whose reboot recovery depends on exact conversation identity need the handoff fence. */
+export function needsDirectAttachFence(session: Pick<TuiSessionRow, 'mode'>): boolean {
+  return !!session.mode && getCli(session.mode)?.capabilities.recovery === 'codex-rollout';
+}
+
 /**
  * tmux's prefix key as a human reads it: `C-b` → `Ctrl+B`, `M-a` → `Alt+A`.
  *
@@ -407,6 +413,10 @@ export interface TuiAttachTab {
   active: boolean;
   /** tmux session to switch to when its number is pressed inside a pane. */
   muxName?: string;
+  /** This target cannot receive direct stdin until its recovery identity is fenced. */
+  requiresDirectAttachFence?: boolean;
+  /** Present only when direct stdin requires a durable recovery-identity fence. */
+  directAttachFenceSessionId?: string;
 }
 
 /** Per-tab label cap. Eight of these plus separators still fit an 80-column terminal. */
@@ -540,6 +550,30 @@ export async function beginAttachHandoff(
   cols?: number,
   rows?: number
 ): Promise<TuiAttachHandoff> {
+  // Alt+1..9 can enter any of these panes after tmux owns stdin. Fence every
+  // reachable Codex target before installing a single switch binding, including
+  // the active target when the dashboard began on a non-Codex row.
+  const fenced = new Set<string>();
+  const unsafeSwitchTargets = new Set<TuiAttachTab>();
+  const reachableTabs = [...tabs.slice(0, 9)];
+  const activeTab = tabs.find((tab) => tab.active);
+  if (activeTab && !reachableTabs.includes(activeTab)) reachableTabs.push(activeTab);
+  for (const tab of reachableTabs) {
+    if (!tab.muxName || !tab.requiresDirectAttachFence) continue;
+    const id = tab.directAttachFenceSessionId;
+    try {
+      if (!id) throw new Error('Codex target has no session id');
+      if (!fenced.has(id)) await client.fenceDirectAttach(id);
+      fenced.add(id);
+    } catch (error) {
+      // The selected target is the attach itself, so it must fail closed. A
+      // secondary target can instead be made unreachable by omitting its Alt
+      // binding; this preserves a Claude/shell attach when the server is down.
+      if (tab.active) throw error;
+      unsafeSwitchTargets.add(tab);
+    }
+  }
+  const handoffTabs = tabs.filter((tab) => !unsafeSwitchTargets.has(tab));
   const prefix = (await client.readPrefixKey(muxName)) ?? undefined;
   // Read, not assumed: see detachChord() for the `d` vs `D` mix-up this closes.
   const detachKey = (await client.readDetachKey()) ?? undefined;
@@ -573,7 +607,7 @@ export async function beginAttachHandoff(
   // really have a pane, and only keys tmux reports as free — the same rule the
   // way-out key follows, so a binding of the user's own is never shadowed.
   const switchKeys: string[] = [];
-  for (const tab of tabs.slice(0, 9)) {
+  for (const tab of handoffTabs.slice(0, 9)) {
     if (!tab.muxName) continue;
     const key = `M-${tab.index}`;
     const bound = await client.readPrefixBinding(key, 'root');
@@ -589,7 +623,7 @@ export async function beginAttachHandoff(
       ...(cols ? { cols } : {}),
       ...(switchKeys.length > 0 ? { switchKeys: true } : {}),
       label: ownLabel,
-      tabs: tabs.map((tab) => ({ ...tab, active: tab.muxName === activeMux })),
+      tabs: handoffTabs.map((tab) => ({ ...tab, active: tab.muxName === activeMux })),
     });
 
   // ⚠️ The bar goes on EVERY session the strip can switch to, not just the one
@@ -602,7 +636,7 @@ export async function beginAttachHandoff(
   const dressed: Array<{ muxName: string; options: TuiSessionOptions }> = [];
   const resized: Array<{ muxName: string; sizing: TuiWindowSizing }> = [];
   const targets = new Map<string, string>([[muxName, label]]);
-  for (const tab of tabs.slice(0, 9)) {
+  for (const tab of handoffTabs.slice(0, 9)) {
     if (tab.muxName && !targets.has(tab.muxName)) targets.set(tab.muxName, tab.label);
   }
   for (const [target, targetLabel] of targets) {
@@ -1623,11 +1657,18 @@ class TuiApp {
       if (row.group === 'recent') continue;
       index += 1;
       const muxName = (row.session.muxName ?? '').trim();
+      const sessionId = (row.session.sessionId ?? '').trim();
       tabs.push({
         index,
         label: rowLabel(row.session),
         active: row.session.sessionId === activeId,
         ...(muxName ? { muxName } : {}),
+        ...(needsDirectAttachFence(row.session)
+          ? {
+              requiresDirectAttachFence: true,
+              ...(sessionId ? { directAttachFenceSessionId: sessionId } : {}),
+            }
+          : {}),
       });
     }
     return tabs;
@@ -2239,13 +2280,21 @@ class TuiApp {
       return;
     }
 
-    // tmux is about to own this terminal. The dashboard is not on screen, and
-    // the pane the preview would keep re-reading is the one the user is now
-    // looking at directly, so the poll stops for the whole handoff (an attach
-    // can last hours).
-    this.stopPreview();
+    if (plan.kind === 'switch' && needsDirectAttachFence(row.session)) {
+      try {
+        await this.client.fenceDirectAttach(row.session.sessionId);
+      } catch (error) {
+        this.message('err', `could not safely attach: ${getErrorMessage(error)}`);
+        this.paint();
+        return;
+      }
+    }
 
     if (plan.kind === 'switch') {
+      // tmux is about to own this terminal. The dashboard is not on screen, and
+      // the pane the preview would keep re-reading is the one the user is now
+      // looking at directly, so the poll stops for the whole handoff.
+      this.stopPreview();
       // Only the sizing, and no restore: this client keeps showing the other
       // session after the TUI exits, so snapping the window back to the
       // browser's size would put the dots on screen at the moment the user
@@ -2269,14 +2318,22 @@ class TuiApp {
     // The way OUT, set up before tmux takes the terminal: a status bar that
     // stays for the whole attach. The line written below is on a screen tmux
     // repaints a moment later, so it is not what the user reads.
-    const handoff = await beginAttachHandoff(
-      this.client,
-      muxName,
-      rowLabel(row.session),
-      this.attachTabs(row.session.sessionId),
-      this.currentLayout().cols,
-      this.currentLayout().rows
-    );
+    let handoff: TuiAttachHandoff;
+    try {
+      handoff = await beginAttachHandoff(
+        this.client,
+        muxName,
+        rowLabel(row.session),
+        this.attachTabs(row.session.sessionId),
+        this.currentLayout().cols,
+        this.currentLayout().rows
+      );
+    } catch (error) {
+      this.message('err', `could not safely attach: ${getErrorMessage(error)}`);
+      this.paint();
+      return;
+    }
+    this.stopPreview();
     this.detachChordLabel = handoff.chord;
     this.screen.leave();
     this.stdout.write(`${handoff.chord} detaches and brings you back here.\n`);
@@ -2677,6 +2734,14 @@ export async function runTuiAttach(position: number, options: TuiRunOptions = {}
     if (plan.kind === 'refuse') {
       process.stderr.write(`${palette.warn(plan.message)}\n`);
       return 1;
+    }
+    if (needsDirectAttachFence(row.session)) {
+      try {
+        await client.fenceDirectAttach(row.session.sessionId);
+      } catch (error) {
+        process.stderr.write(`${palette.err(`could not safely attach: ${getErrorMessage(error)}`)}\n`);
+        return 1;
+      }
     }
     // Same handoff the dashboard does: the window follows this terminal and
     // wears a bar naming the way out. This path has no dashboard to come back

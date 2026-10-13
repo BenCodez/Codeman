@@ -78,8 +78,8 @@ import { workflowRunWatcher, summarizeRun } from '../workflow-run-watcher.js';
 import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment } from '../attachment-registry.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
-import { readCustomModelHosts } from '../custom-model-hosts.js';
-import { applyCustomModelInjection, customModelConfigDir, removeConfigDir } from '../custom-model-injection-apply.js';
+import { customModelConfigDir, removeConfigDir } from '../custom-model-injection-apply.js';
+import { rebuildPersistedCustomModelEnv } from '../custom-model-recovery.js';
 import type { CustomModelBookkeeping } from '../types/session.js';
 import { registerGeneratedArtifactAttachment } from '../generated-artifact-attachments.js';
 import {
@@ -1293,23 +1293,10 @@ export class WebServer extends EventEmitter {
     session: Session,
     saved: CustomModelBookkeeping
   ): Promise<Record<string, string> | undefined> {
-    const entry = getCli(session.mode);
-    if (!entry) return undefined;
-    const endpoint = (await readCustomModelHosts(getDataDir())).find((h) => h.id === saved.endpointId);
-    if (!endpoint) {
-      console.warn(
-        `[WebServer] custom-model endpoint ${saved.endpointId} no longer exists; selection kept for clearing`
-      );
-      return undefined;
-    }
     try {
-      return applyCustomModelInjection(
-        entry,
-        endpoint,
-        saved.modelId,
-        session.id,
-        endpoint.modelContextLengths?.[saved.modelId]
-      )?.envOverrides;
+      const env = await rebuildPersistedCustomModelEnv(session.mode, session.id, saved);
+      if (!env) console.warn('[WebServer] custom-model endpoint is unavailable; selection kept for clearing');
+      return env;
     } catch (err) {
       console.warn('[WebServer] Failed to rebuild custom-model env on recovery:', err);
       return undefined;
@@ -1336,6 +1323,7 @@ export class WebServer extends EventEmitter {
             __codexRebootIdentity: {
               switchPending: session.getRecoveryContext().switchPending,
               submission: session.getRecoveryContext().submission,
+              untrackedInput: session.getRecoveryContext().untrackedInput,
             },
           }
         : {}),
@@ -1409,13 +1397,15 @@ export class WebServer extends EventEmitter {
     coordinateLayout = true
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
-    await this.stopRecoveryController(sessionId, killMux);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], () =>
         this._doCleanupSession(sessionId, killMux, reason, false)
       );
     }
+    // Layout preparation above may reject while the live session remains intact.
+    // Tear recovery down only after deletion has entered its irreversible action.
+    await this.stopRecoveryController(sessionId, killMux);
     const lifecycleLog = getLifecycleLog();
     lifecycleLog.log({
       event: killMux ? 'deleted' : 'detached',
@@ -2384,7 +2374,11 @@ export class WebServer extends EventEmitter {
       const context = session.getRecoveryContext();
       // This synchronous, fsynced fence must succeed before input dispatch.
       // state.json itself is debounced and cannot provide that guarantee.
-      writeRebootIdentityFence(session.id, { switchPending: context.switchPending, submission: context.submission });
+      writeRebootIdentityFence(session.id, {
+        switchPending: context.switchPending,
+        submission: context.submission,
+        untrackedInput: context.untrackedInput,
+      });
       input();
     };
     this.rebootIdentityListeners.set(session.id, identityChanged);
@@ -3499,9 +3493,16 @@ export class WebServer extends EventEmitter {
    * workspace's own files are left exactly as they were, so the session stays
    * restorable on the next attempt.
    */
-  async discardPartiallyBuiltSession(sessionId: string): Promise<void> {
+  async discardPartiallyBuiltSession(
+    sessionId: string,
+    expectedSession?: Session,
+    options?: { preserveCustomModelConfigDir?: boolean }
+  ): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
+    // Reboot restore reuses a historical id. A late failure or cancellation may
+    // arrive after another path has replaced that map entry, so only unwind the
+    // exact tentative instance the caller owns.
+    if (!session || (expectedSession && session !== expectedSession)) return;
     await this.stopRecoveryController(sessionId, false);
     this.sessions.delete(sessionId);
 
@@ -3550,10 +3551,12 @@ export class WebServer extends EventEmitter {
     // `lastRecordedTokens` is deliberately NOT deleted: the `after-spawn` phase
     // seeds it as the daily-usage baseline for these restored totals, and the
     // retry reuses the id, so dropping it would count them as new usage.
-    // The per-session custom-model config dir carries the endpoint's API key, and
-    // `before-spawn` may already have written it. Nothing else would ever remove
-    // it: the stale sweep only touches state.json. A retry rewrites it.
-    removeConfigDir(customModelConfigDir(sessionId));
+    // The per-session custom-model config dir normally belongs to this tentative
+    // construction and carries endpoint credentials, so discard removes it. A
+    // reboot restore can instead REUSE the original session's existing CODEX_HOME,
+    // which also owns its rollout/history. The route snapshots that ownership
+    // before re-applying the endpoint and asks us to preserve the tree on failure.
+    if (!options?.preserveCustomModelConfigDir) removeConfigDir(customModelConfigDir(sessionId));
     try {
       session.removeAllListeners();
       await session.stop(true);

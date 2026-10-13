@@ -149,6 +149,22 @@ describe('durable input delivery — send ordering', () => {
     expect(app._pendingDeliveries.get('session-1')?.[0].data).toBe('a');
   });
 
+  it('keeps recovery-blocked input queued when the server returns 422', async () => {
+    const app = makeApp();
+    const calls: PostBody[] = [];
+    global.fetch = vi.fn(async (_url, init) => {
+      calls.push(JSON.parse(String(init?.body)) as PostBody);
+      return new Response(JSON.stringify({ success: false, errorCode: 'OPERATION_FAILED' }), { status: 422 });
+    });
+
+    app._sendInputAsync('session-1', 'retry after recovery');
+    await waitForCalls(calls, 1);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(app._pendingDeliveries.get('session-1')).toHaveLength(1);
+    expect(app._pendingDeliveries.get('session-1')?.[0].data).toBe('retry after recovery');
+  });
+
   it('drops a frame addressed to a vanished session (404) instead of retrying forever', async () => {
     const app = makeApp();
     global.fetch = vi.fn(async () => new Response('gone', { status: 404 }));

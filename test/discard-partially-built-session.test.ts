@@ -13,21 +13,32 @@
  * one-line stub — an earlier version of this function left four registrations
  * behind and every route test still passed.
  *
+ * The custom-model transaction block below also drives the reboot route through
+ * this real WebServer. Only the launch boundary is stubbed; registration,
+ * cancellation and discard use their production implementations so a cleanup
+ * that recursively deletes the original CODEX_HOME is observable on disk.
+ *
  * The retry assertion is the important one. `setupSessionListeners()` returns
  * early when `sessionListenerRefs` still holds the session id, so a discard that
  * leaves that entry makes the next attempt wire nothing at all, and the user
  * gets a tab that never shows output.
  */
-import { mkdirSync, rmdirSync, unlinkSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, rmdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { safeRmHomeTree } from './mocks/test-helpers.js';
 
 import { WebServer } from '../src/web/server.js';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
-import { dataPath } from '../src/config/instance.js';
+import { dataPath, getDataDir } from '../src/config/instance.js';
+import { verifyCodexRebootIdentity, type RebootRestoreEntry } from '../src/reboot-restore.js';
+import { readRebootIdentityFence } from '../src/recovery/reboot-identity-fence.js';
+import { rebootRestoreRegistry } from '../src/web/reboot-restore-registry.js';
+import { writeCustomModelHosts } from '../src/custom-model-hosts.js';
+import { customModelConfigDir } from '../src/custom-model-injection-apply.js';
+import type { SessionState } from '../src/types.js';
 
 /** Reach the private collections the discard is responsible for emptying. */
 interface ServerInternals {
@@ -37,15 +48,28 @@ interface ServerInternals {
   runSummaryTrackers: Map<string, unknown>;
   registerSessionWithLayout(session: Session): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
-  discardPartiallyBuiltSession(sessionId: string): Promise<void>;
+  discardPartiallyBuiltSession(
+    sessionId: string,
+    expectedSession?: Session,
+    options?: { preserveCustomModelConfigDir?: boolean }
+  ): Promise<void>;
 }
 
 const WORKSPACE = join(homedir(), '.codeman-test-discard');
 const SESSION_ID = 'a1b2c3d4e5f60718';
+const FAILED_RESTORE_ID = 'custom-model-failed-restore';
+const CANCELLED_RESTORE_ID = 'custom-model-cancelled-restore';
+const REBOOT_UUID = '12345678-1234-1234-1234-123456789abc';
 
 let server: WebServer;
 let internals: ServerInternals;
 let mux: TmuxManager;
+
+function removeFixedIdentityFences(): void {
+  for (const id of [SESSION_ID, FAILED_RESTORE_ID, CANCELLED_RESTORE_ID]) {
+    rmSync(dataPath('reboot-identities', `${id}.json`), { force: true });
+  }
+}
 
 function buildSession(): Session {
   return new Session({
@@ -72,8 +96,15 @@ beforeAll(async () => {
   await internals.app.ready();
 });
 
+beforeEach(removeFixedIdentityFences);
+
 afterEach(async () => {
-  await internals.discardPartiallyBuiltSession(SESSION_ID).catch(() => {});
+  for (const id of [SESSION_ID, FAILED_RESTORE_ID, CANCELLED_RESTORE_ID]) {
+    await internals.discardPartiallyBuiltSession(id).catch(() => {});
+  }
+  rebootRestoreRegistry.reset();
+  await writeCustomModelHosts(getDataDir(), []);
+  removeFixedIdentityFences();
 });
 
 afterAll(async () => {
@@ -135,9 +166,248 @@ describe('discarding a session whose pane never started', () => {
   it('does nothing at all for a session it never registered', async () => {
     await expect(internals.discardPartiallyBuiltSession('never-existed')).resolves.toBeUndefined();
   });
+
+  it('does not tear down a replacement that reused the tentative session id', async () => {
+    const stale = buildSession();
+    const replacement = buildSession();
+    await internals.registerSessionWithLayout(replacement);
+    await internals.setupSessionListeners(replacement);
+
+    await internals.discardPartiallyBuiltSession(SESSION_ID, stale);
+
+    expect(internals.sessions.get(SESSION_ID)).toBe(replacement);
+    expect(internals.sessionListenerRefs.has(SESSION_ID)).toBe(true);
+  });
+});
+
+describe('custom-model reboot restore cleanup through the real server route', () => {
+  async function seedOffer(sessionId: string): Promise<{
+    entry: RebootRestoreEntry;
+    rollout: string;
+    history: string;
+    rolloutText: string;
+    historyText: string;
+  }> {
+    await writeCustomModelHosts(getDataDir(), [
+      {
+        id: 'reboot-custom-endpoint',
+        label: 'reboot custom endpoint',
+        baseUrl: 'http://127.0.0.1:8080',
+        apiKey: 'server-owned-secret',
+        models: ['custom-model'],
+      },
+    ]);
+    const home = customModelConfigDir(sessionId);
+    const rollout = join(home, 'sessions', `rollout-2026-10-13T15-00-00-${REBOOT_UUID}.jsonl`);
+    const history = join(home, 'history.jsonl');
+    const rolloutText =
+      JSON.stringify({
+        type: 'session_meta',
+        timestamp: '2026-10-13T15:00:00Z',
+        payload: { id: REBOOT_UUID, cwd: WORKSPACE, originator: `codeman_${sessionId}` },
+      }) + '\n';
+    const historyText = `${JSON.stringify({ session_id: REBOOT_UUID, ts: 1_760_368_500, text: 'original task' })}\n`;
+    mkdirSync(join(home, 'sessions'), { recursive: true });
+    writeFileSync(rollout, rolloutText);
+    writeFileSync(history, historyText);
+    const state = {
+      id: sessionId,
+      pid: 1234,
+      status: 'idle',
+      workingDir: WORKSPACE,
+      currentTaskId: null,
+      createdAt: 1_760_000_000_000,
+      mode: 'codex',
+      codexConfig: { noDaemon: true, resumeSessionId: REBOOT_UUID, model: 'custom-model' },
+      __envOverrides: { CODEX_HOME: home },
+      __customModel: {
+        endpointId: 'reboot-custom-endpoint',
+        modelId: 'custom-model',
+        envKeys: ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'],
+        configDir: home,
+      },
+    } as SessionState;
+    expect(await verifyCodexRebootIdentity(state)).toBe(REBOOT_UUID);
+    const entry: RebootRestoreEntry = {
+      sessionId,
+      workingDir: WORKSPACE,
+      mode: 'codex',
+      resumeConversationId: REBOOT_UUID,
+      state,
+    };
+    rebootRestoreRegistry.set([entry]);
+    return { entry, rollout, history, rolloutText, historyText };
+  }
+
+  function expectOriginalConversationFiles(fixture: Awaited<ReturnType<typeof seedOffer>>): void {
+    expect(existsSync(fixture.rollout)).toBe(true);
+    expect(existsSync(fixture.history)).toBe(true);
+    expect(readFileSync(fixture.rollout, 'utf8')).toBe(fixture.rolloutText);
+    expect(readFileSync(fixture.history, 'utf8')).toBe(fixture.historyText);
+  }
+
+  it('preserves the original rollout and history when launch fails and the offer becomes retryable', async () => {
+    const fixture = await seedOffer(FAILED_RESTORE_ID);
+    const launch = vi.spyOn(Session.prototype, 'startInteractive').mockRejectedValueOnce(new Error('launch failed'));
+    const log = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const response = await internals.app.inject({
+        method: 'POST',
+        url: '/api/reboot-restore/restore',
+        payload: { sessionIds: [FAILED_RESTORE_ID] },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data.skipped).toEqual([{ sessionId: FAILED_RESTORE_ID, reason: 'rebuild-failed' }]);
+      expect(internals.sessions.has(FAILED_RESTORE_ID)).toBe(false);
+      expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([FAILED_RESTORE_ID]);
+      expectOriginalConversationFiles(fixture);
+    } finally {
+      launch.mockRestore();
+      log.mockRestore();
+    }
+  });
+
+  it('preserves the original rollout and history when dismissal cancels an in-flight launch', async () => {
+    const fixture = await seedOffer(CANCELLED_RESTORE_ID);
+    const started = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const launch = vi.spyOn(Session.prototype, 'startInteractive').mockImplementationOnce(async () => {
+      started.resolve();
+      await release.promise;
+    });
+    try {
+      const restoring = internals.app.inject({
+        method: 'POST',
+        url: '/api/reboot-restore/restore',
+        payload: { sessionIds: [CANCELLED_RESTORE_ID] },
+      });
+      await started.promise;
+      const dismissed = await internals.app.inject({
+        method: 'POST',
+        url: '/api/reboot-restore/dismiss',
+        payload: {},
+      });
+      expect(dismissed.statusCode).toBe(200);
+      expect(dismissed.json().data.dismissed).toBe(1);
+      release.resolve();
+
+      const result = (await restoring).json().data;
+      expect(result.restored).toEqual([]);
+      expect(result.skipped).toEqual([{ sessionId: CANCELLED_RESTORE_ID, reason: 'restore-cancelled' }]);
+      expect(internals.sessions.has(CANCELLED_RESTORE_ID)).toBe(false);
+      expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
+      expectOriginalConversationFiles(fixture);
+    } finally {
+      release.resolve();
+      launch.mockRestore();
+    }
+  });
 });
 
 describe('reboot recovery evidence fence', () => {
+  it('fences old conversation A before a supported attach can resume older conversation B', async () => {
+    const oldConversation = '12345678-1234-1234-1234-123456789abc';
+    const resumedOlderConversation = '99999999-1234-1234-1234-123456789abc';
+    const home = join(WORKSPACE, 'direct-attach-codex-home');
+    mkdirSync(join(home, 'sessions'), { recursive: true });
+    for (const [id, timestamp, fileStamp] of [
+      [oldConversation, '2026-10-13T15:00:00Z', '2026-10-13T15-00-00'],
+      [resumedOlderConversation, '2025-10-13T15:00:00Z', '2025-10-13T15-00-00'],
+    ]) {
+      writeFileSync(
+        join(home, 'sessions', `rollout-${fileStamp}-${id}.jsonl`),
+        JSON.stringify({
+          type: 'session_meta',
+          timestamp,
+          payload: { id, cwd: WORKSPACE, originator: `codeman_${SESSION_ID}` },
+        }) + '\n'
+      );
+    }
+    const session = new Session({
+      id: SESSION_ID,
+      workingDir: WORKSPACE,
+      mode: 'codex',
+      useMux: false,
+      codexConfig: { noDaemon: true, resumeSessionId: oldConversation },
+      envOverrides: { CODEX_HOME: home },
+    });
+    const saved = {
+      ...session.toState(),
+      pid: 1234,
+      __envOverrides: { CODEX_HOME: home },
+    };
+    expect(await verifyCodexRebootIdentity(saved)).toBe(oldConversation);
+    await internals.registerSessionWithLayout(session);
+    await internals.setupSessionListeners(session);
+
+    const response = await internals.app.inject({
+      method: 'POST',
+      url: `/api/sessions/${SESSION_ID}/direct-attach-fence`,
+      payload: {},
+    });
+    expect(response.statusCode).toBe(200);
+    expect(readRebootIdentityFence(SESSION_ID)).toEqual({
+      switchPending: true,
+      submission: undefined,
+      untrackedInput: true,
+    });
+    const directWrite = vi.fn();
+    (session as unknown as { ptyProcess: unknown }).ptyProcess = { write: directWrite };
+    try {
+      const browserInput = await internals.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${SESSION_ID}/input`,
+        payload: { input: 'tracked browser prompt\r', useMux: false },
+      });
+      expect(browserInput.statusCode).toBe(200);
+      expect(directWrite).toHaveBeenCalledWith('tracked browser prompt\r');
+      expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
+      expect(readRebootIdentityFence(SESSION_ID)).toEqual({
+        switchPending: true,
+        submission: undefined,
+        untrackedInput: true,
+      });
+    } finally {
+      (session as unknown as { ptyProcess: unknown }).ptyProcess = null;
+    }
+    // Input during the ensuing tmux attach is deliberately invisible. Even if
+    // the user selected the older B rollout, the stale persisted A can no
+    // longer authorize a reboot restore.
+    expect(await verifyCodexRebootIdentity(saved)).toBeUndefined();
+
+    // Reconstructing the live Session is the server-restart boundary. The new
+    // object must reload the independent fence before any browser input can
+    // publish an apparently exact proof over the still-untracked pane.
+    await internals.discardPartiallyBuiltSession(SESSION_ID, session);
+    const reconstructed = new Session({
+      id: SESSION_ID,
+      workingDir: WORKSPACE,
+      mode: 'codex',
+      useMux: false,
+      preserveExitedPane: true,
+      codexConfig: { noDaemon: true, resumeSessionId: oldConversation },
+      envOverrides: { CODEX_HOME: home },
+    });
+    expect(reconstructed.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
+    await internals.registerSessionWithLayout(reconstructed);
+    await internals.setupSessionListeners(reconstructed);
+    const restartedWrite = vi.fn();
+    (reconstructed as unknown as { ptyProcess: unknown }).ptyProcess = { write: restartedWrite };
+    try {
+      const browserInput = await internals.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${SESSION_ID}/input`,
+        payload: { input: 'prompt after server restart\r', useMux: false },
+      });
+      expect(browserInput.statusCode).toBe(200);
+      expect(restartedWrite).toHaveBeenCalledOnce();
+      expect(reconstructed.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
+      expect(await verifyCodexRebootIdentity(saved)).toBeUndefined();
+    } finally {
+      (reconstructed as unknown as { ptyProcess: unknown }).ptyProcess = null;
+    }
+  });
+
   it('releases a send-and-wait pane watcher when the pre-dispatch fence fails', async () => {
     const id = 'wait-fence-failure';
     const session = new Session({ id, workingDir: WORKSPACE, mode: 'codex', mux, useMux: true });

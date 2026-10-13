@@ -196,6 +196,16 @@ exactly as it was on detach, along with each window's size. Every session the st
 can switch to is dressed and sized the same way, so switching is instant and lands
 in a pane that already fills your terminal.
 
+Codex reboot restoration depends on proving the exact conversation behind a pane.
+Before `codeman tui`, `codeman tui <n>`, or a supported direct attach hands stdin to
+tmux, Codeman durably marks every Codex pane reachable through the attach strip as
+having untracked input. That mark survives a server restart and a browser prompt
+cannot clear it, because more terminal input can still arrive afterward. Automatic
+Codex recovery and post-reboot restoration therefore stay fail-closed for that
+managed session after a direct handoff. Direct `tmux attach` and custom automation
+that bypass Codeman's attach endpoint cannot create this mark; such automation must
+call the authenticated direct-attach fence endpoint before handing stdin to tmux.
+
 Detaching leaves the agent running; typing `exit` or pressing `Ctrl+D` would end it,
 which is the difference the bar exists to make obvious. If an agent does exit, its
 pane stays as a corpse: the TUI refuses to attach to a dead pane and offers `r` to

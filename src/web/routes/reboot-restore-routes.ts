@@ -50,7 +50,9 @@ import { applyWorkspaceHooks, seedAgentSessionPreamble } from '../../hooks-confi
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import { STATS_COLLECTION_INTERVAL_MS } from '../../config/server-timing.js';
 import { SseEvent } from '../sse-events.js';
-import type { CodexConfig, SessionAttachmentHistoryItem } from '../../types.js';
+import type { CodexConfig, CustomModelBookkeeping, SessionAttachmentHistoryItem } from '../../types.js';
+import { rebuildPersistedCustomModelEnv } from '../../custom-model-recovery.js';
+import { customModelConfigDir, removeConfigDir } from '../../custom-model-injection-apply.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 type RebootRestoreCtx = SessionPort & EventPort & ConfigPort & InfraPort;
@@ -130,6 +132,14 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
       const workspaceHooksEnabled = await ctx.getWorkspaceHooksEnabled();
 
       for (const entry of restore) {
+        let builtSession: Session | undefined;
+        let newlyCreatedCustomModelConfigDir: string | undefined;
+        let preserveCustomModelConfigDir = false;
+        let restoreCompleted = false;
+        const discardTentativeSession = (session: Session): Promise<void> =>
+          preserveCustomModelConfigDir
+            ? ctx.discardPartiallyBuiltSession(entry.sessionId, session, { preserveCustomModelConfigDir: true })
+            : ctx.discardPartiallyBuiltSession(entry.sessionId, session);
         // The already-live check, re-run against the board as it is NOW. The pass
         // above decided the batch; this catches a conversation that went live while
         // an earlier entry in this same batch was starting. Spent rather than
@@ -177,10 +187,30 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             unspent.delete(entry);
             continue;
           }
-          const envOverrides = await clampEnvOverridesForOwner(
+          let envOverrides = await clampEnvOverridesForOwner(
             saved.owner,
             (saved as { __envOverrides?: Record<string, string> }).__envOverrides
           );
+          const savedCustomModel = (saved as { __customModel?: CustomModelBookkeeping }).__customModel;
+          if (savedCustomModel) {
+            // A custom-model Codex session keeps its rollouts/history under this
+            // isolated home. Snapshot ownership BEFORE re-derivation writes its
+            // config file: cleanup may remove a directory this attempt created,
+            // but must never recursively delete the original conversation home.
+            const trustedConfigDir = customModelConfigDir(saved.id);
+            preserveCustomModelConfigDir = existsSync(trustedConfigDir);
+            if (!preserveCustomModelConfigDir) newlyCreatedCustomModelConfigDir = trustedConfigDir;
+            // CODEX_HOME and API credentials for a custom endpoint are stripped by
+            // the owner clamp above. Re-add only values derived from the CURRENT
+            // admin-owned endpoint store and the deterministic per-session config
+            // directory. Persisted/user-provided values never cross this boundary.
+            const trustedCustomModelEnv = await rebuildPersistedCustomModelEnv(
+              saved.mode ?? 'claude',
+              saved.id,
+              savedCustomModel
+            );
+            if (trustedCustomModelEnv) envOverrides = { ...envOverrides, ...trustedCustomModelEnv };
+          }
           let codexConfig: CodexConfig | undefined;
           if (usesCodexRecovery) {
             // Validate the actual launch home AFTER applying current owner grants.
@@ -236,6 +266,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             owner: saved.owner,
             parentSessionId: saved.parentSessionId,
           });
+          builtSession = session;
 
           if (!rebootRestoreRegistry.isHeld(entry, owner)) {
             failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
@@ -255,10 +286,13 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // custom-model environment and the nice priority shape the process.
           await ctx.reapplyPersistedSessionState(session, saved, 'before-spawn');
           await ctx.setupSessionListeners(session);
-          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
-            await ctx.discardPartiallyBuiltSession(entry.sessionId);
+          const discardCancelledRestore = async (): Promise<void> => {
+            await discardTentativeSession(session);
             failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
             unspent.delete(entry);
+          };
+          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+            await discardCancelledRestore();
             continue;
           }
           const otherSessions = [...ctx.sessions.values()].filter((other) => other !== session);
@@ -268,12 +302,19 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             new Set(otherSessions.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
           ).skipped;
           if (racedConversation) {
-            await ctx.discardPartiallyBuiltSession(entry.sessionId);
+            await discardTentativeSession(session);
             failures.push(racedConversation);
             unspent.delete(entry);
             continue;
           }
           await session.startInteractive();
+          // Launch is a real await: Dismiss can remove this parked offer while
+          // tmux/CLI startup is still in progress. Tear down only this tentative
+          // instance before any restored state is persisted or success broadcast.
+          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+            await discardCancelledRestore();
+            continue;
+          }
           // The session's own history, applied only once the pane exists: on a
           // failed start these totals would belong to a session that never ran.
           // Both halves precede the route's OWN persist, which matters because a
@@ -290,7 +331,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           await ctx.reapplyPersistedSessionState(session, saved, 'after-spawn', {
             rearmAutoResumeSchedule: false,
           });
-          ctx.persistSessionState(session);
+          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+            await discardCancelledRestore();
+            continue;
+          }
 
           // A session without its workspace hooks goes silently blind: no stop or
           // idle events for respawn, no Approvals Inbox item, no red tab on a
@@ -301,23 +345,45 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             await applyWorkspaceHooks(session.workingDir, true).catch((err: unknown) =>
               console.warn(`[reboot-restore] hook install failed for ${session.workingDir}: ${getErrorMessage(err)}`)
             );
+            if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+              await discardCancelledRestore();
+              continue;
+            }
           }
 
           // Both create paths seed this; without it a restored claude session's agent
           // skill falls back to writing out the whole ~150-line §0 preamble. Remote and
           // docker sessions never reach here (the plan rejects them as
           // `remote-or-docker`), so the local-only condition is structural.
-          if (getCli(session.mode)?.capabilities.agentSkillInjection && (await ctx.getAgentSkillEnabled())) {
-            await seedAgentSessionPreamble(session.id).catch((err: unknown) =>
-              console.warn(`[agent-skill] preamble seed failed for ${session.id}: ${getErrorMessage(err)}`)
-            );
+          if (getCli(session.mode)?.capabilities.agentSkillInjection) {
+            const agentSkillEnabled = await ctx.getAgentSkillEnabled();
+            if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+              await discardCancelledRestore();
+              continue;
+            }
+            if (agentSkillEnabled) {
+              await seedAgentSessionPreamble(session.id).catch((err: unknown) =>
+                console.warn(`[agent-skill] preamble seed failed for ${session.id}: ${getErrorMessage(err)}`)
+              );
+              if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+                await discardCancelledRestore();
+                continue;
+              }
+            }
           }
+
+          // No awaited finalization remains after this write. A Dismiss that
+          // lands during state restoration, hook installation or preamble setup
+          // is therefore observed and cleaned up before the rebuilt record can
+          // replace the pre-reboot snapshot.
+          ctx.persistSessionState(session);
 
           getLifecycleLog().log({ event: 'recovered', sessionId: session.id, name: session.name });
           // Every other open tab and phone needs this; the clicking tab already has
           // the response, and the client's handler is an idempotent upsert.
           ctx.broadcast(SseEvent.SessionCreated, ctx.getSessionStateWithRespawn(session));
           restored.push(toBannerItem(entry));
+          restoreCompleted = true;
         } catch (err) {
           // One entry that will not start must not stop the rest of the pass, and
           // must not leave a registered session with no pane behind it: by this
@@ -336,14 +402,22 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // a pinned record to `stopped` (which this pass reads as an intentional
           // kill, making the session permanently unrestorable) and delete the
           // workspace's `.codeman-uploads`. This undoes only the construction.
-          await ctx
-            .discardPartiallyBuiltSession(entry.sessionId)
-            .catch((discardErr: unknown) =>
+          if (builtSession) {
+            await discardTentativeSession(builtSession).catch((discardErr: unknown) =>
               console.error(`[reboot-restore] discarding a failed rebuild failed: ${getErrorMessage(discardErr)}`)
             );
+          }
           failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
           // Left on offer: the user can put the binary back and click again.
           continue;
+        } finally {
+          // Identity rejection or cancellation can happen before the tentative
+          // Session is registered, when discardPartiallyBuiltSession() has
+          // nothing to own. Remove only a profile proven absent before this
+          // attempt; a pre-existing tree may contain the original conversation.
+          if (!restoreCompleted && newlyCreatedCustomModelConfigDir) {
+            removeConfigDir(newlyCreatedCustomModelConfigDir);
+          }
         }
         unspent.delete(entry);
       }

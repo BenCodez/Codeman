@@ -9,7 +9,12 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { hashCodexPrompt, resolveCodexIdentity, type CodexIdentityRequest } from '../src/recovery/codex-identity.js';
+import {
+  hashCodexPrompt,
+  resolveCodexIdentities,
+  resolveCodexIdentity,
+  type CodexIdentityRequest,
+} from '../src/recovery/codex-identity.js';
 
 const A = '019a5aa0-1111-7111-8111-111111111111';
 const B = '019a5aa0-2222-7222-8222-222222222222';
@@ -32,6 +37,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
   else process.env.CODEX_HOME = originalCodexHome;
   await fs.rm(store, { recursive: true, force: true });
@@ -426,5 +432,60 @@ describe('corrupt and over-budget stores', () => {
     expect(close).toHaveBeenCalledTimes(1);
     vi.useRealTimers();
     expect(await resolveCodexIdentity(request())).toMatchObject({ reason: 'verified', conversationId: A });
+  });
+
+  it('bounds one shared home scan for a batch of dead sessions with one plan-wide deadline', async () => {
+    await rollout();
+    const close = vi.fn(async () => {});
+    const directory = { read: async () => null, close } as unknown as Dir;
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    let finish!: () => void;
+    const blocked = new Promise<typeof directory>((resolveBlocked) => {
+      finish = () => resolveBlocked(directory);
+    });
+    const scan = vi.spyOn(fs, 'opendir').mockReturnValueOnce(blocked);
+    const batch = resolveCodexIdentities(
+      Array.from({ length: 40 }, (_, i) => request({ sessionId: `${SESSION}-${i}` }))
+    );
+    await vi.waitFor(() => expect(scan).toHaveBeenCalledTimes(1));
+
+    await vi.advanceTimersByTimeAsync(2_001);
+    expect(await batch).toEqual(Array.from({ length: 40 }, () => ({ reason: 'unreadable' })));
+    expect(scan).toHaveBeenCalledTimes(1);
+
+    finish();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(close).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+
+  it('keeps an earlier verified home when a later home reaches the shared deadline', async () => {
+    const firstHome = join(store, 'first-home');
+    const secondHome = join(store, 'second-home');
+    await rollout(A, {}, CREATED, firstHome);
+    await rollout(B, {}, CREATED, secondHome);
+    const actualLstat = fs.lstat.bind(fs);
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    let finish!: () => void;
+    const blocked = new Promise<Awaited<ReturnType<typeof fs.lstat>>>((resolveBlocked) => {
+      finish = () => void actualLstat(secondHome).then(resolveBlocked);
+    });
+    const lstat = vi.spyOn(fs, 'lstat').mockImplementation((path, options) => {
+      if (String(path) === secondHome) return blocked;
+      return actualLstat(path, options);
+    });
+
+    const batch = resolveCodexIdentities([request({ codexHome: firstHome }), request({ codexHome: secondHome })]);
+    await vi.waitFor(() => expect(lstat).toHaveBeenCalledWith(secondHome));
+    await vi.advanceTimersByTimeAsync(2_001);
+
+    expect(await batch).toEqual([
+      expect.objectContaining({ reason: 'verified', conversationId: A }),
+      { reason: 'unreadable' },
+    ]);
+
+    finish();
+    await vi.advanceTimersByTimeAsync(1);
+    vi.useRealTimers();
   });
 });

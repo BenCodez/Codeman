@@ -2,7 +2,8 @@
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import { initialRecoveryState, type RecoveryState } from '../src/recovery/types.js';
 import { safeRmHomeTree } from './mocks/index.js';
@@ -168,6 +169,64 @@ describe('recovery journal durability', () => {
     const before = await fs.readFile(path, 'utf8');
     await store.drop('already-missing');
     expect(await fs.readFile(path, 'utf8')).toBe(before);
+  });
+
+  it('persists input cancellation before restart can restore a scheduled action', async () => {
+    let now = NOW;
+    const store = new RecoveryStore(path);
+    const state = savedState();
+    state.config.retryDelayMs = 1000;
+    state.config.maxRetryDelayMs = 4000;
+    const observation = {
+      activity: 'interrupted' as const,
+      reason: 'turn-failed' as const,
+      at: NOW,
+      conversationId: THREAD,
+      evidenceKey: 'failure-1',
+      submissionKey: 'original-user-message',
+      safeToAct: true,
+    };
+    const act = vi.fn(async () => 'sent' as const);
+    const controller = new RecoveryController(
+      {
+        observe: async () => observation,
+        act,
+        persist: (next) => store.save('work', next),
+        changed: () => {},
+        now: () => now,
+      },
+      state
+    );
+    await controller.refresh();
+    now += 2000;
+    await controller.refresh();
+    expect(controller.getStatus().pending).toBeDefined();
+
+    controller.noteUserInput();
+    expect(controller.getStatus().pending).toBeUndefined();
+    await controller.drain();
+    controller.stop();
+    await store.flush();
+
+    const restoredStore = new RecoveryStore(path);
+    const restoredState = restoredStore.get('work');
+    expect(restoredState.pending).toBeUndefined();
+    expect(restoredState.nextRetryAt).toBeUndefined();
+    expect(restoredState.armedAt).toBe(now);
+    expect(restoredState.lastReason).toBe('user-input');
+    const restarted = new RecoveryController(
+      {
+        observe: async () => observation,
+        act,
+        persist: (next) => restoredStore.save('work', next),
+        changed: () => {},
+        now: () => now,
+      },
+      restoredState
+    );
+    await restarted.refresh();
+    restarted.stop();
+    expect(act).not.toHaveBeenCalled();
   });
 });
 

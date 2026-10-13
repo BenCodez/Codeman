@@ -105,6 +105,9 @@ const defaultResponder: Responder = (req, res) => {
   if (url.endsWith('/input')) {
     return sendJson(res, 200, { success: true, data: {} });
   }
+  if (url.endsWith('/direct-attach-fence')) {
+    return sendJson(res, 200, { success: true, data: {} });
+  }
   if (url.startsWith('/api/quick-start')) {
     return sendJson(res, 200, { success: true, data: { sessionId: 'new-1', casePath: '/cases/x', caseName: 'x' } });
   }
@@ -383,6 +386,13 @@ describe('TuiClient remaining API surface', () => {
     await client().deleteSession('abc');
     expect(recorded[0].method).toBe('DELETE');
     expect(recorded[0].url).toBe('/api/sessions/abc');
+  });
+
+  it('commits the direct-attach fence through the authenticated API', async () => {
+    await client().fenceDirectAttach('abc/def');
+    expect(recorded[0].method).toBe('POST');
+    expect(recorded[0].url).toBe('/api/sessions/abc%2Fdef/direct-attach-fence');
+    expect(JSON.parse(recorded[0].body)).toEqual({});
   });
 
   it('searches with an encoded query', async () => {

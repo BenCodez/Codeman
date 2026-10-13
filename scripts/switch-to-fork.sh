@@ -79,6 +79,14 @@ assert_clean() {
   fi
 }
 
+assert_no_pushurl() {
+  # A separate push URL survives `remote set-url` and can send later pushes to
+  # the old repository. Preserve intentional routing by refusing to rewrite it.
+  if git config --get-all remote.origin.pushurl >/dev/null; then
+    fail "origin has a separate push URL. Preserve or remove that routing manually before switching."
+  fi
+}
+
 restart_hint() {
   local instance unit label unit_file plist
   instance="$(printf '%s' "${CODEMAN_INSTANCE:-}" | tr -cd 'A-Za-z0-9_-' | cut -c1-32)"
@@ -126,6 +134,7 @@ main() {
   original_origin="$(git config --get-all remote.origin.url)" || fail "The checkout has no origin URL."
   [[ -n "$original_origin" ]] || fail "The checkout has no origin URL."
   case "$original_origin" in *$'\n'*) fail "origin has multiple URLs; resolve them before switching." ;; esac
+  assert_no_pushurl
 
   printf 'Install: %s\nCurrent commit: %s\nCurrent branch: %s\nTarget: %s (%s)\n' \
     "$REPO" "$initial_head" "${initial_branch:-detached release}" "$FORK_URL" "$TARGET_BRANCH"
@@ -178,6 +187,7 @@ main() {
   [[ "$(git rev-parse HEAD)" == "$initial_head" ]] || fail "HEAD changed during the fetch. No checkout or origin switch was applied."
   [[ "$(git symbolic-ref --quiet --short HEAD || true)" == "$initial_branch" ]] || fail "The current branch changed during the fetch."
   [[ "$(git config --get-all remote.origin.url)" == "$original_origin" ]] || fail "origin changed during the fetch."
+  assert_no_pushurl
   git merge-base --is-ancestor "$initial_head" "$target_head" \
     || fail "Fork master cannot fast-forward this HEAD. Local commits were preserved; reconcile them manually."
   master_head="$(git rev-parse --verify "refs/heads/$TARGET_BRANCH" 2>/dev/null || true)"
