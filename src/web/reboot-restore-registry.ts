@@ -38,6 +38,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import { getCli } from '../config/cli-registry/registry.js';
 import { planRebootRestore } from '../reboot-restore.js';
 import { dirname } from 'node:path';
 import type { RebootRestoreEntry } from '../reboot-restore.js';
@@ -98,7 +99,7 @@ export class RebootRestoreRegistry {
         () => true,
         new Map(
           entries
-            .filter((entry) => entry.mode === 'codex')
+            .filter((entry) => getCli(entry.mode)?.capabilities.recovery === 'codex-rollout')
             .map((entry) => [entry.sessionId, entry.resumeConversationId])
         )
       );

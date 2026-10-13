@@ -1975,7 +1975,7 @@ export function registerSessionRoutes(
         delivered = directWrite();
         if (!delivered) undoOnFailure();
       }
-    } else if (autoMux || (useMux && session.mode === 'codex')) {
+    } else if (autoMux || (useMux && getCli(session.mode)?.capabilities.recovery === 'codex-rollout')) {
       // Awaited, unlike the explicit useMux branch below. This shape also reaches here
       // from the browser's POST fallback, which sends its frames one at a time and
       // waits for each 2xx; answering only once Enter has gone out is what keeps the

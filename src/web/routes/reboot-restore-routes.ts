@@ -171,6 +171,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         }
         try {
           const saved = entry.state;
+          const usesCodexRecovery = getCli(saved.mode ?? 'claude')?.capabilities.recovery === 'codex-rollout';
           if (!rebootRestoreRegistry.isHeld(entry, owner)) {
             failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
             unspent.delete(entry);
@@ -181,7 +182,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             (saved as { __envOverrides?: Record<string, string> }).__envOverrides
           );
           let codexConfig: CodexConfig | undefined;
-          if (saved.mode === 'codex') {
+          if (usesCodexRecovery) {
             // Validate the actual launch home AFTER applying current owner grants.
             const verified = await verifyCodexRebootIdentity({
               ...saved,
@@ -218,7 +219,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             // takes its create branch and makes a fresh one.
             claudeMode: await resolveClaudeModeForUsername(claudeModeConfig.claudeMode, saved.owner),
             allowedTools: claudeModeConfig.allowedTools,
-            resumeSessionId: saved.mode === 'codex' ? undefined : entry.resumeConversationId,
+            resumeSessionId: usesCodexRecovery ? undefined : entry.resumeConversationId,
             codexConfig,
             // Re-resolved against the owner's CURRENT grant, never replayed from the
             // record: a grant held when the record was written may be gone now.
@@ -241,7 +242,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             unspent.delete(entry);
             continue;
           }
-          if (session.mode === 'codex') await ctx.prepareRebootRestoreRecovery?.(session.id);
+          if (usesCodexRecovery) await ctx.prepareRebootRestoreRecovery?.(session.id);
           const [racedLive] = rejectAlreadyLive([entry], liveSessionIds(), liveConversationIds()).skipped;
           if (racedLive || !rebootRestoreRegistry.isHeld(entry, owner)) {
             failures.push(racedLive ?? { sessionId: entry.sessionId, reason: 'restore-cancelled' });

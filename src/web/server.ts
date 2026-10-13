@@ -1331,7 +1331,7 @@ export class WebServer extends EventEmitter {
     const state = {
       ...base,
       recovery: this.recoveryControllers.get(session.id)?.getStatus(),
-      ...(session.mode === 'codex'
+      ...(getCli(session.mode)?.capabilities.recovery === 'codex-rollout'
         ? {
             __codexRebootIdentity: {
               switchPending: session.getRecoveryContext().switchPending,

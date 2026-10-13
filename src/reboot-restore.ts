@@ -231,11 +231,12 @@ export function planRebootRestore(
     }
     // Claude uses the top-level resume id; Codex requires a separately verified
     // UUID and replays it through codexConfig, never through the Claude chain.
-    if (state.mode === 'codex' && !verifiedCodexConversationIds.has(sessionId)) {
+    const usesCodexRecovery = getCli(state.mode ?? 'claude')?.capabilities.recovery === 'codex-rollout';
+    if (usesCodexRecovery && !verifiedCodexConversationIds.has(sessionId)) {
       skipped.push({ sessionId, reason: 'identity-unverified' });
       continue;
     }
-    if (state.mode !== 'codex' && getCli(state.mode ?? 'claude')?.capabilities.transcript !== 'claude-jsonl') {
+    if (!usesCodexRecovery && getCli(state.mode ?? 'claude')?.capabilities.transcript !== 'claude-jsonl') {
       skipped.push({ sessionId, reason: 'unsupported-mode' });
       continue;
     }
@@ -253,8 +254,9 @@ export function planRebootRestore(
       workingDir: state.workingDir,
       owner: state.owner,
       mode: state.mode ?? 'claude',
-      resumeConversationId:
-        state.mode === 'codex' ? verifiedCodexConversationIds.get(sessionId)! : resolveResumeConversationId(state),
+      resumeConversationId: usesCodexRecovery
+        ? verifiedCodexConversationIds.get(sessionId)!
+        : resolveResumeConversationId(state),
       state,
     });
   }
@@ -300,7 +302,8 @@ export function newestPersistedActivity(persisted: Readonly<Record<string, Sessi
 
 /** Revalidate an exact persisted UUID; never discover a replacement thread by cwd. */
 export async function verifyCodexRebootIdentity(state: SessionState): Promise<string | undefined> {
-  if (state.mode !== 'codex' || state.remote || state.docker) return undefined;
+  if (getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' || state.remote || state.docker)
+    return undefined;
   const proof =
     readRebootIdentityFence(state.id) ??
     (
@@ -339,7 +342,7 @@ export async function planVerifiedRebootRestore(
     const state = persisted[sessionId];
     if (
       !state ||
-      state.mode !== 'codex' ||
+      getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' ||
       !RESTORABLE_STATUSES.has(state.status) ||
       state.pid == null ||
       isCleanPaneExit(state.paneExit) ||
