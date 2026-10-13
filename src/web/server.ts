@@ -159,6 +159,11 @@ import { MAX_CONCURRENT_SESSIONS, MAX_SSE_CLIENTS } from '../config/map-limits.j
 import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
+import { TaskController } from '../supervision/controller.js';
+import { TaskStore } from '../supervision/store.js';
+import { initialTaskState } from '../supervision/schema.js';
+import { CodexTaskAdapter } from '../supervision/adapter.js';
+import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { RecoveryController } from '../recovery/controller.js';
 import { RecoveryStore } from '../recovery/store.js';
 import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
@@ -194,6 +199,7 @@ import {
   registerSessionRoutes,
   registerRespawnRoutes,
   registerRecoveryRoutes,
+  registerTaskRoutes,
   registerRalphRoutes,
   registerPlanRoutes,
   registerClipboardRoutes,
@@ -306,6 +312,11 @@ export class WebServer extends EventEmitter {
   private app: FastifyInstance;
   private sessions: Map<string, Session> = new Map();
   private respawnControllers: Map<string, RespawnController> = new Map();
+  private taskControllers = new Map<string, TaskController>();
+  private taskInputListeners = new Map<string, () => void>();
+  private actionArbiters = new Map<string, SessionActionArbiter>();
+  private taskStore = new TaskStore();
+  private actionReservationStore = new TaskStore(dataPath('action-reservations.json'));
   private recoveryControllers = new Map<string, RecoveryController>();
   private recoveryInputListeners = new Map<string, () => void>();
   private rebootIdentityListeners = new Map<string, () => void>();
@@ -750,6 +761,7 @@ export class WebServer extends EventEmitter {
       discardPartiallyBuiltSession: this.discardPartiallyBuiltSession.bind(this),
       getSessionStateWithRespawn: this.getSessionStateWithRespawn.bind(this),
       getRecoveryController: this.getRecoveryController.bind(this),
+      getTaskController: this.getTaskController.bind(this),
       // EventPort
       broadcast: this.broadcast.bind(this),
       sendPushNotifications: this.sendPushNotifications.bind(this),
@@ -1153,6 +1165,7 @@ export class WebServer extends EventEmitter {
     this.remoteWake = registerSessionRoutes(this.app, ctx);
     registerRespawnRoutes(this.app, ctx);
     registerRecoveryRoutes(this.app, ctx);
+    registerTaskRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
     registerClipboardRoutes(this.app, ctx);
@@ -1339,6 +1352,7 @@ export class WebServer extends EventEmitter {
             },
           }
         : {}),
+      task: this.taskControllers.get(session.id)?.getStatus(),
       ...(envOverrides ? { __envOverrides: envOverrides } : {}),
       ...(attachmentHistory ? { __attachmentHistory: attachmentHistory } : {}),
       ...(customModel ? { __customModel: customModel } : {}),
@@ -1868,6 +1882,7 @@ export class WebServer extends EventEmitter {
 
   private async setupSessionListeners(session: Session): Promise<void> {
     this.getRecoveryController(session);
+    this.getTaskController(session);
     // Idempotent: the wiring exit handler detaches ALL listeners on every PTY exit
     // (removeSessionListenerRefs), so the re-attach routes (/interactive,
     // /interactive-respawn, /shell) call this again to restore observability
@@ -2329,6 +2344,7 @@ export class WebServer extends EventEmitter {
       respawnConfig: controller?.getConfig() ?? null,
       respawn: controller?.getStatus() ?? null,
       recovery: this.recoveryControllers.get(session.id)?.getStatus(),
+      task: this.taskControllers.get(session.id)?.getStatus(),
     };
   }
 
@@ -2339,6 +2355,54 @@ export class WebServer extends EventEmitter {
     state.nextRetryAt = undefined;
     // Retain in-flight uncertainty, retry budgets, disabled settings and circuit breakers.
     await this.recoveryStore.save(sessionId, state);
+  }
+
+  private getActionArbiter(id: string): SessionActionArbiter {
+    let arbiter = this.actionArbiters.get(id);
+    if (!arbiter) {
+      const restored = this.actionReservationStore.get(id);
+      arbiter = new SessionActionArbiter(async (key) => {
+        const state = initialTaskState();
+        if (key) state.inFlight = { key, startedAt: Date.now() };
+        await this.actionReservationStore.save(id, state);
+      }, this.actionReservationStore.loadFailed || !!restored.inFlight);
+      this.actionArbiters.set(id, arbiter);
+    }
+    return arbiter;
+  }
+
+  private getTaskController(session: Session): TaskController | undefined {
+    if (
+      this.recoveryStopping ||
+      this.sessions.get(session.id) !== session ||
+      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout'
+    )
+      return undefined;
+    const existing = this.taskControllers.get(session.id);
+    if (existing) return existing;
+    const adapter = new CodexTaskAdapter(session, () => this._persistSessionStateNow(session));
+    const controller = new TaskController(
+      {
+        observe: () => adapter.observe(),
+        resetReservation: () => this.getActionArbiter(session.id).reset(),
+        recover: (observation, isCurrent) =>
+          this.getActionArbiter(session.id).run(() => adapter.recover(observation, isCurrent)),
+        act: (key, conversationId, prompt, isCurrent) =>
+          this.getActionArbiter(session.id).run(() => adapter.act(key, conversationId, prompt, isCurrent)),
+        persist: (state) => this.taskStore.save(session.id, state),
+        changed: (state) => {
+          if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;
+          this.broadcast(SseEvent.SessionTask, { sessionId: session.id, state });
+          this.persistSessionState(session);
+        },
+      },
+      this.taskStore.get(session.id)
+    );
+    this.taskControllers.set(session.id, controller);
+    const input = () => controller.noteUserInput();
+    this.taskInputListeners.set(session.id, input);
+    session.on('recoveryUserInput', input);
+    return controller;
   }
 
   private getRecoveryController(session: Session): RecoveryController | undefined {
@@ -2356,7 +2420,13 @@ export class WebServer extends EventEmitter {
     const controller = new RecoveryController(
       {
         observe: () => adapter.observe(),
-        act: (flight, isCurrent) => adapter.act(flight, isCurrent),
+        resetReservation: () => this.getActionArbiter(session.id).reset(),
+        act: (flight, isCurrent) =>
+          this.getActionArbiter(session.id).run(() => {
+            const task = this.taskControllers.get(session.id)?.getStatus();
+            if (task?.config.enabled) return Promise.resolve('not-sent');
+            return adapter.act(flight, isCurrent);
+          }),
         persist: (state) => this.recoveryStore.save(session.id, state),
         changed: (state) => {
           if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;
@@ -2395,6 +2465,20 @@ export class WebServer extends EventEmitter {
   }
 
   private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
+    const task = this.taskControllers.get(id);
+    const taskInput = this.taskInputListeners.get(id);
+    if (taskInput) this.sessions.get(id)?.off('recoveryUserInput', taskInput);
+    this.taskInputListeners.delete(id);
+    if (task) {
+      task.stop();
+      await task.drain();
+      this.taskControllers.delete(id);
+    }
+    this.actionArbiters.delete(id);
+    if (drop) {
+      await this.taskStore.drop(id);
+      await this.actionReservationStore.drop(id);
+    }
     const controller = this.recoveryControllers.get(id);
     const listener = this.recoveryInputListeners.get(id);
     if (listener) {
@@ -4075,6 +4159,8 @@ export class WebServer extends EventEmitter {
     for (const controller of this.recoveryControllers.values()) controller.stop();
     await Promise.all([...this.recoveryControllers.keys()].map((id) => this.stopRecoveryController(id, false)));
     await this.recoveryStore.flush();
+    await this.taskStore.flush();
+    await this.actionReservationStore.flush();
     getLifecycleLog().log({ event: 'server_stopped', sessionId: '*' });
     // Set stopping flag to prevent new timer creation during shutdown
     this.sse.setStopping();

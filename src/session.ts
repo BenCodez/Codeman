@@ -2317,7 +2317,8 @@ export class Session extends EventEmitter {
   async deliverRecovery(
     flight: RecoveryFlight,
     generation: number,
-    isCurrent: () => boolean = () => true
+    isCurrent: () => boolean = () => true,
+    prompt: string = CONTINUATION_PROMPT
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
     if (
@@ -2374,7 +2375,7 @@ export class Session extends EventEmitter {
         )
           return 'not-sent';
         // Browser frames report false during this short reservation so durable clients retain and retry them.
-        const sent = await this._mux!.sendInput(this.id, `${CONTINUATION_PROMPT}\r`);
+        const sent = await this._mux!.sendInput(this.id, `${prompt}\r`);
         if (!sent) return 'unknown'; // text may have landed even when Enter failed
         this._lastSubmitAt = Date.now();
         // Recovery acceptance comes from structured journal evidence. Do not arm the

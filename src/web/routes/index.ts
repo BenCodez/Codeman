@@ -19,6 +19,7 @@ export { registerCaseRoutes } from './case-routes.js';
 export { registerSessionRoutes } from './session-routes.js';
 export { registerRespawnRoutes } from './respawn-routes.js';
 export { registerRecoveryRoutes } from './recovery-routes.js';
+export { registerTaskRoutes } from './task-routes.js';
 export { registerRalphRoutes } from './ralph-routes.js';
 export { registerPlanRoutes } from './plan-routes.js';
 export { registerOrchestratorRoutes } from './orchestrator-routes.js';

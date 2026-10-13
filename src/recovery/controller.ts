@@ -13,6 +13,7 @@ import {
 } from './types.js';
 
 export interface RecoveryDependencies {
+  resetReservation?(): Promise<void>;
   observe(): Promise<RecoveryObservation>;
   /** 'unknown' includes any possibly-partially-delivered operation; it must never be replayed. */
   act(flight: RecoveryFlight, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
@@ -141,6 +142,7 @@ export class RecoveryController {
   async reset(): Promise<RecoveryState> {
     this.revision++;
     return this.enqueue(async () => {
+      await this.deps.resetReservation?.();
       // Reset is explicit user authorization to clear an unresolved delivery/budget, never itself a retry.
       this.state.circuitOpen = false;
       this.state.attempts = 0;

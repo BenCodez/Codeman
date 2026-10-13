@@ -1251,6 +1251,7 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 3 3 9 9 9"/><polyline points="9 12 11 14 15 10"/></svg>
                 <span>Recovery</span>
               </button>
+              <button type="button" class="set-rail-item" data-tab="task" style="display: none;" onclick="app.switchOptionsTab('task')"><span>Task supervision</span></button>
               <button type="button" class="set-rail-item" data-tab="ralph" data-claude-only onclick="app.switchOptionsTab('ralph')">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><polyline points="3 6 4 7 6 5"/><polyline points="3 12 4 13 6 11"/><polyline points="3 18 4 19 6 17"/></svg>
                 <span>Ralph / Todo</span>
@@ -1597,6 +1598,42 @@
                   <table class="recovery-history"><thead><tr><th scope="col">Time</th><th scope="col">Action</th><th scope="col">Reason</th><th scope="col">Attempt</th></tr></thead><tbody id="recoveryHistory"></tbody></table>
                 </div>
               </div>
+            </section>
+
+            <section class="set-section hidden" id="task-tab" data-label="Task supervision">
+              <div class="set-section-head"><h2>Task supervision</h2></div>
+              <p class="set-section-blurb">Opt in separately from recovery. Completion requires verified acceptance criteria; a model completion marker alone is insufficient. Approval, authentication, and usage blockers pause supervision.</p>
+              <p id="taskError" role="alert" hidden>Task status is unavailable. Refresh to try again.</p>
+              <div class="set-group"><h4>Task status</h4><dl class="task-status-grid">
+                <dt>Supervision</dt><dd id="taskPhase">Loading</dd><dt>Outcome</dt><dd id="taskOutcome">Unknown</dd>
+                <dt>Reason</dt><dd id="taskReason" data-i18n-skip>—</dd><dt>Continuations used / limit</dt><dd id="taskAttempts" data-i18n-skip>—</dd>
+                <dt>Runtime / limit (seconds)</dt><dd id="taskRuntime" data-i18n-skip>—</dd><dt>Current attempt started</dt><dd id="taskCurrentAttempt" data-i18n-skip>—</dd>
+                <dt>Last verified step</dt><dd id="taskLastVerified" data-i18n-skip>—</dd><dt>Input evidence</dt><dd id="taskInputEvidence">No input awaiting acceptance</dd>
+              </dl><div class="task-actions">
+                <button class="btn-toolbar" type="button" id="taskRefreshBtn" onclick="app.loadTaskStatus()">Refresh</button>
+                <button class="btn-toolbar" type="button" id="taskResumeBtn" onclick="app.taskAction('resume')">Start / resume</button>
+                <button class="btn-toolbar" type="button" id="taskPauseBtn" onclick="app.taskAction('pause')">Pause</button>
+                <button class="btn-toolbar" type="button" id="taskResetBtn" onclick="app.taskAction('reset')">Reset and disable</button>
+              </div></div>
+              <fieldset class="set-group task-form" id="taskSettings" disabled><legend>Task configuration</legend>
+                <label for="taskObjective">Objective</label><textarea class="set-textarea" id="taskObjective" rows="3" maxlength="4000" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <label for="taskManualCriteria">Owner acceptance criteria (one per line)</label><textarea class="set-textarea" id="taskManualCriteria" rows="3" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <label for="taskCommandCriteria">Command acceptance checks (one exact command per line)</label><textarea class="set-textarea" id="taskCommandCriteria" rows="3" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <p class="set-group-hint">Commands are matched against structured successful execution in this conversation. Saving checks does not run shell commands.</p>
+                <label><input type="checkbox" id="taskEnabled" onchange="app.markTaskDraft()"> Enable task supervision</label>
+                <label for="taskMaxContinuations">Maximum continuations</label><input class="set-input" type="number" id="taskMaxContinuations" min="0" max="10" step="1" oninput="app.markTaskDraft()">
+                <label for="taskMaxRuntime">Maximum runtime (seconds)</label><input class="set-input" type="number" id="taskMaxRuntime" min="1" max="86400" step="1" oninput="app.markTaskDraft()">
+                <button class="btn-toolbar" type="button" onclick="app.saveTaskConfiguration()">Save task configuration</button>
+              </fieldset>
+              <fieldset class="set-group task-form" id="taskProgress" disabled><legend>Checkpoints and completion evidence</legend>
+                <div id="taskCriteriaEvidence"></div>
+                <p class="set-group-hint">Select owner criteria you have independently verified, or request verification of command checks. Command checks require correlated successful execution evidence. Completed is accepted only when every criterion is verified.</p>
+                <label for="taskCheckpoint">Checkpoint</label><textarea class="set-textarea" id="taskCheckpoint" maxlength="4000" rows="2" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <label for="taskNextAction">Next action</label><textarea class="set-textarea" id="taskNextAction" maxlength="4000" rows="2" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <label for="taskProgressOutcome">Reported outcome</label><select class="set-input" id="taskProgressOutcome" onchange="app.markTaskDraft()"><option value="unknown">Unknown</option><option value="unfinished">Unfinished</option><option value="blocked">Blocked</option><option value="completed">Completed</option></select>
+                <button class="btn-toolbar" type="button" onclick="app.saveTaskProgress()">Save checkpoint / verification</button>
+              </fieldset>
+              <div class="set-group"><h4>Recent task events</h4><p id="taskHistoryEmpty">No task events yet</p><ol id="taskHistory" class="task-history"></ol></div>
             </section>
 
             <!-- ══ Ralph / Todo ═════════════════════════════════════════════ -->
@@ -4206,6 +4243,7 @@
   <script defer src="tile-grid.js"></script>
   <script defer src="respawn-ui.js"></script>
   <script defer src="recovery-ui.js"></script>
+  <script defer src="supervision-ui.js"></script>
   <script defer src="ralph-panel.js"></script>
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>

@@ -1749,7 +1749,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
   private liveHistoryResizeSupported: boolean | null = null;
 
-  constructor() {
+  constructor(private readonly inputCommandRunner?: (command: string) => Promise<void>) {
     super();
     this.setMaxListeners(50);
     if (!IS_TEST_MODE) {
@@ -3619,7 +3619,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     // TEST MODE: No-op — don't send input to real tmux sessions
-    if (IS_TEST_MODE) {
+    if (IS_TEST_MODE && !this.inputCommandRunner) {
       return true;
     }
 
@@ -3633,6 +3633,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     try {
+      // Explicit injected runners exercise production input normalization without invoking tmux in tests.
+      const run =
+        this.inputCommandRunner ??
+        (async (command: string) => {
+          await execAsync(command, { timeout: EXEC_TIMEOUT_MS });
+        });
       const hasCarriageReturn = input.includes('\r');
       const textPart = input.replace(/\r/g, '').replace(/\n/g, '').trimEnd();
 
@@ -3641,23 +3647,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
         // character in the input buffer rather than as form submission.
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        await run(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`);
         await new Promise((resolve) => setTimeout(resolve, 50));
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        await run(`${this.tmux()} send-keys -t "${session.muxName}" Enter`);
       } else if (textPart) {
         // Text only, no Enter
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        await run(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`);
       } else if (hasCarriageReturn) {
         // Enter only
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        await run(`${this.tmux()} send-keys -t "${session.muxName}" Enter`);
       }
 
       return true;

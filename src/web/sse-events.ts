@@ -121,6 +121,7 @@ export const SessionRunning = 'session:running' as const;
 export const SessionStatusTelemetry = 'session:statusTelemetry' as const;
 /** Structured recovery observation and automation state. Payload: { sessionId, state }. */
 export const SessionRecovery = 'session:recovery' as const;
+export const SessionTask = 'session:task' as const;
 
 // ─── Session: Ralph ──────────────────────────────────────────────────────────
 
@@ -529,6 +530,7 @@ export const SseEvent = {
   SessionRunning,
   SessionStatusTelemetry,
   SessionRecovery,
+  SessionTask,
 
   // Session: Ralph
   SessionRalphLoopUpdate,

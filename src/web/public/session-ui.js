@@ -2579,6 +2579,7 @@ Object.assign(CodemanApp.prototype, {
 
     // Recovery is advertised by the CLI catalog, never inferred from the mode name.
     if (this.openRecoveryOptions?.(sessionId)) this.switchOptionsTab('recovery');
+    this.openTaskOptions?.(sessionId);
 
     // Populate Ralph Wiggum form with current session values (skip for external CLI sessions)
     if (!isExternalCli) {
@@ -2926,6 +2927,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('ralph-tab').classList.toggle('hidden', tabName !== 'ralph');
     document.getElementById('summary-tab').classList.toggle('hidden', tabName !== 'summary');
     document.getElementById('recovery-tab')?.classList.toggle('hidden', tabName !== 'recovery');
+    document.getElementById('task-tab')?.classList.toggle('hidden', tabName !== 'task');
 
     // A switched-to section starts at its own top, not at the scroll offset the
     // previous one was left at.

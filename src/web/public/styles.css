@@ -22218,3 +22218,35 @@ html[data-header-stats='tiles'] .header-plan-usage:not(:has(.pu-row)) {
 #sessionOptionsModal #recoveryHistoryEmpty[hidden] {
   display: none;
 }
+
+/* Task supervision stays readable inside the owner-bound options pane. */
+#task-tab .task-status-grid {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) 2fr;
+  gap: 8px 16px;
+  font-size: 0.8rem;
+  margin: 16px 0;
+}
+#task-tab .task-status-grid dt { color: var(--text-muted); }
+#task-tab .task-status-grid dd { margin: 0; overflow-wrap: anywhere; }
+#task-tab .task-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+#task-tab .task-form { display: flex; flex-direction: column; gap: 10px; min-width: 0; border: 0; padding: 0; margin: 24px 0; }
+#task-tab .task-form legend { font-size: 0.85rem; font-weight: 600; padding: 0; margin-bottom: 14px; }
+#task-tab .task-form > label { font-size: 0.8rem; }
+#task-tab .task-form textarea { width: 100%; resize: vertical; box-sizing: border-box; }
+#task-tab .task-form > .btn-toolbar { align-self: flex-start; }
+#task-tab .task-criterion { display: flex; gap: 8px; align-items: flex-start; padding: 8px 0; font-size: 0.8rem; overflow-wrap: anywhere; }
+#task-tab .task-history { max-height: 220px; overflow: auto; overflow-wrap: anywhere; padding-left: 24px; font-size: 0.8rem; }
+#task-tab .btn-toolbar:disabled { opacity: 0.45; cursor: default; }
+@media (max-width: 600px) {
+  /* mobile.css compacts all toolbar buttons with !important; task controls need full touch targets. */
+  #task-tab .btn-toolbar {
+    min-height: 44px !important;
+    max-height: none !important;
+    height: auto !important;
+    padding: 8px 12px !important;
+    font-size: 0.8rem !important;
+    line-height: 1.4;
+  }
+  #task-tab .task-criterion { min-height: 44px; align-items: center; }
+}

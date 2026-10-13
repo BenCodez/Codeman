@@ -194,6 +194,7 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.SESSION_CLI_INFO, '_onSessionCliInfo'],
   [SSE_EVENTS.SESSION_STATUS_TELEMETRY, '_onSessionStatusTelemetry'],
   [SSE_EVENTS.SESSION_RECOVERY, '_onSessionRecovery'],
+  [SSE_EVENTS.SESSION_TASK, '_onSessionTask'],
 
   // Scheduled runs
   [SSE_EVENTS.SCHEDULED_CREATED, '_onScheduledCreated'],
@@ -2294,6 +2295,7 @@ class CodemanApp {
     this.handleInit(data);
     // Recovery events missed during a disconnect are reconciled by an authoritative read.
     if (this._recoveryView) void this.loadRecoveryStatus?.();
+    if (this._taskView) void this.loadTaskStatus?.();
     // Start the remote-host reachability poller even if no session switch follows
     // (a page loaded with the remote tab already active) — see host-wake-ui.js.
     this._ensureHostWakePoller?.();
