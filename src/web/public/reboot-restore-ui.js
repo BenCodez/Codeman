@@ -40,6 +40,10 @@ function rebootSkipReason(reason) {
       return 'already open';
     case 'capacity-reached':
       return 'session limit reached';
+    case 'identity-unverified':
+      return 'conversation identity could not be verified';
+    case 'restore-cancelled':
+      return 'restore offer was dismissed';
     case 'rebuild-failed':
       return 'the agent would not start';
     default:

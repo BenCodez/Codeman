@@ -41,8 +41,9 @@ import { existsSync, mkdirSync, readFileSync, chmodSync, statSync } from 'node:f
 import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { hostname as getHostname, uptime as osUptime } from 'node:os';
-import { looksLikeHostReboot, newestPersistedActivity, planRebootRestore } from '../reboot-restore.js';
+import { looksLikeHostReboot, newestPersistedActivity, planVerifiedRebootRestore } from '../reboot-restore.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
+import { writeRebootIdentityFence } from '../recovery/reboot-identity-fence.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { WebhookNotifier, readWebhookConfig } from '../webhook-notify.js';
 import type { WebhookUrgency } from '../types/push.js';
@@ -307,6 +308,7 @@ export class WebServer extends EventEmitter {
   private respawnControllers: Map<string, RespawnController> = new Map();
   private recoveryControllers = new Map<string, RecoveryController>();
   private recoveryInputListeners = new Map<string, () => void>();
+  private rebootIdentityListeners = new Map<string, () => void>();
   private recoveryStore = new RecoveryStore();
   private recoveryStopping = false;
   private respawnTimers: Map<string, { timer: NodeJS.Timeout; endAt: number; startedAt: number }> = new Map();
@@ -743,6 +745,7 @@ export class WebServer extends EventEmitter {
       setupSessionListeners: this.setupSessionListeners.bind(this),
       persistSessionState: this.persistSessionState.bind(this),
       persistSessionStateNow: this._persistSessionStateNow.bind(this),
+      prepareRebootRestoreRecovery: this.prepareRebootRestoreRecovery.bind(this),
       reapplyPersistedSessionState: this.reapplyPersistedSessionState.bind(this),
       discardPartiallyBuiltSession: this.discardPartiallyBuiltSession.bind(this),
       getSessionStateWithRespawn: this.getSessionStateWithRespawn.bind(this),
@@ -1328,6 +1331,14 @@ export class WebServer extends EventEmitter {
     const state = {
       ...base,
       recovery: this.recoveryControllers.get(session.id)?.getStatus(),
+      ...(session.mode === 'codex'
+        ? {
+            __codexRebootIdentity: {
+              switchPending: session.getRecoveryContext().switchPending,
+              submission: session.getRecoveryContext().submission,
+            },
+          }
+        : {}),
       ...(envOverrides ? { __envOverrides: envOverrides } : {}),
       ...(attachmentHistory ? { __attachmentHistory: attachmentHistory } : {}),
       ...(customModel ? { __customModel: customModel } : {}),
@@ -2321,6 +2332,15 @@ export class WebServer extends EventEmitter {
     };
   }
 
+  private async prepareRebootRestoreRecovery(sessionId: string): Promise<void> {
+    const state = this.recoveryStore.get(sessionId);
+    state.armedAt = Date.now();
+    state.pending = undefined;
+    state.nextRetryAt = undefined;
+    // Retain in-flight uncertainty, retry budgets, disabled settings and circuit breakers.
+    await this.recoveryStore.save(sessionId, state);
+  }
+
   private getRecoveryController(session: Session): RecoveryController | undefined {
     if (
       this.recoveryStopping ||
@@ -2356,16 +2376,33 @@ export class WebServer extends EventEmitter {
       this.recoveryStore.get(session.id)
     );
     this.recoveryControllers.set(session.id, controller);
-    const input = () => controller.noteUserInput();
+    const input = () => {
+      controller.noteUserInput();
+      this._persistSessionStateNow(session);
+    };
+    const identityChanged = () => {
+      const context = session.getRecoveryContext();
+      // This synchronous, fsynced fence must succeed before input dispatch.
+      // state.json itself is debounced and cannot provide that guarantee.
+      writeRebootIdentityFence(session.id, { switchPending: context.switchPending, submission: context.submission });
+      input();
+    };
+    this.rebootIdentityListeners.set(session.id, identityChanged);
     this.recoveryInputListeners.set(session.id, input);
     session.on('recoveryUserInput', input);
+    session.on('recoveryIdentityChanged', identityChanged);
     return controller;
   }
 
   private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
     const controller = this.recoveryControllers.get(id);
     const listener = this.recoveryInputListeners.get(id);
-    if (listener) this.sessions.get(id)?.off('recoveryUserInput', listener);
+    if (listener) {
+      this.sessions.get(id)?.off('recoveryUserInput', listener);
+    }
+    const identityListener = this.rebootIdentityListeners.get(id);
+    if (identityListener) this.sessions.get(id)?.off('recoveryIdentityChanged', identityListener);
+    this.rebootIdentityListeners.delete(id);
     this.recoveryInputListeners.delete(id);
     if (controller) {
       controller.stop();
@@ -3325,7 +3362,8 @@ export class WebServer extends EventEmitter {
    *
    * @returns how many sessions are on offer.
    */
-  private planRebootRestoreOffer(dead: string[], livePaneCount: number): number {
+  private async planRebootRestoreOffer(dead: string[], livePaneCount: number): Promise<number> {
+    rebootRestoreRegistry.configurePersistence(join(getDataDir(), 'reboot-restore-offer.json'));
     if (dead.length === 0) return 0;
 
     const persisted = this.store.getSessions();
@@ -3341,7 +3379,9 @@ export class WebServer extends EventEmitter {
       return 0;
     }
 
-    const { restore, skipped } = planRebootRestore(dead, persisted, (workingDir) => existsSync(workingDir));
+    const { restore, skipped } = await planVerifiedRebootRestore(dead, persisted, (workingDir) =>
+      existsSync(workingDir)
+    );
     if (skipped.length > 0) {
       console.log(`[Server] Reboot restore is passing over ${skipped.length} dead session(s):`);
       for (const rejection of skipped) {
@@ -3553,7 +3593,7 @@ export class WebServer extends EventEmitter {
       // failure of the thing it is supposed to help. An offer nobody gets is the
       // correct way for this to fail.
       try {
-        this.planRebootRestoreOffer(dead, alive.length);
+        await this.planRebootRestoreOffer(dead, alive.length);
       } catch (err) {
         console.error('[Server] Building the reboot-restore offer failed; continuing recovery:', err);
       }

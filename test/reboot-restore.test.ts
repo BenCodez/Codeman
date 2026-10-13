@@ -153,7 +153,7 @@ describe('which dead sessions may be rebuilt', () => {
 
   it('skips a CLI whose history the claude transcript reader does not understand', () => {
     const persisted = { c: persistedSession({ id: 'c', mode: 'codex' }) };
-    expect(planRebootRestore(['c'], persisted, () => true).skipped[0].reason).toBe('unsupported-mode');
+    expect(planRebootRestore(['c'], persisted, () => true).skipped[0].reason).toBe('identity-unverified');
   });
 });
 

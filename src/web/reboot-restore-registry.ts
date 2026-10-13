@@ -8,20 +8,10 @@
  * when the user clicks.
  *
  * Invariants:
- * - Entries are in-memory only. A server restart drops the plan, and nothing
- *   re-builds it, because the records it was built from are pruned by then.
- *   That costs the convenience this feature adds and never the conversation:
- *   the conversation IS the transcript under `~/.claude/projects`, which
- *   `services/unified-session-service.ts` reads for the Welcome screen's Resume
- *   list and the Session Manager, and `resumeHistorySession()` in
- *   `web/public/terminal-ui.js` resumes from a row there with no persisted
- *   session record involved. A dropped plan therefore returns the user to
- *   resuming by hand, one at a time, which is where they are without this
- *   feature. What the plan held that a transcript does not is the owner, the
- *   name, the env overrides, the effort, the model, the advisor model and the
- *   lineage.
- * - Module-level singleton in the style of `web/approval-inbox.ts`: no `Session`
- *   import and no IO, which keeps it unit-testable and cycle-free.
+ * - A private atomic snapshot keeps outstanding offers across server restarts.
+ *   Entries held by an unfinished restore remain in the snapshot until resolved.
+ *   Live-session checks prevent a crash after launch from duplicating a pane.
+ * - No Session import: ownership and concurrency stay independent of launching.
  * - Spending is take-then-build: `take()` removes entries synchronously, before
  *   the route's first `await`, so a double-click or two devices cannot both
  *   reach the same entry and put two panes on one conversation.
@@ -35,6 +25,21 @@
  * @module web/reboot-restore-registry
  */
 
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { planRebootRestore } from '../reboot-restore.js';
+import { dirname } from 'node:path';
 import type { RebootRestoreEntry } from '../reboot-restore.js';
 
 /**
@@ -44,6 +49,109 @@ import type { RebootRestoreEntry } from '../reboot-restore.js';
 const PLAN_TTL_MS = 24 * 60 * 60 * 1000;
 
 export class RebootRestoreRegistry {
+  private persistencePath?: string;
+
+  /** Load the durable offer before pruning stale records. Bounded, private and versioned. */
+  configurePersistence(path: string): void {
+    if (this.persistencePath === path) return;
+    this.persistencePath = path;
+    this.entries.clear();
+    this.parked.clear();
+    this.builtAt = 0;
+    try {
+      if (!existsSync(path)) return;
+      const stat = lstatSync(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8 * 1024 * 1024) return;
+      const saved = JSON.parse(readFileSync(path, 'utf8'));
+      if (
+        saved.version !== 1 ||
+        !Number.isFinite(saved.builtAt) ||
+        saved.builtAt <= 0 ||
+        saved.builtAt > Date.now() ||
+        !Array.isArray(saved.entries) ||
+        saved.entries.length > 1000
+      )
+        return;
+      const entries: RebootRestoreEntry[] = saved.entries;
+      if (
+        entries.some(
+          (entry) =>
+            !entry ||
+            typeof entry.sessionId !== 'string' ||
+            typeof entry.resumeConversationId !== 'string' ||
+            typeof entry.workingDir !== 'string' ||
+            !entry.state ||
+            entry.state.id !== entry.sessionId ||
+            entry.state.remote ||
+            entry.state.docker ||
+            typeof entry.mode !== 'string' ||
+            (entry.owner !== undefined && typeof entry.owner !== 'string') ||
+            entry.owner !== entry.state.owner ||
+            entry.workingDir !== entry.state.workingDir ||
+            entry.mode !== (entry.state.mode ?? 'claude')
+        )
+      )
+        return;
+      const eligible = planRebootRestore(
+        entries.map((entry) => entry.sessionId),
+        Object.fromEntries(entries.map((entry) => [entry.sessionId, entry.state])),
+        () => true,
+        new Map(
+          entries
+            .filter((entry) => entry.mode === 'codex')
+            .map((entry) => [entry.sessionId, entry.resumeConversationId])
+        )
+      );
+      const ids = new Set(eligible.restore.map((entry) => entry.sessionId));
+      this.entries = new Map(
+        entries.filter((entry) => ids.has(entry.sessionId)).map((entry) => [entry.sessionId, entry])
+      );
+      this.builtAt = saved.builtAt;
+      this.dropIfExpired();
+    } catch {
+      // An unreadable/corrupt offer never authorizes a process launch.
+    }
+  }
+
+  /** A dismiss/expiry supersedes even an entry already held by a restore. */
+  isHeld(entry: RebootRestoreEntry, spender: string | undefined): boolean {
+    this.dropIfExpired();
+    const held = this.parked.get(entry.sessionId);
+    return held?.entry === entry && held.spender === spender;
+  }
+
+  private persist(): void {
+    if (!this.persistencePath) return;
+    const path = this.persistencePath;
+    const temporary = `${path}.tmp-${randomUUID()}`;
+    try {
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      const entries = [...this.entries.values(), ...[...this.parked.values()].map((held) => held.entry)];
+      const text = JSON.stringify({ version: 1, builtAt: this.builtAt, entries });
+      if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('Restore offer exceeds storage budget');
+      const fd = openSync(temporary, 'wx', 0o600);
+      try {
+        writeFileSync(fd, text);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, path);
+      const directory = openSync(dirname(path), 'r');
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+    } finally {
+      try {
+        unlinkSync(temporary);
+      } catch {
+        /* already renamed */
+      }
+    }
+  }
+
   /** Keyed by session id, in the order the boot pass found them. */
   private entries = new Map<string, RebootRestoreEntry>();
   /** When the boot pass built the plan, in ms since the epoch. */
@@ -75,6 +183,7 @@ export class RebootRestoreRegistry {
     this.builtAt = entries.length > 0 ? Date.now() : 0;
     // A fresh boot plan supersedes anything an in-flight restore still holds.
     this.parked.clear();
+    this.persist();
   }
 
   /**
@@ -115,6 +224,7 @@ export class RebootRestoreRegistry {
       this.parked.set(entry.sessionId, { entry, spender });
       taken.push(entry);
     }
+    // Parking leaves the durable outstanding offer unchanged until the flight resolves.
     return taken;
   }
 
@@ -142,6 +252,7 @@ export class RebootRestoreRegistry {
       }
     }
     if (added > 0 && this.builtAt === 0) this.builtAt = Date.now();
+    this.persist();
   }
 
   /** Drop the entries a viewer can see. Returns how many went. */
@@ -157,7 +268,8 @@ export class RebootRestoreRegistry {
       this.parked.delete(sessionId);
       parkedRemoved += 1;
     }
-    if (this.entries.size === 0) this.builtAt = 0;
+    if (this.entries.size === 0 && this.parked.size === 0) this.builtAt = 0;
+    this.persist();
     return removable.length + parkedRemoved;
   }
 
@@ -182,6 +294,7 @@ export class RebootRestoreRegistry {
     this.parked.clear();
     this.builtAt = 0;
     this.spending.clear();
+    this.persistencePath = undefined;
   }
 
   private dropIfExpired(): void {
@@ -191,6 +304,7 @@ export class RebootRestoreRegistry {
       this.parked.clear();
       this.entries.clear();
       this.builtAt = 0;
+      this.persist();
     }
   }
 }

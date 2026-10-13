@@ -18,6 +18,7 @@ import WebSocket from 'ws';
 import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
 import { registerWsRoutes } from '../../src/web/routes/ws-routes.js';
 import { MAX_INPUT_LENGTH } from '../../src/config/terminal-limits.js';
+import { RebootIdentityFenceError } from '../../src/recovery/reboot-identity-fence.js';
 
 /** Assigned by the OS on every listen (`port: 0`); see beforeEach. */
 let PORT = 0;
@@ -195,6 +196,26 @@ describe('ws-routes', () => {
   // ========== Client input ==========
 
   describe('client input', () => {
+    it('retries the same frame after a pre-dispatch identity fence throws', async () => {
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      const session = ctx._session;
+      const write = vi.spyOn(session, 'write').mockImplementationOnce(() => {
+        throw new RebootIdentityFenceError();
+      });
+      try {
+        const frame = JSON.stringify({ t: 'i', d: '/resume\r', cid: 'fence-client', seq: 1 });
+        ws.send(frame);
+        await expect(nextMessage(ws, 600)).rejects.toThrow(/timeout/);
+        expect(session.writeBuffer).toEqual([]);
+        const acknowledged = nextMessage(ws);
+        ws.send(frame);
+        expect(await acknowledged).toEqual({ t: 'ia', seq: 1 });
+        expect(session.writeBuffer).toEqual(['/resume\r']);
+      } finally {
+        write.mockRestore();
+        ws.close();
+      }
+    });
     it('forwards input messages to session.write()', async () => {
       const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
       try {

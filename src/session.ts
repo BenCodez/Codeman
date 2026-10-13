@@ -146,6 +146,7 @@ import { hashCodexPrompt } from './recovery/codex-identity.js';
 import { CodexInputProofTracker, type CodexInputProof } from './recovery/codex-input-proof.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight } from './recovery/types.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
+import { RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
 import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from './session-env-clamp.js';
 import {
   launchModelFor,
@@ -4560,10 +4561,23 @@ export class Session extends EventEmitter {
   }
 
   private _invalidateRecoverySubmission(): void {
-    const changed = this._recoverySubmission !== undefined || !this._recoverySwitchPending;
     this._recoverySubmission = undefined;
     this._recoverySwitchPending = true;
-    if (changed) this.emit('recoveryIdentityChanged');
+    // Repeat the durable fence even when the in-memory veto is already set:
+    // restored panes and failed persistence attempts may still have an older disk identity.
+    this.emit('recoveryIdentityChanged');
+  }
+
+  private _publishRecoveryIdentityAfterDispatch(): void {
+    try {
+      this.emit('recoveryIdentityChanged');
+    } catch (error) {
+      if (!(error instanceof RebootIdentityFenceError)) throw error;
+      // Input already landed. Keep the earlier durable veto and never make its
+      // delivery look unsuccessful to an exactly-once client.
+      this._recoverySubmission = undefined;
+      this._recoverySwitchPending = true;
+    }
   }
 
   private _emitSubmittedPrompt(submitted: {
@@ -4576,10 +4590,10 @@ export class Session extends EventEmitter {
       if (prompt !== undefined && !prompt.trimStart().startsWith('/')) {
         this._recoverySubmission = { at: proof.at, hash: hashCodexPrompt(prompt) };
         this._recoverySwitchPending = false;
-        this.emit('recoveryIdentityChanged');
+        this._publishRecoveryIdentityAfterDispatch();
       } else if (prompt !== undefined && /^\/exit\b/.test(prompt.trimStart())) {
         this._recoveryIntentionalStopAt = proof.at;
-        this.emit('recoveryIdentityChanged');
+        this._publishRecoveryIdentityAfterDispatch();
       }
     }
     for (const prompt of submitted.prompts) {

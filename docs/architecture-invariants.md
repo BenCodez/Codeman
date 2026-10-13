@@ -337,7 +337,7 @@ The escape hatch is the synced `workspaceHooksEnabled` setting (App Settings →
 
 ### Reboot restore
 
-**Reboot restore** (#411/#442, `src/reboot-restore.ts` pure + `web/reboot-restore-registry.ts` + `routes/reboot-restore-routes.ts` + `reboot-restore-ui.js`): a host reboot takes the tmux server with it, so every pane dies and the board comes up empty with no explanation. At boot Codeman works out which sessions that reboot destroyed, holds the plan IN MEMORY (no new state file, and a server restart simply drops the offer), and the banner asks.
+**Reboot restore** (#411/#442, `src/reboot-restore.ts` pure + `web/reboot-restore-registry.ts` + `routes/reboot-restore-routes.ts` + `reboot-restore-ui.js`): a host reboot takes the tmux server with it, so every pane dies and the board comes up empty with no explanation. At boot Codeman works out which sessions that reboot destroyed, holds the plan in a private atomic `reboot-restore-offer.json` snapshot (a server restart retains outstanding entries and their original 24-hour expiry), and the banner asks.
 
 ⚠️ **The heuristic decides whether to ASK, never whether to act**: two signals have to agree (the socket holds no panes at all while state still lists sessions, AND the host booted after the newest persisted activity), and a wrong yes costs one dismissable line rather than N CLI processes nobody asked for.
 
@@ -349,7 +349,7 @@ The escape hatch is the synced `workspaceHooksEnabled` setting (App Settings →
 
 ⚠️ The rebuild passes `nameSource` through, or the constructor re-infers it from the name and a hand-renamed session shaped like `w<n>-<case>` comes back as `placeholder` for auto-naming to overwrite.
 
-⚠️ Claude-mode only (others carry their conversation id in their own config object), and remote/docker sessions are never offered (`remote-or-docker`), because both need another host or container to be up.
+⚠️ Claude and verified local Codex only. Codex requires an exact persisted UUID verified by the bounded rollout reader at boot and again at click time, using the current-grant-clamped `CODEX_HOME`. A private persisted slash-switch veto rejects unresolved identity changes, and a saved ordinary-submission proof must still attribute to that exact UUID. It keeps `codexConfig` launch settings, the original managed session id and recovery journal settings/budgets/circuit state. Pre-reboot pending recovery and evidence are fenced, so the restored pane receives no automatic prompt. Remote/docker sessions are never offered (`remote-or-docker`), because both need another host or container to be up.
 
 ⚠️ A failed rebuild is undone with `discardPartiallyBuiltSession()`, deliberately NOT `cleanupSession()`: the delete path would count the session's tokens into the lifetime totals, demote a pinned record to `stopped` (which this pass reads as an intentional kill, making the session permanently unrestorable) and recursively remove the WORKSPACE's upload dirs (`.codeman-uploads`, and the pre-move `.claude-images`).
 

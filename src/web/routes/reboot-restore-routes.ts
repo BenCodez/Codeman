@@ -36,8 +36,13 @@ import {
   sessionCapacityMessage,
 } from '../route-helpers.js';
 import { rebootRestoreRegistry } from '../reboot-restore-registry.js';
-import { rejectAlreadyLive, type RebootRestoreEntry, type RebootRestoreRejection } from '../../reboot-restore.js';
-import { clampEnvOverridesForOwner } from '../../session-env-clamp.js';
+import {
+  rejectAlreadyLive,
+  verifyCodexRebootIdentity,
+  type RebootRestoreEntry,
+  type RebootRestoreRejection,
+} from '../../reboot-restore.js';
+import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../../session-env-clamp.js';
 import { Session } from '../../session.js';
 import { resolveClaudeModeForUsername } from '../../user-store.js';
 import { getCli } from '../../config/cli-registry/registry.js';
@@ -45,7 +50,7 @@ import { applyWorkspaceHooks, seedAgentSessionPreamble } from '../../hooks-confi
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import { STATS_COLLECTION_INTERVAL_MS } from '../../config/server-timing.js';
 import { SseEvent } from '../sse-events.js';
-import type { SessionAttachmentHistoryItem } from '../../types.js';
+import type { CodexConfig, SessionAttachmentHistoryItem } from '../../types.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 type RebootRestoreCtx = SessionPort & EventPort & ConfigPort & InfraPort;
@@ -92,13 +97,14 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
     if (!rebootRestoreRegistry.beginSpending(owner)) {
       return reply.code(409).send(createErrorResponse(ApiErrorCode.CONFLICT, 'A reboot restore is already running'));
     }
-    const taken = rebootRestoreRegistry.take(canAccess, body.sessionIds, owner);
     // Entries nothing built a pane for, returned to the plan on every exit path
     // including a throw. Without this a failure between here and the loop would
     // spend the offer and rebuild nothing, and the plan cannot be rebuilt.
-    const unspent = new Set(taken);
+    const unspent = new Set<RebootRestoreEntry>();
 
     try {
+      const taken = rebootRestoreRegistry.take(canAccess, body.sessionIds, owner);
+      for (const entry of taken) unspent.add(entry);
       if (taken.length === 0) return { restored: [], skipped: [] };
 
       // The plan was built at boot and the board has moved on since. A conversation
@@ -165,6 +171,31 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         }
         try {
           const saved = entry.state;
+          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+            failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
+            unspent.delete(entry);
+            continue;
+          }
+          const envOverrides = await clampEnvOverridesForOwner(
+            saved.owner,
+            (saved as { __envOverrides?: Record<string, string> }).__envOverrides
+          );
+          let codexConfig: CodexConfig | undefined;
+          if (saved.mode === 'codex') {
+            // Validate the actual launch home AFTER applying current owner grants.
+            const verified = await verifyCodexRebootIdentity({
+              ...saved,
+              __envOverrides: envOverrides,
+            } as typeof saved);
+            if (verified !== entry.resumeConversationId) {
+              failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+              continue;
+            }
+            const configs = await clampExternalCliConfigsForOwner(saved.owner, {
+              codexConfig: { ...saved.codexConfig, resumeSessionId: verified },
+            });
+            codexConfig = configs.codexConfig as CodexConfig;
+          }
           const claudeModeConfig = await ctx.getClaudeModeConfig();
           const session = new Session({
             // The old id is reused on purpose: a pinned record, subagent parents,
@@ -187,13 +218,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             // takes its create branch and makes a fresh one.
             claudeMode: await resolveClaudeModeForUsername(claudeModeConfig.claudeMode, saved.owner),
             allowedTools: claudeModeConfig.allowedTools,
-            resumeSessionId: entry.resumeConversationId,
+            resumeSessionId: saved.mode === 'codex' ? undefined : entry.resumeConversationId,
+            codexConfig,
             // Re-resolved against the owner's CURRENT grant, never replayed from the
             // record: a grant held when the record was written may be gone now.
-            envOverrides: await clampEnvOverridesForOwner(
-              saved.owner,
-              (saved as { __envOverrides?: Record<string, string> }).__envOverrides
-            ),
+            envOverrides,
             effort: saved.effort,
             model: saved.model,
             advisorModel: saved.advisorModel,
@@ -207,12 +236,42 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             parentSessionId: saved.parentSessionId,
           });
 
+          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+            failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
+            unspent.delete(entry);
+            continue;
+          }
+          if (session.mode === 'codex') await ctx.prepareRebootRestoreRecovery?.(session.id);
+          const [racedLive] = rejectAlreadyLive([entry], liveSessionIds(), liveConversationIds()).skipped;
+          if (racedLive || !rebootRestoreRegistry.isHeld(entry, owner)) {
+            failures.push(racedLive ?? { sessionId: entry.sessionId, reason: 'restore-cancelled' });
+            unspent.delete(entry);
+            continue;
+          }
           await ctx.addSession(session);
           // Before the listeners, because setupSessionListeners() reads the
           // image-watcher flag this phase restores; before the spawn, because the
           // custom-model environment and the nice priority shape the process.
           await ctx.reapplyPersistedSessionState(session, saved, 'before-spawn');
           await ctx.setupSessionListeners(session);
+          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+            await ctx.discardPartiallyBuiltSession(entry.sessionId);
+            failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
+            unspent.delete(entry);
+            continue;
+          }
+          const otherSessions = [...ctx.sessions.values()].filter((other) => other !== session);
+          const [racedConversation] = rejectAlreadyLive(
+            [entry],
+            new Set(otherSessions.map((other) => other.id)),
+            new Set(otherSessions.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
+          ).skipped;
+          if (racedConversation) {
+            await ctx.discardPartiallyBuiltSession(entry.sessionId);
+            failures.push(racedConversation);
+            unspent.delete(entry);
+            continue;
+          }
           await session.startInteractive();
           // The session's own history, applied only once the pane exists: on a
           // failed start these totals would belong to a session that never ran.
@@ -301,8 +360,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
       // throw, so a transient failure costs a retry rather than the whole plan.
       // Ends the flight: entries still parked for it come back if they are in
       // `unspent`, and a Dismiss that unparked them meanwhile wins.
-      rebootRestoreRegistry.releaseFlight(owner, [...unspent]);
-      rebootRestoreRegistry.endSpending(owner);
+      try {
+        rebootRestoreRegistry.releaseFlight(owner, [...unspent]);
+      } finally {
+        rebootRestoreRegistry.endSpending(owner);
+      }
     }
   });
 

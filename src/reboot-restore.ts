@@ -44,6 +44,8 @@
 
 import type { SessionState } from './types.js';
 import { getCli } from './config/cli-registry/registry.js';
+import { resolveCodexIdentity } from './recovery/codex-identity.js';
+import { readRebootIdentityFence } from './recovery/reboot-identity-fence.js';
 import { isCleanPaneExit } from './pane-exit-sweep.js';
 
 /** Session statuses a reboot restore may rebuild. `stopped` is the kill marker. */
@@ -128,6 +130,8 @@ export interface RebootRestoreRejection {
     | 'respawn-blocked'
     | 'remote-or-docker'
     | 'unsupported-mode'
+    | 'identity-unverified'
+    | 'restore-cancelled'
     | 'no-working-dir'
     | 'workspace-missing'
     | 'workspace-forbidden'
@@ -147,7 +151,7 @@ export interface RebootRestoreEntry {
   resumeConversationId: string;
   /**
    * The persisted record, kept whole so the rebuild can replay what it held.
-   * Read at boot, before pruning deletes it, and held in memory until the click.
+   * Read at boot before pruning, retained in the private durable offer until the click.
    */
   state: SessionState;
 }
@@ -172,7 +176,8 @@ export interface RebootRestorePlan {
 export function planRebootRestore(
   deadSessionIds: readonly string[],
   persisted: Readonly<Record<string, SessionState>>,
-  workspaceExists: (workingDir: string) => boolean
+  workspaceExists: (workingDir: string) => boolean,
+  verifiedCodexConversationIds: ReadonlyMap<string, string> = new Map()
 ): RebootRestorePlan {
   const restore: RebootRestoreEntry[] = [];
   const skipped: RebootRestoreRejection[] = [];
@@ -224,11 +229,13 @@ export function planRebootRestore(
       skipped.push({ sessionId, reason: 'remote-or-docker' });
       continue;
     }
-    // Capability, not a CLI id: this pass resumes by handing the CLI a conversation
-    // id through the top-level `resumeSessionId`, which only a CLI whose history the
-    // claude-jsonl reader understands can consume that way. Others carry their thread
-    // id in their own `<Mode>Config`, which this pass does not thread through.
-    if (getCli(state.mode ?? 'claude')?.capabilities.transcript !== 'claude-jsonl') {
+    // Claude uses the top-level resume id; Codex requires a separately verified
+    // UUID and replays it through codexConfig, never through the Claude chain.
+    if (state.mode === 'codex' && !verifiedCodexConversationIds.has(sessionId)) {
+      skipped.push({ sessionId, reason: 'identity-unverified' });
+      continue;
+    }
+    if (state.mode !== 'codex' && getCli(state.mode ?? 'claude')?.capabilities.transcript !== 'claude-jsonl') {
       skipped.push({ sessionId, reason: 'unsupported-mode' });
       continue;
     }
@@ -246,7 +253,8 @@ export function planRebootRestore(
       workingDir: state.workingDir,
       owner: state.owner,
       mode: state.mode ?? 'claude',
-      resumeConversationId: resolveResumeConversationId(state),
+      resumeConversationId:
+        state.mode === 'codex' ? verifiedCodexConversationIds.get(sessionId)! : resolveResumeConversationId(state),
       state,
     });
   }
@@ -288,4 +296,62 @@ export function newestPersistedActivity(persisted: Readonly<Record<string, Sessi
     if (stamp > newest) newest = stamp;
   }
   return newest;
+}
+
+/** Revalidate an exact persisted UUID; never discover a replacement thread by cwd. */
+export async function verifyCodexRebootIdentity(state: SessionState): Promise<string | undefined> {
+  if (state.mode !== 'codex' || state.remote || state.docker) return undefined;
+  const proof =
+    readRebootIdentityFence(state.id) ??
+    (
+      state as SessionState & {
+        __codexRebootIdentity?: { switchPending?: boolean; submission?: { at: number; hash: string } };
+      }
+    ).__codexRebootIdentity;
+  if (proof?.switchPending) return undefined;
+  const id = state.recovery?.conversationId ?? state.codexConfig?.resumeSessionId;
+  if (
+    !id ||
+    (state.recovery?.conversationId &&
+      state.codexConfig?.resumeSessionId &&
+      state.recovery.conversationId !== state.codexConfig.resumeSessionId)
+  )
+    return undefined;
+  const identity = await resolveCodexIdentity({
+    sessionId: state.id,
+    workingDir: state.workingDir,
+    codexHome: (state as { __envOverrides?: Record<string, string> }).__envOverrides?.CODEX_HOME,
+    resumeId: id,
+    submission: proof?.submission,
+    noDaemon: state.codexConfig?.noDaemon === true,
+  });
+  return identity.reason === 'verified' && identity.conversationId === id ? id : undefined;
+}
+
+/** Disk verification is bounded and serial; the pure planner remains usable by callers/tests. */
+export async function planVerifiedRebootRestore(
+  deadSessionIds: readonly string[],
+  persisted: Readonly<Record<string, SessionState>>,
+  workspaceExists: (workingDir: string) => boolean
+): Promise<RebootRestorePlan> {
+  const verified = new Map<string, string>();
+  for (const sessionId of deadSessionIds) {
+    const state = persisted[sessionId];
+    if (
+      !state ||
+      state.mode !== 'codex' ||
+      !RESTORABLE_STATUSES.has(state.status) ||
+      state.pid == null ||
+      isCleanPaneExit(state.paneExit) ||
+      state.respawnBlocked ||
+      state.remote ||
+      state.docker ||
+      !state.workingDir ||
+      !workspaceExists(state.workingDir)
+    )
+      continue;
+    const id = await verifyCodexRebootIdentity(state);
+    if (id) verified.set(sessionId, id);
+  }
+  return planRebootRestore(deadSessionIds, persisted, workspaceExists, verified);
 }

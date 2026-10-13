@@ -36,6 +36,7 @@ import { FastifyInstance } from 'fastify';
 import type { WebSocket } from 'ws';
 import type { SessionPort } from '../ports/session-port.js';
 import { MAX_INPUT_LENGTH } from '../../config/terminal-limits.js';
+import { RebootIdentityFenceError } from '../../recovery/reboot-identity-fence.js';
 import { isAllowedRequestHost, isAllowedRequestOrigin, type HostPolicy } from '../network-auth-policy.js';
 import { WsConnectionRegistry } from '../ws-connection-registry.js';
 import { canAccessOwned, getAuthUser } from '../route-helpers.js';
@@ -198,7 +199,12 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               // and re-asserts the desktop layout after a mobile override.
               if (holdsDesktopClaim) session.noteDesktopActivity();
               // Browser keystrokes are the user's own, so they may name the tab.
-              delivered = session.write(msg.d, { fromUser: true });
+              try {
+                delivered = session.write(msg.d, { fromUser: true });
+              } catch (error) {
+                if (error instanceof RebootIdentityFenceError && cid && seq !== null) session.forgetInputSeq(cid, seq);
+                throw error;
+              }
               // A session whose PTY is gone swallows the write. ACKing anyway told
               // the client to drop the frame from its durable queue and left the seq
               // burnt, so the retry that reliable delivery exists for was rejected as

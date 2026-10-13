@@ -150,6 +150,7 @@ import {
   setHistorySessionIndex,
 } from '../session-history-index.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort, AuthPort, TabLayoutPort } from '../ports/index.js';
+import { RebootIdentityFenceError } from '../../recovery/reboot-identity-fence.js';
 import { RunSummaryTracker } from '../../run-summary.js';
 
 import { MAX_INPUT_LENGTH, MAX_SESSION_NAME_LENGTH } from '../../config/terminal-limits.js';
@@ -1934,6 +1935,16 @@ export function registerSessionRoutes(
     const undoOnFailure = () => {
       if (tagged) session.forgetInputSeq(clientId as string, seq as number);
     };
+    const directWrite = () => {
+      try {
+        return session.write(inputStr, { fromUser: true });
+      } catch (error) {
+        if (error instanceof RebootIdentityFenceError) undoOnFailure();
+        abort.abort();
+        stopDeathWatch();
+        throw error;
+      }
+    };
 
     // Whether the bytes actually reached a write path. Only meaningful on the wait
     // path (the fire-and-forget branches return before the response is built), and
@@ -1961,10 +1972,10 @@ export function registerSessionRoutes(
         delivered = true;
       } else {
         console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-        delivered = session.write(inputStr, { fromUser: true });
+        delivered = directWrite();
         if (!delivered) undoOnFailure();
       }
-    } else if (autoMux) {
+    } else if (autoMux || (useMux && session.mode === 'codex')) {
       // Awaited, unlike the explicit useMux branch below. This shape also reaches here
       // from the browser's POST fallback, which sends its frames one at a time and
       // waits for each 2xx; answering only once Enter has gone out is what keeps the
@@ -1972,7 +1983,7 @@ export function registerSessionRoutes(
       const ok = await session.writeViaMux(inputStr, { fromUser: true }).catch(() => false);
       if (!ok) {
         console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-        if (!session.write(inputStr, { fromUser: true })) undoOnFailure();
+        if (!directWrite()) undoOnFailure();
       }
     } else if (useMux) {
       // Fire-and-forget: don't block the HTTP response on a tmux child process.
@@ -1991,7 +2002,7 @@ export function registerSessionRoutes(
       // Same rollback. NOT an error response, deliberately: a session can
       // legitimately have no PTY yet (created but not started), and callers have
       // always been able to write to one without a 4xx.
-      delivered = session.write(inputStr, { fromUser: true });
+      delivered = directWrite();
       if (!delivered && tagged) {
         session.forgetInputSeq(clientId as string, seq as number);
       }

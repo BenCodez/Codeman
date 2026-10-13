@@ -20,11 +20,15 @@
 import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 /** Set per test: whether the mocked `startInteractive()` rejects. */
 let startShouldThrow = false;
 /** Ordering log, so a test can assert what ran before the pane spawned. */
 const callOrder: string[] = [];
+const launchConfigs: Record<string, unknown>[] = [];
 
 vi.mock('../../src/session.js', () => ({
   Session: class {
@@ -35,6 +39,7 @@ vi.mock('../../src/session.js', () => ({
     owner?: string;
     claudeSessionId: string | null = null;
     constructor(config: { id: string; mode?: string; name?: string; workingDir: string; owner?: string }) {
+      launchConfigs.push(config as unknown as Record<string, unknown>);
       this.id = config.id;
       this.mode = config.mode ?? 'claude';
       this.name = config.name;
@@ -110,6 +115,7 @@ async function createHarness(ctx: ReturnType<typeof createMockRouteContext>): Pr
 beforeEach(() => {
   startShouldThrow = false;
   callOrder.length = 0;
+  launchConfigs.length = 0;
 });
 
 afterEach(() => {
@@ -118,6 +124,40 @@ afterEach(() => {
 });
 
 describe('a rebuild that fails after the session is registered', () => {
+  it('restores Claude without depending on the Codex recovery journal', async () => {
+    rebootRestoreRegistry.set([offerEntry('claude-with-full-codex-journal')]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    const prepare = vi.fn(async () => {
+      throw new Error('Codex journal is over capacity');
+    });
+    Object.assign(ctx, { prepareRebootRestoreRecovery: prepare });
+    const app = await createHarness(ctx);
+    try {
+      const response = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data.restored).toHaveLength(1);
+      expect(prepare).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+    }
+  });
+  it('releases the owner lock even when final offer persistence fails', async () => {
+    rebootRestoreRegistry.set([offerEntry('a')]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    const app = await createHarness(ctx);
+    const release = vi.spyOn(rebootRestoreRegistry, 'releaseFlight').mockImplementationOnce(() => {
+      throw new Error('simulated storage failure');
+    });
+    try {
+      const response = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+      expect(response.statusCode).toBe(500);
+      expect(rebootRestoreRegistry.beginSpending(undefined)).toBe(true);
+      rebootRestoreRegistry.endSpending(undefined);
+    } finally {
+      release.mockRestore();
+      await app.close();
+    }
+  });
   it('reports why it failed rather than blaming the workspace', async () => {
     startShouldThrow = true;
     rebootRestoreRegistry.set([offerEntry('a')]);
@@ -373,5 +413,90 @@ describe('a dismiss that lands while a restore is running', () => {
     // her entries, not his, so his offer survives.
     rebootRestoreRegistry.releaseFlight('bob', bobsTaken);
     expect(rebootRestoreRegistry.list(() => true).map((e) => e.sessionId)).toEqual(['theirs']);
+  });
+});
+
+describe('Codex reboot launch and cancellation', () => {
+  const uuid = '12345678-1234-1234-1234-123456789abc';
+  function codexOffer(): RebootRestoreEntry {
+    const home = join(homedir(), 'codex-reboot-route');
+    mkdirSync(join(home, 'sessions'), { recursive: true });
+    writeFileSync(
+      join(home, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`),
+      JSON.stringify({
+        type: 'session_meta',
+        timestamp: '2026-10-13T15:00:00Z',
+        payload: { id: uuid, cwd: WORKSPACE, originator: 'codeman_codex-original' },
+      }) + '\n'
+    );
+    const entry = offerEntry('codex-original');
+    entry.mode = 'codex';
+    entry.resumeConversationId = uuid;
+    entry.state.mode = 'codex';
+    entry.state.pid = 1234;
+    entry.state.codexConfig = {
+      noDaemon: true,
+      noAltScreen: true,
+      resumeSessionId: uuid,
+      sandbox: 'read-only',
+      approvalPolicy: 'on-request',
+      model: 'custom-model',
+      reasoningEffort: 'high',
+    };
+    (entry.state as unknown as Record<string, unknown>).__envOverrides = { CODEX_HOME: home, CODEX_OTHER: 'keep' };
+    return entry;
+  }
+  it('launches original UUID with supported settings and preserves the original journal key', async () => {
+    const entry = codexOffer();
+    rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    const prepare = vi.fn(async (_id: string) => {
+      callOrder.push('prepareRecovery');
+    });
+    Object.assign(ctx, { prepareRebootRestoreRecovery: prepare });
+    const app = await createHarness(ctx);
+    const res = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;
+    expect(res.restored.map((item: { id: string }) => item.id)).toEqual(['codex-original']);
+    expect(launchConfigs[0]).toMatchObject({
+      id: 'codex-original',
+      mode: 'codex',
+      codexConfig: entry.state.codexConfig,
+      envOverrides: { CODEX_OTHER: 'keep' },
+    });
+    expect(launchConfigs[0].resumeSessionId).toBeUndefined();
+    expect(prepare).toHaveBeenCalledWith('codex-original');
+    expect(callOrder.indexOf('prepareRecovery')).toBeLessThan(callOrder.indexOf('startInteractive'));
+    expect(ctx.reapplyPersistedSessionState).toHaveBeenCalledWith(expect.anything(), entry.state, 'after-spawn', {
+      rearmAutoResumeSchedule: false,
+    });
+    await app.close();
+  });
+  it('rechecks the rollout on click and leaves an invalid identity on offer without launching', async () => {
+    const entry = codexOffer();
+    entry.state.workingDir = WORKSPACE;
+    entry.state.codexConfig!.resumeSessionId = '99999999-1234-1234-1234-123456789abc';
+    rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    const app = await createHarness(ctx);
+    const res = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;
+    expect(res.skipped).toEqual([{ sessionId: 'codex-original', reason: 'identity-unverified' }]);
+    expect(launchConfigs).toEqual([]);
+    expect(rebootRestoreRegistry.list(() => true)).toHaveLength(1);
+    await app.close();
+  });
+  it('dismissal during pre-spawn preparation prevents launching and releases partial registration', async () => {
+    const entry = codexOffer();
+    rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    ctx.reapplyPersistedSessionState.mockImplementation(async (_session, _saved, phase) => {
+      if (phase === 'before-spawn') rebootRestoreRegistry.clear(() => true);
+    });
+    const app = await createHarness(ctx);
+    const res = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;
+    expect(res.skipped).toEqual([{ sessionId: 'codex-original', reason: 'restore-cancelled' }]);
+    expect(callOrder).not.toContain('startInteractive');
+    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith('codex-original');
+    expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
+    await app.close();
   });
 });

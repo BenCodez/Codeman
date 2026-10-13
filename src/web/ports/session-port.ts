@@ -8,6 +8,8 @@ import type { SessionState } from '../../types.js';
 
 export interface SessionPort {
   readonly sessions: ReadonlyMap<string, Session>;
+  /** Fence pre-reboot recovery evidence without resetting settings or retry budgets. */
+  prepareRebootRestoreRecovery?(sessionId: string): Promise<void>;
   addSession(session: Session): Promise<void>;
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
