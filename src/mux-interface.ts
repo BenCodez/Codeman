@@ -31,6 +31,8 @@ import type {
  * Multiplexer session metadata.
  */
 export interface MuxSession {
+  /** Set by a successful local launch whose actual registry command disabled the shared daemon. */
+  recoveryIsolated?: boolean;
   /** Codeman session ID */
   sessionId: string;
   /** Multiplexer session name (e.g., "codeman-abc12345") */
@@ -129,6 +131,8 @@ export interface CreateSessionOptions {
 
 /** Options for respawning a dead pane. */
 export interface RespawnPaneOptions {
+  /** Recovery refuses a pane that became live by omitting tmux's kill-live-pane flag. Local only. */
+  onlyIfDead?: boolean;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;
@@ -381,4 +385,11 @@ export interface TerminalMultiplexer extends EventEmitter {
    * pane cannot be read.
    */
   capturePaneText?(muxName: string, paneTarget?: string): string | null;
+  /** Fresh, bounded local-pane evidence for recovery. A missing/ambiguous probe is UNKNOWN. */
+  inspectPaneForRecovery?(muxName: string): Promise<{
+    dead: boolean;
+    status?: number;
+    signal?: number;
+    screen: string | null;
+  } | null>;
 }

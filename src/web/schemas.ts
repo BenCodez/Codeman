@@ -323,6 +323,10 @@ const CodexConfigSchema = z
       .optional(),
     dangerouslyBypassApprovals: z.boolean().optional(),
     animations: z.boolean().optional(),
+    noDaemon: z.boolean().optional(),
+    noAltScreen: z.boolean().optional(),
+    sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+    approvalPolicy: z.enum(['on-request', 'never']).optional(),
     renderMode: z
       .enum(['scrollback', 'hybrid'])
       .optional()

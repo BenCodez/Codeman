@@ -83,6 +83,9 @@ export function createMockRouteContext(options?: {
     restoreRespawnController: vi.fn(),
     saveRespawnConfig: vi.fn(),
 
+    // -- RecoveryPort --
+    getRecoveryController: vi.fn(() => undefined),
+
     // -- ConfigPort --
     store: {
       getConfig: vi.fn(() => ({ ralphEnabled: false, maxConcurrentSessions: 5 })),

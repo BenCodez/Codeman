@@ -1247,6 +1247,10 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
                 <span>Session</span>
               </button>
+              <button type="button" class="set-rail-item" data-tab="recovery" style="display: none;" onclick="app.switchOptionsTab('recovery')">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 3 3 9 9 9"/><polyline points="9 12 11 14 15 10"/></svg>
+                <span>Recovery</span>
+              </button>
               <button type="button" class="set-rail-item" data-tab="ralph" data-claude-only onclick="app.switchOptionsTab('ralph')">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><polyline points="3 6 4 7 6 5"/><polyline points="3 12 4 13 6 11"/><polyline points="3 18 4 19 6 17"/></svg>
                 <span>Ralph / Todo</span>
@@ -1501,6 +1505,96 @@
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="modalFlickerFilterEnabled" onchange="app.toggleFlickerFilter()"><span class="slider"></span></label>
                   </div>
+                </div>
+              </div>
+            </section>
+
+            <!-- Recovery uses structured Codex events. Quiet output alone never starts a retry. -->
+            <section class="set-section hidden" id="recovery-tab" data-label="Recovery">
+              <div class="set-section-head">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 3 3 9 9 9"/><polyline points="9 12 11 14 15 10"/></svg>
+                <h2>Recovery</h2>
+              </div>
+              <p class="set-section-blurb">Resume verified unfinished work after an interruption or crash, with bounded retries.</p>
+              <p class="set-group-hint">Automatic recovery requires a Codeman-owned local Codex session launched with --no-daemon. Daemon, remote, Docker, and discovered sessions remain paused.</p>
+              <p class="recovery-notice" id="recoveryError" role="alert" hidden>Recovery status is unavailable. Refresh to try again.</p>
+
+              <div class="set-group">
+                <div class="set-group-head"><h4>Recovery status</h4></div>
+                <dl class="recovery-state-grid" aria-live="polite">
+                  <div><dt>Observed activity</dt><dd id="recoveryActivity">Loading</dd></div>
+                  <div><dt>Automation state</dt><dd id="recoveryPhase">Loading</dd></div>
+                  <div><dt>Conversation ID</dt><dd id="recoveryConversationId" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Recovery attempts</dt><dd id="recoveryAttempts" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Failed attempts</dt><dd id="recoveryFailures" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Last successful recovery</dt><dd id="recoveryLastSuccess" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Next retry</dt><dd id="recoveryNextRetry" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Attention</dt><dd id="recoveryAttention">Loading</dd></div>
+                  <div class="recovery-state-reason"><dt>Reason</dt><dd id="recoveryReason">Loading</dd></div>
+                </dl>
+                <div class="recovery-actions">
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryRefreshBtn" onclick="app.loadRecoveryStatus()">Refresh status</button>
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryRetryBtn" onclick="app.retryRecovery()" disabled>Retry recovery</button>
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryResetBtn" onclick="app.resetRecovery()" disabled>Reset recovery</button>
+                </div>
+                <p class="set-group-hint recovery-actions-hint">Retry rechecks safety before acting. Reset clears retry limits without restarting the session.</p>
+              </div>
+
+              <fieldset class="recovery-settings" id="recoverySettings" disabled>
+                <legend class="sr-only">Recovery settings</legend>
+                <div class="set-group">
+                  <div class="set-group-head"><h4>Automatic recovery</h4></div>
+                  <div class="set-group-body">
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryEnabled">Enable automatic recovery</label><span class="set-row-desc">Off by default. Pauses for user input, approvals, authentication, and usage limits.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryEnabled" aria-label="Enable automatic recovery" onchange="app.saveRecoverySetting('enabled', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryInterrupted">Recover interrupted turns</label><span class="set-row-desc">Continue only when structured events confirm an unfinished turn.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryInterrupted" checked aria-label="Recover interrupted turns" onchange="app.saveRecoverySetting('recoverInterrupted', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryCrashes">Recover crashes</label><span class="set-row-desc">Resume the same verified conversation after an unexpected process exit.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryCrashes" checked aria-label="Recover crashes" onchange="app.saveRecoverySetting('recoverCrashes', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Detect stalls (alert only)</label><span class="set-row-desc">Raise an alert for stalled work. Silence alone never triggers recovery.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryStalls" aria-label="Detect stalls (alert only)" onchange="app.saveRecoverySetting('detectStalls', this)"><span class="slider"></span></label>
+                    </div>
+                  </div>
+                </div>
+                <div class="set-group">
+                  <div class="set-group-head"><h4>Retry limits</h4></div>
+                  <div class="set-group-body">
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryMaxRetries">Maximum retries</label><span class="set-row-desc">Stop automatic attempts when this limit is reached.</span></div>
+                      <input class="set-input recovery-number" id="recoveryMaxRetries" type="number" min="1" max="10" step="1" value="3" onchange="app.saveRecoverySetting('maxRetries', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryRetryDelay">Retry delay (seconds)</label><span class="set-row-desc">Initial wait before retrying. Later attempts use bounded backoff.</span></div>
+                      <input class="set-input recovery-number" id="recoveryRetryDelay" type="number" min="1" max="300" step="1" value="15" onchange="app.saveRecoverySetting('retryDelayMs', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryMaxDelay">Maximum retry delay (seconds)</label><span class="set-row-desc">Must be at least the initial retry delay.</span></div>
+                      <input class="set-input recovery-number" id="recoveryMaxDelay" type="number" min="1" max="3600" step="1" value="120" onchange="app.saveRecoverySetting('maxRetryDelayMs', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryMaxDuration">Maximum recovery duration (seconds)</label><span class="set-row-desc">Stop trying after this total recovery window.</span></div>
+                      <input class="set-input recovery-number" id="recoveryMaxDuration" type="number" min="10" max="3600" step="1" value="900" onchange="app.saveRecoverySetting('maxRecoveryDurationMs', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalledAfter">Stall alert delay (seconds)</label><span class="set-row-desc">How long working activity can remain unchanged before an alert.</span></div>
+                      <input class="set-input recovery-number" id="recoveryStalledAfter" type="number" min="10" max="3600" step="1" value="300" onchange="app.saveRecoverySetting('stalledAfterMs', this)">
+                    </div>
+                  </div>
+                </div>
+              </fieldset>
+
+              <div class="set-group">
+                <div class="set-group-head"><h4>Recent recovery events</h4></div>
+                <p class="set-group-hint" id="recoveryHistoryEmpty">No recovery events yet</p>
+                <div class="recovery-history-wrap" id="recoveryHistoryWrap" hidden>
+                  <table class="recovery-history"><thead><tr><th scope="col">Time</th><th scope="col">Action</th><th scope="col">Reason</th><th scope="col">Attempt</th></tr></thead><tbody id="recoveryHistory"></tbody></table>
                 </div>
               </div>
             </section>
@@ -4111,6 +4205,7 @@
   <script defer src="terminal-split.js"></script>
   <script defer src="tile-grid.js"></script>
   <script defer src="respawn-ui.js"></script>
+  <script defer src="recovery-ui.js"></script>
   <script defer src="ralph-panel.js"></script>
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>

@@ -158,6 +158,9 @@ import { MAX_CONCURRENT_SESSIONS, MAX_SSE_CLIENTS } from '../config/map-limits.j
 import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
+import { RecoveryController } from '../recovery/controller.js';
+import { RecoveryStore } from '../recovery/store.js';
+import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
@@ -189,6 +192,7 @@ import {
   registerCaseRoutes,
   registerSessionRoutes,
   registerRespawnRoutes,
+  registerRecoveryRoutes,
   registerRalphRoutes,
   registerPlanRoutes,
   registerClipboardRoutes,
@@ -301,6 +305,10 @@ export class WebServer extends EventEmitter {
   private app: FastifyInstance;
   private sessions: Map<string, Session> = new Map();
   private respawnControllers: Map<string, RespawnController> = new Map();
+  private recoveryControllers = new Map<string, RecoveryController>();
+  private recoveryInputListeners = new Map<string, () => void>();
+  private recoveryStore = new RecoveryStore();
+  private recoveryStopping = false;
   private respawnTimers: Map<string, { timer: NodeJS.Timeout; endAt: number; startedAt: number }> = new Map();
   private runSummaryTrackers: Map<string, RunSummaryTracker> = new Map();
   private transcriptWatchers: Map<string, TranscriptWatcher> = new Map();
@@ -738,6 +746,7 @@ export class WebServer extends EventEmitter {
       reapplyPersistedSessionState: this.reapplyPersistedSessionState.bind(this),
       discardPartiallyBuiltSession: this.discardPartiallyBuiltSession.bind(this),
       getSessionStateWithRespawn: this.getSessionStateWithRespawn.bind(this),
+      getRecoveryController: this.getRecoveryController.bind(this),
       // EventPort
       broadcast: this.broadcast.bind(this),
       sendPushNotifications: this.sendPushNotifications.bind(this),
@@ -1140,6 +1149,7 @@ export class WebServer extends EventEmitter {
     // cleanup path and resolves in-flight wakes on shutdown.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
     registerRespawnRoutes(this.app, ctx);
+    registerRecoveryRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
     registerClipboardRoutes(this.app, ctx);
@@ -1317,6 +1327,7 @@ export class WebServer extends EventEmitter {
     const customModel = session.getCustomModelForPersist();
     const state = {
       ...base,
+      recovery: this.recoveryControllers.get(session.id)?.getStatus(),
       ...(envOverrides ? { __envOverrides: envOverrides } : {}),
       ...(attachmentHistory ? { __attachmentHistory: attachmentHistory } : {}),
       ...(customModel ? { __customModel: customModel } : {}),
@@ -1387,6 +1398,7 @@ export class WebServer extends EventEmitter {
     coordinateLayout = true
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
+    await this.stopRecoveryController(sessionId, killMux);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], () =>
@@ -1730,6 +1742,7 @@ export class WebServer extends EventEmitter {
           order: entry.order,
           kind: entry.kind,
           external: entry.capabilities.external,
+          recovery: entry.capabilities.recovery,
           enabled,
           available: enabled && installed,
         };
@@ -1843,6 +1856,7 @@ export class WebServer extends EventEmitter {
   }
 
   private async setupSessionListeners(session: Session): Promise<void> {
+    this.getRecoveryController(session);
     // Idempotent: the wiring exit handler detaches ALL listeners on every PTY exit
     // (removeSessionListenerRefs), so the re-attach routes (/interactive,
     // /interactive-respawn, /shell) call this again to restore observability
@@ -2303,7 +2317,62 @@ export class WebServer extends EventEmitter {
       respawnEnabled: controller?.getConfig()?.enabled ?? false,
       respawnConfig: controller?.getConfig() ?? null,
       respawn: controller?.getStatus() ?? null,
+      recovery: this.recoveryControllers.get(session.id)?.getStatus(),
     };
+  }
+
+  private getRecoveryController(session: Session): RecoveryController | undefined {
+    if (
+      this.recoveryStopping ||
+      this.sessions.get(session.id) !== session ||
+      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout'
+    )
+      return undefined;
+    const existing = this.recoveryControllers.get(session.id);
+    if (existing) return existing;
+    const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+    let previousAttention = false;
+    let previousReason = '';
+    const controller = new RecoveryController(
+      {
+        observe: () => adapter.observe(),
+        act: (flight, isCurrent) => adapter.act(flight, isCurrent),
+        persist: (state) => this.recoveryStore.save(session.id, state),
+        changed: (state) => {
+          if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;
+          this.broadcast(SseEvent.SessionRecovery, { sessionId: session.id, state });
+          this.persistSessionState(session);
+          if (state.needsAttention && (!previousAttention || state.lastReason !== previousReason)) {
+            void this.sendPushNotifications(SseEvent.SessionRecovery, {
+              sessionId: session.id,
+              sessionName: session.name,
+              reason: state.lastReason,
+            });
+          }
+          previousAttention = state.needsAttention;
+          previousReason = state.lastReason;
+        },
+      },
+      this.recoveryStore.get(session.id)
+    );
+    this.recoveryControllers.set(session.id, controller);
+    const input = () => controller.noteUserInput();
+    this.recoveryInputListeners.set(session.id, input);
+    session.on('recoveryUserInput', input);
+    return controller;
+  }
+
+  private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
+    const controller = this.recoveryControllers.get(id);
+    const listener = this.recoveryInputListeners.get(id);
+    if (listener) this.sessions.get(id)?.off('recoveryUserInput', listener);
+    this.recoveryInputListeners.delete(id);
+    if (controller) {
+      controller.stop();
+      await controller.drain();
+      this.recoveryControllers.delete(id);
+    }
+    if (drop) await this.recoveryStore.drop(id);
   }
 
   /**
@@ -2591,6 +2660,8 @@ export class WebServer extends EventEmitter {
       if (!session.setPaneExit(getPaneExit(muxName))) continue;
       this.persistSessionState(session);
       this.broadcastSessionStateDebounced(session.id);
+      const recovery = this.recoveryControllers.get(session.id);
+      if (recovery?.getStatus().config.enabled) void recovery.refresh().catch(() => {});
     }
     this.closeCleanlyExitedSessions();
   }
@@ -2672,6 +2743,7 @@ export class WebServer extends EventEmitter {
     [SseEvent.SessionError]: { title: 'Session Error', urgency: 'critical' },
     [SseEvent.RespawnBlocked]: { title: 'Respawn Blocked', urgency: 'critical' },
     [SseEvent.SessionRespawnBreakerTripped]: { title: 'Session crash loop stopped', urgency: 'critical' },
+    [SseEvent.SessionRecovery]: { title: 'Codex recovery needs attention', urgency: 'critical' },
     [SseEvent.SessionRalphCompletionDetected]: { title: 'Task Complete', urgency: 'warning' },
   };
 
@@ -2790,6 +2862,9 @@ export class WebServer extends EventEmitter {
       body += body ? ' ' : '';
       body += String(data.error).slice(0, 200);
     } else if (event === SseEvent.RespawnBlocked && data.reason) {
+      body += body ? ' ' : '';
+      body += String(data.reason);
+    } else if (event === SseEvent.SessionRecovery && data.reason) {
       body += body ? ' ' : '';
       body += String(data.reason);
     } else if (event === SseEvent.SessionRalphCompletionDetected && data.phrase) {
@@ -3387,6 +3462,7 @@ export class WebServer extends EventEmitter {
   async discardPartiallyBuiltSession(sessionId: string): Promise<void> {
     const session = this.sessions.get(sessionId);
     if (!session) return;
+    await this.stopRecoveryController(sessionId, false);
     this.sessions.delete(sessionId);
 
     // --- the inverse of setupSessionListeners(), in reverse order ---
@@ -3514,6 +3590,9 @@ export class WebServer extends EventEmitter {
             // session-manager (see updateSessionState). Cast to read the non-public field.
             // Note: a legacy CLAUDE_CODE_EFFORT_LEVEL entry is auto-migrated to `effort`
             // by the Session constructor (env var would hard-lock /effort switching).
+            // An attach does not change the existing process's launch policy or environment.
+            // Preserve its actual settings; the recovery adapter re-checks current owner
+            // grants and refuses action when those settings are no longer authorized.
             const savedEnvOverrides = (savedState as { __envOverrides?: Record<string, string> })?.__envOverrides;
             const savedCustomModel = (savedState as { __customModel?: CustomModelBookkeeping })?.__customModel;
             // Prefer the private (externalPath-bearing) history; fall back to the
@@ -3540,6 +3619,7 @@ export class WebServer extends EventEmitter {
               allowedTools: recoveryClaudeMode.allowedTools,
               openCodeConfig: muxSession.mode === 'opencode' ? savedState?.openCodeConfig : undefined,
               codexConfig: muxSession.mode === 'codex' ? savedState?.codexConfig : undefined,
+              preserveExitedPane: getCli(muxSession.mode)?.capabilities.recovery === 'codex-rollout',
               geminiConfig: muxSession.mode === 'gemini' ? savedState?.geminiConfig : undefined,
               antigravityConfig: muxSession.mode === 'antigravity' ? savedState?.antigravityConfig : undefined,
               piConfig: muxSession.mode === 'pi' ? savedState?.piConfig : undefined,
@@ -3951,6 +4031,10 @@ export class WebServer extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.recoveryStopping = true;
+    for (const controller of this.recoveryControllers.values()) controller.stop();
+    await Promise.all([...this.recoveryControllers.keys()].map((id) => this.stopRecoveryController(id, false)));
+    await this.recoveryStore.flush();
     getLifecycleLog().log({ event: 'server_stopped', sessionId: '*' });
     // Set stopping flag to prevent new timer creation during shutdown
     this.sse.setStopping();

@@ -141,7 +141,12 @@ import {
 } from './session-attachment-history.js';
 import type { SessionAttachmentHistoryItem, DisplayModel } from './types/session.js';
 import { resolveConfigModel } from './model-config-resolvers.js';
-import { legacyConfigForMode } from './session-cli-registry-bridge.js';
+import { legacyConfigForMode, buildSpawnCommandFromRegistry } from './session-cli-registry-bridge.js';
+import { hashCodexPrompt } from './recovery/codex-identity.js';
+import { CodexInputProofTracker, type CodexInputProof } from './recovery/codex-input-proof.js';
+import { CONTINUATION_PROMPT, type RecoveryFlight } from './recovery/types.js';
+import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
+import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from './session-env-clamp.js';
 import {
   launchModelFor,
   readScreenModel,
@@ -500,6 +505,7 @@ export class Session extends EventEmitter {
    * (`startMode: 'shell'`), so a shell tab is not renamed after every `ls`.
    */
   private readonly _submittedPromptTracker = new SubmittedPromptTracker();
+  private readonly _recoveryInputProofTracker = new CodexInputProofTracker();
   private readonly _acceptsPrompts: boolean;
   private ptyProcess: pty.IPty | null = null;
   private _pid: number | null = null;
@@ -656,6 +662,7 @@ export class Session extends EventEmitter {
   // Multiplexer session support (tmux)
   private _mux: TerminalMultiplexer | null = null;
   private _muxSession: MuxSession | null = null;
+  private _preserveExitedPane = false;
   private _useMux: boolean = false;
   /**
    * The agent in this session's local tmux pane has exited (Ark0N/Codeman#446).
@@ -867,6 +874,8 @@ export class Session extends EventEmitter {
       attachmentHistory?: SessionAttachmentHistoryItem[];
       /** Restored wall-clock ms of the pane's last Enter (see `lastSubmitAt`). */
       lastSubmitAt?: number;
+      /** Boot recovery attaches to an exited Codex pane; only its durable controller may relaunch it. */
+      preserveExitedPane?: boolean;
       /** Restored conversation chain, oldest first (see `claudeSessionChain`). */
       claudeSessionChain?: string[];
       /** Restored agent-exit observation for this session's pane (see `paneExit`). */
@@ -951,6 +960,11 @@ export class Session extends EventEmitter {
     this._mux = config.mux || null;
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this._muxSession = config.muxSession || null;
+    this._preserveExitedPane = config.preserveExitedPane ?? false;
+    // Input while the server was down cannot be reconstructed from a launch resume id.
+    // A fresh exact ordinary submission must re-verify the physical pane's current thread.
+    this._recoverySwitchPending = this._preserveExitedPane;
+    if (this._preserveExitedPane) this._recoveryInputProofTracker.invalidate();
 
     // Apply Nice priority configuration if provided
     if (config.niceConfig) {
@@ -1955,7 +1969,7 @@ export class Session extends EventEmitter {
 
   /**
    * Returns a subset of env overrides safe for disk persistence (state.json).
-   * Only non-sensitive `CLAUDE_CODE_*` keys plus CLAUDE_CONFIG_DIR (a path, not
+   * Only non-sensitive `CLAUDE_CODE_*` keys plus CLAUDE_CONFIG_DIR and CODEX_HOME (paths, not
    * a secret — and losing it across a restart would silently move a session back
    * to the default Claude account, #255) are included. `OPENCODE_*` keys are
    * filtered out because the schema permits them and they can carry secrets
@@ -1966,7 +1980,7 @@ export class Session extends EventEmitter {
     if (!this._envOverrides) return undefined;
     const safe: Record<string, string> = {};
     for (const [key, value] of Object.entries(this._envOverrides)) {
-      if (key.startsWith('CLAUDE_CODE_') || key === 'CLAUDE_CONFIG_DIR') safe[key] = value;
+      if (key.startsWith('CLAUDE_CODE_') || key === 'CLAUDE_CONFIG_DIR' || key === 'CODEX_HOME') safe[key] = value;
     }
     return Object.keys(safe).length > 0 ? safe : undefined;
   }
@@ -2060,6 +2074,8 @@ export class Session extends EventEmitter {
     spawnErrLabel: string;
   }): Promise<{ isRestored: boolean; respawnedResumeId?: string; respawnedDeadPane: boolean }> {
     const mux = this._mux!;
+    const preserveExitedPane = this._preserveExitedPane;
+    this._preserveExitedPane = false;
 
     // Verify stale mux session — tmux may have been destroyed (e.g., killed externally).
     // A session that HAD a mux session relaunches its CLI below just like a failed
@@ -2071,6 +2087,7 @@ export class Session extends EventEmitter {
       console.log('[Session] Stale mux session detected (tmux gone):', this._muxSession.muxName);
       this._muxSession = null;
       muxSessionVanished = true;
+      if (preserveExitedPane) throw new Error('Recovery cannot recreate an unverified missing pane');
     }
 
     // Check if session exists but pane is dead (remain-on-exit keeps it alive)
@@ -2078,7 +2095,7 @@ export class Session extends EventEmitter {
     let needsNewSession = false;
     let respawnedDeadPane = false;
     let respawnedResumeId: string | undefined;
-    if (this._muxSession && mux.isPaneDead(this._muxSession.muxName)) {
+    if (this._muxSession && mux.isPaneDead(this._muxSession.muxName) && !preserveExitedPane) {
       console.log('[Session] Dead pane detected, respawning:', this._muxSession.muxName);
       // Confirmed dead — safe to resolve/pin now (see `_pinOmpRespawnId()`).
       // `options.respawnPaneOptions` was built eagerly before this dead-pane
@@ -2241,7 +2258,132 @@ export class Session extends EventEmitter {
    *   the mux session is gone — see {@link reattachRemote} for that reasoning).
    */
   async restartCli(): Promise<boolean> {
+    if (this._recoveryDelivering) return false;
     return this._withPaneLifecycle(() => this._doRestartCli());
+  }
+
+  private _recoveryGeneration = 0;
+  private _recoveryDelivering = false;
+  private _recoverySubmission?: { at: number; hash: string };
+  private _recoveryIntentionalStopAt = 0;
+  private _recoverySwitchPending = false;
+
+  get recoveryInputReserved(): boolean {
+    return this._recoveryDelivering;
+  }
+
+  /** Private recovery evidence; raw prompts and environment values never enter the public session state. */
+  getRecoveryContext() {
+    const entry = getCli(this.mode);
+    const command = entry
+      ? buildSpawnCommandFromRegistry(entry, {
+          sessionId: this.id,
+          mode: this.mode,
+          codexConfig: this._codexConfig,
+        })
+      : undefined;
+    return {
+      generation: this._recoveryGeneration,
+      submission: this._recoverySubmission,
+      intentionalStopAt: this._recoveryIntentionalStopAt,
+      switchPending: this._recoverySwitchPending,
+      managed: this.paneExitApplies && !this._closing && !this._isStopped && !this._respawnBlocked,
+      noDaemon:
+        this._muxSession?.recoveryIsolated === true &&
+        this._codexConfig?.noDaemon === true &&
+        /(?:^|\s)--no-daemon(?:\s|$)/.test(command ?? ''),
+      codexHome: this._envOverrides?.CODEX_HOME,
+    };
+  }
+
+  /** Pin only a resolver-verified Codex UUID. Never supply the Codeman id or a cwd heuristic. */
+  pinRecoveryConversation(id: string): void {
+    if (
+      getCli(this.mode)?.capabilities.recovery !== 'codex-rollout' ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(id)
+    )
+      return;
+    this._codexConfig = { ...this._codexConfig, resumeSessionId: id };
+    this._claudeSessionId = id;
+  }
+
+  async inspectRecoveryPane() {
+    if (!this.paneExitApplies || !this._muxSession) return null;
+    return this._mux?.inspectPaneForRecovery?.(this._muxSession.muxName) ?? null;
+  }
+
+  /** Revalidate under the lifecycle guard, and never kill a live pane as crash recovery. */
+  async deliverRecovery(
+    flight: RecoveryFlight,
+    generation: number,
+    isCurrent: () => boolean = () => true
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
+    const context = this.getRecoveryContext();
+    if (
+      !isCurrent() ||
+      !context.managed ||
+      !context.noDaemon ||
+      context.switchPending ||
+      this._paneLifecycleOps > 0 ||
+      this._recoveryDelivering ||
+      generation !== context.generation ||
+      this._codexConfig?.resumeSessionId !== flight.conversationId
+    )
+      return 'not-sent';
+    this._recoveryDelivering = true;
+    try {
+      return await this._withPaneLifecycle(async () => {
+        const pane = await this.inspectRecoveryPane();
+        const safeConfig = await clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig });
+        const safeEnv = await clampEnvOverridesForOwner(this.owner, this._envOverrides);
+        if (
+          JSON.stringify(safeConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(safeEnv) !== JSON.stringify(this._envOverrides)
+        )
+          return 'not-sent';
+        const currentContext = this.getRecoveryContext();
+        if (
+          !isCurrent() ||
+          !pane ||
+          !currentContext.managed ||
+          !currentContext.noDaemon ||
+          currentContext.switchPending ||
+          currentContext.generation !== generation ||
+          this._codexConfig?.resumeSessionId !== flight.conversationId
+        )
+          return 'not-sent';
+        this._submitVerifier?.cancel();
+        this._submitVerifier = null;
+        if (flight.action === 'restart') {
+          if (!pane.dead || !((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0))
+            return 'not-sent';
+          // Same current settings and exact resume id through the registry; no fallback to a fresh conversation.
+          const pid = await this._mux!.respawnPane({ ...this._buildRespawnPaneOptions(), onlyIfDead: true });
+          if (!pid) return 'unknown';
+          this.clearPaneExitForNewPane();
+          return 'sent';
+        }
+        if (
+          pane.dead ||
+          this.isBusy() ||
+          this.watching ||
+          !pane.screen ||
+          !hasEmptyCodexComposer(pane.screen) ||
+          /esc to interrupt|reconnecting|would you like|approve this/i.test(pane.screen)
+        )
+          return 'not-sent';
+        // Browser frames report false during this short reservation so durable clients retain and retry them.
+        const sent = await this._mux!.sendInput(this.id, `${CONTINUATION_PROMPT}\r`);
+        if (!sent) return 'unknown'; // text may have landed even when Enter failed
+        this._lastSubmitAt = Date.now();
+        this._verifySubmitted(`${CONTINUATION_PROMPT}\r`);
+        return 'sent';
+      });
+    } catch {
+      return 'unknown';
+    } finally {
+      this._recoveryDelivering = false;
+    }
   }
 
   private async _doRestartCli(): Promise<boolean> {
@@ -2642,6 +2784,7 @@ export class Session extends EventEmitter {
   }
 
   async startInteractive(): Promise<void> {
+    if (this._recoveryDelivering) throw new Error('Session recovery is in progress');
     if (this.ptyProcess) {
       throw new Error('Session already has a running process');
     }
@@ -3664,6 +3807,7 @@ export class Session extends EventEmitter {
    * ```
    */
   async startShell(): Promise<void> {
+    if (this._recoveryDelivering) throw new Error('Session recovery is in progress');
     if (this.ptyProcess) {
       throw new Error('Session already has a running process');
     }
@@ -4336,6 +4480,7 @@ export class Session extends EventEmitter {
    * input could disappear while the caller believed it had been delivered.
    */
   write(data: string, options: SessionWriteOptions = {}): boolean {
+    if (this._recoveryDelivering) return false;
     const submittedPrompt = this._trackSubmit(data, options);
     if (!this.ptyProcess) return false;
     this.ptyProcess.write(data);
@@ -4362,12 +4507,44 @@ export class Session extends EventEmitter {
    * kick-starts, respawn `/clear`s, cron launches, approval answers and the
    * trust-dialog keys all arrive without `fromUser` and so can never name a tab.
    */
-  private _trackSubmit(data: string, options: SessionWriteOptions): string[] {
+  private _trackSubmit(
+    data: string,
+    options: SessionWriteOptions,
+    viaMux = false
+  ): {
+    prompts: string[];
+    recovery?: CodexInputProof & { generation: number; at: number };
+  } {
+    let recovery: (CodexInputProof & { generation: number; at: number }) | undefined;
+    if (data && getCli(this.mode)?.capabilities.recovery === 'codex-rollout') {
+      this._recoveryGeneration++;
+      if (options.fromUser && this._acceptsPrompts) {
+        const text = data.endsWith('\r') ? data.slice(0, -1) : data;
+        // sendInput removes CR/LF and trims trailing whitespace. Such writes
+        // cannot prove the raw draft; browser PTY input is recorded unchanged.
+        const muxChangesInput = viaMux && (/[\r\n]/.test(text) || text.trimEnd() !== text);
+        if (muxChangesInput) this._recoveryInputProofTracker.invalidate();
+        recovery = {
+          ...this._recoveryInputProofTracker.feed(data),
+          generation: this._recoveryGeneration,
+          at: Date.now(),
+        };
+        recovery.invalidated ||= muxChangesInput;
+        // Set the veto before dispatch, including failed sends and slash switches.
+        // A successful exact ordinary submission may lift it in _emitSubmittedPrompt.
+        if (recovery.invalidated || recovery.prompts.length > 0) this._invalidateRecoverySubmission();
+        if (data === '\x1b' || data.includes('\x03')) this._recoveryIntentionalStopAt = Date.now();
+        this.emit('recoveryUserInput');
+      } else {
+        this._recoveryInputProofTracker.invalidate();
+        this._invalidateRecoverySubmission();
+      }
+    }
     const submitted = options.fromUser && this._acceptsPrompts ? this._submittedPromptTracker.feed(data) : [];
     if (data.includes('\r') || data.includes('\n')) {
       this._lastSubmitAt = Date.now();
     }
-    return submitted;
+    return { prompts: submitted, recovery };
   }
 
   /**
@@ -4377,12 +4554,33 @@ export class Session extends EventEmitter {
    * separator. Reports submissions like a write would (a line feed never is one).
    */
   trackUserInput(data: string): void {
-    if (!this._acceptsPrompts) return;
-    this._emitSubmittedPrompt(this._submittedPromptTracker.feed(data));
+    this._emitSubmittedPrompt(this._trackSubmit(data, { fromUser: true }));
   }
 
-  private _emitSubmittedPrompt(prompts: string[]): void {
-    for (const prompt of prompts) {
+  private _invalidateRecoverySubmission(): void {
+    const changed = this._recoverySubmission !== undefined || !this._recoverySwitchPending;
+    this._recoverySubmission = undefined;
+    this._recoverySwitchPending = true;
+    if (changed) this.emit('recoveryIdentityChanged');
+  }
+
+  private _emitSubmittedPrompt(submitted: {
+    prompts: string[];
+    recovery?: CodexInputProof & { generation: number; at: number };
+  }): void {
+    const proof = submitted.recovery;
+    if (proof && proof.generation === this._recoveryGeneration && !proof.invalidated && proof.prompts.length === 1) {
+      const prompt = proof.prompts[0];
+      if (prompt !== undefined && !prompt.trimStart().startsWith('/')) {
+        this._recoverySubmission = { at: proof.at, hash: hashCodexPrompt(prompt) };
+        this._recoverySwitchPending = false;
+        this.emit('recoveryIdentityChanged');
+      } else if (prompt !== undefined && /^\/exit\b/.test(prompt.trimStart())) {
+        this._recoveryIntentionalStopAt = proof.at;
+        this.emit('recoveryIdentityChanged');
+      }
+    }
+    for (const prompt of submitted.prompts) {
       this.emit('promptSubmitted', prompt);
     }
   }
@@ -4482,7 +4680,8 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    const submittedPrompt = this._trackSubmit(data, options);
+    if (this._recoveryDelivering) return false;
+    const submittedPrompt = this._trackSubmit(data, options, !!(this._mux && this._muxSession));
     if (this._mux && this._muxSession) {
       const sent = await this._mux.sendInput(this.id, data);
       if (sent) {

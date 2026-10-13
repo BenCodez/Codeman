@@ -193,6 +193,7 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.SESSION_RESPAWN_BREAKER_TRIPPED, '_onSessionRespawnBreakerTripped'],
   [SSE_EVENTS.SESSION_CLI_INFO, '_onSessionCliInfo'],
   [SSE_EVENTS.SESSION_STATUS_TELEMETRY, '_onSessionStatusTelemetry'],
+  [SSE_EVENTS.SESSION_RECOVERY, '_onSessionRecovery'],
 
   // Scheduled runs
   [SSE_EVENTS.SCHEDULED_CREATED, '_onScheduledCreated'],
@@ -2291,6 +2292,8 @@ class CodemanApp {
   _onInit(data) {
     _crashDiag.log(`INIT: ${data.sessions?.length || 0} sessions`);
     this.handleInit(data);
+    // Recovery events missed during a disconnect are reconciled by an authoritative read.
+    if (this._recoveryView) void this.loadRecoveryStatus?.();
     // Start the remote-host reachability poller even if no session switch follows
     // (a page loaded with the remote tab already active) — see host-wake-ui.js.
     this._ensureHostWakePoller?.();
@@ -2350,6 +2353,7 @@ class CodemanApp {
   }
 
   _onSessionDeleted(data) {
+    if (this.editingSessionId === data.id) this.closeSessionOptions?.();
     if (this._wsSessionId === data.id) this._disconnectWs();
     // Solo window whose session just ended → show the "unavailable" state.
     if (this.isSoloWindow && data.id === this.soloSessionId) {

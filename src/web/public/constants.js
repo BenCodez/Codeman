@@ -1632,6 +1632,7 @@ const SSE_EVENTS = {
   SESSION_INTERACTIVE: 'session:interactive',
   SESSION_RUNNING: 'session:running',
   SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
+  SESSION_RECOVERY: 'session:recovery',
 
   // Scheduled runs
   SCHEDULED_CREATED: 'scheduled:created',

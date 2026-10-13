@@ -29,6 +29,13 @@ import { dataPath } from '../src/config/instance.js';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
 
+// Rendering never launches a pane; its constructor dependency is the in-memory
+// test manager, independent of whether tmux happens to be installed in PATH.
+vi.mock('../src/mux-factory.js', async () => {
+  const { TmuxManager } = await import('../src/tmux-manager.js');
+  return { createMultiplexer: () => new TmuxManager() };
+});
+
 // renderIndexHtml probes the real PATH for every CLI, which would make the
 // assertions below depend on whatever happens to be installed on the machine
 // running the suite. Default them all to "not installed" and opt in per test.
@@ -249,6 +256,7 @@ describe('WebServer.renderIndexHtml', () => {
       order: number;
       kind: string;
       external: boolean;
+      recovery?: 'codex-rollout' | null;
       enabled: boolean;
       available: boolean;
     }>;
@@ -257,6 +265,7 @@ describe('WebServer.renderIndexHtml', () => {
       label: 'Codex',
       kind: 'agent',
       external: true,
+      recovery: 'codex-rollout',
     });
     // claude is `kind: 'agent'` too; `external` is what keeps its Respawn/Ralph options visible.
     expect(catalog.find((entry) => entry.id === 'claude')).toMatchObject({ kind: 'agent', external: false });
@@ -264,7 +273,7 @@ describe('WebServer.renderIndexHtml', () => {
     expect(
       catalog.every((entry) =>
         Object.keys(entry).every((key) =>
-          ['id', 'label', 'shortBadge', 'order', 'kind', 'external', 'enabled', 'available'].includes(key)
+          ['id', 'label', 'shortBadge', 'order', 'kind', 'external', 'recovery', 'enabled', 'available'].includes(key)
         )
       )
     ).toBe(true);

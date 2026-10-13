@@ -271,7 +271,11 @@ describe('cross-field integrity', () => {
     // shipped entry must be on the param side of that line.
     const codex = STOCK_CLIS.find((e) => (e.id as string) === 'codex');
     expect(codex).toBeDefined();
-    expect(codex!.capabilities.privilegedParams.map((c) => c.param)).toEqual(['bypassApprovals']);
+    expect(codex!.capabilities.privilegedParams.map((c) => c.param)).toEqual([
+      'bypassApprovals',
+      'sandbox',
+      'approvalPolicy',
+    ]);
     expect(codex!.launch.legacyConfigAliases?.bypassApprovals).toBe('dangerouslyBypassApprovals');
 
     const wrong = baseEntry('codex');

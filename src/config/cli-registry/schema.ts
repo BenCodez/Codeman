@@ -289,6 +289,7 @@ const capabilitiesSchema = z
     requiresMux: z.boolean(),
     hooks: z.enum(['none', 'always', 'supervised']),
     transcript: z.enum(['claude-jsonl', 'codex-rollout', 'deepseek-zstd', 'omp-jsonl', 'none']),
+    recovery: z.enum(['codex-rollout']).optional(),
     altScreen: z.enum(['strip-full', 'strip-mux-only', 'strip-mux-and-mouse', 'preserve']),
     echo: echoSchema,
     wheelForward: z
@@ -429,8 +430,17 @@ const capabilitiesSchema = z
             param: z.string(),
             clampTo: z.union([z.boolean(), z.string()]),
             materializeWhenAbsent: z.boolean().optional(),
+            whenValues: z
+              .array(z.union([z.boolean(), z.string().min(1).max(100)]))
+              .min(1)
+              .max(8)
+              .optional(),
           })
           .strict()
+          .refine(
+            (clamp) => clamp.whenValues === undefined || clamp.materializeWhenAbsent !== true,
+            'whenValues cannot materialize an absent param'
+          )
       )
       .max(8),
     // Exact env var NAMES, not prefixes: this list is a targeted deny, and a prefix here
@@ -632,12 +642,29 @@ export const CliEntrySchema = z
     // `permissionMode` an alias later would otherwise have removed its clamp with nothing
     // saying so.
     entry.capabilities.privilegedParams.forEach((clamp, i) => {
-      if (!declaredParams.has(clamp.param)) {
+      const spec = entry.launch.params[clamp.param];
+      if (!spec) {
         ctx.addIssue({
           code: 'custom',
           message: `privilegedParams param "${clamp.param}" is not a declared launch param`,
           path: ['capabilities', 'privilegedParams', i, 'param'],
         });
+        return;
+      }
+      if (clamp.whenValues !== undefined) {
+        // A conditional clamp can name only values its enum/bool param admits, never
+        // a token, expression or unrelated value that would silently skip the clamp.
+        const accepts = (value: boolean | string): boolean =>
+          spec.type === 'enum'
+            ? typeof value === 'string' && spec.values.includes(value)
+            : spec.type === 'bool' && typeof value === 'boolean';
+        if (!clamp.whenValues.every(accepts) || !accepts(clamp.clampTo)) {
+          ctx.addIssue({
+            code: 'custom',
+            message: `privilegedParams whenValues and clampTo must belong to enum/bool param "${clamp.param}"`,
+            path: ['capabilities', 'privilegedParams', i, 'whenValues'],
+          });
+        }
       }
     });
 

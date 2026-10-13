@@ -2319,6 +2319,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         sessionId,
         muxName,
         pid,
+        recoveryIsolated:
+          !remote &&
+          !docker &&
+          getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
+          /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd),
         createdAt: Date.now(),
         workingDir,
         remote,
@@ -2504,7 +2509,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       await execAsync(
-        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+        `${this.tmux()} respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
         {
           timeout: EXEC_TIMEOUT_MS,
         }
@@ -2517,7 +2522,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // write the old death back over the pane that just replaced it.
       this.clearPaneExit(muxName);
       const pid = this.getPanePid(muxName);
-      if (pid) session.pid = pid;
+      if (pid) {
+        session.pid = pid;
+        session.recoveryIsolated =
+          !remote &&
+          !docker &&
+          getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
+          /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd);
+        this.saveSessions();
+      }
       return pid;
     } catch (err) {
       console.error('[TmuxManager] Failed to respawn pane:', err);
@@ -3835,6 +3848,37 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * terminal. Returns null in tests (no tmux) so callers fall back to their
    * stream heuristics rather than reading an empty screen as "not working".
    */
+  async inspectPaneForRecovery(muxName: string): Promise<{
+    dead: boolean;
+    status?: number;
+    signal?: number;
+    screen: string | null;
+  } | null> {
+    if (IS_TEST_MODE || !isValidMuxName(muxName)) return null;
+    try {
+      const { stdout } = await execAsync(
+        `${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}'`,
+        { timeout: EXEC_TIMEOUT_MS, maxBuffer: 16_384 }
+      );
+      const rows = stdout.trim().split('\n');
+      if (rows.length !== 1) return null;
+      const [dead, status, signal, paneId] = rows[0].split('|');
+      if (!/^[01]$/.test(dead) || !/^%\d+$/.test(paneId ?? '')) return null;
+      const number = (s: string): number | undefined => (/^\d{1,5}$/.test(s) ? Number(s) : undefined);
+      let screen: string | null = null;
+      if (dead === '0') {
+        const capture = await execAsync(`${this.tmux()} capture-pane -p -t ${shellescape(paneId)}`, {
+          timeout: EXEC_TIMEOUT_MS,
+          maxBuffer: 64 * 1024,
+        });
+        screen = capture.stdout;
+      }
+      return { dead: dead === '1', status: number(status), signal: number(signal), screen };
+    } catch {
+      return null;
+    }
+  }
+
   capturePaneText(muxName: string, paneTarget?: string): string | null {
     if (IS_TEST_MODE) return null;
     const target = resolveTmuxPaneTarget(muxName, paneTarget);

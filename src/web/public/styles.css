@@ -22120,3 +22120,101 @@ html[data-header-stats='tiles'] .header-plan-usage:not(:has(.pu-row)) {
   border: 1px solid var(--control-border);
   color: var(--text-muted);
 }
+
+/* Structured recovery stays within the Session Options settings surface. */
+#sessionOptionsModal .recovery-state-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+  margin: 0 0 12px;
+  padding: 12px;
+  border: 1px solid var(--control-border);
+  border-radius: 9px;
+  background: var(--control-bg);
+}
+
+#sessionOptionsModal .recovery-state-grid dt {
+  margin-bottom: 3px;
+  color: var(--text-muted);
+  font-size: 0.65rem;
+}
+
+#sessionOptionsModal .recovery-state-grid dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+#sessionOptionsModal .recovery-state-reason {
+  grid-column: 1 / -1;
+}
+
+#sessionOptionsModal .recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+#sessionOptionsModal .recovery-actions-hint {
+  margin-bottom: 14px;
+}
+
+#sessionOptionsModal .recovery-settings {
+  min-width: 0;
+  margin: 0 0 14px;
+  padding: 0;
+  border: 0;
+}
+
+#sessionOptionsModal .recovery-settings:disabled {
+  opacity: 0.65;
+}
+
+#sessionOptionsModal .recovery-number {
+  width: 80px;
+  min-width: 65px;
+  flex-shrink: 0;
+}
+
+#sessionOptionsModal .recovery-notice {
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.74rem;
+}
+
+#sessionOptionsModal .recovery-history-wrap {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--control-border);
+  border-radius: 8px;
+}
+
+#sessionOptionsModal .recovery-history {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.67rem;
+  color: var(--text);
+}
+
+#sessionOptionsModal .recovery-history th,
+#sessionOptionsModal .recovery-history td {
+  padding: 7px 8px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--control-border);
+}
+
+#sessionOptionsModal .recovery-history th {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+#sessionOptionsModal .recovery-notice[hidden],
+#sessionOptionsModal .recovery-history-wrap[hidden],
+#sessionOptionsModal #recoveryHistoryEmpty[hidden] {
+  display: none;
+}

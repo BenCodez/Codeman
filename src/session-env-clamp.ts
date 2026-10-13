@@ -35,6 +35,36 @@ import { canUsernameRunPrivilegedCommands } from './user-store.js';
 import { enabledClis } from './config/cli-registry/registry.js';
 
 /**
+ * Clamp per-CLI configs at launch or recovery using the owner's CURRENT grant.
+ * Conditional clamps preserve safe explicit choices and never invent absent values.
+ */
+export async function clampExternalCliConfigsForOwner(
+  owner: string | undefined,
+  configs: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  if (await canUsernameRunPrivilegedCommands(owner)) return configs;
+
+  const out = { ...configs };
+  for (const entry of enabledClis()) {
+    const field = entry.launch.legacyConfigField;
+    if (!field) continue;
+    // Clamp names use the registry-param namespace; the wire config may alias them
+    // (Codex bypassApprovals -> dangerouslyBypassApprovals).
+    const aliases = entry.launch.legacyConfigAliases ?? {};
+    const existing = out[field] as Record<string, unknown> | undefined;
+    let next = existing;
+    for (const { param, clampTo, materializeWhenAbsent, whenValues } of entry.capabilities.privilegedParams) {
+      if (next === undefined && !materializeWhenAbsent) continue;
+      const wireField = aliases[param] ?? param;
+      if (whenValues && !whenValues.some((value) => value === next?.[wireField])) continue;
+      next = { ...(next ?? {}), [wireField]: clampTo };
+    }
+    if (next !== existing) out[field] = next;
+  }
+  return out;
+}
+
+/**
  * Env-var keys a non-granted owner must not be able to set, because each one
  * hands back privilege `clampExternalCliBypassForOwner()` just removed, or redirects a
  * credential-resolution endpoint.

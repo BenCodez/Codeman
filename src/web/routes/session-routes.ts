@@ -112,8 +112,8 @@ import {
 } from '../route-helpers.js';
 import { buildAgentCaseMarker, writeAgentCaseMarker } from '../../agent-case-marker.js';
 import { canUsernameRunPrivilegedCommands, resolveClaudeModeForUsername } from '../../user-store.js';
-import { clampEnvOverridesForOwner } from '../../session-env-clamp.js';
-import { enabledClis, getCli } from '../../config/cli-registry/registry.js';
+import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../../session-env-clamp.js';
+import { getCli } from '../../config/cli-registry/registry.js';
 import type { NewlineSequence } from '../../config/cli-registry/types.js';
 import { resolveCliLaunchError } from '../../utils/cli-launcher.js';
 import { applyLaunchDefaults } from '../launch-defaults.js';
@@ -476,34 +476,7 @@ async function clampExternalCliBypassForOwner(
   owner: string | undefined,
   configs: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  if (await canUsernameRunPrivilegedCommands(owner)) return configs;
-
-  const out = { ...configs };
-  for (const entry of enabledClis()) {
-    const field = entry.launch.legacyConfigField;
-    if (!field) continue;
-    // `privilegedParams[].param` names the REGISTRY param, so it has to be translated to the
-    // legacy wire field on the way out — the same `legacyConfigAliases` hop `configSetenvValues`
-    // already makes. Writing `param` straight through would put it in a DIFFERENT namespace
-    // from every other `param` in the schema, and a name that is right in one and wrong in the
-    // other is a SILENT no-op: no load error, no failing test, the clamp simply stops clamping.
-    // Codex is where the two names differ (`bypassApprovals` vs `dangerouslyBypassApprovals`),
-    // and `schema.ts` refuses an entry naming a param it never declared.
-    const aliases = entry.launch.legacyConfigAliases ?? {};
-    const existing = out[field] as Record<string, unknown> | undefined;
-    let next = existing;
-    for (const { param, clampTo, materializeWhenAbsent } of entry.capabilities.privilegedParams) {
-      // MATERIALIZE vs ONLY-IF-SENT is the whole design of this clamp, and the two are not
-      // interchangeable — see CliCapabilities.privilegedParams. Materialize where the CLI's
-      // own absent-config default is ITSELF unsafe (gemini defaults to yolo; pi's default is
-      // an interactive trust prompt the session user could just answer "yes" to), so a
-      // caller who sends no config at all still gets clamped.
-      if (next === undefined && !materializeWhenAbsent) continue;
-      next = { ...(next ?? {}), [aliases[param] ?? param]: clampTo };
-    }
-    if (next !== existing) out[field] = next;
-  }
-  return out;
+  return clampExternalCliConfigsForOwner(owner, configs);
 }
 
 /**
@@ -2240,6 +2213,9 @@ export function registerSessionRoutes(
 
     const session = findSessionOrFail(ctx, id, req);
     const muxName = session.muxName;
+    if (session.recoveryInputReserved) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the key');
+    }
     if (!muxName) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No tmux session');
     }

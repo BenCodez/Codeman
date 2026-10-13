@@ -463,6 +463,8 @@ export interface CliCapabilities {
    * ASCII-art splash as the worker's first answer.
    */
   transcript: 'claude-jsonl' | 'codex-rollout' | 'deepseek-zstd' | 'omp-jsonl' | 'none';
+  /** Named recovery adapter. Absence means this CLI has no automatic recovery adapter. */
+  recovery?: 'codex-rollout';
   /**
    * What the server strips from this CLI's output stream before the browser sees it.
    * The value encodes three independent choices (predicates in session.ts):
@@ -589,7 +591,13 @@ export interface CliCapabilities {
    * naming a param it never declared, because getting this wrong is a SILENT no-op: no load
    * error, no failing test, the clamp just stops clamping.
    */
-  privilegedParams: Array<{ param: string; clampTo: boolean | string; materializeWhenAbsent?: boolean }>;
+  privilegedParams: Array<{
+    param: string;
+    clampTo: boolean | string;
+    materializeWhenAbsent?: boolean;
+    /** Clamp only these explicitly supplied enum/bool values; safe values stay unchanged. */
+    whenValues?: Array<boolean | string>;
+  }>;
   /**
    * Env var names a non-granted multi-user owner may not set at all, DROPPED from
    * `envOverrides` before spawn.

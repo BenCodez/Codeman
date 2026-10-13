@@ -584,6 +584,10 @@ const CODEX: CliEntry = {
     params: {
       bypassApprovals: { type: 'bool' },
       animations: { type: 'bool' },
+      noDaemon: { type: 'bool' },
+      noAltScreen: { type: 'bool' },
+      sandbox: { type: 'enum', values: ['read-only', 'workspace-write', 'danger-full-access'] },
+      approvalPolicy: { type: 'enum', values: ['on-request', 'never'] },
       model: { type: 'token', pattern: 'model' },
       reasoningEffort: { type: 'enum', values: [...CODEX_REASONING_EFFORTS] },
       resumeId: { type: 'token', pattern: 'id' },
@@ -593,7 +597,11 @@ const CODEX: CliEntry = {
         id: 'default',
         args: [
           { lit: 'codex' },
+          { flag: '--no-daemon', when: { param: 'noDaemon', is: true } },
+          { flag: '--no-alt-screen', when: { param: 'noAltScreen', is: true } },
           { flag: '--dangerously-bypass-approvals-and-sandbox', when: { param: 'bypassApprovals', is: true } },
+          { flag: '--sandbox', valueFrom: 'sandbox', when: { param: 'sandbox', state: 'set' } },
+          { flag: '--ask-for-approval', valueFrom: 'approvalPolicy', when: { param: 'approvalPolicy', state: 'set' } },
           { flag: '--config', value: 'tui.animations=true', when: { param: 'animations', is: true } },
           { flag: '--config', value: 'tui.animations=false', when: { param: 'animations', is: false } },
           { flag: '--model', valueFrom: 'model', when: { param: 'model', state: 'set' } },
@@ -703,6 +711,7 @@ const CODEX: CliEntry = {
     // never 1, so the width is not a function of the pane.
     transcriptGutter: 2,
     transcript: 'codex-rollout',
+    recovery: 'codex-rollout',
     altScreen: 'strip-full',
     echo: { policy: 'predict', anchor: { kind: 'cursor' }, predictProfile: 'codex' },
     wheelForward: { mode: 'never' }, // #227: codex ignores SGR wheel reports, never forward
@@ -715,7 +724,11 @@ const CODEX: CliEntry = {
     // does. codex is the entry where the two names differ (`bypassApprovals` here,
     // `dangerouslyBypassApprovals` on the wire), so it is the one that would have caught a
     // regression; `schema.ts` now rejects a name that is not a declared param.
-    privilegedParams: [{ param: 'bypassApprovals', clampTo: false }],
+    privilegedParams: [
+      { param: 'bypassApprovals', clampTo: false },
+      { param: 'sandbox', clampTo: 'workspace-write', whenValues: ['danger-full-access'] },
+      { param: 'approvalPolicy', clampTo: 'on-request', whenValues: ['never'] },
+    ],
     mcpConfig: {
       path: '.codex/config.toml',
       format: 'codex-toml',
