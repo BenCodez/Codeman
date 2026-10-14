@@ -2250,7 +2250,12 @@ export class Session extends EventEmitter {
    * @returns true if the pane was respawned (reattach issued), false otherwise.
    */
   async reattachRemote(): Promise<boolean> {
-    if (this._inputDeliveryInFlight) return false;
+    if (this.paneLifecycleInFlight || this._closing || this._isStopped) return false;
+    if (!this._remote || !this._useMux || !this._mux || !this._muxSession) return false;
+    return this._withPaneLifecycle(() => this._doReattachRemote());
+  }
+
+  private async _doReattachRemote(): Promise<boolean> {
     if (!this._remote) return false; // not a remote session
     if (!this._useMux || !this._mux || !this._muxSession) return false;
     const mux = this._mux;
@@ -3449,6 +3454,25 @@ export class Session extends EventEmitter {
     this._recoveryInputProofTracker.invalidate();
     this._mux.registerSession(record);
     return true;
+  }
+
+  /** Stage only our native marker for the caller's durable mux commit; the Session remains fenced. */
+  prepareCodexRestoreLaunchCommit(binding: string): void {
+    if (!this._codexRestoreWorkerMayExist) return;
+    if (!this._mux || !this._muxSession || this._mux.getSession(this.id) !== this._muxSession)
+      throw new Error('Reboot worker registration changed before durable commit');
+    if (!/^[a-f0-9]{64}$/.test(binding)) throw new Error('Reboot state binding is unverified');
+    this._muxSession.codexRestoreStateBinding = binding;
+    this._muxSession.codexRestoreUncertain = false;
+    this._mux.registerSession(this._muxSession);
+  }
+
+  /** A failed commit retains the launched worker and its original registration for inspection. */
+  retainCodexRestoreLaunchUncertainty(): void {
+    if (!this._codexRestoreWorkerMayExist || !this._mux || !this._muxSession) return;
+    if (this._mux.getSession(this.id) !== this._muxSession) return;
+    this._muxSession.codexRestoreUncertain = true;
+    this._mux.registerSession(this._muxSession);
   }
 
   /** Release tentative protection only after a complete successful restoration commit. */
@@ -5184,6 +5208,10 @@ export class Session extends EventEmitter {
   }
 
   /** Rejected owner intent still cancels a tentative launch without claiming any input delivery. */
+  noteRejectedOwnerInput(data: string): void {
+    this._rejectLifecycleOwnerInput(data, { fromUser: true });
+  }
+
   private _rejectLifecycleOwnerInput(data: string, options: SessionWriteOptions): void {
     if (
       !data ||
@@ -5825,7 +5853,6 @@ export class Session extends EventEmitter {
    * ```
    */
   async stop(killMux: boolean = true): Promise<void> {
-    if (this._codexRestoreWorkerMayExist) killMux = false;
     // Set stopped flag first to prevent new timers from being created
     this._isStopped = true;
     this._namedKeyAbort?.abort();

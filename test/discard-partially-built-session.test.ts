@@ -28,6 +28,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { safeRmHomeTree } from './mocks/test-helpers.js';
+import { createDeferred } from './mocks/index.js';
 
 import { WebServer } from '../src/web/server.js';
 import { Session } from '../src/session.js';
@@ -39,6 +40,7 @@ import { rebootRestoreRegistry } from '../src/web/reboot-restore-registry.js';
 import { writeCustomModelHosts } from '../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../src/custom-model-injection-apply.js';
 import type { SessionState } from '../src/types.js';
+import type { RecoveryController } from '../src/recovery/controller.js';
 
 /** Reach the private collections the discard is responsible for emptying. */
 interface ServerInternals {
@@ -46,12 +48,16 @@ interface ServerInternals {
   sessions: Map<string, Session>;
   sessionListenerRefs: Map<string, unknown>;
   runSummaryTrackers: Map<string, unknown>;
+  cleaningUp: Set<string>;
+  mux: TmuxManager;
+  broadcast: ReturnType<typeof vi.fn> | WebServer['broadcast'];
+  getRecoveryController(session: Session): RecoveryController | undefined;
   registerSessionWithLayout(session: Session): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
   discardPartiallyBuiltSession(
     sessionId: string,
     expectedSession?: Session,
-    options?: { preserveCustomModelConfigDir?: boolean }
+    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean; retainForInspection?: boolean }
   ): Promise<void>;
 }
 
@@ -178,6 +184,112 @@ describe('discarding a session whose pane never started', () => {
     expect(internals.sessions.get(SESSION_ID)).toBe(replacement);
     expect(internals.sessionListenerRefs.has(SESSION_ID)).toBe(true);
   });
+
+  it('fences recovery recreation and preserves a replacement installed during the actual controller drain', async () => {
+    const stale = new Session({ id: SESSION_ID, workingDir: WORKSPACE, mode: 'codex', useMux: false });
+    await internals.registerSessionWithLayout(stale);
+    await internals.setupSessionListeners(stale);
+    const controller = internals.getRecoveryController(stale)!;
+    const entered = createDeferred<void>();
+    const release = createDeferred<void>();
+    const drain = vi.spyOn(controller, 'drain').mockImplementation(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    const discarded = internals.discardPartiallyBuiltSession(SESSION_ID, stale);
+    await entered.promise;
+    const replacement = buildSession();
+    const stop = vi.spyOn(replacement, 'stop');
+    const listeners = internals.sessionListenerRefs.get(SESSION_ID);
+    const profile = customModelConfigDir(SESSION_ID);
+    mkdirSync(profile, { recursive: true });
+    writeFileSync(join(profile, 'replacement-profile'), 'keep replacement state');
+    const broadcast = vi.spyOn(internals, 'broadcast');
+    try {
+      expect(internals.cleaningUp.has(SESSION_ID)).toBe(true);
+      expect(stale.getRecoveryContext().managed).toBe(false);
+      expect(internals.getRecoveryController(stale)).toBeUndefined();
+      await internals.registerSessionWithLayout(replacement);
+      release.resolve();
+      await discarded;
+      expect(internals.sessions.get(SESSION_ID)).toBe(replacement);
+      expect(internals.sessionListenerRefs.get(SESSION_ID)).toBe(listeners);
+      expect(readFileSync(join(profile, 'replacement-profile'), 'utf8')).toBe('keep replacement state');
+      expect(stop).not.toHaveBeenCalled();
+      expect(broadcast).not.toHaveBeenCalled();
+      expect(internals.cleaningUp.has(SESSION_ID)).toBe(false);
+    } finally {
+      release.resolve();
+      await discarded;
+      drain.mockRestore();
+      broadcast.mockRestore();
+      stop.mockRestore();
+      await stale.stop(false);
+    }
+  });
+
+  it.each(['unchanged', 'replaced'] as const)(
+    'publishes retained uncertain inspection only for its current instance after the mux flush: %s',
+    async (change) => {
+      const home = join(homedir(), 'retained-inspection-home');
+      const record = await internals.mux.createSession({
+        sessionId: SESSION_ID,
+        workingDir: WORKSPACE,
+        mode: 'codex',
+        codexConfig: { noDaemon: true, resumeSessionId: REBOOT_UUID },
+        recoveryCodexHome: home,
+      });
+      record.codexRestoreUncertain = true;
+      const stale = new Session({
+        id: SESSION_ID,
+        workingDir: WORKSPACE,
+        mode: 'codex',
+        mux: internals.mux,
+        muxSession: record,
+        useMux: true,
+        codexConfig: { noDaemon: true, resumeSessionId: REBOOT_UUID },
+        recoveryCodexHome: home,
+      });
+      await internals.registerSessionWithLayout(stale);
+      await internals.setupSessionListeners(stale);
+      const entered = createDeferred<void>();
+      const release = createDeferred<void>();
+      const flush = vi.spyOn(internals.mux, 'flushSessionsDurably').mockImplementation(async () => {
+        entered.resolve();
+        await release.promise;
+      });
+      const broadcast = vi.spyOn(internals, 'broadcast');
+      const discarded = internals.discardPartiallyBuiltSession(SESSION_ID, stale, {
+        retainForInspection: true,
+        preserveMuxPane: true,
+        preserveCustomModelConfigDir: true,
+      });
+      let replacement: Session | undefined;
+      try {
+        await entered.promise;
+        if (change === 'replaced') {
+          replacement = buildSession();
+          await internals.registerSessionWithLayout(replacement);
+        }
+        release.resolve();
+        await discarded;
+        expect(internals.sessions.get(SESSION_ID)).toBe(replacement ?? stale);
+        expect(broadcast.mock.calls.filter(([event]) => event === 'session:created')).toHaveLength(
+          change === 'unchanged' ? 1 : 0
+        );
+        expect(broadcast.mock.calls.some(([event]) => event === 'session:deleted')).toBe(false);
+        expect(stale.codexRestoreWorkerMayExist).toBe(true);
+        expect(internals.mux.getSession(SESSION_ID)).toBe(record);
+        expect(internals.cleaningUp.has(SESSION_ID)).toBe(false);
+      } finally {
+        release.resolve();
+        await discarded;
+        flush.mockRestore();
+        broadcast.mockRestore();
+        if (replacement) await stale.stop(false);
+      }
+    }
+  );
 });
 
 describe('custom-model reboot restore cleanup through the real server route', () => {

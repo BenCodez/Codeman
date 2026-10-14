@@ -38,7 +38,8 @@ function enabledState(patch: Partial<RecoveryState> = {}, config: Partial<Recove
   return {
     ...state,
     ...patch,
-    armedAt: patch.armedAt ?? NOW,
+    // Stall-positive fixtures were already armed before their observed quiet interval.
+    armedAt: patch.armedAt ?? (config.detectStalls ? NOW - 20_000 : NOW),
     config: { ...state.config, enabled: true, retryDelayMs: 1000, maxRetryDelayMs: 4000, ...config },
   };
 }
@@ -243,6 +244,26 @@ describe('recovery action authority', () => {
     expect(f.observe).toHaveBeenCalledTimes(observations);
   });
 
+  it('requires new repeated confirmation when native incarnation changes under the same evidence key', async () => {
+    const f = fixture(enabledState());
+    f.observation = failure('same-cached-exit', { processProofKey: 'native-incarnation-1' });
+    await f.controller.refresh();
+    advance(2000);
+    f.observation = failure('same-cached-exit', { processProofKey: 'native-incarnation-2' });
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    advance(1999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.act).not.toHaveBeenCalled();
+    advance(1);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toMatchObject({ key: 'same-cached-exit' });
+    advance(1000);
+    await f.controller.refresh();
+    expect(f.act).toHaveBeenCalledOnce();
+  });
+
   it('is disabled by default and does not poll or act without opt-in', async () => {
     const f = fixture();
     await vi.advanceTimersByTimeAsync(300_000);
@@ -428,6 +449,60 @@ describe('recovery action authority', () => {
     expect(f.act).toHaveBeenCalledTimes(1);
     expect(f.act.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
   });
+
+  it.each(['automation', 'stall-policy'] as const)(
+    'starts a durable fresh quiet interval when enabling %s despite historical silence',
+    async (optIn) => {
+      for (const dead of [false, true]) {
+        const state = initialRecoveryState();
+        state.config = {
+          ...state.config,
+          enabled: optIn === 'stall-policy',
+          detectStalls: optIn === 'automation',
+          stalledAfterMs: 10_000,
+          retryDelayMs: 1000,
+        };
+        state.armedAt = NOW - 60_000;
+        const f = fixture(state);
+        f.observation = stalled(`new-opt-in-${optIn}-${dead}`, dead);
+        await f.controller.updateConfig(optIn === 'automation' ? { enabled: true } : { detectStalls: true });
+        expect(f.controller.getStatus().armedAt).toBe(NOW);
+        for (const offset of [0, 2000, 9999]) {
+          vi.setSystemTime(NOW + offset);
+          await f.controller.refresh();
+          expect(f.controller.getStatus().needsAttention).toBe(false);
+          expect(f.controller.getStatus().pending).toBeUndefined();
+          expect(f.act).not.toHaveBeenCalled();
+        }
+        const saved = f.journal.at(-1)!;
+        f.controller.stop();
+        const restored = fixture(saved);
+        restored.observation = structuredClone(f.observation);
+        vi.setSystemTime(NOW + 10_000);
+        await restored.controller.refresh();
+        advance(1999);
+        await restored.controller.refresh();
+        expect(restored.controller.getStatus().needsAttention).toBe(false);
+        expect(restored.controller.getStatus().pending).toBeUndefined();
+        advance(1);
+        await restored.controller.refresh();
+        if (dead) {
+          expect(restored.controller.getStatus().pending).toMatchObject({ action: 'restart', reason: 'stalled' });
+          expect(restored.act).not.toHaveBeenCalled();
+          advance(1000);
+          await restored.controller.refresh();
+          expect(restored.act).toHaveBeenCalledOnce();
+        } else {
+          expect(restored.controller.getStatus()).toMatchObject({
+            needsAttention: true,
+            lastReason: 'stall-unverified',
+          });
+          expect(restored.act).not.toHaveBeenCalled();
+        }
+        vi.setSystemTime(NOW);
+      }
+    }
+  );
 
   it('requests attention for repeated live-turn silence and never acts, even on manual Retry', async () => {
     const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
@@ -1040,7 +1115,16 @@ describe('recovery action authority', () => {
     advance(2000);
     await f.controller.refresh();
     expect(f.controller.getStatus().lastReason).not.toBe('stall-unverified');
-    advance(2000);
+    advance(7999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().lastReason).not.toBe('stall-unverified');
+    advance(1);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().lastReason).not.toBe('stall-unverified');
+    advance(1999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().lastReason).not.toBe('stall-unverified');
+    advance(1);
     await f.controller.refresh();
     expect(f.controller.getStatus().lastReason).toBe('stall-unverified');
     expect(f.act).not.toHaveBeenCalled();

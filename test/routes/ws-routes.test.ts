@@ -30,6 +30,7 @@ import { RebootIdentityFenceError } from '../../src/recovery/reboot-identity-fen
 import { Session } from '../../src/session.js';
 import type { MuxSession, TerminalMultiplexer } from '../../src/mux-interface.js';
 import * as remoteClock from '../../src/recovery/remote-clock.js';
+import { queueInputDispatch } from '../../src/web/input-dispatch-queue.js';
 
 /** Assigned by the OS on every listen (`port: 0`); see beforeEach. */
 let PORT = 0;
@@ -129,9 +130,14 @@ async function inputReceived(ws: WebSocket): Promise<void> {
 describe('ws-routes', () => {
   let app: FastifyInstance;
   let ctx: MockRouteContext;
+  let requestUser: { username: string; role: 'user' | 'admin' } | undefined;
 
   beforeEach(async () => {
+    requestUser = undefined;
     app = Fastify({ logger: false });
+    app.addHook('onRequest', async (req) => {
+      if (requestUser) req.authUser = requestUser;
+    });
     await app.register(fastifyWebsocket);
 
     ctx = createMockRouteContext({ sessionId: 'ws-test-session' });
@@ -329,6 +335,199 @@ describe('ws-routes', () => {
         await session.stop(false);
       }
     });
+    it('closes queued legacy input after owner access is lost', async () => {
+      const previousMultiuser = process.env.CODEMAN_MULTIUSER;
+      process.env.CODEMAN_MULTIUSER = '1';
+      requestUser = { username: 'alice', role: 'user' };
+      const { session, written } = isolatedRemoteWsSession();
+      session.owner = 'alice';
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const blocker = createDeferred<void>();
+      const queued = queueInputDispatch(session, 0, () => blocker.promise);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      const closed = waitForClose(ws);
+      try {
+        ws.send(JSON.stringify({ t: 'i', d: 'owner bytes' }));
+        await inputReceived(ws);
+        session.owner = 'bob';
+        blocker.resolve();
+        await queued;
+        expect((await closed).code).toBe(4011);
+        expect(written).not.toHaveBeenCalled();
+      } finally {
+        blocker.resolve();
+        await queued;
+        ws.close();
+        await session.stop(false);
+        if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+      }
+    });
+
+    it.each(['ws', 'http', 'named-key'] as const)(
+      'records rejected %s owner intent once during an actual tentative pane lifecycle',
+      async (transport) => {
+        const { session, written } = isolatedRemoteWsSession();
+        const respawn = createDeferred<number>();
+        Object.assign(session, { _mux: { muxSessionExists: () => true, respawnPane: () => respawn.promise } });
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const ownerIntent = vi.fn();
+        session.on('recoveryUserInput', ownerIntent);
+        const lifecycle = session.reattachRemote();
+        const before = session.getRecoveryContext().generation;
+        const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+        const closed = transport === 'ws' ? waitForClose(ws) : undefined;
+        try {
+          expect(session.inputDispatchAllowed).toBe(false);
+          if (transport === 'ws') {
+            ws.send(JSON.stringify({ t: 'i', d: 'cancel launch' }));
+            expect((await closed!).code).toBe(4011);
+          } else {
+            const response = await app.inject({
+              method: 'POST',
+              url: `/api/sessions/${session.id}/${transport === 'http' ? 'input' : 'send-key'}`,
+              payload:
+                transport === 'http'
+                  ? { input: 'cancel launch', useMux: false, clientId: 'intent', seq: 1 }
+                  : { key: 'C-Enter' },
+            });
+            expect(response.json()).toMatchObject({ success: false, errorCode: 'OPERATION_FAILED' });
+          }
+          expect(session.getRecoveryContext().generation).toBe(before + 1);
+          expect(ownerIntent).toHaveBeenCalledTimes(1);
+          expect(written).not.toHaveBeenCalled();
+        } finally {
+          respawn.resolve(123);
+          await lifecycle;
+          ws.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(['ws', 'http'] as const)(
+      'does not manufacture %s owner intent for an applied duplicate',
+      async (transport) => {
+        const { session, written } = isolatedRemoteWsSession();
+        const respawn = createDeferred<number>();
+        Object.assign(session, { _mux: { muxSessionExists: () => true, respawnPane: () => respawn.promise } });
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        session.shouldApplyInput('applied', 1);
+        session.commitInputSeq('applied', 1);
+        const lifecycle = session.reattachRemote();
+        const before = session.getRecoveryContext().generation;
+        const ownerIntent = vi.fn();
+        session.on('recoveryUserInput', ownerIntent);
+        const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+        try {
+          if (transport === 'ws') {
+            ws.send(JSON.stringify({ t: 'i', d: 'duplicate', cid: 'applied', seq: 1 }));
+            await inputReceived(ws);
+            expect(ws.readyState).toBe(WebSocket.OPEN);
+          } else {
+            await app.inject({
+              method: 'POST',
+              url: `/api/sessions/${session.id}/input`,
+              payload: { input: 'duplicate', clientId: 'applied', seq: 1, wait: 'stop', waitTimeout: 5 },
+            });
+          }
+          expect(session.getRecoveryContext().generation).toBe(before);
+          expect(ownerIntent).not.toHaveBeenCalled();
+          expect(written).not.toHaveBeenCalled();
+        } finally {
+          respawn.resolve(123);
+          await lifecycle;
+          ws.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(['restart', 'reattach'] as const)(
+      'closes an untagged socket when queued input crosses an actual %s pane epoch',
+      async (action) => {
+        const { session, written } = isolatedRemoteWsSession();
+        const mux = { isAvailable: () => true, muxSessionExists: () => true, respawnPane: vi.fn(async () => 123) };
+        Object.assign(session, { _mux: mux });
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const blocker = createDeferred<void>();
+        const queued = queueInputDispatch(session, 0, () => blocker.promise);
+        const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+        const closed = waitForClose(ws);
+        const before = session.paneStartedAt;
+        try {
+          for (const d of ['a', 'b', '\r']) ws.send(JSON.stringify({ t: 'i', d }));
+          await inputReceived(ws);
+          expect(await (action === 'restart' ? session.restartCli() : session.reattachRemote())).toBe(true);
+          expect(session.paneStartedAt).toBeGreaterThan(before);
+          blocker.resolve();
+          await queued;
+          expect(await closed).toEqual({ code: 4011, reason: 'Input delivery not confirmed' });
+          expect(written).not.toHaveBeenCalled();
+          expect(mux.respawnPane).toHaveBeenCalledTimes(1);
+        } finally {
+          blocker.resolve();
+          await queued;
+          ws.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(['named-key', 'clock'] as const)(
+      'closes an untagged socket while an actual %s operation owns input',
+      async (operation) => {
+        const { session, written } = isolatedRemoteWsSession();
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const key = createDeferred<void>();
+        const clock = createDeferred<remoteClock.RemoteClockWitness>();
+        vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
+        const held =
+          operation === 'named-key'
+            ? session.sendNamedKey('A', () => key.promise)
+            : session.prepareUserInputClock('Owner prompt\r', { fromUser: true });
+        const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+        const closed = waitForClose(ws);
+        try {
+          expect(session.recoveryInputReserved).toBe(true);
+          for (const d of ['a', 'b', '\r']) ws.send(JSON.stringify({ t: 'i', d }));
+          expect(await closed).toEqual({ code: 4011, reason: 'Input delivery not confirmed' });
+          key.resolve();
+          clock.resolve(currentClockWitness());
+          await held;
+          expect(written).not.toHaveBeenCalled();
+          expect(session.lastInputSeq('legacy')).toBe(0);
+        } finally {
+          key.resolve();
+          clock.resolve(currentClockWitness());
+          await held;
+          ws.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(['false', 'partial'] as const)('closes legacy input after %s delivery without replay', async (outcome) => {
+      const { session, written } = isolatedRemoteWsSession();
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      if (outcome === 'false') Object.assign(session, { ptyProcess: null });
+      else
+        written.mockImplementation(() => {
+          throw new Error('Fixture partial dispatch');
+        });
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      const closed = waitForClose(ws);
+      ws.send(JSON.stringify({ t: 'i', d: 'once' }));
+      ws.send(JSON.stringify({ t: 'i', d: 'tail' }));
+      try {
+        expect(await closed).toEqual({ code: 4011, reason: 'Input delivery not confirmed' });
+        expect(written).toHaveBeenCalledTimes(outcome === 'partial' ? 1 : 0);
+      } finally {
+        ws.close();
+        await session.stop(false);
+      }
+    });
+
     it.each(['recovery', 'named-key', 'remote-clock'])(
       'retains all three frames blocked by an actual Session %s reservation',
       async (owner) => {
@@ -693,11 +892,15 @@ describe('ws-routes', () => {
             replacement = isolatedRemoteWsSession();
             (ctx.sessions as unknown as Map<string, Session>).set(session.id, replacement.session);
           } else Object.assign(session, { _paneStartedAt: session.paneStartedAt + 1 });
+          const rejected = ['closing-session', 'replaced-session', 'replaced-pane'].includes(change)
+            ? waitForClose(second)
+            : undefined;
           clock.resolve(currentClockWitness());
           await request;
           const expected = change === 'closed-socket' ? ['HTTP\r', 'B'] : change === 'aborted-http' ? ['A', 'B'] : [];
           await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(expected));
-          await inputReceived(second);
+          if (rejected) expect((await rejected).code).toBe(4011);
+          else await inputReceived(second);
           expect(written.mock.calls.map(([data]) => data)).toEqual(expected);
         } finally {
           clock.resolve(currentClockWitness());
@@ -852,6 +1055,7 @@ describe('ws-routes', () => {
             expect(replacement.written.mock.calls.map(([data]) => data)).toEqual(['new\r']);
             expect(written).not.toHaveBeenCalled();
           }
+          const rejectedSecond = change === 'replaced-session' ? waitForClose(second) : undefined;
           clock.resolve(currentClockWitness());
           await vi.waitFor(() => expect(session.recoveryInputReserved).toBe(false));
           if (change === 'closed-second')
@@ -865,7 +1069,7 @@ describe('ws-routes', () => {
             expect(session.lastInputSeq('first-frame')).toBe(1);
           }
           if (change === 'replaced-session') {
-            await inputReceived(second);
+            expect((await rejectedSecond!).code).toBe(4011);
             expect(written).not.toHaveBeenCalled();
             expect(session.lastInputSeq('first-frame')).toBe(0);
           }

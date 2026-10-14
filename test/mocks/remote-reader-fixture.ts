@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { SessionRemote } from '../../src/types.js';
+import { guardedNativeTmuxFixture } from './remote-native-tmux.js';
 import {
   buildRemoteCodexEvidenceCommand,
   buildRemoteCodexInputCommand,
@@ -38,6 +39,19 @@ export async function fixture(
     malformedHistoryAt?: number;
     paneRow?: string;
     expectedPane?: { paneId: string; panePid: number; status?: number; signal?: number };
+    beforeEffect?:
+      | 'pid'
+      | 'dead'
+      | 'status'
+      | 'signal'
+      | 'session'
+      | 'session-id'
+      | 'server'
+      | 'pid-after-input'
+      | 'pane-id'
+      | 'signal-alias';
+    prompt?: string;
+    workingDir?: string;
   }
 ) {
   const root = await mkdtemp(join(tmpdir(), 'codeman-remote-witness-'));
@@ -52,13 +66,14 @@ export async function fixture(
     host: 'worker.invalid',
     username: 'runner',
     port: 22,
-    remotePath: '/fixture/work',
+    remotePath: correlation?.workingDir ?? '/fixture/work',
     owned: true,
   };
   try {
     await mkdir(sessions, { recursive: true });
     await mkdir(bin);
     await writeFile(log, '');
+    await writeFile(log + '.commands', '');
     const at = Date.now() - 60_000;
     const prompt = 'fixture owner input';
     const header = (id: string, createdAt: number, cwd = remote.remotePath, originator = `codeman_${SESSION}`) =>
@@ -102,7 +117,7 @@ export async function fixture(
       `const fs=require('fs');const mode=process.env.MUTATION;const swap=p=>{fs.renameSync(p,p+'-saved');fs.symlinkSync(p+'-saved',p,'dir')};if(mode==='new-conflict'||mode==='changed-sibling')fs.writeFileSync(process.env.SIBLING,process.env.CONFLICT);else if(mode==='swap-home')swap(process.env.HOME_PATH);else if(mode==='swap-ancestor')swap(process.env.ANCESTOR);else if(mode==='swap-directory')swap(process.env.SESSIONS);`
     );
     await writeFile(
-      join(bin, 'tmux'),
+      join(bin, 'tmux-base'),
       String.raw`#!/bin/sh
 case "$*" in
 *has-session*) node "$MUTATE_SCRIPT" || exit 2; [ "$KIND" = restore ] && exit 1; exit 0;;
@@ -110,7 +125,7 @@ case "$*" in
   if [ -n "$PANE_ROW" ]; then printf '%s\n' "$PANE_ROW"; exit 0; fi
   if [ "$5" = '$17' ]; then
     [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
-    printf '1|%%9|9009|1|17000\n'
+    printf '1|%%9|9009|1||17000\n'
   elif [ "$KIND" = restart ]; then printf '1|1||%%7|4242\n'; else printf '0|||%%7|4242\n'; fi;;
 *capture-pane*) printf '›\n';;
 *new-session*)
@@ -133,9 +148,10 @@ case "$*" in
 esac
 `
     );
+    await writeFile(join(bin, 'tmux'), guardedNativeTmuxFixture(join(bin, 'tmux-base')));
     await writeFile(join(bin, 'ssh'), '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n');
     await writeFile(join(bin, 'login-shell'), '#!/bin/sh\nexec /bin/sh -c "$4"\n');
-    await Promise.all(['tmux', 'ssh', 'login-shell'].map((name) => chmod(join(bin, name), 0o755)));
+    await Promise.all(['tmux', 'tmux-base', 'ssh', 'login-shell'].map((name) => chmod(join(bin, name), 0o755)));
     const request = {
       sessionId: SESSION,
       workingDir: remote.remotePath,
@@ -160,7 +176,7 @@ esac
           ? buildRemoteCodexInputCommand(remote, {
               ...request,
               expected: { ...expectedIdentity, paneId: '%7', panePid: 4242, screenHash: sha('›\n') },
-              prompt: 'fixture continuation',
+              prompt: correlation?.prompt ?? 'fixture continuation',
             })
           : kind === 'restart'
             ? buildRemoteCodexRestartCommand(remote, {
@@ -174,6 +190,8 @@ esac
       SHELL: join(bin, 'login-shell'),
       KIND: kind,
       PANE_ROW: correlation?.paneRow ?? '',
+      NATIVE_BEFORE_EFFECT: correlation?.beforeEffect ?? '',
+      NATIVE_COMMAND_LOG: log + '.commands',
       MUTATION: mutation,
       MUTATE_SCRIPT: mutate,
       EFFECT_LOG: log,
@@ -195,7 +213,7 @@ esac
           })
         ).stdout;
       } catch (error) {
-        if (correlation?.paneRow === undefined) throw error;
+        if (correlation?.paneRow === undefined && correlation?.beforeEffect === undefined) throw error;
         refused = true;
         return typeof (error as { stdout?: unknown }).stdout === 'string' ? (error as { stdout: string }).stdout : '';
       }
@@ -212,6 +230,14 @@ esac
     return {
       status,
       effects,
+      ...(correlation?.beforeEffect || correlation?.prompt !== undefined
+        ? {
+            commands: (await readFile(log + '.commands', 'utf8'))
+              .split('\n')
+              .filter(Boolean)
+              .map((line) => JSON.parse(line) as string[]),
+          }
+        : {}),
       laterReason,
       ...(correlation?.paneRow !== undefined ? { pane: parseRemoteCodexEvidence(stdout)?.pane } : {}),
       ...(kind === 'inspect' || correlation

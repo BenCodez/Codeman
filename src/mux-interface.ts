@@ -35,6 +35,8 @@ export interface MuxSession {
   codexRestoreUncertain?: boolean;
   /** Non-secret exact argv settings recorded before an uncertain reboot worker effect. */
   codexRestoreConfig?: CodexConfig;
+  /** Non-secret identity digest of the main-state snapshot expected after a reboot launch. */
+  codexRestoreStateBinding?: string;
   /** Persisted launch fact: the owned pane's actual registry command disabled the shared daemon. */
   recoveryIsolated?: boolean;
   /** Exact non-secret local Codex home pinned at an owned launch, never inferred on attach. */

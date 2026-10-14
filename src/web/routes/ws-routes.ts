@@ -170,13 +170,56 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
       const sizingToken = Symbol('ws-desktop-sizing');
       let holdsDesktopClaim = false;
 
+      // Legacy input has no delivery ACK or retry identity. Make rejection
+      // observable by closing its transport; never replay uncertain bytes.
+      const rejectLegacyInput = (msg: Record<string, unknown>) => {
+        if (
+          msg.t === 'i' &&
+          typeof msg.d === 'string' &&
+          !(typeof msg.cid === 'string' && msg.cid.length > 0 && Number.isInteger(msg.seq)) &&
+          socket.readyState === 1
+        )
+          socket.close(4011, 'Input delivery not confirmed');
+      };
+
+      const notedOwnerIntent = new WeakSet<object>();
+      const noteLifecycleOwnerIntent = (msg: Record<string, unknown>) => {
+        if (
+          typeof msg.cid === 'string' &&
+          Number.isInteger(msg.seq) &&
+          session.hasAppliedInputSeq(msg.cid, msg.seq as number)
+        )
+          return;
+        if (
+          !notedOwnerIntent.has(msg) &&
+          msg.t === 'i' &&
+          typeof msg.d === 'string' &&
+          msg.d.length <= MAX_INPUT_LENGTH &&
+          socket.readyState === 1 &&
+          ctx.sessions.get(id) === session &&
+          canAccessOwned(getAuthUser(req), session.owner) &&
+          session.inputDispatchAllowed === false
+        ) {
+          notedOwnerIntent.add(msg);
+          session.noteRejectedOwnerInput?.(msg.d);
+        }
+      };
+
       // EventEmitter does not await message listeners. Keep all sockets for this
       // exact Session in arrival order through async admission. Resize/pong/close
       // remain immediate; tagged identities enter the Session FIFO on arrival.
       const handleMessage = async (msg: Record<string, unknown>) => {
         try {
-          if (socket.readyState !== 1 || ctx.sessions.get(id) !== session || session.inputDispatchAllowed === false)
+          noteLifecycleOwnerIntent(msg);
+          if (
+            socket.readyState !== 1 ||
+            ctx.sessions.get(id) !== session ||
+            session.inputDispatchAllowed === false ||
+            !canAccessOwned(getAuthUser(req), session.owner)
+          ) {
+            rejectLegacyInput(msg);
             return;
+          }
           if (msg.t === 'i' && typeof msg.d === 'string') {
             if (msg.d.length > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame
@@ -196,7 +239,10 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
             // A rejected frame must not claim a delivery identity. Otherwise a
             // burst during recovery can manufacture a watermark for lost bytes.
-            if (session.recoveryInputReserved) return;
+            if (session.recoveryInputReserved) {
+              rejectLegacyInput(msg);
+              return;
+            }
             const apply = cid && seq !== null ? session.shouldApplyInput(cid, seq) : true;
             let delivered = true;
             if (apply) {
@@ -214,6 +260,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
                   delivered =
                     socket.readyState === 1 &&
                     ctx.sessions.get(id) === session &&
+                    canAccessOwned(getAuthUser(req), session.owner) &&
                     !!admission &&
                     admission() === true &&
                     session.write(msg.d, writeOptions);
@@ -228,6 +275,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               // a duplicate: the input was lost for good.
               if (!delivered && cid && seq !== null) session.forgetInputSeq(cid, seq);
               if (delivered && cid && seq !== null) session.commitInputSeq(cid, seq);
+              if (!delivered) rejectLegacyInput(msg);
             }
             if (seq !== null && socket.readyState === 1) {
               if (apply) {
@@ -296,6 +344,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             }
           }
         } catch {
+          rejectLegacyInput(msg);
           // Ignore malformed messages
         }
       };
@@ -320,10 +369,14 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             return;
           }
           const paneStartedAt = session.paneStartedAt;
+          noteLifecycleOwnerIntent(msg);
           void queueInputDispatch(session, msg.d.length, async () => {
-            if (session.paneStartedAt !== paneStartedAt) return;
+            if (session.paneStartedAt !== paneStartedAt) {
+              rejectLegacyInput(msg);
+              return;
+            }
             await handleMessage(msg);
-          }).catch(() => {});
+          }).catch(() => rejectLegacyInput(msg));
         } catch {
           // Ignore malformed messages without disturbing the input queue.
         }

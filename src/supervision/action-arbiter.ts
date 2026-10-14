@@ -59,7 +59,8 @@ export class SessionActionArbiter {
   async run(
     owner: SessionActionOwner,
     operation: string,
-    action: () => Promise<'sent' | 'not-sent' | 'unknown'>
+    action: () => Promise<'sent' | 'not-sent' | 'unknown'>,
+    retainSent = false
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     if (this.active || this.unresolvedOwner || !operation || operation.length > 250) return 'not-sent';
     this.active = true;
@@ -70,7 +71,8 @@ export class SessionActionArbiter {
       this.unresolvedOwner = owner;
       await this.persist?.(this.unresolvedKey);
       const result = await action();
-      if (result !== 'unknown') {
+      // A dispatched restart is still unaccepted until fresh native process readiness is durable.
+      if (result === 'not-sent' || (result === 'sent' && !retainSent)) {
         await this.persist?.(undefined);
         this.unresolvedOwner = undefined;
         this.unresolvedKey = undefined;

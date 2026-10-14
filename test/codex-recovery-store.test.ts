@@ -555,6 +555,9 @@ describe('recovery journal durability', () => {
     let harness: Awaited<ReturnType<typeof createRouteTestHarness>> | undefined;
     try {
       await controller.refresh();
+      expect(controller.getStatus().needsAttention).toBe(false);
+      now += 10_000;
+      await controller.refresh();
       now += 2000;
       await controller.refresh();
       controller.stop();
@@ -595,7 +598,7 @@ describe('recovery journal durability', () => {
       expect(restarted.getStatus().inFlight).toBeUndefined();
       expect(act).not.toHaveBeenCalled();
 
-      observation.progressAt += 1000; // New structured progress clears attention even when it is already old.
+      observation.progressAt = NOW + 1000; // Progress after arming clears attention even when it is already old.
       await restarted.inspect();
       expect(restarted.getStatus()).toMatchObject({
         needsAttention: false,

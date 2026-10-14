@@ -144,6 +144,72 @@ describe('task and recovery server action wiring', () => {
     }
   );
 
+  it.each(['sent', 'unknown'] as const)(
+    'keeps both task restart fences after %s until fresh readiness, including owner completion and reload',
+    async (result) => {
+      const id = `task-restart-fence-${result}`;
+      let now = Date.now();
+      const crashKey = `${id}-crash`;
+      let observation: RecoveryObservation = {
+        activity: 'crashed',
+        reason: 'process-crashed',
+        at: now,
+        liveProofAt: now,
+        conversationId: flight.conversationId,
+        evidenceKey: crashKey,
+        safeToAct: true,
+        processReady: false,
+      };
+      vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+        observation,
+        commands: new Map(),
+      }));
+      const restart = vi.spyOn(CodexTaskAdapter.prototype, 'recover').mockResolvedValue(result);
+      const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const { task, taskDeps, recoveryDeps } = controllers(id);
+      taskDeps.now = () => now;
+      await task.update({
+        objective: 'Finish the task',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      await task.progress({ outcome: 'unfinished', checkpoint: 'Verified step', nextAction: 'Next step' });
+      await task.refresh();
+      const reserved = task.getStatus().inFlight!;
+      expect(reserved).toMatchObject({ action: 'restart', key: crashKey });
+      const commonKey = sessionActionKey('task', crashKey);
+      expect(new TaskStore().get(id).inFlight?.key).toBe(crashKey);
+      expect(internals.actionReservationStore.get(id).inFlight?.key).toBe(commonKey);
+
+      // An owned respawn/PID and manual completion do not establish native Codex readiness.
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', processReady: true, at: ++now };
+      await task.progress({ outcome: 'completed', verifiedCriteria: ['review'] });
+      expect(task.getStatus().inFlight?.accepted).toBeUndefined();
+      expect(internals.actionReservationStore.get(id).inFlight?.key).toBe(commonKey);
+      expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+      expect(recoveryAct).not.toHaveBeenCalled();
+
+      const session = internals.sessions.get(id)!;
+      await internals.stopRecoveryController(id, false);
+      const restored = internals.getTaskController(session)!;
+      const restoredDeps = (restored as unknown as TaskControllerInternals).deps;
+      restoredDeps.now = () => now;
+      expect(restored.getStatus().inFlight).toMatchObject(reserved);
+      await restored.progress({ outcome: 'completed' });
+      expect(internals.actionReservationStore.get(id).inFlight?.key).toBe(commonKey);
+      observation = { ...observation, processReadyAt: ++now };
+      await restored.progress({ outcome: 'completed' });
+      expect(restored.getStatus().inFlight).toBeUndefined();
+      expect(internals.actionReservationStore.get(id).inFlight).toBeUndefined();
+      expect(new TaskStore().get(id).inFlight).toBeUndefined();
+      const nextRecovery = internals.getRecoveryController(session)!;
+      const nextDeps = (nextRecovery as unknown as RecoveryControllerInternals).deps;
+      expect(await nextDeps.act(flight, () => true)).toBe('sent');
+      expect(restart).toHaveBeenCalledOnce();
+      expect(recoveryAct).toHaveBeenCalledOnce();
+    }
+  );
+
   it('keeps a task-owned unknown delivery reserved when recovery is reset', async () => {
     vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValueOnce('unknown');
     const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
@@ -298,6 +364,9 @@ describe('task and recovery server action wiring', () => {
         expect(!!task.getStatus().inFlight).toBe(owner === 'in-flight');
         await recovery.updateConfig({ detectStalls: true, stalledAfterMs: 10_000, maxRetries: 1 });
 
+        await recovery.retry();
+        expect(recoveryAct).not.toHaveBeenCalled();
+        now += 10_000;
         await recovery.retry();
         now += 2000;
         await recovery.retry();

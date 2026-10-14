@@ -2765,6 +2765,24 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           })
         : localFullCmd;
 
+    let retiredBinding: string | undefined;
+    let retiredConfig: MuxSession['codexRestoreConfig'];
+    let provenanceRetired = false;
+    let workerEffectMayHaveOccurred = false;
+    const restoreRetiredProvenance = async () => {
+      if (
+        !provenanceRetired ||
+        workerEffectMayHaveOccurred ||
+        this.sessions.get(sessionId) !== session ||
+        session.codexRestoreStateBinding !== undefined ||
+        session.codexRestoreConfig !== undefined
+      )
+        return;
+      if (retiredBinding !== undefined) session.codexRestoreStateBinding = retiredBinding;
+      if (retiredConfig !== undefined) session.codexRestoreConfig = retiredConfig;
+      this.saveSessions();
+      await this.flushSessionsDurably().catch(() => {});
+    };
     try {
       if (!canDispatch()) return null;
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
@@ -2784,6 +2802,22 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       if (!canDispatch()) return null;
+      if (session.codexRestoreStateBinding !== undefined || session.codexRestoreConfig !== undefined) {
+        // A later owner/recovery launch must not inherit an earlier reboot's
+        // configuration binding, even if the new effect loses its receipt.
+        if (this.sessions.get(sessionId) !== session) return null;
+        retiredBinding = session.codexRestoreStateBinding;
+        retiredConfig = session.codexRestoreConfig;
+        provenanceRetired = true;
+        delete session.codexRestoreStateBinding;
+        delete session.codexRestoreConfig;
+        this.saveSessions();
+        await this.flushSessionsDurably(canDispatch);
+        if (!canDispatch() || this.sessions.get(sessionId) !== session) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+      }
       guard?.noteDispatch();
       const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${expected ? shellescape(expected.paneId) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
       const predicate = expected
@@ -2798,6 +2832,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : undefined;
       // The server evaluates this exact dead-process fence before queuing a no-k
       // respawn. A refused or lost response remains uncertainty-sealed by Session.
+      workerEffectMayHaveOccurred = true;
       const { stdout: spawnOutput } = await execAsync(
         `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(expected!.paneId)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}`,
         {
@@ -2825,6 +2860,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
       return pid;
     } catch (err) {
+      await restoreRetiredProvenance();
       console.error('[TmuxManager] Failed to respawn pane:', err);
       return null;
     }
@@ -3187,12 +3223,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // socket tag to reconcile and no cross-socket ambiguity that could mark a
     // live session dead (the root cause of vanished/duplicate tabs).
     let active: Map<string, number>;
+    let completeListing = false;
     try {
-      const output = execSync(`${this.tmux()} list-panes -a -F '${PANE_LIST_FORMAT}' 2>/dev/null || true`, {
+      const output = execSync(`${this.tmux()} list-panes -a -F '${PANE_LIST_FORMAT}'`, {
         encoding: 'utf-8',
         timeout: EXEC_TIMEOUT_MS,
-      }).trim();
-      const rows = parsePaneRows(output);
+        maxBuffer: 512 * 1024,
+      });
+      const frame = output.endsWith('\n') ? output.slice(0, -1) : output;
+      const lines = frame === '' ? [] : frame.split('\n');
+      const rows = parsePaneRows(frame);
+      // Absence resolves a lost launch receipt only after a successful complete
+      // socket listing. Legacy resource parsing is intentionally more tolerant.
+      completeListing =
+        Buffer.byteLength(output, 'utf8') <= 512 * 1024 &&
+        (output === '' || output.endsWith('\n')) &&
+        !frame.includes('\r') &&
+        rows.length === lines.length &&
+        lines.every((line) => line.length > 0) &&
+        rows.every((row) => row.dead !== undefined && !/\p{Cc}/u.test(row.sessionName));
+
       active = new Map(rows.map((row) => [row.sessionName, row.pid]));
       // The same read answers both questions, so recovery starts with a pane-exit
       // reading rather than waiting for the first stats tick — which may never
@@ -3205,18 +3255,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       active = new Map();
     }
 
+    let uncertaintyChanged = false;
     // Check tracked sessions against the live pane list.
     for (const [sessionId, session] of this.sessions) {
+      if (
+        (session.codexRestoreUncertain === true || session.codexRestoreStateBinding !== undefined) &&
+        !completeListing
+      ) {
+        // A completed reboot binding does not prove that its worker survived
+        // this boot. Preserve its identity for inspection while the native
+        // listing is unavailable, including the server's historical-state veto.
+        if (session.codexRestoreUncertain !== true) {
+          session.codexRestoreUncertain = true;
+          uncertaintyChanged = true;
+        }
+        continue;
+      }
       const pid = active.get(session.muxName);
       if (pid !== undefined) {
         alive.push(sessionId);
         if (pid !== session.pid) session.pid = pid;
       } else {
         dead.push(sessionId);
-        // A failed/missing listing cannot resolve a dispatch whose receipt was
-        // lost. Retain its original identity for owner inspection; never discover
-        // that possibly existing worker under a generated replacement id.
-        if (session.codexRestoreUncertain === true) continue;
         this.sessions.delete(sessionId);
         this.clearPaneExit(session.muxName);
         this.clearRemoteReconnectState(sessionId);
@@ -3269,7 +3329,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       console.log(`[TmuxManager] Discovered unknown tmux session: ${sessionName} (PID ${pid})`);
     }
 
-    if (dead.length > 0 || discovered.length > 0) {
+    if (uncertaintyChanged || dead.length > 0 || discovered.length > 0) {
       this.saveSessions();
     }
 
