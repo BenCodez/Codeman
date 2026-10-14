@@ -68,6 +68,7 @@ async function fixture(kind: Kind, jump: number, phase: Phase = 'pane') {
     await mkdir(sessions, { recursive: true });
     await writeFile(log, '');
     await writeFile(offset, '0');
+    await writeFile(join(root, 'screen'), '›\n  fixture-model default · /fixture/work\n');
     await writeFile(
       preload,
       "const fs=require('fs');const real=Date.now.bind(Date);Date.now=()=>real()+Number(fs.readFileSync(process.env.CLOCK_OFFSET_FILE,'utf8'));"
@@ -101,8 +102,8 @@ case "$*" in
     [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
     printf '1|%%9|9009|1||17000\n'
   elif [ "$KIND" = restart ]; then printf '1|1||%%7|700\n'; else printf '0|||%%7|700\n'; fi;;
-*capture-pane*) printf '›\n';;
-*send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG"; case "$*" in *' -l '*) [ "$CLOCK_PHASE" = text ] && step;; *' Enter') [ "$CLOCK_PHASE" = enter ] && step;; esac; exit 0;;
+*capture-pane*) cat "$SCREEN_FILE";;
+*send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG"; case "$*" in *' -l '*) printf '› %s\n  fixture-model default · /fixture/work\n' "$7" > "$SCREEN_FILE"; [ "$CLOCK_PHASE" = text ] && step;; *' Enter') [ "$CLOCK_PHASE" = enter ] && step;; esac; exit 0;;
 *new-session*)
   [ "$KIND" = restore ] || exit 2
   printf created > "$RESTORE_STAGE_FILE"
@@ -135,6 +136,7 @@ esac
       KIND: kind,
       FIXTURE_PANE_PID: '700',
       EFFECT_LOG: log,
+      SCREEN_FILE: join(root, 'screen'),
       RESTORE_STAGE_FILE: join(root, 'restore-stage'),
     };
     const run = (command: string) =>
@@ -151,7 +153,13 @@ esac
         clock: { localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at },
       },
       dispatchClock: { localAt: Date.now(), min: 0, max: 0 },
-      expected: { conversationId: THREAD, tailHash: sha(tail), paneId: '%7', panePid: 700, screenHash: sha('›\n') },
+      expected: {
+        conversationId: THREAD,
+        tailHash: sha(tail),
+        paneId: '%7',
+        panePid: 700,
+        screenHash: sha('›\n  fixture-model default · /fixture/work\n'),
+      },
       expectedIdentity: { conversationId: THREAD, tailHash: sha(tail) },
       expectedPane: { paneId: '%7', panePid: 700, status: 1 },
       codexConfig: { noDaemon: true, resumeSessionId: THREAD },

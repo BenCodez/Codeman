@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vitest';
 import {
   classifyCodexTail,
   hasEmptyCodexComposer,
+  hasCodexComposerText,
   type CodexClassificationContext,
 } from '../src/recovery/codex-classifier.js';
 
@@ -374,6 +375,27 @@ describe('screen evidence may veto but never authorize recovery', () => {
       hasEmptyCodexComposer('›\n  fixture-model high · /fixture/workspace\n  ← for agents · ? for shortcuts\n')
     ).toBe(true);
   });
+
+  it.each([
+    '› Exact pending text\n',
+    '› Exact pending text owner edit\n  fixture-model high · /tmp\n',
+    '› Exact pending text \n  fixture-model high · /tmp\n',
+    '›  Exact pending text\n  fixture-model high · /tmp\n',
+    '› Exact pending text\n\n  fixture-model high · /tmp\n',
+    '› Exact pending text\n  multiline draft\n  fixture-model high · /tmp\n',
+    '› Exact pending text\n  fixture-model high · /tmp\n  unknown footer\n',
+    '› Exact pending text\n› Newest owner draft\n  fixture-model high · /tmp\n',
+  ])('rejects ambiguous, incomplete or changed exact input acknowledgements: %j', (screen) => {
+    expect(hasCodexComposerText(screen, 'Exact pending text')).toBe(false);
+  });
+
+  it.each(['Exact pending text', 'café 🧭 漢字', JSON.stringify({ objective: 'First\nSecond' })])(
+    'requires the exact joined native composer and recognized footer: %j',
+    (text) => {
+      expect(hasCodexComposerText(`› ${text}\n  fixture-model high · /tmp\n\n`, text)).toBe(true);
+      expect(hasCodexComposerText(`› ${text}\n  fixture-model high · /tmp\n  ? for shortcuts\n`, text)).toBe(true);
+    }
+  );
 });
 
 describe('background subagents', () => {
