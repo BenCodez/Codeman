@@ -8,6 +8,20 @@ import { dataPath } from '../config/instance.js';
 import { TaskStateSchema, initialTaskState, type TaskState } from './schema.js';
 const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
 
+/** An unfinished objective or unresolved delivery remains owned without a live pane. */
+export function taskJournalHasOwnership(state: TaskState): boolean {
+  return (
+    !!state.inFlight ||
+    state.agentProgressVeto === true ||
+    (!!state.objective &&
+      (state.outcome !== 'completed' ||
+        state.phase !== 'completed' ||
+        state.criteria.length === 0 ||
+        state.criteria.some((criterion) => !criterion.verified))) ||
+    (!state.objective && state.config.enabled)
+  );
+}
+
 export class TaskStore {
   private records: Record<string, TaskState> = {};
   private writes: Promise<unknown> = Promise.resolve();
@@ -67,6 +81,27 @@ export class TaskStore {
       delete next[id];
       await this.write(next);
       this.records = next;
+    });
+    this.writes = result.catch(() => {});
+    return result;
+  }
+
+  /** Prune unreachable inactive records, preserving durable task/action ownership. */
+  pruneOrphans(keep: (id: string) => boolean): Promise<number> {
+    if (this.loadFailed) return Promise.reject(new Error('Task journal could not be loaded; refusing overwrite'));
+    const result = this.writes.then(async () => {
+      const next = { ...this.records };
+      let removed = 0;
+      for (const [id, state] of Object.entries(next)) {
+        if (keep(id) || taskJournalHasOwnership(state)) continue;
+        delete next[id];
+        removed++;
+      }
+      if (removed > 0) {
+        await this.write(next);
+        this.records = next;
+      }
+      return removed;
     });
     this.writes = result.catch(() => {});
     return result;
