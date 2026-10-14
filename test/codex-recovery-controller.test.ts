@@ -543,32 +543,42 @@ describe('recovery action authority', () => {
     expect(restored.act).toHaveBeenCalledTimes(1);
   });
 
-  it('preserves legacy v1 stall warnings without treating their alert time as dead proof', async () => {
-    const f = fixture(
-      enabledState(
-        {
-          conversationId: THREAD,
-          phase: 'paused',
-          lastReason: 'stall-unverified',
-          needsAttention: true,
-          history: [{ at: NOW, kind: 'attention', reason: 'stall-unverified', attempt: 0 }],
-        },
-        { detectStalls: true, stalledAfterMs: 10_000 }
-      )
-    );
-    f.observation = stalled('legacy-warning');
-    await f.controller.inspect();
-    advance(5000);
-    await f.controller.refresh();
-    expect(f.controller.getStatus()).toMatchObject({
-      needsAttention: true,
-      lastReason: 'stall-unverified',
-      stallAlert: { key: 'legacy-warning', conversationId: THREAD, progressAt: NOW - 20_000 },
-    });
-    f.observation.stallRestartable = true;
-    await f.controller.retry();
-    expect(f.act).not.toHaveBeenCalled();
-  });
+  it.each(['stalled', 'stall-unverified'] as const)(
+    'preserves legacy v1 %s warnings without treating their alert time as dead proof',
+    async (legacyReason) => {
+      const f = fixture(
+        enabledState(
+          {
+            conversationId: THREAD,
+            phase: 'paused',
+            lastReason: legacyReason,
+            needsAttention: true,
+            history: [{ at: NOW, kind: 'attention', reason: legacyReason, attempt: 0 }],
+          },
+          { detectStalls: true, stalledAfterMs: 10_000 }
+        )
+      );
+      f.observation = stalled('legacy-warning');
+      await f.controller.inspect();
+      advance(5000);
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+        stallAlert: { key: 'legacy-warning', conversationId: THREAD, progressAt: NOW - 20_000 },
+      });
+      expect(f.controller.getStatus().history.filter((event) => event.kind === 'attention')).toHaveLength(1);
+      f.observation.stallRestartable = true;
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      advance(1999);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      advance(1);
+      await f.controller.retry();
+      expect(f.act).toHaveBeenCalledOnce();
+    }
+  );
 
   it('retains a stall warning through inconclusive evidence and clears it on owner input', async () => {
     const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));

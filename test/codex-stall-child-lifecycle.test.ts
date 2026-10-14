@@ -11,6 +11,12 @@ import {
   returnedChildTail,
 } from './helpers/codex-child-lifecycle-fixture.js';
 
+vi.mock('../src/recovery/remote-clock.js', async (original) => ({
+  ...(await original<typeof import('../src/recovery/remote-clock.js')>()),
+  sampleRemoteCodexClock: vi.fn(async () => clockAt()),
+}));
+const clockAt = (at = Date.now()) => ({ localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at });
+
 vi.mock('../src/session-env-clamp.js', () => ({
   clampExternalCliConfigsForOwner: vi.fn(async (_owner, configs) => configs),
   clampEnvOverridesForOwner: vi.fn(async (_owner, env) => env),
@@ -75,7 +81,7 @@ describe('actual local stall controller with an abnormally dead owned pane', () 
   );
 });
 
-async function remoteFixture(type: string, status: unknown, dead: boolean) {
+async function remoteFixture(type: string, status: unknown, dead: boolean, preparedClock = true) {
   const f = await createChildLifecycleFixture(returnedChildTail(type, status, true), false);
   const remote = {
     hostId: 'fixture-host',
@@ -89,10 +95,16 @@ async function remoteFixture(type: string, status: unknown, dead: boolean) {
     _remote: remote,
     ptyProcess: { write: vi.fn(), kill: vi.fn() },
   });
-  // Ordinary tracked user submission supplies the actual Session's remote identity boundary.
+  // Prepare the real Session admission before the owner bytes, with exclusively fake clock IO.
+  if (preparedClock) {
+    const admission = await f.session.prepareUserInputClock('Sanitized fixture request\r', { fromUser: true });
+    expect(admission?.()).toBe(true);
+  }
   expect(f.session.write('Sanitized fixture request\r', { fromUser: true })).toBe(true);
   expect(f.session.getRecoveryContext()).toMatchObject({ managed: true, noDaemon: true, remoteOwned: true });
   expect(f.session.getRecoveryContext().submission).toBeDefined();
+  if (preparedClock)
+    expect(f.session.getRecoveryContext().submission).toMatchObject({ clockDomain: 'local', clock: clockAt() });
   const evidence: RemoteCodexEvidence = {
     transport: 'reachable',
     session: 'present',
@@ -106,15 +118,39 @@ async function remoteFixture(type: string, status: unknown, dead: boolean) {
     },
   };
   const deps: CodexRecoveryAdapterDeps = {
-    inspectRemote: vi.fn(async () => evidence),
+    inspectRemote: vi.fn(async () => ({ ...evidence, clock: clockAt() })),
     restartRemote: vi.fn(async () => 'sent'),
-    deliverRemote: vi.fn(async () => ({ status: 'sent', submittedAt: Date.now() })),
+    deliverRemote: vi.fn(async () => ({ status: 'sent', submittedAt: Date.now(), clock: clockAt() })),
   };
   const adapter = new CodexRecoveryAdapter(f.session, vi.fn(), deps);
   return { ...f, adapter, deps };
 }
 
 describe('actual remote adapter uses the same child lifecycle veto', () => {
+  it.each([false, true])('refuses legacy remote submission without clock provenance (dead=%s)', async (dead) => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, dead, false);
+    try {
+      expect(f.session.getRecoveryContext().submission?.clock).toBeUndefined();
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'unknown',
+        reason: 'identity-unverified',
+        safeToAct: false,
+      });
+      expect(
+        await f.adapter.act({
+          key: 'legacy-clock',
+          action: dead ? 'restart' : 'continue',
+          conversationId: CHILD_THREAD,
+          startedAt: Date.now(),
+        })
+      ).toBe('not-sent');
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it.each(REACTIVATIONS)('never continues or restarts while %s reports a reactivated child', async (type) => {
     for (const dead of [false, true]) {
       const f = await remoteFixture(type, 'running', dead);

@@ -14,10 +14,11 @@ import {
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { dataPath } from '../config/instance.js';
+import { validSubmissionClock, type RecoverySubmission } from './remote-clock.js';
 
 export interface RebootIdentityFence {
   switchPending: boolean;
-  submission?: { at: number; hash: string };
+  submission?: RecoverySubmission;
   /** Exact UUID validated and launched by a completed new-pane reboot restore. */
   resumeSessionId?: string;
   /** Direct tmux owned stdin, so tracked writes can no longer prove the pane's thread. */
@@ -106,7 +107,9 @@ export function readRebootIdentityFence(id: string): RebootIdentityFence | undef
     if (value.version !== 1 || typeof value.switchPending !== 'boolean') throw new Error('Invalid fence');
     if (
       value.submission !== undefined &&
-      (!Number.isFinite(value.submission?.at) || !/^[a-f0-9]{64}$/.test(value.submission?.hash))
+      (!Number.isFinite(value.submission?.at) ||
+        !/^[a-f0-9]{64}$/.test(value.submission?.hash) ||
+        !validSubmissionClock(value.submission))
     )
       throw new Error('Invalid proof');
     if (value.untrackedInput !== undefined && typeof value.untrackedInput !== 'boolean')

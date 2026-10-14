@@ -96,13 +96,19 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
   return result;
 }
 
-export function latestProgressMarker(
-  tail: string,
-  since: number,
-  now: number
-): { key: string; progress: unknown; at: number; submissionKey?: string } | undefined {
+export interface TaskProgressMarker {
+  key: string;
+  progress: unknown;
+  /** Earliest plausible local timestamp. */
+  at: number;
+  /** Remote clock evidence may leave a bounded latest plausible timestamp. */
+  latestAt?: number;
+  submissionKey?: string;
+}
+
+export function latestProgressMarker(tail: string, since: number, now: number): TaskProgressMarker | undefined {
   if (Buffer.byteLength(tail) > 262144 || !tail.endsWith('\n')) return undefined;
-  let marker: { key: string; progress: unknown; at: number; submissionKey?: string } | undefined;
+  let marker: TaskProgressMarker | undefined;
   let submissionKey: string | undefined;
   for (const line of tail.split('\n')) {
     if (!line.trim()) continue;

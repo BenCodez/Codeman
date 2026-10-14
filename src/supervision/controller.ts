@@ -8,12 +8,12 @@ import {
   type TaskUpdate,
   type TaskProgress,
 } from './schema.js';
-import { commandHash, type CommandSuccessEvidence } from './evidence.js';
+import { commandHash, type CommandSuccessEvidence, type TaskProgressMarker } from './evidence.js';
 import { CONTINUATION_PROMPT, type RecoveryObservation } from '../recovery/types.js';
 export interface TaskObservation {
   observation: RecoveryObservation;
   commands: Map<string, CommandSuccessEvidence>;
-  marker?: { key: string; progress: unknown; at: number; submissionKey?: string };
+  marker?: TaskProgressMarker;
 }
 export interface TaskDependencies {
   resetReservation?(): Promise<void>;
@@ -40,6 +40,7 @@ export class TaskController {
   private timer?: ReturnType<typeof setTimeout>;
   private revision = 0;
   private lastUserInputRevision = 0;
+  private lastOwnerPauseRevision = 0;
   private userInputSaveQueued = false;
   private stopped = false;
   constructor(
@@ -47,10 +48,13 @@ export class TaskController {
     restored?: TaskState
   ) {
     this.state = structuredClone(restored ?? initialTaskState());
-    if (acceptanceCriteriaComplete(this.state)) this.state.outcome = 'completed';
+    if (!this.state.agentProgressVeto && acceptanceCriteriaComplete(this.state)) this.state.outcome = 'completed';
     if (this.state.config.enabled && this.state.inFlight) {
       this.state.phase = 'paused';
       this.state.reason = 'restart-in-flight';
+    } else if (this.state.agentProgressVeto) {
+      this.state.phase = 'paused';
+      this.state.reason = 'task-evidence-unknown';
     } else if (this.state.outcome === 'completed') {
       this.state.phase = 'completed';
       this.state.reason = 'completed';
@@ -80,7 +84,9 @@ export class TaskController {
       await this.deps.persist(snapshot);
       this.lastPersisted = snapshot;
     } catch {
+      const agentProgressVeto = this.state.agentProgressVeto;
       this.state = structuredClone(this.lastPersisted);
+      if (agentProgressVeto) this.state.agentProgressVeto = true;
       this.state.config.enabled = false;
       this.state.phase = 'blocked';
       this.state.reason = 'persistence-failed';
@@ -125,12 +131,15 @@ export class TaskController {
     return !this.stopped && this.revision === revision && !this.runtimeBudgetExpired();
   }
   noteUserInput(): void {
+    const hadAgentProgressVeto = !!this.state.agentProgressVeto;
+    delete this.state.agentProgressVeto;
     this.revision++;
     this.lastUserInputRevision = this.revision;
     const phase = this.state.config.enabled ? 'paused' : 'disabled';
     this.state.phase = phase;
     this.arm();
-    if ((!this.state.config.enabled && !this.state.inFlight) || this.userInputSaveQueued) return;
+    if ((!this.state.config.enabled && !this.state.inFlight && !hadAgentProgressVeto) || this.userInputSaveQueued)
+      return;
     const flight = this.state.inFlight;
     const persistedFlight = this.lastPersisted.inFlight;
     if (
@@ -180,6 +189,13 @@ export class TaskController {
     const deadlineExpired = !this.stopped && this.revision === revision && this.runtimeBudgetExpired();
     if (!this.stopped && this.revision === revision && !deadlineExpired && externallyCurrent()) return undefined;
     if (result === 'not-sent') {
+      if (
+        !this.stopped &&
+        this.revision !== revision &&
+        this.lastUserInputRevision <= revision &&
+        this.lastOwnerPauseRevision <= revision
+      )
+        this.retainFinalEvidenceRefusal();
       delete this.state.inFlight;
       if (kickoff) delete this.state.kickoffAt;
     }
@@ -244,7 +260,10 @@ export class TaskController {
           );
       if (changed && this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
       const candidate = changed ? initialTaskState() : this.getStatus();
-      if (changed) candidate.config = { ...this.state.config };
+      if (changed) {
+        candidate.config = { ...this.state.config };
+        if (objective === this.state.objective && this.state.agentProgressVeto) candidate.agentProgressVeto = true;
+      }
       candidate.objective = objective;
       if (changed) {
         candidate.criteria = criteria.map((c) => ({ ...c, verified: false }));
@@ -256,11 +275,14 @@ export class TaskController {
         throw new TaskValidationError('Task objective and criteria are required');
       if (candidate.inFlight && candidate.config.enabled)
         throw new TaskValidationError('Unresolved delivery requires reset');
-      if (acceptanceCriteriaComplete(candidate)) candidate.outcome = 'completed';
+      if (!candidate.agentProgressVeto && acceptanceCriteriaComplete(candidate)) candidate.outcome = 'completed';
       // Configuration saves do not reacquire authority cancelled by owner input or restart.
       const enabledChanged = candidate.config.enabled !== this.state.config.enabled;
-      candidate.phase =
-        candidate.outcome === 'completed'
+      candidate.phase = candidate.agentProgressVeto
+        ? candidate.config.enabled
+          ? 'paused'
+          : 'disabled'
+        : candidate.outcome === 'completed'
           ? 'completed'
           : !candidate.config.enabled
             ? 'disabled'
@@ -312,6 +334,7 @@ export class TaskController {
       }
       if (patch.outcome === 'completed' && (!candidate.criteria.length || !candidate.criteria.every((c) => c.verified)))
         throw new TaskValidationError('Acceptance criteria remain unverified');
+      if (patch.outcome === 'unfinished' || patch.outcome === 'completed') delete candidate.agentProgressVeto;
       candidate.submissionKey = observation.submissionKey;
       this.state = candidate;
       this.state.lastProgressAt = this.now();
@@ -332,7 +355,7 @@ export class TaskController {
     });
   }
   pause(): Promise<TaskState> {
-    this.revision++;
+    this.lastOwnerPauseRevision = ++this.revision;
     return this.enqueue(async () => {
       this.state.phase = 'paused';
       this.arm();
@@ -353,6 +376,7 @@ export class TaskController {
         throw new TaskValidationError('No unfinished task to supervise');
       const beforeObserveCancelled = this.preserveCancelledDelivery(revision, 'not-sent', false, externallyCurrent);
       if (beforeObserveCancelled) return beforeObserveCancelled;
+      delete this.state.agentProgressVeto;
       this.state.config.enabled = true;
       if (this.runtimeBudgetExpired()) {
         this.state.phase = 'blocked';
@@ -410,6 +434,7 @@ export class TaskController {
       const cancelled = this.preserveCancelledDelivery(revision, delivered, true, externallyCurrent);
       if (cancelled) return cancelled;
       if (delivered === 'not-sent') {
+        this.retainFinalEvidenceRefusal();
         delete this.state.inFlight;
         delete this.state.kickoffAt;
       }
@@ -449,6 +474,30 @@ export class TaskController {
       .replace(/[\r\n]+/g, ' ')
       .trim();
   }
+  private retainFinalEvidenceRefusal(): void {
+    this.state.agentProgressVeto = true;
+    this.state.outcome = 'unknown';
+    this.state.checkpoint = '';
+    this.state.nextAction = '';
+  }
+
+  private recordAgentAttention(
+    marker: NonNullable<TaskObservation['marker']>,
+    reason: string,
+    outcome: 'unknown' | 'blocked' = 'unknown'
+  ): Promise<TaskState> {
+    this.retainFinalEvidenceRefusal();
+    this.state.outcome = outcome;
+    this.state.phase = outcome === 'blocked' ? 'blocked' : 'paused';
+    this.state.lastProgressAt = Math.max(
+      this.state.lastProgressAt ?? 0,
+      Number.isFinite(marker.latestAt) ? marker.latestAt! : Number.isFinite(marker.at) ? marker.at : 0
+    );
+    this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
+    this.arm();
+    return this.save(reason);
+  }
+
   refresh(): Promise<TaskState> {
     return this.enqueue(async () => {
       if (this.stopped || !this.state.config.enabled || this.state.phase !== 'watching') return this.getStatus();
@@ -469,18 +518,37 @@ export class TaskController {
           return this.save('acceptance-unverified');
         } else return this.getStatus();
       }
-      if (
+      const markerIsCurrent =
         marker &&
         !!marker.submissionKey &&
         marker.submissionKey === this.state.submissionKey &&
         marker.submissionKey === o.submissionKey &&
-        marker.at >= (this.state.configuredAt ?? this.state.startedAt ?? this.now()) &&
-        marker.at > (this.state.lastProgressAt ?? 0) &&
-        !this.state.handledEvidence.includes(marker.key)
-      ) {
+        !this.state.handledEvidence.includes(marker.key);
+      const progressBoundary = this.state.lastProgressAt ?? 0;
+      const configurationBoundary = this.state.configuredAt ?? this.state.startedAt ?? this.now();
+      if (markerIsCurrent && marker.latestAt !== undefined) {
+        const intervalValid =
+          Number.isFinite(marker.at) &&
+          Number.isFinite(marker.latestAt) &&
+          marker.latestAt >= marker.at &&
+          marker.latestAt - marker.at <= 1000;
+        const possiblyFresh = marker.latestAt >= configurationBoundary && marker.latestAt > progressBoundary;
+        const definitelyFresh = marker.at >= configurationBoundary && marker.at > progressBoundary;
+        // A remote marker overlapping newer owner intent cannot be dismissed as
+        // stale and thereby release the previous action. Uncertainty is attention.
+        if (!intervalValid || (possiblyFresh && (!definitelyFresh || marker.latestAt > this.now())))
+          return this.recordAgentAttention(marker, 'task-evidence-unknown');
+      }
+      if (markerIsCurrent && marker.at >= configurationBoundary && marker.at > progressBoundary) {
         const parsed = TaskProgressSchema.safeParse(marker.progress);
         if (parsed.success) {
           const p = parsed.data;
+          // Each agent report must establish its own actionable step; owner edits may remain incremental.
+          if (
+            p.outcome === 'unknown' ||
+            (p.outcome === 'unfinished' && (!p.checkpoint?.trim() || !p.nextAction?.trim()))
+          )
+            return this.recordAgentAttention(marker, 'task-evidence-unknown');
           let valid = true;
           for (const id of p.verifiedCriteria ?? []) {
             const c = this.state.criteria.find((c) => c.id === id);
@@ -491,34 +559,27 @@ export class TaskController {
               break;
             }
           }
-          if (!valid) {
-            this.state.outcome = 'unknown';
-            this.state.phase = 'paused';
-            return this.save('criterion-evidence-unverified');
-          }
+          if (!valid) return this.recordAgentAttention(marker, 'criterion-evidence-unverified');
           if (valid) {
+            if (p.outcome === 'blocked') return this.recordAgentAttention(marker, 'task-blocked', 'blocked');
             for (const id of p.verifiedCriteria ?? []) {
               const c = this.state.criteria.find((c) => c.id === id)!;
               const hash = commandHash(c.command!);
               c.verified = true;
               c.evidence = { source: 'command', at: commands.get(hash)!.completedAt, commandHash: hash };
             }
-            this.state.outcome = acceptanceCriteriaComplete(this.state)
-              ? 'completed'
-              : p.outcome === 'completed'
-                ? 'unknown'
-                : p.outcome;
+            if (p.outcome === 'completed' && !acceptanceCriteriaComplete(this.state))
+              return this.recordAgentAttention(marker, 'task-evidence-unknown');
+            this.state.outcome = acceptanceCriteriaComplete(this.state) ? 'completed' : p.outcome;
             this.state.lastProgressAt = marker.at;
-            this.state.checkpoint = p.checkpoint ?? this.state.checkpoint;
-            this.state.nextAction = p.nextAction ?? this.state.nextAction;
+            this.state.checkpoint =
+              p.outcome === 'unfinished' ? p.checkpoint! : (p.checkpoint ?? this.state.checkpoint);
+            this.state.nextAction =
+              p.outcome === 'unfinished' ? p.nextAction! : (p.nextAction ?? this.state.nextAction);
             this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
             await this.save('progress-recorded');
           }
-        } else {
-          this.state.outcome = 'unknown';
-          this.state.phase = 'paused';
-          return this.save('task-evidence-unknown');
-        }
+        } else return this.recordAgentAttention(marker, 'task-evidence-unknown');
       }
       if (this.state.outcome === 'completed' || acceptanceCriteriaComplete(this.state)) {
         this.state.outcome = 'completed';
@@ -527,6 +588,7 @@ export class TaskController {
       }
       if (
         this.deps.recover &&
+        !this.state.agentProgressVeto &&
         ['crashed', 'interrupted'].includes(o.activity) &&
         o.safeToAct &&
         o.at >= (this.state.startedAt ?? 0) &&
@@ -561,6 +623,7 @@ export class TaskController {
           const result = await this.deps.recover(o, () => this.actionIsCurrent(revision));
           const cancelled = this.preserveCancelledDelivery(revision, result);
           if (cancelled) return cancelled;
+          if (result === 'not-sent') this.retainFinalEvidenceRefusal();
           if (result === 'not-sent' || (result === 'sent' && o.activity === 'crashed')) delete this.state.inFlight;
           if (result === 'sent') {
             // Successful recovery invalidates the pre-recovery declaration of unfinished work.
@@ -623,6 +686,7 @@ export class TaskController {
       }
       if (result === 'not-sent') delete this.state.inFlight;
       if (result === 'not-sent') {
+        this.retainFinalEvidenceRefusal();
         this.state.phase = 'paused';
         return this.save('delivery-cancelled');
       }

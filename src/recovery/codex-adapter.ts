@@ -6,6 +6,14 @@ import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../s
 import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './codex-home.js';
 import { classifyCodexTail, hasEmptyCodexComposer } from './codex-classifier.js';
+import {
+  validRemoteClock,
+  remoteSubmissionWindow,
+  remoteClockOffset,
+  remoteToLocal,
+  remoteCompletionToLocal,
+  type RemoteClockWitness,
+} from './remote-clock.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight, type RecoveryObservation } from './types.js';
 import {
   inspectRemoteCodex,
@@ -19,6 +27,7 @@ import {
   type RemoteCodexInputResult,
   type RemoteCodexRestartRequest,
   type RemoteCodexRestoreRequest,
+  type RemoteCodexActionAuthority,
 } from './remote-codex.js';
 
 export interface CodexRecoveryAdapterDeps {
@@ -28,15 +37,18 @@ export interface CodexRecoveryAdapterDeps {
   ): Promise<RemoteCodexEvidence>;
   restartRemote(
     remote: NonNullable<Session['remote']>,
-    request: RemoteCodexRestartRequest
+    request: RemoteCodexRestartRequest,
+    isCurrent?: RemoteCodexActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'>;
   deliverRemote(
     remote: NonNullable<Session['remote']>,
-    request: RemoteCodexInputRequest
+    request: RemoteCodexInputRequest,
+    isCurrent?: RemoteCodexActionAuthority
   ): Promise<RemoteCodexInputResult>;
   restoreRemote?(
     remote: NonNullable<Session['remote']>,
-    request: RemoteCodexRestoreRequest
+    request: RemoteCodexRestoreRequest,
+    isCurrent?: RemoteCodexActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'>;
 }
 
@@ -92,6 +104,7 @@ export class CodexRecoveryAdapter {
     witness?: CodexIdentityWitness;
     config?: string;
     env?: string;
+    clock?: RemoteClockWitness;
   };
   private remotePaneContinuity?: {
     generation: number;
@@ -175,6 +188,9 @@ export class CodexRecoveryAdapter {
       // in-TUI thread switch. Remote authority starts with the latest exact
       // ordinary submission and its matching remote history record.
       if (!context.submission) return unknown('identity-unverified');
+      if (evidence.session === 'unknown') return unknown('identity-unverified');
+      if (!validRemoteClock(evidence.clock)) return unknown('identity-unverified');
+      if (!remoteSubmissionWindow(context.submission, evidence.clock)) return unknown('identity-unverified');
       if (
         evidence.identity.reason !== 'verified' ||
         !evidence.identity.conversationId ||
@@ -184,7 +200,28 @@ export class CodexRecoveryAdapter {
         return unknown('identity-unverified');
       const conversationId = evidence.identity.conversationId;
       const tailHash = createHash('sha256').update(evidence.identity.tail, 'utf8').digest('hex');
-      this.verifiedTail = { conversationId, tail: evidence.identity.tail };
+      const remoteTail = evidence.identity.tail;
+      const remoteTailTruncated = evidence.identity.tailTruncated;
+      const remoteClock = evidence.clock;
+      this.verifiedTail = { conversationId, tail: evidence.identity.tail, clock: evidence.clock };
+      const classifyRemoteTail = (screen: string | null, busy: boolean): RecoveryObservation => {
+        const clock = remoteClock;
+        const result = classifyCodexTail(remoteTail, {
+          conversationId,
+          now: clock.remoteAfter,
+          screen,
+          busy,
+          watching: !!session.watching,
+          tailTruncated: remoteTailTruncated,
+          lastIntentionalStopAt:
+            context.intentionalStopAt > 0
+              ? context.intentionalStopAt + remoteClockOffset(clock).max
+              : context.intentionalStopAt,
+        });
+        result.at = remoteToLocal(result.at, clock);
+        if (result.progressAt !== undefined) result.progressAt = remoteCompletionToLocal(result.progressAt, clock);
+        return result;
+      };
       if (session.codexConfig?.resumeSessionId !== conversationId) {
         session.pinRecoveryConversation(conversationId);
         this.persistSession();
@@ -208,15 +245,7 @@ export class CodexRecoveryAdapter {
         if (!((transportPane.status ?? 0) > 0 || (transportPane.signal ?? 0) > 0)) {
           return unknown('pane-unverified');
         }
-        const classified = classifyCodexTail(evidence.identity.tail, {
-          conversationId,
-          now: Date.now(),
-          screen: null,
-          busy: false,
-          watching: !!session.watching,
-          tailTruncated: evidence.identity.tailTruncated,
-          lastIntentionalStopAt: context.intentionalStopAt,
-        });
+        const classified = classifyRemoteTail(null, false);
         // Explicit restoration still cannot clear active child work or a structured veto.
         if (['watching', 'unknown', 'paused', 'blocked'].includes(classified.activity)) return classified;
         this.missingProof = { generation: context.generation, conversationId, tailHash };
@@ -278,15 +307,7 @@ export class CodexRecoveryAdapter {
               ? rolloutChangedAt
               : 0;
           const crashAt = transitionedFromLive?.deadObservedAt ?? boundedRolloutChangedAt;
-          const childWork = classifyCodexTail(evidence.identity.tail, {
-            conversationId,
-            now: Date.now(),
-            screen: '',
-            busy: false,
-            watching: !!session.watching,
-            tailTruncated: evidence.identity.tailTruncated,
-            lastIntentionalStopAt: context.intentionalStopAt,
-          });
+          const childWork = classifyRemoteTail('', false);
           observation = ['watching', 'unknown', 'paused', 'blocked'].includes(childWork.activity)
             ? childWork
             : {
@@ -309,15 +330,7 @@ export class CodexRecoveryAdapter {
           panePid: pane.panePid,
           liveObservedAt: observedAt,
         };
-        observation = classifyCodexTail(evidence.identity.tail, {
-          conversationId,
-          now: Date.now(),
-          screen: pane.screen,
-          busy: session.isBusy(),
-          watching: !!session.watching,
-          tailTruncated: evidence.identity.tailTruncated,
-          lastIntentionalStopAt: context.intentionalStopAt,
-        });
+        observation = classifyRemoteTail(pane.screen, session.isBusy());
         observation.processReady =
           evidence.identity.tailTruncated === false &&
           pane.screen !== null &&
@@ -493,6 +506,18 @@ export class CodexRecoveryAdapter {
     return this.verifiedTail?.conversationId === conversationId ? this.verifiedTail.tail : undefined;
   }
 
+  getVerifiedRemoteClock(conversationId: string): RemoteClockWitness | undefined {
+    return this.verifiedTail?.conversationId === conversationId ? this.verifiedTail.clock : undefined;
+  }
+
+  private remoteAuthority(conversationId: string, generation: number, isCurrent: () => boolean) {
+    const expected = this.session.remoteRecoveryConfiguration();
+    return {
+      check: () => this.session.confirmRemoteRecoveryAuthority(conversationId, generation, isCurrent, expected),
+      isCurrent: () => this.session.isRemoteRecoveryAuthorityCurrent(conversationId, generation, isCurrent, expected),
+    };
+  }
+
   /** Last local evidence read after Session has awaited pane and current grants. */
   confirmLocalEvidence(conversationId: string, generation: number): boolean {
     const expected = this.verifiedTail;
@@ -566,25 +591,30 @@ export class CodexRecoveryAdapter {
         const pane = this.proof.remotePane;
         const context = this.session.getRecoveryContext();
         if (!pane || !this.session.codexConfig || !context.submission) return 'not-sent';
+        const authority = this.remoteAuthority(flight.conversationId, this.proof.generation, isCurrent);
         result = await this.session.restartRemoteRecoveryPane(
           flight.conversationId,
           this.proof.generation,
           isCurrent,
           () =>
-            this.deps.restartRemote(this.session.remote!, {
-              sessionId: this.session.id,
-              resumeId: flight.conversationId,
-              submission: context.submission,
-              expectedIdentity: { conversationId: pane.conversationId, tailHash: pane.tailHash },
-              expectedPane: {
-                paneId: pane.paneId,
-                panePid: pane.panePid,
-                status: pane.status,
-                signal: pane.signal,
+            this.deps.restartRemote(
+              this.session.remote!,
+              {
+                sessionId: this.session.id,
+                resumeId: flight.conversationId,
+                submission: context.submission,
+                expectedIdentity: { conversationId: pane.conversationId, tailHash: pane.tailHash },
+                expectedPane: {
+                  paneId: pane.paneId,
+                  panePid: pane.panePid,
+                  status: pane.status,
+                  signal: pane.signal,
+                },
+                codexConfig: { ...this.session.codexConfig!, resumeSessionId: flight.conversationId },
+                codexHome: context.codexHome,
               },
-              codexConfig: { ...this.session.codexConfig!, resumeSessionId: flight.conversationId },
-              codexHome: context.codexHome,
-            })
+              authority
+            )
         );
       } else {
         result = await this.deliverRemotePrompt(
@@ -623,20 +653,25 @@ export class CodexRecoveryAdapter {
       !isCurrent()
     )
       return 'not-sent';
+    const authority = this.remoteAuthority(conversationId, generation, isCurrent);
     return this.session.deliverRemoteRecoveryInput(
       conversationId,
       generation,
       prompt,
       () =>
-        this.deps.deliverRemote(remote, {
-          sessionId: this.session.id,
-          workingDir: this.session.workingDir,
-          codexHome: context.codexHome,
-          resumeId: conversationId,
-          submission: proof.submission,
-          expected: proof.expected,
-          prompt,
-        }),
+        this.deps.deliverRemote(
+          remote,
+          {
+            sessionId: this.session.id,
+            workingDir: this.session.workingDir,
+            codexHome: context.codexHome,
+            resumeId: conversationId,
+            submission: proof.submission,
+            expected: proof.expected,
+            prompt,
+          },
+          authority
+        ),
       isCurrent
     );
   }
@@ -665,19 +700,24 @@ export class CodexRecoveryAdapter {
       return 'not-sent';
     const context = this.session.getRecoveryContext();
     if (!this.session.remote || !this.session.codexConfig || !context.submission) return 'not-sent';
+    const authority = this.remoteAuthority(proof.conversationId, proof.generation, isCurrent);
     const result = await this.session.restoreMissingRemoteWorker(
       proof.conversationId,
       proof.generation,
       isCurrent,
       () =>
-        this.deps.restoreRemote!(this.session.remote!, {
-          sessionId: this.session.id,
-          resumeId: proof.conversationId,
-          submission: context.submission,
-          expectedIdentity: { conversationId: proof.conversationId, tailHash: proof.tailHash },
-          codexConfig: { ...this.session.codexConfig!, resumeSessionId: proof.conversationId },
-          codexHome: context.codexHome,
-        })
+        this.deps.restoreRemote!(
+          this.session.remote!,
+          {
+            sessionId: this.session.id,
+            resumeId: proof.conversationId,
+            submission: context.submission,
+            expectedIdentity: { conversationId: proof.conversationId, tailHash: proof.tailHash },
+            codexConfig: { ...this.session.codexConfig!, resumeSessionId: proof.conversationId },
+            codexHome: context.codexHome,
+          },
+          authority
+        )
     );
     if (result === 'sent') this.persistSession();
     return result;

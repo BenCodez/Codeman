@@ -37,6 +37,9 @@ export function createMockRouteContext(options?: {
       sessions.set(s.id, s);
     }),
     commitSessionRegistration: vi.fn(),
+    persistRebootRestoreDurably: vi.fn(async (_session: MockSession, current: () => boolean) => {
+      if (!current()) throw new Error('Reboot restoration cancelled');
+    }),
     tabLayouts: {
       get: vi.fn(),
       put: vi.fn(),
