@@ -59,7 +59,7 @@ describe('the client lifts itself over the watermark', () => {
   it('does NOT re-queue a retry, which the dedup correctly suppressed', () => {
     // A retry called a duplicate means the original DID land; re-sending it would
     // type the same thing twice — the exact thing exactly-once delivery prevents.
-    expect(handler).toMatch(/if \(rec && !rec\.key && rec\.tries <= 1\)/);
+    expect(handler).toMatch(/if \(rec && !rec\.key && !rec\.replayUncertain && rec\.tries <= 1\)/);
   });
 
   it('persists the raised counter immediately, not on the debounce', () => {

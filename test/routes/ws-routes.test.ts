@@ -21,6 +21,7 @@ import { MAX_INPUT_LENGTH } from '../../src/config/terminal-limits.js';
 import { RebootIdentityFenceError } from '../../src/recovery/reboot-identity-fence.js';
 import { Session } from '../../src/session.js';
 import type { MuxSession, TerminalMultiplexer } from '../../src/mux-interface.js';
+import * as remoteClock from '../../src/recovery/remote-clock.js';
 
 /** Assigned by the OS on every listen (`port: 0`); see beforeEach. */
 let PORT = 0;
@@ -281,12 +282,14 @@ describe('ws-routes', () => {
         await session.stop(false);
       }
     });
-    it.each(['recovery', 'named-key'])(
+    it.each(['recovery', 'named-key', 'remote-clock'])(
       'retains all three frames blocked by an actual Session %s reservation',
       async (owner) => {
         const thread = '11111111-2222-3333-4444-555555555555';
         const probe = createDeferred<{ dead: false; screen: string }>();
         const key = createDeferred<void>();
+        const clock = createDeferred<remoteClock.RemoteClockWitness>();
+        if (owner === 'remote-clock') vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
         const mux = {
           isAvailable: () => true,
           inspectPaneForRecovery: () => probe.promise,
@@ -304,22 +307,37 @@ describe('ws-routes', () => {
             recoveryCodexHome: '/fixture/codex-home',
           } as MuxSession,
           codexConfig: { noDaemon: true, resumeSessionId: thread },
+          ...(owner === 'remote-clock'
+            ? {
+                remote: {
+                  hostId: 'fixture',
+                  label: 'Fixture',
+                  host: 'worker.invalid',
+                  username: 'fixture',
+                  remotePath: '/tmp',
+                  owned: true,
+                },
+                envOverrides: { CODEX_HOME: '/fixture/codex-home' },
+              }
+            : {}),
         });
         const written = vi.fn();
         Object.assign(session, { ptyProcess: { write: written } });
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const held =
-          owner === 'named-key'
-            ? session.sendNamedKey('\n', () => key.promise)
-            : session.deliverRecovery(
-                {
-                  action: 'continue',
-                  key: 'fixture',
-                  conversationId: thread,
-                  startedAt: Date.now(),
-                },
-                0
-              );
+          owner === 'remote-clock'
+            ? session.prepareUserInputClock('Owner prompt\r', { fromUser: true })
+            : owner === 'named-key'
+              ? session.sendNamedKey('\n', () => key.promise)
+              : session.deliverRecovery(
+                  {
+                    action: 'continue',
+                    key: 'fixture',
+                    conversationId: thread,
+                    startedAt: Date.now(),
+                  },
+                  0
+                );
         const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
         const received: unknown[] = [];
         ws.on('message', (raw) => received.push(JSON.parse(String(raw))));
@@ -334,6 +352,12 @@ describe('ws-routes', () => {
           expect(written).not.toHaveBeenCalled();
           expect(received).toEqual([]);
           key.resolve();
+          clock.resolve({
+            localBefore: Date.now(),
+            localAfter: Date.now(),
+            remoteBefore: Date.now(),
+            remoteAfter: Date.now(),
+          });
           probe.resolve({ dead: false, screen: '›\n  example-model high · /tmp\n' });
           await held;
           const acks = collectMessages(ws, 3);
@@ -351,6 +375,12 @@ describe('ws-routes', () => {
           expect(written).toHaveBeenCalledTimes(3);
         } finally {
           key.resolve();
+          clock.resolve({
+            localBefore: Date.now(),
+            localAfter: Date.now(),
+            remoteBefore: Date.now(),
+            remoteAfter: Date.now(),
+          });
           probe.resolve({ dead: false, screen: '›\n  example-model high · /tmp\n' });
           await held;
           ws.close();

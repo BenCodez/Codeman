@@ -103,6 +103,8 @@ export interface SupervisionTaskState {
   lastProgressAt?: number;
   conversationId?: string;
   submissionKey?: string;
+  /** Explicit uncertain or blocked agent progress retains authority to veto recovery. */
+  agentProgressVeto?: boolean;
   inFlight?: {
     key: string;
     startedAt: number;

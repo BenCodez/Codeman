@@ -17,6 +17,10 @@ import { CONTINUATION_PROMPT, type RecoveryFlight, type RecoveryObservation } fr
 import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import { createDeferred } from './mocks/index.js';
+import type { RecoverySubmission } from '../src/recovery/remote-clock.js';
+import { CodexTaskAdapter } from '../src/supervision/adapter.js';
+import { commandHash } from '../src/supervision/evidence.js';
+const clockAt = (at = Date.now()) => ({ localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at });
 
 vi.mock('../src/recovery/codex-identity.js', () => ({ resolveCodexIdentity: vi.fn() }));
 vi.mock('../src/session-env-clamp.js', () => ({
@@ -95,7 +99,7 @@ function fixture() {
       intentionalStopAt: 0,
       switchPending: false,
       codexHome: '/fixture/codex-home' as string | undefined,
-      submission: undefined as { at: number; hash: string } | undefined,
+      submission: undefined as RecoverySubmission | undefined,
     },
     pane: { dead: false, screen: READY } as Pane | null,
     transportPane: { dead: true, status: 255, screen: null } as Pane | null,
@@ -112,6 +116,7 @@ function fixture() {
     remoteEvidence: {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: false, paneId: '%7', panePid: 700, screen: READY },
       identity: {
         reason: 'verified',
@@ -136,6 +141,9 @@ function fixture() {
     watching: null as string | null,
     getRecoveryContext: vi.fn(() => ({ ...state.context })),
     getEnvOverridesForPersist: vi.fn(() => state.env),
+    remoteRecoveryConfiguration: vi.fn(() => JSON.stringify([session.remote, session.codexConfig, state.env])),
+    confirmRemoteRecoveryAuthority: vi.fn(async () => true),
+    isRemoteRecoveryAuthorityCurrent: vi.fn(() => true),
     inspectRecoveryPane: vi.fn(async () => state.pane),
     inspectRemoteTransportPane: vi.fn(async () => state.transportPane),
     isBusy: vi.fn(() => state.busy),
@@ -238,6 +246,8 @@ describe('exact current identity and delivery proof', () => {
     const f = fixture();
     f.context.submission = {
       at: NOW - 20_000,
+      clockDomain: 'local',
+      clock: clockAt(NOW - 20_000),
       hash: createHash('sha256').update('Sanitized fixture request.').digest('hex'),
     };
     const observation = await f.adapter.observe();
@@ -725,6 +735,8 @@ describe('owned remote evidence and mutation', () => {
     const f = fixture();
     f.context.submission = {
       at: NOW - 20_000,
+      clockDomain: 'local',
+      clock: clockAt(NOW - 20_000),
       hash: createHash('sha256').update('Remote fixture request.').digest('hex'),
     };
     f.session.remote = {
@@ -737,6 +749,79 @@ describe('owned remote evidence and mutation', () => {
     } as Session['remote'];
     return f;
   }
+
+  it.each(['missing-clock', 'malformed-clock', 'legacy-submission', 'changed-clock'] as const)(
+    'refuses identity and task command authority from %s even with a claimed verified tail',
+    async (fault) => {
+      const f = remoteFixture();
+      const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+      if (fault === 'missing-clock') delete evidence.clock;
+      if (fault === 'malformed-clock') evidence.clock = { ...clockAt(), localAfter: NOW - 1 };
+      if (fault === 'legacy-submission') f.context.submission = { at: NOW - 20_000, hash: f.context.submission!.hash };
+      if (fault === 'changed-clock')
+        evidence.clock = { ...clockAt(), remoteBefore: NOW + 60_000, remoteAfter: NOW + 60_000 };
+      evidence.identity.tail =
+        completedTail() +
+        event({ type: 'exec_command_begin', call_id: 'proof', command: ['sh', '-c', 'npm test'] }, NOW - 2000) +
+        '\n' +
+        event({ type: 'exec_command_end', call_id: 'proof', exit_code: 0 }, NOW - 1000) +
+        '\n';
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'unknown',
+        reason: 'identity-unverified',
+        safeToAct: false,
+      });
+      expect(f.adapter.getVerifiedTail(THREAD)).toBeUndefined();
+      const task = await new CodexTaskAdapter(f.session as unknown as Session, f.persist, f.deps).observe();
+      expect(task.observation.activity).toBe('unknown');
+      expect(task.commands.size).toBe(0);
+      expect(task.marker).toBeUndefined();
+      expect(f.session.pinRecoveryConversation).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([-60_000, 60_000])(
+    'classifies native remote task/command evidence and exports bounded local times with %i ms skew',
+    async (offset) => {
+      const f = remoteFixture();
+      f.context.submission!.clock = {
+        ...clockAt(NOW - 20_000),
+        remoteBefore: NOW - 20_000 + offset,
+        remoteAfter: NOW - 20_000 + offset,
+      };
+      const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+      evidence.clock = { ...clockAt(), remoteBefore: NOW + offset, remoteAfter: NOW + offset };
+      evidence.identity.tail =
+        [
+          event({ type: 'task_started', turn_id: 'native-turn' }, NOW - 10_000 + offset),
+          event(
+            { type: 'exec_command_begin', call_id: 'native-command', command: ['sh', '-c', 'npm test'] },
+            NOW - 8000 + offset
+          ),
+          event({ type: 'exec_command_end', call_id: 'native-command', exit_code: 0 }, NOW - 7000 + offset),
+          event(
+            {
+              type: 'agent_message',
+              message:
+                'CODEMAN_TASK_PROGRESS ' +
+                JSON.stringify({ outcome: 'unfinished', checkpoint: 'Verified fixture', nextAction: 'Finish fixture' }),
+            },
+            NOW - 6500 + offset
+          ),
+          event({ type: 'task_complete', turn_id: 'native-turn', last_agent_message: null }, NOW - 6000 + offset),
+        ].join('\n') + '\n';
+      const task = await new CodexTaskAdapter(f.session as unknown as Session, f.persist, f.deps).observe();
+      expect(task.observation).toMatchObject({ activity: 'completed', at: NOW - 6000, processReady: true });
+      expect(task.commands.get(commandHash('npm test'))).toEqual({ startedAt: NOW - 8000, completedAt: NOW - 7000 });
+      expect(task.marker?.at).toBe(NOW - 6500);
+      expect(task.marker?.progress).toMatchObject({
+        outcome: 'unfinished',
+        checkpoint: 'Verified fixture',
+        nextAction: 'Finish fixture',
+      });
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+    }
+  );
 
   it.each([undefined, '', 'relative/home'])(
     'refuses remote authority without an explicit absolute worker home (%s)',
@@ -860,6 +945,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'missing',
+      clock: clockAt(),
       identity: {
         reason: 'verified',
         conversationId: THREAD,
@@ -895,6 +981,7 @@ describe('owned remote evidence and mutation', () => {
       f.remoteEvidence = {
         transport: 'reachable',
         session: 'present',
+        clock: clockAt(),
         pane: { dead: false, paneId: '%7', panePid: 700, screen: READY },
         identity: {
           reason: 'verified',
@@ -921,6 +1008,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'missing',
+      clock: clockAt(),
       identity: {
         reason: 'verified',
         conversationId: THREAD,
@@ -938,6 +1026,8 @@ describe('owned remote evidence and mutation', () => {
     const f = remoteFixture();
     f.context.submission = {
       at: NOW - 20_000,
+      clockDomain: 'local',
+      clock: clockAt(NOW - 20_000),
       hash: createHash('sha256').update('Remote fixture request.').digest('hex'),
     };
     await f.adapter.observe();
@@ -975,7 +1065,8 @@ describe('owned remote evidence and mutation', () => {
         prompt: expect.stringContaining('Continue the previous unfinished task'),
         submission: f.context.submission,
         expected: expect.objectContaining({ conversationId: THREAD, paneId: '%7', panePid: 700 }),
-      })
+      }),
+      expect.objectContaining({ check: expect.any(Function), isCurrent: expect.any(Function) })
     );
     expect(f.deps.restartRemote).not.toHaveBeenCalled();
   });
@@ -986,6 +1077,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null },
       identity: {
         reason: 'verified',
@@ -1014,7 +1106,8 @@ describe('owned remote evidence and mutation', () => {
         expectedPane: { paneId: '%9', panePid: 901, status: 17, signal: undefined },
         codexHome: '/fixture/codex-home',
         codexConfig: expect.objectContaining({ resumeSessionId: THREAD, noDaemon: true }),
-      })
+      }),
+      expect.objectContaining({ check: expect.any(Function), isCurrent: expect.any(Function) })
     );
   });
 
@@ -1025,6 +1118,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: false, paneId: '%9', panePid: 901, screen: READY },
       identity: {
         reason: 'verified',
@@ -1070,6 +1164,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null },
       identity: {
         reason: 'verified',
@@ -1118,6 +1213,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: false, paneId: '%9', panePid: 901, screen: READY },
       identity: {
         reason: 'verified',
@@ -1181,6 +1277,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null },
       identity: { reason: 'verified', conversationId: THREAD, tail, tailTruncated: false, changedAt: NOW - 9_000 },
     };
@@ -1200,6 +1297,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane,
       identity: {
         reason: 'verified',
@@ -1218,6 +1316,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'missing',
+      clock: clockAt(),
       identity: {
         reason: 'verified',
         conversationId: THREAD,
@@ -1241,7 +1340,8 @@ describe('owned remote evidence and mutation', () => {
         expectedIdentity: { conversationId: THREAD, tailHash: expect.any(String) },
         codexHome: '/fixture/codex-home',
         codexConfig: expect.objectContaining({ noDaemon: true, resumeSessionId: THREAD }),
-      })
+      }),
+      expect.objectContaining({ check: expect.any(Function), isCurrent: expect.any(Function) })
     );
   });
 
@@ -1250,6 +1350,7 @@ describe('owned remote evidence and mutation', () => {
     f.remoteEvidence = {
       transport: 'reachable',
       session: 'missing',
+      clock: clockAt(),
       identity: {
         reason: 'verified',
         conversationId: THREAD,
@@ -1263,6 +1364,7 @@ describe('owned remote evidence and mutation', () => {
       .mockResolvedValueOnce({
         ...structuredClone(f.remoteEvidence),
         session: 'present',
+        clock: clockAt(),
         pane: { dead: false, paneId: '%1', panePid: 1, screen: READY },
       });
     expect(await f.adapter.restoreMissingRemote()).toBe('not-sent');

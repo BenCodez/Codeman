@@ -3,6 +3,7 @@ import type { Session } from '../session.js';
 import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../recovery/codex-adapter.js';
 import { successfulCommands, latestProgressMarker } from './evidence.js';
 import type { TaskObservation } from './controller.js';
+import { validRemoteClock, remoteToLocal, remoteCompletionToLocal } from '../recovery/remote-clock.js';
 export class CodexTaskAdapter {
   private readonly recovery: CodexRecoveryAdapter;
   private continuationProof?: {
@@ -28,12 +29,27 @@ export class CodexTaskAdapter {
     const tail = this.recovery.getVerifiedTail(observation.conversationId);
     if (tail === undefined || context.generation !== this.session.getRecoveryContext().generation)
       return { observation: { ...observation, activity: 'unknown', safeToAct: false }, commands: new Map() };
-    const now = Date.now();
+    const clock = this.recovery.getVerifiedRemoteClock(observation.conversationId);
+    if (this.session.remote && !validRemoteClock(clock))
+      return { observation: { ...observation, activity: 'unknown', safeToAct: false }, commands: new Map() };
+    const now = clock?.remoteAfter ?? Date.now();
+    const commands = successfulCommands(tail, 0, now);
+    const marker = latestProgressMarker(tail, 0, now);
+    if (clock) {
+      for (const command of commands.values()) {
+        command.startedAt = remoteToLocal(command.startedAt, clock);
+        command.completedAt = remoteCompletionToLocal(command.completedAt, clock);
+      }
+      if (marker) {
+        marker.latestAt = remoteCompletionToLocal(marker.at, clock);
+        marker.at = remoteToLocal(marker.at, clock);
+      }
+    }
     return this.recordObservation(
       {
         observation,
-        commands: successfulCommands(tail, 0, now),
-        marker: latestProgressMarker(tail, 0, now),
+        commands,
+        marker,
       },
       context.generation
     );

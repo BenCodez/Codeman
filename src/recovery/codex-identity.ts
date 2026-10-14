@@ -370,7 +370,9 @@ async function readHistory(home: string, budget: Budget): Promise<HistoryIndex> 
     ) {
       throw new Refusal('unverified');
     }
-    history.push({ id: entry.session_id, at: entry.ts * 1000, hash: hashCodexPrompt(entry.text) });
+    const at = entry.ts * 1000;
+    if (!Number.isFinite(at) || at <= 0 || at > Number.MAX_SAFE_INTEGER) throw new Refusal('unverified');
+    history.push({ id: entry.session_id, at, hash: hashCodexPrompt(entry.text) });
   }
   if (history.some((entry, i) => i > 0 && entry.at < history[i - 1].at)) throw new Refusal('unverified');
   return { entries: history, truncated: window.truncated };

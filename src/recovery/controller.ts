@@ -14,6 +14,8 @@ import {
 
 export interface RecoveryDependencies {
   resetReservation?(): Promise<void>;
+  /** Shared task ownership may revoke authority while a delivery reservation is saving. */
+  hasActionAuthority?(): boolean;
   observe(): Promise<RecoveryObservation>;
   /** 'unknown' includes any possibly-partially-delivered operation; it must never be replayed. */
   act(flight: RecoveryFlight, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
@@ -224,14 +226,13 @@ export class RecoveryController {
   async restoreMissingRemote(): Promise<RecoveryState> {
     const revision = ++this.revision;
     return this.enqueue(async () => {
-      if (this.stopped || !this.deps.restoreMissingRemote || this.state.inFlight) return this.getStatus();
+      const isCurrent = () =>
+        !this.stopped &&
+        revision === this.revision &&
+        (this.deps.hasActionAuthority ? this.deps.hasActionAuthority() === true : true);
+      if (!isCurrent() || !this.deps.restoreMissingRemote || this.state.inFlight) return this.getStatus();
       const observation = await this.deps.observe();
-      if (
-        this.stopped ||
-        revision !== this.revision ||
-        observation.reason !== 'remote-session-missing' ||
-        !observation.conversationId
-      ) {
+      if (!isCurrent() || observation.reason !== 'remote-session-missing' || !observation.conversationId) {
         return this.getStatus();
       }
       const key = `${observation.conversationId}:remote-restore:${observation.at}`;
@@ -250,7 +251,7 @@ export class RecoveryController {
       await this.save();
       let outcome: 'sent' | 'not-sent' | 'unknown';
       try {
-        outcome = await this.deps.restoreMissingRemote(() => !this.stopped && revision === this.revision);
+        outcome = isCurrent() ? await this.deps.restoreMissingRemote(isCurrent) : 'not-sent';
       } catch {
         outcome = 'unknown';
       }
@@ -480,7 +481,11 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const isCurrent = () => !this.stopped && revision === this.revision && !this.recoveryWindowExpired();
+    const isCurrent = () =>
+      !this.stopped &&
+      revision === this.revision &&
+      !this.recoveryWindowExpired() &&
+      (this.deps.hasActionAuthority ? this.deps.hasActionAuthority() === true : true);
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
       outcome = isCurrent() ? await this.deps.act(this.state.inFlight, isCurrent) : 'not-sent';

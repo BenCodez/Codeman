@@ -3875,7 +3875,7 @@ class CodemanApp {
    * Named newline keys share the input queue's ordering, but only travel over
    * HTTP: the server chooses the CLI's exact hex sequence. They have no server
    * dedup contract, so only a certified not-sent response may be retried, and
-   * they are never persisted/replayed across a reload with an unknown outcome.
+   * their ordering barriers are persisted but never replayed across a reload.
    * `owner` is the terminal/tile lifetime, also used to cancel pending keys.
    */
   _sendNamedKey(sessionId, key, owner, delayMs = 0) {
@@ -3889,8 +3889,14 @@ class CodemanApp {
       this.showToast?.('Too many newline keys queued; key not sent', 'error');
       return;
     }
+    const seq = this._nextSeq(sessionId);
+    if (seq === null) {
+      if (!list.length) this._pendingDeliveries.delete(sessionId);
+      this.showToast?.('Input delivery limit reached; newline key not sent. Check the prompt before retrying', 'warning');
+      return;
+    }
     list.push({
-      seq: this._nextSeq(sessionId),
+      seq,
       data: '', key, owner, delayMs,
       ts: Date.now(), tries: 0, sentAt: 0, retryAt: 0,
     });
@@ -3906,8 +3912,12 @@ class CodemanApp {
         if (!rec.key || rec.owner !== owner) continue;
         rec.cancelled = true;
         rec.abort?.abort();
-        this._ackDelivery(sessionId, rec.seq);
-        this.showToast?.('Terminal closed; pending newline key cancelled', 'warning');
+        if (rec.tries > 0 && !rec.retryAt) {
+          this._discardKeySuffix(sessionId, rec, 'Terminal closed during newline delivery; following input not sent', 'warning');
+        } else {
+          this._ackDelivery(sessionId, rec.seq);
+          this.showToast?.('Terminal closed; pending newline key cancelled', 'warning');
+        }
       }
       this._drainSession(sessionId);
     }
@@ -3993,6 +4003,10 @@ class CodemanApp {
   /** Record one input frame and kick delivery. The record lives until ACKed. */
   _reliableSend(sessionId, data, useMux) {
     const seq = this._nextSeq(sessionId);
+    if (seq === null) {
+      this.showToast?.('Input delivery limit reached; input not sent. Check the prompt before retrying', 'warning');
+      return;
+    }
     const rec = { seq, data, useMux: !!useMux, ts: Date.now(), tries: 0, sentAt: 0 };
     let list = this._pendingDeliveries.get(sessionId);
     if (!list) {
@@ -4010,9 +4024,10 @@ class CodemanApp {
   }
 
   _nextSeq(sessionId) {
-    const next = (this._seqCounters.get(sessionId) || 0) + 1;
-    this._seqCounters.set(sessionId, next);
-    return next;
+    const previous = this._seqCounters.get(sessionId) ?? 0;
+    if (!Number.isSafeInteger(previous) || previous < 0 || previous >= Number.MAX_SAFE_INTEGER) return null;
+    this._seqCounters.set(sessionId, previous + 1);
+    return previous + 1;
   }
 
   /** Deliver all unacked records for a session, in seq order. */
@@ -4033,9 +4048,11 @@ class CodemanApp {
         if (rec.key) break;
         if (rec.sentAt !== 0) continue;
         try {
-          sock.ws.send(JSON.stringify({ t: 'i', d: rec.data, seq: rec.seq, cid: this._clientId }));
+          // Seal the attempt before bytes can land, including a send that throws.
           rec.sentAt = Date.now();
           rec.tries++;
+          this._persistReliableNow();
+          sock.ws.send(JSON.stringify({ t: 'i', d: rec.data, seq: rec.seq, cid: this._clientId }));
         } catch {
           break; // socket died mid-send — reconnect/POST drainer retries
         }
@@ -4071,6 +4088,8 @@ class CodemanApp {
           }
           rec.tries++;
           rec.sentAt = Date.now();
+          if (rec.key) rec.retryAt = 0;
+          this._persistReliableNow();
           // ACK the occurrence sent by THIS request, even if a late socket ACK
           // repairs the record's sequence while the POST is still in flight.
           const sentSeq = rec.seq;
@@ -4107,9 +4126,9 @@ class CodemanApp {
             if (rec.cancelled) continue;
             if (rec.retryAt > Date.now()) break;
             const refused = resp && [400, 404, 410, 413].includes(resp.status);
-            this._dropNamedKey(sessionId, rec,
-              refused ? 'Newline key refused by the server; not sent'
-                : 'Newline key delivery could not be confirmed; check the prompt before retrying');
+            if (refused) this._dropNamedKey(sessionId, rec, 'Newline key refused by the server; not sent');
+            else this._discardKeySuffix(sessionId, rec,
+              'Newline key delivery could not be confirmed; following input not sent. Check the prompt before retrying');
             continue;
           }
           if (resp && resp.ok) {
@@ -4146,8 +4165,19 @@ class CodemanApp {
   }
 
   _dropNamedKey(sessionId, rec, message) {
-    this._ackDelivery(sessionId, rec.seq);
-    this.showToast?.(message, 'error');
+    this._discardKeySuffix(sessionId, rec, `${message}; following input not sent`);
+  }
+
+  /** A failed non-deduplicated key cannot release text that depended on it. */
+  _discardKeySuffix(sessionId, rec, message, level = 'error') {
+    const list = this._pendingDeliveries.get(sessionId);
+    const index = list?.indexOf(rec) ?? -1;
+    if (index === -1) return;
+    list.splice(index);
+    if (!list.length) this._pendingDeliveries.delete(sessionId);
+    this._persistReliableNow();
+    this._updateConnectionIndicator();
+    this.showToast?.(message, level);
   }
 
   /** Drop a frame the server refused for good, and say so once. */
@@ -4187,15 +4217,16 @@ class CodemanApp {
    *
    * `dup:true` means the server REJECTED the frame as already-seen rather than
    * applying it, and `last` is its watermark for this clientId. That combination
-   * is the escape hatch from a rolled-back counter: our seqs persist on a
-   * debounced write, so a tab killed between a send and that write comes back
+   * is the escape hatch from a rolled-back counter: a failed durable write
+   * can leave a tab killed after a send counting from an older snapshot, coming back
    * counting from BELOW the server's watermark, and from then on every keystroke
    * is dropped-but-ACKed — a silently dead terminal that a reload cannot fix,
    * because the stale counter is restored from localStorage too.
    *
    * ⚠️ Only a FIRST-attempt record is repaired. A retry (`tries > 1`) being
    * called a duplicate is the mechanism working as designed — the original did
-   * land — and re-sending it would type the same thing twice.
+   * land — and re-sending it would type the same thing twice. Restored records
+   * remain uncertain even when their saved attempt count was zero.
    */
   _onWsInputAck(seq, msg, sessionId = this._wsSessionId) {
     // `sessionId` is the session of the socket the ACK arrived on: `{t:'ia'}`
@@ -4220,7 +4251,17 @@ class CodemanApp {
         this._seqCounters.set(sessionId, watermark);
         this._persistReliableNow();
       }
-      if (rec && !rec.key && rec.tries <= 1) {
+      if (rec && !rec.key && !rec.replayUncertain && rec.tries <= 1) {
+        const following = list.slice(list.indexOf(rec) + 1).filter((pending) => pending.tries === 0);
+        // Check room for the whole synchronous repair before changing identities or crossing a key.
+        const counter = this._seqCounters.get(sessionId) ?? 0;
+        if (!Number.isSafeInteger(counter) || counter < 0 ||
+            counter > Number.MAX_SAFE_INTEGER - following.length - 1) {
+          this._discardKeySuffix(sessionId, rec,
+            'Input delivery limit reached; pending input not replayed. Check the prompt before retrying', 'warning');
+          this._drainSession(sessionId);
+          return;
+        }
         rec.seq = this._nextSeq(sessionId);
         rec.sentAt = 0;
         rec.tries = 0;
@@ -4228,9 +4269,7 @@ class CodemanApp {
         // every record (including chunk boundaries/key owners) in its FIFO slot.
         // Attempted frames retain their identities until their own ACK certifies
         // rejection; renumbering an ambiguous send would risk applying it twice.
-        for (const pending of list.slice(list.indexOf(rec) + 1)) {
-          if (pending.tries === 0) pending.seq = this._nextSeq(sessionId);
-        }
+        for (const pending of following) pending.seq = this._nextSeq(sessionId);
         this._persistReliableNow();
         this._drainSession(sessionId);
         return;
@@ -4320,6 +4359,7 @@ class CodemanApp {
     } catch {
       this._clientId = '';
     }
+    const durableClientId = this._clientId;
     if (!this._clientId) {
       this._clientId = 'c-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
       try {
@@ -4334,27 +4374,56 @@ class CodemanApp {
       const saved = JSON.parse(raw);
       if (saved && saved.seqs) {
         for (const [s, n] of Object.entries(saved.seqs)) {
-          if (Number.isFinite(n)) this._seqCounters.set(s, n);
+          if (Number.isSafeInteger(n) && n >= 0) this._seqCounters.set(s, n);
         }
       }
       if (saved && saved.pending) {
+        if (saved.version !== undefined && saved.version !== 2) {
+          this.showToast?.('Pending input format could not be verified; input not replayed. Check the prompt before retrying', 'warning');
+          return;
+        }
+        if (!durableClientId || (saved.version === 2
+          ? saved.clientId !== durableClientId
+          : saved.clientId && saved.clientId !== durableClientId)) {
+          this.showToast?.('Pending input identity could not be verified; input not replayed. Check the prompt before retrying', 'warning');
+          return;
+        }
         for (const [s, recs] of Object.entries(saved.pending)) {
           if (Array.isArray(recs) && recs.length) {
             const frameMax = window.CodemanInputLimit?.FRAME_MAX_CHARS ?? Infinity;
-            const kept = recs
-              .filter((r) => r && typeof r.data === 'string' && Number.isInteger(r.seq))
-              // A frame over the server's limit can never be ACKed; one persisted
-              // by an older build would otherwise come back on every load (#484).
-              .filter((r) => r.data.length <= frameMax)
-              // Reset sentAt so they re-deliver promptly on this fresh load.
-              .map((r) => ({
+            const kept = [];
+            let previousSeq;
+            let refusedSuffix = false;
+            for (const r of recs) {
+              // Keys have no dedup identity. Never replay them or join text from
+              // opposite sides of one. A legacy queue may have omitted a key
+              // before its first record or in a gap, so only its contiguous
+              // prefix starting at sequence 1 proves the absence of a key.
+              if (r?.key || !r || typeof r.data !== 'string' || !r.data.length || !Number.isSafeInteger(r.seq) || r.seq <= 0 ||
+                  (saved.version !== 2 && r.seq !== (previousSeq === undefined ? 1 : previousSeq + 1))) {
+                refusedSuffix = true;
+                break;
+              }
+              previousSeq = r.seq;
+              // An oversized frame is a certified permanent refusal, not an
+              // unknown key boundary, and must not strand the remaining queue.
+              if (!(r.data.length <= frameMax)) continue;
+              kept.push({
                 seq: r.seq,
                 data: r.data,
                 useMux: !!r.useMux,
                 ts: r.ts || Date.now(),
-                tries: 0,
+                tries: Number.isSafeInteger(r.tries) && r.tries > 0 ? r.tries : 1,
+                // Even saved tries:0 can precede a landed send whose attempt
+                // write failed. A restored frame may only replay its exact seq.
+                replayUncertain: true,
                 sentAt: 0,
-              }));
+              });
+            }
+            if (refusedSuffix) this.showToast?.(
+              'Pending newline or incomplete input queue was not replayed; following input not sent. Check the prompt before retrying',
+              'warning'
+            );
             if (kept.length) this._pendingDeliveries.set(s, kept);
           }
         }
@@ -4385,9 +4454,10 @@ class CodemanApp {
       let bytes = 0;
       for (const [s, list] of this._pendingDeliveries) {
         if (!list.length) continue;
-        pending[s] = list.filter((r) => !r.key).map((r) => ({
+        pending[s] = list.map((r) => ({
           seq: r.seq,
           data: r.data,
+          ...(r.key ? { key: r.key } : {}),
           useMux: r.useMux,
           ts: r.ts,
           tries: r.tries,
@@ -4398,7 +4468,8 @@ class CodemanApp {
       // (so future input stays monotonic and dedup-safe) but skip the payloads —
       // the in-memory queue still delivers; only cross-reload durability is lost.
       const payload =
-        bytes > this._reliableMaxBytes ? { seqs } : { seqs, pending };
+        bytes > this._reliableMaxBytes ? { version: 2, clientId: this._clientId, seqs }
+          : { version: 2, clientId: this._clientId, seqs, pending };
       localStorage.setItem('codeman:pendingInput', JSON.stringify(payload));
     } catch {
       /* QuotaExceeded or disabled storage — in-memory delivery is unaffected */

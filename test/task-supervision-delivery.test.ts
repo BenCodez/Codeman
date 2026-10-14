@@ -1,3 +1,8 @@
+vi.mock('../src/recovery/remote-clock.js', async (original) => ({
+  ...(await original<typeof import('../src/recovery/remote-clock.js')>()),
+  sampleRemoteCodexClock: vi.fn(async () => clockAt()),
+}));
+import { sampleRemoteCodexClock } from '../src/recovery/remote-clock.js';
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 /** Real Session + real tmux input normalization, with an injected recording runner and no processes. */
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -14,6 +19,12 @@ import type { RemoteCodexEvidence } from '../src/recovery/remote-codex.js';
 import { buildRemoteCodexInputCommand } from '../src/recovery/remote-codex.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import * as codexIdentity from '../src/recovery/codex-identity.js';
+const clockAt = (remoteAt = Date.now(), localAt = Date.now()) => ({
+  localBefore: localAt,
+  localAfter: localAt,
+  remoteBefore: remoteAt,
+  remoteAfter: remoteAt,
+});
 const THREAD = '11111111-2222-3333-4444-555555555555';
 const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 let session: Session | undefined;
@@ -125,6 +136,7 @@ describe('transport canonical task prompts', () => {
         processReady: true,
       }));
       vi.spyOn(CodexRecoveryAdapter.prototype, 'getVerifiedTail').mockImplementation(() => tail);
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'getVerifiedRemoteClock').mockImplementation(() => clockAt(now, now));
       vi.spyOn(CodexRecoveryAdapter.prototype, 'deliverRemotePrompt').mockImplementation(async () => deliver());
       vi.spyOn(codexIdentity, 'resolveCodexIdentity').mockRejectedValue(
         new Error('Task delivery must use the recovery observation rather than another identity scan')
@@ -395,6 +407,7 @@ describe('transport canonical task prompts', () => {
     const evidence = (): RemoteCodexEvidence => ({
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: false, paneId: '%7', panePid: 700, screen },
       identity: {
         reason: 'verified',
@@ -411,7 +424,7 @@ describe('transport canonical task prompts', () => {
       deliverRemote: vi.fn(async (_remote, request) => {
         expect(() => buildRemoteCodexInputCommand(_remote, request)).not.toThrow();
         delivered.push(request.prompt);
-        return { status: 'sent', submittedAt: Date.now() };
+        return { status: 'sent', submittedAt: Date.now(), clock: clockAt() };
       }),
     };
     session = new Session({
@@ -432,6 +445,7 @@ describe('transport canonical task prompts', () => {
       codexConfig: { noDaemon: true, resumeSessionId: THREAD },
       envOverrides: { CODEX_HOME: '/fixture/codex-home' },
     });
+    await session.prepareUserInputClock('Initial owner request\r', { fromUser: true });
     session.trackUserInput('Initial owner request\r');
     const adapter = new CodexTaskAdapter(session, () => {}, deps);
     controller = new TaskController({
@@ -522,6 +536,7 @@ describe('transport canonical task prompts', () => {
     let evidence: RemoteCodexEvidence = {
       transport: 'reachable',
       session: 'present',
+      clock: clockAt(),
       pane: { dead: false, paneId: '%7', panePid: 700, screen: '›\n  fixture-model high · /tmp\n' },
       identity: {
         reason: 'verified',
@@ -555,6 +570,7 @@ describe('transport canonical task prompts', () => {
       codexConfig: { noDaemon: true, resumeSessionId: THREAD },
       envOverrides: { CODEX_HOME: '/fixture/codex-home' },
     });
+    await session.prepareUserInputClock('Initial owner request\r', { fromUser: true });
     session.trackUserInput('Initial owner request\r');
     const adapter = new CodexTaskAdapter(session, () => {}, deps);
     expect((await adapter.observe()).observation).toMatchObject({ activity: 'completed' });

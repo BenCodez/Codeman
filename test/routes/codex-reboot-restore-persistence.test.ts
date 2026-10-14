@@ -10,6 +10,7 @@ import { userCasesDir } from '../../src/config/multiuser.js';
 import { writeCustomModelHosts } from '../../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
 import { planVerifiedRebootRestore, verifyCodexRebootIdentity } from '../../src/reboot-restore.js';
+import * as identityWitness from '../../src/recovery/codex-identity.js';
 import { hashCodexPrompt, resolveCodexIdentity } from '../../src/recovery/codex-identity.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../src/recovery/reboot-identity-fence.js';
 import { Session } from '../../src/session.js';
@@ -167,7 +168,7 @@ describe('durable Codex reboot completion', () => {
     expect(rebootRestoreRegistry.list(() => true)).toHaveLength(uncertainty === 'cancelled-after-create' ? 0 : 1);
   });
 
-  it.each(['final-grant', 'mux-preparation'] as const)(
+  it.each(['final-grant', 'mux-preparation', 'snapshot-microtask', 'final-witness'] as const)(
     'refuses a saved privileged launch when its current grant is revoked during %s',
     async (stage) => {
       process.env.CODEMAN_MULTIUSER = '1';
@@ -199,6 +200,31 @@ describe('durable Codex reboot completion', () => {
           }
           return result;
         });
+      }
+      if (stage === 'snapshot-microtask' || stage === 'final-witness') {
+        const revoke = () => {
+          const path = dataPath('users.json');
+          const users = JSON.parse(readFileSync(path, 'utf8'));
+          users.users.find((user: { username: string }) => user.username === username).canBypassPermissions = false;
+          writeFileSync(path, JSON.stringify(users));
+          revoked = true;
+        };
+        const clamp = launchGrants.clampRecoveryLaunchForOwner;
+        let prepared = false;
+        vi.spyOn(launchGrants, 'clampRecoveryLaunchForOwner').mockImplementation(async (...args) => {
+          const result = await clamp(...args);
+          prepared = true;
+          if (stage === 'snapshot-microtask') queueMicrotask(revoke);
+          return result;
+        });
+        if (stage === 'final-witness') {
+          const confirm = identityWitness.confirmCodexIdentityWitness;
+          vi.spyOn(identityWitness, 'confirmCodexIdentityWitness').mockImplementation((...args) => {
+            const result = confirm(...args);
+            if (prepared && !revoked) revoke();
+            return result;
+          });
+        }
       }
       const originalCreate = ctx.mux.createSession.bind(ctx.mux);
       const effects: string[] = [];

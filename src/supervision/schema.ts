@@ -104,6 +104,7 @@ export const TaskStateSchema = z
     lastProgressAt: z.number().optional(),
     conversationId: z.string().max(100).optional(),
     submissionKey: z.string().max(100).optional(),
+    agentProgressVeto: z.boolean().optional(),
     inFlight: z
       .object({
         key: z.string().max(250),

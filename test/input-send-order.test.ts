@@ -441,10 +441,11 @@ describe('named newline keys in the input queue', () => {
     });
     app._sendNamedKey('session-1', 'C-Enter', {});
     app._sendInputAsync('session-1', 'after');
-    await waitForCalls(requests, 2);
+    await new Promise((r) => setTimeout(r, 0));
     app._drainSession('session-1');
-    expect(requests.filter((url) => url.endsWith('/send-key'))).toHaveLength(1);
-    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('could not be confirmed'), 'error');
+    expect(requests).toEqual(['/api/sessions/session-1/send-key']);
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'error');
   });
 
   it('cancels a recovery-blocked key on owner destruction and still delivers ordinary text', async () => {
@@ -465,18 +466,19 @@ describe('named newline keys in the input queue', () => {
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('cancelled'), 'warning');
   });
 
-  it('drops an unsupported key response and releases the next text with feedback', async () => {
+  it.each([400, 404, 410, 413])('refuses dependent text when the key receives HTTP %s', async (status) => {
     const app = makeApp();
     const requests: string[] = [];
     global.fetch = vi.fn(async (url) => {
       requests.push(String(url));
-      return new Response('{}', { status: String(url).endsWith('/send-key') ? 400 : 200 });
+      return new Response('{}', { status: String(url).endsWith('/send-key') ? status : 200 });
     });
     app._sendNamedKey('session-1', 'S-Enter', {});
     app._sendInputAsync('session-1', 'after');
-    await waitForCalls(requests, 2);
-    expect(requests.filter((url) => url.endsWith('/send-key'))).toHaveLength(1);
-    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('refused'), 'error');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(requests).toEqual(['/api/sessions/session-1/send-key']);
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'error');
   });
 
   it.each(['expired', 'attempts'])('bounds certified retries by %s and reports the unsent key', async (bound) => {
@@ -489,6 +491,7 @@ describe('named newline keys in the input queue', () => {
     app._sendNamedKey('session-1', 'C-Enter', {});
     await waitForCalls(requests, 1);
     await new Promise((r) => setTimeout(r, 0));
+    app._sendInputAsync('session-1', 'after');
     const key = app._pendingDeliveries.get('session-1')![0];
     key.retryAt = 0;
     if (bound === 'expired') key.ts = Date.now() - 30000;
@@ -496,7 +499,10 @@ describe('named newline keys in the input queue', () => {
     app._drainSession('session-1');
     expect(requests).toHaveLength(1);
     expect(app._pendingDeliveries.get('session-1')).toBeUndefined();
-    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('key not sent'), 'error');
+    expect(app.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('key not sent; following input not sent'),
+      'error'
+    );
   });
 });
 

@@ -12,10 +12,12 @@ prompt vanished with no trace and no resend.
 
 ## The guarantee
 
-Every byte of user input is **recorded durably before delivery** and **only
-dropped once the server ACKs it** — so a half-open socket, a reconnect, or a page
-reload can never lose input. Redelivery is **exactly-once**: the server applies
-each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
+Ordinary input is queued and persisted before delivery, and remains pending
+until the server ACKs or permanently refuses it. A half-open socket or reconnect
+replays its exact `(clientId, seq)` identity. The server applies that identity at
+most once while its dedup state remains available. Storage failures, backlog
+limits, and uncertain newline boundaries limit cross-reload durability as
+explained below.
 
 ## How it works
 
@@ -25,9 +27,18 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
   browser to the server's dedup across reconnects and reloads.
 - Each input frame gets a **monotonic per-session `seq`**. Frame records
   (`{seq,data,useMux,ts,tries,sentAt}`) live in `_pendingDeliveries`
-  (`Map<sessionId, record[]>`), persisted (debounced, + flushed on `pagehide`/
-  `visibilitychange`) to `localStorage['codeman:pendingInput']`. The seq counters
-  persist too, so seqs stay monotonic across reloads (never reset — a reset would
+  (`Map<sessionId, record[]>`), persisted synchronously before each attempt to
+  `localStorage['codeman:pendingInput']`, with ACK cleanup debounced and flushed
+  on `pagehide`/`visibilitychange`. The snapshot includes its client identity,
+  attempt counts, and named-key barriers. Restored frames retain their exact
+  identities and cannot use first-attempt sequence repair, even if a failed
+  attempt write left `tries:0`. A missing or mismatched saved client identity
+  refuses replay with feedback. Unsupported explicit snapshot versions refuse
+  replay too; empty non-key records retain a refusal boundary for dependent text.
+  Persisted counters must be nonnegative safe integers so new WebSocket frames
+  cannot accidentally become unsequenced legacy writes. An exhausted counter
+  refuses new delivery or sequence repair with feedback; it never resets or
+  reuses an identity. The seq counters persist too, so seqs stay monotonic across reloads (never reset — a reset would
   let the server treat fresh input as an already-applied duplicate).
 - **Delivery** (`_drainSession`):
   - **WS path** — when the socket is `OPEN` for the session, send each not-yet-sent
@@ -60,7 +71,7 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
   ACKed as `{t:'ia',seq,dup:true,last:<watermark>}`, where `last` is the server's
   highest applied seq for that `clientId` (`Session.lastInputSeq`). The client drops
   an applied record; on `dup` it lifts its own counter to `last` first and
-  repairs a FIRST-attempt record's sequence **in its existing FIFO position**,
+  repairs a fresh FIRST-attempt record's sequence **in its existing FIFO position**,
   also renumbering later never-attempted records in place. Attempted records keep
   their identities until their own ACK certifies rejection. A newline barrier
   therefore cannot overtake the rejected text. A retry being called a duplicate
@@ -114,10 +125,17 @@ input queue as an HTTP ordering barrier: earlier text must be acknowledged and
 later text waits. Only a recovery reservation's `422` response with
 `retryable:true` and `notSent:true` permits a retry (at most 16 attempts within
 30 seconds, with a 1-second minimum retry delay). Key requests have a 10-second
-deadline. Terminal teardown cancels its pending keys, and unsupported or unknown
-delivery outcomes produce feedback rather than replaying a potentially delivered
-newline. Named keys are not persisted across reloads; ordinary input retains its
-durable seq/ACK behavior.
+deadline. A permanent refusal, expired retry budget, or unknown key outcome
+refuses the dependent suffix with feedback; it cannot join text from opposite
+sides of the missing newline. Explicit terminal teardown may release ordinary
+text behind a never-attempted or certified-not-sent key, but an in-flight key
+with an uncertain outcome also refuses its suffix. Snapshots preserve named-key
+ordering markers. Reload never replays a key: it refuses that barrier and its
+dependent suffix with a warning while preserving preceding ordinary text and
+sequence counters. Legacy snapshots omitted keys, so only their contiguous
+prefix beginning at sequence 1 proves the absence of a missing key. Disabled or
+full browser storage and backlogs over 256 KiB can lose cross-reload durability;
+the live queue remains available.
 
 Dedup state is in-memory on the server. A **server restart** between a write and
 the client's redelivery of that same seq could re-apply it (a rare duplicate).
@@ -130,5 +148,7 @@ across the narrow restart window.
   semantics (monotonic, per-client, gap-tolerant, eviction-safe).
 - `test/routes/session-routes.test.ts` — POST `/input` applies a tagged
   `(clientId, seq)` once on redelivery; untagged input always applies.
+- `test/reliable-input-reload.test.ts` — response-loss replay identity, failed
+  attempt persistence, legacy snapshots, and unreplayable newline barriers.
 - `test/input-size-limit.test.ts`: one input limit on both sides, frame
   splitting, and dropping (never retrying) a frame refused for good (#484).
