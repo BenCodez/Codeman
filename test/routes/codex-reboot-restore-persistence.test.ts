@@ -1,6 +1,7 @@
 /** Production reboot route, Session, and WebServer persistence against isolated test-mode panes. */
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
+import { createHash } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +14,7 @@ import { planVerifiedRebootRestore, verifyCodexRebootIdentity } from '../../src/
 import * as identityWitness from '../../src/recovery/codex-identity.js';
 import { hashCodexPrompt, resolveCodexIdentity } from '../../src/recovery/codex-identity.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../src/recovery/reboot-identity-fence.js';
+import { rebootStateBinding } from '../../src/recovery/reboot-state-binding.js';
 import { Session } from '../../src/session.js';
 import { TmuxManager } from '../../src/tmux-manager.js';
 import type { StateStore } from '../../src/state-store.js';
@@ -106,33 +108,259 @@ afterEach(async () => {
 });
 
 describe('durable Codex reboot completion', () => {
-  it.each(['live', 'dead', 'missing', 'no-history'] as const)(
+  it.each([
+    { sandbox: 'unsupported-sandbox' },
+    { approvalPolicy: 'on-failure' },
+    { noDaemon: 'true' },
+    { noAltScreen: 'true' },
+    { dangerouslyBypassApprovals: 'false' },
+    { animations: 1 },
+    { model: { name: 'model' } },
+    { reasoningEffort: 'unsupported-effort' },
+    { resumeSessionId: 'historical-codeman-id' },
+    { resumeSessionId: null },
+    { customCommand: 'unsupported command' },
+  ])('refuses malformed offered launch settings before reservation or worker creation: %j', async (patch) => {
+    const id = '04040404-1111-2222-3333-444444444444';
+    const { state } = fixture(id);
+    state.codexConfig!.resumeSessionId = UUID;
+    await offer(state);
+    // A durable offer can be older than the record checked at the click boundary.
+    Object.assign(state.codexConfig!, patch);
+    const { server, app, ctx, store } = await harness();
+    store.setSession(id, state);
+    store.flush();
+    const historical = readFileSync(dataPath('state.json'), 'utf8');
+    const prepare = vi.spyOn(ctx, 'prepareRebootRestoreRecovery');
+    const add = vi.spyOn(ctx, 'addSession');
+    const launch = vi.spyOn(ctx.mux, 'createSession');
+    const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+    expect(result.json().restored).toEqual([]);
+    expect(result.json().skipped).toEqual([{ sessionId: id, reason: 'identity-unverified' }]);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(add).not.toHaveBeenCalled();
+    expect(launch).not.toHaveBeenCalled();
+    expect(sessionMap(server).has(id)).toBe(false);
+    expect(readFileSync(dataPath('state.json'), 'utf8')).toBe(historical);
+    expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([id]);
+  });
+
+  it.each(['saved', 'derived'] as const)(
+    'launches healthy exact settings with a %s resume UUID through the actual restore route',
+    async (kind) => {
+      const id = `${kind === 'saved' ? '05050505' : '06060606'}-1111-2222-3333-444444444444`;
+      const { state, home } = fixture(id);
+      state.codexConfig = {
+        noDaemon: true,
+        noAltScreen: true,
+        model: 'example-model',
+        reasoningEffort: 'high',
+        sandbox: 'read-only',
+        approvalPolicy: 'on-request',
+        animations: false,
+        dangerouslyBypassApprovals: false,
+        ...(kind === 'saved' ? { resumeSessionId: UUID } : {}),
+      };
+      const prompt = 'Exact original restoration task';
+      const submission = { at: Date.now(), hash: hashCodexPrompt(prompt) };
+      writeFileSync(
+        join(home, 'history.jsonl'),
+        JSON.stringify({ session_id: UUID, ts: submission.at / 1000, text: prompt }) + '\n'
+      );
+      writeRebootIdentityFence(id, { switchPending: false, submission });
+      await offer(state);
+      const { server, app, ctx, store } = await harness();
+      store.setSession(id, state);
+      const launch = vi.spyOn(ctx.mux, 'createSession');
+      const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+      expect(result.json().skipped).toEqual([]);
+      expect(result.json().restored.map((item: { id: string }) => item.id)).toEqual([id]);
+      const planned = { ...state.codexConfig, resumeSessionId: UUID };
+      expect(launch).toHaveBeenCalledExactlyOnceWith(
+        expect.objectContaining({ codexConfig: planned, recoveryCodexHome: home })
+      );
+      expect(sessionMap(server).get(id)!.codexConfig).toEqual(planned);
+      expect(store.getSession(id)?.codexConfig).toEqual(planned);
+    }
+  );
+
+  it.each(['inherited', 'default'] as const)(
+    'restores an empty override to the exact captured %s home through the real route and fake mux',
+    async (kind) => {
+      const id = `${kind === 'default' ? '01010101' : '02020202'}-1111-2222-3333-444444444444`;
+      const home = join(homedir(), kind === 'default' ? '.codex' : 'empty-route-inherited');
+      vi.stubEnv('CODEX_HOME', kind === 'default' ? undefined : home);
+      try {
+        const { state } = fixture(id, home);
+        state.codexConfig!.resumeSessionId = UUID;
+        Object.assign(state, { __envOverrides: { CODEX_HOME: '' } });
+        vi.stubEnv('CODEX_HOME', join(homedir(), 'empty-route-new-default'));
+        await offer(state);
+        const { server, app, ctx, store } = await harness();
+        store.setSession(id, state);
+        const launch = vi.spyOn(ctx.mux, 'createSession');
+        const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+        expect(result.json().skipped).toEqual([]);
+        expect(result.json().restored.map((item: { id: string }) => item.id)).toEqual([id]);
+        expect(launch).toHaveBeenCalledExactlyOnceWith(
+          expect.objectContaining({
+            recoveryCodexHome: home,
+            envOverrides: { CODEX_HOME: '' },
+            codexConfig: state.codexConfig,
+          })
+        );
+        expect(sessionMap(server).get(id)!.getRecoveryContext()).toMatchObject({ codexHome: home, noDaemon: true });
+        expect(store.getSession(id)).toMatchObject({ __codexRecoveryHome: home, codexConfig: state.codexConfig });
+        expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    }
+  );
+
+  it('refuses an empty override when the captured inherited home is no longer authorized', async () => {
+    process.env.CODEMAN_MULTIUSER = '1';
+    invalidateUsersCache();
+    const username = 'empty-home-revoked';
+    await createUser({ username, role: 'user', password: 'fixture-password', canBypassPermissions: true });
+    const id = '03030303-1111-2222-3333-444444444444';
+    const { state } = fixture(id, join(homedir(), 'empty-revoked-home'), join(userCasesDir(username), 'project'));
+    state.owner = username;
+    state.codexConfig!.resumeSessionId = UUID;
+    Object.assign(state, { __envOverrides: { CODEX_HOME: '' } });
+    await offer(state);
+    await updateUser(username, { canBypassPermissions: false });
+    const { server, app, ctx, store } = await harness();
+    store.setSession(id, state);
+    const launch = vi.spyOn(ctx.mux, 'createSession');
+    const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+    expect(result.json().restored).toEqual([]);
+    expect(result.json().skipped).toEqual([{ sessionId: id, reason: 'identity-unverified' }]);
+    expect(launch).not.toHaveBeenCalled();
+    expect(sessionMap(server).has(id)).toBe(false);
+    expect(store.getSession(id)).toEqual(state);
+    expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([id]);
+  });
+
+  it.each([
+    'live',
+    'dead',
+    'missing',
+    'no-history',
+    'partial-stale',
+    'partial-pruned',
+    'partial-malformed',
+    'partial-malformed-state',
+    'partial-missing-home',
+    'partial-native-config',
+    'partial-native-owner',
+    'partial-native-cwd',
+    'partial-native-home',
+    'partial-native-missing-config',
+    'partial-native-missing-home',
+    'binding-healthy',
+    'binding-reattached',
+    'binding-null-pid',
+  ] as const)(
     'retains the uncertain original board identity and historical state after server reconstruction: %s',
     async (pane) => {
       const id = `aabbccdd-5555-2222-3333-${hashCodexPrompt(pane).slice(0, 12)}`;
       const { state, home } = fixture(id);
       state.name = 'Historical worker';
       state.codexConfig!.model = 'historical-model';
-      const actualConfig = { ...state.codexConfig, model: 'actual-worker-model', resumeSessionId: UUID };
+      const completeBinding = pane.startsWith('binding-');
+      if (
+        completeBinding ||
+        pane.startsWith('partial-native-') ||
+        ['partial-missing-home', 'partial-malformed-state'].includes(pane)
+      )
+        state.codexConfig!.resumeSessionId = UUID;
+      const actualConfig = {
+        ...state.codexConfig,
+        model:
+          completeBinding ||
+          pane.startsWith('partial-native-') ||
+          ['partial-missing-home', 'partial-malformed-state'].includes(pane)
+            ? state.codexConfig.model
+            : 'actual-worker-model',
+        resumeSessionId: UUID,
+      };
+      let malformedBinding: string | undefined;
+      if (pane === 'partial-malformed-state') {
+        Object.assign(state.codexConfig!, { dangerouslyBypassApprovals: 'no' });
+        // An old permissive digest would match these malformed saved types.
+        malformedBinding = createHash('sha256')
+          .update(
+            JSON.stringify([
+              state.id,
+              state.owner ?? null,
+              state.workingDir,
+              home,
+              Object.fromEntries(Object.entries(state.codexConfig!).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))),
+            ])
+          )
+          .digest('hex');
+        expect(rebootStateBinding(state)).toBeUndefined();
+      }
+      if (pane === 'binding-reattached') state.pid = 8765;
+      if (pane === 'binding-null-pid') state.pid = null;
       const { server, ctx, store } = await harness();
-      if (pane !== 'no-history') store.setSession(id, state);
+      if (!['no-history', 'partial-pruned'].includes(pane)) store.setSession(id, state);
+      if (pane === 'partial-missing-home') {
+        const historicalWithoutHome = { ...state } as SessionState & { __codexRecoveryHome?: string };
+        delete historicalWithoutHome.__codexRecoveryHome;
+        store.setSession(id, historicalWithoutHome);
+      }
       store.flush();
       const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
       writeRebootIdentityFence(id, { resumeSessionId: UUID, switchPending: true, untrackedInput: true });
+      const nativeConfig =
+        pane === 'partial-native-missing-config'
+          ? undefined
+          : pane === 'partial-native-config'
+            ? { ...actualConfig, model: 'different-native-model' }
+            : actualConfig;
+      const nativeHome =
+        pane === 'partial-native-missing-home'
+          ? undefined
+          : pane === 'partial-native-home'
+            ? join(home, 'different-native-home')
+            : home;
+      const nativeWorkingDir =
+        pane === 'partial-native-cwd' ? join(state.workingDir, 'different-native-cwd') : state.workingDir;
+      mkdirSync(nativeWorkingDir, { recursive: true });
       ctx.mux.registerSession({
         sessionId: id,
         muxName: `codeman-${id.slice(0, 8)}`,
         pid: 0,
         createdAt: state.createdAt,
-        workingDir: state.workingDir,
+        workingDir: nativeWorkingDir,
         mode: 'codex',
+        owner: pane === 'partial-native-owner' ? 'different-native-owner' : state.owner,
         attached: false,
         name: 'Historical worker',
-        recoveryCodexHome: home,
-        codexRestoreUncertain: true,
-        codexRestoreConfig: actualConfig,
+        recoveryCodexHome: nativeHome,
+        codexRestoreUncertain: !pane.startsWith('partial-') && !completeBinding,
+        codexRestoreConfig: nativeConfig,
+        ...(pane.startsWith('partial-') || completeBinding
+          ? {
+              codexRestoreStateBinding:
+                pane === 'partial-malformed'
+                  ? 'not-a-binding'
+                  : (malformedBinding ??
+                    rebootStateBinding({
+                      ...state,
+                      codexConfig: actualConfig,
+                      __codexRecoveryHome: home,
+                    } as SessionState & { __codexRecoveryHome: string })),
+            }
+          : {}),
       });
-      vi.spyOn(ctx.mux, 'reconcileSessions').mockResolvedValue({ alive: [], dead: [id], discovered: [] });
+      vi.spyOn(ctx.mux, 'reconcileSessions').mockResolvedValue({
+        alive: completeBinding ? [id] : [],
+        dead: completeBinding ? [] : [id],
+        discovered: [],
+      });
       vi.spyOn(ctx.mux, 'muxSessionExists').mockReturnValue(pane !== 'missing');
       vi.spyOn(ctx.mux, 'isPaneDead').mockReturnValue(pane === 'dead');
       const create = vi.spyOn(ctx.mux, 'createSession');
@@ -142,14 +370,19 @@ describe('durable Codex reboot completion', () => {
       const session = sessionMap(server).get(id)!;
       expect(session).toBeDefined();
       expect(session.name).toBe(state.name);
-      expect(session.claudeSessionId).toBe(UUID);
-      expect(session.toState().codexConfig).toEqual(actualConfig);
-      expect(session.codexRestoreWorkerMayExist).toBe(true);
-      expect(session.getRecoveryContext()).toMatchObject({ managed: false, untrackedInput: true });
+      expect(session.claudeSessionId).toBe(nativeConfig?.resumeSessionId ?? id);
+      if (!nativeConfig) expect(session.getRecoveryContext()).toMatchObject({ managed: false, noDaemon: false });
+      expect(session.toState().codexConfig).toEqual(nativeConfig);
+      expect(session.codexRestoreWorkerMayExist).toBe(!completeBinding);
+      expect(session.getRecoveryContext()).toMatchObject({ managed: completeBinding, untrackedInput: true });
       ctx.persistSessionState(session);
       Reflect.get(server, '_persistSessionStateNow').call(server, session);
       store.flush();
-      expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
+      const savedAfterAttach = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
+      if (completeBinding) {
+        expect(savedAfterAttach.codexConfig).toEqual(actualConfig);
+        expect(rebootStateBinding(savedAfterAttach)).toBe(ctx.mux.getSession(id)!.codexRestoreStateBinding);
+      } else expect(savedAfterAttach).toEqual(historical);
       expect(create).not.toHaveBeenCalled();
       expect(respawn).not.toHaveBeenCalled();
       expect(kill).not.toHaveBeenCalled();
@@ -503,6 +736,7 @@ describe('durable Codex reboot completion', () => {
     });
     let launching: Session | undefined;
     vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(async function () {
+      // eslint-disable-next-line @typescript-eslint/no-this-alias -- Expose the actual awaited launch instance to the race assertion.
       launching = this;
       await barrier;
       if (outcome === 'failed') throw new Error('fixture launch failed');
@@ -559,6 +793,7 @@ describe('durable Codex reboot completion', () => {
     });
     let launching: Session | undefined;
     vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(async function (...args) {
+      // eslint-disable-next-line @typescript-eslint/no-this-alias -- Expose the actual awaited launch instance to the race assertion.
       launching = this;
       await barrier;
       await originalStart.apply(this, args);

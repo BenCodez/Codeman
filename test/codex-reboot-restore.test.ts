@@ -12,8 +12,7 @@ import { dataPath } from '../src/config/instance.js';
 import { initialRecoveryState } from '../src/recovery/types.js';
 
 const UUID = '12345678-1234-1234-1234-123456789abc';
-function fixture(overrides: Partial<SessionState> = {}): SessionState {
-  const home = join(homedir(), 'custom-codex');
+function fixture(overrides: Partial<SessionState> = {}, home = join(homedir(), 'custom-codex')): SessionState {
   mkdirSync(join(home, 'sessions'), { recursive: true });
   writeFileSync(
     join(home, 'sessions', `rollout-2026-10-13T15-00-00-${UUID}.jsonl`),
@@ -55,6 +54,27 @@ beforeEach(() => {
 });
 
 describe('verified local Codex reboot offers', () => {
+  it.each([
+    { sandbox: 'unsupported-sandbox' },
+    { approvalPolicy: 'on-failure' },
+    { noDaemon: 'true' },
+    { noAltScreen: 'true' },
+    { dangerouslyBypassApprovals: 'false' },
+    { animations: 1 },
+    { model: { name: 'model' } },
+    { reasoningEffort: 'unsupported-effort' },
+    { resumeSessionId: 'original' },
+    { resumeSessionId: null },
+    { customCommand: 'unsupported command' },
+  ])('refuses malformed historical Codex launch settings before identity reads: %j', async (patch) => {
+    const state = fixture();
+    Object.assign(state.codexConfig!, patch);
+    const read = vi.spyOn(fs, 'opendir');
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+    expect((await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true)).restore).toEqual([]);
+    expect(read).not.toHaveBeenCalled();
+  });
+
   it.each([
     { type: 'collab_agent_spawn_end', call_id: 'spawn', new_thread_id: 'child', status: 'running' },
     { type: 'exec_approval_request' },
@@ -131,6 +151,47 @@ describe('verified local Codex reboot offers', () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it.each(['inherited', 'default'] as const)(
+    'verifies an empty override against its captured %s launch home after defaults change',
+    async (kind) => {
+      const home = join(homedir(), kind === 'default' ? '.codex' : 'empty-inherited-codex');
+      vi.stubEnv('CODEX_HOME', kind === 'default' ? undefined : home);
+      try {
+        const state = fixture({}, home);
+        Object.assign(state, { __envOverrides: { CODEX_HOME: '' } });
+        vi.stubEnv('CODEX_HOME', join(homedir(), 'different-current-profile'));
+        expect(await verifyCodexRebootIdentity(state)).toBe(UUID);
+        const plan = await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true);
+        expect(plan.skipped).toEqual([]);
+        expect(plan.restore[0]).toMatchObject({ sessionId: state.id, resumeConversationId: UUID });
+        expect((state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome).toBe(home);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    }
+  );
+
+  it.each(['missing-pin', 'relative', 'whitespace', 'mismatch', 'null'] as const)(
+    'keeps an empty-home restoration exception closed for %s provenance',
+    async (kind) => {
+      const state = fixture();
+      const overrides: unknown =
+        kind === 'relative'
+          ? 'relative-profile'
+          : kind === 'whitespace'
+            ? ' '
+            : kind === 'mismatch'
+              ? join(homedir(), 'different-pinned-profile')
+              : kind === 'null'
+                ? null
+                : '';
+      Object.assign(state, { __envOverrides: { CODEX_HOME: overrides } });
+      if (kind === 'missing-pin') delete (state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome;
+      expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+      expect((await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true)).restore).toEqual([]);
+    }
+  );
 
   it('honors a newer durable fence over an older debounced state snapshot', async () => {
     const state = fixture();

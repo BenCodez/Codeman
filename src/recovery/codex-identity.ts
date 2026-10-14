@@ -57,9 +57,17 @@ export interface CodexIdentityResult {
 export function confirmCodexIdentityWitness(identity: CodexIdentityResult): boolean {
   if (!identity.path || !identity.witness || identity.tailTruncated !== false || identity.tail === undefined)
     return false;
-  let fd: number | undefined;
-  try {
-    for (const input of identity.witness.paths) {
+  const leaf = identity.witness.paths.find((input) => input.path === identity.path && input.kind === 'file');
+  if (!leaf || leaf.size === undefined || leaf.mtimeMs === undefined || leaf.ctimeMs === undefined) return false;
+  const matchesLeaf = (stat: Stats) =>
+    stat.isFile() &&
+    stat.dev === leaf.dev &&
+    stat.ino === leaf.ino &&
+    stat.size === leaf.size &&
+    stat.mtimeMs === leaf.mtimeMs &&
+    stat.ctimeMs === leaf.ctimeMs;
+  const witnessIsCurrent = () => {
+    for (const input of identity.witness!.paths) {
       const stat = lstatSync(input.path);
       if (
         stat.isSymbolicLink() ||
@@ -72,16 +80,20 @@ export function confirmCodexIdentityWitness(identity: CodexIdentityResult): bool
       )
         return false;
     }
-    fd = openSync(identity.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    return true;
+  };
+  let fd: number | undefined;
+  try {
+    if (!witnessIsCurrent()) return false;
+    fd = openSync(identity.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
     const before = fstatSync(fd);
-    if (!before.isFile() || before.size > 262_144) return false;
+    if (!matchesLeaf(before) || before.size > 262_144) return false;
     const bytes = Buffer.alloc(before.size);
     if (readSync(fd, bytes, 0, before.size, 0) !== before.size) return false;
     const after = fstatSync(fd);
     return (
-      before.size === after.size &&
-      before.mtimeMs === after.mtimeMs &&
-      before.ctimeMs === after.ctimeMs &&
+      matchesLeaf(after) &&
+      witnessIsCurrent() &&
       createHash('sha256').update(bytes).digest('hex') === createHash('sha256').update(identity.tail).digest('hex')
     );
   } catch {
@@ -203,7 +215,7 @@ async function readWindow(
   budget.check();
   // Acquire outside checked(): if open finishes after the deadline, the handle must
   // still reach this finally block instead of being lost in the deadline check.
-  const file = await fs.open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const file = await fs.open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     budget.check();
     const stat = await checked(budget, () => file.stat());

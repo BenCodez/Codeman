@@ -101,6 +101,26 @@ function acceptedSubmission(patch: Partial<RecoveryObservation> = {}): RecoveryO
 }
 
 describe('recovery action authority', () => {
+  it('requires new repeated confirmation when native incarnation changes under the same evidence key', async () => {
+    const f = fixture(enabledState());
+    f.observation = failure('same-cached-exit', { processProofKey: 'native-incarnation-1' });
+    await f.controller.refresh();
+    advance(2000);
+    f.observation = failure('same-cached-exit', { processProofKey: 'native-incarnation-2' });
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    advance(1999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.act).not.toHaveBeenCalled();
+    advance(1);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toMatchObject({ key: 'same-cached-exit' });
+    advance(1000);
+    await f.controller.refresh();
+    expect(f.act).toHaveBeenCalledOnce();
+  });
+
   it('is disabled by default and does not poll or act without opt-in', async () => {
     const f = fixture();
     await vi.advanceTimersByTimeAsync(300_000);
