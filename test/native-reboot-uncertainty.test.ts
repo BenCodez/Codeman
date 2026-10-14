@@ -119,6 +119,95 @@ function fixture() {
 }
 
 describe('native uncertain Codex reboot ownership', () => {
+  it.each(['authorized', 'refused', 'throwing'] as const)(
+    'awaits the final asynchronous launch proof before any worker effect: %s',
+    async (outcome) => {
+      const { manager, home } = fixture();
+      let finish!: (value: boolean) => void;
+      let fail!: (error: Error) => void;
+      const held = new Promise<boolean>((resolve, reject) => {
+        finish = resolve;
+        fail = reject;
+      });
+      let confirmations = 0;
+      const dispatch = vi.fn();
+      const launch = manager.createSession({
+        sessionId: ID,
+        workingDir: root,
+        mode: 'codex',
+        codexConfig: config,
+        recoveryCodexHome: home,
+        codexRestoreGuard: {
+          prepare: async () => {},
+          confirm: () => (++confirmations === 3 ? held : true),
+          noteDispatch: dispatch,
+        },
+      });
+      const settled = launch.then(
+        (value) => ({ value }),
+        (error: unknown) => ({ error })
+      );
+      try {
+        await vi.waitFor(() => expect(confirmations).toBe(3));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(dispatch).not.toHaveBeenCalled();
+        expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
+        if (outcome === 'throwing') fail(new Error('Fixture private proof unavailable'));
+        else finish(outcome === 'authorized');
+        const result = await settled;
+        if (outcome === 'authorized') {
+          expect(result).toHaveProperty('value');
+          expect(dispatch).toHaveBeenCalledOnce();
+          expect(effects.sync.mock.calls.filter(([command]) => command.includes(' respawn-pane '))).toHaveLength(1);
+        } else {
+          expect(result).toHaveProperty('error');
+          expect(dispatch).not.toHaveBeenCalled();
+          expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
+          expect(manager.getSession(ID)).toBeUndefined();
+        }
+      } finally {
+        finish(false);
+        await settled;
+      }
+    }
+  );
+
+  it('rechecks Session owner intent after an awaited launch proof', async () => {
+    const { manager, home } = fixture();
+    const session = new Session({
+      id: ID,
+      workingDir: root,
+      mode: 'codex',
+      useMux: true,
+      mux: manager,
+      codexConfig: config,
+      recoveryCodexHome: home,
+    });
+    sessions.push(session);
+    let finish!: (value: boolean) => void;
+    const held = new Promise<boolean>((resolve) => {
+      finish = resolve;
+    });
+    const proof = vi.fn(() => held);
+    const create = vi.spyOn(manager, 'createSession');
+    session.setCodexRestoreLaunchGuard({ prepare: async () => {}, confirm: proof });
+    const launch = session.startInteractive().then(
+      () => undefined,
+      (error: unknown) => error
+    );
+    try {
+      await vi.waitFor(() => expect(proof).toHaveBeenCalledOnce());
+      session.fenceUntrackedInput();
+      finish(true);
+      expect(await launch).toBeInstanceOf(Error);
+      expect(create).not.toHaveBeenCalled();
+      expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
+    } finally {
+      finish(false);
+      await launch;
+    }
+  });
+
   it.each(['lost-receipt', 'unknown-pid'] as const)(
     'preserves original durable identity when worker launch has %s',
     async (failure) => {
@@ -351,6 +440,15 @@ describe('native uncertain Codex reboot ownership', () => {
     'missing-final-newline',
     'blank-line',
     'crlf',
+    'no-server',
+    'wrong-socket',
+    'missing-socket',
+    'no-server-signal',
+    'no-server-killed',
+    'no-server-status',
+    'no-server-timeout',
+    'no-server-output',
+    'no-server-extra',
   ] as const)('retires uncertain identity only after a complete pane listing proves absence (%s)', async (listing) => {
     const { manager, home } = fixture();
     const record: MuxSession = {
@@ -372,6 +470,26 @@ describe('native uncertain Codex reboot ownership', () => {
     const valid = (name: string, pid: string) => [name, pid, '0', '', ''].join(sep) + '\n';
     effects.sync.mockImplementation((command: string) => {
       expect(command).not.toContain('|| true');
+      if (
+        listing === 'no-server' ||
+        listing === 'wrong-socket' ||
+        listing === 'missing-socket' ||
+        listing.startsWith('no-server-')
+      ) {
+        const socket = join(process.env.TMUX_TMPDIR ?? '/tmp', `tmux-${process.getuid!()}`, 'fixture-socket');
+        const diagnostic =
+          listing === 'missing-socket'
+            ? `error connecting to ${socket} (No such file or directory)\n`
+            : `no server running on ${listing === 'wrong-socket' ? socket + '-other' : socket}\n`;
+        throw Object.assign(new Error('Fixture native no-server'), {
+          status: listing === 'no-server-status' ? 2 : 1,
+          stdout: listing === 'no-server-output' ? 'partial listing' : '',
+          stderr: diagnostic + (listing === 'no-server-extra' ? 'extra diagnostic\n' : ''),
+          ...(listing === 'no-server-signal' ? { signal: 'SIGTERM' } : {}),
+          ...(listing === 'no-server-killed' ? { killed: true } : {}),
+          ...(listing === 'no-server-timeout' ? { code: 'ETIMEDOUT' } : {}),
+        });
+      }
       if (listing === 'failed') throw new Error('Fixture pane listing unavailable');
       return listing === 'empty'
         ? ''
@@ -400,7 +518,7 @@ describe('native uncertain Codex reboot ownership', () => {
     const died = vi.fn();
     manager.on('sessionDied', died);
     const result = await manager.reconcileSessions();
-    const absent = listing === 'empty' || listing === 'other-live';
+    const absent = listing === 'empty' || listing === 'other-live' || listing === 'no-server';
     expect(manager.getSession(ID)).toBe(absent ? undefined : record);
     if (absent) {
       expect(result.dead).toContain(ID);
@@ -544,6 +662,7 @@ describe('native uncertain Codex reboot ownership', () => {
     'revoked-before',
     'revoked-during-retirement',
     'retirement-file-failure',
+    'private-proof-refused',
     'record-replaced',
   ] as const)('retires a previous reboot binding before any later native respawn effect (%s)', async (outcome) => {
     const { manager, home } = fixture();
@@ -602,13 +721,21 @@ describe('native uncertain Codex reboot ownership', () => {
       codexConfig: { ...config, model: 'new-owner-model' },
       recoveryCodexHome: home,
       onlyIfDead: true,
-      recoveryDispatchGuard: { confirm: () => authorized, noteDispatch: vi.fn() },
+      recoveryDispatchGuard: {
+        confirm: () => authorized,
+        prepareEvidence: async () => outcome !== 'private-proof-refused',
+        noteDispatch: vi.fn(),
+      },
     });
     expect(result).toBe(outcome === 'sent' ? 99999 : null);
     expect(effects.exec.mock.calls.filter(([command]) => String(command).includes(' respawn-pane '))).toHaveLength(
       outcome === 'sent' || outcome === 'lost-receipt' ? 1 : 0
     );
-    if (['revoked-before', 'revoked-during-retirement', 'retirement-file-failure'].includes(outcome)) {
+    if (
+      ['revoked-before', 'revoked-during-retirement', 'retirement-file-failure', 'private-proof-refused'].includes(
+        outcome
+      )
+    ) {
       await manager.flushSessionsDurably();
       const saved = JSON.parse(readFileSync(metadata, 'utf8')).find((row: MuxSession) => row.sessionId === ID);
       expect(saved.codexRestoreStateBinding).toBe('a'.repeat(64));

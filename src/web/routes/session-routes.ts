@@ -2105,6 +2105,13 @@ export function registerSessionRoutes(
   app.post('/api/sessions/:id/direct-attach-fence', async (req) => {
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
+    if (session.paneLifecycleInFlight || session.recoveryInputReserved) {
+      return {
+        ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Pane input is still in progress; retry attachment'),
+        retryable: true,
+        notSent: true,
+      };
+    }
     // The TUI is about to bypass Session.write() and hand stdin to tmux. For a
     // recoverable CLI, synchronously invalidate and fsync the old conversation
     // proof before acknowledging the handoff. Other modes are a no-op so their

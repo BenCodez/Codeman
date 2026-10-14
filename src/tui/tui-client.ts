@@ -974,77 +974,16 @@ export class TuiClient {
     }
   }
 
-  /**
-   * Bind a prefix-less key to switch this client to another session, so the tab
-   * strip on the attach bar is not just a picture: Alt+1..9 moves between
-   * sessions from INSIDE a pane, the way it does in the web UI.
-   *
-   * `switch-client` rather than detach-then-attach: it keeps the terminal, so
-   * the move is instant and the TUI stays blocked in its `spawnSync` exactly as
-   * before, still holding the restore it owes.
-   */
-  async bindSwitchKey(key: string, target: string): Promise<boolean> {
-    if (!MUX_NAME_PATTERN.test(target)) return false;
-    try {
-      // Two commands: go there, then let that window follow this terminal again.
-      // It is already the right size (see presizeWindow), so `latest` changes
-      // nothing on arrival and costs no repaint — it matters only if the
-      // terminal is resized while sitting in that session.
-      //
-      // ⚠️ The separator MUST be an escaped `\;`. A bare `;` is a command
-      // separator to tmux's own parser, so it ends the `bind-key` and RUNS
-      // what follows immediately: the binding kept only `switch-client`, and
-      // every session got `window-size latest` executed on it at attach time.
-      // That is what left sessions on `latest` after a detach, since the
-      // snapshot was then taken from already-corrupted state.
-      await this.exec('tmux', [
-        '-L',
-        this.socket,
-        'bind-key',
-        '-T',
-        'root',
-        key,
-        'switch-client',
-        '-t',
-        target,
-        '\\;',
-        'set-window-option',
-        '-t',
-        target,
-        'window-size',
-        'latest',
-      ]);
-      return true;
-    } catch {
-      return false;
-    }
+  /** Global switch keys cannot be safely claimed for one attaching client. */
+  async bindSwitchKey(_key: string, _target: string): Promise<boolean> {
+    return false;
   }
 
-  /** Give back a switch key only while it still carries our generated command. */
-  async unbindSwitchKey(key: string): Promise<void> {
-    const bound = await this.readPrefixBinding(key, 'root');
-    if (!bound || !isAttachSwitchBinding(bound)) return;
-    try {
-      await this.exec('tmux', ['-L', this.socket, 'unbind-key', '-T', 'root', key]);
-    } catch {
-      /* the next attach sweep retries any generated key left behind */
-    }
-  }
+  /** Syntax alone does not prove ownership of an existing global binding. */
+  async unbindSwitchKey(_key: string): Promise<void> {}
 
-  /** Remove stale Alt jumps before deciding which targets are safe for this attach. */
-  async clearLeakedAttachSwitchKeys(): Promise<void> {
-    const { stdout } = await this.exec('tmux', ['-L', this.socket, 'list-keys', '-T', 'root']);
-    for (let index = 1; index <= 9; index++) {
-      const key = `M-${index}`;
-      const bound = parsePrefixBinding(stdout, key, 'root');
-      if (!bound || !isAttachSwitchBinding(bound)) continue;
-      // Re-read before removal in case a user's binding changed during the sweep.
-      const fresh = await this.exec('tmux', ['-L', this.socket, 'list-keys', '-T', 'root']);
-      const current = parsePrefixBinding(fresh.stdout, key, 'root');
-      if (current !== bound) continue;
-      await this.exec('tmux', ['-L', this.socket, 'unbind-key', '-T', 'root', key]);
-    }
-  }
+  /** Preserve global controls until their actual owner releases them. */
+  async clearLeakedAttachSwitchKeys(): Promise<void> {}
 
   /**
    * Give a key back, but ONLY while it still means `detach-client`. Anything
@@ -1167,9 +1106,7 @@ export class TuiClient {
    * are server-global, so this method cannot tell a leak from a live claim.
    */
   async clearLeakedAttachBanners(): Promise<number> {
-    // These bindings outlive the bar and can point at a target whose identity
-    // fence failed on the next attach. Only our exact generated forms are owned.
-    await this.clearLeakedAttachSwitchKeys().catch(() => undefined);
+    // Global switch bindings are preserved: command text cannot prove ownership.
     let names: string[];
     try {
       const { stdout } = await this.exec('tmux', ['-L', this.socket, 'list-sessions', '-F', '#{session_name}']);
