@@ -1338,7 +1338,7 @@ const KeyboardAccessoryBar = {
       };
       syncUploadUi();
       try {
-        const paths = await app._uploadAndInsertImages(images, { insert: false });
+        const paths = await app._uploadAndInsertImages(images, { sessionId, insert: false });
         if (paths?.length) {
           const currentOverlay =
             this._composerOverlay?.isConnected && this._composerOverlay.dataset.sessionId === sessionId
@@ -1408,6 +1408,11 @@ const KeyboardAccessoryBar = {
    *  uploads to /api/sessions/:id/paste-image and inserts the saved path. */
   pasteFromClipboard() {
     if (typeof app === 'undefined' || !app.activeSessionId) return;
+    if (!this._isShellSession()) {
+      this.composePrompt();
+      return;
+    }
+    const sessionId = app.activeSessionId;
 
     // Create overlay
     const overlay = document.createElement('div');
@@ -1433,8 +1438,8 @@ const KeyboardAccessoryBar = {
       const text = textarea.value;
       close();
       if (text) {
-        app.sendInput(text);
-        setTimeout(() => app.sendInput('\r'), 80);
+        app._sendInputAsync(sessionId, text, { useMux: true });
+        setTimeout(() => app._sendInputAsync(sessionId, '\r', { useMux: true }), 80);
       }
     };
 
@@ -1444,7 +1449,7 @@ const KeyboardAccessoryBar = {
       const images = Array.from(files || []).filter((f) => f.type.startsWith('image/'));
       if (images.length === 0) return false;
       close();
-      if (typeof app._uploadAndInsertImages === 'function') app._uploadAndInsertImages(images);
+      if (typeof app._uploadAndInsertImages === 'function') app._uploadAndInsertImages(images, { sessionId });
       return true;
     };
 

@@ -31,6 +31,7 @@ import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { parseNativePaneSignal } from './recovery/native-pane-signal.js';
 import {
   dataPath,
   DEFAULT_TMUX_SOCKET,
@@ -314,14 +315,7 @@ interface TrackedPaneExit extends PaneExitObservation {
   reads: number;
 }
 
-/** Read one optional numeric field; a blank or non-numeric value is "not reported". */
-function paneField(fields: string[], index: number): number | undefined {
-  const raw = fields[index];
-  if (raw === undefined || raw === '') return undefined;
-  const value = parseInt(raw, 10);
-  return Number.isNaN(value) ? undefined : value;
-}
-
+const EXIT_NUMBER = /^(?:0|[1-9]\d{0,4})?$/;
 /**
  * Parse the output of `tmux list-panes -a -F` under {@link PANE_LIST_FORMAT}
  * into one row per pane, in tmux's own order. Exported for unit testing.
@@ -341,12 +335,24 @@ export function parsePaneRows(output: string): PaneRow[] {
     const pid = parseInt(fields[1] ?? '', 10);
     if (!sessionName || Number.isNaN(pid)) continue;
     const deadFlag = fields[2];
+    const rawStatus = fields[3] ?? '';
+    const rawSignal = fields[4] ?? '';
+    const signal = parseNativePaneSignal(rawSignal);
+    const validExit =
+      fields.length === 5 &&
+      /^[1-9]\d{0,9}$/.test(fields[1] ?? '') &&
+      Number.isSafeInteger(pid) &&
+      EXIT_NUMBER.test(rawStatus) &&
+      (rawStatus === '' || Number(rawStatus) <= 255) &&
+      signal !== null &&
+      !(rawStatus !== '' && (signal ?? 0) > 0) &&
+      (deadFlag !== '0' || (rawStatus === '' && rawSignal === ''));
     rows.push({
       sessionName,
       pid,
-      dead: deadFlag === '1' ? true : deadFlag === '0' ? false : undefined,
-      exitStatus: paneField(fields, 3),
-      exitSignal: paneField(fields, 4),
+      dead: validExit ? (deadFlag === '1' ? true : deadFlag === '0' ? false : undefined) : undefined,
+      exitStatus: validExit && rawStatus !== '' ? Number(rawStatus) : undefined,
+      exitSignal: validExit ? (signal ?? undefined) : undefined,
     });
   }
   return rows;
@@ -3925,21 +3931,35 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    */
   async inspectPaneForRecovery(muxName: string): Promise<{
     dead: boolean;
+    paneId?: string;
+    panePid?: number;
     status?: number;
     signal?: number;
+    paneSignalToken?: string;
     screen: string | null;
   } | null> {
     if (IS_TEST_MODE || !isValidMuxName(muxName)) return null;
     try {
       const { stdout } = await execAsync(
-        `${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}'`,
+        `${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}|#{pane_pid}'`,
         { timeout: EXEC_TIMEOUT_MS, maxBuffer: 16_384 }
       );
-      const rows = stdout.trim().split('\n');
-      if (rows.length !== 1) return null;
-      const [dead, status, signal, paneId] = rows[0].split('|');
-      if (!/^[01]$/.test(dead) || !/^%\d+$/.test(paneId ?? '')) return null;
-      const number = (s: string): number | undefined => (/^\d{1,5}$/.test(s) ? Number(s) : undefined);
+      const frame = stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout;
+      const fields = frame.split('|');
+      if (fields.length !== 5 || /[\r\n]/.test(frame)) return null;
+      const [dead, status, signal, paneId, rawPid] = fields;
+      if (!/^[01]$/.test(dead) || !/^%(?:0|[1-9]\d{0,9})$/.test(paneId)) return null;
+      if (!/^[1-9]\d{0,9}$/.test(rawPid) || !Number.isSafeInteger(Number(rawPid))) return null;
+      const signalNumber = parseNativePaneSignal(signal);
+      if (
+        !EXIT_NUMBER.test(status) ||
+        (status !== '' && Number(status) > 255) ||
+        signalNumber === null ||
+        (status !== '' && (signalNumber ?? 0) > 0) ||
+        (dead === '0' && (status !== '' || signal !== ''))
+      )
+        return null;
+      const number = (s: string): number | undefined => (s === '' ? undefined : Number(s));
       let screen: string | null = null;
       if (dead === '0') {
         const capture = await execAsync(`${this.tmux()} capture-pane -p -t ${shellescape(paneId)}`, {
@@ -3948,7 +3968,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         });
         screen = capture.stdout;
       }
-      return { dead: dead === '1', status: number(status), signal: number(signal), screen };
+      return {
+        dead: dead === '1',
+        status: number(status),
+        signal: signalNumber,
+        paneSignalToken: signal,
+        screen,
+        paneId,
+        panePid: Number(rawPid),
+      };
     } catch {
       return null;
     }

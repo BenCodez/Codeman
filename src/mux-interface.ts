@@ -402,8 +402,12 @@ export interface TerminalMultiplexer extends EventEmitter {
   /** Fresh, bounded local-pane evidence for recovery. A missing/ambiguous probe is UNKNOWN. */
   inspectPaneForRecovery?(muxName: string): Promise<{
     dead: boolean;
+    paneId?: string;
+    panePid?: number;
     status?: number;
     signal?: number;
+    /** Validated exact native signal token, retained only for a final pane-identity fence. */
+    paneSignalToken?: string;
     screen: string | null;
   } | null>;
 }

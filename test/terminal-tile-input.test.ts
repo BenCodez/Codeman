@@ -783,12 +783,16 @@ describe('TerminalTile links and paste follow THIS pane', () => {
     const app = makeApp();
     const paste = vi.fn();
     app._handleImagePaste = paste;
-    const { term } = await connectTile(app);
+    const { term, tile } = await connectTile(app);
 
     const handled = term.keyHandler!({ type: 'keydown', key: 'v', ctrlKey: true, code: 'KeyV' });
 
     expect(handled).toBe(false);
-    expect(paste).toHaveBeenCalledWith({ terminal: term, sessionId: 's-tile' });
+    expect(paste).toHaveBeenCalledWith({ terminal: term, sessionId: 's-tile', isCurrent: expect.any(Function) });
+    const target = paste.mock.calls[0][0];
+    expect(target.isCurrent()).toBe(true);
+    tile.destroy();
+    expect(target.isCurrent()).toBe(false);
   });
 
   it('leaves Ctrl+Shift+V (voice input) out of the paste trap', async () => {
