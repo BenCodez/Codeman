@@ -51,6 +51,12 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
     recovery: {
       getStatus: vi.fn(() => structuredClone(recoveryState)),
       inspect: vi.fn(async () => structuredClone(recoveryState)),
+      inspectEvidence: vi.fn(async () => ({
+        state: await worker.recovery.inspect(),
+        observedAt: 10_000,
+        stale: false,
+        isCurrent: () => true,
+      })),
       retry: vi.fn(async () => structuredClone(recoveryState)),
     },
   };
@@ -992,6 +998,7 @@ describe('SupervisorController', () => {
           at: 10_001,
           conversationId: WORKER,
           processReady: true,
+          processReadyAt: 10_000,
           safeToAct: false,
         };
         await recovery.inspect();
@@ -1015,6 +1022,217 @@ describe('SupervisorController', () => {
     expect(full.getStatus().handledRequestIds).toHaveLength(128);
   });
 
+  it.each(['accepted', 'mismatch', 'common-write', 'domain-write'] as const)(
+    'keeps real supervisor recovery inspection stale until durable acceptance cleanup succeeds (%s)',
+    async (cleanup) => {
+      const state = initialRecoveryState();
+      state.conversationId = WORKER;
+      state.inFlight = { key: 'restart-receipt', action: 'restart', conversationId: WORKER, startedAt: 9_000 };
+      const act = vi.fn(async () => 'sent' as const);
+      const acceptReservation = vi.fn(async () => {
+        if (cleanup === 'common-write') throw new Error('fixture journal unavailable');
+        return cleanup !== 'mismatch';
+      });
+      const recovery = new RecoveryController(
+        {
+          observe: async () => ({
+            activity: 'working',
+            reason: 'turn-running',
+            conversationId: WORKER,
+            at: 9_000,
+            processReady: true,
+            processReadyAt: 10_000,
+            safeToAct: false,
+          }),
+          act,
+          acceptReservation,
+          persist: async (next) => {
+            if (cleanup === 'domain-write' && !next.inFlight) throw new Error('fixture deletion unavailable');
+          },
+          changed: () => {},
+          now: () => 10_000,
+        },
+        state
+      );
+      const h = harness();
+      h.worker.recovery = recovery;
+      try {
+        await h.controller.configure(config);
+        await h.controller.start();
+        const [row] = await h.controller.inspectWorkers();
+        expect(row).toMatchObject({
+          health: cleanup === 'accepted' ? 'working' : 'unknown',
+          taskStale: true,
+          stale: true,
+          recoveryStale: cleanup !== 'accepted',
+        });
+        expect(acceptReservation).toHaveBeenCalledExactlyOnceWith('restart-receipt');
+        if (cleanup === 'accepted') expect(recovery.getStatus().inFlight).toBeUndefined();
+        else expect(recovery.getStatus().inFlight).toMatchObject({ accepted: true, acceptedAt: 10_000 });
+        expect(act).not.toHaveBeenCalled();
+        expect(h.worker.task.resume).not.toHaveBeenCalled();
+      } finally {
+        recovery.stop();
+      }
+    }
+  );
+
+  it.each(['unchanged', 'input', 'stop', 'configure'] as const)(
+    'binds real read-only recovery freshness to a completed current observation (%s)',
+    async (change) => {
+      let release!: (observation: RecoveryObservation) => void;
+      const act = vi.fn(async () => 'sent' as const);
+      const observe = vi.fn(
+        () =>
+          new Promise<RecoveryObservation>((resolve) => {
+            release = resolve;
+          })
+      );
+      const recovery = new RecoveryController({
+        observe,
+        act,
+        persist: async () => {},
+        changed: () => {},
+        now: () => 10_000,
+      });
+      const h = harness();
+      h.worker.recovery = recovery;
+      await h.controller.configure(config);
+      await h.controller.start();
+      const read = h.controller.inspectWorkers();
+      await vi.waitFor(() => expect(observe).toHaveBeenCalledOnce());
+      let edit: Promise<unknown> | undefined;
+      if (change === 'input') recovery.noteUserInput();
+      if (change === 'stop') recovery.stop();
+      if (change === 'configure') edit = recovery.updateConfig({ enabled: true });
+      release({ activity: 'crashed', reason: 'process-crashed', at: 10_000, conversationId: WORKER, safeToAct: false });
+      const [row] = await read;
+      await edit;
+      expect(row).toMatchObject({
+        health: change === 'unchanged' ? 'dead-pane' : 'unknown',
+        stale: true,
+        taskStale: true,
+        recoveryStale: change !== 'unchanged',
+      });
+      expect(act).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      recovery.stop();
+    }
+  );
+
+  it.each(['removed', 'replaced', 'paused'] as const)(
+    'refuses a recovery result after the inspection binding is %s',
+    async (change) => {
+      let release!: (state: ReturnType<typeof initialRecoveryState>) => void;
+      const h = harness({ inspectionTimeoutMs: 1000 });
+      vi.mocked(h.worker.recovery.inspect).mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+          })
+      );
+      await h.controller.configure(config);
+      await h.controller.start();
+      const read = h.controller.inspectWorkers();
+      await vi.waitFor(() => expect(h.worker.recovery.inspect).toHaveBeenCalledOnce());
+      if (change === 'removed') vi.mocked(h.deps.worker).mockReturnValue(undefined);
+      if (change === 'replaced') vi.mocked(h.deps.worker).mockReturnValue(harness().worker);
+      if (change === 'paused') await h.controller.pause();
+      const state = initialRecoveryState();
+      state.activity = 'crashed';
+      release(state);
+      const [row] = await read;
+      expect(row).toMatchObject({ health: 'unknown', stale: true, taskStale: true, recoveryStale: true });
+      expect(row.task).toBeUndefined();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      expect(h.worker.recovery.retry).not.toHaveBeenCalled();
+    }
+  );
+
+  it('never reuses an unfinished old-controller inspection after replacement', async () => {
+    let release!: (state: ReturnType<typeof initialRecoveryState>) => void;
+    const h = harness({ inspectionTimeoutMs: 5 });
+    vi.mocked(h.worker.recovery.inspect).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        })
+    );
+    await h.controller.configure(config);
+    await h.controller.start();
+    expect((await h.controller.inspectWorkers())[0].recoveryStale).toBe(true);
+    const replacement = harness().worker;
+    vi.mocked(h.deps.worker).mockReturnValue(replacement);
+    expect((await h.controller.inspectWorkers())[0]).toMatchObject({ health: 'unknown', recoveryStale: true });
+    expect(replacement.recovery.inspectEvidence).not.toHaveBeenCalled();
+    const oldState = initialRecoveryState();
+    oldState.activity = 'crashed';
+    release(oldState);
+    await vi.waitFor(() => expect((h.controller as any).workerInspections.size).toBe(0));
+    vi.mocked(replacement.recovery.inspect).mockResolvedValue({ ...initialRecoveryState(), activity: 'working' });
+    expect((await h.controller.inspectWorkers())[0]).toMatchObject({
+      health: 'working',
+      recoveryStale: false,
+      taskStale: true,
+      stale: true,
+    });
+  });
+
+  it.each(['owner-input', 'conversation-change'] as const)(
+    'keeps cached task evidence stale during a fresh recovery inspection after %s',
+    async (change) => {
+      let release!: (state: ReturnType<typeof initialRecoveryState>) => void;
+      const h = harness({ inspectionTimeoutMs: 1000 });
+      h.taskState.objective = 'Historical objective';
+      h.taskState.checkpoint = 'Historical checkpoint';
+      h.taskState.conversationId = WORKER;
+      h.taskState.criteria = [
+        {
+          id: 'owner',
+          kind: 'manual',
+          description: 'Owner accepted',
+          verified: true,
+          evidence: { source: 'owner', at: 9000 },
+        },
+      ];
+      vi.mocked(h.worker.recovery.inspect).mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            release = resolve;
+          })
+      );
+      await h.controller.configure(config);
+      await h.controller.start();
+      const read = h.controller.inspectWorkers();
+      await vi.waitFor(() => expect(h.worker.recovery.inspect).toHaveBeenCalledOnce());
+      const recovery = initialRecoveryState();
+      recovery.conversationId = change === 'conversation-change' ? SUPERVISOR : WORKER;
+      recovery.activity = 'working';
+      if (change === 'owner-input') {
+        h.taskState.phase = 'paused';
+        h.taskState.reason = 'user-input';
+        h.taskState.checkpoint = 'New owner checkpoint';
+      }
+      release(recovery);
+      const [row] = await read;
+      expect(row).toMatchObject({
+        health: 'working',
+        stale: true,
+        taskStale: true,
+        recoveryStale: false,
+        task: h.taskState,
+      });
+      expect(row.task!.criteria[0]).toMatchObject({
+        kind: 'manual',
+        verified: true,
+        evidence: { source: 'owner', at: 9000 },
+      });
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      expect(h.worker.recovery.retry).not.toHaveBeenCalled();
+    }
+  );
+
   it('deduplicates overlapping worker inspection and returns bounded stale evidence at an expired deadline', async () => {
     let release!: (state: ReturnType<typeof initialRecoveryState>) => void;
     const h = harness({ inspectionTimeoutMs: 1000, inspectionConcurrency: 1 });
@@ -1034,12 +1252,23 @@ describe('SupervisorController', () => {
     const [first, duplicate] = await Promise.all([firstRead, duplicateRead]);
     expect(h.worker.recovery.inspect).toHaveBeenCalledTimes(1);
     expect(first).toEqual(duplicate);
-    expect(first[0]).toMatchObject({ sessionId: WORKER, health: 'unknown', stale: false });
+    expect(first[0]).toMatchObject({
+      sessionId: WORKER,
+      health: 'unknown',
+      stale: true,
+      taskStale: true,
+      recoveryStale: false,
+    });
 
     const expired = harness({ inspectionTimeoutMs: 0, inspectionConcurrency: 1 });
     await expired.controller.configure(config);
     await expired.controller.start();
-    expect((await expired.controller.inspectWorkers())[0]).toMatchObject({ health: 'unknown', stale: true });
+    expect((await expired.controller.inspectWorkers())[0]).toMatchObject({
+      health: 'unknown',
+      stale: true,
+      taskStale: true,
+      recoveryStale: true,
+    });
     expect(expired.worker.recovery.inspect).not.toHaveBeenCalled();
   });
 

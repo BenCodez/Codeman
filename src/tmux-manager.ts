@@ -41,6 +41,7 @@ import {
 import { writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { homedir } from 'node:os';
+import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
 import {
   dataPath,
   DEFAULT_TMUX_SOCKET,
@@ -322,14 +323,7 @@ interface TrackedPaneExit extends PaneExitObservation {
   reads: number;
 }
 
-/** Read one optional numeric field; a blank or non-numeric value is "not reported". */
-function paneField(fields: string[], index: number): number | undefined {
-  const raw = fields[index];
-  if (raw === undefined || raw === '') return undefined;
-  const value = parseInt(raw, 10);
-  return Number.isNaN(value) ? undefined : value;
-}
-
+const EXIT_NUMBER = /^(?:0|[1-9]\d{0,4})?$/;
 /**
  * Parse the output of `tmux list-panes -a -F` under {@link PANE_LIST_FORMAT}
  * into one row per pane, in tmux's own order. Exported for unit testing.
@@ -349,12 +343,24 @@ export function parsePaneRows(output: string): PaneRow[] {
     const pid = parseInt(fields[1] ?? '', 10);
     if (!sessionName || Number.isNaN(pid)) continue;
     const deadFlag = fields[2];
+    const rawStatus = fields[3] ?? '';
+    const rawSignal = fields[4] ?? '';
+    const signal = parseNativePaneSignal(rawSignal);
+    const validExit =
+      fields.length === 5 &&
+      /^[1-9]\d{0,9}$/.test(fields[1] ?? '') &&
+      Number.isSafeInteger(pid) &&
+      EXIT_NUMBER.test(rawStatus) &&
+      (rawStatus === '' || Number(rawStatus) <= 255) &&
+      signal !== null &&
+      !(rawStatus !== '' && (signal ?? 0) > 0) &&
+      (deadFlag !== '0' || (rawStatus === '' && rawSignal === ''));
     rows.push({
       sessionName,
       pid,
-      dead: deadFlag === '1' ? true : deadFlag === '0' ? false : undefined,
-      exitStatus: paneField(fields, 3),
-      exitSignal: paneField(fields, 4),
+      dead: validExit ? (deadFlag === '1' ? true : deadFlag === '0' ? false : undefined) : undefined,
+      exitStatus: validExit && rawStatus !== '' ? Number(rawStatus) : undefined,
+      exitSignal: validExit ? (signal ?? undefined) : undefined,
     });
   }
   return rows;
@@ -2267,6 +2273,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         pid: 99999,
         recoveryCodexHome,
         recoveryIsolated: localCodex && codexConfig?.noDaemon === true,
+        ...(options.codexRestoreGuard
+          ? { codexRestoreUncertain: true, codexRestoreConfig: structuredClone(codexConfig) }
+          : {}),
         createdAt: Date.now(),
         workingDir,
         remote,
@@ -2344,6 +2353,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     let createdRestoreShell = false;
     let launchedRestoreWorker = false;
+    let reservedRestoreRecord: MuxSession | undefined;
     try {
       // Build the full command to run inside tmux
       const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
@@ -2428,6 +2438,27 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // pane launch in /tmp, then cd inside bash against the current mount table.
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       if (options.codexRestoreGuard) {
+        // Record exact ownership before a dispatch whose receipt may be lost.
+        // PID 0 is explicitly unknown; it never supplies live/dead action proof.
+        reservedRestoreRecord = {
+          sessionId,
+          muxName,
+          pid: 0,
+          createdAt: Date.now(),
+          workingDir,
+          remote,
+          docker,
+          owner,
+          mode,
+          attached: false,
+          name,
+          recoveryCodexHome,
+          recoveryIsolated: false,
+          codexRestoreUncertain: true,
+          codexRestoreConfig: structuredClone(codexConfig),
+        };
+        this.sessions.set(sessionId, reservedRestoreRecord);
+        await this.flushSessionsDurably(() => options.codexRestoreGuard!.confirm() === true);
         await options.codexRestoreGuard.prepare();
         if (options.codexRestoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
       }
@@ -2496,6 +2527,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         muxName,
         pid,
         recoveryCodexHome,
+        ...(options.codexRestoreGuard
+          ? { codexRestoreUncertain: true, codexRestoreConfig: structuredClone(codexConfig) }
+          : {}),
         recoveryIsolated:
           !docker &&
           (!remote || (remote.owned !== false && !remote.commands?.[mode])) &&
@@ -2523,6 +2557,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           execSync(`${this.tmux()} kill-session -t "${muxName}"`, { timeout: EXEC_TIMEOUT_MS, stdio: 'ignore' });
         } catch {
           /* Preserve the launch refusal even when cleanup of its empty shell fails. */
+        }
+        if (reservedRestoreRecord && this.sessions.get(sessionId) === reservedRestoreRecord) {
+          this.sessions.delete(sessionId);
+          await this.flushSessionsDurably().catch(() => {});
         }
       }
       throw new Error(`Failed to create tmux session: ${getErrorMessage(err)}`);
@@ -2646,6 +2684,24 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // Recovery cannot turn current server defaults into provenance for an old pane.
     if (options.onlyIfDead && localCodex && !recoveryCodexHome) return null;
     const guard = options.recoveryDispatchGuard;
+    const expected = options.expectedRecoveryPane;
+    if (
+      expected &&
+      (!options.onlyIfDead ||
+        !localCodex ||
+        !/^%(?:0|[1-9]\d{0,9})$/.test(expected.paneId) ||
+        !Number.isSafeInteger(Number(expected.paneId.slice(1))) ||
+        !Number.isSafeInteger(expected.panePid) ||
+        expected.panePid <= 0 ||
+        !/^[1-9]\d{0,9}$/.test(String(expected.panePid)) ||
+        (expected.status !== undefined && (expected.status > 255 || (expected.signal ?? 0) > 0)) ||
+        !matchesNativePaneSignal(expected.signal, expected.paneSignalToken) ||
+        ![expected.status, expected.signal].every(
+          (value) => value === undefined || (Number.isSafeInteger(value) && value >= 0)
+        ) ||
+        !((expected.status ?? 0) > 0 || (expected.signal ?? 0) > 0))
+    )
+      return null;
     const canDispatch = () =>
       !guard ||
       (options.onlyIfDead === true &&
@@ -2729,12 +2785,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       if (!canDispatch()) return null;
       guard?.noteDispatch();
-      await execAsync(
-        `${this.tmux()} respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}`,
+      const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${expected ? shellescape(expected.paneId) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
+      const predicate = expected
+        ? [
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${expected.paneId}}`,
+            `#{==:#{pane_pid},${expected.panePid}}`,
+            '#{==:#{pane_dead},1}',
+            `#{==:#{pane_dead_status},${expected.status ?? ''}}`,
+            `#{==:#{pane_dead_signal},${expected.paneSignalToken ?? ''}}`,
+          ].reduce((all, term) => `#{&&:${all},${term}}`)
+        : undefined;
+      // The server evaluates this exact dead-process fence before queuing a no-k
+      // respawn. A refused or lost response remains uncertainty-sealed by Session.
+      const { stdout: spawnOutput } = await execAsync(
+        `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(expected!.paneId)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}`,
         {
           timeout: EXEC_TIMEOUT_MS,
         }
       );
+      if (expected && spawnOutput.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') return null;
       // Wait for the respawned process to start
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
       // The pane now runs a fresh command, so whatever the last read observed of
@@ -3143,6 +3213,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         if (pid !== session.pid) session.pid = pid;
       } else {
         dead.push(sessionId);
+        // A failed/missing listing cannot resolve a dispatch whose receipt was
+        // lost. Retain its original identity for owner inspection; never discover
+        // that possibly existing worker under a generated replacement id.
+        if (session.codexRestoreUncertain === true) continue;
         this.sessions.delete(sessionId);
         this.clearPaneExit(session.muxName);
         this.clearRemoteReconnectState(sessionId);
@@ -4087,21 +4161,35 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    */
   async inspectPaneForRecovery(muxName: string): Promise<{
     dead: boolean;
+    paneId?: string;
+    panePid?: number;
     status?: number;
     signal?: number;
+    paneSignalToken?: string;
     screen: string | null;
   } | null> {
     if (IS_TEST_MODE || !isValidMuxName(muxName)) return null;
     try {
       const { stdout } = await execAsync(
-        `${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}'`,
+        `${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}|#{pane_pid}'`,
         { timeout: EXEC_TIMEOUT_MS, maxBuffer: 16_384 }
       );
-      const rows = stdout.trim().split('\n');
-      if (rows.length !== 1) return null;
-      const [dead, status, signal, paneId] = rows[0].split('|');
-      if (!/^[01]$/.test(dead) || !/^%\d+$/.test(paneId ?? '')) return null;
-      const number = (s: string): number | undefined => (/^\d{1,5}$/.test(s) ? Number(s) : undefined);
+      const frame = stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout;
+      const fields = frame.split('|');
+      if (fields.length !== 5 || /[\r\n]/.test(frame)) return null;
+      const [dead, status, signal, paneId, rawPid] = fields;
+      if (!/^[01]$/.test(dead) || !/^%(?:0|[1-9]\d{0,9})$/.test(paneId)) return null;
+      if (!/^[1-9]\d{0,9}$/.test(rawPid) || !Number.isSafeInteger(Number(rawPid))) return null;
+      const signalNumber = parseNativePaneSignal(signal);
+      if (
+        !EXIT_NUMBER.test(status) ||
+        (status !== '' && Number(status) > 255) ||
+        signalNumber === null ||
+        (status !== '' && (signalNumber ?? 0) > 0) ||
+        (dead === '0' && (status !== '' || signal !== ''))
+      )
+        return null;
+      const number = (s: string): number | undefined => (s === '' ? undefined : Number(s));
       let screen: string | null = null;
       if (dead === '0') {
         const capture = await execAsync(`${this.tmux()} capture-pane -p -t ${shellescape(paneId)}`, {
@@ -4110,7 +4198,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         });
         screen = capture.stdout;
       }
-      return { dead: dead === '1', status: number(status), signal: number(signal), screen };
+      return {
+        dead: dead === '1',
+        status: number(status),
+        signal: signalNumber,
+        paneSignalToken: signal,
+        screen,
+        paneId,
+        panePid: Number(rawPid),
+      };
     } catch {
       return null;
     }

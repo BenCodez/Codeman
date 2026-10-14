@@ -12,7 +12,11 @@ import { initialRecoveryState } from '../src/recovery/types.js';
 import { TaskStore } from '../src/supervision/store.js';
 import { TaskController } from '../src/supervision/controller.js';
 import { initialTaskState } from '../src/supervision/schema.js';
-import type { SessionActionArbiter, SessionActionOwner } from '../src/supervision/action-arbiter.js';
+import {
+  sessionActionKey,
+  type SessionActionArbiter,
+  type SessionActionOwner,
+} from '../src/supervision/action-arbiter.js';
 import { SupervisorStore } from '../src/supervisor/store.js';
 import { SupervisorController } from '../src/supervisor/controller.js';
 import { initialSupervisorState } from '../src/supervisor/schema.js';
@@ -75,11 +79,10 @@ async function fixture(
   const arbiter = internals.getActionArbiter(ID);
   const workerStarted = createDeferred<void>();
   const workerDone = createDeferred<'sent' | 'not-sent' | 'unknown'>();
-  const act = () =>
-    arbiter.run(owner ?? 'task', async () => {
-      workerStarted.resolve();
-      return workerDone.promise;
-    });
+  const effect = async () => {
+    workerStarted.resolve();
+    return workerDone.promise;
+  };
   const recovery = new RecoveryController({
     observe: async () => ({
       activity: 'crashed',
@@ -89,7 +92,7 @@ async function fixture(
       evidenceKey: 'proof',
       safeToAct: true,
     }),
-    act,
+    act: (flight) => arbiter.run('recovery', flight.key, effect),
     persist: (state) => internals.recoveryStore.save(ID, state),
     changed: () => {},
   });
@@ -105,7 +108,7 @@ async function fixture(
       },
       commands: new Map(),
     }),
-    act,
+    act: (key) => arbiter.run('task', key, effect),
     persist: (state) => internals.taskStore.save(ID, state),
     changed: () => {},
   });
@@ -117,7 +120,12 @@ async function fixture(
       criteria: [{ id: 'manual', kind: 'manual', description: 'Owner accepts' }],
     });
   const workerPending = owner === 'task' ? task.resume() : owner === 'recovery' ? recovery.retry() : Promise.resolve();
-  if (owner) await workerStarted.promise;
+  if (owner) {
+    await workerStarted.promise;
+    const flight = owner === 'task' ? task.getStatus().inFlight : recovery.getStatus().inFlight;
+    expect(flight).toBeDefined();
+    expect(internals.actionReservationStore.get(ID).inFlight?.key).toBe(sessionActionKey(owner, flight!.key));
+  }
   const managerStarted = createDeferred<void>();
   const managerDone = createDeferred<void>();
   const supervisor = new SupervisorController(

@@ -42,6 +42,7 @@ export interface SupervisorWorkerHandle {
   recovery: {
     getStatus(): RecoveryState;
     inspect(): Promise<RecoveryState>;
+    inspectEvidence(): Promise<{ state: RecoveryState; observedAt: number; stale: boolean; isCurrent(): boolean }>;
     retry(isCurrent?: () => boolean): Promise<RecoveryState>;
   };
 }
@@ -75,7 +76,13 @@ export class SupervisorController {
   private stopped = false;
   private revision = 0;
   private inspection?: Promise<SupervisorWorkerInspection[]>;
-  private readonly workerInspections = new Map<string, Promise<RecoveryState | undefined>>();
+  private readonly workerInspections = new Map<
+    string,
+    {
+      controller: SupervisorWorkerHandle['recovery'];
+      promise: ReturnType<SupervisorWorkerHandle['recovery']['inspectEvidence']>;
+    }
+  >();
 
   constructor(
     private readonly deps: SupervisorDependencies,
@@ -243,6 +250,7 @@ export class SupervisorController {
   }
 
   private async runInspection(): Promise<SupervisorWorkerInspection[]> {
+    const revision = this.revision;
     const configured = [...this.state.workers];
     const result = new Array<SupervisorWorkerInspection>(configured.length);
     const deadline = Date.now() + (this.deps.inspectionTimeoutMs ?? 10_000);
@@ -253,36 +261,110 @@ export class SupervisorController {
       const worker = this.deps.worker(workerId);
       const observedAt = this.now();
       if (!worker) {
-        result[index] = { sessionId: workerId, health: 'unknown', observedAt, stale: true };
+        result[index] = {
+          sessionId: workerId,
+          health: 'unknown',
+          observedAt,
+          stale: true,
+          taskStale: true,
+          recoveryStale: true,
+        };
         return;
       }
       const task = worker.task.getStatus();
       const fallback = worker.recovery.getStatus();
       const remaining = deadline - Date.now();
       if (remaining <= 0) {
-        result[index] = { sessionId: workerId, task, recovery: fallback, health: 'unknown', observedAt, stale: true };
+        result[index] = {
+          sessionId: workerId,
+          task,
+          recovery: fallback,
+          health: 'unknown',
+          observedAt,
+          stale: true,
+          taskStale: true,
+          recoveryStale: true,
+        };
         return;
       }
       let inspection = this.workerInspections.get(workerId);
+      if (inspection && inspection.controller !== worker.recovery) {
+        result[index] = {
+          sessionId: workerId,
+          task,
+          recovery: fallback,
+          health: 'unknown',
+          observedAt,
+          stale: true,
+          taskStale: true,
+          recoveryStale: true,
+        };
+        return;
+      }
       if (!inspection) {
-        inspection = worker.recovery.inspect().catch(() => undefined);
+        inspection = {
+          controller: worker.recovery,
+          promise: worker.recovery
+            .inspectEvidence()
+            .catch(() => ({ state: fallback, observedAt, stale: true, isCurrent: () => false })),
+        };
         this.workerInspections.set(workerId, inspection);
-        void inspection.finally(() => {
+        void inspection.promise.finally(() => {
           if (this.workerInspections.get(workerId) === inspection) this.workerInspections.delete(workerId);
         });
       }
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const recovery = await Promise.race([
-        inspection,
+      const evidence = await Promise.race([
+        inspection.promise,
         new Promise<undefined>((resolve) => {
           timer = setTimeout(() => resolve(undefined), remaining);
         }),
       ]).finally(() => {
         if (timer) clearTimeout(timer);
       });
+      // Recovery inspection is read-only. Task refresh can dispatch work, so its
+      // current durable snapshot carries its own explicit uncertainty instead.
+      const currentWorker = this.deps.worker(workerId);
+      if (
+        this.stopped ||
+        this.state.phase !== 'active' ||
+        this.revision !== revision ||
+        currentWorker?.task !== worker.task ||
+        currentWorker?.recovery !== worker.recovery
+      ) {
+        result[index] = {
+          sessionId: workerId,
+          health: 'unknown',
+          observedAt,
+          stale: true,
+          taskStale: true,
+          recoveryStale: true,
+        };
+        return;
+      }
+      const currentTask = currentWorker.task.getStatus();
+      const recovery = evidence && !evidence.stale && evidence.isCurrent() ? evidence.state : undefined;
       result[index] = recovery
-        ? { sessionId: workerId, task, recovery, health: this.health(recovery), observedAt: this.now(), stale: false }
-        : { sessionId: workerId, task, recovery: fallback, health: 'unknown', observedAt, stale: true };
+        ? {
+            sessionId: workerId,
+            task: currentTask,
+            recovery,
+            health: this.health(recovery),
+            observedAt: evidence!.observedAt,
+            stale: true,
+            taskStale: true,
+            recoveryStale: false,
+          }
+        : {
+            sessionId: workerId,
+            task: currentTask,
+            recovery: fallback,
+            health: 'unknown',
+            observedAt,
+            stale: true,
+            taskStale: true,
+            recoveryStale: true,
+          };
     };
     const runners = Array.from({ length: Math.min(concurrency, configured.length) }, async () => {
       while (cursor < configured.length) {

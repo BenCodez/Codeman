@@ -21,6 +21,7 @@ function fixture() {
       turnId: 't1',
       submissionKey: 'fixture-submission',
       processReady: true,
+      liveProofAt: 10000,
       safeToAct: false,
     },
     commands: new Map(),
@@ -811,11 +812,11 @@ describe('task supervision', () => {
   it('shares one action slot across actors', async () => {
     const arbiter = new SessionActionArbiter();
     let release!: () => void;
-    const p = arbiter.run('task', async () => {
+    const p = arbiter.run('task', 'fixture-operation', async () => {
       await new Promise<void>((r) => (release = r));
       return 'sent';
     });
-    expect(await arbiter.run('recovery', async () => 'sent')).toBe('not-sent');
+    expect(await arbiter.run('recovery', 'fixture-operation', async () => 'sent')).toBe('not-sent');
     await expect(arbiter.reset('task')).rejects.toThrow('active');
     await expect(arbiter.reset('recovery')).resolves.toBeUndefined();
     release();
@@ -861,34 +862,34 @@ describe('task supervision', () => {
     const a = new SessionActionArbiter(async (next) => {
       key = next;
     });
-    expect(await a.run('task', async () => 'unknown')).toBe('unknown');
+    expect(await a.run('task', 'fixture-operation', async () => 'unknown')).toBe('unknown');
     expect(key).toBeTruthy();
     const restarted = new SessionActionArbiter(async (next) => {
       key = next;
     }, key);
     const act = vi.fn(async () => 'sent' as const);
-    expect(await restarted.run('task', act)).toBe('not-sent');
+    expect(await restarted.run('task', 'fixture-operation', act)).toBe('not-sent');
     expect(act).not.toHaveBeenCalled();
     await restarted.reset('task');
-    expect(await restarted.run('task', act)).toBe('sent');
+    expect(await restarted.run('task', 'fixture-operation', act)).toBe('sent');
   });
   it("does not let one actor reset another actor's unresolved reservation", async () => {
     const arbiter = new SessionActionArbiter();
     const act = vi.fn(async () => 'sent' as const);
-    expect(await arbiter.run('task', async () => 'unknown')).toBe('unknown');
+    expect(await arbiter.run('task', 'fixture-operation', async () => 'unknown')).toBe('unknown');
     await arbiter.reset('recovery');
-    expect(await arbiter.run('recovery', act)).toBe('not-sent');
+    expect(await arbiter.run('recovery', 'fixture-operation', act)).toBe('not-sent');
     expect(act).not.toHaveBeenCalled();
     await arbiter.reset('task');
-    expect(await arbiter.run('recovery', act)).toBe('sent');
+    expect(await arbiter.run('recovery', 'fixture-operation', act)).toBe('sent');
   });
   it('requires an explicit safe claim before clearing a legacy unowned reservation', async () => {
     const arbiter = new SessionActionArbiter(undefined, 'bare-uuid');
     const act = vi.fn(async () => 'sent' as const);
     await arbiter.reset('task');
-    expect(await arbiter.run('task', act)).toBe('not-sent');
+    expect(await arbiter.run('task', 'fixture-operation', act)).toBe('not-sent');
     await arbiter.reset('task', true);
-    expect(await arbiter.run('task', act)).toBe('sent');
+    expect(await arbiter.run('task', 'fixture-operation', act)).toBe('sent');
   });
   it('uses same authority for genuine crashes and bounds recovery', async () => {
     const f = fixture();
@@ -903,6 +904,7 @@ describe('task supervision', () => {
         observe: async () => ({
           observation: {
             activity: 'crashed',
+            liveProofAt: 10001,
             reason: 'process-crashed',
             at: 10001,
             conversationId: id,
@@ -925,7 +927,38 @@ describe('task supervision', () => {
     expect(c.getStatus().continuations).toBe(1);
     c.stop();
   });
-  it.each([11000, NaN, Infinity, 20001, 15000])(
+  it.each([
+    { proof: 10000, at: 40000, now: 40000, allowed: true },
+    { proof: 10000, at: 40001, now: 40001, allowed: false },
+    { proof: 30000, at: 30001, now: 60001, allowed: false },
+    { proof: 20001, at: 20002, now: 20000, allowed: false },
+  ])(
+    'bounds fresh crash proof against both observation and current time: $proof/$at/$now',
+    async ({ proof, at, now, allowed }) => {
+      const f = fixture();
+      await configure(f.controller);
+      f.clock(now);
+      f.set({
+        activity: 'crashed',
+        reason: 'process-crashed',
+        safeToAct: true,
+        processReady: false,
+        evidenceKey: 'bounded-crash',
+        at,
+        liveProofAt: proof,
+      });
+      try {
+        await f.controller.refresh();
+        expect(f.recover).toHaveBeenCalledTimes(allowed ? 1 : 0);
+        expect(f.controller.getStatus().continuations).toBe(allowed ? 1 : 0);
+        if (!allowed) expect(f.controller.getStatus().inFlight).toBeUndefined();
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
+
+  it.each([undefined, 11000, NaN, Infinity, 20001, 15000])(
     'requires crash live proof %s to fall within the armed task lifetime',
     async (liveProofAt) => {
       const f = fixture();
@@ -1174,6 +1207,7 @@ describe('task supervision', () => {
         observe: async () => ({
           observation: {
             activity: 'crashed',
+            liveProofAt: 10001,
             reason: 'process-crashed',
             at: 10001,
             conversationId: id,
@@ -1297,6 +1331,7 @@ describe('task supervision', () => {
       let observation: TaskObservation = {
         observation: {
           activity,
+          liveProofAt: 12000,
           reason: activity === 'crashed' ? 'process-crashed' : 'turn-interrupted',
           at: 12001,
           conversationId: id,
@@ -1421,6 +1456,7 @@ describe('task supervision', () => {
     let observation: TaskObservation = {
       observation: {
         activity: 'crashed',
+        liveProofAt: 10001,
         reason: 'process-crashed',
         at: 12001,
         conversationId: id,
@@ -1899,6 +1935,7 @@ describe('fresh agent progress authorizes only its own next action', () => {
       f.clock(10002);
       f.set({
         activity: 'crashed',
+        liveProofAt: 10001,
         reason: 'process-crashed',
         at: 10001,
         safeToAct: true,
@@ -1958,6 +1995,7 @@ describe('agent attention survives unrelated edits until newer owner authority',
               observe: async () => ({
                 observation: {
                   activity: 'crashed',
+                  liveProofAt: 10001,
                   reason: 'process-crashed',
                   at: 10003,
                   conversationId: id,
@@ -1980,6 +2018,7 @@ describe('agent attention survives unrelated edits until newer owner authority',
         expect(f.controller.getStatus()).toMatchObject({ agentProgressVeto: true, phase: 'paused' });
         f.set({
           activity: 'crashed',
+          liveProofAt: 10001,
           reason: 'process-crashed',
           at: 10003,
           safeToAct: true,
@@ -2093,6 +2132,7 @@ it.each(['blocked', 'completed', 'malformed'] as const)(
       f.clock(10004);
       f.set({
         activity: 'crashed',
+        liveProofAt: 10001,
         reason: 'process-crashed',
         at: 10003,
         safeToAct: true,
@@ -2148,6 +2188,7 @@ it('does not mistake an old submission uncertainty marker for the current owner 
     f.clock(10004);
     f.set({
       activity: 'crashed',
+      liveProofAt: 10001,
       reason: 'process-crashed',
       at: 10003,
       safeToAct: true,
@@ -2216,6 +2257,7 @@ describe('final evidence refusals retain task authority across recovery domains'
           observation.observation = {
             ...observation.observation,
             activity: 'crashed',
+            liveProofAt: 10001,
             reason: 'process-crashed',
             at: 10004,
             safeToAct: true,
@@ -2236,6 +2278,7 @@ describe('final evidence refusals retain task authority across recovery domains'
         observation.observation = {
           ...observation.observation,
           activity: 'crashed',
+          liveProofAt: 10001,
           reason: 'process-crashed',
           at: 10005,
           safeToAct: true,
@@ -2357,6 +2400,7 @@ it.each(['kickoff', 'continuation', 'recovery'] as const)(
         observation.observation = {
           ...observation.observation,
           activity: 'crashed',
+          liveProofAt: 10001,
           reason: 'process-crashed',
           safeToAct: true,
           evidenceKey: 'current-crash',

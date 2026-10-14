@@ -60,7 +60,14 @@ afterEach(async () => {
 });
 
 function fixture(extra: Record<string, unknown> = {}) {
-  const pane = { dead: true, status: 1, signal: undefined as number | undefined, screen: null as string | null };
+  const pane = {
+    dead: true,
+    paneId: '%7',
+    panePid: 700,
+    status: 1,
+    signal: undefined as number | undefined,
+    screen: null as string | null,
+  };
   const mux = {
     isAvailable: () => true,
     inspectPaneForRecovery: vi.fn(async () => ({ ...pane })),
@@ -105,6 +112,33 @@ function fixture(extra: Record<string, unknown> = {}) {
 }
 
 describe('the actual Session recovery boundary', () => {
+  it.each(['unchanged', 'paneId', 'panePid', 'status', 'signal', 'missing'] as const)(
+    'checks the ephemeral stalled native pane fence after the final Session read: %s',
+    async (change) => {
+      const f = fixture();
+      f.flight.reason = 'stalled';
+      const expected = { paneId: '%7', panePid: 700, status: 1, signal: undefined };
+      if (change === 'paneId') f.pane.paneId = '%8';
+      if (change === 'panePid') f.pane.panePid = 701;
+      if (change === 'status') f.pane.status = 2;
+      if (change === 'signal') f.pane.signal = 9;
+      expect(
+        await f.session.deliverRecovery(
+          f.flight,
+          0,
+          () => true,
+          CONTINUATION_PROMPT,
+          () => true,
+          change === 'missing' ? undefined : expected
+        )
+      ).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+      expect(f.mux.respawnPane).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+      if (change === 'unchanged')
+        expect(f.mux.respawnPane).toHaveBeenCalledWith(
+          expect.objectContaining({ expectedRecoveryPane: expected, onlyIfDead: true })
+        );
+    }
+  );
   it('requires realized isolated launch evidence, not just the requested flag', async () => {
     const f = fixture();
     f.muxSession.recoveryIsolated = undefined;

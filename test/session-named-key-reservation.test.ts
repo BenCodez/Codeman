@@ -49,6 +49,52 @@ afterEach(async () => {
 });
 
 describe('named-key input reservation', () => {
+  it.each(['pty', 'mux', 'key'] as const)(
+    'cancels a tentative launch for rejected owner %s input without committing bytes or submission evidence',
+    async (transport) => {
+      const f = fixture();
+      const before = f.session.getRecoveryContext().generation;
+      const intent = vi.fn();
+      f.session.on('recoveryUserInput', intent);
+      Object.assign(f.session, { _paneLifecycleOps: 1 });
+      expect(f.session.shouldApplyInput('fixture-client', 1)).toBe(true);
+      const dispatch = vi.fn(async () => {});
+      const data = 'Rejected owner request\r';
+      const options = { fromUser: true, inputSeq: { clientId: 'fixture-client', seq: 1 } };
+      const delivered =
+        transport === 'pty'
+          ? f.session.write(data, options)
+          : transport === 'mux'
+            ? await f.session.writeViaMux(data, options)
+            : await f.session.sendNamedKey(data, dispatch);
+      expect(delivered).toBe(false);
+      expect(intent).toHaveBeenCalledOnce();
+      expect(f.session.getRecoveryContext()).toMatchObject({ switchPending: true, submission: undefined });
+      expect(f.session.getRecoveryContext().generation).toBeGreaterThan(before);
+      expect(f.session.lastSubmitAt).toBe(0);
+      expect(f.session.hasAppliedInputSeq('fixture-client', 1)).toBe(false);
+      expect(dispatch).not.toHaveBeenCalled();
+      expect(f.mux.sendInput).not.toHaveBeenCalled();
+      Object.assign(f.session, { _paneLifecycleOps: 0 });
+      f.session.forgetInputSeq('fixture-client', 1);
+      expect(f.session.shouldApplyInput('fixture-client', 1)).toBe(true);
+    }
+  );
+
+  it('rejects programmatic lifecycle input without manufacturing owner intent', async () => {
+    const f = fixture();
+    const before = f.session.getRecoveryContext().generation;
+    const intent = vi.fn();
+    f.session.on('recoveryUserInput', intent);
+    Object.assign(f.session, { _paneLifecycleOps: 1 });
+    expect(f.session.write('programmatic\r')).toBe(false);
+    expect(await f.session.writeViaMux('programmatic\r')).toBe(false);
+    expect(intent).not.toHaveBeenCalled();
+    expect(f.session.getRecoveryContext().generation).toBe(before);
+    expect(f.mux.sendInput).not.toHaveBeenCalled();
+    Object.assign(f.session, { _paneLifecycleOps: 0 });
+  });
+
   it('cancels old authority before dispatch and excludes recovery, another key, and text until completion', async () => {
     const f = fixture();
     const done = createDeferred<void>();

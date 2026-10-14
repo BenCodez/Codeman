@@ -1,6 +1,7 @@
-/** Actual Session/TmuxManager effect boundaries, exclusively injected children and temporary owner data. */
+/** @fileoverview Actual Session/TmuxManager effect boundaries, exclusively injected children and temporary owner data. */
 import { mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { parseNativePaneSignal } from '../src/recovery/native-pane-signal.js';
 import { join } from 'node:path';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MuxSession } from '../src/mux-interface.js';
@@ -22,6 +23,15 @@ vi.mock('node:child_process', async (original) => {
       throw new Error('Unmocked process effect forbidden');
     },
     spawn: () => {
+      throw new Error('Unmocked process effect forbidden');
+    },
+    execFileSync: () => {
+      throw new Error('Unmocked process effect forbidden');
+    },
+    spawnSync: () => {
+      throw new Error('Unmocked process effect forbidden');
+    },
+    fork: () => {
       throw new Error('Unmocked process effect forbidden');
     },
   };
@@ -70,14 +80,18 @@ function setGrant(granted: boolean) {
   );
   renameSync(`${path}.fixture`, path);
 }
-async function fixture(action: 'continue' | 'restart') {
+async function fixture(action: 'continue' | 'restart', stalled = false, paneSignalToken?: string) {
   const home = join(directory, 'codex');
   mkdirSync(home);
   const id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
   const thread = '11111111-2222-3333-4444-555555555555';
   const pane = {
+    paneId: '%7',
+    panePid: 700,
     dead: action === 'restart',
-    status: action === 'restart' ? 1 : undefined,
+    status: action === 'restart' && !paneSignalToken ? 1 : undefined,
+    signal: paneSignalToken ? parseNativePaneSignal(paneSignalToken)! : undefined,
+    paneSignalToken,
     screen: action === 'restart' ? null : '›\n  fixture-model high · /tmp\n',
   };
   // Bypass constructor/background discovery; use the real effect methods with a single owned registry entry.
@@ -123,15 +137,26 @@ async function fixture(action: 'continue' | 'restart') {
   let evidence = true;
   const deliver = () =>
     worker.deliverRecovery(
-      { action, key: 'fixture', conversationId: thread, startedAt: Date.now() },
+      {
+        action,
+        key: 'fixture',
+        conversationId: thread,
+        startedAt: Date.now(),
+        ...(stalled ? { reason: 'stalled' as const } : {}),
+      },
       worker.getRecoveryContext().generation,
       () => current,
       'Authorized fixture continuation',
-      () => evidence
+      () => evidence,
+      stalled ? { paneId: '%7', panePid: 700, status: pane.status, signal: pane.signal, paneSignalToken } : undefined
     );
   return {
     worker,
     manager,
+    pane,
+    home,
+    id,
+    thread,
     deliver,
     cancel: () => {
       current = false;
@@ -144,6 +169,80 @@ async function fixture(action: 'continue' | 'restart') {
 function commands() {
   return effects.exec.mock.calls.map(([command]) => String(command));
 }
+
+describe('native recovery pane frame validation', () => {
+  it.each([
+    '1|9|garbage|%7|700',
+    '1|9|KILL|%7|700',
+    '1|0|TERM|%7|700',
+    '0|0||%7|700',
+    '0||KILL|%7|700',
+    '1|garbage|9|%7|700',
+    '1|9||%7|700|extra',
+    '1|9||%7',
+    '1|9||%7|700\n1|9||%8|701',
+    '1|9||%7|700\n\n',
+    '1|9||%7|700\r\n',
+    '1|-1||%7|700',
+    '1|100000||%7|700',
+    '1|256||%7|700',
+    '1|9|99999|%7|700',
+    '1|9|-1|%7|700',
+    '1|9|100000|%7|700',
+    '1|9||%999999999999999999999|700',
+    '1|9||%7;touch|700',
+    '1|9||%07|700',
+    '1|9||%7|0',
+    '1|9||%7|-1',
+    '1|9||%7|700 ',
+    '1|9||%7|700x',
+    '1|9||%7|999999999999',
+    '1||NOTASIGNAL|%7|700',
+    '1||TERM;touch|%7|700',
+    '1||SIGKILL|%7|700',
+    '1||kill|%7|700',
+    '2|9||%7|700',
+    '1|9| |%7|700',
+    '0|garbage||%7|700',
+  ])('rejects the whole malformed native frame before screen capture: %j', async (frame) => {
+    const manager = Object.create(TmuxManager.prototype) as ManagerType;
+    Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
+    effects.exec.mockResolvedValue({ stdout: frame, stderr: '' });
+    expect(await manager.inspectPaneForRecovery('codeman-aaaaaaaa')).toBeNull();
+    expect(commands()).toHaveLength(1);
+    expect(commands()[0]).toContain('list-panes');
+    expect(commands().some((command) => command.includes('capture-pane'))).toBe(false);
+  });
+  it.each([
+    { frame: '1|9||%7|700\n', dead: true, status: 9, signal: undefined },
+    { frame: '1||9|%7|700', dead: true, status: undefined, signal: 9 },
+    { frame: '1||KILL|%7|700', dead: true, status: undefined, signal: 9 },
+    { frame: '1||TERM|%7|700', dead: true, status: undefined, signal: 15 },
+    { frame: '1|0|0|%0|700', dead: true, status: 0, signal: 0 },
+    { frame: '0|||%7|700\n', dead: false, status: undefined, signal: undefined },
+  ])(
+    'accepts a complete bounded native frame with normal empty exit fields: $frame',
+    async ({ frame, dead, status, signal }) => {
+      const manager = Object.create(TmuxManager.prototype) as ManagerType;
+      Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
+      effects.exec.mockImplementation(async (command: string) => {
+        if (command.includes('list-panes')) return { stdout: frame, stderr: '' };
+        if (command.includes('capture-pane')) return { stdout: 'Sanitized ready screen', stderr: '' };
+        throw new Error('Unmocked native command forbidden');
+      });
+      expect(await manager.inspectPaneForRecovery('codeman-aaaaaaaa')).toEqual({
+        dead,
+        status,
+        signal,
+        paneId: frame.includes('%0') ? '%0' : '%7',
+        panePid: 700,
+        paneSignalToken: frame.split('|')[2],
+        screen: dead ? null : 'Sanitized ready screen',
+      });
+      expect(commands()).toHaveLength(dead ? 1 : 2);
+    }
+  );
+});
 
 describe('native continuation after literal input', () => {
   it.each(['unchanged', 'cancel', 'grant', 'delay-cancel', 'delay-grant', 'evidence', 'config', 'stop', 'exception'])(
@@ -188,6 +287,148 @@ describe('native continuation after literal input', () => {
 });
 
 describe('native restart final preparation boundary', () => {
+  it.each(
+    (['task', 'recovery'] as const).flatMap((agent) =>
+      (['unchanged', 'Session-PID', 'preparation-PID'] as const).map((change) => ({ agent, change }))
+    )
+  )(
+    'passes the genuine $agent adapter private pane fence through Session and native dispatch ($change)',
+    async ({ agent, change }) => {
+      const f = await fixture('restart');
+      mkdirSync(join(f.home, 'sessions'));
+      const at = new Date(Date.now() - 60_000).toISOString();
+      writeFileSync(
+        join(f.home, 'sessions', `rollout-fixture-${f.thread}.jsonl`),
+        JSON.stringify({
+          timestamp: at,
+          type: 'session_meta',
+          payload: { id: f.thread, cwd: directory, originator: `codeman_${f.id}` },
+        }) +
+          '\n' +
+          JSON.stringify({
+            timestamp: at,
+            type: 'event_msg',
+            payload: { type: 'task_complete', turn_id: 'fixture-turn' },
+          }) +
+          '\n'
+      );
+      const { CodexTaskAdapter } = await import('../src/supervision/adapter.js');
+      const { CodexRecoveryAdapter } = await import('../src/recovery/codex-adapter.js');
+      const adapter =
+        agent === 'task' ? new CodexTaskAdapter(f.worker, vi.fn()) : new CodexRecoveryAdapter(f.worker, vi.fn());
+      f.pane.dead = false;
+      f.pane.status = undefined;
+      f.pane.screen = '›\n  fixture-model high · /tmp\n';
+      await adapter.observe();
+      f.pane.dead = true;
+      f.pane.status = 1;
+      f.pane.screen = null;
+      f.worker.setPaneExit({ at: Date.now(), status: 1 });
+      const observed = await adapter.observe();
+      const observation = 'observation' in observed ? observed.observation : observed;
+      expect(observation).toMatchObject({ activity: 'crashed', safeToAct: true });
+      if (agent === 'task') expect(observation.liveProofAt).toBeDefined();
+      if (change === 'Session-PID') {
+        const inspect = f.worker.inspectRecoveryPane.bind(f.worker);
+        let reads = 0;
+        vi.spyOn(f.worker, 'inspectRecoveryPane').mockImplementation(async () => {
+          const current = await inspect();
+          if (++reads === (agent === 'task' ? 3 : 2) && current) current.panePid = 701;
+          return current;
+        });
+      }
+      let workerEffects = 0;
+      const snapshot: Record<string, string> = {
+        session_name: 'codeman-aaaaaaaa',
+        pane_id: '%7',
+        pane_pid: '700',
+        pane_dead: '1',
+        pane_dead_status: '1',
+        pane_dead_signal: '',
+      };
+      effects.sync.mockImplementation((command: string) => {
+        if (change === 'preparation-PID' && command.includes('setenv') && command.includes(' CODEX_HOME '))
+          snapshot.pane_pid = '701';
+        return '99999\n';
+      });
+      effects.exec.mockImplementation(async (command: string) => {
+        const terms = [...command.matchAll(/#\{==:#\{([^}]+)\},([^}]*)\}/g)];
+        expect(terms).toHaveLength(6);
+        if (!terms.every((term) => snapshot[term[1]] === term[2]))
+          return { stdout: 'CODEMAN_RECOVERY_PANE_REFUSED\n', stderr: '' };
+        workerEffects++;
+        return { stdout: '', stderr: '' };
+      });
+      const result =
+        agent === 'task'
+          ? await (adapter as InstanceType<typeof CodexTaskAdapter>).recover(observation, () => true)
+          : await (adapter as InstanceType<typeof CodexRecoveryAdapter>).act({
+              key: observation.evidenceKey!,
+              action: 'restart',
+              conversationId: f.thread,
+              startedAt: Date.now(),
+            });
+      expect(result).toBe(change === 'unchanged' ? 'sent' : change === 'Session-PID' ? 'not-sent' : 'unknown');
+      expect(workerEffects).toBe(change === 'unchanged' ? 1 : 0);
+      if (change !== 'Session-PID') expect(commands().at(-1)).not.toContain('respawn-pane -k');
+      effects.exec.mockClear();
+    }
+  );
+  it.each(['KILL', 'TERM', '9'])(
+    'retains actual native tmux %s signal identity in the final stalled predicate',
+    async (token) => {
+      const f = await fixture('restart', true, token);
+      effects.exec.mockImplementation(async (command: string) => {
+        expect(command).toContain(`#{==:#{pane_dead_signal},${token}}`);
+        expect(command).toContain('#{==:#{pane_dead_status},}');
+        expect(command).not.toContain('respawn-pane -k');
+        return { stdout: '', stderr: '' };
+      });
+      expect(await f.deliver()).toBe('sent');
+      expect(commands()).toHaveLength(1);
+    }
+  );
+  it.each(['unchanged', 'PID', 'pane', 'session', 'live', 'clean', 'signal', 'response-loss'] as const)(
+    'uses the actual native tmux conditional dispatch to preserve an exact stalled process after preparation: %s',
+    async (change) => {
+      const f = await fixture('restart', true);
+      let workerEffects = 0;
+      const snapshot: Record<string, string> = {
+        session_name: 'codeman-aaaaaaaa',
+        pane_id: '%7',
+        pane_pid: '700',
+        pane_dead: '1',
+        pane_dead_status: '1',
+        pane_dead_signal: '',
+      };
+      effects.sync.mockImplementation((command: string) => {
+        if (command.includes('setenv') && command.includes(' CODEX_HOME ')) {
+          if (change === 'PID') snapshot.pane_pid = '701';
+          if (change === 'pane') snapshot.pane_id = '%8';
+          if (change === 'session') snapshot.session_name = 'codeman-bbbbbbbb';
+          if (change === 'live') snapshot.pane_dead = '0';
+          if (change === 'clean') snapshot.pane_dead_status = '0';
+          if (change === 'signal') snapshot.pane_dead_signal = '9';
+        }
+        return '99999\n';
+      });
+      effects.exec.mockImplementation(async (command: string) => {
+        expect(command).toContain('if-shell -F -t');
+        expect(command).not.toContain('respawn-pane -k');
+        const terms = [...command.matchAll(/#\{==:#\{([^}]+)\},([^}]*)\}/g)];
+        expect(terms).toHaveLength(6);
+        if (!terms.every((term) => snapshot[term[1]] === term[2]))
+          return { stdout: 'CODEMAN_RECOVERY_PANE_REFUSED\n', stderr: '' };
+        workerEffects++;
+        if (change === 'response-loss') throw new Error('Fixture conditional respawn response lost');
+        return { stdout: '', stderr: '' };
+      });
+      expect(await f.deliver()).toBe(change === 'unchanged' ? 'sent' : 'unknown');
+      expect(workerEffects).toBe(change === 'unchanged' || change === 'response-loss' ? 1 : 0);
+      expect(commands()).toHaveLength(1);
+      expect(commands()[0]).not.toContain('kill-');
+    }
+  );
   it.each(['unchanged', 'cancel', 'grant', 'evidence', 'config'])(
     'rechecks %s after environment setup before a worker child',
     async (change) => {

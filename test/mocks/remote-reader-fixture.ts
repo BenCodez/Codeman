@@ -36,6 +36,8 @@ export async function fixture(
     truncatedPrefix?: boolean;
     retainedPrefixAt?: number;
     malformedHistoryAt?: number;
+    paneRow?: string;
+    expectedPane?: { paneId: string; panePid: number; status?: number; signal?: number };
   }
 ) {
   const root = await mkdtemp(join(tmpdir(), 'codeman-remote-witness-'));
@@ -105,6 +107,7 @@ export async function fixture(
 case "$*" in
 *has-session*) node "$MUTATE_SCRIPT" || exit 2; [ "$KIND" = restore ] && exit 1; exit 0;;
 *list-panes*)
+  if [ -n "$PANE_ROW" ]; then printf '%s\n' "$PANE_ROW"; exit 0; fi
   if [ "$5" = '$17' ]; then
     [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
     printf '1|%%9|9009|1|17000\n'
@@ -162,7 +165,7 @@ esac
           : kind === 'restart'
             ? buildRemoteCodexRestartCommand(remote, {
                 ...workerRequest,
-                expectedPane: { paneId: '%7', panePid: 4242, status: 1 },
+                expectedPane: correlation?.expectedPane ?? { paneId: '%7', panePid: 4242, status: 1 },
               })
             : buildRemoteCodexRestoreCommand(remote, workerRequest);
     const env = {
@@ -170,6 +173,7 @@ esac
       PATH: `${bin}:${process.env.PATH}`,
       SHELL: join(bin, 'login-shell'),
       KIND: kind,
+      PANE_ROW: correlation?.paneRow ?? '',
       MUTATION: mutation,
       MUTATE_SCRIPT: mutate,
       EFFECT_LOG: log,
@@ -180,16 +184,24 @@ esac
       ANCESTOR: ancestor,
       SESSIONS: sessions,
     };
-    const run = async (cmd: string, change = mutation) =>
-      (
-        await execFileAsync('/bin/sh', ['-c', cmd], {
-          env: { ...env, MUTATION: change },
-          timeout: 10_000,
-          maxBuffer: 768 * 1024,
-        })
-      ).stdout;
+    let refused = false;
+    const run = async (cmd: string, change = mutation) => {
+      try {
+        return (
+          await execFileAsync('/bin/sh', ['-c', cmd], {
+            env: { ...env, MUTATION: change },
+            timeout: 10_000,
+            maxBuffer: 768 * 1024,
+          })
+        ).stdout;
+      } catch (error) {
+        if (correlation?.paneRow === undefined) throw error;
+        refused = true;
+        return typeof (error as { stdout?: unknown }).stdout === 'string' ? (error as { stdout: string }).stdout : '';
+      }
+    };
     const stdout = await run(command);
-    const status = parseRemoteCodexAction(stdout);
+    const status = parseRemoteCodexAction(stdout) ?? (refused ? 'unknown' : undefined);
     const effects = await readFile(log, 'utf8');
     // Prove the newly introduced conflict is a refusal under the actual resolver,
     // rather than simply requiring every unrelated session to have this identity.
@@ -201,6 +213,7 @@ esac
       status,
       effects,
       laterReason,
+      ...(correlation?.paneRow !== undefined ? { pane: parseRemoteCodexEvidence(stdout)?.pane } : {}),
       ...(kind === 'inspect' || correlation
         ? { identityReason: parseRemoteCodexEvidence(stdout)?.identity.reason }
         : {}),

@@ -69,7 +69,12 @@ import { claudeTranscriptExists } from './utils/claude-transcript.js';
 import { matchesPattern } from './config/cli-registry/patterns.js';
 import { probeDockerCliVersion } from './docker-hosts.js';
 import { probeRemoteCliVersion } from './remote-hosts.js';
-import type { TerminalMultiplexer, MuxSession, CodexRestoreLaunchGuard } from './mux-interface.js';
+import type {
+  TerminalMultiplexer,
+  MuxSession,
+  CodexRestoreLaunchGuard,
+  RecoveryPaneIdentity,
+} from './mux-interface.js';
 import { TaskTracker, type BackgroundTask } from './task-tracker.js';
 import { RalphTracker } from './ralph-tracker.js';
 import { BashToolParser } from './bash-tool-parser.js';
@@ -977,7 +982,8 @@ export class Session extends EventEmitter {
     this._mux = config.mux || null;
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this._muxSession = config.muxSession || null;
-    this._preserveExitedPane = config.preserveExitedPane ?? false;
+    this._codexRestoreWorkerMayExist = this._muxSession?.codexRestoreUncertain === true;
+    this._preserveExitedPane = (config.preserveExitedPane ?? false) || this._codexRestoreWorkerMayExist;
     this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
     this._recoveryUntrackedInput =
       getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
@@ -1014,6 +1020,8 @@ export class Session extends EventEmitter {
     if (config.codexConfig) {
       this._codexConfig = config.codexConfig;
     }
+    if (this._codexRestoreWorkerMayExist && this._muxSession?.codexRestoreConfig?.resumeSessionId)
+      this.pinRecoveryConversation(this._muxSession.codexRestoreConfig.resumeSessionId);
 
     // Apply Gemini configuration
     if (config.geminiConfig) {
@@ -2098,7 +2106,9 @@ export class Session extends EventEmitter {
   }): Promise<{ isRestored: boolean; respawnedResumeId?: string; respawnedDeadPane: boolean }> {
     const mux = this._mux!;
     if (this._codexRestoreGuard && this._muxSession) throw new Error('Reboot restoration cannot attach to a pane');
-    const preserveExitedPane = this._preserveExitedPane;
+    if (this._codexRestoreWorkerMayExist && !this._muxSession)
+      throw new Error('An uncertain reboot worker requires owner inspection of its existing pane');
+    const preserveExitedPane = this._preserveExitedPane || this._codexRestoreWorkerMayExist;
     this._preserveExitedPane = false;
 
     // Verify stale mux session — tmux may have been destroyed (e.g., killed externally).
@@ -2309,6 +2319,11 @@ export class Session extends EventEmitter {
   private _recoverySwitchPending = false;
   private _recoveryUntrackedInput = false;
 
+  /** Queued owner input must not cross closing, stopped or pane-lifecycle boundaries. */
+  get inputDispatchAllowed(): boolean {
+    return !this._closing && !this._isStopped && this._paneLifecycleOps === 0;
+  }
+
   get recoveryInputReserved(): boolean {
     return this._recoveryDelivering || this._namedKeyAbort !== null || this._remoteClockPreparing;
   }
@@ -2325,7 +2340,10 @@ export class Session extends EventEmitter {
    * because bytes may have reached the pane. Raw input is tracked exactly once.
    */
   async sendNamedKey(data: string, dispatch: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
-    if (this._inputDeliveryInFlight || this._paneLifecycleOps > 0 || this._closing || this._isStopped) return false;
+    if (this._inputDeliveryInFlight || this._paneLifecycleOps > 0 || this._closing || this._isStopped) {
+      this._rejectLifecycleOwnerInput(data, { fromUser: true });
+      return false;
+    }
     const abort = new AbortController();
     this._namedKeyAbort = abort;
     try {
@@ -2379,7 +2397,9 @@ export class Session extends EventEmitter {
       switchPending: this._recoverySwitchPending || this._recoveryUntrackedInput,
       untrackedInput: this._recoveryUntrackedInput,
       managed:
-        lifecycleManaged && (this.paneExitApplies || (!!this._remote && this._remote.owned !== false && !this._docker)),
+        lifecycleManaged &&
+        !this._codexRestoreWorkerMayExist &&
+        (this.paneExitApplies || (!!this._remote && this._remote.owned !== false && !this._docker)),
       remoteOwned: !!this._remote && this._remote.owned !== false,
       noDaemon:
         this._muxSession?.recoveryIsolated === true &&
@@ -2803,7 +2823,8 @@ export class Session extends EventEmitter {
     generation: number,
     isCurrent: () => boolean = () => true,
     prompt: string = CONTINUATION_PROMPT,
-    confirmEvidence?: () => boolean
+    confirmEvidence?: () => boolean,
+    expectedRecoveryPane?: RecoveryPaneIdentity
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
     if (
@@ -2815,6 +2836,7 @@ export class Session extends EventEmitter {
       this._paneLifecycleOps > 0 ||
       this._inputDeliveryInFlight ||
       generation !== context.generation ||
+      (flight.reason === 'stalled' && !expectedRecoveryPane) ||
       this._codexConfig?.resumeSessionId !== flight.conversationId
     )
       return 'not-sent';
@@ -2822,6 +2844,16 @@ export class Session extends EventEmitter {
     try {
       return await this._withPaneLifecycle(async () => {
         const pane = await this.inspectRecoveryPane();
+        if (
+          expectedRecoveryPane &&
+          (!pane ||
+            pane.paneId !== expectedRecoveryPane.paneId ||
+            pane.panePid !== expectedRecoveryPane.panePid ||
+            pane.status !== expectedRecoveryPane.status ||
+            pane.signal !== expectedRecoveryPane.signal ||
+            (pane.paneSignalToken ?? '') !== (expectedRecoveryPane.paneSignalToken ?? ''))
+        )
+          return 'not-sent';
         const envToAuthorize =
           context.codexHome !== currentLocalCodexHome()
             ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
@@ -2917,6 +2949,7 @@ export class Session extends EventEmitter {
           const pid = await this._mux!.respawnPane({
             ...this._buildRespawnPaneOptions(),
             onlyIfDead: true,
+            ...(expectedRecoveryPane ? { expectedRecoveryPane: { ...expectedRecoveryPane } } : {}),
             recoveryDispatchGuard: recoveryGuard,
           });
           if (!pid) return refusedBeforeDispatch && !dispatched ? 'not-sent' : 'unknown';
@@ -3384,9 +3417,47 @@ export class Session extends EventEmitter {
     return this._codexRestoreWorkerMayExist;
   }
 
+  /** Adopt only our guarded launch's existing metadata; this does not attach or launch a worker. */
+  adoptUncertainCodexRestore(): boolean {
+    if (!this._codexRestoreWorkerMayExist || this._remote || this._docker || !this._mux) return false;
+    const record = this._mux.getSession(this.id);
+    const expectedHome = this._recoveryCodexHome ?? normalizedCodexHome(this._envOverrides?.CODEX_HOME);
+    if (
+      !record ||
+      record.sessionId !== this.id ||
+      record.mode !== 'codex' ||
+      record.owner !== this.owner ||
+      record.workingDir !== this.workingDir ||
+      !normalizedCodexHome(record.recoveryCodexHome) ||
+      (expectedHome !== undefined && record.recoveryCodexHome !== expectedHome) ||
+      (record.codexRestoreConfig !== undefined &&
+        JSON.stringify(record.codexRestoreConfig) !== JSON.stringify(this._codexConfig))
+    )
+      return false;
+    record.codexRestoreUncertain = true;
+    this._muxSession = record;
+    this._preserveExitedPane = true;
+    // Retire the failed launch authority. Inspection may attach only to this
+    // existing pane; the uncertainty flag still forbids recreation or respawn.
+    this._codexRestoreGuard = undefined;
+    // The route has already fsynced the uncertainty fence while preserving its
+    // historical submission. Do not replace that fence with a tentative snapshot.
+    this._recoveryUntrackedInput = true;
+    this._recoverySwitchPending = true;
+    this._recoverySubmission = undefined;
+    this._recoveryGeneration++;
+    this._recoveryInputProofTracker.invalidate();
+    this._mux.registerSession(record);
+    return true;
+  }
+
   /** Release tentative protection only after a complete successful restoration commit. */
   commitCodexRestoreLaunch(): void {
     this._codexRestoreWorkerMayExist = false;
+    if (this._muxSession?.codexRestoreUncertain) {
+      this._muxSession.codexRestoreUncertain = false;
+      this._mux?.registerSession(this._muxSession);
+    }
   }
 
   async startInteractive(): Promise<void> {
@@ -3618,7 +3689,7 @@ export class Session extends EventEmitter {
           this._armPaneSettle(true);
         }
       } catch (err) {
-        if (this._codexRestoreGuard) throw err;
+        if (this._codexRestoreGuard || this._codexRestoreWorkerMayExist) throw err;
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;
         this._muxSession = null;
@@ -5090,7 +5161,10 @@ export class Session extends EventEmitter {
    * input could disappear while the caller believed it had been delivered.
    */
   write(data: string, options: SessionWriteOptions = {}): boolean {
-    if (this.recoveryInputReserved) return false;
+    if (!this.inputDispatchAllowed || this.recoveryInputReserved) {
+      this._rejectLifecycleOwnerInput(data, options);
+      return false;
+    }
     this._ordinaryInputWrites++;
     try {
       const submittedPrompt = this._trackSubmit(data, options);
@@ -5107,6 +5181,24 @@ export class Session extends EventEmitter {
     } finally {
       this._ordinaryInputWrites--;
     }
+  }
+
+  /** Rejected owner intent still cancels a tentative launch without claiming any input delivery. */
+  private _rejectLifecycleOwnerInput(data: string, options: SessionWriteOptions): void {
+    if (
+      !data ||
+      !options.fromUser ||
+      this._paneLifecycleOps === 0 ||
+      this.recoveryInputReserved ||
+      this._closing ||
+      this._isStopped ||
+      getCli(this.mode)?.capabilities.recovery !== 'codex-rollout'
+    )
+      return;
+    this._recoveryGeneration++;
+    this._recoveryInputProofTracker.invalidate();
+    this._invalidateRecoverySubmission();
+    this.emit('recoveryUserInput');
   }
 
   // ── Conversation tracking ─────────────────────────────────────────────
@@ -5414,7 +5506,10 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    if (this.recoveryInputReserved) return false;
+    if (!this.inputDispatchAllowed || this.recoveryInputReserved) {
+      this._rejectLifecycleOwnerInput(data, options);
+      return false;
+    }
     this._ordinaryInputWrites++;
     try {
       return await this._doWriteViaMux(data, options);

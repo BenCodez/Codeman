@@ -54,8 +54,12 @@ export interface SupervisorWorkerInspection {
   task?: TaskState;
   recovery?: RecoveryState;
   health: string;
-  /** Time the underlying controller evidence was sampled, in Unix milliseconds. */
+  /** Time the recovery evidence was sampled, in Unix milliseconds; task snapshots may be older. */
   observedAt: number;
-  /** True when inspection timed out or the worker was unavailable; health is then unknown. */
+  /** True when any included evidence has not been revalidated in this inspection. */
   stale: boolean;
+  /** Task checkpoints and criteria are durable controller snapshots, not a new worker observation. */
+  taskStale: boolean;
+  /** True when recovery inspection timed out or the worker was unavailable; health is then unknown. */
+  recoveryStale: boolean;
 }

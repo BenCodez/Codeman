@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "config": {
+    "enabled": true,
+    "recoverInterrupted": true,
+    "recoverCrashes": true,
+    "detectStalls": true,
+    "maxRetries": 3,
+    "retryDelayMs": 15000,
+    "maxRetryDelayMs": 120000,
+    "maxRecoveryDurationMs": 900000,
+    "stalledAfterMs": 10000
+  },
+  "activity": "working",
+  "phase": "paused",
+  "attempts": 0,
+  "failedAttempts": 0,
+  "lastReason": "turn-running",
+  "circuitOpen": false,
+  "needsAttention": true,
+  "handledEvidence": [],
+  "history": [
+    {
+      "at": 1791892799999,
+      "kind": "attention",
+      "reason": "stalled",
+      "attempt": 0
+    }
+  ],
+  "conversationId": "11111111-2222-3333-4444-555555555555"
+}

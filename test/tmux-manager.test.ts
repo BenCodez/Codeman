@@ -847,6 +847,13 @@ describe('TmuxManager (unit)', () => {
     ])('scopes guarded reboot launch effects and cleanup for %s', async (outcome) => {
       const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
       const nonTestManager = new NonTestTmuxManager();
+      // Reboot acknowledgement performs real sync durability beneath setup.ts's temporary HOME.
+      // This suite mocks mkdirSync for ordinary launch tests, so provision only that isolated directory.
+      const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const { dirname } = await import('node:path');
+      const { dataPath } = await import('../src/config/instance.js');
+      const metadataPath = dataPath('mux-sessions.json');
+      actualFs.mkdirSync(dirname(metadataPath), { recursive: true, mode: 0o700 });
       vi.spyOn(
         nonTestManager as unknown as { buildPathExport(mode: string): { dir: string; pathExport: string } },
         'buildPathExport'
@@ -854,6 +861,18 @@ describe('TmuxManager (unit)', () => {
       let workerMayBeRunning = false;
       let grant = true;
       mockedExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes('respawn-pane')) {
+          const persisted = JSON.parse(actualFs.readFileSync(metadataPath, 'utf8'));
+          expect(persisted).toMatchObject([
+            {
+              sessionId: 'aabbccdd-1234-5678-90ab-cdef12345678',
+              pid: 0,
+              recoveryCodexHome: '/fixture/codex-home',
+              codexRestoreUncertain: true,
+              codexRestoreConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
+            },
+          ]);
+        }
         if (cmd.includes('respawn-pane') && outcome === 'dispatch-uncertain') {
           workerMayBeRunning = true;
           throw new Error('Fixture response lost after worker dispatch');
@@ -897,7 +916,15 @@ describe('TmuxManager (unit)', () => {
           ['before-worker', 'grant-revoked-during-shell-prep'].includes(outcome) ? 1 : 0
         );
         expect(workerMayBeRunning).toBe(outcome === 'dispatch-uncertain');
-        if (outcome === 'dispatch-uncertain') expect(nonTestManager.getSessions()).toEqual([]);
+        if (outcome === 'dispatch-uncertain')
+          expect(nonTestManager.getSessions()).toMatchObject([
+            {
+              sessionId: 'aabbccdd-1234-5678-90ab-cdef12345678',
+              pid: 0,
+              codexRestoreUncertain: true,
+              recoveryCodexHome: '/fixture/codex-home',
+            },
+          ]);
       } finally {
         nonTestManager.destroy();
       }
@@ -1196,7 +1223,7 @@ describe('parsePaneRows', () => {
 
   it('reads a live pane as not dead, with no status or signal', () => {
     // Measured against tmux 3.2a: a live pane leaves both numeric fields blank.
-    const [row] = parsePaneRows('codeman-aaaa|1234|0|||1');
+    const [row] = parsePaneRows('codeman-aaaa|1234|0||');
     expect(row.dead).toBe(false);
     expect(row.exitStatus).toBeUndefined();
     expect(row.exitSignal).toBeUndefined();
@@ -1236,6 +1263,57 @@ describe('parsePaneRows', () => {
     const rows = parsePaneRows('codeman-aaaa|100|0|||\ncodeman-aaaa|200|1|0|');
     expect(rows.map((row) => row.pid)).toEqual([100, 200]);
     expect(rows.map((row) => row.sessionName)).toEqual(['codeman-aaaa', 'codeman-aaaa']);
+  });
+});
+
+describe('native exit signal evidence', () => {
+  it.each([
+    ['KILL', 9],
+    ['TERM', 15],
+    ['9', 9],
+  ] as const)('maps known native signal %s to a classified recorded exit', (raw, signal) => {
+    const rows = parsePaneRows(`codeman-aaaa|700|1||${raw}`);
+    expect(rows[0]).toMatchObject({ pid: 700, dead: true, exitSignal: signal });
+    expect(derivePaneExits(rows, 12345).get('codeman-aaaa')).toEqual({ panePid: 700, exit: { signal, at: 12345 } });
+  });
+  it.each([
+    '1|9',
+    '1|0',
+    '1',
+    '1|9|garbage',
+    '1|9|KILL',
+    '1|0|TERM',
+    '0|0|',
+    '0||KILL',
+    '1|0|UNKNOWN',
+    '1|9|TERM;touch',
+    '1|9|SIGKILL',
+    '1|9|kill',
+    '1|9|99999',
+    '1|256|',
+    '1|9|TERM|extra',
+    '1|0x|',
+    '1|-1|',
+  ])('keeps resource PID compatibility while refusing malformed death evidence: %s', (frame) => {
+    const rows = parsePaneRows(`codeman-aaaa|700|${frame}`);
+    expect(rows[0].pid).toBe(700);
+    expect(rows[0].dead).toBeUndefined();
+    expect(rows[0].exitStatus).toBeUndefined();
+    expect(rows[0].exitSignal).toBeUndefined();
+    expect(derivePaneExits(rows, 12345).size).toBe(0);
+  });
+  it.each(['700x', '0', '-1', '700 ', '9999999999999999999'])(
+    'refuses death evidence from a malformed native PID while preserving legacy resource parsing: %s',
+    (rawPid) => {
+      const rows = parsePaneRows(`codeman-aaaa|${rawPid}|1|9|`);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].dead).toBeUndefined();
+      expect(derivePaneExits(rows, 12345).size).toBe(0);
+    }
+  );
+  it('keeps legacy blank signal/status death unknown instead of inventing a clean exit', () => {
+    const rows = parsePaneRows('codeman-aaaa|700|1||');
+    expect(derivePaneExits(rows, 12345).get('codeman-aaaa')).toEqual({ panePid: 700, exit: { at: 12345 } });
   });
 });
 

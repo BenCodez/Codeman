@@ -42,6 +42,34 @@ afterEach(() => {
 });
 
 describe('Codex supervisor UI', () => {
+  it.each([false, true])(
+    'distinguishes cached task status from recovery freshness (recovery stale=%s)',
+    (recoveryStale) => {
+      const h = harness();
+      h.app._supervisorView = {
+        sessionId: SID,
+        state: { ...state(), phase: 'active', workers: [{ sessionId: WID, assignments: 0, maxAssignments: 2 }] },
+        workersBusy: false,
+        workerStatus: [
+          {
+            sessionId: WID,
+            health: 'dead-pane',
+            stale: true,
+            taskStale: true,
+            recoveryStale,
+            task: { phase: 'paused' },
+          },
+        ],
+      };
+      h.app._renderSupervisorStatus();
+      const row = h.get('supervisorWorkerStatus');
+      expect(row.textContent).toContain('task status may be stale');
+      expect(row.textContent.includes('recovery may be stale')).toBe(recoveryStale);
+      expect(row.querySelectorAll('button')[1].disabled).toBe(recoveryStale);
+      expect(h.app._apiJson).not.toHaveBeenCalled();
+    }
+  );
+
   it.each([
     [null],
     [{ sessionId: 0 }],

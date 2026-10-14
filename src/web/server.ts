@@ -2558,15 +2558,16 @@ export class WebServer extends EventEmitter {
     const controller = new TaskController(
       {
         observe: () => adapter.observe(),
+        acceptReservation: (key) => this.getActionArbiter(session.id).accept('task', key),
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('task', !this.controllerHasRecoveryFlight(session.id)),
         recover: (observation, isCurrent) =>
-          this.getActionArbiter(session.id).run('task', () => {
+          this.getActionArbiter(session.id).run('task', observation.evidenceKey ?? '', () => {
             if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
             return adapter.recover(observation, isCurrent);
           }),
         act: (key, conversationId, prompt, isCurrent) =>
-          this.getActionArbiter(session.id).run('task', () => {
+          this.getActionArbiter(session.id).run('task', key, () => {
             if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
             return adapter.act(key, conversationId, prompt, isCurrent);
           }),
@@ -2611,7 +2612,7 @@ export class WebServer extends EventEmitter {
         this.controllerHasTaskFlight(session.id)
       );
     };
-    const controller = new RecoveryController(
+    const controller: RecoveryController = new RecoveryController(
       {
         hasActionAuthority: () => !taskBlocksRecovery(),
         observe: async () => {
@@ -2621,16 +2622,17 @@ export class WebServer extends EventEmitter {
           // including dead-turn stalls whose authority is independent of safeToAct.
           return taskBlocksRecovery() ? { ...observation, safeToAct: false, stallRestartable: false } : observation;
         },
+        acceptReservation: (key) => this.getActionArbiter(session.id).accept('recovery', key),
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('recovery', !this.controllerHasTaskFlight(session.id)),
         act: (flight, isCurrent) =>
-          this.getActionArbiter(session.id).run('recovery', () => {
+          this.getActionArbiter(session.id).run('recovery', flight.key, () => {
             // Retain the final veto for a task that acquires authority after observation.
             if (taskBlocksRecovery()) return Promise.resolve('not-sent');
             return adapter.act(flight, isCurrent);
           }),
         restoreMissingRemote: (isCurrent) =>
-          this.getActionArbiter(session.id).run('recovery', () => {
+          this.getActionArbiter(session.id).run('recovery', controller.getStatus().inFlight?.key ?? '', () => {
             if (taskBlocksRecovery()) return Promise.resolve('not-sent');
             return adapter.restoreMissingRemote(() => isCurrent() && !taskBlocksRecovery());
           }),
@@ -3882,7 +3884,7 @@ export class WebServer extends EventEmitter {
   async discardPartiallyBuiltSession(
     sessionId: string,
     expectedSession?: Session,
-    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean }
+    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean; retainForInspection?: boolean }
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     // Reboot restore reuses a historical id. A late failure or cancellation may
@@ -3895,6 +3897,14 @@ export class WebServer extends EventEmitter {
     try {
       await this.stopRecoveryController(sessionId, false);
       if (this.sessions.get(sessionId) !== session) return;
+      if (options?.retainForInspection && options.preserveMuxPane && session.codexRestoreWorkerMayExist) {
+        session.adoptUncertainCodexRestore();
+        this.persistDeb.cancelKey(sessionId);
+        // Keep tentative protection: the historical state record must remain intact.
+        await this.mux.flushSessionsDurably();
+        this.broadcast(SseEvent.SessionCreated, this.getSessionStateWithRespawn(session));
+        return;
+      }
       this.sessions.delete(sessionId);
     } finally {
       if (ownsCleanupFence) {
@@ -4000,7 +4010,11 @@ export class WebServer extends EventEmitter {
         console.error('[Server] Building the reboot-restore offer failed; continuing recovery:', err);
       }
 
-      if (alive.length > 0 || discovered.length > 0) {
+      if (
+        alive.length > 0 ||
+        discovered.length > 0 ||
+        this.mux.getSessions().some((session) => session.codexRestoreUncertain === true)
+      ) {
         console.log(`[Server] Found ${alive.length + discovered.length} alive mux session(s) from previous run`);
 
         // For each alive mux session, create a Session object if it doesn't exist
@@ -4060,7 +4074,12 @@ export class WebServer extends EventEmitter {
               claudeMode: recoveryClaudeMode.claudeMode,
               allowedTools: recoveryClaudeMode.allowedTools,
               openCodeConfig: muxSession.mode === 'opencode' ? savedState?.openCodeConfig : undefined,
-              codexConfig: muxSession.mode === 'codex' ? savedState?.codexConfig : undefined,
+              codexConfig:
+                muxSession.mode === 'codex'
+                  ? muxSession.codexRestoreUncertain === true
+                    ? muxSession.codexRestoreConfig
+                    : savedState?.codexConfig
+                  : undefined,
               preserveExitedPane: getCli(muxSession.mode)?.capabilities.recovery === 'codex-rollout',
               geminiConfig: muxSession.mode === 'gemini' ? savedState?.geminiConfig : undefined,
               antigravityConfig: muxSession.mode === 'antigravity' ? savedState?.antigravityConfig : undefined,
@@ -4258,6 +4277,7 @@ export class WebServer extends EventEmitter {
               }
             }
 
+            if (session.codexRestoreWorkerMayExist) this.tentativeSessionRegistrations.add(session);
             this.sessions.set(session.id, session);
             await this.setupSessionListeners(session);
 

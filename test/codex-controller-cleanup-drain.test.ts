@@ -81,8 +81,8 @@ async function fixture(
   const arbiter = internals.getActionArbiter(ID) as SessionActionArbiter;
   const started = createDeferred<void>();
   const finish = createDeferred<Outcome>();
-  const action = () =>
-    arbiter.run(owner, async () => {
+  const action = (key: string) =>
+    arbiter.run(owner, key, async () => {
       started.resolve();
       return finish.promise;
     });
@@ -95,7 +95,7 @@ async function fixture(
       evidenceKey: 'crashed-proof',
       safeToAct: true,
     }),
-    act: action,
+    act: (flight) => action(flight.key),
     persist: (state) => internals.recoveryStore.save(ID, state),
     changed: () => {},
   });

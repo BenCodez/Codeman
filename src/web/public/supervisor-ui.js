@@ -266,7 +266,14 @@ Object.assign(CodemanApp.prototype, {
       row.dataset.i18nSkip = '';
       const inspection = inspections.get(worker.sessionId);
       const evidence = document.createElement('span');
-      evidence.textContent = `${worker.sessionId.slice(0, 8)} — ${worker.assignments}/${worker.maxAssignments} assignments — ${inspection?.health ?? 'not inspected'}${inspection?.stale ? ' (stale)' : ''}${inspection?.task?.phase ? ` — task ${inspection.task.phase}` : ''}`;
+      const uncertainty = [
+        inspection?.recoveryStale ? 'recovery may be stale' : '',
+        inspection?.taskStale ? 'task status may be stale' : '',
+      ]
+        .filter(Boolean)
+        .join('; ');
+      const stale = uncertainty ? ` (${uncertainty})` : inspection?.stale ? ' (stale)' : '';
+      evidence.textContent = `${worker.sessionId.slice(0, 8)} — ${worker.assignments}/${worker.maxAssignments} assignments — ${inspection?.health ?? 'not inspected'}${stale}${inspection?.task?.phase ? ` — task ${inspection.task.phase}` : ''}`;
       row.appendChild(evidence);
       const assign = document.createElement('button');
       assign.className = 'btn-toolbar btn-sm';
@@ -280,6 +287,7 @@ Object.assign(CodemanApp.prototype, {
       retry.disabled =
         state.phase !== 'active' ||
         !!view.workersBusy ||
+        (inspection?.recoveryStale ?? inspection?.stale) !== false ||
         !['dead-pane', 'interrupted'].includes(inspection?.health ?? '');
       retry.addEventListener('click', () => void this.supervisorWorkerAction(worker.sessionId, 'retry'));
       row.appendChild(retry);

@@ -12,11 +12,19 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { AddressInfo } from 'node:net';
+import type { IncomingMessage } from 'node:http';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import WebSocket from 'ws';
 import { createMockRouteContext, createDeferred, type MockRouteContext } from '../mocks/index.js';
 import { registerWsRoutes } from '../../src/web/routes/ws-routes.js';
+import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
+
+const childProcess = vi.hoisted(() => ({ execFile: vi.fn() }));
+vi.mock('node:child_process', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:child_process')>()),
+  execFile: childProcess.execFile,
+}));
 import { MAX_INPUT_LENGTH } from '../../src/config/terminal-limits.js';
 import { RebootIdentityFenceError } from '../../src/recovery/reboot-identity-fence.js';
 import { Session } from '../../src/session.js';
@@ -81,6 +89,43 @@ function collectMessages(ws: WebSocket, count: number, timeoutMs = 3000): Promis
   });
 }
 
+function isolatedRemoteWsSession() {
+  const session = new Session({
+    id: 'ws-test-session',
+    workingDir: '/tmp',
+    mode: 'codex',
+    useMux: true,
+    mux: { isAvailable: () => true } as unknown as TerminalMultiplexer,
+    muxSession: {
+      muxName: 'codeman-ws-fixture',
+      recoveryIsolated: true,
+      recoveryCodexHome: '/fixture/codex-home',
+    } as MuxSession,
+    codexConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
+    remote: {
+      hostId: 'fixture',
+      label: 'Fixture',
+      host: 'worker.invalid',
+      username: 'fixture',
+      remotePath: '/tmp',
+      owned: true,
+    },
+    envOverrides: { CODEX_HOME: '/fixture/codex-home' },
+  });
+  const written = vi.fn();
+  Object.assign(session, { ptyProcess: { write: written, resize: vi.fn() } });
+  return { session, written };
+}
+function currentClockWitness(): remoteClock.RemoteClockWitness {
+  const at = Date.now();
+  return { localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at };
+}
+async function inputReceived(ws: WebSocket): Promise<void> {
+  const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+  ws.ping();
+  await pong;
+}
+
 describe('ws-routes', () => {
   let app: FastifyInstance;
   let ctx: MockRouteContext;
@@ -91,6 +136,8 @@ describe('ws-routes', () => {
 
     ctx = createMockRouteContext({ sessionId: 'ws-test-session' });
     registerWsRoutes(app, ctx as never, () => ({ bindHost: '127.0.0.1', allowedHosts: [], tunnelHost: null }));
+    registerSessionRoutes(app, ctx as never, { remoteWake: { hasWakeTarget: async () => false } as never });
+    childProcess.execFile.mockReset();
 
     await app.listen({ port: 0, host: '127.0.0.1' });
     PORT = (app.server.address() as AddressInfo).port;
@@ -454,6 +501,418 @@ describe('ws-routes', () => {
         } finally {
           clock.resolve(witness());
           ws.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(
+      [false, true].flatMap((firstTagged) =>
+        [false, true].flatMap((secondTagged) =>
+          ['valid', 'missing', 'throw'].map((clockResult) => ({ firstTagged, secondTagged, clockResult }))
+        )
+      )
+    )(
+      'orders two sockets through $clockResult clock admission (first=$firstTagged second=$secondTagged)',
+      async ({ firstTagged, secondTagged, clockResult }) => {
+        const clock = createDeferred<remoteClock.RemoteClockWitness | undefined>();
+        const sampling = vi
+          .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockImplementation(async () => currentClockWitness())
+          .mockReturnValueOnce(clock.promise);
+        const { session, written } = isolatedRemoteWsSession();
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const admitted = vi.spyOn(session, 'deferInputSeq');
+        const write = session.write;
+        const receipts: Array<ReturnType<Session['getRecoveryContext']>['submission']> = [];
+        vi.spyOn(session, 'write').mockImplementation((data, options) => {
+          const sent = write.call(session, data, options);
+          if (data.includes('\r')) receipts.push(session.getRecoveryContext().submission);
+          return sent;
+        });
+        const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=first-socket');
+        const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=second-socket');
+        const firstMessages: Array<{ t: string; seq?: number }> = [];
+        const secondMessages: Array<{ t: string; seq?: number }> = [];
+        first.on('message', (raw) => firstMessages.push(JSON.parse(String(raw))));
+        second.on('message', (raw) => secondMessages.push(JSON.parse(String(raw))));
+        const send = (ws: WebSocket, d: string, seq: number, tagged: boolean) =>
+          ws.send(JSON.stringify({ t: 'i', d, ...(tagged ? { cid: 'shared-clock-client', seq } : {}) }));
+        try {
+          send(first, 'first\r', 1, firstTagged);
+          await vi.waitFor(() => expect(sampling).toHaveBeenCalledTimes(1));
+          send(first, 'A', 2, firstTagged);
+          await inputReceived(first);
+          send(second, 'B', 3, secondTagged);
+          send(second, 'C', 4, secondTagged);
+          send(second, '\r', 5, secondTagged);
+          await inputReceived(second);
+          if (firstTagged) expect(admitted).toHaveBeenCalledWith('shared-clock-client', 2);
+          if (secondTagged)
+            for (const seq of [3, 4, 5]) expect(admitted).toHaveBeenCalledWith('shared-clock-client', seq);
+          expect(session.recoveryInputReserved).toBe(true);
+          expect(written).not.toHaveBeenCalled();
+          expect(sampling).toHaveBeenCalledTimes(1);
+          const resized = nextMessage(second);
+          second.send(JSON.stringify({ t: 'z', c: 100, r: 30 }));
+          expect(await resized).toMatchObject({ t: 'zc' });
+          if (clockResult === 'throw') clock.reject(new Error('Fixture clock transport unavailable'));
+          else clock.resolve(clockResult === 'valid' ? currentClockWitness() : undefined);
+          await vi.waitFor(() =>
+            expect(written.mock.calls.map(([data]) => data)).toEqual(['first\r', 'A', 'B', 'C', '\r'])
+          );
+          expect(sampling).toHaveBeenCalledTimes(2);
+          await vi.waitFor(() => {
+            expect(firstMessages.filter((message) => message.t === 'ia').map((message) => message.seq)).toEqual(
+              firstTagged ? [1, 2] : []
+            );
+            expect(secondMessages.filter((message) => message.t === 'ia').map((message) => message.seq)).toEqual(
+              secondTagged ? [3, 4, 5] : []
+            );
+          });
+          expect(receipts[0]?.hash).toBeDefined();
+          if (clockResult === 'valid') expect(receipts[0]?.clockDomain).toBe('local');
+          else expect(receipts[0]?.clock).toBeUndefined();
+          if (firstTagged || secondTagged) {
+            const socket = secondTagged ? second : first;
+            const seq = secondTagged ? 5 : 2;
+            const duplicate = nextMessage(socket);
+            send(socket, secondTagged ? '\r' : 'A', seq, true);
+            expect(await duplicate).toEqual({ t: 'ia', seq, dup: true, last: seq });
+            expect(written).toHaveBeenCalledTimes(5);
+          }
+        } finally {
+          clock.resolve(currentClockWitness());
+          first.close();
+          second.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(
+      [false, true].flatMap((tagged) => ['valid', 'missing', 'throw'].map((clockResult) => ({ tagged, clockResult })))
+    )(
+      'retains two sockets after HTTP clock admission ($clockResult, tagged=$tagged)',
+      async ({ tagged, clockResult }) => {
+        const clock = createDeferred<remoteClock.RemoteClockWitness | undefined>();
+        const sampling = vi
+          .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockImplementation(async () => currentClockWitness())
+          .mockReturnValueOnce(clock.promise);
+        const { session, written } = isolatedRemoteWsSession();
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const admitted = vi.spyOn(session, 'deferInputSeq');
+        const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=http-first');
+        const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=http-second');
+        let request: Promise<Response> | undefined;
+        try {
+          request = fetch(`http://127.0.0.1:${PORT}/api/sessions/${session.id}/input`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              input: 'HTTP\r',
+              useMux: false,
+              ...(tagged ? { clientId: 'http-owner', seq: 1 } : {}),
+            }),
+          });
+          await vi.waitFor(() => expect(sampling).toHaveBeenCalledTimes(1));
+          first.send(JSON.stringify({ t: 'i', d: 'A', ...(tagged ? { cid: 'http-owner', seq: 2 } : {}) }));
+          await inputReceived(first);
+          second.send(JSON.stringify({ t: 'i', d: 'B', ...(tagged ? { cid: 'http-owner', seq: 3 } : {}) }));
+          second.send(JSON.stringify({ t: 'i', d: '\r', ...(tagged ? { cid: 'http-owner', seq: 4 } : {}) }));
+          await inputReceived(second);
+          if (tagged) for (const seq of [2, 3, 4]) expect(admitted).toHaveBeenCalledWith('http-owner', seq);
+          expect(written).not.toHaveBeenCalled();
+          const resized = nextMessage(second);
+          second.send(JSON.stringify({ t: 'z', c: 100, r: 30 }));
+          expect(await resized).toMatchObject({ t: 'zc' });
+          if (clockResult === 'throw') clock.reject(new Error('Fixture clock unavailable'));
+          else clock.resolve(clockResult === 'valid' ? currentClockWitness() : undefined);
+          expect((await request).status).toBe(200);
+          await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(['HTTP\r', 'A', 'B', '\r']));
+          expect(sampling).toHaveBeenCalledTimes(2);
+          if (tagged) {
+            await vi.waitFor(() => expect(session.lastInputSeq('http-owner')).toBe(4));
+            const ack = nextMessage(second);
+            second.send(JSON.stringify({ t: 'i', d: '\r', cid: 'http-owner', seq: 4 }));
+            expect(await ack).toMatchObject({ t: 'ia', seq: 4, dup: true });
+            expect(written).toHaveBeenCalledTimes(4);
+          }
+        } finally {
+          clock.resolve(currentClockWitness());
+          await request;
+          first.close();
+          second.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(['closed-socket', 'aborted-http', 'closing-session', 'replaced-session', 'replaced-pane'] as const)(
+      'retains current owner input and cancellation vetoes after HTTP admission: %s',
+      async (change) => {
+        const clock = createDeferred<remoteClock.RemoteClockWitness>();
+        const sampling = vi
+          .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockImplementation(async () => currentClockWitness())
+          .mockReturnValueOnce(clock.promise);
+        const { session, written } = isolatedRemoteWsSession();
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=http-cancel-first');
+        const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=http-cancel-second');
+        const abort = new AbortController();
+        const httpClosed = createDeferred<void>();
+        const observeHttp = (req: IncomingMessage) => {
+          if (req.url?.endsWith('/input')) req.socket.once('close', () => httpClosed.resolve());
+        };
+        app.server.on('request', observeHttp);
+        const request = fetch(`http://127.0.0.1:${PORT}/api/sessions/${session.id}/input`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          signal: abort.signal,
+          body: JSON.stringify({ input: 'HTTP\r', useMux: false }),
+        }).catch(() => undefined);
+        let replacement: ReturnType<typeof isolatedRemoteWsSession> | undefined;
+        try {
+          await vi.waitFor(() => expect(sampling).toHaveBeenCalledTimes(1));
+          first.send(JSON.stringify({ t: 'i', d: 'A' }));
+          await inputReceived(first);
+          second.send(JSON.stringify({ t: 'i', d: 'B' }));
+          await inputReceived(second);
+          if (change === 'closed-socket') {
+            const closed = waitForClose(first);
+            first.close();
+            await closed;
+          } else if (change === 'aborted-http') {
+            abort.abort();
+            await request;
+            await httpClosed.promise;
+          } else if (change === 'closing-session') session.markClosing(true);
+          else if (change === 'replaced-session') {
+            replacement = isolatedRemoteWsSession();
+            (ctx.sessions as unknown as Map<string, Session>).set(session.id, replacement.session);
+          } else Object.assign(session, { _paneStartedAt: session.paneStartedAt + 1 });
+          clock.resolve(currentClockWitness());
+          await request;
+          const expected = change === 'closed-socket' ? ['HTTP\r', 'B'] : change === 'aborted-http' ? ['A', 'B'] : [];
+          await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(expected));
+          await inputReceived(second);
+          expect(written.mock.calls.map(([data]) => data)).toEqual(expected);
+        } finally {
+          clock.resolve(currentClockWitness());
+          await request;
+          first.close();
+          second.close();
+          await session.stop(false);
+          await replacement?.session.stop(false);
+          app.server.off('request', observeHttp);
+        }
+      }
+    );
+
+    it('refuses HTTP and named-key overflow before effects and retries after the shared backlog drains', async () => {
+      const heldMux = createDeferred<boolean>();
+      const { session, written } = isolatedRemoteWsSession();
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const muxWrite = vi.spyOn(session, 'writeViaMux').mockReturnValueOnce(heldMux.promise);
+      const socket = await connectWs('/ws/sessions/ws-test-session/terminal?cid=shared-overflow');
+      const post = (path: string, body: unknown) =>
+        fetch(`http://127.0.0.1:${PORT}/api/sessions/${session.id}/${path}`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+      const request = post('input', { input: 'HTTP', useMux: true });
+      try {
+        await vi.waitFor(() => expect(muxWrite).toHaveBeenCalledTimes(1));
+        const tail = 'a'.repeat(MAX_INPUT_LENGTH - 4);
+        socket.send(JSON.stringify({ t: 'i', d: tail }));
+        await inputReceived(socket);
+        const refused = await (
+          await post('input', { input: 'Z', useMux: false, clientId: 'overflow-owner', seq: 1 })
+        ).json();
+        expect(refused).toMatchObject({ success: false, retryable: true, notSent: true });
+        const keyRefused = await (await post('send-key', { key: 'C-Enter' })).json();
+        expect(keyRefused).toMatchObject({ success: false, retryable: true, notSent: true });
+        expect(childProcess.execFile).not.toHaveBeenCalled();
+        expect(written).not.toHaveBeenCalled();
+        heldMux.resolve(true);
+        await request;
+        await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual([tail]));
+        const retry = await post('input', { input: 'Z', useMux: false, clientId: 'overflow-owner', seq: 1 });
+        expect(await retry.json()).toEqual({});
+        expect(written.mock.calls.map(([data]) => data)).toEqual([tail, 'Z']);
+        childProcess.execFile.mockImplementation((_cmd, _args, _options, callback) => callback(null));
+        expect(await (await post('send-key', { key: 'C-Enter' })).json()).toEqual({});
+        expect(childProcess.execFile).toHaveBeenCalledTimes(1);
+      } finally {
+        heldMux.resolve(true);
+        await request;
+        socket.close();
+        await session.stop(false);
+      }
+    });
+
+    it.each([false, true])(
+      'keeps socket input behind named-key dispatch (unknown child failure=%s)',
+      async (failed) => {
+        vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockImplementation(async () => currentClockWitness());
+        const { session, written } = isolatedRemoteWsSession();
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=key-first');
+        const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=key-second');
+        let finishKey: ((error: Error | null) => void) | undefined;
+        childProcess.execFile.mockImplementation((_cmd, _args, _options, callback) => {
+          finishKey = callback;
+        });
+        const request = fetch(`http://127.0.0.1:${PORT}/api/sessions/${session.id}/send-key`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ key: 'S-Enter' }),
+        });
+        try {
+          await vi.waitFor(() => expect(finishKey).toBeDefined());
+          first.send(JSON.stringify({ t: 'i', d: 'A' }));
+          await inputReceived(first);
+          second.send(JSON.stringify({ t: 'i', d: 'B', cid: 'key-owner', seq: 1 }));
+          await inputReceived(second);
+          expect(written).not.toHaveBeenCalled();
+          finishKey!(failed ? new Error('Fixture unknown child outcome') : null);
+          const response = await request;
+          const body = await response.json();
+          if (failed) {
+            expect(body).toMatchObject({ success: false });
+            expect(body.notSent).toBeUndefined();
+          }
+          await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(['A', 'B']));
+          expect(childProcess.execFile).toHaveBeenCalledTimes(1);
+          expect(childProcess.execFile.mock.calls[0]?.[1]).toEqual([
+            '-L',
+            ctx.mux.muxSocket,
+            'send-keys',
+            '-H',
+            '-t',
+            session.muxName,
+            '0a',
+          ]);
+        } finally {
+          finishKey?.(null);
+          await request;
+          first.close();
+          second.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(['closed-second', 'closed-first', 'superseded-first', 'replaced-session'] as const)(
+      'keeps per-socket and exact Session vetoes after $0 while another socket is queued',
+      async (change) => {
+        const clock = createDeferred<remoteClock.RemoteClockWitness>();
+        const sampling = vi
+          .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockImplementation(async () => currentClockWitness())
+          .mockReturnValueOnce(clock.promise);
+        const { session, written } = isolatedRemoteWsSession();
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=replaceable-first');
+        const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=independent-second');
+        let replacementSocket: WebSocket | undefined;
+        let replacementSession: Session | undefined;
+        try {
+          first.send(JSON.stringify({ t: 'i', d: 'first\r', cid: 'first-frame', seq: 1 }));
+          await vi.waitFor(() => expect(sampling).toHaveBeenCalledTimes(1));
+          second.send(JSON.stringify({ t: 'i', d: 'second' }));
+          await inputReceived(second);
+          if (change === 'closed-second') {
+            const closed = waitForClose(second);
+            second.close();
+            await closed;
+            first.send(JSON.stringify({ t: 'i', d: 'tail', cid: 'first-frame', seq: 2 }));
+            await inputReceived(first);
+          } else if (change === 'closed-first') {
+            const closed = waitForClose(first);
+            first.close();
+            await closed;
+          } else if (change === 'superseded-first') {
+            const closed = waitForClose(first);
+            replacementSocket = await connectWs('/ws/sessions/ws-test-session/terminal?cid=replaceable-first');
+            expect((await closed).code).toBe(4010);
+            replacementSocket.send(JSON.stringify({ t: 'i', d: 'first\r', cid: 'first-frame', seq: 1 }));
+            await inputReceived(replacementSocket);
+          } else {
+            const replacement = isolatedRemoteWsSession();
+            replacementSession = replacement.session;
+            (ctx.sessions as unknown as Map<string, Session>).set(session.id, replacementSession);
+            replacementSocket = await connectWs('/ws/sessions/ws-test-session/terminal?cid=new-session');
+            const ack = nextMessage(replacementSocket);
+            replacementSocket.send(JSON.stringify({ t: 'i', d: 'new\r', cid: 'new-frame', seq: 1 }));
+            expect(await ack).toEqual({ t: 'ia', seq: 1 });
+            expect(replacement.written.mock.calls.map(([data]) => data)).toEqual(['new\r']);
+            expect(written).not.toHaveBeenCalled();
+          }
+          clock.resolve(currentClockWitness());
+          await vi.waitFor(() => expect(session.recoveryInputReserved).toBe(false));
+          if (change === 'closed-second')
+            await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(['first\r', 'tail']));
+          if (change === 'closed-first') {
+            await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(['second']));
+            expect(session.lastInputSeq('first-frame')).toBe(0);
+          }
+          if (change === 'superseded-first') {
+            await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(['second', 'first\r']));
+            expect(session.lastInputSeq('first-frame')).toBe(1);
+          }
+          if (change === 'replaced-session') {
+            await inputReceived(second);
+            expect(written).not.toHaveBeenCalled();
+            expect(session.lastInputSeq('first-frame')).toBe(0);
+          }
+        } finally {
+          clock.resolve(currentClockWitness());
+          first.close();
+          second.close();
+          replacementSocket?.close();
+          await session.stop(false);
+          await replacementSession?.stop(false);
+        }
+      }
+    );
+
+    it.each(['bytes', 'frames'] as const)(
+      'bounds the combined %s backlog across independent session sockets',
+      async (limit) => {
+        const clock = createDeferred<remoteClock.RemoteClockWitness>();
+        const sampling = vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
+        const { session, written } = isolatedRemoteWsSession();
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=quota-first');
+        const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=quota-second');
+        const admittedFirst =
+          limit === 'bytes' ? ['x'.repeat(Math.floor(MAX_INPUT_LENGTH / 2))] : Array.from({ length: 255 }, () => 'a');
+        try {
+          first.send(JSON.stringify({ t: 'i', d: 'first\r', cid: 'quota-client', seq: 1 }));
+          await vi.waitFor(() => expect(sampling).toHaveBeenCalledTimes(1));
+          for (const d of admittedFirst) first.send(JSON.stringify({ t: 'i', d }));
+          await inputReceived(first);
+          const closed = waitForClose(second);
+          if (limit === 'bytes')
+            second.send(JSON.stringify({ t: 'i', d: 'y'.repeat(Math.floor(MAX_INPUT_LENGTH / 2)) }));
+          else {
+            for (let i = 0; i < 257; i++) second.send(JSON.stringify({ t: 'i', d: 'b' }));
+          }
+          expect((await closed).code).toBe(4008);
+          expect(written).not.toHaveBeenCalled();
+          clock.resolve(currentClockWitness());
+          await vi.waitFor(() =>
+            expect(written.mock.calls.map(([data]) => data)).toEqual(['first\r', ...admittedFirst])
+          );
+          expect(session.lastInputSeq('quota-client')).toBe(1);
+        } finally {
+          clock.resolve(currentClockWitness());
+          first.close();
+          second.close();
           await session.stop(false);
         }
       }
