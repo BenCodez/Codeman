@@ -31,7 +31,7 @@
  * @module session-env-clamp
  */
 
-import { canUsernameRunPrivilegedCommands } from './user-store.js';
+import { canUsernameRunPrivilegedCommands, prepareRecoveryPrivilegeGrant } from './user-store.js';
 import { enabledClis } from './config/cli-registry/registry.js';
 
 /**
@@ -149,6 +149,10 @@ export async function clampRecoveryLaunchForOwner(
   configs: Record<string, unknown>,
   env: Record<string, string> | undefined
 ) {
-  const privileged = await canUsernameRunPrivilegedCommands(owner);
-  return { configs: clampConfigsWithGrant(configs, privileged), env: clampEnvWithGrant(env, privileged) };
+  const grant = await prepareRecoveryPrivilegeGrant(owner);
+  return {
+    configs: clampConfigsWithGrant(configs, grant.privileged),
+    env: clampEnvWithGrant(env, grant.privileged),
+    isCurrent: grant.isCurrent,
+  };
 }

@@ -2389,12 +2389,21 @@ export class Session extends EventEmitter {
           context.codexHome !== currentLocalCodexHome()
             ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
             : this._envOverrides;
+        const launchSnapshot = JSON.stringify([
+          this.owner,
+          this.workingDir,
+          this._codexConfig,
+          this._envOverrides,
+          context.codexHome,
+          this._muxSession?.muxName,
+        ]);
         const granted = await clampRecoveryLaunchForOwner(
           this.owner,
           { codexConfig: this._codexConfig },
           envToAuthorize
         );
         if (
+          granted.isCurrent() !== true ||
           JSON.stringify(granted.configs.codexConfig) !== JSON.stringify(this._codexConfig) ||
           JSON.stringify(granted.env) !== JSON.stringify(envToAuthorize)
         )
@@ -2408,6 +2417,7 @@ export class Session extends EventEmitter {
         }
         const currentContext = this.getRecoveryContext();
         if (
+          granted.isCurrent() !== true ||
           !isCurrent() ||
           !pane ||
           !currentContext.managed ||
@@ -2417,14 +2427,61 @@ export class Session extends EventEmitter {
           this._codexConfig?.resumeSessionId !== flight.conversationId
         )
           return 'not-sent';
+        let dispatched = false;
+        let refusedBeforeDispatch = false;
+        const contextCurrent = (): boolean => {
+          const current = this.getRecoveryContext();
+          return (
+            current.managed &&
+            current.noDaemon &&
+            !current.switchPending &&
+            current.generation === generation &&
+            this._codexConfig?.resumeSessionId === flight.conversationId &&
+            JSON.stringify([
+              this.owner,
+              this.workingDir,
+              this._codexConfig,
+              this._envOverrides,
+              current.codexHome,
+              this._muxSession?.muxName,
+            ]) === launchSnapshot &&
+            (flight.action === 'restart' || (!this.isBusy() && !this.watching))
+          );
+        };
+        const recoveryGuard = {
+          confirm: (): boolean => {
+            let accepted = false;
+            try {
+              accepted =
+                granted.isCurrent() === true &&
+                isCurrent() === true &&
+                contextCurrent() &&
+                (!confirmEvidence || confirmEvidence() === true) &&
+                granted.isCurrent() === true &&
+                isCurrent() === true &&
+                contextCurrent();
+            } catch {
+              accepted = false;
+            }
+            if (!accepted && !dispatched) refusedBeforeDispatch = true;
+            return accepted;
+          },
+          noteDispatch: () => {
+            dispatched = true;
+          },
+        };
         this._submitVerifier?.cancel();
         this._submitVerifier = null;
         if (flight.action === 'restart') {
           if (!pane.dead || !((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0))
             return 'not-sent';
           // Same current settings and exact resume id through the registry; no fallback to a fresh conversation.
-          const pid = await this._mux!.respawnPane({ ...this._buildRespawnPaneOptions(), onlyIfDead: true });
-          if (!pid) return 'unknown';
+          const pid = await this._mux!.respawnPane({
+            ...this._buildRespawnPaneOptions(),
+            onlyIfDead: true,
+            recoveryDispatchGuard: recoveryGuard,
+          });
+          if (!pid) return refusedBeforeDispatch && !dispatched ? 'not-sent' : 'unknown';
           this.clearPaneExitForNewPane();
           return 'sent';
         }
@@ -2438,8 +2495,8 @@ export class Session extends EventEmitter {
         )
           return 'not-sent';
         // Browser frames report false during this short reservation so durable clients retain and retry them.
-        const sent = await this._mux!.sendInput(this.id, `${prompt}\r`);
-        if (!sent) return 'unknown'; // text may have landed even when Enter failed
+        const sent = await this._mux!.sendInput(this.id, `${prompt}\r`, recoveryGuard);
+        if (!sent) return refusedBeforeDispatch && !dispatched ? 'not-sent' : 'unknown'; // text may have landed even when Enter failed
         this._lastSubmitAt = Date.now();
         // Recovery acceptance comes from structured journal evidence. Do not arm the
         // generic submit verifier: its delayed Enter retries are separate input actions

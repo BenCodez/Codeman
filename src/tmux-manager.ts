@@ -109,6 +109,7 @@ import type {
   CreateSessionOptions,
   RespawnPaneOptions,
   PaneCaptureOptions,
+  RecoveryMuxDispatchGuard,
 } from './mux-interface.js';
 import {
   decideReconnect,
@@ -1683,6 +1684,19 @@ function setCliConfigContent(tmuxCmd: string, muxName: string, varName: string, 
  * await manager.killSession(sessionId);
  * ```
  */
+function confirmRecoveryMuxDispatch(guard: RecoveryMuxDispatchGuard): boolean {
+  try {
+    const verdict: unknown = guard.confirm();
+    if (verdict instanceof Promise) {
+      void verdict.catch(() => {});
+      return false;
+    }
+    return verdict === true;
+  } catch {
+    return false;
+  }
+}
+
 export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   readonly backend = 'tmux' as const;
   private sessions: Map<string, MuxSession> = new Map();
@@ -2479,6 +2493,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : undefined;
     // Recovery cannot turn current server defaults into provenance for an old pane.
     if (options.onlyIfDead && localCodex && !recoveryCodexHome) return null;
+    const guard = options.recoveryDispatchGuard;
+    const canDispatch = () =>
+      !guard ||
+      (options.onlyIfDead === true &&
+        localCodex &&
+        this.sessions.get(sessionId) === session &&
+        session.muxName === muxName &&
+        confirmRecoveryMuxDispatch(guard));
+    if (!canDispatch()) return null;
 
     if (!isValidMuxName(muxName) || !isValidPath(workingDir)) return null;
 
@@ -2524,6 +2547,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : localFullCmd;
 
     try {
+      if (!canDispatch()) return null;
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
       this._configureCliEnv(
         muxName,
@@ -2540,6 +2564,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      if (!canDispatch()) return null;
+      guard?.noteDispatch();
       await execAsync(
         `${this.tmux()} respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
         {
@@ -3642,7 +3668,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * - `Enter` key is sent as a SEPARATE tmux invocation after a small delay
    * - Ink (Claude CLI) needs text and Enter split to avoid treating Enter as a newline
    */
-  async sendInput(sessionId: string, input: string): Promise<boolean> {
+  async sendInput(sessionId: string, input: string, recoveryGuard?: RecoveryMuxDispatchGuard): Promise<boolean> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       console.error(
@@ -3651,8 +3677,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       return false;
     }
 
+    const muxName = session.muxName;
+    const canDispatch = () =>
+      !recoveryGuard ||
+      (this.sessions.get(sessionId) === session &&
+        session.muxName === muxName &&
+        confirmRecoveryMuxDispatch(recoveryGuard));
+    if (!canDispatch()) return false;
+
     // TEST MODE: No-op — don't send input to real tmux sessions
     if (IS_TEST_MODE) {
+      recoveryGuard?.noteDispatch();
       return true;
     }
 
@@ -3674,20 +3709,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
         // character in the input buffer rather than as form submission.
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
           timeout: EXEC_TIMEOUT_MS,
         });
         await new Promise((resolve) => setTimeout(resolve, 50));
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
           timeout: EXEC_TIMEOUT_MS,
         });
       } else if (textPart) {
         // Text only, no Enter
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
           timeout: EXEC_TIMEOUT_MS,
         });
       } else if (hasCarriageReturn) {
         // Enter only
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
           timeout: EXEC_TIMEOUT_MS,
         });
