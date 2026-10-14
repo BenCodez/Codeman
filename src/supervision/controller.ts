@@ -29,6 +29,7 @@ export interface TaskDependencies {
   changed(state: TaskState): void;
   now?: () => number;
 }
+export class TaskValidationError extends Error {}
 function acceptanceCriteriaComplete(state: TaskState): boolean {
   return state.criteria.length > 0 && state.criteria.every((criterion) => criterion.verified);
 }
@@ -200,7 +201,8 @@ export class TaskController {
     return true;
   }
   private requireCurrent(revision: number): void {
-    if (this.stopped || this.revision !== revision) throw new Error('Task action was superseded by session input');
+    if (this.stopped || this.revision !== revision)
+      throw new TaskValidationError('Task action was superseded by session input');
   }
   update(patch: TaskUpdate): Promise<TaskState> {
     TaskUpdateSchema.parse(patch);
@@ -225,7 +227,7 @@ export class TaskController {
                 : { id: c.id, description: c.description, kind: c.kind }
             )
           );
-      if (changed && this.state.inFlight) throw new Error('Unresolved delivery requires reset');
+      if (changed && this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
       const candidate = changed ? initialTaskState() : this.getStatus();
       if (changed) candidate.config = { ...this.state.config };
       candidate.objective = objective;
@@ -236,8 +238,9 @@ export class TaskController {
       }
       if (patch.config) candidate.config = { ...candidate.config, ...patch.config };
       if (candidate.config.enabled && (!candidate.objective || !candidate.criteria.length))
-        throw new Error('Task objective and criteria are required');
-      if (candidate.inFlight && candidate.config.enabled) throw new Error('Unresolved delivery requires reset');
+        throw new TaskValidationError('Task objective and criteria are required');
+      if (candidate.inFlight && candidate.config.enabled)
+        throw new TaskValidationError('Unresolved delivery requires reset');
       if (acceptanceCriteriaComplete(candidate)) candidate.outcome = 'completed';
       candidate.phase =
         candidate.outcome === 'completed' ? 'completed' : candidate.config.enabled ? 'watching' : 'disabled';
@@ -256,17 +259,17 @@ export class TaskController {
       const { commands, observation } = await this.deps.observe();
       this.requireCurrent(revision);
       if (this.state.conversationId && observation.conversationId !== this.state.conversationId)
-        throw new Error('Task conversation changed');
+        throw new TaskValidationError('Task conversation changed');
       const candidate = this.getStatus();
       this.reconcileAcceptedFlight(candidate, observation);
       for (const id of patch.verifiedCriteria ?? []) {
         const c = candidate.criteria.find((c) => c.id === id);
-        if (!c) throw new Error('Unknown criterion');
-        if (c.kind === 'manual' && !owner) throw new Error('Manual criteria require owner verification');
+        if (!c) throw new TaskValidationError('Unknown criterion');
+        if (c.kind === 'manual' && !owner) throw new TaskValidationError('Manual criteria require owner verification');
         const hash = c.command ? commandHash(c.command) : undefined;
         const at = hash ? commands.get(hash) : this.now();
         if (c.kind === 'command' && (!at || at < (this.state.configuredAt ?? this.state.startedAt ?? this.now())))
-          throw new Error('Command success evidence is not verified');
+          throw new TaskValidationError('Command success evidence is not verified');
         c.verified = true;
         c.evidence = {
           source: c.kind === 'command' ? 'command' : 'owner',
@@ -275,7 +278,7 @@ export class TaskController {
         };
       }
       if (patch.outcome === 'completed' && (!candidate.criteria.length || !candidate.criteria.every((c) => c.verified)))
-        throw new Error('Acceptance criteria remain unverified');
+        throw new TaskValidationError('Acceptance criteria remain unverified');
       candidate.submissionKey = observation.submissionKey;
       this.state = candidate;
       this.state.lastProgressAt = this.now();
@@ -307,9 +310,9 @@ export class TaskController {
     const revision = ++this.revision;
     return this.enqueue(async () => {
       this.requireCurrent(revision);
-      if (this.state.inFlight) throw new Error('Unresolved delivery requires reset');
+      if (this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
       if (!this.state.objective || !this.state.criteria.length || this.state.outcome === 'completed')
-        throw new Error('No unfinished task to supervise');
+        throw new TaskValidationError('No unfinished task to supervise');
       this.state.config.enabled = true;
       this.state.startedAt ??= this.now();
       if (this.state.kickoffAt !== undefined) {
@@ -475,7 +478,7 @@ export class TaskController {
         o.safeToAct &&
         o.at >= (this.state.startedAt ?? 0) &&
         o.evidenceKey &&
-        this.state.outcome === 'unfinished'
+        (this.state.outcome === 'unfinished' || (this.state.outcome === 'unknown' && o.activity === 'crashed'))
       ) {
         if (
           this.state.continuations >= this.state.config.maxContinuations ||

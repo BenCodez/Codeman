@@ -14,6 +14,7 @@ import {
   CONTINUATION_PROMPT,
   initialRecoveryState,
   type RecoveryFlight,
+  type RecoveryObservation,
   type RecoveryState,
 } from '../src/recovery/types.js';
 
@@ -140,6 +141,72 @@ describe('task and recovery server action wiring', () => {
     expect(task.getStatus().phase).toBe('completed');
     expect(await recoveryDeps.act(flight, () => true)).toBe('sent');
     expect(recoveryAct).toHaveBeenCalledTimes(2);
+  });
+
+  it('defers recovery attempts while a supervised task recovers a pre-marker crash', async () => {
+    let taskObservation: RecoveryObservation = {
+      activity: 'idle' as const,
+      reason: 'observing' as const,
+      at: Date.now(),
+      conversationId: flight.conversationId,
+      submissionKey: 'before-kickoff',
+      processReady: true,
+      safeToAct: false,
+    };
+    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+      observation: taskObservation,
+      commands: new Map(),
+    }));
+    vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
+    const taskRecover = vi.spyOn(CodexTaskAdapter.prototype, 'recover').mockResolvedValue('sent');
+    let recoveryObservation: RecoveryObservation = { ...taskObservation };
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => recoveryObservation);
+    const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+    const { task, recovery } = controllers('task-premarker-crash');
+    await recovery.updateConfig({ enabled: true, maxRetries: 1 });
+    await task.update({
+      objective: 'Complete the supervised task',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+    });
+
+    await task.resume();
+    const kickoff = task.getStatus().inFlight!;
+    taskObservation = {
+      activity: 'working',
+      reason: 'turn-running',
+      at: Date.now(),
+      conversationId: flight.conversationId,
+      submissionKey: 'accepted-kickoff',
+      submissionHash: kickoff.promptHash,
+      processReady: true,
+      safeToAct: false,
+    };
+    await task.refresh();
+    expect(task.getStatus()).toMatchObject({ phase: 'watching', outcome: 'unknown' });
+    expect(task.getStatus().inFlight).toBeUndefined();
+
+    const crash = {
+      activity: 'crashed' as const,
+      reason: 'process-crashed' as const,
+      at: Date.now() + 1000,
+      conversationId: flight.conversationId,
+      evidenceKey: 'premarker-crash',
+      processReady: false,
+      safeToAct: true,
+    };
+    taskObservation = crash;
+    recoveryObservation = crash;
+
+    await recovery.retry();
+
+    expect(recovery.getStatus()).toMatchObject({ attempts: 0, failedAttempts: 0, circuitOpen: false });
+    expect(recovery.getStatus().inFlight).toBeUndefined();
+    expect(recoveryAct).not.toHaveBeenCalled();
+
+    await task.refresh();
+
+    expect(taskRecover).toHaveBeenCalledOnce();
+    expect(task.getStatus()).toMatchObject({ reason: 'recovery-sent', continuations: 1, outcome: 'unknown' });
   });
 
   it('settles an accepted kickoff when the owner completes the task before the acceptance poll', async () => {

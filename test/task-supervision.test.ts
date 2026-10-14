@@ -987,16 +987,32 @@ describe('task supervision', () => {
 describe('structured command evidence', () => {
   const line = (at: number, payload: unknown) =>
     JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
-  it('correlates exact begin/end and rejects failed/missing/partial evidence', () => {
+  it('correlates supported Codex shells and rejects failed, partial, or arbitrary wrapper evidence', () => {
+    for (const [index, shell] of ['bash', '/bin/zsh', '/usr/bin/bash', '/usr/bin/sh', '/usr/bin/zsh'].entries()) {
+      const callId = `supported-${index}`;
+      const begin = line(10000, {
+        type: 'exec_command_begin',
+        call_id: callId,
+        command: [shell, '-lc', 'npm test'],
+      });
+      const end = line(10001, { type: 'exec_command_end', call_id: callId, exit_code: 0 });
+      expect(successfulCommands(begin + end, 9000, 11000).get(commandHash('npm test'))).toBe(10001);
+    }
     const begin = line(10000, { type: 'exec_command_begin', call_id: 'c', command: ['bash', '-lc', 'npm test'] });
     const end = line(10001, { type: 'exec_command_end', call_id: 'c', exit_code: 0 });
-    expect(successfulCommands(begin + end, 9000, 11000).get(commandHash('npm test'))).toBe(10001);
     expect(successfulCommands(end, 9000, 11000).size).toBe(0);
     expect(successfulCommands(begin + end.trim(), 9000, 11000).size).toBe(0);
     expect(
       successfulCommands(begin + line(10001, { type: 'exec_command_end', call_id: 'c', exit_code: 1 }), 9000, 11000)
         .size
     ).toBe(0);
+    const arbitrary = line(10000, {
+      type: 'exec_command_begin',
+      call_id: 'arbitrary',
+      command: ['/tmp/bash', '-lc', 'npm test'],
+    });
+    const arbitraryEnd = line(10001, { type: 'exec_command_end', call_id: 'arbitrary', exit_code: 0 });
+    expect(successfulCommands(arbitrary + arbitraryEnd, 9000, 11000).size).toBe(0);
   });
   it('clears a future-dated prior marker on a later user row and attributes new markers to the classifier submission identity', () => {
     const earlier = line(9999, { type: 'user_message', message: 'Earlier task' });

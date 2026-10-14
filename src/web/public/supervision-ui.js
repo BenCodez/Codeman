@@ -191,8 +191,8 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('taskCommandCriteria').value = commandCriteria.join('\n');
       view.configurationBaseline = {
         objective: (state?.objective ?? '').trim(),
-        manual: manualCriteria.map((text) => text.trim()).filter(Boolean),
-        commands: commandCriteria.map((text) => text.trim()).filter(Boolean),
+        manualText: manualCriteria.join('\n'),
+        commandText: commandCriteria.join('\n'),
       };
       document.getElementById('taskEnabled').checked = state?.config.enabled ?? false;
       document.getElementById('taskMaxContinuations').value = state?.config.maxContinuations ?? '';
@@ -245,24 +245,34 @@ Object.assign(CodemanApp.prototype, {
     const view = this._taskView;
     if (!view?.state || view.busy || view.loading) return;
     const objective = document.getElementById('taskObjective').value.trim();
-    const manual = document
-      .getElementById('taskManualCriteria')
-      .value.split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
-    const commands = document
-      .getElementById('taskCommandCriteria')
-      .value.split('\n')
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const manualText = document.getElementById('taskManualCriteria').value;
+    const commandText = document.getElementById('taskCommandCriteria').value;
+    const currentManual = view.state.criteria.filter((criterion) => criterion.kind === 'manual');
+    const currentCommands = view.state.criteria.filter((criterion) => criterion.kind === 'command');
+    const baseline = view.configurationBaseline ?? {
+      objective: view.state.objective.trim(),
+      manualText: currentManual.map((criterion) => criterion.description).join('\n'),
+      commandText: currentCommands.map((criterion) => criterion.command).join('\n'),
+    };
+    const manualChanged = manualText !== baseline.manualText;
+    const commandChanged = commandText !== baseline.commandText;
+    const parseCriteria = (text) =>
+      text
+        .split('\n')
+        .map((value) => value.trim())
+        .filter(Boolean);
+    const manual = manualChanged ? parseCriteria(manualText) : null;
+    const commands = commandChanged ? parseCriteria(commandText) : null;
+    const manualCount = manual?.length ?? currentManual.length;
+    const commandCount = commands?.length ?? currentCommands.length;
     const max = document.getElementById('taskMaxContinuations');
     const runtime = document.getElementById('taskMaxRuntime');
     if (
       !objective ||
-      (!manual.length && !commands.length) ||
-      manual.length + commands.length > 30 ||
-      manual.some((text) => text.length > 1000) ||
-      commands.some((text) => text.length > 1000) ||
+      (!manualCount && !commandCount) ||
+      manualCount + commandCount > 30 ||
+      manual?.some((text) => text.length > 1000) ||
+      commands?.some((text) => text.length > 1000) ||
       !max.value ||
       !runtime.value ||
       !max.checkValidity() ||
@@ -271,37 +281,52 @@ Object.assign(CodemanApp.prototype, {
       this.showToast('Provide an objective, acceptance criteria, and valid task limits', 'warning');
       return;
     }
-    const usedIds = new Set();
-    const baseline = view.configurationBaseline ?? {
-      objective: view.state.objective.trim(),
-      manual: view.state.criteria.filter((c) => c.kind === 'manual').map((c) => c.description.trim()),
-      commands: view.state.criteria.filter((c) => c.kind === 'command').map((c) => c.command.trim()),
-    };
-    const criteriaChanged =
-      JSON.stringify(manual) !== JSON.stringify(baseline.manual) ||
-      JSON.stringify(commands) !== JSON.stringify(baseline.commands);
-    const criteria = criteriaChanged
-      ? [
-          ...manual.map((description) => ({ description, kind: 'manual' })),
-          ...commands.map((command) => ({ description: command, command, kind: 'command' })),
-        ].map((criterion, i) => {
+    const criteriaChanged = manualChanged || commandChanged;
+    let criteria;
+    if (criteriaChanged) {
+      const unchangedKinds = new Set([...(manualChanged ? [] : ['manual']), ...(commandChanged ? [] : ['command'])]);
+      const usedIds = new Set(
+        view.state.criteria.filter((criterion) => unchangedKinds.has(criterion.kind)).map((criterion) => criterion.id)
+      );
+      let generated = 0;
+      const inputCriterion = (criterion) =>
+        criterion.kind === 'command'
+          ? {
+              id: criterion.id,
+              description: criterion.description,
+              kind: criterion.kind,
+              command: criterion.command,
+            }
+          : { id: criterion.id, description: criterion.description, kind: criterion.kind };
+      const rebuild = (kind, values) =>
+        values.map((value) => {
           const old = view.state.criteria.find(
             (candidate) =>
               !usedIds.has(candidate.id) &&
-              candidate.kind === criterion.kind &&
-              (criterion.kind === 'command'
-                ? candidate.command === criterion.command
-                : candidate.description === criterion.description)
+              candidate.kind === kind &&
+              (kind === 'command' ? candidate.command === value : candidate.description === value)
           );
-          const id = old?.id ?? `criterion-${Date.now()}-${i + 1}`;
+          const id = old?.id ?? `criterion-${Date.now()}-${++generated}`;
           usedIds.add(id);
-          return {
-            ...criterion,
-            ...(old?.kind === 'command' && criterion.kind === 'command' ? { description: old.description } : {}),
-            id,
-          };
-        })
-      : undefined;
+          return kind === 'command'
+            ? { id, description: old?.description ?? value, kind, command: value }
+            : { id, description: value, kind };
+        });
+      const nextManual = manualChanged ? rebuild('manual', manual) : currentManual.map(inputCriterion);
+      const nextCommands = commandChanged ? rebuild('command', commands) : currentCommands.map(inputCriterion);
+      if (manualChanged !== commandChanged) {
+        const changedKind = manualChanged ? 'manual' : 'command';
+        const changed = manualChanged ? nextManual : nextCommands;
+        let changedIndex = 0;
+        criteria = view.state.criteria.flatMap((criterion) => {
+          if (criterion.kind !== changedKind) return [inputCriterion(criterion)];
+          return changedIndex < changed.length ? [changed[changedIndex++]] : [];
+        });
+        criteria.push(...changed.slice(changedIndex));
+      } else {
+        criteria = [...nextManual, ...nextCommands];
+      }
+    }
     await this._performTaskRequest('', 'PUT', {
       ...(objective !== baseline.objective ? { objective } : {}),
       ...(criteria ? { criteria } : {}),

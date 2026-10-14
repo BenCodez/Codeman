@@ -316,13 +316,17 @@ function codexRebootIdentityCandidate(state: SessionState): CodexRebootIdentityC
         __codexRebootIdentity?: {
           switchPending?: boolean;
           submission?: { at: number; hash: string };
+          resumeSessionId?: string;
           untrackedInput?: boolean;
         };
       }
     ).__codexRebootIdentity;
   if (proof?.switchPending || proof?.untrackedInput) return undefined;
-  const id = state.recovery?.conversationId ?? state.codexConfig?.resumeSessionId;
+  // A completed reboot restore replaces the consumed submission with its exact
+  // launched UUID synchronously. It may be newer than the debounced state record.
+  const id = proof?.resumeSessionId ?? state.recovery?.conversationId ?? state.codexConfig?.resumeSessionId;
   if (
+    !proof?.resumeSessionId &&
     state.recovery?.conversationId &&
     state.codexConfig?.resumeSessionId &&
     state.recovery.conversationId !== state.codexConfig.resumeSessionId

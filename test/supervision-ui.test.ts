@@ -87,26 +87,18 @@ describe('Task supervision UI', () => {
     restored.criteria = [
       {
         id: 'custom-command',
-        description: 'Unit tests pass',
+        description: 'Unit and lint checks pass',
         kind: 'command',
-        command: 'npm test',
+        command: 'npm test\nnpm run lint',
         verified: true,
         evidence: { source: 'command', at: 10001, commandHash: 'a'.repeat(64) },
       },
       {
         id: 'custom-manual',
-        description: 'Owner approved release',
+        description: 'Owner approved UI\nOwner approved API',
         kind: 'manual',
         verified: true,
         evidence: { source: 'owner', at: 10002 },
-      },
-      {
-        id: 'custom-lint',
-        description: 'Lint checks pass',
-        kind: 'command',
-        command: 'npm run lint',
-        verified: true,
-        evidence: { source: 'command', at: 10003, commandHash: 'b'.repeat(64) },
       },
     ];
     restored.config = { enabled: true, maxContinuations: 3, maxRuntimeMs: 900000 };
@@ -142,7 +134,7 @@ describe('Task supervision UI', () => {
     expect(body.criteria).toBeUndefined();
     const after = controller.getStatus();
     expect(after.criteria).toEqual(before.criteria);
-    expect(after.criteria.map((criterion) => criterion.id)).toEqual(['custom-command', 'custom-manual', 'custom-lint']);
+    expect(after.criteria.map((criterion) => criterion.id)).toEqual(['custom-command', 'custom-manual']);
     expect(after).toMatchObject({
       outcome: 'completed',
       phase: 'completed',
@@ -160,9 +152,10 @@ describe('Task supervision UI', () => {
     expect(afterEdit.kickoffAt).toBeUndefined();
     expect(afterEdit.criteria.every((criterion) => !criterion.verified)).toBe(true);
     expect(afterEdit.criteria.find((criterion) => criterion.id === 'custom-command')).toMatchObject({
-      description: 'Unit tests pass',
-      command: 'npm test',
+      description: 'Unit and lint checks pass',
+      command: 'npm test\nnpm run lint',
     });
+    expect(afterEdit.criteria.filter((criterion) => criterion.kind === 'command')).toHaveLength(1);
     controller.stop();
   });
   it('submits owner verification only and guards exhausted, blocked and completed actions', async () => {

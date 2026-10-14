@@ -1,6 +1,7 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
 import { registerTaskRoutes } from '../../src/web/routes/task-routes.js';
 import { initialTaskState } from '../../src/supervision/schema.js';
+import { TaskController, TaskValidationError } from '../../src/supervision/controller.js';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
 describe('task routes ownership and bounded inputs', () => {
   let h: RouteTestHarness;
@@ -70,7 +71,7 @@ describe('task routes ownership and bounded inputs', () => {
     expect(controller.update).not.toHaveBeenCalled();
   });
   it('does not expose internal verification errors', async () => {
-    controller.progress.mockRejectedValueOnce(new Error('/private/transcript'));
+    controller.progress.mockRejectedValueOnce(new TaskValidationError('/private/transcript'));
     const res = await h.app.inject({
       method: 'POST',
       url: `/api/sessions/${h.ctx._sessionId}/task/progress`,
@@ -78,5 +79,32 @@ describe('task routes ownership and bounded inputs', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(res.body).not.toContain('/private');
+  });
+  it('returns a sanitized operational failure when valid task persistence fails', async () => {
+    const actual = new TaskController({
+      observe: async () => {
+        throw new Error('not used');
+      },
+      act: async () => 'not-sent',
+      persist: async () => {
+        throw new Error('/private/tasks.json is read-only');
+      },
+      changed: () => {},
+    });
+    getController.mockReturnValueOnce(actual);
+
+    const res = await h.app.inject({
+      method: 'PUT',
+      url: `/api/sessions/${h.ctx._sessionId}/task`,
+      payload: {
+        objective: 'Verify persistence handling',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      },
+    });
+
+    expect(res.statusCode).toBe(500);
+    expect(res.json()).toMatchObject({ success: false, errorCode: 'OPERATION_FAILED' });
+    expect(res.body).not.toContain('/private');
+    actual.stop();
   });
 });

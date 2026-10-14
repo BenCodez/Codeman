@@ -1,5 +1,16 @@
 /** @fileoverview Only bounded structured ExecCommandEnd evidence proves command success. */
 import { createHash } from 'node:crypto';
+const SUPPORTED_POSIX_SHELLS = new Set([
+  'bash',
+  'sh',
+  'zsh',
+  '/bin/bash',
+  '/bin/sh',
+  '/bin/zsh',
+  '/usr/bin/bash',
+  '/usr/bin/sh',
+  '/usr/bin/zsh',
+]);
 export function commandHash(command: string): string {
   return createHash('sha256').update(command).digest('hex');
 }
@@ -36,9 +47,7 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
       // Shell invocation must match the owner's EXACT command, without normalization.
       const c = p.command;
       const command =
-        c.length === 3 && ['bash', '/bin/bash', 'sh', '/bin/sh'].includes(c[0]) && ['-lc', '-c'].includes(c[1])
-          ? c[2]
-          : undefined;
+        c.length === 3 && SUPPORTED_POSIX_SHELLS.has(c[0]) && ['-lc', '-c'].includes(c[1]) ? c[2] : undefined;
       if (command && command.length <= 1000 && pending.size < 100) pending.set(p.call_id, { command, at });
     }
     if (p.type === 'exec_command_end' && typeof p.call_id === 'string' && p.exit_code === 0) {

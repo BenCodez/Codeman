@@ -2429,15 +2429,24 @@ export class WebServer extends EventEmitter {
     const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
     let previousAttention = false;
     let previousReason = '';
+    const taskBlocksRecovery = () => {
+      const task = this.taskControllers.get(session.id)?.getStatus();
+      return task?.phase === 'watching' || !!task?.inFlight;
+    };
     const controller = new RecoveryController(
       {
-        observe: () => adapter.observe(),
+        observe: async () => {
+          const observation = await adapter.observe();
+          // Defer before RecoveryController reserves or charges an attempt. The task
+          // controller owns exact crash recovery while it is actively supervising.
+          return taskBlocksRecovery() ? { ...observation, safeToAct: false } : observation;
+        },
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('recovery', !this.controllerHasTaskFlight(session.id)),
         act: (flight, isCurrent) =>
           this.getActionArbiter(session.id).run('recovery', () => {
-            const task = this.taskControllers.get(session.id)?.getStatus();
-            if (task?.phase === 'watching' || task?.inFlight) return Promise.resolve('not-sent');
+            // Retain the final veto for a task that acquires authority after observation.
+            if (taskBlocksRecovery()) return Promise.resolve('not-sent');
             return adapter.act(flight, isCurrent);
           }),
         persist: (state) => this.recoveryStore.save(session.id, state),
