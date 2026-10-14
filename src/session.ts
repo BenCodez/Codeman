@@ -967,7 +967,8 @@ export class Session extends EventEmitter {
     this._mux = config.mux || null;
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this._muxSession = config.muxSession || null;
-    this._preserveExitedPane = config.preserveExitedPane ?? false;
+    this._codexRestoreWorkerMayExist = this._muxSession?.codexRestoreUncertain === true;
+    this._preserveExitedPane = (config.preserveExitedPane ?? false) || this._codexRestoreWorkerMayExist;
     this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
     this._recoveryUntrackedInput =
       getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
@@ -1004,6 +1005,8 @@ export class Session extends EventEmitter {
     if (config.codexConfig) {
       this._codexConfig = config.codexConfig;
     }
+    if (this._codexRestoreWorkerMayExist && this._muxSession?.codexRestoreConfig?.resumeSessionId)
+      this.pinRecoveryConversation(this._muxSession.codexRestoreConfig.resumeSessionId);
 
     // Apply Gemini configuration
     if (config.geminiConfig) {
@@ -2088,7 +2091,9 @@ export class Session extends EventEmitter {
   }): Promise<{ isRestored: boolean; respawnedResumeId?: string; respawnedDeadPane: boolean }> {
     const mux = this._mux!;
     if (this._codexRestoreGuard && this._muxSession) throw new Error('Reboot restoration cannot attach to a pane');
-    const preserveExitedPane = this._preserveExitedPane;
+    if (this._codexRestoreWorkerMayExist && !this._muxSession)
+      throw new Error('An uncertain reboot worker requires owner inspection of its existing pane');
+    const preserveExitedPane = this._preserveExitedPane || this._codexRestoreWorkerMayExist;
     this._preserveExitedPane = false;
 
     // Verify stale mux session — tmux may have been destroyed (e.g., killed externally).
@@ -2346,7 +2351,12 @@ export class Session extends EventEmitter {
       intentionalStopAt: this._recoveryIntentionalStopAt,
       switchPending: this._recoverySwitchPending,
       untrackedInput: this._recoveryUntrackedInput,
-      managed: this.paneExitApplies && !this._closing && !this._isStopped && !this._respawnBlocked,
+      managed:
+        this.paneExitApplies &&
+        !this._closing &&
+        !this._isStopped &&
+        !this._respawnBlocked &&
+        !this._codexRestoreWorkerMayExist,
       noDaemon:
         this._muxSession?.recoveryIsolated === true &&
         normalizedCodexHome(this._muxSession.recoveryCodexHome) !== undefined &&
@@ -2961,9 +2971,47 @@ export class Session extends EventEmitter {
     return this._codexRestoreWorkerMayExist;
   }
 
+  /** Adopt only our guarded launch's existing metadata; this does not attach or launch a worker. */
+  adoptUncertainCodexRestore(): boolean {
+    if (!this._codexRestoreWorkerMayExist || this._remote || this._docker || !this._mux) return false;
+    const record = this._mux.getSession(this.id);
+    const expectedHome = this._recoveryCodexHome ?? normalizedCodexHome(this._envOverrides?.CODEX_HOME);
+    if (
+      !record ||
+      record.sessionId !== this.id ||
+      record.mode !== 'codex' ||
+      record.owner !== this.owner ||
+      record.workingDir !== this.workingDir ||
+      !normalizedCodexHome(record.recoveryCodexHome) ||
+      (expectedHome !== undefined && record.recoveryCodexHome !== expectedHome) ||
+      (record.codexRestoreConfig !== undefined &&
+        JSON.stringify(record.codexRestoreConfig) !== JSON.stringify(this._codexConfig))
+    )
+      return false;
+    record.codexRestoreUncertain = true;
+    this._muxSession = record;
+    this._preserveExitedPane = true;
+    // Retire the failed launch authority. Inspection may attach only to this
+    // existing pane; the uncertainty flag still forbids recreation or respawn.
+    this._codexRestoreGuard = undefined;
+    // The route has already fsynced the uncertainty fence while preserving its
+    // historical submission. Do not replace that fence with a tentative snapshot.
+    this._recoveryUntrackedInput = true;
+    this._recoverySwitchPending = true;
+    this._recoverySubmission = undefined;
+    this._recoveryGeneration++;
+    this._recoveryInputProofTracker.invalidate();
+    this._mux.registerSession(record);
+    return true;
+  }
+
   /** Release tentative protection only after a complete successful restoration commit. */
   commitCodexRestoreLaunch(): void {
     this._codexRestoreWorkerMayExist = false;
+    if (this._muxSession?.codexRestoreUncertain) {
+      this._muxSession.codexRestoreUncertain = false;
+      this._mux?.registerSession(this._muxSession);
+    }
   }
 
   async startInteractive(): Promise<void> {
@@ -3195,7 +3243,7 @@ export class Session extends EventEmitter {
           this._armPaneSettle(true);
         }
       } catch (err) {
-        if (this._codexRestoreGuard) throw err;
+        if (this._codexRestoreGuard || this._codexRestoreWorkerMayExist) throw err;
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;
         this._muxSession = null;

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { RecoveryConfigSchema } from './schema.js';
 import {
   CONTINUATION_PROMPT,
+  hasFreshProcessReady,
   initialRecoveryState,
   type RecoveryConfig,
   type RecoveryEvent,
@@ -13,6 +14,7 @@ import {
 } from './types.js';
 
 export interface RecoveryDependencies {
+  acceptReservation?(key: string): Promise<boolean>;
   resetReservation?(): Promise<void>;
   /** Shared task ownership may revoke authority while a delivery reservation is saving. */
   hasActionAuthority?(): boolean;
@@ -125,13 +127,19 @@ export class RecoveryController {
   /** Cancel scheduled actions on ANY user input; an Escape is not an invitation to restart. */
   noteUserInput(): void {
     const canceledScheduledAction = !!this.state.pending || this.state.nextRetryAt !== undefined;
+    const dismissedStall =
+      this.state.lastReason === 'stalled' &&
+      this.state.needsAttention &&
+      !this.state.inFlight &&
+      !this.state.circuitOpen;
     this.revision++;
     this.confirmation = undefined;
     this.state.armedAt = this.now();
     this.state.pending = undefined;
     this.state.nextRetryAt = undefined;
-    if (canceledScheduledAction && !this.stopped) {
+    if ((canceledScheduledAction || dismissedStall) && !this.stopped) {
       this.state.phase = this.state.config.enabled ? 'watching' : 'idle';
+      if (dismissedStall) this.state.needsAttention = false;
       this.event('state', 'user-input');
       // Keep the input callback synchronous while serializing its cancellation
       // after any already-running observation/reservation save.
@@ -184,6 +192,7 @@ export class RecoveryController {
     this.revision++;
     return this.enqueue(async () => {
       const config = RecoveryConfigSchema.parse({ ...this.state.config, ...patch }) as RecoveryConfig;
+      const hadStall = this.state.lastReason === 'stalled' && this.state.needsAttention;
       const enabledNow = config.enabled && !this.state.config.enabled;
       this.state.config = config;
       if (enabledNow) this.state.armedAt = this.now();
@@ -192,7 +201,14 @@ export class RecoveryController {
         this.state.nextRetryAt = undefined;
         if (!this.state.inFlight) this.state.phase = 'idle';
       }
-      this.event('state', config.enabled ? 'observing' : 'disabled');
+      if (hadStall && (!config.enabled || !config.detectStalls) && !this.state.inFlight && !this.state.circuitOpen) {
+        this.state.needsAttention = false;
+        this.state.phase = config.enabled ? 'watching' : 'idle';
+      }
+      this.event(
+        'state',
+        hadStall && config.enabled && config.detectStalls ? 'stalled' : config.enabled ? 'observing' : 'disabled'
+      );
       await this.save();
       this.arm();
       return this.getStatus();
@@ -259,16 +275,33 @@ export class RecoveryController {
         const flightObservationComplete = this.flightObservationComplete;
         const before = JSON.stringify(retained);
         this.state.activity = observation.activity;
-        this.state.conversationId = observation.conversationId;
+        if (!this.state.inFlight?.accepted) this.state.conversationId = observation.conversationId;
         const hadFlight = !!this.state.inFlight;
         if (hadFlight) this.reconcileFlight(observation);
-        else if (!this.state.pending && !this.state.circuitOpen) this.state.lastReason = observation.reason;
-        if (JSON.stringify(this.state) !== before) {
+        else if (!this.state.pending && !this.state.circuitOpen) {
+          const hadStall = this.state.lastReason === 'stalled' && this.state.needsAttention;
+          if (hadStall && this.isStalled(observation)) {
+            this.state.phase = 'paused';
+            this.state.needsAttention = true;
+          } else {
+            if (hadStall) {
+              const uncertain = ['blocked', 'paused', 'unknown', 'interrupted', 'crashed'].includes(
+                observation.activity
+              );
+              this.state.phase = uncertain ? 'paused' : observation.activity === 'completed' ? 'completed' : 'watching';
+              this.state.needsAttention = uncertain && this.state.config.enabled;
+            }
+            this.state.lastReason = observation.reason;
+          }
+        }
+        if (this.state.inFlight?.accepted || JSON.stringify(this.state) !== before) {
           if (!(await this.save({ state: retained, revision }))) {
             // A read still reports the durable uncertainty and persistence veto.
             // Mutation/action callers keep the throwing save contract.
             this.restoredFlight = restoredFlight;
             this.flightObservationComplete = flightObservationComplete;
+          } else if (!this.stopped && revision === this.revision && this.state.inFlight?.accepted) {
+            await this.settleAcceptedFlight(revision, true);
           }
         }
         return this.getStatus();
@@ -294,21 +327,22 @@ export class RecoveryController {
   /** Reconcile only a known durable delivery reservation; this never authorizes an action. */
   private reconcileFlight(observation: RecoveryObservation): void {
     const flight = this.state.inFlight;
-    if (!flight) return;
+    if (!flight || flight.accepted) return;
     const sameThread = observation.conversationId === flight.conversationId;
     const accepted =
       sameThread &&
       (flight.action === 'restart'
-        ? observation.processReady === true
+        ? hasFreshProcessReady(observation, flight.startedAt, this.now())
         : observation.submissionHash === promptHash &&
           !!observation.submissionKey &&
           observation.submissionKey !== flight.previousSubmissionKey);
     if (accepted) {
       this.handled(flight.key);
-      this.state.inFlight = undefined;
+      flight.accepted = true;
+      flight.acceptedAt = this.now();
       this.restoredFlight = false;
       this.flightObservationComplete = true;
-      this.state.lastSuccessfulRecovery = this.now();
+      this.state.lastSuccessfulRecovery = flight.acceptedAt;
       this.state.needsAttention = false;
       this.state.phase = 'watching';
       this.event('accepted', 'recovery-accepted');
@@ -321,11 +355,43 @@ export class RecoveryController {
     }
   }
 
+  private async settleAcceptedFlight(revision: number, readOnly = false): Promise<boolean> {
+    const flight = this.state.inFlight;
+    if (!flight?.accepted) return false;
+    const accepted = this.getStatus();
+    try {
+      if (this.deps.acceptReservation && !(await this.deps.acceptReservation(flight.key))) return false;
+    } catch {
+      this.block('persistence-failed', true);
+      this.deps.changed(this.getStatus());
+      if (!readOnly) throw new Error('Recovery reservation could not be released');
+      return false;
+    }
+    this.state.inFlight = undefined;
+    // Preserve the durable acceptance proof if the domain deletion write fails.
+    return this.save({ state: accepted, revision });
+  }
+
   private recoveryWindowExpired(): boolean {
     const origin = this.state.windowStartedAt;
     if (origin === undefined) return false;
     const elapsed = this.now() - origin;
     return !Number.isFinite(origin) || origin < 0 || elapsed < 0 || elapsed >= this.state.config.maxRecoveryDurationMs;
+  }
+
+  private isStalled(observation: RecoveryObservation): boolean {
+    const progressAt = observation.progressAt ?? observation.at;
+    const quietSince = Math.max(progressAt, this.state.armedAt ?? 0);
+    return (
+      this.state.config.detectStalls &&
+      observation.activity === 'working' &&
+      observation.reason === 'turn-running' &&
+      Number.isFinite(progressAt) &&
+      progressAt >= 0 &&
+      Number.isFinite(quietSince) &&
+      quietSince >= 0 &&
+      this.now() - quietSince >= this.state.config.stalledAfterMs
+    );
   }
 
   private async evaluate(manual: boolean): Promise<void> {
@@ -340,14 +406,16 @@ export class RecoveryController {
     }
     if (this.stopped || revision !== this.revision) return;
     this.state.activity = observation.activity;
-    this.state.conversationId = observation.conversationId;
+    if (!this.state.inFlight?.accepted) this.state.conversationId = observation.conversationId;
 
     if (this.state.inFlight) {
+      const retained = this.getStatus();
       this.reconcileFlight(observation);
-      if (this.state.inFlight) {
-        if (JSON.stringify(this.state) !== before) await this.save();
-        return;
-      }
+      if (this.state.inFlight?.accepted) {
+        if (!(await this.save({ state: retained, revision }))) return;
+        if (!this.stopped && revision === this.revision) await this.settleAcceptedFlight(revision);
+      } else if (JSON.stringify(this.state) !== before) await this.save();
+      return;
     }
 
     if (!manual && !this.state.config.enabled) {
@@ -388,12 +456,11 @@ export class RecoveryController {
           this.state.needsAttention = false;
         }
       }
-      if (
-        this.state.config.detectStalls &&
-        observation.activity === 'working' &&
-        this.now() - (observation.progressAt ?? observation.at) >= this.state.config.stalledAfterMs
-      ) {
-        if (this.state.lastReason !== 'stalled') this.block('stalled');
+      if (this.isStalled(observation)) {
+        // State retention is independent of deduplicating attention events.
+        this.state.phase = 'paused';
+        this.state.needsAttention = true;
+        if (this.state.lastReason !== 'stalled') this.event('attention', 'stalled');
       } else if (this.state.lastReason !== observation.reason) this.event('state', observation.reason);
       if (JSON.stringify(this.state) !== before) await this.save();
       return;

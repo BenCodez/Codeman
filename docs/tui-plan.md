@@ -15,11 +15,11 @@ The goal: replace Codeman's scattered terminal surfaces with one first-class TUI
 
 Three disconnected surfaces, three visual idioms, two data sources:
 
-| Surface | What it is | Data source | Idiom |
-| --- | --- | --- | --- |
-| `codeman` CLI (`src/cli.ts`, 1214 lines) | commander + chalk, ~20 commands | HTTP API + state files | `✓`/`✗` line-per-fact, no interactivity |
-| `sc` (`scripts/tmux-chooser.sh`, 663 lines) | bash number-menu chooser, mobile-tuned (44 cols) | `tmux -L codeman` + `state.json` via jq | 256-color, numbered, full repaint per key |
-| `scripts/tmux-manager.sh` (529 lines) | bash cursor TUI with kill/info | `mux-sessions.json` (and writes it back) | 8-color, box-drawn, arrow keys |
+| Surface                                     | What it is                                       | Data source                              | Idiom                                     |
+| ------------------------------------------- | ------------------------------------------------ | ---------------------------------------- | ----------------------------------------- |
+| `codeman` CLI (`src/cli.ts`, 1214 lines)    | commander + chalk, ~20 commands                  | HTTP API + state files                   | `✓`/`✗` line-per-fact, no interactivity   |
+| `sc` (`scripts/tmux-chooser.sh`, 663 lines) | bash number-menu chooser, mobile-tuned (44 cols) | `tmux -L codeman` + `state.json` via jq  | 256-color, numbered, full repaint per key |
+| `scripts/tmux-manager.sh` (529 lines)       | bash cursor TUI with kill/info                   | `mux-sessions.json` (and writes it back) | 8-color, box-drawn, arrow keys            |
 
 Weaknesses found in the audit (file:line refs verified 2026-08-16):
 
@@ -92,13 +92,13 @@ One command, one full-screen client of the existing HTTP/SSE API.
 
 Exactly the web's language so the two surfaces read the same:
 
-| Group | Glyph | Color | Source |
-| --- | --- | --- | --- |
-| NEEDS YOU (question/permission) | `⚠` | red, blinking row | approvals inbox / `permission_prompt` |
-| NEEDS YOU (waiting for input) | `✋` | yellow | `idle_prompt` / waiting classification |
-| WORKING | `✻` animating through `· ✢ ✳ ∗ ✻ ✽` at 2Hz | green | working classification (the same glyph family Claude itself draws, a deliberate nod) |
-| IDLE | `○` | muted | idle |
-| RECENT / done | `✔` | muted green | unified list history rows |
+| Group                           | Glyph                                      | Color             | Source                                                                               |
+| ------------------------------- | ------------------------------------------ | ----------------- | ------------------------------------------------------------------------------------ |
+| NEEDS YOU (question/permission) | `⚠`                                        | red, blinking row | approvals inbox / `permission_prompt`                                                |
+| NEEDS YOU (waiting for input)   | `✋`                                       | yellow            | `idle_prompt` / waiting classification                                               |
+| WORKING                         | `✻` animating through `· ✢ ✳ ∗ ✻ ✽` at 2Hz | green             | working classification (the same glyph family Claude itself draws, a deliberate nod) |
+| IDLE                            | `○`                                        | muted             | idle                                                                                 |
+| RECENT / done                   | `✔`                                        | muted green       | unified list history rows                                                            |
 
 Nerd-font/glyph fallback exactly like `sc` does today (`[!] [w] [*] [-] [ok]` when the terminal is not known-capable), plus full NO_COLOR / `tput colors` degradation (8-color and mono renderings are designed, not accidental).
 
@@ -130,7 +130,7 @@ While the TUI is open and a session flips to NEEDS YOU: flash the row, ring BEL,
 
 ### Degraded mode (server down)
 
-`sc` works without the server today and the TUI must too: when no server answers, enumerate `tmux -L codeman list-sessions` + read `state.json` (read-only), show a "server not running" header line, and offer attach only (no states, no approvals). This keeps the "web server crashed, get me to my sessions" path alive.
+When no server answers, enumerate `tmux -L codeman list-sessions` + read `state.json` (read-only), show a "server not running" header line, and offer attach only for sessions that do not require a Codex input fence (no states, no approvals). Codex attachment requires the authenticated direct-attach fence endpoint to acknowledge its durable write before stdin reaches tmux. If that endpoint is unreachable, authentication fails, or the write fails, refuse attachment, including a non-Codex target whose attach strip could switch to a Codex pane. This preserves degraded attachment for eligible sessions while keeping Codex recovery identity safe.
 
 ## 4. Architecture
 
@@ -152,17 +152,17 @@ identity evidence.
 
 Everything live comes from the API the web UI already uses:
 
-| Need | Endpoint |
-| --- | --- |
-| Session list + history | `GET /api/sessions/unified` |
-| Live updates | SSE `GET /api/events` (heartbeat `sse:heartbeat` already exists; fall back to 2s polling) |
-| Pending approvals + parsed options | `GET /api/approvals`, answer via `POST /api/approvals/:id/answer` |
-| Preview tail | `GET /api/sessions/:id/terminal?tail=N` (throttled to the selected session only) |
-| Prompt send | `POST /api/sessions/:id/input` (single line + `\r`, per the composer contract) |
-| New session | `POST /api/quick-start` (routes remote/docker cases correctly) |
-| Search | `GET /api/search` |
-| Away digest | `GET /api/away-digest` |
-| Plan usage chip | latest status-telemetry snapshot (`plan-usage-latest`) |
+| Need                               | Endpoint                                                                                  |
+| ---------------------------------- | ----------------------------------------------------------------------------------------- |
+| Session list + history             | `GET /api/sessions/unified`                                                               |
+| Live updates                       | SSE `GET /api/events` (heartbeat `sse:heartbeat` already exists; fall back to 2s polling) |
+| Pending approvals + parsed options | `GET /api/approvals`, answer via `POST /api/approvals/:id/answer`                         |
+| Preview tail                       | `GET /api/sessions/:id/terminal?tail=N` (throttled to the selected session only)          |
+| Prompt send                        | `POST /api/sessions/:id/input` (single line + `\r`, per the composer contract)            |
+| New session                        | `POST /api/quick-start` (routes remote/docker cases correctly)                            |
+| Search                             | `GET /api/search`                                                                         |
+| Away digest                        | `GET /api/away-digest`                                                                    |
+| Plan usage chip                    | latest status-telemetry snapshot (`plan-usage-latest`)                                    |
 
 Server discovery and auth reuse what exists: instance config from `src/config/instance.ts` (`CODEMAN_INSTANCE`, `CODEMAN_PORT`), the probe logic from `daemon-control.ts`, credentials from `~/.codeman/.env` (the established `codeman attach` pattern), self-signed HTTPS accepted for loopback probes (the hooks-on-HTTPS lesson). Multi-user scoping comes free: the API only returns what the authenticated user owns.
 
@@ -197,13 +197,13 @@ A shared style kit, `src/cli-style.ts`: one palette (mirroring the web's status 
 
 ## 6. Phasing
 
-| Phase | Contents | Size |
-| --- | --- | --- |
-| 0 | `cli-style.ts` + mechanical fixes (§5), real CLI tests (retire the fixture parser in `test/cli-commands.test.ts`) | S |
-| 1 | `codeman tui` core: list + states via SSE, cursor + 1-9, attach/return loop, kill w/ confirm, new session, narrow mode, degraded mode, `sc` alias flip + `--list`/`<n>` parity | M/L |
-| 2 | Preview pane (SGR clip), approvals answering, prompt composer, search, digest, resume, plan-usage header | M |
-| 3 | Mouse support, `--pick` popup switcher + tmux binding, opt-in attach status line, BEL/OSC 9 notifications | M |
-| 4 | Retire `tmux-chooser.sh`/fold `tmux-manager.sh` (keep as thin wrappers for one release), docs/README/wiki, screenshots for promo | S |
+| Phase | Contents                                                                                                                                                                       | Size |
+| ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---- |
+| 0     | `cli-style.ts` + mechanical fixes (§5), real CLI tests (retire the fixture parser in `test/cli-commands.test.ts`)                                                              | S    |
+| 1     | `codeman tui` core: list + states via SSE, cursor + 1-9, attach/return loop, kill w/ confirm, new session, narrow mode, degraded mode, `sc` alias flip + `--list`/`<n>` parity | M/L  |
+| 2     | Preview pane (SGR clip), approvals answering, prompt composer, search, digest, resume, plan-usage header                                                                       | M    |
+| 3     | Mouse support, `--pick` popup switcher + tmux binding, opt-in attach status line, BEL/OSC 9 notifications                                                                      | M    |
+| 4     | Retire `tmux-chooser.sh`/fold `tmux-manager.sh` (keep as thin wrappers for one release), docs/README/wiki, screenshots for promo                                               | S    |
 
 Phases 0-1 are the useful minimum; 2 is where it beats herdr's sidebar (answering approvals from the dashboard); 3 is delight.
 

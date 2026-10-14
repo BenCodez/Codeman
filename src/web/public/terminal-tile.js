@@ -337,7 +337,12 @@
         // markers intact. Mirrors terminal-ui.js's own Ctrl+V gate; without it
         // xterm's default only ever pasted text.
         if ((ev.ctrlKey || ev.metaKey) && ev.key === 'v' && ev.type === 'keydown') {
-          global.app?._handleImagePaste?.({ terminal: this.terminal, sessionId: this.sessionId });
+          const terminal = this.terminal;
+          global.app?._handleImagePaste?.({
+            terminal,
+            sessionId: this.sessionId,
+            isCurrent: () => this.terminal === terminal,
+          });
           return false;
         }
         // Ctrl+Z (SIGTSTP/job-control suspend), as terminal-ui.js swallows it:

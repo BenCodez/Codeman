@@ -9,13 +9,14 @@ import {
   type TaskProgress,
 } from './schema.js';
 import { commandHash, type CommandSuccessEvidence } from './evidence.js';
-import { CONTINUATION_PROMPT, type RecoveryObservation } from '../recovery/types.js';
+import { CONTINUATION_PROMPT, hasFreshProcessReady, type RecoveryObservation } from '../recovery/types.js';
 export interface TaskObservation {
   observation: RecoveryObservation;
   commands: Map<string, CommandSuccessEvidence>;
   marker?: { key: string; progress: unknown; at: number; submissionKey?: string };
 }
 export interface TaskDependencies {
+  acceptReservation?(key: string): Promise<boolean>;
   resetReservation?(): Promise<void>;
   observe(): Promise<TaskObservation>;
   recover?(observation: RecoveryObservation, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
@@ -217,18 +218,35 @@ export class TaskController {
     this.state.submissionKey = newPrompt ? undefined : (observation.submissionKey ?? this.state.submissionKey);
     if (marker) this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
   }
-  /** Clear only a delivery whose exact prompt is visible under a new submission identity. */
+  /** Mark exact acceptance before releasing the common or domain reservation. */
   private reconcileAcceptedFlight(state: TaskState, observation: RecoveryObservation): boolean {
     const flight = state.inFlight;
-    if (
-      !flight?.promptHash ||
-      observation.submissionHash !== flight.promptHash ||
-      !observation.submissionKey ||
-      observation.submissionKey === flight.previousSubmissionKey
-    )
-      return false;
-    state.submissionKey = observation.submissionKey;
-    delete state.inFlight;
+    if (flight?.accepted) return true;
+    if (!flight || !state.conversationId || observation.conversationId !== state.conversationId) return false;
+    const accepted =
+      flight.action === 'restart'
+        ? hasFreshProcessReady(observation, flight.startedAt, this.now())
+        : !!flight.promptHash &&
+          observation.submissionHash === flight.promptHash &&
+          !!observation.submissionKey &&
+          observation.submissionKey !== flight.previousSubmissionKey;
+    if (!accepted) return false;
+    if (observation.submissionKey) state.submissionKey = observation.submissionKey;
+    flight.action ??= 'continue';
+    flight.accepted = true;
+    flight.acceptedAt = this.now();
+    return true;
+  }
+  private async settleAcceptedFlight(): Promise<boolean> {
+    const flight = this.state.inFlight;
+    if (!flight?.accepted) return false;
+    // The accepted flag must already be durable before the common reservation clears.
+    if (this.lastPersisted.inFlight?.key !== flight.key || !this.lastPersisted.inFlight.accepted)
+      await this.save('continuation-accepted');
+    if (this.deps.acceptReservation && !(await this.deps.acceptReservation(flight.key))) return false;
+    delete this.state.inFlight;
+    // A failed deletion write restores the durable accepted flight for cleanup on retry/reload.
+    await this.save('continuation-accepted');
     return true;
   }
   private requireCurrent(revision: number): void {
@@ -335,7 +353,8 @@ export class TaskController {
       if (patch.outcome === 'completed' && (!candidate.criteria.length || !candidate.criteria.every((c) => c.verified)))
         throw new TaskValidationError('Acceptance criteria remain unverified');
       if (patch.outcome === 'unfinished' || patch.outcome === 'completed') delete candidate.agentProgressVeto;
-      candidate.submissionKey = observation.submissionKey;
+      const acceptedFlight = candidate.inFlight?.accepted;
+      if (!acceptedFlight) candidate.submissionKey = observation.submissionKey;
       this.state = candidate;
       this.state.lastProgressAt = this.now();
       this.state.outcome = acceptanceCriteriaComplete(this.state) ? 'completed' : patch.outcome;
@@ -349,9 +368,21 @@ export class TaskController {
             : patch.outcome === 'blocked'
               ? 'blocked'
               : 'paused';
-      const result = await this.save('progress-recorded');
+      await this.save('progress-recorded');
+      if (this.state.inFlight?.accepted) {
+        const settled = await this.settleAcceptedFlight();
+        if (
+          settled &&
+          !this.stopped &&
+          revision === this.revision &&
+          this.state.submissionKey !== observation.submissionKey
+        ) {
+          this.state.submissionKey = observation.submissionKey;
+          await this.save('progress-recorded');
+        }
+      }
       this.arm();
-      return result;
+      return this.getStatus();
     });
   }
   pause(): Promise<TaskState> {
@@ -416,6 +447,7 @@ export class TaskController {
       this.state.inFlight = {
         key,
         startedAt: this.now(),
+        action: 'continue',
         promptHash: createHash('sha256').update(this.prompt().trim()).digest('hex'),
         previousSubmissionKey: o.submissionKey,
       };
@@ -506,11 +538,12 @@ export class TaskController {
         return this.save('identity-changed');
       }
       if (o.conversationId) this.state.conversationId = o.conversationId;
-      if (this.state.inFlight?.promptHash) {
+      if (this.state.inFlight) {
         const flight = this.state.inFlight;
         if (this.reconcileAcceptedFlight(this.state, o)) {
           await this.save('continuation-accepted');
-          if (this.stopped || revision !== this.revision) return this.getStatus();
+          if (!(await this.settleAcceptedFlight()) || this.stopped || revision !== this.revision)
+            return this.getStatus();
         } else if (['paused', 'blocked', 'unknown'].includes(o.activity) || this.now() - flight.startedAt >= 60000) {
           this.state.phase = o.activity === 'blocked' ? 'blocked' : 'paused';
           return this.save('acceptance-unverified');
@@ -579,8 +612,13 @@ export class TaskController {
         o.safeToAct &&
         o.at >= (this.state.startedAt ?? 0) &&
         (o.activity !== 'crashed' ||
-          o.liveProofAt === undefined ||
-          (Number.isFinite(o.liveProofAt) && o.liveProofAt >= (this.state.startedAt ?? 0) && o.liveProofAt <= o.at)) &&
+          (typeof o.liveProofAt === 'number' &&
+            Number.isFinite(o.liveProofAt) &&
+            o.liveProofAt >= (this.state.startedAt ?? 0) &&
+            o.liveProofAt <= o.at &&
+            o.liveProofAt <= this.now() &&
+            o.at - o.liveProofAt <= 30_000 &&
+            this.now() - o.liveProofAt <= 30_000)) &&
         o.evidenceKey &&
         (this.state.outcome === 'unfinished' || (this.state.outcome === 'unknown' && o.activity === 'crashed'))
       ) {
@@ -593,6 +631,7 @@ export class TaskController {
           this.state.inFlight = {
             key: o.evidenceKey,
             startedAt: reservationAt,
+            action: o.activity === 'crashed' ? 'restart' : 'continue',
             ...(o.activity === 'interrupted'
               ? {
                   promptHash: createHash('sha256').update(CONTINUATION_PROMPT.trim()).digest('hex'),
@@ -654,6 +693,7 @@ export class TaskController {
       this.state.inFlight = {
         key,
         startedAt: this.now(),
+        action: 'continue',
         promptHash: createHash('sha256').update(this.prompt().trim()).digest('hex'),
         previousSubmissionKey: o.submissionKey,
       };

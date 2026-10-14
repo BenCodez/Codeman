@@ -79,7 +79,12 @@ const StateSchema = z
     lastReason: ReasonSchema,
     circuitOpen: z.boolean(),
     needsAttention: z.boolean(),
-    inFlight: Pending.extend({ startedAt: Stamp, previousSubmissionKey: z.string().max(100).optional() }).optional(),
+    inFlight: Pending.extend({
+      startedAt: Stamp,
+      previousSubmissionKey: z.string().max(100).optional(),
+      accepted: z.boolean().optional(),
+      acceptedAt: Stamp.optional(),
+    }).optional(),
     pending: Pending.optional(),
     handledEvidence: z.array(Evidence).max(32),
     history: z
@@ -95,7 +100,24 @@ const StateSchema = z
       )
       .max(100),
   })
-  .strict();
+  .strict()
+  .refine(
+    (state) => {
+      const flight = state.inFlight;
+      if (!flight?.accepted) return true;
+      return (
+        state.conversationId === flight.conversationId &&
+        flight.acceptedAt !== undefined &&
+        flight.acceptedAt >= flight.startedAt &&
+        state.lastSuccessfulRecovery === flight.acceptedAt &&
+        state.handledEvidence.includes(flight.key) &&
+        state.history.some(
+          (event) => event.kind === 'accepted' && event.reason === 'recovery-accepted' && event.at >= flight.startedAt
+        )
+      );
+    },
+    { message: 'Accepted delivery evidence is incomplete', path: ['inFlight'] }
+  );
 
 export class RecoveryStore {
   private records: Record<string, RecoveryState> = {};

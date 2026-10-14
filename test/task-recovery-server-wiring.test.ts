@@ -189,6 +189,7 @@ describe('task and recovery server action wiring', () => {
 
     const crash = {
       activity: 'crashed' as const,
+      liveProofAt: Date.now(),
       reason: 'process-crashed' as const,
       at: Date.now() + 1000,
       conversationId: flight.conversationId,

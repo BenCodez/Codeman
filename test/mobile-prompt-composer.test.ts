@@ -102,6 +102,33 @@ function mountComposeButton(bar: any, document: Document): HTMLButtonElement {
 }
 
 describe('mobile prompt composer', () => {
+  it('opens the native multiline draft composer for agent pasting and preserves a cancelled draft', () => {
+    const { app, bar, document } = loadComposer();
+    bar.pasteFromClipboard();
+    const input = document.querySelector('.prompt-composer-textarea') as HTMLTextAreaElement;
+    expect(input).not.toBeNull();
+    input.value = '  α\n🙂\nlast line  ';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+    (document.querySelector('.paste-cancel') as HTMLButtonElement).click();
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    bar.pasteFromClipboard();
+    expect((document.querySelector('.prompt-composer-textarea') as HTMLTextAreaElement).value).toBe(input.value);
+  });
+
+  it('pins shell paste and its delayed Enter to the original session across a tab switch', () => {
+    const { app, bar, document, runTimers } = loadComposer();
+    app.sessions.set('session-1', { mode: 'shell' });
+    bar.pasteFromClipboard();
+    (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = 'fixture command';
+    app.activeSessionId = 'session-2';
+    (document.querySelector('.paste-send') as HTMLButtonElement).click();
+    runTimers();
+    expect(app._sendInputAsync.mock.calls).toEqual([
+      ['session-1', 'fixture command', { useMux: true }],
+      ['session-1', '\r', { useMux: true }],
+    ]);
+  });
+
   beforeEach(() => vi.restoreAllMocks());
 
   it('replaces Paste with Compose on agent bars while shell keeps direct Paste', () => {
@@ -347,32 +374,35 @@ describe('mobile prompt composer', () => {
     expect(textarea(document).value).toBe('keep this; then continue');
   });
 
-  it('uploads images without writing into the PTY and inserts their paths into the draft', async () => {
-    const { app, bar, document } = loadComposer();
-    let finishUpload!: (paths: string[]) => void;
-    app._uploadAndInsertImages.mockImplementation(
-      () => new Promise<string[]>((resolveUpload) => (finishUpload = resolveUpload))
-    );
-    bar.composePrompt();
-    const input = textarea(document);
-    input.value = 'review';
-    input.selectionStart = input.selectionEnd = input.value.length;
-    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
-    const fileInput = document.querySelector('.paste-file-input') as HTMLInputElement;
-    const image = new document.defaultView!.File(['image'], 'shot.png', { type: 'image/png' });
-    Object.defineProperty(fileInput, 'files', { configurable: true, value: [image] });
+  it.each([false, true])(
+    'pins image upload and draft insertion to the composer session (tab switch=%s)',
+    async (switchTab) => {
+      const { app, bar, document } = loadComposer();
+      let finishUpload!: (paths: string[]) => void;
+      app._uploadAndInsertImages.mockImplementation(
+        () => new Promise<string[]>((resolveUpload) => (finishUpload = resolveUpload))
+      );
+      bar.composePrompt();
+      const input = textarea(document);
+      input.value = 'review';
+      input.selectionStart = input.selectionEnd = input.value.length;
+      input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+      const fileInput = document.querySelector('.paste-file-input') as HTMLInputElement;
+      const image = new document.defaultView!.File(['image'], 'shot.png', { type: 'image/png' });
+      Object.defineProperty(fileInput, 'files', { configurable: true, value: [image] });
+      if (switchTab) app.activeSessionId = 'session-2';
+      fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
+      expect((document.querySelector('.paste-image') as HTMLButtonElement).disabled).toBe(true);
+      expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(true);
+      finishUpload(['/tmp/image-one.png']);
+      await vi.waitFor(() => expect(input.value).toBe('review /tmp/image-one.png'));
 
-    fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
-    expect((document.querySelector('.paste-image') as HTMLButtonElement).disabled).toBe(true);
-    expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(true);
-    finishUpload(['/tmp/image-one.png']);
-    await vi.waitFor(() => expect(input.value).toBe('review /tmp/image-one.png'));
-
-    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([image], { insert: false });
-    expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(false);
-    expect(app.terminal.paste).not.toHaveBeenCalled();
-    expect(app._sendInputAsync).not.toHaveBeenCalled();
-  });
+      expect(app._uploadAndInsertImages).toHaveBeenCalledWith([image], { sessionId: 'session-1', insert: false });
+      expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(false);
+      expect(app.terminal.paste).not.toHaveBeenCalled();
+      expect(app._sendInputAsync).not.toHaveBeenCalled();
+    }
+  );
 
   it('finishes an upload into a reopened composer without restoring a deleted session draft', async () => {
     const { app, bar, document } = loadComposer();

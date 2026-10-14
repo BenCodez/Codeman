@@ -131,6 +131,96 @@ function fixture() {
   return Object.assign(state, { session, adapter, persist });
 }
 
+describe('fresh process readiness provenance', () => {
+  it.each([
+    'ready',
+    'missing-id',
+    'missing-pid',
+    'dead',
+    'blank-screen',
+    'truncated',
+    'bounded-delay',
+    'expired-delay',
+    'backward',
+  ] as const)('keeps current live readiness separate from historical rollout time: %s', async (change) => {
+    const f = fixture();
+    f.identity.tail = completedTail();
+    f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 1234 };
+    if (change === 'missing-id') delete f.pane.paneId;
+    if (change === 'missing-pid') delete f.pane.panePid;
+    if (change === 'dead') f.pane = { dead: true, screen: null, status: 1, paneId: '%7', panePid: 1234 };
+    if (change === 'blank-screen') f.pane.screen = '';
+    if (change === 'truncated') f.identity.tailTruncated = true;
+    if (['bounded-delay', 'expired-delay', 'backward'].includes(change)) {
+      resolver.mockImplementation(async () => {
+        vi.setSystemTime(NOW + (change === 'bounded-delay' ? 30000 : change === 'expired-delay' ? 30001 : -1));
+        return structuredClone(f.identity);
+      });
+    }
+    const observation = await f.adapter.observe();
+    if (change === 'ready' || change === 'bounded-delay') {
+      expect(observation).toMatchObject({
+        activity: 'completed',
+        processReady: true,
+        processReadyAt: NOW,
+        at: NOW - 9000,
+      });
+    } else expect(observation.processReadyAt).toBeUndefined();
+  });
+});
+
+describe('bounded live-pane provenance', () => {
+  it.each([
+    'observed',
+    'first-dead',
+    'missing-id',
+    'changed-id',
+    'changed-pid',
+    'generation',
+    'configuration',
+    'expired',
+    'backward',
+    'unknown-between',
+  ] as const)('binds crash live proof to a recent matching native observation (%s)', async (change) => {
+    const f = fixture();
+    f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 1234 };
+    f.identity.tail = completedTail();
+    if (change === 'missing-id') delete f.pane.paneId;
+    if (change !== 'first-dead') await f.adapter.observe();
+    if (change === 'unknown-between') {
+      f.pane = null;
+      await f.adapter.observe();
+    }
+    const now = change === 'expired' ? NOW + 31_000 : change === 'backward' ? NOW - 1 : NOW + 1000;
+    vi.setSystemTime(now);
+    f.pane = {
+      dead: true,
+      status: 1,
+      screen: null,
+      paneId: change === 'changed-id' ? '%8' : '%7',
+      panePid: change === 'changed-pid' ? 1235 : 1234,
+    };
+    f.session.paneExit = { at: now, status: 1 };
+    f.identity.tail = failedTail();
+    if (change === 'generation') f.context.generation++;
+    if (change === 'configuration')
+      f.session.codexConfig = { ...f.session.codexConfig, model: 'different-fixture-model' };
+    const observation = await f.adapter.observe();
+    expect(observation.activity).toBe('crashed');
+    if (change === 'observed') {
+      expect(observation.liveProofAt).toBe(NOW);
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(true);
+      await f.adapter.observe();
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(true);
+      vi.setSystemTime(NOW + 31_001);
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(false);
+    } else {
+      expect(observation.liveProofAt).toBeUndefined();
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(false);
+    }
+  });
+});
+
 async function withRollout(
   body: string,
   check: (f: ReturnType<typeof fixture>, writeBody: (nextBody: string) => Promise<void>) => Promise<void>

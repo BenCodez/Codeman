@@ -290,4 +290,54 @@ describe('Shift/Ctrl+Enter through the shipped key handlers (keypress must be sw
       });
     }
   });
+  it.each(['unchanged', 'tab-switch'] as const)(
+    'pastes multiline Codex text once after replay and cancels a changed target: %s',
+    async (target) => {
+      const result = await page.evaluate(
+        async ({ id, target }) => {
+          const w = window as any;
+          const app = w.app;
+          const previous = {
+            id: app.activeSessionId,
+            echo: app._localEchoEnabled,
+            send: app._sendInputAsync,
+            session: app.sessions.get(id),
+          };
+          const chunks: string[] = [];
+          app.activeSessionId = id;
+          app.sessions.set(id, { mode: 'codex' });
+          app._localEchoEnabled = false;
+          app._pendingInput = '';
+          app._sendInputAsync = (_sid: string, data: string) => chunks.push(data);
+          try {
+            await new Promise<void>((resolve) => app.terminal.write('\x1b[?2004l', resolve));
+            app._handleImagePaste();
+            const trap = document.activeElement as HTMLElement;
+            if (target === 'tab-switch') app.activeSessionId = 'different-paste-target';
+            const clipboard = new DataTransfer();
+            clipboard.setData('text/plain', '  α\r\n🙂\n終  ');
+            trap.dispatchEvent(
+              new ClipboardEvent('paste', { clipboardData: clipboard, bubbles: true, cancelable: true })
+            );
+            trap.dispatchEvent(
+              new ClipboardEvent('paste', { clipboardData: clipboard, bubbles: true, cancelable: true })
+            );
+            await new Promise((resolve) => setTimeout(resolve, 150));
+            return { chunks, removed: !trap.isConnected };
+          } finally {
+            app._activePasteCleanup?.();
+            app.activeSessionId = previous.id;
+            app._localEchoEnabled = previous.echo;
+            app._sendInputAsync = previous.send;
+            app._pendingInput = '';
+            if (previous.session) app.sessions.set(id, previous.session);
+            else app.sessions.delete(id);
+          }
+        },
+        { id: MAIN_ID, target }
+      );
+      expect(result.removed).toBe(true);
+      expect(result.chunks.join('')).toBe(target === 'unchanged' ? '\x1b[200~  α\r🙂\r終  \x1b[201~' : '');
+    }
+  );
 });

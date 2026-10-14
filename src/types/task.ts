@@ -109,6 +109,9 @@ export interface SupervisionTaskState {
     key: string;
     startedAt: number;
     promptHash?: string;
+    action?: 'continue' | 'restart';
+    accepted?: boolean;
+    acceptedAt?: number;
     previousSubmissionKey?: string;
   };
   handledEvidence: string[];
