@@ -580,6 +580,121 @@ describe('recovery action authority', () => {
     }
   );
 
+  it('recovers successive independently confirmed deaths in one turn without resetting the durable retry budget', async () => {
+    let f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000, maxRetries: 2 }));
+    const firstProgress = NOW - 20_000;
+    f.observation = stalled('same-unfinished-turn', true);
+    await f.controller.retry();
+    advance(2000);
+    await f.controller.retry();
+    expect(f.act).toHaveBeenCalledOnce();
+    expect(f.controller.getStatus().inFlight).toMatchObject({
+      key: 'same-unfinished-turn',
+      stallProgressAt: firstProgress,
+    });
+    f.observation = { ...stalled('same-unfinished-turn'), processReady: true };
+    await f.controller.inspect();
+    expect(f.controller.getStatus().handledEvidence[0]).toMatch(/^stall:[a-f0-9]{64}:/);
+    const accepted = f.controller.getStatus();
+    f.controller.stop();
+    f = fixture(accepted);
+    // Time passing and a repeated old proof cannot create another recovery cycle.
+    advance(20_000);
+    f.observation = stalled('same-unfinished-turn', true);
+    await f.controller.retry();
+    advance(2000);
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+    // Actual structured progress after acceptance gives the same turn a new baseline.
+    const secondProgress = Date.now();
+    f.observation = { ...stalled('same-unfinished-turn', true), progressAt: secondProgress };
+    await f.controller.retry();
+    advance(9999);
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+    advance(1);
+    await f.controller.retry();
+    advance(1999);
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+    advance(1);
+    await f.controller.retry();
+    expect(f.act).toHaveBeenCalledOnce();
+    expect(f.controller.getStatus()).toMatchObject({
+      attempts: 2,
+      inFlight: { key: 'same-unfinished-turn', stallProgressAt: secondProgress },
+    });
+    f.observation = { ...f.observation, stallRestartable: undefined, processReady: true };
+    await f.controller.inspect();
+    advance(1);
+    const thirdProgress = Date.now();
+    f.observation = { ...f.observation, processReady: undefined, stallRestartable: true, progressAt: thirdProgress };
+    advance(10_000);
+    await f.controller.retry();
+    advance(2000);
+    await f.controller.retry();
+    expect(f.controller.getStatus()).toMatchObject({ circuitOpen: true, lastReason: 'retries-exhausted', attempts: 2 });
+    expect(f.act).toHaveBeenCalledOnce();
+  });
+
+  it.each([undefined, NaN, Infinity, -1, 0, Number.MAX_SAFE_INTEGER + 1, NOW + 1])(
+    'never authorizes a stall restart from invalid structured progress %s',
+    async (progressAt) => {
+      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      f.observation = { ...stalled('bad-progress', true), progressAt };
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([NaN, Infinity, -1, 0, Number.MAX_SAFE_INTEGER + 1, NOW + 10_000])(
+    'rejects inconsistent activity timestamps %s without consuming a stall attempt',
+    async (at) => {
+      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      f.observation = { ...stalled('bad-at', true), at };
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().attempts).toBe(0);
+    }
+  );
+
+  it('retains legacy handled turn and unknown-delivery vetoes despite new structured progress', async () => {
+    for (const restored of [
+      enabledState({ handledEvidence: ['legacy-stall'] }, { detectStalls: true, stalledAfterMs: 10_000 }),
+      enabledState(
+        {
+          handledEvidence: [`stall:${createHash('sha256').update('legacy-stall').digest('hex')}:malformed`],
+          lastSuccessfulRecovery: NOW - 20_000,
+        },
+        { detectStalls: true, stalledAfterMs: 10_000 }
+      ),
+      enabledState(
+        {
+          inFlight: {
+            key: 'legacy-stall',
+            action: 'restart',
+            conversationId: THREAD,
+            startedAt: NOW - 1000,
+            reason: 'stalled',
+            stallProgressAt: NOW - 20_000,
+          },
+        },
+        { detectStalls: true, stalledAfterMs: 10_000 }
+      ),
+    ]) {
+      const f = fixture(restored);
+      f.observation = { ...stalled('legacy-stall', true), progressAt: NOW - 11_000 };
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  });
+
   it('retains a stall warning through inconclusive evidence and clears it on owner input', async () => {
     const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('warning-owner-cancel');
@@ -968,6 +1083,31 @@ describe('recovery action authority', () => {
     });
     expect(f.controller.getStatus().inFlight).toBeUndefined();
     expect(f.act).toHaveBeenCalledTimes(1);
+  });
+
+  it('retains failed read-only flight reconciliation across automatic timers until a later read can commit', async () => {
+    const flight = { key: 'crash-proof', action: 'restart' as const, conversationId: THREAD, startedAt: NOW };
+    const f = fixture({ ...initialRecoveryState(), conversationId: THREAD, inFlight: flight });
+    f.observation = acceptedSubmission({ processReady: true });
+    f.persist.mockRejectedValue(new Error('Disk unavailable'));
+    await expect(f.controller.inspect()).resolves.toMatchObject({
+      inFlight: flight,
+      phase: 'blocked',
+      circuitOpen: true,
+      lastReason: 'persistence-failed',
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.observe).toHaveBeenCalledTimes(1);
+    expect(f.controller.getStatus().inFlight).toEqual(flight);
+    expect(f.changes.every((state) => state.inFlight?.key === flight.key)).toBe(true);
+    expect(f.changes.some((state) => state.history.some((event) => event.kind === 'accepted'))).toBe(false);
+    f.persist.mockImplementation(async (state) => {
+      f.journal.push(structuredClone(state));
+    });
+    await expect(f.controller.inspect()).resolves.toMatchObject({ lastReason: 'recovery-accepted' });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.journal.at(-1)?.inFlight).toBeUndefined();
+    expect(f.act).not.toHaveBeenCalled();
   });
 
   it('bounds disabled in-flight observation at the acceptance timeout', async () => {

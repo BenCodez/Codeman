@@ -45,9 +45,7 @@ describe.each(paths)('bounded uncertain history before %s', (kind) => {
     if (kind === 'inspect') expect(result.effects).toBe('');
     else {
       expect(result.status).toBe('sent');
-      expect(result.effects).toContain(
-        kind === 'input' ? 'send-keys' : kind === 'restart' ? 'respawn-pane' : 'new-session'
-      );
+      expect(result.effects).toContain(kind === 'input' ? 'send-keys' : 'respawn-pane');
     }
   });
 });

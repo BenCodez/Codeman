@@ -692,6 +692,64 @@ describe('authoritative agent exits and process readiness', () => {
     }
   );
 
+  it('recovers two same-turn deaths using fresh progress and raw adapter keys across durable reload', async () => {
+    await withRollout(activeTail(), async (f, writeBody) => {
+      f.pane = { dead: true, status: 9, screen: null };
+      f.session.paneExit = undefined;
+      const store = new RecoveryStore(join(f.context.codexHome!, 'recovery-journal.json'));
+      const dependencies = {
+        observe: () => f.adapter.observe(),
+        act: (reservation: RecoveryFlight, isCurrent: () => boolean) => f.adapter.act(reservation, isCurrent),
+        persist: (state: import('../src/recovery/types.js').RecoveryState) => store.save(SESSION, state),
+        changed: () => {},
+        now: () => Date.now(),
+      };
+      let controller = new RecoveryController(dependencies);
+      try {
+        await controller.updateConfig({ enabled: true, detectStalls: true, stalledAfterMs: 10_000, maxRetries: 2 });
+        await controller.retry();
+        vi.setSystemTime(NOW + 2000);
+        await controller.retry();
+        expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+        const firstKey = controller.getStatus().inFlight!.key;
+        f.pane = { dead: false, screen: READY };
+        await controller.inspect();
+        const accepted = new RecoveryStore(join(f.context.codexHome!, 'recovery-journal.json')).get(SESSION);
+        expect(accepted.attempts).toBe(1);
+        expect(accepted.inFlight).toBeUndefined();
+        controller.stop();
+        controller = new RecoveryController(dependencies, accepted);
+        // The old turn/progress remains deduplicated even after a fresh pane probe.
+        vi.setSystemTime(NOW + 20_000);
+        f.pane = { dead: true, status: 9, screen: null };
+        await controller.retry();
+        vi.setSystemTime(NOW + 22_000);
+        await controller.retry();
+        expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+        const progress = NOW + 22_001;
+        vi.setSystemTime(progress);
+        await writeBody(activeTail() + event({ type: 'exec_command_end', call_id: 'next-progress' }, progress) + '\n');
+        f.pane = { dead: false, screen: READY };
+        await controller.inspect();
+        // Structured progress legitimately exceeds the last activity transition.
+        expect(await f.adapter.observe()).toMatchObject({ at: NOW - 20_000, progressAt: progress });
+        f.pane = { dead: true, status: 9, screen: null };
+        vi.setSystemTime(progress + 10_000);
+        await controller.retry();
+        expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+        vi.setSystemTime(progress + 12_000);
+        await controller.retry();
+        expect(f.session.deliverRecovery).toHaveBeenCalledTimes(2);
+        expect(controller.getStatus()).toMatchObject({
+          attempts: 2,
+          inFlight: { key: firstKey, stallProgressAt: progress },
+        });
+      } finally {
+        controller.stop();
+      }
+    });
+  });
+
   it('vetoes a stall reservation when its final complete lifecycle becomes unknown', async () => {
     await withRollout(activeTail(), async (f, writeBody) => {
       f.pane = { dead: true, status: 9, screen: null };

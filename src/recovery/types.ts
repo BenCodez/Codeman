@@ -117,6 +117,8 @@ export interface RecoveryFlight {
   startedAt: number;
   reason?: RecoveryReason;
   previousSubmissionKey?: string;
+  /** Exact structured silence baseline reserved for this stall recovery cycle. */
+  stallProgressAt?: number;
 }
 
 export interface RecoveryState {

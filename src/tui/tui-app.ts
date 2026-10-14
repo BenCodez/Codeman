@@ -554,13 +554,22 @@ export async function beginAttachHandoff(
   // A killed older TUI may have left Alt jumps outside this tab set. Remove
   // those before fencing: omitting an unsafe target must make it unreachable.
   await client.clearLeakedAttachSwitchKeys();
-  // Alt+1..9 can enter any of these panes after tmux owns stdin. Fence every
-  // reachable Codex target before installing a single switch binding, including
-  // the active target when the dashboard began on a non-Codex row.
+  // A user-owned Alt binding makes its proposed target unreachable. Inspect
+  // availability before fencing so that an untouched worker retains authority.
+  const availableSwitchTargets = new Set<TuiAttachTab>();
+  const unavailableSwitchTargets = new Set<TuiAttachTab>();
+  for (const tab of tabs.slice(0, 9)) {
+    if (!tab.muxName) continue;
+    const bound = await client.readAttachSwitchBinding(`M-${tab.index}`);
+    if (bound !== null && !isAttachSwitchBinding(bound)) unavailableSwitchTargets.add(tab);
+    else availableSwitchTargets.add(tab);
+  }
+  // Fence every reachable Codex target before installing a single switch
+  // binding. The actual primary attach remains reachable even with its key taken.
   const fenced = new Set<string>();
   const unsafeSwitchTargets = new Set<TuiAttachTab>();
-  const reachableTabs = [...tabs.slice(0, 9)];
-  const activeTab = tabs.find((tab) => tab.active);
+  const reachableTabs = [...availableSwitchTargets];
+  const activeTab = tabs.find((tab) => tab.muxName === muxName);
   if (activeTab && !reachableTabs.includes(activeTab)) reachableTabs.push(activeTab);
   for (const tab of reachableTabs) {
     if (!tab.muxName || !tab.requiresDirectAttachFence) continue;
@@ -573,11 +582,13 @@ export async function beginAttachHandoff(
       // The selected target is the attach itself, so it must fail closed. A
       // secondary target can instead be made unreachable by omitting its Alt
       // binding; this preserves a Claude/shell attach when the server is down.
-      if (tab.active) throw error;
+      if (tab === activeTab) throw error;
       unsafeSwitchTargets.add(tab);
     }
   }
-  const handoffTabs = tabs.filter((tab) => !unsafeSwitchTargets.has(tab));
+  const handoffTabs = tabs.filter(
+    (tab) => !unsafeSwitchTargets.has(tab) && (!unavailableSwitchTargets.has(tab) || tab === activeTab)
+  );
   const prefix = (await client.readPrefixKey(muxName)) ?? undefined;
   // Read, not assumed: see detachChord() for the `d` vs `D` mix-up this closes.
   const detachKey = (await client.readDetachKey()) ?? undefined;
@@ -611,12 +622,23 @@ export async function beginAttachHandoff(
   // really have a pane, and only keys tmux reports as free — the same rule the
   // way-out key follows, so a binding of the user's own is never shadowed.
   const switchKeys: string[] = [];
+  const boundSwitchTargets = new Set<TuiAttachTab>();
   for (const tab of handoffTabs.slice(0, 9)) {
-    if (!tab.muxName) continue;
+    if (!tab.muxName || !availableSwitchTargets.has(tab)) continue;
     const key = `M-${tab.index}`;
-    const bound = await client.readPrefixBinding(key, 'root');
+    let bound: string | null;
+    try {
+      bound = await client.readAttachSwitchBinding(key);
+    } catch {
+      // Earlier keys may already be installed. Omit this uncertain target and
+      // return the handoff so its caller can restore every successful claim.
+      continue;
+    }
     if (bound !== null && !isAttachSwitchBinding(bound)) continue;
-    if (await client.bindSwitchKey(key, tab.muxName)) switchKeys.push(key);
+    if (await client.bindSwitchKey(key, tab.muxName)) {
+      switchKeys.push(key);
+      boundSwitchTargets.add(tab);
+    }
   }
   const bannerFor = (activeMux: string, ownLabel: string): Record<string, string> =>
     buildAttachBanner({
@@ -641,7 +663,7 @@ export async function beginAttachHandoff(
   const resized: Array<{ muxName: string; sizing: TuiWindowSizing }> = [];
   const targets = new Map<string, string>([[muxName, label]]);
   for (const tab of handoffTabs.slice(0, 9)) {
-    if (tab.muxName && !targets.has(tab.muxName)) targets.set(tab.muxName, tab.label);
+    if (tab.muxName && boundSwitchTargets.has(tab) && !targets.has(tab.muxName)) targets.set(tab.muxName, tab.label);
   }
   for (const [target, targetLabel] of targets) {
     const snapshot = await client.readSessionOptions(target, Object.keys(banner));

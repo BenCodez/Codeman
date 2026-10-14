@@ -56,7 +56,7 @@ import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import { STATS_COLLECTION_INTERVAL_MS } from '../../config/server-timing.js';
 import { SseEvent } from '../sse-events.js';
 import type { CodexConfig, CustomModelBookkeeping, SessionAttachmentHistoryItem } from '../../types.js';
-import { rebuildPersistedCustomModelEnv } from '../../custom-model-recovery.js';
+import { rebuildPersistedCustomModelEnv, captureCustomModelRecoveryWitness } from '../../custom-model-recovery.js';
 import { customModelConfigDir, removeConfigDir } from '../../custom-model-injection-apply.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
 import { confirmCodexIdentityWitness } from '../../recovery/codex-identity.js';
@@ -219,6 +219,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             (saved as { __envOverrides?: Record<string, string> }).__envOverrides
           );
           const savedCustomModel = (saved as { __customModel?: CustomModelBookkeeping }).__customModel;
+          let customModelIsCurrent = () => true;
           if (savedCustomModel) {
             // A custom-model Codex session keeps its rollouts/history under this
             // isolated home. Snapshot ownership BEFORE re-derivation writes its
@@ -239,6 +240,19 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             if (!trustedCustomModelEnv) {
               failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
               continue;
+            }
+            if (usesCodexRecovery) {
+              const witness = captureCustomModelRecoveryWitness(
+                saved.mode ?? 'claude',
+                saved.id,
+                savedCustomModel,
+                trustedCustomModelEnv
+              );
+              if (!witness) {
+                failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
+                continue;
+              }
+              customModelIsCurrent = witness;
             }
             const customModelKeys = new Set(savedCustomModel.envKeys);
             envOverrides = {
@@ -410,6 +424,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 grantIsCurrent = current.isCurrent;
                 granted =
                   grantIsCurrent() === true &&
+                  customModelIsCurrent() === true &&
                   sameCodexLaunchConfig(current.configs.codexConfig as CodexConfig | undefined, codexConfig!) &&
                   JSON.stringify(current.env) === JSON.stringify(envToAuthorize);
               },
@@ -417,6 +432,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 const peers = [...ctx.sessions.values()].filter((other) => other !== session);
                 return (
                   granted &&
+                  customModelIsCurrent() === true &&
                   grantIsCurrent() === true &&
                   rebootRestoreRegistry.isHeld(entry, owner) &&
                   ctx.sessions.get(session.id) === session &&
@@ -427,6 +443,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                     new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
                   ).skipped.length === 0 &&
                   confirmCodexIdentityWitness(finalEvidence!) &&
+                  customModelIsCurrent() === true &&
                   grantIsCurrent() === true
                 );
               },

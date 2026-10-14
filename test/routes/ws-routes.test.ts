@@ -389,6 +389,109 @@ describe('ws-routes', () => {
       }
     );
 
+    it.each([false, true])(
+      'preserves rapid remote owner input through SSH clock admission (tagged: %s)',
+      async (tagged) => {
+        const clock = createDeferred<remoteClock.RemoteClockWitness>();
+        const witness = () => ({
+          localBefore: Date.now(),
+          localAfter: Date.now(),
+          remoteBefore: Date.now(),
+          remoteAfter: Date.now(),
+        });
+        const sampling = vi
+          .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockImplementation(async () => witness())
+          .mockReturnValueOnce(clock.promise);
+        const session = new Session({
+          id: 'ws-test-session',
+          workingDir: '/tmp',
+          mode: 'codex',
+          useMux: true,
+          mux: { isAvailable: () => true } as unknown as TerminalMultiplexer,
+          muxSession: {
+            muxName: 'codeman-ws-fixture',
+            recoveryIsolated: true,
+            recoveryCodexHome: '/fixture/codex-home',
+          } as MuxSession,
+          codexConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
+          remote: {
+            hostId: 'fixture',
+            label: 'Fixture',
+            host: 'worker.invalid',
+            username: 'fixture',
+            remotePath: '/tmp',
+            owned: true,
+          },
+          envOverrides: { CODEX_HOME: '/fixture/codex-home' },
+        });
+        const written = vi.fn();
+        Object.assign(session, { ptyProcess: { write: written, resize: vi.fn() } });
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+        const received: unknown[] = [];
+        ws.on('message', (raw) => received.push(JSON.parse(String(raw))));
+        const frames = ['first\r', 'n', 'e', 'x', 't', '\r'];
+        try {
+          for (const [index, d] of frames.entries())
+            ws.send(JSON.stringify({ t: 'i', d, ...(tagged ? { cid: 'ordered-clock', seq: index + 1 } : {}) }));
+          // A resize and pong are handled while ordinary owner input awaits SSH.
+          const resized = nextMessage(ws);
+          ws.send(JSON.stringify({ t: 'z', c: 100, r: 30 }));
+          expect(await resized).toMatchObject({ t: 'zc' });
+          expect(session.recoveryInputReserved).toBe(true);
+          expect(written).not.toHaveBeenCalled();
+          clock.resolve(witness());
+          await vi.waitFor(() => expect(written.mock.calls.map(([data]) => data)).toEqual(frames));
+          expect(sampling).toHaveBeenCalledTimes(2);
+          if (tagged) {
+            await vi.waitFor(() => expect(received.filter((msg) => (msg as { t: string }).t === 'ia')).toHaveLength(6));
+            const duplicate = nextMessage(ws);
+            ws.send(JSON.stringify({ t: 'i', d: '\r', cid: 'ordered-clock', seq: 6 }));
+            expect(await duplicate).toEqual({ t: 'ia', seq: 6, dup: true, last: 6 });
+            expect(written).toHaveBeenCalledTimes(6);
+          } else expect(received.filter((msg) => (msg as { t: string }).t === 'ia')).toEqual([]);
+        } finally {
+          clock.resolve(witness());
+          ws.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it.each(['owner close', 'legacy byte overflow', 'legacy frame overflow'] as const)(
+      'drops queued input without dispatch or delivery ACK after %s',
+      async (cause) => {
+        const clock = createDeferred<remoteClock.RemoteClockWitness>();
+        const sampling = vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
+        const session = ctx._session;
+        session.requiresRemoteInputClock = vi.fn(() => true);
+        session.prepareUserInputClock = vi.fn(async () => {
+          await sampling({} as never);
+          return () => true;
+        });
+        const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+        try {
+          ws.send(JSON.stringify({ t: 'i', d: 'first\r', cid: 'closed', seq: 1 }));
+          await vi.waitFor(() => expect(sampling).toHaveBeenCalledTimes(1));
+          ws.send(JSON.stringify({ t: 'i', d: 'queued', cid: 'closed', seq: 2 }));
+          const closed = waitForClose(ws);
+          if (cause === 'owner close') ws.close();
+          else if (cause === 'legacy byte overflow')
+            ws.send(JSON.stringify({ t: 'i', d: 'x'.repeat(MAX_INPUT_LENGTH) }));
+          else for (let i = 0; i < 512; i++) ws.send(JSON.stringify({ t: 'i', d: 'x' }));
+          expect((await closed).code).toBe(cause === 'owner close' ? 1005 : 4008);
+          clock.resolve({ localBefore: 1, localAfter: 1, remoteBefore: 1, remoteAfter: 1 });
+          await vi.waitFor(() => expect(session.prepareUserInputClock).toHaveBeenCalledTimes(1));
+          expect(session.writeBuffer).toEqual([]);
+          expect(session.lastInputSeq('closed')).toBe(0);
+        } finally {
+          clock.resolve({ localBefore: 1, localAfter: 1, remoteBefore: 1, remoteAfter: 1 });
+          ws.close();
+        }
+      }
+    );
+
     it('does not invent watermarks for sparse failed writes on the actual Session', async () => {
       const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'shell' });
       (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);

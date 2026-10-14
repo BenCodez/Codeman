@@ -2,7 +2,13 @@
 import { z } from 'zod';
 import type { SupervisionTaskState } from '../types/task.js';
 export type { SupervisionTaskState as TaskState, TaskProgress, TaskUpdate } from '../types/task.js';
-const Text = z.string().max(4000);
+// Task prompts flatten CR/LF. Every other terminal control remains a keypress,
+// including tabs and C1 controls; reject those before reserving any delivery.
+export const PromptTextSchema = z
+  .string()
+  // eslint-disable-next-line no-control-regex -- terminal control bytes are the rejected input
+  .regex(/^[^\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f]*$/, 'Prompt text must not contain terminal control characters');
+const Text = PromptTextSchema.max(4000);
 export const TaskConfigSchema = z
   .object({
     enabled: z.boolean(),
@@ -11,8 +17,8 @@ export const TaskConfigSchema = z
   })
   .strict();
 const CriterionId = z.string().regex(/^[\w-]{1,80}$/);
-const CriterionDescription = z.string().min(1).max(1000);
-const CriterionCommand = z.string().min(1).max(1000);
+const CriterionDescription = PromptTextSchema.min(1).max(1000);
+const CriterionCommand = PromptTextSchema.min(1).max(1000);
 export const CriterionSchema = z.discriminatedUnion('kind', [
   z.object({ id: CriterionId, description: CriterionDescription, kind: z.literal('manual') }).strict(),
   z
@@ -31,7 +37,7 @@ const Criteria = z
   .refine((c) => new Set(c.map((x) => x.id)).size === c.length);
 export const TaskUpdateSchema = z
   .object({
-    objective: z.string().min(1).max(4000).optional(),
+    objective: Text.min(1).optional(),
     criteria: Criteria.optional(),
     config: TaskConfigSchema.partial().optional(),
   })

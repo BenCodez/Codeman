@@ -101,7 +101,34 @@ export async function fixture(
     );
     await writeFile(
       join(bin, 'tmux'),
-      `#!/bin/sh\ncase "$*" in\n*has-session*) node "$MUTATE_SCRIPT" || exit 2; [ "$KIND" = restore ] && exit 1; exit 0;;\n*list-panes*) if [ "$KIND" = restart ]; then printf '1|1||%%7|4242\\n'; else printf '0|||%%7|4242\\n'; fi;;\n*capture-pane*) printf '›\\n';;\n*send-keys*|*respawn-pane*|*new-session*) printf '%s\\n' "$*" >> "$EFFECT_LOG";;\n*) exit 2;;\nesac\n`
+      String.raw`#!/bin/sh
+case "$*" in
+*has-session*) node "$MUTATE_SCRIPT" || exit 2; [ "$KIND" = restore ] && exit 1; exit 0;;
+*list-panes*)
+  if [ "$5" = '$17' ]; then
+    [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
+    printf '1|%%9|9009|1|17000\n'
+  elif [ "$KIND" = restart ]; then printf '1|1||%%7|4242\n'; else printf '0|||%%7|4242\n'; fi;;
+*capture-pane*) printf '›\n';;
+*new-session*)
+  [ "$KIND" = restore ] || exit 2
+  printf created > "$RESTORE_STAGE_FILE"
+  printf '%s\n' '$17|%9|9009|17000';;
+*set-option*)
+  [ "$(cat "$RESTORE_STAGE_FILE")" = created ] || exit 2
+  printf configured > "$RESTORE_STAGE_FILE";;
+*wait-for*)
+  [ "$(cat "$RESTORE_STAGE_FILE")" = configured ] || exit 2
+  printf released > "$RESTORE_STAGE_FILE";;
+*respawn-pane*)
+  if [ "$KIND" = restore ]; then
+    [ "$7" = '%9' ] && [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
+  fi
+  printf '%s\n' "$*" >> "$EFFECT_LOG";;
+*send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG";;
+*) exit 2;;
+esac
+`
     );
     await writeFile(join(bin, 'ssh'), '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n');
     await writeFile(join(bin, 'login-shell'), '#!/bin/sh\nexec /bin/sh -c "$4"\n');
@@ -146,6 +173,7 @@ export async function fixture(
       MUTATION: mutation,
       MUTATE_SCRIPT: mutate,
       EFFECT_LOG: log,
+      RESTORE_STAGE_FILE: join(root, 'restore-stage'),
       SIBLING: sibling,
       CONFLICT: conflict,
       HOME_PATH: home,
