@@ -628,29 +628,14 @@ describe('attach window sizing', () => {
   });
 });
 
-describe('TuiClient.bindSwitchKey', () => {
-  it('escapes the command separator, or tmux runs the second command instead of binding it', () => {
-    // ⚠️ A bare `;` argument is a command separator to tmux's OWN parser: it
-    // ends the bind-key and executes what follows immediately. That bound only
-    // `switch-client` and ran `window-size latest` against every session at
-    // attach time, which is why sessions were left on `latest` after a detach —
-    // the sizing snapshot was taken from already-corrupted state. Verified
-    // against real tmux both ways before this test was written.
-    const calls: string[][] = [];
-    const exec: TuiExecFile = async (_file, args) => {
-      calls.push([...args]);
-      return { stdout: '', stderr: '' };
-    };
+describe('global attach switch controls', () => {
+  it('never creates, removes or sweeps another client’s root controls', async () => {
+    const exec = vi.fn<TuiExecFile>(async () => ({ stdout: '', stderr: '' }));
     const client = new TuiClient({ baseUrl, socket: 'codeman-beta', exec });
-    return client.bindSwitchKey('M-2', 'codeman-aaaa1111').then(() => {
-      const bind = calls.find((args) => args.includes('bind-key'));
-      expect(bind).toBeDefined();
-      expect(bind).toContain('\\;');
-      expect(bind).not.toContain(';');
-      // Both commands have to be in the ONE binding.
-      expect(bind?.join(' ')).toContain('switch-client -t codeman-aaaa1111');
-      expect(bind?.join(' ')).toContain('window-size latest');
-    });
+    expect(await client.bindSwitchKey('M-2', 'codeman-aaaa1111')).toBe(false);
+    await client.unbindSwitchKey('M-2');
+    await client.clearLeakedAttachSwitchKeys();
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

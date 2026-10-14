@@ -11,6 +11,7 @@ import {
   type RecoveryReason,
   type RecoveryState,
   type RecoveryFlight,
+  type RecoveryActionAuthority,
 } from './types.js';
 
 export interface RecoveryDependencies {
@@ -20,9 +21,9 @@ export interface RecoveryDependencies {
   hasActionAuthority?(): boolean;
   observe(): Promise<RecoveryObservation>;
   /** 'unknown' includes any possibly-partially-delivered operation; it must never be replayed. */
-  act(flight: RecoveryFlight, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
+  act(flight: RecoveryFlight, isCurrent: RecoveryActionAuthority): Promise<'sent' | 'not-sent' | 'unknown'>;
   /** Explicit owner action for a verified missing owned remote worker. */
-  restoreMissingRemote?(isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
+  restoreMissingRemote?(isCurrent: RecoveryActionAuthority): Promise<'sent' | 'not-sent' | 'unknown'>;
   persist(state: RecoveryState): Promise<void>;
   changed(state: RecoveryState): void;
   now?: () => number;

@@ -158,6 +158,32 @@ describe('shared child status lifecycle', () => {
 });
 
 describe('real owned local recovery lifecycle', () => {
+  it.each([false, true])('refuses a seeded owned pane without a tracked current submission (dead=%s)', async (dead) => {
+    const f = await createChildLifecycleFixture(
+      returnedChildTail('collab_wait_end', 'completed', true),
+      dead,
+      dead,
+      false
+    );
+    try {
+      expect(f.session.codexConfig?.resumeSessionId).toBe(CHILD_THREAD);
+      expect(f.session.getRecoveryContext().submission).toBeUndefined();
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'unknown',
+        reason: 'identity-unverified',
+        safeToAct: false,
+      });
+      await f.controller.refresh();
+      await f.controller.retry();
+      expect(f.delivered).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().attempts).toBe(0);
+      expect(f.controller.getStatus().inFlight).toBeUndefined();
+      expect(f.adapter.getVerifiedTail(CHILD_THREAD)).toBeUndefined();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it.each(ENDS)('never continues or restarts over a reactivated child reported by %s', async (type) => {
     for (const dead of [false, true]) {
       const f = await createChildLifecycleFixture(returnedChildTail(type, 'running', true), dead);

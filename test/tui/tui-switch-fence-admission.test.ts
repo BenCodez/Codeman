@@ -90,23 +90,20 @@ it.each(['select-window -t 2', 'switch-client -t codeman-bbbbbbbb ; display-mess
 );
 
 it.each([
-  undefined,
   'switch-client -t codeman-cccccccc',
   'switch-client -t codeman-cccccccc ; set-window-option -t codeman-cccccccc window-size latest',
-])('fences and installs an available switch after removing stale binding %s', async (binding) => {
+])('preserves inherited controls and refuses their uncertain ownership: %s', async (binding) => {
   const f = fixture(binding);
-  const handoff = await beginAttachHandoff(f.client, 'codeman-aaaaaaaa', 'Claude', f.tabs);
-  expect(f.fence).toHaveBeenCalledExactlyOnceWith('codex-secondary');
-  expect(f.events.indexOf('fence:codex-secondary')).toBeLessThan(f.events.indexOf('bind:M-2'));
-  if (binding) expect(f.events.indexOf('unbind:M-2')).toBeLessThan(f.events.indexOf('fence:codex-secondary'));
-  expect(f.bindings.get('M-2')).toContain('switch-client -t codeman-bbbbbbbb');
-  await handoff.restore();
-  expect(f.bindings.has('M-2')).toBe(false);
+  await expect(beginAttachHandoff(f.client, 'codeman-aaaaaaaa', 'Claude', f.tabs)).rejects.toThrow('owner cleanup');
+  expect(f.bindings.get('M-2')).toBe(binding);
+  expect(f.fence).not.toHaveBeenCalled();
+  expect(
+    f.events.some((event) => event.startsWith('bind:') || event.startsWith('unbind:') || event.startsWith('decorate:'))
+  ).toBe(false);
 });
 
 it('still fences the actual primary Codex attach when its Alt key belongs to the user', async () => {
   const f = fixture('select-window -t 2');
-  // The mux target controls the actual attach, rather than potentially stale active metadata.
   const handoff = await beginAttachHandoff(f.client, 'codeman-bbbbbbbb', 'Codex', f.tabs);
   expect(f.fence).toHaveBeenCalledExactlyOnceWith('codex-secondary');
   expect(f.events).not.toContain('bind:M-2');
@@ -114,49 +111,40 @@ it('still fences the actual primary Codex attach when its Alt key belongs to the
   await handoff.restore();
 });
 
-it.each(['cleanup', 'availability'] as const)(
-  'fails closed before fencing or binding when %s is uncertain',
-  async (stage) => {
-    const f = fixture(stage === 'cleanup' ? 'switch-client -t codeman-cccccccc' : undefined);
-    if (stage === 'cleanup') f.failCleanup();
-    else f.failRead(2); // Stale cleanup succeeds; the first candidate availability read fails.
-    await expect(beginAttachHandoff(f.client, 'codeman-aaaaaaaa', 'Claude', f.tabs)).rejects.toThrow('unavailable');
-    expect(f.fence).not.toHaveBeenCalled();
-    expect(f.events.some((event) => event.startsWith('bind:') || event.startsWith('decorate:'))).toBe(false);
-  }
-);
+it('fails closed before fencing or binding when the global key table is unreadable', async () => {
+  const f = fixture();
+  f.failRead(2);
+  await expect(beginAttachHandoff(f.client, 'codeman-aaaaaaaa', 'Claude', f.tabs)).rejects.toThrow('unavailable');
+  expect(f.fence).not.toHaveBeenCalled();
+  expect(f.events.some((event) => event.startsWith('bind:') || event.startsWith('decorate:'))).toBe(false);
+});
 
-it('refuses an unfenced primary before installing any switch or detach key', async () => {
+it('refuses an unfenced primary before installing any detach key', async () => {
   const f = fixture('select-window -t 2');
   f.fence.mockRejectedValue(new Error('Fixture fence refused'));
   await expect(beginAttachHandoff(f.client, 'codeman-bbbbbbbb', 'Codex', f.tabs)).rejects.toThrow('fence refused');
   expect(f.events.some((event) => event.startsWith('bind:') || event.startsWith('decorate:'))).toBe(false);
 });
 
-it('rechecks occupancy after the fence without replacing a newly installed user binding', async () => {
+it('does not fence or expose a secondary worker during a healthy Claude attach', async () => {
   const f = fixture();
-  f.fence.mockImplementation(async () => {
-    f.bindings.set('M-2', 'display-message new-user-binding');
-  });
   const handoff = await beginAttachHandoff(f.client, 'codeman-aaaaaaaa', 'Claude', f.tabs);
-  expect(f.events).not.toContain('bind:M-2');
+  expect(f.fence).not.toHaveBeenCalled();
+  expect(f.bindings.has('M-1')).toBe(false);
+  expect(f.bindings.has('M-2')).toBe(false);
   expect(f.events).not.toContain('decorate:codeman-bbbbbbbb');
   await handoff.restore();
-  expect(f.bindings.get('M-2')).toBe('display-message new-user-binding');
 });
 
-it('omits an uncertain final switch read after earlier temporary keys were installed and restores them', async () => {
+it('refuses a generated switch introduced during the primary fence without altering it', async () => {
   const f = fixture();
-  f.failRead(6); // Cleanup, two preflights, F1, M-1 success, then the M-2 final read fails.
-  const handoff = await beginAttachHandoff(f.client, 'codeman-aaaaaaaa', 'Claude', f.tabs);
-  expect(f.fence).toHaveBeenCalledExactlyOnceWith('codex-secondary');
-  expect(f.bindings.has('M-1')).toBe(true);
-  expect(f.bindings.has('F1')).toBe(true);
-  expect(f.prefixBindings.has('C-d')).toBe(true);
-  expect(f.bindings.has('M-2')).toBe(false);
-  expect(f.events).not.toContain('bind:M-2');
-  expect(f.events).not.toContain('decorate:codeman-bbbbbbbb');
-  await handoff.restore();
-  expect(f.bindings.size).toBe(0);
-  expect(f.prefixBindings.size).toBe(0);
+  const command = 'switch-client -t codeman-cccccccc';
+  f.fence.mockImplementation(async () => {
+    f.bindings.set('M-9', command);
+  });
+  await expect(beginAttachHandoff(f.client, 'codeman-bbbbbbbb', 'Codex', f.tabs)).rejects.toThrow('owner cleanup');
+  expect(f.bindings.get('M-9')).toBe(command);
+  expect(
+    f.events.some((event) => event.startsWith('bind:') || event.startsWith('unbind:') || event.startsWith('decorate:'))
+  ).toBe(false);
 });

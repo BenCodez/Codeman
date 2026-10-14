@@ -149,18 +149,21 @@ for (const action of ['continue', 'restart'] as const) {
         await fs.writeFile(
           join(home, 'sessions', `rollout-2026-10-13T12-00-01-${unrelated}.jsonl`),
           JSON.stringify({
-            timestamp: new Date(NOW + 1000).toISOString(),
+            timestamp: new Date(NOW - 5000).toISOString(),
             type: 'session_meta',
             payload: { id: unrelated, cwd: work, originator: 'unrelated-owned-fixture' },
           }) + '\n'
         );
-        await fs.appendFile(
+        const currentHistory = await fs.readFile(join(home, 'history.jsonl'), 'utf8');
+        await fs.writeFile(
           join(home, 'history.jsonl'),
           JSON.stringify({
             session_id: unrelated,
-            ts: NOW / 1000,
+            ts: (NOW - 4000) / 1000,
             text: 'Different owner request',
-          }) + '\n'
+          }) +
+            '\n' +
+            currentHistory
         );
       }
       const adapter = new CodexRecoveryAdapter(session, () => {});

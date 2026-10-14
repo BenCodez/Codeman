@@ -27,12 +27,13 @@
 
 import {
   closeSync,
-  existsSync,
+  constants,
+  fstatSync,
+  readSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -52,10 +53,98 @@ const PLAN_TTL_MS = 24 * 60 * 60 * 1000;
 type ParkedEntry = { entry: RebootRestoreEntry; spender: string | undefined };
 type SnapshotWriter = (path: string, text: string) => void;
 
-function writeAtomicSnapshot(path: string, text: string): void {
+const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
+
+function validateSnapshot(value: unknown): { builtAt: number; entries: RebootRestoreEntry[] } {
+  const saved = value as { version?: unknown; builtAt: number; entries: RebootRestoreEntry[] };
+  if (
+    !saved ||
+    typeof saved !== 'object' ||
+    Array.isArray(saved) ||
+    saved.version !== 1 ||
+    !Number.isFinite(saved.builtAt) ||
+    saved.builtAt < 0 ||
+    saved.builtAt > Date.now() ||
+    !Array.isArray(saved.entries) ||
+    saved.entries.length > 1000 ||
+    (saved.entries.length > 0 && saved.builtAt === 0)
+  )
+    throw new Error('Invalid restore offer journal');
+  if (
+    saved.entries.some(
+      (entry) =>
+        !entry ||
+        typeof entry !== 'object' ||
+        Array.isArray(entry) ||
+        typeof entry.sessionId !== 'string' ||
+        typeof entry.resumeConversationId !== 'string' ||
+        !entry.resumeConversationId ||
+        typeof entry.workingDir !== 'string' ||
+        !entry.state ||
+        typeof entry.state !== 'object' ||
+        Array.isArray(entry.state) ||
+        entry.state.id !== entry.sessionId ||
+        entry.state.remote ||
+        entry.state.docker ||
+        typeof entry.mode !== 'string' ||
+        (entry.owner !== undefined && typeof entry.owner !== 'string') ||
+        entry.owner !== entry.state.owner ||
+        entry.workingDir !== entry.state.workingDir ||
+        entry.mode !== (entry.state.mode ?? 'claude')
+    )
+  )
+    throw new Error('Invalid restore offer entries');
+  return saved;
+}
+
+/** Preserve unreadable, malformed and replaced journals instead of overwriting them. */
+function readSnapshotBytes(path: string): string | undefined {
+  let stat;
+  try {
+    stat = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_SNAPSHOT_BYTES)
+    throw new Error('Restore offer journal is unreadable');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const before = fstatSync(fd);
+    const matches = (current: typeof before) =>
+      current.isFile() &&
+      !current.isSymbolicLink() &&
+      current.dev === stat.dev &&
+      current.ino === stat.ino &&
+      current.size === stat.size &&
+      current.mtimeMs === stat.mtimeMs &&
+      current.ctimeMs === stat.ctimeMs;
+    if (!matches(before)) throw new Error('Restore offer journal changed');
+    const bytes = Buffer.alloc(before.size);
+    if (
+      readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length ||
+      !matches(fstatSync(fd)) ||
+      !matches(lstatSync(path))
+    )
+      throw new Error('Restore offer journal changed');
+    const text = bytes.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes)) throw new Error('Restore offer journal is malformed');
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      throw new Error('Restore offer journal is malformed');
+    }
+    validateSnapshot(parsed);
+    return text;
+  } finally {
+    closeSync(fd);
+  }
+}
+
+function replaceSnapshot(path: string, text: string): void {
   const temporary = `${path}.tmp-${randomUUID()}`;
   try {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     const fd = openSync(temporary, 'wx', 0o600);
     try {
       writeFileSync(fd, text);
@@ -79,8 +168,46 @@ function writeAtomicSnapshot(path: string, text: string): void {
   }
 }
 
+function writeAtomicSnapshot(path: string, text: string): void {
+  // A surviving shadow marks an earlier unacknowledged replacement. It remains
+  // authoritative until a retry commits; current pathname contents alone cannot.
+  const current = readSnapshotBytes(path);
+  const shadowPath = `${path}.previous`;
+  const previous = readSnapshotBytes(shadowPath) ?? current ?? JSON.stringify({ version: 1, builtAt: 0, entries: [] });
+  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  replaceSnapshot(shadowPath, previous);
+  try {
+    replaceSnapshot(path, text);
+  } catch (error) {
+    // The rename may have succeeded before directory acknowledgement failed.
+    // Keep the durable shadow even if this bounded rollback also cannot fsync.
+    try {
+      replaceSnapshot(path, previous);
+    } catch {
+      /* shadow still preserves the old snapshot */
+    }
+    throw error;
+  }
+  // Reclaim only after the primary acknowledgement. A surviving/reappearing
+  // shadow remains a conservative prior offer, with its original expiry and
+  // explicit-restore checks. A known cleanup failure is still surfaced.
+  try {
+    unlinkSync(shadowPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      try {
+        replaceSnapshot(path, previous);
+      } catch {
+        /* retain the shadow on uncertain rollback */
+      }
+      throw error;
+    }
+  }
+}
+
 export class RebootRestoreRegistry {
   private persistencePath?: string;
+  private persistenceLoadFailed = false;
 
   constructor(private readonly snapshotWriter: SnapshotWriter = writeAtomicSnapshot) {}
 
@@ -88,43 +215,17 @@ export class RebootRestoreRegistry {
   configurePersistence(path: string): void {
     if (this.persistencePath === path) return;
     this.persistencePath = path;
+    this.persistenceLoadFailed = false;
     this.entries.clear();
     this.parked.clear();
+    this.failedReleases.clear();
     this.builtAt = 0;
     try {
-      if (!existsSync(path)) return;
-      const stat = lstatSync(path);
-      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 8 * 1024 * 1024) return;
-      const saved = JSON.parse(readFileSync(path, 'utf8'));
-      if (
-        saved.version !== 1 ||
-        !Number.isFinite(saved.builtAt) ||
-        saved.builtAt <= 0 ||
-        saved.builtAt > Date.now() ||
-        !Array.isArray(saved.entries) ||
-        saved.entries.length > 1000
-      )
-        return;
-      const entries: RebootRestoreEntry[] = saved.entries;
-      if (
-        entries.some(
-          (entry) =>
-            !entry ||
-            typeof entry.sessionId !== 'string' ||
-            typeof entry.resumeConversationId !== 'string' ||
-            typeof entry.workingDir !== 'string' ||
-            !entry.state ||
-            entry.state.id !== entry.sessionId ||
-            entry.state.remote ||
-            entry.state.docker ||
-            typeof entry.mode !== 'string' ||
-            (entry.owner !== undefined && typeof entry.owner !== 'string') ||
-            entry.owner !== entry.state.owner ||
-            entry.workingDir !== entry.state.workingDir ||
-            entry.mode !== (entry.state.mode ?? 'claude')
-        )
-      )
-        return;
+      const current = readSnapshotBytes(path);
+      const raw = readSnapshotBytes(`${path}.previous`) ?? current;
+      if (raw === undefined) return;
+      const saved = validateSnapshot(JSON.parse(raw));
+      const entries = saved.entries;
       const eligible = planRebootRestore(
         entries.map((entry) => entry.sessionId),
         Object.fromEntries(entries.map((entry) => [entry.sessionId, entry.state])),
@@ -140,9 +241,18 @@ export class RebootRestoreRegistry {
         entries.filter((entry) => ids.has(entry.sessionId)).map((entry) => [entry.sessionId, entry])
       );
       this.builtAt = saved.builtAt;
+    } catch {
+      this.persistenceLoadFailed = true;
+      this.entries.clear();
+      this.parked.clear();
+      this.builtAt = 0;
+      // Unreadable/corrupt originals remain available for owner inspection.
+      return;
+    }
+    try {
       this.dropIfExpired();
     } catch {
-      // An unreadable/corrupt offer never authorizes a process launch.
+      /* Retain the acknowledged snapshot; a later expiry read retries without granting it. */
     }
   }
 
@@ -158,16 +268,14 @@ export class RebootRestoreRegistry {
     parked: ReadonlyMap<string, ParkedEntry>,
     builtAt: number
   ): void {
+    if (this.persistenceLoadFailed) throw new Error('Restore offer journal could not be loaded; refusing overwrite');
     if (!this.persistencePath) return;
     const path = this.persistencePath;
     const outstanding = [...entries.values(), ...[...parked.values()].map((held) => held.entry)];
+    if (outstanding.length > 1000) throw new Error('Restore offer exceeds entry budget');
     const text = JSON.stringify({ version: 1, builtAt, entries: outstanding });
     if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('Restore offer exceeds storage budget');
     this.snapshotWriter(path, text);
-  }
-
-  private persist(): void {
-    this.persistState(this.entries, this.parked, this.builtAt);
   }
 
   /** Keyed by session id, in the order the boot pass found them. */
@@ -187,6 +295,7 @@ export class RebootRestoreRegistry {
    * sessions, and then the spender and the owner are different keys.
    */
   private parked = new Map<string, ParkedEntry>();
+  private failedReleases = new Set<string | undefined>();
   /**
    * Owners with a restore in flight, between its take and its last pane.
    * Keyed by owner so one user's restore does not turn another user's click into
@@ -197,11 +306,14 @@ export class RebootRestoreRegistry {
 
   /** Replace the plan with what the boot pass found. An empty list clears it. */
   set(entries: readonly RebootRestoreEntry[]): void {
-    this.entries = new Map(entries.map((entry) => [entry.sessionId, entry]));
-    this.builtAt = entries.length > 0 ? Date.now() : 0;
-    // A fresh boot plan supersedes anything an in-flight restore still holds.
+    const nextEntries = new Map(entries.map((entry) => [entry.sessionId, entry]));
+    const nextBuiltAt = entries.length > 0 ? Date.now() : 0;
+    this.persistState(nextEntries, new Map(), nextBuiltAt);
+    this.entries = nextEntries;
+    this.builtAt = nextBuiltAt;
+    // Acknowledged fresh plans supersede old held work.
     this.parked.clear();
-    this.persist();
+    this.failedReleases.clear();
   }
 
   /**
@@ -263,20 +375,28 @@ export class RebootRestoreRegistry {
    */
   releaseFlight(spender: string | undefined, keep: readonly RebootRestoreEntry[]): void {
     const wanted = new Set(keep.map((entry) => entry.sessionId));
+    const nextEntries = new Map(this.entries);
+    const nextParked = new Map(this.parked);
     let added = 0;
-    for (const [sessionId, held] of [...this.parked]) {
+    for (const [sessionId, held] of nextParked) {
       if (held.spender !== spender) continue;
-      this.parked.delete(sessionId);
-      // Still parked means nothing cancelled it while the restore ran. A dismiss,
-      // an expiry or a fresh boot plan removes it from `parked`, and then it does
-      // not come back however the restore ended.
+      nextParked.delete(sessionId);
       if (wanted.has(sessionId)) {
-        this.entries.set(sessionId, held.entry);
-        added += 1;
+        nextEntries.set(sessionId, held.entry);
+        added++;
       }
     }
-    if (added > 0 && this.builtAt === 0) this.builtAt = Date.now();
-    this.persist();
+    const nextBuiltAt = added > 0 && this.builtAt === 0 ? Date.now() : this.builtAt;
+    try {
+      this.persistState(nextEntries, nextParked, nextBuiltAt);
+    } catch (error) {
+      this.failedReleases.add(spender);
+      throw error;
+    }
+    this.failedReleases.delete(spender);
+    this.entries = nextEntries;
+    this.parked = nextParked;
+    this.builtAt = nextBuiltAt;
   }
 
   /** Drop the entries a viewer can see. Returns how many went. */
@@ -318,6 +438,15 @@ export class RebootRestoreRegistry {
 
   endSpending(owner?: string): void {
     this.spending.delete(owner);
+    if (!this.failedReleases.delete(owner)) return;
+    // A failed release retained the acknowledged outstanding set. End the
+    // ephemeral lease without losing it or allowing a later empty take to
+    // consume orphaned parks. Any actual/live worker still vetoes a new restore.
+    for (const [id, held] of this.parked) {
+      if (held.spender !== owner) continue;
+      this.entries.set(id, held.entry);
+      this.parked.delete(id);
+    }
   }
 
   /** Test hook: forget everything, including the single-flight claim. */
@@ -326,17 +455,19 @@ export class RebootRestoreRegistry {
     this.parked.clear();
     this.builtAt = 0;
     this.spending.clear();
+    this.failedReleases.clear();
     this.persistencePath = undefined;
+    this.persistenceLoadFailed = false;
   }
 
   private dropIfExpired(): void {
     if (this.builtAt > 0 && Date.now() - this.builtAt > PLAN_TTL_MS) {
       // A restore that took entries just before the expiry must not hand them
       // back afterwards and give an expired plan another full day of life.
+      this.persistState(new Map(), new Map(), 0);
       this.parked.clear();
       this.entries.clear();
       this.builtAt = 0;
-      this.persist();
     }
   }
 }

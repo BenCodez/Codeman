@@ -4,7 +4,8 @@ import type { Session } from '../session.js';
 import type { RecoveryPaneIdentity } from '../mux-interface.js';
 import { matchesNativePaneSignal } from './native-pane-signal.js';
 import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../session-env-clamp.js';
-import { resolveCodexIdentity, confirmCodexIdentityWitness, type CodexIdentityWitness } from './codex-identity.js';
+import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
+import { checkCodexIdentityWitnesses } from './codex-witness-check.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './codex-home.js';
 import { classifyCodexTail, hasEmptyCodexComposer } from './codex-classifier.js';
 import {
@@ -15,7 +16,12 @@ import {
   remoteCompletionToLocal,
   type RemoteClockWitness,
 } from './remote-clock.js';
-import { CONTINUATION_PROMPT, type RecoveryFlight, type RecoveryObservation } from './types.js';
+import {
+  CONTINUATION_PROMPT,
+  isRecoveryEvidenceSourceCurrent,
+  type RecoveryFlight,
+  type RecoveryObservation,
+} from './types.js';
 import {
   inspectRemoteCodex,
   deliverRemoteCodexInput,
@@ -198,6 +204,9 @@ export class CodexRecoveryAdapter {
     if (!context.noDaemon) return unknown('managed-daemon');
     if (context.switchPending || context.untrackedInput || session.paneLifecycleInFlight)
       return unknown('identity-unverified');
+    // A launch seed cannot witness an untracked direct-TUI /resume.
+    // Effects require an exact owner submission and its current history identity.
+    if (!context.submission) return unknown('identity-unverified');
     // Re-check the owner's current grant before either continuing or relaunching a privilege-bearing pane.
     const clamped = await clampExternalCliConfigsForOwner(session.owner, { codexConfig: session.codexConfig });
     // Include the active home explicitly; the path participates in the current grant check.
@@ -615,16 +624,30 @@ export class CodexRecoveryAdapter {
     return this.verifiedTail?.conversationId === conversationId ? this.verifiedTail.clock : undefined;
   }
 
-  private remoteAuthority(conversationId: string, generation: number, isCurrent: () => boolean) {
+  private remoteAuthority(
+    conversationId: string,
+    generation: number,
+    isCurrent: import('./types.js').RecoveryActionAuthority
+  ) {
     const expected = this.session.remoteRecoveryConfiguration();
     return {
-      check: () => this.session.confirmRemoteRecoveryAuthority(conversationId, generation, isCurrent, expected),
+      check: async () => {
+        if (!(await this.session.confirmRemoteRecoveryAuthority(conversationId, generation, isCurrent, expected)))
+          return false;
+        // The shared SSH slot and clock sampling can wait. Revalidate the local
+        // issuer after those waits before the remote reader performs its own private checks.
+        if (isCurrent.prepareEvidence && (await isCurrent.prepareEvidence()) !== true) return false;
+        return this.session.isRemoteRecoveryAuthorityCurrent(conversationId, generation, isCurrent, expected);
+      },
       isCurrent: () => this.session.isRemoteRecoveryAuthorityCurrent(conversationId, generation, isCurrent, expected),
     };
   }
 
-  /** Last local evidence read after Session has awaited pane and current grants. */
-  confirmLocalEvidence(conversationId: string, generation: number): boolean {
+  /** Immutable private witness plus pure scope, for one shared worker/issuer verification. */
+  getLocalEvidenceSource(
+    conversationId: string,
+    generation: number
+  ): import('./types.js').RecoveryEvidenceSource | undefined {
     const expected = this.verifiedTail;
     const context = this.session.getRecoveryContext();
     if (
@@ -636,20 +659,58 @@ export class CodexRecoveryAdapter {
       expected.config !== JSON.stringify(this.session.codexConfig) ||
       expected.env !== JSON.stringify(this.session.getEnvOverridesForPersist())
     )
-      return false;
-    return (
-      confirmCodexIdentityWitness({
+      return undefined;
+    const scope = () =>
+      JSON.stringify([
+        this.session.owner,
+        this.session.workingDir,
+        this.session.codexConfig,
+        this.session.getEnvOverridesForPersist(),
+        this.session.getRecoveryContext(),
+        this.session.remote,
+      ]);
+    const snapshot = scope();
+    return {
+      sessionId: this.session.id,
+      identity: {
         reason: 'verified',
         conversationId,
         path: expected.path,
         tail: expected.tail,
         tailTruncated: expected.tailTruncated,
         witness: expected.witness,
-      }) && this.session.getRecoveryContext().generation === generation
+      },
+      isCurrent: () =>
+        this.verifiedTail === expected &&
+        scope() === snapshot &&
+        this.session.getRecoveryContext().generation === generation,
+    };
+  }
+
+  /** Last bounded evidence check after asynchronous launch preparation; issuer and worker share one barrier. */
+  async confirmLocalEvidence(
+    conversationId: string,
+    generation: number,
+    otherSource?: import('./types.js').RecoveryEvidenceSource
+  ): Promise<boolean> {
+    const source = this.getLocalEvidenceSource(conversationId, generation);
+    if (
+      !source ||
+      !isRecoveryEvidenceSourceCurrent(source) ||
+      (otherSource && !isRecoveryEvidenceSourceCurrent(otherSource))
+    )
+      return false;
+    return (
+      (await checkCodexIdentityWitnesses([source.identity, ...(otherSource ? [otherSource.identity] : [])])) &&
+      isRecoveryEvidenceSourceCurrent(source) &&
+      (!otherSource || isRecoveryEvidenceSourceCurrent(otherSource))
     );
   }
 
-  async act(flight: RecoveryFlight, isCurrent: () => boolean = () => true): Promise<'sent' | 'not-sent' | 'unknown'> {
+  async act(
+    flight: RecoveryFlight,
+    isCurrent: import('./types.js').RecoveryActionAuthority = () => true
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const previous = this.proof;
     if (!isCurrent() || !previous || previous.key !== flight.key || previous.conversationId !== flight.conversationId)
       return 'not-sent';
@@ -707,7 +768,9 @@ export class CodexRecoveryAdapter {
       }
     } else {
       const generation = this.proof.generation;
-      const confirmEvidence = () => this.confirmLocalEvidence(flight.conversationId, generation);
+      const confirmEvidence: import('./types.js').RecoveryEvidenceGuard = () =>
+        this.confirmLocalEvidence(flight.conversationId, generation);
+      confirmEvidence.getEvidenceSource = () => this.getLocalEvidenceSource(flight.conversationId, generation);
       result =
         flight.action === 'restart'
           ? await this.session.deliverRecovery(
@@ -729,7 +792,7 @@ export class CodexRecoveryAdapter {
     conversationId: string,
     generation: number,
     prompt: string,
-    isCurrent: () => boolean = () => true
+    isCurrent: import('./types.js').RecoveryActionAuthority = () => true
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const proof = this.remotePromptProof;
     const remote = this.session.remote;
@@ -767,7 +830,9 @@ export class CodexRecoveryAdapter {
   }
 
   /** Explicit owner-request path only; automatic evaluation never calls this. */
-  async restoreMissingRemote(isCurrent: () => boolean = () => true): Promise<'sent' | 'not-sent' | 'unknown'> {
+  async restoreMissingRemote(
+    isCurrent: import('./types.js').RecoveryActionAuthority = () => true
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
     if (!this.deps.restoreRemote) return 'not-sent';
     const first = await this.observe();
     const proof = this.missingProof;

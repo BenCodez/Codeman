@@ -1,4 +1,5 @@
 /** @fileoverview Recovery contracts. Observation and automation state are deliberately independent. */
+import type { CodexIdentityResult } from './codex-identity.js';
 
 export interface RecoveryConfig {
   enabled: boolean;
@@ -38,6 +39,31 @@ export type RecoveryActivity =
 
 export type RecoveryPhase = 'idle' | 'watching' | 'recovering' | 'paused' | 'blocked' | 'completed' | 'failed';
 export type RecoveryAction = 'continue' | 'restart';
+/** Pure current owner authority plus a fresh issuer evidence check at each effect boundary. */
+export interface RecoveryEvidenceSource {
+  sessionId: string;
+  identity: CodexIdentityResult;
+  isCurrent(): boolean;
+}
+export function isRecoveryEvidenceSourceCurrent(source: RecoveryEvidenceSource): boolean {
+  try {
+    const verdict: unknown = source.isCurrent();
+    if (verdict instanceof Promise) {
+      void verdict.catch(() => {});
+      return false;
+    }
+    return verdict === true;
+  } catch {
+    return false;
+  }
+}
+
+export type RecoveryEvidenceGuard = (() => boolean | Promise<boolean>) & {
+  getEvidenceSource?: () => RecoveryEvidenceSource | undefined;
+};
+export type RecoveryActionAuthority = (() => boolean) & {
+  prepareEvidence?: (source?: RecoveryEvidenceSource) => Promise<boolean>;
+};
 
 /** Reasons are closed, sanitized codes: never persist raw terminal, transcript or SSH diagnostics. */
 export type RecoveryReason =

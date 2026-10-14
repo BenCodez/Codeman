@@ -38,6 +38,9 @@ export async function fixture(
     truncatedPrefix?: boolean;
     retainedPrefixAt?: number;
     malformedHistoryAt?: number;
+    latestHistory?: { id: 'same' | 'other' | 'unknown'; delta: number; text?: string };
+    latestMalformedHistory?: boolean;
+    fifoOn?: 'rollout' | 'history';
     paneRow?: string;
     expectedPane?: { paneId: string; panePid: number; status?: number; signal?: number };
     beforeEffect?:
@@ -137,12 +140,23 @@ if(process.argv[2]==='capture'){
       // Keep rows monotonic so a missing timestamp validation is the opposing gap.
       history = at > 0 ? history + malformed : malformed + history;
     }
+    if (correlation?.latestHistory)
+      history += historyRow(
+        correlation.latestHistory.id === 'same'
+          ? THREAD
+          : correlation.latestHistory.id === 'other'
+            ? SIBLING
+            : '99999999-2222-3333-4444-555555555555',
+        correlation.latestHistory.delta,
+        correlation.latestHistory.text ?? 'Later direct TUI owner input'
+      );
+    if (correlation?.latestMalformedHistory) history += '{malformed latest history}\n';
     await writeFile(join(home, 'history.jsonl'), history);
     const sibling = join(sessions, `rollout-sibling-${SIBLING}.jsonl`);
     if (mutation === 'changed-sibling' || unrelated) {
       await writeFile(sibling, header(SIBLING, Date.now(), '/fixture/unrelated'));
     }
-    if (correlation?.conflict === 'other' || correlation?.truncatedPrefix)
+    if (correlation?.conflict === 'other' || correlation?.truncatedPrefix || correlation?.latestHistory?.id === 'other')
       await writeFile(sibling, header(SIBLING, at - 5000, remote.remotePath, 'codex-tui'));
     const conflict = header(SIBLING, Date.now());
     const mutate = join(root, 'mutate.cjs');
@@ -240,6 +254,25 @@ esac
       ANCESTOR: ancestor,
       SESSIONS: sessions,
     };
+    if (correlation?.fifoOn) {
+      const fifo = join(root, 'fifo-preload.cjs');
+      const target =
+        correlation.fifoOn === 'rollout'
+          ? join(sessions, `rollout-selected-${THREAD}.jsonl`)
+          : join(home, 'history.jsonl');
+      await writeFile(
+        fifo,
+        `
+const fs=require('node:fs'),target=${JSON.stringify(target)},log=${JSON.stringify(log + '.fifo')};
+const open=fs.openSync.bind(fs),stat=fs.fstatSync.bind(fs),read=fs.readSync.bind(fs),close=fs.closeSync.bind(fs),fds=new Set();
+fs.openSync=(p,flags,...args)=>{if(p!==target)return open(p,flags,...args);fs.appendFileSync(log,JSON.stringify({nonblock:!!(flags&fs.constants.O_NONBLOCK),nofollow:!!(flags&fs.constants.O_NOFOLLOW)})+'\\n');if(!(flags&fs.constants.O_NONBLOCK))throw new Error('Fixture prevented a blocking FIFO open');const fd=open('/dev/null',flags,...args);fds.add(fd);return fd};
+fs.fstatSync=(fd,...args)=>{const s=stat(fd,...args);if(fds.has(fd)){s.mode=0o010600;s.isFile=()=>false;s.isFIFO=()=>true;}return s};
+fs.readSync=(fd,...args)=>{if(fds.has(fd))fs.appendFileSync(log,'read\\n');return read(fd,...args)};
+fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return close(fd)};
+`
+      );
+      Object.assign(env, { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${JSON.stringify(fifo)}` });
+    }
     let refused = false;
     const run = async (cmd: string, change = mutation) => {
       try {
@@ -274,6 +307,7 @@ esac
     return {
       status,
       effects,
+      ...(correlation?.fifoOn ? { fifoReads: await readFile(log + '.fifo', 'utf8') } : {}),
       ...(correlation?.beforeEffect || correlation?.prompt !== undefined
         ? {
             commands: (await readFile(log + '.commands', 'utf8'))

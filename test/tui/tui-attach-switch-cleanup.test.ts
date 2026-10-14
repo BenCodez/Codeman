@@ -51,8 +51,6 @@ async function harness(bindings: Record<string, string>, fenceAllowed: boolean) 
   const fenceCalls: string[] = [];
   const server = http.createServer((req, res) => {
     fenceCalls.push(req.url!);
-    // Cleanup must precede even the failed HTTP identity fence.
-    expect(root.has('M-2')).toBe(false);
     res.writeHead(fenceAllowed ? 200 : 503, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(fenceAllowed ? { success: true } : { success: false, error: 'fixture fence unavailable' }));
   });
@@ -78,41 +76,63 @@ const tabs = [
   },
 ];
 
-describe('owned attach switch binding cleanup', () => {
+describe('global attach switch ownership', () => {
   it.each([GENERATED, ESCAPED_GENERATED, LEGACY])(
-    'sweeps a stale generated binding with the attach bar: %s',
+    'preserves a recognizable binding during banner cleanup and refuses handoff: %s',
     async (bound) => {
-      const { client, root } = await harness({ 'M-2': bound }, false);
+      const { client, root, calls, fenceCalls } = await harness({ 'M-2': bound }, false);
       expect(await client.clearLeakedAttachBanners()).toBe(1);
-      expect(root.has('M-2')).toBe(false);
-    }
-  );
-
-  it.each([GENERATED, ESCAPED_GENERATED, LEGACY])(
-    'keeps a rejected Codex jump unreachable before, during and after handoff: %s',
-    async (bound) => {
-      const { client, root, fenceCalls } = await harness({ 'M-2': bound }, false);
       expect(root.get('M-2')).toBe(bound);
-      const handoff = await beginAttachHandoff(client, CLAUDE, 'Claude', tabs);
-      expect(fenceCalls).toEqual(['/api/sessions/bbbb2222/direct-attach-fence']);
-      expect(root.has('M-2')).toBe(false);
-      expect(root.get('M-1')).toContain(`switch-client -t ${CLAUDE}`);
-      await handoff.restore();
-      expect(root.has('M-2')).toBe(false);
-      expect(root.has('M-1')).toBe(false);
+      await expect(beginAttachHandoff(client, CLAUDE, 'Claude', tabs)).rejects.toThrow('owner cleanup');
+      expect(root.get('M-2')).toBe(bound);
+      expect(fenceCalls).toEqual([]);
+      expect(calls.some((args) => args[2] === 'unbind-key')).toBe(false);
     }
   );
 
-  it('replaces a stale generated jump only after the new fence succeeds', async () => {
+  it.each([true, false])(
+    'keeps two concurrent owner handoffs separate (second fence accepted=%s)',
+    async (accepted) => {
+      const { client, root, calls } = await harness({ 'M-3': 'display-message user-owned' }, accepted);
+      const second = new TuiClient({
+        baseUrl: Reflect.get(client, 'base') as string,
+        socket: 'codeman-fixture',
+        exec: Reflect.get(client, 'exec') as TuiExecFile,
+      });
+      const [first, next] = await Promise.allSettled([
+        beginAttachHandoff(client, CLAUDE, 'Owner A', tabs),
+        beginAttachHandoff(second, CODEX, 'Owner B', [
+          {
+            index: 1,
+            label: 'Owner B',
+            active: true,
+            muxName: CODEX,
+            requiresDirectAttachFence: true,
+            directAttachFenceSessionId: 'bbbb2222',
+          },
+        ]),
+      ]);
+      expect(first.status).toBe('fulfilled');
+      expect(next.status).toBe(accepted ? 'fulfilled' : 'rejected');
+      expect(calls.some((args) => args[2] === 'bind-key' && args.includes('switch-client'))).toBe(false);
+      expect(root.get('M-3')).toBe('display-message user-owned');
+      if (first.status === 'fulfilled') await first.value.restore();
+      expect(root.get('M-3')).toBe('display-message user-owned');
+      if (next.status === 'fulfilled') await next.value.restore();
+      expect(root.get('M-3')).toBe('display-message user-owned');
+    }
+  );
+
+  it('does not treat a surviving live-owner binding as stale even when its target is known', async () => {
     const { client, root, fenceCalls } = await harness({ 'M-2': GENERATED }, true);
-    const handoff = await beginAttachHandoff(client, CLAUDE, 'Claude', tabs);
-    expect(fenceCalls).toHaveLength(1);
+    await expect(beginAttachHandoff(client, CLAUDE, 'Claude', tabs)).rejects.toThrow('owner cleanup');
+    expect(fenceCalls).toEqual([]);
     expect(root.get('M-2')).toBe(GENERATED);
-    await handoff.restore();
-    expect(root.has('M-2')).toBe(false);
+    await client.unbindSwitchKey('M-2');
+    expect(root.get('M-2')).toBe(GENERATED);
   });
 
-  it('preserves custom switch chains, unrelated targets and keys outside Alt+1..9', async () => {
+  it('preserves custom switch chains and unrelated user keys', async () => {
     const userBindings = {
       'M-1': `switch-client -t ${CLAUDE} ; display-message user-owned`,
       'M-3': 'switch-client -t personal-session',
@@ -122,27 +142,8 @@ describe('owned attach switch binding cleanup', () => {
       F2: LEGACY,
     };
     const { client, root } = await harness(userBindings, false);
-    await client.clearLeakedAttachBanners();
     const handoff = await beginAttachHandoff(client, CLAUDE, 'Claude', tabs);
-    expect(Object.fromEntries([...root].filter(([key]) => key !== 'F1'))).toEqual(userBindings);
-    // A user replacing a claimed switch during attach owns its new command.
-    root.set('M-2', `switch-client -t ${CODEX} ; display-message custom replacement`);
-    await client.unbindSwitchKey('M-2');
-    expect(root.get('M-2')).toContain('custom replacement');
-    root.delete('M-2');
     await handoff.restore();
     expect(Object.fromEntries(root)).toEqual(userBindings);
-  });
-
-  it('refuses handoff when a stale generated jump cannot be removed', async () => {
-    const { client, root, fenceCalls } = await harness({ 'M-2': GENERATED }, false);
-    const originalExec = Reflect.get(client, 'exec') as TuiExecFile;
-    Reflect.set(client, 'exec', async (file: string, args: readonly string[]) => {
-      if (args[2] === 'unbind-key') throw new Error('fixture cleanup failed');
-      return originalExec(file, args);
-    });
-    await expect(beginAttachHandoff(client, CLAUDE, 'Claude', tabs)).rejects.toThrow('fixture cleanup failed');
-    expect(root.get('M-2')).toBe(GENERATED);
-    expect(fenceCalls).toEqual([]);
   });
 });
