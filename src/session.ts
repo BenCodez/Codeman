@@ -2327,13 +2327,25 @@ export class Session extends EventEmitter {
           codexConfig: this._codexConfig,
         })
       : undefined;
+    const lifecycleManaged =
+      this._useMux &&
+      this._muxSession !== null &&
+      !this._discoveredMuxSession &&
+      !this._closing &&
+      !this._isStopped &&
+      !this._respawnBlocked;
     return {
       generation: this._recoveryGeneration,
       submission: this._recoverySubmission,
       intentionalStopAt: this._recoveryIntentionalStopAt,
-      switchPending: this._recoverySwitchPending,
+      // Direct tmux handoff is a permanent authority veto for this pane. Keep
+      // the legacy switch flag derived from it so no caller can accidentally
+      // recover authority by clearing only the ordinary submission fence.
+      switchPending: this._recoverySwitchPending || this._recoveryUntrackedInput,
       untrackedInput: this._recoveryUntrackedInput,
-      managed: this.paneExitApplies && !this._closing && !this._isStopped && !this._respawnBlocked,
+      managed:
+        lifecycleManaged && (this.paneExitApplies || (!!this._remote && this._remote.owned !== false && !this._docker)),
+      remoteOwned: !!this._remote && this._remote.owned !== false,
       noDaemon:
         this._muxSession?.recoveryIsolated === true &&
         this._codexConfig?.noDaemon === true &&
@@ -2358,6 +2370,249 @@ export class Session extends EventEmitter {
     return this._mux?.inspectPaneForRecovery?.(this._muxSession.muxName) ?? null;
   }
 
+  /** The local SSH-wrapper pane only; never use its exit status as remote-agent evidence. */
+  async inspectRemoteTransportPane() {
+    if (!this._remote || !this._muxSession) return null;
+    return this._mux?.inspectPaneForRecovery?.(this._muxSession.muxName) ?? null;
+  }
+
+  /** Deliver after the adapter has revalidated remote rollout and pane evidence. */
+  async deliverRemoteRecoveryInput(
+    conversationId: string,
+    generation: number,
+    prompt: string,
+    dispatch: () => Promise<{ status: 'sent'; submittedAt: number } | { status: 'not-sent' | 'unknown' }>,
+    isCurrent: () => boolean = () => true
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
+    const context = this.getRecoveryContext();
+    if (
+      !isCurrent() ||
+      !context.managed ||
+      !context.remoteOwned ||
+      !context.noDaemon ||
+      context.switchPending ||
+      context.untrackedInput ||
+      this._paneLifecycleOps > 0 ||
+      this._inputDeliveryInFlight ||
+      generation !== context.generation ||
+      this._codexConfig?.resumeSessionId !== conversationId ||
+      !this._mux ||
+      !this._muxSession
+    )
+      return 'not-sent';
+    this._recoveryDelivering = true;
+    this._submitVerifier?.cancel();
+    this._submitVerifier = null;
+    try {
+      return await this._withPaneLifecycle(async () => {
+        const safeConfig = await clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig });
+        const safeEnv = await clampEnvOverridesForOwner(this.owner, this._envOverrides);
+        const current = this.getRecoveryContext();
+        if (
+          !isCurrent() ||
+          !current.managed ||
+          !current.remoteOwned ||
+          !current.noDaemon ||
+          current.switchPending ||
+          current.untrackedInput ||
+          current.generation !== generation ||
+          this._codexConfig?.resumeSessionId !== conversationId ||
+          JSON.stringify(safeConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(safeEnv) !== JSON.stringify(this._envOverrides)
+        )
+          return 'not-sent';
+        const transport = await this.inspectRemoteTransportPane();
+        if (!transport) return 'not-sent';
+        if (transport.dead) {
+          const pid = await this._mux!.respawnPane({
+            ...this._buildRespawnPaneOptions(),
+            remoteAttachOnly: true,
+            onlyIfDead: true,
+          });
+          if (!pid) return 'unknown';
+          this.clearPaneExitForNewPane();
+        }
+        const [finalConfig, finalEnv] = await Promise.all([
+          clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig }),
+          clampEnvOverridesForOwner(this.owner, this._envOverrides),
+        ]);
+        const final = this.getRecoveryContext();
+        if (
+          !isCurrent() ||
+          !final.managed ||
+          !final.remoteOwned ||
+          !final.noDaemon ||
+          final.switchPending ||
+          final.untrackedInput ||
+          generation !== final.generation ||
+          this._codexConfig?.resumeSessionId !== conversationId ||
+          JSON.stringify(finalConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(finalEnv) !== JSON.stringify(this._envOverrides)
+        )
+          return 'not-sent';
+        const receipt = await dispatch();
+        const result = receipt?.status;
+        if (
+          !['sent', 'not-sent', 'unknown'].includes(result ?? '') ||
+          (result === 'sent' && (!Number.isSafeInteger(receipt.submittedAt) || receipt.submittedAt <= 0))
+        )
+          return 'unknown';
+        if (result === 'sent') {
+          this._lastSubmitAt = Date.now();
+          const afterDispatch = this.getRecoveryContext();
+          if (
+            isCurrent() &&
+            afterDispatch.generation === generation &&
+            !afterDispatch.switchPending &&
+            !afterDispatch.untrackedInput
+          ) {
+            this._recoverySubmission = { at: receipt.submittedAt, hash: hashCodexPrompt(prompt) };
+            this._recoverySwitchPending = false;
+            this._publishRecoveryIdentityAfterDispatch();
+          }
+        }
+        return result;
+      });
+    } catch {
+      return 'unknown';
+    } finally {
+      this._recoveryDelivering = false;
+    }
+  }
+
+  /** Reserve owner input and pane lifecycle while a guarded SSH restart performs its final proof. */
+  async restartRemoteRecoveryPane(
+    conversationId: string,
+    generation: number,
+    isCurrent: () => boolean,
+    dispatch: () => Promise<'sent' | 'not-sent' | 'unknown'>
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
+    const context = this.getRecoveryContext();
+    if (
+      !isCurrent() ||
+      !context.managed ||
+      !context.remoteOwned ||
+      !context.noDaemon ||
+      context.switchPending ||
+      context.untrackedInput ||
+      this._paneLifecycleOps > 0 ||
+      this._inputDeliveryInFlight ||
+      context.generation !== generation ||
+      this._codexConfig?.resumeSessionId !== conversationId ||
+      !this._remote ||
+      !this._muxSession
+    )
+      return 'not-sent';
+    this._recoveryDelivering = true;
+    this._submitVerifier?.cancel();
+    this._submitVerifier = null;
+    try {
+      return await this._withPaneLifecycle(async () => {
+        const [safeConfig, safeEnv] = await Promise.all([
+          clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig }),
+          clampEnvOverridesForOwner(this.owner, this._envOverrides),
+        ]);
+        const current = this.getRecoveryContext();
+        if (
+          !isCurrent() ||
+          !current.managed ||
+          !current.remoteOwned ||
+          !current.noDaemon ||
+          current.switchPending ||
+          current.untrackedInput ||
+          current.generation !== generation ||
+          this._codexConfig?.resumeSessionId !== conversationId ||
+          JSON.stringify(safeConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(safeEnv) !== JSON.stringify(this._envOverrides)
+        )
+          return 'not-sent';
+        return dispatch();
+      });
+    } catch {
+      return 'unknown';
+    } finally {
+      this._recoveryDelivering = false;
+    }
+  }
+
+  /** Explicit owner action: rebuild a missing owned remote tmux around an exact resume id. */
+  async restoreMissingRemoteWorker(
+    conversationId: string,
+    generation: number,
+    isCurrent: () => boolean = () => true
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
+    const context = this.getRecoveryContext();
+    if (
+      !isCurrent() ||
+      !context.managed ||
+      !context.remoteOwned ||
+      !context.noDaemon ||
+      context.switchPending ||
+      context.untrackedInput ||
+      this._paneLifecycleOps > 0 ||
+      this._inputDeliveryInFlight ||
+      context.generation !== generation ||
+      this._codexConfig?.resumeSessionId !== conversationId ||
+      !this._mux ||
+      !this._muxSession
+    )
+      return 'not-sent';
+    this._recoveryDelivering = true;
+    this._submitVerifier?.cancel();
+    this._submitVerifier = null;
+    try {
+      return await this._withPaneLifecycle(async () => {
+        const safeConfig = await clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig });
+        const safeEnv = await clampEnvOverridesForOwner(this.owner, this._envOverrides);
+        const current = this.getRecoveryContext();
+        if (
+          !isCurrent() ||
+          !current.managed ||
+          !current.remoteOwned ||
+          !current.noDaemon ||
+          current.switchPending ||
+          current.untrackedInput ||
+          current.generation !== generation ||
+          this._codexConfig?.resumeSessionId !== conversationId ||
+          JSON.stringify(safeConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(safeEnv) !== JSON.stringify(this._envOverrides)
+        )
+          return 'not-sent';
+        const transport = await this.inspectRemoteTransportPane();
+        const [finalConfig, finalEnv] = await Promise.all([
+          clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig }),
+          clampEnvOverridesForOwner(this.owner, this._envOverrides),
+        ]);
+        const final = this.getRecoveryContext();
+        if (
+          !transport?.dead ||
+          !((transport.status ?? 0) > 0 || (transport.signal ?? 0) > 0) ||
+          !isCurrent() ||
+          !final.managed ||
+          !final.remoteOwned ||
+          !final.noDaemon ||
+          final.switchPending ||
+          final.untrackedInput ||
+          generation !== final.generation ||
+          this._codexConfig?.resumeSessionId !== conversationId ||
+          !this._mux ||
+          !this._muxSession ||
+          JSON.stringify(finalConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(finalEnv) !== JSON.stringify(this._envOverrides)
+        )
+          return 'not-sent';
+        const pid = await this._mux!.respawnPane({ ...this._buildRespawnPaneOptions(), onlyIfDead: true });
+        if (!pid) return 'unknown';
+        this.clearPaneExitForNewPane();
+        return 'sent';
+      });
+    } catch {
+      return 'unknown';
+    } finally {
+      this._recoveryDelivering = false;
+    }
+  }
+
   /** Revalidate under the lifecycle guard, and never kill a live pane as crash recovery. */
   async deliverRecovery(
     flight: RecoveryFlight,
@@ -2371,6 +2626,7 @@ export class Session extends EventEmitter {
       !context.managed ||
       !context.noDaemon ||
       context.switchPending ||
+      context.untrackedInput ||
       this._paneLifecycleOps > 0 ||
       this._inputDeliveryInFlight ||
       generation !== context.generation ||
@@ -2395,6 +2651,7 @@ export class Session extends EventEmitter {
           !currentContext.managed ||
           !currentContext.noDaemon ||
           currentContext.switchPending ||
+          currentContext.untrackedInput ||
           currentContext.generation !== generation ||
           this._codexConfig?.resumeSessionId !== flight.conversationId
         )
@@ -4627,6 +4884,7 @@ export class Session extends EventEmitter {
   fenceUntrackedInput(): void {
     if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return;
     this._recoveryUntrackedInput = true;
+    this._recoveryGeneration++;
     this._recoveryInputProofTracker.invalidate();
     this._invalidateRecoverySubmission();
   }

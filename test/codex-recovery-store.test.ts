@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
-import { initialRecoveryState, type RecoveryState } from '../src/recovery/types.js';
+import { initialRecoveryState, type RecoveryReason, type RecoveryState } from '../src/recovery/types.js';
 import { safeRmHomeTree } from './mocks/index.js';
 
 const NOW = Date.UTC(2026, 9, 13, 12);
@@ -124,6 +124,47 @@ describe('recovery journal durability', () => {
     expect(restored.loadFailed).toBe(false);
     expect(restored.get('reserved')).toEqual(reserved);
     expect(restored.get('blocked')).toEqual(blocked);
+  });
+
+  it.each<RecoveryReason>([
+    'transport-unreachable',
+    'transport-unavailable',
+    'remote-inspector-unavailable',
+    'remote-session-missing',
+  ])('round trips the remote recovery reason %s', async (reason) => {
+    const store = new RecoveryStore(path);
+    const state = savedState({
+      lastReason: reason,
+      history: [{ at: NOW, kind: 'state', reason, attempt: 0 }],
+    });
+    await store.save('remote', state);
+    await store.flush();
+    expect(new RecoveryStore(path).get('remote')).toEqual(state);
+  });
+
+  it('persists an explicit missing-remote restore reservation with a store-safe key', async () => {
+    const store = new RecoveryStore(path);
+    const controller = new RecoveryController({
+      observe: async () => ({
+        activity: 'unknown',
+        reason: 'remote-session-missing',
+        at: NOW,
+        conversationId: THREAD,
+        safeToAct: false,
+      }),
+      act: async () => 'not-sent',
+      restoreMissingRemote: async () => 'sent',
+      persist: (state) => store.save('remote-restore', state),
+      changed: () => {},
+      now: () => NOW,
+    });
+    try {
+      await controller.restoreMissingRemote();
+      await store.flush();
+      expect(new RecoveryStore(path).get('remote-restore').inFlight?.key).toBe(`${THREAD}:remote-restore:${NOW}`);
+    } finally {
+      controller.stop();
+    }
   });
 
   it('publishes only complete old or new JSON snapshots during replacement', async () => {

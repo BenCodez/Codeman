@@ -22157,6 +22157,10 @@ html[data-header-stats='tiles'] .header-plan-usage:not(:has(.pu-row)) {
   margin-bottom: 8px;
 }
 
+#sessionOptionsModal #recoveryRestoreRemoteBtn[hidden] {
+  display: none;
+}
+
 #sessionOptionsModal .recovery-actions-hint {
   margin-bottom: 14px;
 }

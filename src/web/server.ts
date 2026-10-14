@@ -2478,6 +2478,12 @@ export class WebServer extends EventEmitter {
             if (taskBlocksRecovery()) return Promise.resolve('not-sent');
             return adapter.act(flight, isCurrent);
           }),
+        restoreMissingRemote: (isCurrent) =>
+          this.getActionArbiter(session.id).run('recovery', () => {
+            const task = this.taskControllers.get(session.id)?.getStatus();
+            if (task?.phase === 'watching' || task?.inFlight) return Promise.resolve('not-sent');
+            return adapter.restoreMissingRemote(isCurrent);
+          }),
         persist: (state) => this.recoveryStore.save(session.id, state),
         changed: (state) => {
           if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;

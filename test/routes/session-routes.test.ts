@@ -2386,6 +2386,97 @@ describe('session-routes', () => {
       expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: ApiErrorCode.INVALID_INPUT });
     });
 
+    it('preserves exact owned remote Codex config and an absolute CODEX_HOME', async () => {
+      const startInteractive = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
+      try {
+        remoteStore.hosts = [
+          {
+            id: 'gpu-box',
+            label: 'GPU Box',
+            host: '10.0.0.42',
+            username: 'ubuntu',
+            port: 2222,
+            identityFile: '/keys/gpu',
+            jumpHost: 'bastion.example',
+            extraSshOptions: ['ConnectTimeout=4'],
+          },
+        ];
+        remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+        const codexConfig = {
+          model: 'gpt-6.1-codex',
+          reasoningEffort: 'high',
+          noDaemon: true,
+          noAltScreen: true,
+          sandbox: 'workspace-write',
+          approvalPolicy: 'on-request',
+        };
+        const res = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: {
+            caseName: 'gpu-work',
+            mode: 'codex',
+            codexConfig,
+            envOverrides: { CODEX_HOME: '/home/ubuntu/.codex-team' },
+          },
+        });
+
+        expect(res.statusCode).toBe(200);
+        const body = JSON.parse(res.body);
+        const session = [...harness.ctx.sessions.values()].find((item) => item.id === body.data.sessionId);
+        expect(session?.codexConfig).toMatchObject(codexConfig);
+        expect(session?.getEnvOverridesForPersist()).toEqual({ CODEX_HOME: '/home/ubuntu/.codex-team' });
+        expect(session?.toState().remote).toMatchObject({
+          port: 2222,
+          identityFile: '/keys/gpu',
+          jumpHost: 'bastion.example',
+          extraSshOptions: ['ConnectTimeout=4'],
+        });
+      } finally {
+        startInteractive.mockRestore();
+      }
+    });
+
+    it.each([
+      { envOverrides: { CODEX_HOME: 'relative/home' } },
+      { envOverrides: { CODEX_HOME: '/home/ubuntu/.codex', OPENAI_API_KEY: 'secret' } },
+    ])('rejects unsafe remote Codex environment overrides: %j', async (extra) => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/quick-start',
+        payload: { caseName: 'gpu-work', mode: 'codex', codexConfig: { noDaemon: true }, ...extra },
+      });
+
+      expect(res.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.INVALID_INPUT));
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: ApiErrorCode.INVALID_INPUT });
+    });
+
+    it('rejects exact remote Codex config when a host command override is authoritative', async () => {
+      remoteStore.hosts = [
+        {
+          id: 'gpu-box',
+          label: 'GPU Box',
+          host: '10.0.0.42',
+          username: 'ubuntu',
+          commands: { codex: 'codex --profile remote' },
+        },
+      ];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/quick-start',
+        payload: { caseName: 'gpu-work', mode: 'codex', codexConfig: { noDaemon: true } },
+      });
+
+      expect(res.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.INVALID_INPUT));
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: ApiErrorCode.INVALID_INPUT });
+    });
+
     it('rejects a remote quick-start when the remote host lacks tmux', async () => {
       remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
       remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];

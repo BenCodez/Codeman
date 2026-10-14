@@ -73,9 +73,13 @@ function fixture(restored = initialRecoveryState()) {
     f.order.push(`act:${flight.action}`);
     return f.outcome;
   });
-  const controller = new RecoveryController({ observe, persist, changed, act, now: () => Date.now() }, restored);
+  const restoreMissingRemote = vi.fn(async () => f.outcome);
+  const controller = new RecoveryController(
+    { observe, persist, changed, act, restoreMissingRemote, now: () => Date.now() },
+    restored
+  );
   controllers.push(controller);
-  return Object.assign(f, { controller, observe, persist, changed, act });
+  return Object.assign(f, { controller, observe, persist, changed, act, restoreMissingRemote });
 }
 
 async function schedule(f: ReturnType<typeof fixture>): Promise<number> {
@@ -101,6 +105,126 @@ function acceptedSubmission(patch: Partial<RecoveryObservation> = {}): RecoveryO
 }
 
 describe('recovery action authority', () => {
+  it('durably reserves an explicit missing-remote restore and never duplicates an in-flight action', async () => {
+    const f = fixture();
+    f.observation = {
+      activity: 'unknown',
+      reason: 'remote-session-missing',
+      at: NOW - 1000,
+      conversationId: THREAD,
+      safeToAct: false,
+    };
+    const first = await f.controller.restoreMissingRemote();
+    expect(f.journal[0].inFlight).toMatchObject({ action: 'restart', conversationId: THREAD });
+    expect(f.restoreMissingRemote).toHaveBeenCalledOnce();
+    expect(first.inFlight).toBeDefined();
+    await f.controller.restoreMissingRemote();
+    expect(f.restoreMissingRemote).toHaveBeenCalledOnce();
+    const restored = fixture(f.journal.at(-1)!);
+    await restored.controller.restoreMissingRemote();
+    expect(restored.restoreMissingRemote).not.toHaveBeenCalled();
+    expect(restored.controller.getStatus()).toMatchObject({ lastReason: 'restart-in-flight', needsAttention: true });
+  });
+
+  it('polls bounded acceptance for an explicit remote restore while automation stays disabled', async () => {
+    const f = fixture();
+    f.observation = {
+      activity: 'unknown',
+      reason: 'remote-session-missing',
+      at: NOW - 1000,
+      conversationId: THREAD,
+      safeToAct: false,
+    };
+    await f.controller.restoreMissingRemote();
+    expect(f.controller.getStatus()).toMatchObject({ config: { enabled: false }, phase: 'recovering' });
+    f.observation = {
+      activity: 'completed',
+      reason: 'turn-completed',
+      at: NOW,
+      conversationId: THREAD,
+      processReady: true,
+      safeToAct: false,
+    };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.controller.getStatus()).toMatchObject({
+      config: { enabled: false },
+      phase: 'watching',
+      lastReason: 'recovery-accepted',
+      inFlight: undefined,
+    });
+    const observations = f.observe.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.observe).toHaveBeenCalledTimes(observations);
+  });
+
+  it('observes acceptance for a second explicit restore after the prior restore was accepted', async () => {
+    const f = fixture();
+    const missing = (at: number): RecoveryObservation => ({
+      activity: 'unknown',
+      reason: 'remote-session-missing',
+      at,
+      conversationId: THREAD,
+      safeToAct: false,
+    });
+    f.observation = missing(NOW - 1000);
+    await f.controller.restoreMissingRemote();
+    f.observation = {
+      activity: 'completed',
+      reason: 'turn-completed',
+      at: NOW,
+      conversationId: THREAD,
+      processReady: true,
+      safeToAct: false,
+    };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+
+    f.observation = missing(Date.now());
+    await f.controller.restoreMissingRemote();
+    expect(f.controller.getStatus().inFlight).toBeDefined();
+    f.observation = {
+      activity: 'idle',
+      reason: 'turn-completed',
+      at: Date.now(),
+      conversationId: THREAD,
+      processReady: true,
+      safeToAct: false,
+    };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.controller.getStatus()).toMatchObject({
+      inFlight: undefined,
+      lastReason: 'recovery-accepted',
+      phase: 'watching',
+    });
+    expect(f.restoreMissingRemote).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds a restore after an accepted manual retry instead of leaving it unobserved', async () => {
+    const f = fixture();
+    await f.controller.retry();
+    f.observation = acceptedSubmission();
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+
+    f.observation = {
+      activity: 'unknown',
+      reason: 'remote-session-missing',
+      at: Date.now(),
+      conversationId: THREAD,
+      safeToAct: false,
+    };
+    await f.controller.restoreMissingRemote();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(f.controller.getStatus()).toMatchObject({
+      lastReason: 'acceptance-unverified',
+      phase: 'paused',
+    });
+    expect(f.controller.getStatus().inFlight).toBeDefined();
+    const observations = f.observe.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(f.observe).toHaveBeenCalledTimes(observations);
+  });
+
   it('is disabled by default and does not poll or act without opt-in', async () => {
     const f = fixture();
     await vi.advanceTimersByTimeAsync(300_000);

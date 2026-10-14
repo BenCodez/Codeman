@@ -2,7 +2,7 @@
 
 Session Options has a dedicated **Recovery** tab for Codex. Automatic recovery starts **off**, including after upgrading an existing installation.
 
-This first milestone supports **Codeman-owned local tmux sessions launched with `--no-daemon`**. It can continue a confirmed failed model turn or resume the exact conversation after a confirmed process crash. The controller stores its settings, retry budget, bounded history and pending delivery in the instance data directory.
+Recovery supports **Codeman-owned local and SSH tmux sessions launched with `--no-daemon`**. It can continue a confirmed failed model turn or resume the exact conversation after a confirmed process crash. The controller stores its settings, retry budget, bounded history and pending delivery in the instance data directory.
 
 ## Launch an eligible session
 
@@ -40,7 +40,7 @@ The status shows observed Codex activity separately from recovery-controller sta
 - Recovery reads bounded structured Codex rollout events. `stream_error` is an internal retry, and steering is not a failure. Assistant prose and historical terminal text cannot authorize a restart.
 - A failed turn needs current structured evidence, two observations, an idle screen and an empty composer. A newer prompt, background work, approval, usage limit, authentication problem or uncertain state prevents automatic input.
 - Recovery uses exact Codex UUIDs validated against rollout metadata. An exact prompt hash plus timestamp can link a submitted prompt to its history entry; timestamp or working-directory similarity alone cannot authorize recovery. The input model preserves simple text and multiline LF paste, and pauses when cursor edits, recalled history, completion, oversized input, or delivery normalization make the submitted bytes uncertain. Conversation switches invalidate pending authority.
-- Shared-daemon sessions pause because the daemon can inherit another terminal's originator environment. Remote, Docker and discovered sessions also pause; their agent identity and ownership need different evidence. Existing SSH reconnect remains responsible for transport reconnection.
+- Shared-daemon and Docker sessions pause because their identity cannot be isolated. Discovered remote sessions pause because Codeman does not own them. Owned SSH sessions use remote rollout and remote tmux evidence; the local ssh-wrapper pane is transport state only.
 - A crash restart requires a fresh, explicit non-zero exit or signal and an exact conversation. The recovery primitive omits tmux's kill-live-pane flag, so a pane that became healthy cannot be killed by a stale crash observation. Clean exits are never revived.
 - Current owner grants are checked after asynchronous evidence reads and immediately before dispatch. Recovery preserves model, effort, directory, environment, sandbox, approvals and supported launch options.
 - Every action is reserved atomically before dispatch. A possibly partial delivery or restart during an in-flight action pauses for inspection instead of replaying it. Inspect the terminal before resetting an uncertain reservation.
@@ -59,12 +59,13 @@ All routes use existing authentication and session ownership checks. `/api/v1` a
 | PUT | `/api/sessions/:id/recovery/config` | Update bounded settings; unknown fields are rejected |
 | POST | `/api/sessions/:id/recovery/retry` | Request one guarded attempt, with no caller-supplied prompt or thread |
 | POST | `/api/sessions/:id/recovery/reset` | Clear retry/circuit/uncertain-reservation state explicitly |
+| POST | `/api/sessions/:id/recovery/restore-remote` | Explicitly recreate a verified missing owned remote worker after a host reboot |
 
 The API returns `{ "success": true, "data": ... }` or the existing error envelope. The owner-scoped SSE event `session:recovery` carries `{ sessionId, state }`. Attention events use the existing push/webhook integrations and sanitized reason codes; ordinary successful retries do not send notifications.
 
 ## Follow-up work
 
-This milestone does not provide remote agent restarts, host-reboot Codex restoration, or **Continue Until Complete** task supervision/checkpoints. Those require independent ownership/completion evidence and remain separate features. It does not restart a prolonged stall or repeatedly continue an ordinary completed/idle turn.
+Remote recovery requires Node.js and tmux on the remote host for its bounded evidence probe. It does not restart a prolonged stall or repeatedly continue an ordinary completed/idle turn.
 
 Codex event fixtures follow [`openai/codex` `rust-v0.162.1` protocol definitions](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/protocol/src/protocol.rs). Unsupported or incomplete event variants remain non-actionable. No live Codex service or private SSH host is needed by the automated recovery tests.
 

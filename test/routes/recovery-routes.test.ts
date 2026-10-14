@@ -16,6 +16,7 @@ describe('recovery-routes', () => {
     updateConfig: ReturnType<typeof vi.fn>;
     retry: ReturnType<typeof vi.fn>;
     reset: ReturnType<typeof vi.fn>;
+    restoreMissingRemote: ReturnType<typeof vi.fn>;
   };
   let getController: ReturnType<typeof vi.fn>;
 
@@ -32,6 +33,7 @@ describe('recovery-routes', () => {
       }),
       retry: vi.fn(async () => ({ ...structuredClone(state), phase: 'watching' })),
       reset: vi.fn(async () => ({ ...structuredClone(state), attempts: 0, lastReason: 'manual-reset' })),
+      restoreMissingRemote: vi.fn(async () => ({ ...structuredClone(state), phase: 'recovering' })),
     };
     getController = vi.fn(() => (supported ? controller : undefined));
     harness = await createRouteTestHarness(
@@ -210,4 +212,41 @@ describe('recovery-routes', () => {
       expect(controller[action]).not.toHaveBeenCalled();
     });
   }
+
+  it('delivers an explicit owned missing-remote restore through the controller boundary', async () => {
+    Object.assign(harness.ctx._session, {
+      remote: { hostId: 'fixture', host: 'fixture.invalid', username: 'runner', remotePath: '/srv/work', owned: true },
+    });
+    state.lastReason = 'remote-session-missing';
+    controller.inspect.mockResolvedValue(structuredClone(state));
+    const response = await harness.app.inject({
+      method: 'POST',
+      url: '/api/sessions/test-session-1/recovery/restore-remote',
+    });
+    expect(response.statusCode).toBe(200);
+    expect(controller.inspect).toHaveBeenCalledExactlyOnceWith();
+    expect(controller.restoreMissingRemote).toHaveBeenCalledExactlyOnceWith();
+    expect(response.json().data.phase).toBe('recovering');
+  });
+
+  it('refuses foreign, local, live, and caller-parameterized remote restores', async () => {
+    for (const remote of [undefined, { owned: false }, { owned: true }]) {
+      Object.assign(harness.ctx._session, { remote });
+      state.lastReason = remote?.owned ? 'turn-running' : 'remote-session-missing';
+      controller.inspect.mockResolvedValue(structuredClone(state));
+      const response = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/recovery/restore-remote',
+      });
+      expect(response.statusCode).toBe(remote?.owned ? 409 : 400);
+    }
+    Object.assign(harness.ctx._session, { remote: { owned: true } });
+    const injected = await harness.app.inject({
+      method: 'POST',
+      url: '/api/sessions/test-session-1/recovery/restore-remote',
+      payload: { conversationId: 'caller-selected' },
+    });
+    expect(injected.statusCode).toBe(400);
+    expect(controller.restoreMissingRemote).not.toHaveBeenCalled();
+  });
 });

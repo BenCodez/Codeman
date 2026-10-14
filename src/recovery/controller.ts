@@ -17,6 +17,8 @@ export interface RecoveryDependencies {
   observe(): Promise<RecoveryObservation>;
   /** 'unknown' includes any possibly-partially-delivered operation; it must never be replayed. */
   act(flight: RecoveryFlight, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
+  /** Explicit owner action for a verified missing owned remote worker. */
+  restoreMissingRemote?(isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
   persist(state: RecoveryState): Promise<void>;
   changed(state: RecoveryState): void;
   now?: () => number;
@@ -219,6 +221,55 @@ export class RecoveryController {
     });
   }
 
+  async restoreMissingRemote(): Promise<RecoveryState> {
+    const revision = ++this.revision;
+    return this.enqueue(async () => {
+      if (this.stopped || !this.deps.restoreMissingRemote || this.state.inFlight) return this.getStatus();
+      const observation = await this.deps.observe();
+      if (
+        this.stopped ||
+        revision !== this.revision ||
+        observation.reason !== 'remote-session-missing' ||
+        !observation.conversationId
+      ) {
+        return this.getStatus();
+      }
+      const key = `${observation.conversationId}:remote-restore:${observation.at}`;
+      this.flightObservationComplete = false;
+      this.state.inFlight = {
+        key,
+        action: 'restart',
+        conversationId: observation.conversationId,
+        startedAt: this.now(),
+      };
+      this.state.phase = 'recovering';
+      this.state.needsAttention = false;
+      this.event('scheduled', 'scheduled');
+      // Durable before the first SSH mutation. The shared arbiter adds its own
+      // cross-controller reservation before dispatch as well.
+      await this.save();
+      let outcome: 'sent' | 'not-sent' | 'unknown';
+      try {
+        outcome = await this.deps.restoreMissingRemote(() => !this.stopped && revision === this.revision);
+      } catch {
+        outcome = 'unknown';
+      }
+      if (outcome === 'sent') {
+        this.event('restart', 'process-resumed');
+      } else if (outcome === 'not-sent') {
+        this.state.inFlight = undefined;
+        this.block('delivery-failed');
+      } else {
+        this.block('acceptance-unverified');
+      }
+      await this.save();
+      // Explicit restore is allowed while automation is disabled. Its durable
+      // restart flight still needs the bounded acceptance observer.
+      this.arm();
+      return this.getStatus();
+    });
+  }
+
   async refresh(): Promise<RecoveryState> {
     return this.enqueue(async () => {
       try {
@@ -369,7 +420,14 @@ export class RecoveryController {
     const key = observation.evidenceKey;
     if (this.state.handledEvidence.includes(key)) return;
     // Enabling recovery never replays old failures from a historical rollout. Manual Retry is explicit.
-    if (!manual && observation.at < (this.state.armedAt ?? this.now())) return;
+    const armedAt = this.state.armedAt ?? this.now();
+    const invalidLiveProof =
+      observation.activity === 'crashed' &&
+      observation.liveProofAt !== undefined &&
+      (!Number.isFinite(observation.liveProofAt) ||
+        observation.liveProofAt > observation.at ||
+        observation.liveProofAt < armedAt);
+    if (!manual && (observation.at < armedAt || invalidLiveProof)) return;
     if (!manual && (this.confirmation?.key !== key || this.now() - this.confirmation.at < CONFIRM_MS)) {
       this.confirmation ??= { key, at: this.now() };
       if (this.confirmation.key !== key) this.confirmation = { key, at: this.now() };

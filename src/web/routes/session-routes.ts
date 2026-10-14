@@ -6,7 +6,7 @@
 
 import { FastifyInstance, type FastifyReply } from 'fastify';
 import { z } from 'zod';
-import { join, dirname, extname, basename } from 'node:path';
+import { join, dirname, extname, basename, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { existsSync, statSync, mkdirSync, writeFileSync } from 'node:fs';
 import { execFile } from 'node:child_process';
@@ -3629,16 +3629,22 @@ export function registerSessionRoutes(
       const host = (await readRemoteHosts(CODEMAN_CONFIG_DIR)).find((item) => item.id === remoteCase.hostId);
       if (!host) return createErrorResponse(ApiErrorCode.NOT_FOUND, 'Remote host not found');
 
-      // Per-session config that is applied to the LOCAL tmux/CLI wrapper (env vars via
-      // tmux setenv, effort/model CLI args, codex/gemini/antigravity/opencode config) does NOT
-      // cross ssh, so it would silently no-op. Reject rather than pretend it worked —
-      // remote command/env customization goes through the per-host command override.
+      // Most per-session config is applied to the local wrapper and cannot cross ssh.
+      // Owned Codex sessions are the one exception: the remote launcher renders the exact
+      // Codex argv and CODEX_HOME, which recovery later verifies before it can act.
+      const remoteEnvKeys = Object.keys(envOverrides ?? {});
+      const remoteCodexHome = envOverrides?.CODEX_HOME;
+      const remoteRecoveryCapable = getCli(mode)?.capabilities.recovery === 'codex-rollout';
+      const hasRemoteCodexLaunchConfig = !!codexConfig || remoteCodexHome !== undefined;
+      const invalidRemoteEnv =
+        remoteEnvKeys.some((key) => !remoteRecoveryCapable || key !== 'CODEX_HOME') ||
+        (remoteCodexHome !== undefined && !isAbsolute(remoteCodexHome));
       if (
-        (envOverrides && Object.keys(envOverrides).length > 0) ||
+        invalidRemoteEnv ||
         effort ||
         advisorModel ||
         modelOverride !== undefined ||
-        codexConfig ||
+        (!remoteRecoveryCapable && codexConfig) ||
         geminiConfig ||
         antigravityConfig ||
         piConfig ||
@@ -3650,7 +3656,13 @@ export function registerSessionRoutes(
       ) {
         return createErrorResponse(
           ApiErrorCode.INVALID_INPUT,
-          'envOverrides, effort, advisorModel, modelOverride, per-CLI config, and custom model endpoints are not supported for remote cases (they do not cross ssh). Configure the remote command via the host command override instead.'
+          'Remote cases only accept Codex launch config and an absolute CODEX_HOME override; effort, advisorModel, modelOverride, other environment/config fields, and custom model endpoints do not cross ssh.'
+        );
+      }
+      if (remoteRecoveryCapable && host.commands?.[mode] && hasRemoteCodexLaunchConfig) {
+        return createErrorResponse(
+          ApiErrorCode.INVALID_INPUT,
+          'A remote Codex host command override cannot be combined with per-session codexConfig or CODEX_HOME.'
         );
       }
 

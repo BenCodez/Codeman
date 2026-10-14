@@ -191,6 +191,30 @@ describe('Recovery Session Options', () => {
     expect(h.input('recoveryEnabled').checked).toBe(false);
   });
 
+  it('shows and delivers the explicit missing owned remote worker action only at its boundary', async () => {
+    const state = initialRecoveryState();
+    state.lastReason = 'remote-session-missing';
+    const h = harness(state);
+    h.app.sessions.set('session-a', {
+      id: 'session-a',
+      mode: 'codex',
+      pid: null,
+      remote: { owned: true, label: 'Fixture' },
+    });
+    await h.open();
+    expect(h.button('recoveryRestoreRemoteBtn').hidden).toBe(false);
+    expect(h.button('recoveryRestoreRemoteBtn').disabled).toBe(false);
+    await h.app.restoreRemoteRecovery();
+    expect(h.fetchMock.mock.calls[1]).toMatchObject([
+      '/api/sessions/session-a/recovery/restore-remote',
+      { method: 'POST' },
+    ]);
+
+    h.app.sessions.get('session-a').remote.owned = false;
+    h.app._renderRecoveryStatus();
+    expect(h.button('recoveryRestoreRemoteBtn').hidden).toBe(true);
+  });
+
   it.each(['managed-daemon', 'unsupported-location', 'unowned-session'] as const)(
     'shows the paused reason and disables retry for %s',
     async (reason) => {

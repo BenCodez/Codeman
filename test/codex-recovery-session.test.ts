@@ -1,14 +1,32 @@
 /** Recovery uses the real Session boundary with an isolated fake mux; never a live agent or tmux socket. */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight } from '../src/recovery/types.js';
 import { createDeferred } from './mocks/index.js';
+import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../src/recovery/codex-adapter.js';
+import { CodexTaskAdapter } from '../src/supervision/adapter.js';
+import { readRebootIdentityFence, writeRebootIdentityFence } from '../src/recovery/reboot-identity-fence.js';
+import { dataPath } from '../src/config/instance.js';
+import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../src/session-env-clamp.js';
+
+vi.mock('../src/session-env-clamp.js', () => ({
+  clampExternalCliConfigsForOwner: vi.fn(async (_owner, configs) => configs),
+  clampEnvOverridesForOwner: vi.fn(async (_owner, env) => env),
+}));
 
 const THREAD = '11111111-2222-3333-4444-555555555555';
 const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const sessions: Session[] = [];
+const configClamp = vi.mocked(clampExternalCliConfigsForOwner);
+const envClamp = vi.mocked(clampEnvOverridesForOwner);
+beforeEach(() => {
+  configClamp.mockReset().mockImplementation(async (_owner, configs) => configs);
+  envClamp.mockReset().mockImplementation(async (_owner, env) => env);
+});
 afterEach(async () => {
   for (const session of sessions.splice(0)) await session.stop(false);
   vi.useRealTimers();
@@ -22,6 +40,7 @@ function fixture(extra: Record<string, unknown> = {}) {
     respawnPane: vi.fn(async () => 99999),
     clearPaneExit: vi.fn(),
     sendInput: vi.fn(async () => true),
+    capturePaneText: vi.fn(async () => '› stale prompt\n'),
   };
   const muxSession = {
     muxName: 'codeman-aaaaaaaa',
@@ -236,6 +255,311 @@ describe('the actual Session recovery boundary', () => {
     const f = fixture();
     f.session.markClosing(true);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
+  });
+});
+
+describe('the actual owned remote Session boundary', () => {
+  const ownedRemote = {
+    hostId: 'fixture-host',
+    label: 'Fixture',
+    host: 'fixture.invalid',
+    username: 'runner',
+    remotePath: '/tmp',
+    owned: true,
+  };
+
+  it('reattaches a healthy worker with attach-only and then delivers once', async () => {
+    const f = fixture({ remote: ownedRemote });
+    const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now() }));
+    Object.assign(f.pane, { dead: true, status: 255, screen: null });
+    expect(f.session.getRecoveryContext()).toMatchObject({ managed: true, remoteOwned: true, noDaemon: true });
+    expect(await f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, dispatch)).toBe('sent');
+    expect(f.mux.respawnPane).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        sessionId: SESSION,
+        onlyIfDead: true,
+        remoteAttachOnly: true,
+        remote: ownedRemote,
+        codexConfig: expect.objectContaining({ resumeSessionId: THREAD, noDaemon: true }),
+        envOverrides: { CODEX_HOME: '/srv/example/codex-home' },
+      })
+    );
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(f.mux.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('does not respawn the local SSH wrapper when it is still live', async () => {
+    const f = fixture({ remote: ownedRemote });
+    const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now() }));
+    Object.assign(f.pane, { dead: false, status: undefined, screen: 'ssh attached' });
+    expect(await f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, dispatch)).toBe('sent');
+    expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(f.mux.sendInput).not.toHaveBeenCalled();
+  });
+
+  it('holds the input reservation through transport reattach and final guarded dispatch', async () => {
+    const f = fixture({ remote: ownedRemote });
+    const reattached = createDeferred<number>();
+    f.mux.respawnPane.mockReturnValueOnce(reattached.promise);
+    const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now() }));
+    const delivery = f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, dispatch);
+    await vi.waitFor(() => expect(f.mux.respawnPane).toHaveBeenCalledOnce());
+    expect(f.session.recoveryInputReserved).toBe(true);
+    expect(await f.session.writeViaMux('owner draft\r', { fromUser: true })).toBe(false);
+    reattached.resolve(12345);
+    expect(await delivery).toBe('sent');
+    expect(dispatch).toHaveBeenCalledOnce();
+    expect(f.session.recoveryInputReserved).toBe(false);
+  });
+
+  it.each(['named-key', 'ordinary-text'] as const)(
+    'excludes all remote mutations while an owner %s send is still in flight',
+    async (kind) => {
+      const f = fixture({ remote: ownedRemote });
+      const held = createDeferred<boolean>();
+      const input =
+        kind === 'named-key'
+          ? f.session.sendNamedKey('\n', async () => {
+              await held.promise;
+            })
+          : (() => {
+              f.mux.sendInput.mockReturnValueOnce(held.promise);
+              return f.session.writeViaMux('owner draft', { fromUser: true });
+            })();
+      // Current generation and valid identity make the in-flight input the veto.
+      const context = f.session.getRecoveryContext();
+      expect(context).toMatchObject({ managed: true, remoteOwned: true, switchPending: false, untrackedInput: false });
+      expect(f.session.paneLifecycleInFlight).toBe(true);
+      const deliver = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now() }));
+      const restart = vi.fn(async () => 'sent' as const);
+      expect(await f.session.deliverRemoteRecoveryInput(THREAD, context.generation, CONTINUATION_PROMPT, deliver)).toBe(
+        'not-sent'
+      );
+      expect(await f.session.restartRemoteRecoveryPane(THREAD, context.generation, () => true, restart)).toBe(
+        'not-sent'
+      );
+      expect(await f.session.restoreMissingRemoteWorker(THREAD, context.generation)).toBe('not-sent');
+      expect(deliver).not.toHaveBeenCalled();
+      expect(restart).not.toHaveBeenCalled();
+      expect(f.mux.inspectPaneForRecovery).not.toHaveBeenCalled();
+      expect(f.mux.respawnPane).not.toHaveBeenCalled();
+      held.resolve(true);
+      expect(await input).toBe(true);
+      expect(f.session.paneLifecycleInFlight).toBe(false);
+      expect(await f.session.restartRemoteRecoveryPane(THREAD, context.generation, () => true, restart)).toBe('sent');
+      expect(restart).toHaveBeenCalledOnce();
+    }
+  );
+
+  it.each(['sent', 'unknown'] as const)(
+    'keeps a direct-attach taint that lands while guarded remote input is in flight and resolves %s',
+    async (outcome) => {
+      const taintedSession = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+      const fencePath = dataPath('reboot-identities', `${taintedSession}.json`);
+      rmSync(fencePath, { force: true });
+      const f = fixture({ id: taintedSession, remote: ownedRemote });
+      Object.assign(f.pane, { dead: false, status: undefined, screen: 'ssh attached' });
+      const started = createDeferred<void>();
+      const dispatched = createDeferred<{ status: 'sent'; submittedAt: number } | { status: 'unknown' }>();
+      const initialGeneration = f.session.getRecoveryContext().generation;
+      f.session.on('recoveryIdentityChanged', () => {
+        const context = f.session.getRecoveryContext();
+        writeRebootIdentityFence(taintedSession, {
+          switchPending: context.switchPending,
+          submission: context.submission,
+          untrackedInput: context.untrackedInput,
+        });
+      });
+      try {
+        const delivery = f.session.deliverRemoteRecoveryInput(
+          THREAD,
+          initialGeneration,
+          CONTINUATION_PROMPT,
+          async () => {
+            started.resolve();
+            return dispatched.promise;
+          }
+        );
+        await started.promise;
+        f.session.fenceUntrackedInput();
+        expect(f.session.getRecoveryContext()).toMatchObject({
+          generation: initialGeneration + 1,
+          submission: undefined,
+          switchPending: true,
+          untrackedInput: true,
+        });
+        dispatched.resolve(
+          outcome === 'sent' ? { status: outcome, submittedAt: Date.now() - 3_000 } : { status: outcome }
+        );
+        expect(await delivery).toBe(outcome);
+        expect(f.session.getRecoveryContext()).toMatchObject({
+          generation: initialGeneration + 1,
+          submission: undefined,
+          switchPending: true,
+          untrackedInput: true,
+        });
+        expect(readRebootIdentityFence(taintedSession)).toEqual({
+          switchPending: true,
+          submission: undefined,
+          untrackedInput: true,
+        });
+
+        const inspectRemote = vi.fn(async () => {
+          throw new Error('tainted recovery must not inspect remote authority');
+        });
+        const deps: CodexRecoveryAdapterDeps = {
+          inspectRemote,
+          restartRemote: vi.fn(async () => 'not-sent'),
+          deliverRemote: vi.fn(async () => ({ status: 'not-sent' })),
+        };
+        expect(await new CodexRecoveryAdapter(f.session, () => {}, deps).observe()).toMatchObject({
+          activity: 'unknown',
+          reason: 'identity-unverified',
+          safeToAct: false,
+        });
+        expect((await new CodexTaskAdapter(f.session, () => {}, deps).observe()).observation).toMatchObject({
+          activity: 'unknown',
+          reason: 'identity-unverified',
+          safeToAct: false,
+        });
+        expect(inspectRemote).not.toHaveBeenCalled();
+
+        const reconstructed = new Session({
+          id: taintedSession,
+          workingDir: '/tmp',
+          mode: 'codex',
+          useMux: false,
+          codexConfig: { noDaemon: true, resumeSessionId: THREAD },
+        });
+        sessions.push(reconstructed);
+        expect(reconstructed.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
+      } finally {
+        rmSync(fencePath, { force: true });
+      }
+    }
+  );
+
+  it('records the remote send instant after an acknowledgement delayed beyond identity tolerance', async () => {
+    vi.useFakeTimers();
+    const f = fixture({ remote: ownedRemote });
+    Object.assign(f.pane, { dead: false, status: undefined, screen: 'ssh attached' });
+    const remoteSendAt = Date.now() - 60_000;
+    const delivery = f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, async () => {
+      await new Promise((resolve) => setTimeout(resolve, 3_000));
+      return { status: 'sent', submittedAt: remoteSendAt };
+    });
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(await delivery).toBe('sent');
+    expect(f.session.getRecoveryContext().submission).toEqual({
+      at: remoteSendAt,
+      hash: createHash('sha256').update(CONTINUATION_PROMPT, 'utf8').digest('hex'),
+    });
+  });
+
+  it.each(['input', 'restart', 'restore'] as const)(
+    'cancels the stale automatic Enter verifier before remote %s reservation',
+    async (kind) => {
+      vi.useFakeTimers();
+      const f = fixture({ remote: ownedRemote });
+      f.session.verifySubmitted('stale prompt');
+      const deferred = createDeferred<void>();
+      let operation: Promise<'sent' | 'not-sent' | 'unknown'>;
+      if (kind === 'input') {
+        Object.assign(f.pane, { dead: false, status: undefined, screen: 'ssh attached' });
+        operation = f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, async () => {
+          await deferred.promise;
+          return { status: 'sent', submittedAt: Date.now() };
+        });
+      } else if (kind === 'restart') {
+        operation = f.session.restartRemoteRecoveryPane(
+          THREAD,
+          0,
+          () => true,
+          async () => {
+            await deferred.promise;
+            return 'sent';
+          }
+        );
+      } else {
+        f.mux.respawnPane.mockImplementationOnce(async () => {
+          await deferred.promise;
+          return 99999;
+        });
+        operation = f.session.restoreMissingRemoteWorker(THREAD, 0);
+      }
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(f.mux.capturePaneText).not.toHaveBeenCalled();
+      expect(f.mux.sendInput).not.toHaveBeenCalled();
+      deferred.resolve();
+      expect(await operation).toBe('sent');
+    }
+  );
+
+  it('reserves owner input for a remote restart and cancels before dispatch when authority changes', async () => {
+    const f = fixture({ remote: ownedRemote });
+    const dispatch = vi.fn(async () => 'sent' as const);
+    const restart = f.session.restartRemoteRecoveryPane(THREAD, 0, () => true, dispatch);
+    expect(f.session.recoveryInputReserved).toBe(true);
+    f.session.markClosing(true);
+    expect(await restart).toBe('not-sent');
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(f.session.recoveryInputReserved).toBe(false);
+  });
+
+  it('explicitly rebuilds a missing worker only through a confirmed dead local wrapper', async () => {
+    const f = fixture({ remote: ownedRemote });
+    expect(await f.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('sent');
+    expect(f.mux.respawnPane).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        onlyIfDead: true,
+        remote: ownedRemote,
+        codexConfig: expect.objectContaining({ resumeSessionId: THREAD }),
+        envOverrides: { CODEX_HOME: '/srv/example/codex-home' },
+      })
+    );
+    const live = fixture({ remote: ownedRemote });
+    Object.assign(live.pane, { dead: false, status: undefined, screen: 'ssh attached' });
+    expect(await live.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
+    expect(live.mux.respawnPane).not.toHaveBeenCalled();
+
+    const clean = fixture({ remote: ownedRemote });
+    Object.assign(clean.pane, { dead: true, status: 0, signal: undefined, screen: null });
+    expect(await clean.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
+    expect(clean.mux.respawnPane).not.toHaveBeenCalled();
+  });
+
+  it.each(['closing', 'config', 'grant'] as const)(
+    'rechecks %s authority after the missing-worker transport probe',
+    async (change) => {
+      const f = fixture({ remote: ownedRemote });
+      const pending = createDeferred<typeof f.pane>();
+      f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
+      const restore = f.session.restoreMissingRemoteWorker(THREAD, 0);
+      await vi.waitFor(() => expect(f.mux.inspectPaneForRecovery).toHaveBeenCalledOnce());
+
+      if (change === 'closing') f.session.markClosing(true);
+      else if (change === 'config') f.session.pinRecoveryConversation('22222222-2222-3333-4444-555555555555');
+      else configClamp.mockImplementation(async () => ({ codexConfig: undefined }));
+
+      pending.resolve(f.pane);
+      expect(await restore).toBe('not-sent');
+      expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    }
+  );
+
+  it('refuses foreign remote ownership at the last delivery boundary', async () => {
+    const f = fixture({ remote: { ...ownedRemote, owned: false } });
+    expect(f.session.getRecoveryContext().managed).toBe(false);
+    expect(
+      await f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, async () => ({
+        status: 'sent',
+        submittedAt: Date.now(),
+      }))
+    ).toBe('not-sent');
+    expect(await f.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
+    expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    expect(f.mux.sendInput).not.toHaveBeenCalled();
   });
 });
 

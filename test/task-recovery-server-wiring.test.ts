@@ -321,6 +321,37 @@ describe('task and recovery server action wiring', () => {
     expect(taskAct).toHaveBeenCalledOnce();
   });
 
+  it('shares the recovery reservation and task phase guards for missing remote restoration', async () => {
+    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({
+      observation: {
+        activity: 'completed',
+        reason: 'turn-completed',
+        at: Date.now(),
+        conversationId: flight.conversationId,
+        processReady: true,
+        safeToAct: false,
+      },
+      commands: new Map(),
+    });
+    const restore = vi.spyOn(CodexRecoveryAdapter.prototype, 'restoreMissingRemote').mockResolvedValue('unknown');
+    const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
+    const { task, taskDeps, recovery, recoveryDeps } = controllers('remote-restore-action-boundary');
+    await task.update({
+      objective: 'Verify remote work',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { enabled: true },
+    });
+    expect(await recoveryDeps.restoreMissingRemote!(() => true)).toBe('not-sent');
+    expect(restore).not.toHaveBeenCalled();
+    await task.pause();
+    expect(await recoveryDeps.restoreMissingRemote!(() => true)).toBe('unknown');
+    await task.reset();
+    expect(await taskDeps.act('task-key', flight.conversationId, 'continue', () => true)).toBe('not-sent');
+    expect(taskAct).not.toHaveBeenCalled();
+    await recovery.reset();
+    expect(await taskDeps.act('task-key', flight.conversationId, 'continue', () => true)).toBe('sent');
+  });
+
   it('allows recovery beside task supervision paused by a server restart', async () => {
     const id = 'task-restart-paused';
     const state = initialTaskState();

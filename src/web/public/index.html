@@ -1523,7 +1523,7 @@
                 <h2>Recovery</h2>
               </div>
               <p class="set-section-blurb">Resume verified unfinished work after an interruption or crash, with bounded retries.</p>
-              <p class="set-group-hint">Automatic recovery requires a Codeman-owned local Codex session launched with --no-daemon. Daemon, remote, Docker, and discovered sessions remain paused.</p>
+              <p class="set-group-hint">Automatic recovery requires a Codeman-owned Codex session launched with --no-daemon. Owned SSH sessions use bounded remote evidence; Docker and discovered sessions remain paused.</p>
               <p class="recovery-notice" id="recoveryError" role="alert" hidden>Recovery status is unavailable. Refresh to try again.</p>
 
               <div class="set-group">
@@ -1542,6 +1542,7 @@
                 <div class="recovery-actions">
                   <button type="button" class="btn-toolbar btn-sm" id="recoveryRefreshBtn" onclick="app.loadRecoveryStatus()">Refresh status</button>
                   <button type="button" class="btn-toolbar btn-sm" id="recoveryRetryBtn" onclick="app.retryRecovery()" disabled>Retry recovery</button>
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryRestoreRemoteBtn" onclick="app.restoreRemoteRecovery()" hidden disabled>Restore remote worker</button>
                   <button type="button" class="btn-toolbar btn-sm" id="recoveryResetBtn" onclick="app.resetRecovery()" disabled>Reset recovery</button>
                 </div>
                 <p class="set-group-hint recovery-actions-hint">Retry rechecks safety before acting. Reset clears retry limits without restarting the session.</p>

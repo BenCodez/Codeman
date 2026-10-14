@@ -4,15 +4,18 @@
  */
 import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Session } from '../src/session.js';
 import type { CodexConfig } from '../src/types/session.js';
 import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../src/session-env-clamp.js';
-import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
+import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../src/recovery/codex-adapter.js';
+import type { RemoteCodexEvidence, RemoteCodexInputResult } from '../src/recovery/remote-codex.js';
 import { resolveCodexIdentity, type CodexIdentityResult } from '../src/recovery/codex-identity.js';
 import type { RecoveryFlight, RecoveryObservation } from '../src/recovery/types.js';
+import { RecoveryController } from '../src/recovery/controller.js';
+import { RecoveryStore } from '../src/recovery/store.js';
 import { createDeferred } from './mocks/index.js';
 
 vi.mock('../src/recovery/codex-identity.js', () => ({ resolveCodexIdentity: vi.fn() }));
@@ -95,6 +98,7 @@ function fixture() {
       submission: undefined as { at: number; hash: string } | undefined,
     },
     pane: { dead: false, screen: READY } as Pane | null,
+    transportPane: { dead: true, status: 255, screen: null } as Pane | null,
     identity: {
       reason: 'verified',
       conversationId: THREAD,
@@ -105,6 +109,20 @@ function fixture() {
     env: undefined as Record<string, string> | undefined,
     busy: false,
     delivery: 'sent' as DeliveryResult,
+    remoteEvidence: {
+      transport: 'reachable',
+      session: 'present',
+      pane: { dead: false, paneId: '%7', panePid: 700, screen: READY },
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: failedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 9_000,
+      },
+    } as RemoteCodexEvidence,
+    remoteRestart: 'sent' as const as 'sent' | 'not-sent' | 'unknown',
+    remoteDelivery: { status: 'sent', submittedAt: NOW } as RemoteCodexInputResult,
   };
   const session = {
     id: SESSION,
@@ -119,16 +137,39 @@ function fixture() {
     getRecoveryContext: vi.fn(() => ({ ...state.context })),
     getEnvOverridesForPersist: vi.fn(() => state.env),
     inspectRecoveryPane: vi.fn(async () => state.pane),
+    inspectRemoteTransportPane: vi.fn(async () => state.transportPane),
     isBusy: vi.fn(() => state.busy),
     pinRecoveryConversation: vi.fn((id: string) => {
       session.codexConfig = { ...session.codexConfig, resumeSessionId: id };
     }),
     deliverRecovery: vi.fn(async (_flight: RecoveryFlight, _generation: number) => state.delivery),
+    deliverRemoteRecoveryInput: vi.fn(
+      async (
+        _conversationId: string,
+        _generation: number,
+        _prompt: string,
+        dispatch: () => Promise<RemoteCodexInputResult>
+      ) => (await dispatch()).status
+    ),
+    restartRemoteRecoveryPane: vi.fn(
+      async (
+        _conversationId: string,
+        _generation: number,
+        _isCurrent: () => boolean,
+        dispatch: () => Promise<DeliveryResult>
+      ) => dispatch()
+    ),
+    restoreMissingRemoteWorker: vi.fn(async () => state.delivery),
   };
   const persist = vi.fn();
-  const adapter = new CodexRecoveryAdapter(session as unknown as Session, persist);
+  const deps: CodexRecoveryAdapterDeps = {
+    inspectRemote: vi.fn(async () => structuredClone(state.remoteEvidence)),
+    restartRemote: vi.fn(async () => state.remoteRestart),
+    deliverRemote: vi.fn(async () => state.remoteDelivery),
+  };
+  const adapter = new CodexRecoveryAdapter(session as unknown as Session, persist, deps);
   resolver.mockImplementation(async () => structuredClone(state.identity));
-  return Object.assign(state, { session, adapter, persist });
+  return Object.assign(state, { session, adapter, persist, deps });
 }
 
 async function withRollout(
@@ -312,10 +353,10 @@ describe('exact current identity and delivery proof', () => {
 });
 
 describe('ownership, location and isolated-launch gates', () => {
-  it.each([true, false])('never mutates an owned:%s remote transport', async (owned) => {
+  it('never mutates a foreign remote transport', async () => {
     const f = fixture();
-    f.session.remote = { owned } as Session['remote'];
-    expect(await f.adapter.observe()).toMatchObject({ reason: 'unsupported-location', safeToAct: false });
+    f.session.remote = { owned: false } as Session['remote'];
+    expect(await f.adapter.observe()).toMatchObject({ reason: 'unowned-session', safeToAct: false });
     expect(resolver).not.toHaveBeenCalled();
     expect(f.session.inspectRecoveryPane).not.toHaveBeenCalled();
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
@@ -660,6 +701,476 @@ describe('authoritative agent exits and process readiness', () => {
     expect(await f.adapter.observe()).toMatchObject({ processReady: false, safeToAct: false });
     f.pane = { dead: false, screen: `Sanitized sign in requirement\n${READY}` };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'blocked', processReady: false, safeToAct: false });
+  });
+});
+
+describe('owned remote evidence and mutation', () => {
+  function remoteFixture() {
+    const f = fixture();
+    f.context.submission = {
+      at: NOW - 20_000,
+      hash: createHash('sha256').update('Remote fixture request.').digest('hex'),
+    };
+    f.session.remote = {
+      hostId: 'fixture-host',
+      label: 'Fixture',
+      host: 'fixture.invalid',
+      username: 'runner',
+      remotePath: '/fixture/workspace',
+      owned: true,
+    } as Session['remote'];
+    return f;
+  }
+
+  const invalidLifecycleRows = [
+    { name: 'malformed JSON', row: '{broken-json}' },
+    {
+      name: 'unsupported lifecycle schema',
+      row: event({ type: 'task_complete', turn_id: { unsupported: 'fixture-turn' } }, NOW - 9_250),
+    },
+  ];
+
+  it.each(invalidLifecycleRows)('vetoes a dead remote pane with $name after a live child', async ({ row }) => {
+    const f = remoteFixture();
+    f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
+    f.remoteEvidence.identity.tail = failedTail(event(CHILD_SPAWN, NOW - 9_500), row);
+    expect(await f.adapter.observe()).toMatchObject({ activity: 'unknown', safeToAct: false });
+    expect(f.session.restartRemoteRecoveryPane).not.toHaveBeenCalled();
+    expect(f.deps.restartRemote).not.toHaveBeenCalled();
+  });
+
+  it.each(invalidLifecycleRows)(
+    'vetoes a remote restart reservation when final evidence has $name',
+    async ({ row }) => {
+      const f = remoteFixture();
+      f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
+      const reservation = flight(await f.adapter.observe(), 'restart');
+      f.remoteEvidence.identity.tail = failedTail(event(CHILD_SPAWN, NOW - 9_500), row);
+      expect(await f.adapter.act(reservation)).toBe('not-sent');
+      expect(f.session.restartRemoteRecoveryPane).not.toHaveBeenCalled();
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+    }
+  );
+
+  it('permits verified remote crash restart after a complete child lifecycle settles', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
+    f.remoteEvidence.identity.tail = failedTail(
+      event(CHILD_SPAWN, NOW - 9_500),
+      event(
+        {
+          type: 'collab_wait_end',
+          call_id: 'fixture-wait',
+          sender_thread_id: THREAD,
+          statuses: { [OTHER]: 'completed' },
+        },
+        NOW - 9_250
+      )
+    );
+    expect(await f.adapter.act(flight(await f.adapter.observe(), 'restart'))).toBe('sent');
+    expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+  });
+
+  it('separates an unreachable SSH transport from a missing remote worker', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence = { transport: 'unreachable', session: 'unknown', identity: { reason: 'unreadable' } };
+    expect(await f.adapter.observe()).toMatchObject({ reason: 'transport-unreachable', safeToAct: false });
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'missing',
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 1000,
+      },
+    };
+    expect(await f.adapter.observe()).toMatchObject({
+      reason: 'remote-session-missing',
+      conversationId: THREAD,
+      safeToAct: false,
+    });
+  });
+
+  it('reports an SSH authentication/inspection failure without claiming the host is unreachable', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence = { transport: 'unavailable', session: 'unknown', identity: { reason: 'unreadable' } };
+    expect(await f.adapter.observe()).toMatchObject({ reason: 'transport-unavailable', safeToAct: false });
+  });
+
+  it('reports a missing remote inspector runtime as unsupported without restart', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence = { transport: 'reachable', session: 'unknown', identity: { reason: 'unsupported' } };
+    expect(await f.adapter.observe()).toMatchObject({ reason: 'remote-inspector-unavailable', safeToAct: false });
+    expect(f.deps.restartRemote).not.toHaveBeenCalled();
+  });
+
+  it.each([true, undefined])(
+    'refuses remote input and restart when the bounded tail truncation signal is %s',
+    async (tailTruncated) => {
+      const f = remoteFixture();
+      f.remoteEvidence = {
+        transport: 'reachable',
+        session: 'present',
+        pane: { dead: false, paneId: '%7', panePid: 700, screen: READY },
+        identity: {
+          reason: 'verified',
+          conversationId: THREAD,
+          tail: completedTail(),
+          tailTruncated,
+          changedAt: NOW - 1000,
+        },
+      };
+      expect(await f.adapter.observe()).toMatchObject({ reason: 'identity-unverified', safeToAct: false });
+      expect(await f.adapter.deliverRemotePrompt(THREAD, 3, 'Fixture kickoff', () => true)).toBe('not-sent');
+
+      f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%7', panePid: 700, screen: null };
+      expect(await f.adapter.observe()).toMatchObject({ reason: 'identity-unverified', safeToAct: false });
+      expect(f.session.restartRemoteRecoveryPane).not.toHaveBeenCalled();
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+    }
+  );
+
+  it('treats a missing remote tmux after a clean ssh-wrapper exit as /exit, never reboot restore', async () => {
+    const f = remoteFixture();
+    f.transportPane = { dead: true, status: 0, screen: null };
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'missing',
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 1000,
+      },
+    };
+    expect(await f.adapter.observe()).toMatchObject({ activity: 'exited', reason: 'clean-exit', safeToAct: false });
+    expect(await f.adapter.restoreMissingRemote()).toBe('not-sent');
+    expect(f.session.restoreMissingRemoteWorker).not.toHaveBeenCalled();
+  });
+
+  it('sends exact current ordinary-submission proof to the remote reader', async () => {
+    const f = remoteFixture();
+    f.context.submission = {
+      at: NOW - 20_000,
+      hash: createHash('sha256').update('Remote fixture request.').digest('hex'),
+    };
+    await f.adapter.observe();
+    expect(f.deps.inspectRemote).toHaveBeenCalledWith(
+      f.session.remote,
+      expect.objectContaining({ submission: f.context.submission, resumeId: THREAD })
+    );
+  });
+
+  it('never accepts originator or a pinned resume id without current ordinary-submission proof', async () => {
+    const f = remoteFixture();
+    f.context.submission = undefined;
+    expect(await f.adapter.observe()).toMatchObject({ reason: 'identity-unverified', safeToAct: false });
+    expect(f.deps.inspectRemote).toHaveBeenCalledExactlyOnceWith(
+      f.session.remote,
+      expect.objectContaining({ submission: undefined, resumeId: THREAD })
+    );
+  });
+
+  it('reattaches a healthy remote worker before delivering without restarting its pane', async () => {
+    const f = remoteFixture();
+    const observation = await f.adapter.observe();
+    expect(observation).toMatchObject({ activity: 'interrupted', safeToAct: true });
+    expect(await f.adapter.act(flight(observation))).toBe('sent');
+    expect(f.session.deliverRemoteRecoveryInput).toHaveBeenCalledWith(
+      THREAD,
+      3,
+      expect.stringContaining('Continue the previous unfinished task'),
+      expect.any(Function),
+      expect.any(Function)
+    );
+    expect(f.deps.deliverRemote).toHaveBeenCalledWith(
+      f.session.remote,
+      expect.objectContaining({
+        prompt: expect.stringContaining('Continue the previous unfinished task'),
+        submission: f.context.submission,
+        expected: expect.objectContaining({ conversationId: THREAD, paneId: '%7', panePid: 700 }),
+      })
+    );
+    expect(f.deps.restartRemote).not.toHaveBeenCalled();
+  });
+
+  it('restarts only an exact abnormal remote dead pane and never uses the local wrapper exit', async () => {
+    const f = remoteFixture();
+    f.session.paneExit = { at: NOW - 1000, status: 0 } as Session['paneExit'];
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'present',
+      pane: { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null },
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: failedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 9000,
+      },
+    };
+    const observation = await f.adapter.observe();
+    expect(observation).toMatchObject({ activity: 'crashed', reason: 'process-crashed', safeToAct: true });
+    expect(await f.adapter.act(flight(observation, 'restart'))).toBe('sent');
+    expect(f.session.restartRemoteRecoveryPane).toHaveBeenCalledWith(
+      THREAD,
+      3,
+      expect.any(Function),
+      expect.any(Function)
+    );
+    expect(f.deps.restartRemote).toHaveBeenCalledExactlyOnceWith(
+      f.session.remote,
+      expect.objectContaining({
+        sessionId: SESSION,
+        resumeId: THREAD,
+        submission: f.context.submission,
+        expectedIdentity: expect.objectContaining({ conversationId: THREAD, tailHash: expect.any(String) }),
+        expectedPane: { paneId: '%9', panePid: 901, status: 17, signal: undefined },
+        codexHome: '/fixture/codex-home',
+        codexConfig: expect.objectContaining({ resumeSessionId: THREAD, noDaemon: true }),
+      })
+    );
+  });
+
+  it('persists and recovers a fresh live-to-dead remote pane transition when the rollout did not change', async () => {
+    const f = remoteFixture();
+    const root = await fs.mkdtemp(join(tmpdir(), 'codeman-remote-crash-store-'));
+    const store = new RecoveryStore(join(root, 'recovery.json'));
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'present',
+      pane: { dead: false, paneId: '%9', panePid: 901, screen: READY },
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW + 60_000,
+      },
+    };
+    const controller = new RecoveryController({
+      observe: () => f.adapter.observe(),
+      act: (reservation, isCurrent) => f.adapter.act(reservation, isCurrent),
+      persist: (state) => store.save(SESSION, state),
+      changed: () => {},
+      now: () => Date.now(),
+    });
+    try {
+      await controller.updateConfig({ enabled: true, retryDelayMs: 1000 });
+      await controller.refresh();
+      vi.setSystemTime(NOW + 1000);
+      f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
+      await controller.refresh();
+      expect(controller.getStatus().inFlight).toBeUndefined();
+      vi.setSystemTime(NOW + 3000);
+      await controller.refresh();
+      vi.setSystemTime(NOW + 4000);
+      await controller.refresh();
+      expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+      expect(controller.getStatus().inFlight).toBeDefined();
+      await store.flush();
+      const persisted = new RecoveryStore(join(root, 'recovery.json')).get(SESSION);
+      expect(persisted.lastReason).not.toBe('persistence-failed');
+      expect(persisted.inFlight?.key).toMatch(new RegExp(`^${THREAD}:remote-pane:[a-f0-9]{64}$`));
+      expect(persisted.inFlight?.key).not.toContain('%9');
+    } finally {
+      controller.stop();
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not recover an already-dead remote pane from a future rollout timestamp', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'present',
+      pane: { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null },
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW + 60_000,
+      },
+    };
+    expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', at: 0, safeToAct: false });
+    const controller = new RecoveryController({
+      observe: () => f.adapter.observe(),
+      act: (reservation, isCurrent) => f.adapter.act(reservation, isCurrent),
+      persist: async () => {},
+      changed: () => {},
+      now: () => Date.now(),
+    });
+    try {
+      await controller.updateConfig({ enabled: true, retryDelayMs: 1000 });
+      await controller.refresh();
+      vi.setSystemTime(NOW + 59_000);
+      await controller.refresh();
+      vi.setSystemTime(NOW + 60_000);
+      await controller.refresh();
+      vi.setSystemTime(NOW + 62_000);
+      await controller.refresh();
+      vi.setSystemTime(NOW + 65_000);
+      await controller.refresh();
+
+      expect(controller.getStatus()).toMatchObject({ attempts: 0, failedAttempts: 0 });
+      expect(controller.getStatus().pending).toBeUndefined();
+      expect(controller.getStatus().inFlight).toBeUndefined();
+      expect(f.session.restartRemoteRecoveryPane).not.toHaveBeenCalled();
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', at: 0, safeToAct: false });
+      expect(
+        await new CodexRecoveryAdapter(f.session as unknown as Session, f.persist, f.deps).observe()
+      ).toMatchObject({ activity: 'crashed', at: 0, safeToAct: false });
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it('does not recover a remote pane that was already dead before recovery was enabled', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'present',
+      pane: { dead: false, paneId: '%9', panePid: 901, screen: READY },
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 60_000,
+      },
+    };
+    vi.setSystemTime(NOW - 10_000);
+    await f.adapter.observe();
+    f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
+    vi.setSystemTime(NOW - 5000);
+    expect(await f.adapter.observe()).toMatchObject({
+      activity: 'crashed',
+      at: NOW - 5000,
+      liveProofAt: NOW - 10_000,
+    });
+
+    vi.setSystemTime(NOW);
+    const controller = new RecoveryController({
+      observe: () => f.adapter.observe(),
+      act: (reservation, isCurrent) => f.adapter.act(reservation, isCurrent),
+      persist: async () => {},
+      changed: () => {},
+      now: () => Date.now(),
+    });
+    try {
+      await controller.updateConfig({ enabled: true, retryDelayMs: 1000 });
+      await controller.refresh();
+      vi.setSystemTime(NOW + 10_000);
+      await controller.refresh();
+      expect(controller.getStatus().inFlight).toBeUndefined();
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it('vetoes a dead remote pane while structured child work is unfinished', async () => {
+    const f = remoteFixture();
+    const tail =
+      event({ type: 'task_started', turn_id: 'fixture-turn' }, NOW - 10_000) +
+      '\n' +
+      event(
+        {
+          type: 'collab_agent_spawn_end',
+          call_id: 'fixture-spawn',
+          sender_thread_id: THREAD,
+          new_thread_id: OTHER,
+          status: 'running',
+        },
+        NOW - 9_500
+      ) +
+      '\n' +
+      event(
+        { type: 'task_complete', turn_id: 'fixture-turn', error: { message: 'Conversation interrupted.' } },
+        NOW - 9_000
+      ) +
+      '\n';
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'present',
+      pane: { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null },
+      identity: { reason: 'verified', conversationId: THREAD, tail, tailTruncated: false, changedAt: NOW - 9_000 },
+    };
+    expect(await f.adapter.observe()).toMatchObject({
+      activity: 'watching',
+      reason: 'background-work',
+      safeToAct: false,
+    });
+    expect(f.deps.restartRemote).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { dead: true, status: 0, paneId: '%7', panePid: 700, screen: null },
+    { dead: true, paneId: '%7', panePid: 700, screen: null },
+  ])('never revives clean or unverified remote pane exit %j', async (pane) => {
+    const f = remoteFixture();
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'present',
+      pane,
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: failedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 9000,
+      },
+    };
+    expect(await f.adapter.observe()).toMatchObject({ safeToAct: false });
+    expect(f.deps.restartRemote).not.toHaveBeenCalled();
+  });
+
+  it('double-checks exact missing identity before explicit owner restore', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'missing',
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 1000,
+      },
+    };
+    expect(await f.adapter.restoreMissingRemote()).toBe('sent');
+    expect(f.deps.inspectRemote).toHaveBeenCalledTimes(2);
+    expect(f.session.restoreMissingRemoteWorker).toHaveBeenCalledExactlyOnceWith(THREAD, 3, expect.any(Function));
+  });
+
+  it('refuses a missing-worker restore if another worker appears during revalidation', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence = {
+      transport: 'reachable',
+      session: 'missing',
+      identity: {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 1000,
+      },
+    };
+    vi.mocked(f.deps.inspectRemote)
+      .mockResolvedValueOnce(structuredClone(f.remoteEvidence))
+      .mockResolvedValueOnce({
+        ...structuredClone(f.remoteEvidence),
+        session: 'present',
+        pane: { dead: false, paneId: '%1', panePid: 1, screen: READY },
+      });
+    expect(await f.adapter.restoreMissingRemote()).toBe('not-sent');
+    expect(f.session.restoreMissingRemoteWorker).not.toHaveBeenCalled();
   });
 });
 

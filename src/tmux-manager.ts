@@ -259,9 +259,7 @@ const PANE_LIST_FORMAT =
  * 构建 pane 启动前的 nofile 修复命令。
  *
  * macOS launchd/tmux 组合有时会让 pane 继承 256 的 soft nofile；
- * 新版 Claude Code 会在这种环境下直接退出。这里避免使用 $变量
- * 或命令替换，因为 fullCmd 目前经由双引号 bash -c 传递，外层
- * shell 会提前展开它们。
+ * 新版 Claude Code 会在这种环境下直接退出。
  */
 export function buildNofileLimitCommand(targetLimit = CLAUDE_CODE_NOFILE_LIMIT): string {
   const safeLimit = Number.isSafeInteger(targetLimit) && targetLimit > 0 ? targetLimit : CLAUDE_CODE_NOFILE_LIMIT;
@@ -917,12 +915,8 @@ export function buildSpawnCommand(options: {
     const rendered = buildSpawnCommandFromRegistry(entry, options);
     if (rendered !== undefined) return rendered;
   }
-  // #208: NOT the literal '$SHELL'. This string is embedded in the `bash -c "…"`
-  // argument of the respawn-pane line, which execSync runs through `/bin/sh -c`,
-  // so a `$SHELL` here is expanded by the SERVER process's shell against the
-  // SERVER process's env — empty in containers and system systemd units, leaving
-  // the pane command ending in a dangling `&&` ("syntax error: unexpected end of
-  // file", pane dead on arrival). Resolve it in Node and quote the result.
+  // Resolve the local shell in Node so the pane launch is independent of the
+  // server process's environment and remains one exact bash -c payload.
   // #209: launch it as a LOGIN shell, which is what tmux itself does for a pane
   // with no `default-command`, so a Codeman shell tab matches a hand-started tmux
   // one. That is what picks up /etc/profile and /etc/profile.d/* — a systemd
@@ -962,6 +956,45 @@ export function remoteTmuxSessionName(sessionId: string): string {
   return `codeman-ssh-${sessionId.slice(0, 8)}`;
 }
 
+function buildRemoteRecoveryLoginCommand(options: {
+  entry: CliEntry;
+  mode: SessionMode;
+  sessionId: string;
+  codexConfig?: CodexConfig;
+  codexHome?: string;
+}): string {
+  if (options.entry.capabilities.recovery !== 'codex-rollout') {
+    throw new Error(`Remote recovery launch is not supported for ${options.mode}`);
+  }
+  const codexCmd = buildSpawnCommandFromRegistry(options.entry, {
+    mode: options.mode,
+    sessionId: options.sessionId,
+    codexConfig: options.codexConfig,
+  });
+  if (!codexCmd) throw new Error(`Cannot render the exact remote recovery command for ${options.mode}`);
+  const remoteEnv = [
+    `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=${shellescape(`codeman_${options.sessionId}`)}`,
+    ...(options.codexHome ? [`CODEX_HOME=${shellescape(options.codexHome)}`] : []),
+  ].join(' ');
+  return remoteLoginShellCommand(`exec env ${remoteEnv} ${codexCmd}`);
+}
+
+/** Exact command placed in an owned remote Codex pane, shared with guarded recovery. */
+export function buildRemoteCodexPaneCommand(options: {
+  remotePath: string;
+  sessionId: string;
+  codexConfig?: CodexConfig;
+  codexHome?: string;
+}): string {
+  const entry = getCli('codex');
+  if (!entry) throw new Error('Cannot resolve the Codex CLI registry entry');
+  return `cd ${shellescape(options.remotePath)} && ${buildRemoteRecoveryLoginCommand({
+    ...options,
+    entry,
+    mode: 'codex',
+  })}`;
+}
+
 /**
  * COD-104 — build the SSH command that launches (or reattaches) a remote
  * session INSIDE a tmux server on the remote host, so the remote agent survives
@@ -999,9 +1032,14 @@ export function buildRemoteLaunchCommand(options: {
   allowedTools?: string;
   /** OMP only — resume/continue overrides for the remote omp relaunch (dead-pane respawn). */
   ompConfig?: OmpConfig;
+  /** Codex launch flags must cross the SSH boundary exactly as configured. */
+  codexConfig?: CodexConfig;
+  /** Only CODEX_HOME is materialized remotely; other local overrides stay local. */
+  envOverrides?: Record<string, string>;
   resumeSessionId?: string;
 }): string {
-  const { mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId } = options;
+  const { mode, remote, sessionId, claudeMode, allowedTools, ompConfig, codexConfig, envOverrides, resumeSessionId } =
+    options;
   // §6.3: honor the session's EFFECTIVE claude permission mode on remote instead of
   // hardcoding --dangerously-skip-permissions, so a non-granted multi-user user's
   // downgraded 'auto' actually reaches the remote agent (the default command otherwise
@@ -1067,6 +1105,20 @@ export function buildRemoteLaunchCommand(options: {
         }) ?? 'omp')
       : 'omp';
     modeCommand = remoteLoginShellCommand(ompCmd);
+  } else if (getCli(mode)?.capabilities.recovery === 'codex-rollout') {
+    // Recovery attribution depends on the same isolated launch configuration and
+    // originator that local Codex panes receive. These values have to be inside
+    // the remote login-shell command: setting them on the local tmux session only
+    // affects ssh, not the process started by the remote tmux server.
+    const entry = getCli(mode);
+    if (!entry) throw new Error(`Cannot resolve the CLI registry entry for ${mode}`);
+    modeCommand = buildRemoteRecoveryLoginCommand({
+      entry,
+      mode,
+      sessionId,
+      codexConfig,
+      codexHome: envOverrides?.CODEX_HOME,
+    });
   } else {
     modeCommand = defaultRemoteCommandForMode(mode);
   }
@@ -1240,7 +1292,7 @@ export interface DockerLaunchOptions {
  * Build the ONE `bash -c` launch string for a docker session: image-check ->
  * ensure (inspect-or-create) -> start -> `exec docker exec -it` into the durable
  * in-container tmux (resume-aware). PURE and unit-testable. The escaping survives
- * four layers: outer `bash -c "…"` (JSON.stringify at respawn-pane) -> the joined
+ * four layers: outer `bash -c '<…>'` (shellescape at respawn-pane) -> the joined
  * command -> `docker exec … sh -lc '<tmux>'` -> tmux `'<paneCommand>'`.
  */
 export function buildDockerLaunchCommand(opts: DockerLaunchOptions): string {
@@ -1327,11 +1379,8 @@ export function buildDockerLaunchCommand(opts: DockerLaunchOptions): string {
   const ensure = adopted
     ? `${base} inspect ${name} >/dev/null 2>&1 || { echo ${notFoundMsg}; exit 1; }`
     : `${base} inspect ${name} >/dev/null 2>&1 || ${createCommand}`;
-  // ⚠️ No double quotes and no `$(…)` in the ADOPTED arms. This whole chain is
-  // embedded in an outer `bash -c "…"`, so an unescaped `"` closes that string early,
-  // the rest is re-tokenized, and tmux fails to exec with a bare `execvp(3) failed`.
-  // A `grep -qx` pipeline reads the same answer using only the single-quoted form
-  // every other line in this builder already uses.
+  // Keep the adopted probe literal and side-effect free. A `grep -qx` pipeline
+  // reads the same answer without command substitution.
   const start = adopted
     ? `${base} inspect -f ${shellescape('{{.State.Running}}')} ${name} 2>/dev/null | grep -qx true || { echo ${notRunningMsg}; exit 1; }`
     : `${base} start ${name} >/dev/null 2>&1 || { echo ${startFailMsg}; exit 1; }`;
@@ -1523,6 +1572,14 @@ export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionNam
   return sshParts.join(' ');
 }
 
+/** Attach to an owned private-socket session without `new-session -A` recreation. */
+export function buildOwnedRemoteAttachCommand(remote: SessionRemote, sessionId: string): string {
+  const name = remoteTmuxSessionName(sessionId);
+  const tmuxInvocation = `tmux -L ${REMOTE_TMUX_SOCKET} attach -t ${shellescape(name)}`;
+  const [ssh, batchMode, ...connectionArgs] = buildSshConnectionArgs(remote);
+  return [ssh, batchMode, '-t', ...connectionArgs, remoteSshTarget(remote), shellescape(tmuxInvocation)].join(' ');
+}
+
 /**
  * COD-105 — choose the right remote ssh command for a session's ownership:
  *   - NON-owned (`remote.owned === false`): ATTACH to a discovered remote tmux
@@ -1539,13 +1596,17 @@ function buildRemoteSessionCommand(options: {
   allowedTools?: string;
   /** OMP only — resume/continue overrides for a remote omp relaunch. */
   ompConfig?: OmpConfig;
+  codexConfig?: CodexConfig;
+  envOverrides?: Record<string, string>;
   resumeSessionId?: string;
+  attachOnly?: boolean;
 }): string {
-  const { remote, sessionId } = options;
+  const { remote, sessionId, attachOnly } = options;
   if (remote.owned === false) {
     const target = remote.remoteSessionName || remoteTmuxSessionName(sessionId);
     return buildRemoteAttachCommand(remote, target);
   }
+  if (attachOnly) return buildOwnedRemoteAttachCommand(remote, sessionId);
   return buildRemoteLaunchCommand(options);
 }
 
@@ -2199,7 +2260,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const fullCmd = docker
         ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
         : remote
-          ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+          ? buildRemoteSessionCommand({
+              mode,
+              remote,
+              sessionId,
+              claudeMode,
+              allowedTools,
+              ompConfig,
+              codexConfig,
+              envOverrides,
+              resumeSessionId,
+            })
           : localFullCmd;
 
       // Create tmux session in three steps to handle cold-start (no server running)
@@ -2259,7 +2330,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // pane launch in /tmp, then cd inside bash against the current mount table.
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       execSync(
-        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}`,
         {
           timeout: EXEC_TIMEOUT_MS,
           stdio: 'ignore',
@@ -2320,8 +2391,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         muxName,
         pid,
         recoveryIsolated:
-          !remote &&
           !docker &&
+          (!remote || (remote.owned !== false && !remote.commands?.[mode])) &&
           getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
           /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd),
         createdAt: Date.now(),
@@ -2444,6 +2515,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       remote,
       docker,
       cliName,
+      remoteAttachOnly,
     } = options;
     const session = this.sessions.get(sessionId);
     if (!session) return null;
@@ -2489,7 +2561,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const fullCmd = docker
       ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
       : remote
-        ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+        ? buildRemoteSessionCommand({
+            mode,
+            remote,
+            sessionId,
+            claudeMode,
+            allowedTools,
+            ompConfig,
+            codexConfig,
+            envOverrides,
+            resumeSessionId,
+            attachOnly: remoteAttachOnly,
+          })
         : localFullCmd;
 
     try {
@@ -2509,7 +2592,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       await execAsync(
-        `${this.tmux()} respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+        `${this.tmux()} respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}`,
         {
           timeout: EXEC_TIMEOUT_MS,
         }
@@ -2524,11 +2607,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const pid = this.getPanePid(muxName);
       if (pid) {
         session.pid = pid;
-        session.recoveryIsolated =
-          !remote &&
-          !docker &&
-          getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
-          /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd);
+        session.recoveryIsolated = remote
+          ? session.recoveryIsolated
+          : !docker &&
+            getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
+            /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd);
         this.saveSessions();
       }
       return pid;

@@ -31,7 +31,7 @@ import type {
  * Multiplexer session metadata.
  */
 export interface MuxSession {
-  /** Set by a successful local launch whose actual registry command disabled the shared daemon. */
+  /** Persisted launch fact: the owned pane's actual registry command disabled the shared daemon. */
   recoveryIsolated?: boolean;
   /** Codeman session ID */
   sessionId: string;
@@ -133,6 +133,8 @@ export interface CreateSessionOptions {
 export interface RespawnPaneOptions {
   /** Recovery refuses a pane that became live by omitting tmux's kill-live-pane flag. Local only. */
   onlyIfDead?: boolean;
+  /** Owned SSH recovery may attach to an existing private remote tmux, never create it. */
+  remoteAttachOnly?: boolean;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;

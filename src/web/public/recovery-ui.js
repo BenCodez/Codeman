@@ -27,6 +27,10 @@ const RECOVERY_UI_REASONS = Object.freeze({
   'identity-changed': 'Conversation identity changed',
   'managed-daemon': 'Daemon sessions cannot be recovered automatically',
   'unsupported-location': 'Recovery requires a local session',
+  'transport-unreachable': 'The SSH transport is unreachable',
+  'transport-unavailable': 'The SSH transport could not be authenticated or inspected',
+  'remote-inspector-unavailable': 'Remote recovery needs Node.js and tmux in the remote login path',
+  'remote-session-missing': 'The owned remote worker is missing',
   'unowned-session': 'Recovery requires a Codeman-owned session',
   'user-input': 'Paused for user input',
   'user-interrupted': 'Paused after a user interruption',
@@ -210,6 +214,16 @@ Object.assign(CodemanApp.prototype, {
     }
     const reset = document.getElementById('recoveryResetBtn');
     if (reset) reset.disabled = !state || view.busy || view.loading;
+    const restoreRemote = document.getElementById('recoveryRestoreRemoteBtn');
+    if (restoreRemote) {
+      const session = this.sessions.get(view.sessionId);
+      restoreRemote.hidden = !(
+        session?.remote &&
+        session.remote.owned !== false &&
+        state?.lastReason === 'remote-session-missing'
+      );
+      restoreRemote.disabled = !state || view.busy || view.loading || !!state.inFlight;
+    }
 
     for (const [key, field] of Object.entries(RECOVERY_UI_FIELDS)) {
       const input = document.getElementById(field.id);
@@ -277,6 +291,12 @@ Object.assign(CodemanApp.prototype, {
     const button = document.getElementById('recoveryResetBtn');
     if (!button || button.disabled) return;
     await this._performRecoveryRequest('reset', 'POST');
+  },
+
+  async restoreRemoteRecovery() {
+    const button = document.getElementById('recoveryRestoreRemoteBtn');
+    if (!button || button.disabled || button.hidden) return;
+    await this._performRecoveryRequest('restore-remote', 'POST');
   },
 
   async _performRecoveryRequest(action, method, body) {

@@ -121,6 +121,11 @@ Key points:
   (see [Respawn / reattach continuation](#respawn--reattach-continuation)), and
   because the claude arm is an `a || b` pair under `-c`, its pane PID is the
   **login shell**, not the agent.
+- **Owned Codex** has its own exact command builder. Quick-start accepts
+  `codexConfig` plus an absolute `CODEX_HOME` override and renders the model,
+  reasoning, isolation, approval, display and resume options inside the remote
+  login shell. A per-host `commands.codex` override cannot be combined with
+  these fields because Codeman could not prove what it launched.
 - The **whole tmux invocation is a single shell-quoted ssh argument**, and the
   pane command is independently quoted, so a `remotePath` with spaces is safe.
 - Connection options come from the **same `buildSshConnectionArgs(remote)`** as
@@ -250,6 +255,37 @@ success, so reading stdout would misclassify every live session as gone. An
 unreachable host answers "unknown", which also means do not revive. The answer
 is cached per session and cleared whenever the pane is next seen alive, so a
 stale `true` from one transport drop can never revive the NEXT clean exit.
+
+## Owned remote Codex recovery
+
+Recovery treats the local SSH pane as transport only. Its exit status is never
+used as evidence that Codex crashed. A bounded SSH inspection independently
+reads the private remote tmux pane and the exact Codex rollout under the
+configured `CODEX_HOME`, using the same port, identity, jump host, proxy and
+extra SSH options as launch. The inspector requires `node` and `tmux` in the
+remote interactive-login PATH. A missing prerequisite is reported as unsupported
+or unreadable; recovery never installs it, wakes the host, or calls the host
+unreachable on that evidence. The rollout must match its filename/header UUID,
+cwd and an exact fresh ordinary submission in `history.jsonl`; originator or a
+saved resume id alone cannot authorize it. Symlinks, subagent rollouts, duplicate
+matches, incomplete reads and traversal-limit failures are non-actionable.
+
+A healthy remote tmux session is only reattached. A confirmed dead pane is
+respawned only when it has a non-zero status or signal, belongs to an owned
+recovery-isolated session, and a second observation matches its pane id, pid,
+status, signal and exact conversation. The guarded remote command checks those
+values again and uses `respawn-pane` without `-k`, so it cannot kill a pane that
+became live. Status zero is a clean exit and is never restarted. Discovered
+`owned:false` sessions and host command overrides are never mutated.
+
+If a host reboot removed the owned private tmux session, automatic recovery
+stops at `remote-session-missing`. The owner can use **Restore remote worker**;
+that route performs fresh identity and ownership checks, reserves the action in
+the durable recovery journal, and recreates the missing session with the exact
+pinned launch configuration. Unreachable transport is reported separately and
+never authorizes recreation. The dead local SSH wrapper must also show an
+abnormal transport exit; its status-zero path is the clean `/exit` veto, not
+remote-agent crash evidence.
 
 ## File access over SSH
 

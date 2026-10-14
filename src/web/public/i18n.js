@@ -109,8 +109,8 @@
     Recovery: '恢复',
     'Resume verified unfinished work after an interruption or crash, with bounded retries.':
       '在中断或崩溃后恢复已验证的未完成工作，并限制重试次数。',
-    'Automatic recovery requires a Codeman-owned local Codex session launched with --no-daemon. Daemon, remote, Docker, and discovered sessions remain paused.':
-      '自动恢复需要由 Codeman 创建、以 --no-daemon 启动的本地 Codex 会话。守护进程、远程、Docker 和发现的会话会保持暂停。',
+    'Automatic recovery requires a Codeman-owned Codex session launched with --no-daemon. Owned SSH sessions use bounded remote evidence; Docker and discovered sessions remain paused.':
+      '自动恢复需要由 Codeman 创建、以 --no-daemon 启动的 Codex 会话。自有 SSH 会话使用有界远程证据；Docker 和发现的会话会保持暂停。',
     'Recovery status is unavailable. Refresh to try again.': '恢复状态不可用。刷新后重试。',
     'Recovery status': '恢复状态',
     'Observed activity': '观察到的活动',
@@ -123,6 +123,7 @@
     Attention: '关注事项',
     'Refresh status': '刷新状态',
     'Retry recovery': '重试恢复',
+    'Restore remote worker': '恢复远程工作进程',
     'Reset recovery': '重置恢复',
     'Retry rechecks safety before acting. Reset clears retry limits without restarting the session.':
       '重试会在执行前重新检查安全条件。重置会清除重试限制，不会重新启动会话。',
@@ -181,6 +182,10 @@
     'Daemon sessions cannot be recovered automatically': '守护进程会话无法自动恢复',
     'Recovery requires a local session': '恢复需要本地会话',
     'Recovery requires a Codeman-owned session': '恢复需要由 Codeman 创建的会话',
+    'The SSH transport is unreachable': 'SSH 传输不可达',
+    'The SSH transport could not be authenticated or inspected': '无法认证或检查 SSH 传输',
+    'Remote recovery needs Node.js and tmux in the remote login path': '远程恢复需要远程登录路径中提供 Node.js 和 tmux',
+    'The owned remote worker is missing': '自有远程工作进程缺失',
     'Paused for user input': '因用户输入而暂停',
     'Paused after a user interruption': '用户中断后暂停',
     'Approval is required': '需要审批',

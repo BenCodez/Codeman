@@ -66,4 +66,24 @@ export function registerRecoveryRoutes(app: FastifyInstance, ctx: SessionPort & 
     if (!controller) return;
     return { success: true, data: await controller.reset() };
   });
+
+  app.post('/api/sessions/:id/recovery/restore-remote', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    if (req.body !== undefined) parseBody(RecoveryActionSchema, req.body, 'Remote restore does not accept options');
+    if (!session.remote || session.remote.owned === false) {
+      return reply
+        .code(400)
+        .send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Only an owned remote session can be restored'));
+    }
+    const controller = controllerOrFail(ctx, session, reply);
+    if (!controller) return;
+    const before = await controller.inspect();
+    if (before.lastReason !== 'remote-session-missing') {
+      return reply
+        .code(409)
+        .send(createErrorResponse(ApiErrorCode.CONFLICT, 'The owned remote worker is not verified missing'));
+    }
+    return { success: true, data: await controller.restoreMissingRemote() };
+  });
 }
