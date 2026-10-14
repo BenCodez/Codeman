@@ -56,6 +56,7 @@ const Evidence = z
   .string()
   .max(250)
   .regex(/^[\w:.-]+$/);
+const ProgressEvidence = z.string().regex(/^remote:[a-f0-9]{64}$/);
 const Pending = z
   .object({
     key: Evidence,
@@ -91,11 +92,21 @@ const StateSchema = z
     lastReason: ReasonSchema,
     circuitOpen: z.boolean(),
     needsAttention: z.boolean(),
-    stallAlert: z.object({ key: Evidence, conversationId: IdSchema, progressAt: Stamp }).strict().optional(),
+    stallAlert: z
+      .object({
+        key: Evidence,
+        conversationId: IdSchema,
+        progressAt: Stamp,
+        progressEvidenceKey: ProgressEvidence.optional(),
+      })
+      .strict()
+      .optional(),
     inFlight: Pending.extend({
       startedAt: Stamp,
       previousSubmissionKey: z.string().max(100).optional(),
       stallProgressAt: Stamp.positive().max(Number.MAX_SAFE_INTEGER).optional(),
+      stallProgressEvidenceKey: ProgressEvidence.optional(),
+      stallQuietPeriodMs: z.number().int().min(10_000).max(3_600_000).optional(),
       accepted: z.boolean().optional(),
       acceptedAt: Stamp.optional(),
     }).optional(),
@@ -118,10 +129,19 @@ const StateSchema = z
   .refine(
     (state) => {
       const flight = state.inFlight;
+      if (
+        flight &&
+        (flight.stallProgressEvidenceKey !== undefined || flight.stallQuietPeriodMs !== undefined) &&
+        (flight.reason !== 'stalled' ||
+          flight.stallProgressAt === undefined ||
+          flight.stallProgressEvidenceKey === undefined ||
+          flight.stallQuietPeriodMs === undefined)
+      )
+        return false;
       if (!flight?.accepted) return true;
       const handledKey =
         flight.reason === 'stalled' && flight.stallProgressAt !== undefined
-          ? `stall:${createHash('sha256').update(flight.key).digest('hex')}:${flight.stallProgressAt}`
+          ? `stall:${createHash('sha256').update(flight.key).digest('hex')}:${flight.stallProgressEvidenceKey ?? flight.stallProgressAt}`
           : flight.key;
       return (
         (flight.reason !== 'stalled' || flight.stallProgressAt !== undefined) &&

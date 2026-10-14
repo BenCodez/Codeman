@@ -119,88 +119,113 @@ describe('recovery journal durability', () => {
     expect(new RecoveryStore(path).get('worker')).toEqual(accepted);
   });
 
-  it('durably retains a qualified stalled acceptance until its exact shared reservation can be released', async () => {
-    const store = new RecoveryStore(path);
-    const state = savedState({
-      attempts: 1,
-      inFlight: {
-        key: 'same-turn',
-        action: 'restart',
-        conversationId: THREAD,
-        startedAt: NOW - 1000,
-        reason: 'stalled',
-        stallProgressAt: NOW - 20_000,
-      },
-      stallAlert: { key: 'same-turn', conversationId: THREAD, progressAt: NOW - 20_000 },
-      needsAttention: true,
-    });
-    await store.save('worker', state);
-    let observation: RecoveryObservation = {
-      activity: 'working',
-      reason: 'turn-running',
-      conversationId: THREAD,
-      at: NOW - 20_000,
-      processReady: true,
-      processReadyAt: NOW,
-      safeToAct: false,
-    };
-    const acceptReservation = vi.fn(async (_key: string) => false);
-    const act = vi.fn(async () => 'sent' as const);
-    const deps = {
-      observe: async () => observation,
-      persist: (next: RecoveryState) => store.save('worker', next),
-      changed: () => {},
-      act,
-      acceptReservation,
-      now: () => NOW,
-    };
-    const controller = new RecoveryController(deps, state);
-    let restored: RecoveryController | undefined;
-    try {
-      await controller.inspect();
-      const accepted = new RecoveryStore(path).get('worker');
-      const handledKey = `stall:${createHash('sha256').update('same-turn').digest('hex')}:${NOW - 20_000}`;
-      expect(accepted).toMatchObject({
+  it.each([false, true])(
+    'durably retains a qualified stalled acceptance until its exact shared reservation can be released (native identity=%s)',
+    async (nativeIdentity) => {
+      const store = new RecoveryStore(path);
+      const state = savedState({
         attempts: 1,
-        lastSuccessfulRecovery: NOW,
-        needsAttention: false,
-        inFlight: { key: 'same-turn', accepted: true, acceptedAt: NOW, stallProgressAt: NOW - 20_000 },
-        handledEvidence: [handledKey],
-      });
-      expect(accepted.stallAlert).toBeUndefined();
-      expect(acceptReservation).toHaveBeenCalledExactlyOnceWith('same-turn');
-      const previous = await fs.readFile(path, 'utf8');
-      for (const incomplete of [
-        { ...accepted, handledEvidence: ['same-turn'] },
-        { ...accepted, handledEvidence: [handledKey.replace(String(NOW - 20_000), String(NOW - 19_000))] },
-        { ...accepted, inFlight: { ...accepted.inFlight!, acceptedAt: undefined } },
-        { ...accepted, inFlight: { ...accepted.inFlight!, stallProgressAt: undefined } },
-        {
-          ...accepted,
-          handledEvidence: ['same-turn'],
-          inFlight: { ...accepted.inFlight!, stallProgressAt: undefined },
+        inFlight: {
+          key: 'same-turn',
+          action: 'restart',
+          conversationId: THREAD,
+          startedAt: NOW - 1000,
+          reason: 'stalled',
+          stallProgressAt: NOW - 20_000,
+          ...(nativeIdentity
+            ? { stallProgressEvidenceKey: `remote:${'b'.repeat(64)}`, stallQuietPeriodMs: 40_000 }
+            : {}),
         },
-      ]) {
-        expect(() => store.save('worker', incomplete)).toThrow();
-        expect(await fs.readFile(path, 'utf8')).toBe(previous);
+        stallAlert: { key: 'same-turn', conversationId: THREAD, progressAt: NOW - 20_000 },
+        needsAttention: true,
+      });
+      await store.save('worker', state);
+      let observation: RecoveryObservation = {
+        activity: 'working',
+        reason: 'turn-running',
+        conversationId: THREAD,
+        at: NOW - 20_000,
+        processReady: true,
+        processReadyAt: NOW,
+        safeToAct: false,
+      };
+      const acceptReservation = vi.fn(async (_key: string) => false);
+      const act = vi.fn(async () => 'sent' as const);
+      const deps = {
+        observe: async () => observation,
+        persist: (next: RecoveryState) => store.save('worker', next),
+        changed: () => {},
+        act,
+        acceptReservation,
+        now: () => NOW,
+      };
+      const controller = new RecoveryController(deps, state);
+      let restored: RecoveryController | undefined;
+      try {
+        await controller.inspect();
+        const accepted = new RecoveryStore(path).get('worker');
+        const handledKey = `stall:${createHash('sha256').update('same-turn').digest('hex')}:${nativeIdentity ? `remote:${'b'.repeat(64)}` : NOW - 20_000}`;
+        expect(accepted).toMatchObject({
+          attempts: 1,
+          lastSuccessfulRecovery: NOW,
+          needsAttention: false,
+          inFlight: { key: 'same-turn', accepted: true, acceptedAt: NOW, stallProgressAt: NOW - 20_000 },
+          handledEvidence: [handledKey],
+        });
+        expect(accepted.stallAlert).toBeUndefined();
+        expect(acceptReservation).toHaveBeenCalledExactlyOnceWith('same-turn');
+        const previous = await fs.readFile(path, 'utf8');
+        for (const incomplete of [
+          { ...accepted, handledEvidence: ['same-turn'] },
+          {
+            ...accepted,
+            handledEvidence: [
+              nativeIdentity
+                ? handledKey.replace('b'.repeat(64), 'c'.repeat(64))
+                : handledKey.replace(String(NOW - 20_000), String(NOW - 19_000)),
+            ],
+          },
+          { ...accepted, inFlight: { ...accepted.inFlight!, acceptedAt: undefined } },
+          { ...accepted, inFlight: { ...accepted.inFlight!, stallProgressAt: undefined } },
+          ...(nativeIdentity
+            ? [
+                { ...accepted, inFlight: { ...accepted.inFlight!, stallProgressEvidenceKey: undefined } },
+                { ...accepted, inFlight: { ...accepted.inFlight!, stallQuietPeriodMs: undefined } },
+                {
+                  ...accepted,
+                  inFlight: { ...accepted.inFlight!, stallProgressEvidenceKey: `remote:${'c'.repeat(64)}` },
+                },
+                { ...accepted, inFlight: { ...accepted.inFlight!, stallProgressEvidenceKey: 'remote:incomplete' } },
+                { ...accepted, inFlight: { ...accepted.inFlight!, stallQuietPeriodMs: 9999 } },
+              ]
+            : []),
+          {
+            ...accepted,
+            handledEvidence: ['same-turn'],
+            inFlight: { ...accepted.inFlight!, stallProgressAt: undefined },
+          },
+        ]) {
+          expect(() => store.save('worker', incomplete)).toThrow();
+          expect(await fs.readFile(path, 'utf8')).toBe(previous);
+        }
+        controller.stop();
+        observation = { activity: 'unknown', reason: 'identity-unverified', at: NOW, safeToAct: false };
+        acceptReservation.mockResolvedValue(true);
+        restored = new RecoveryController(deps, accepted);
+        await restored.inspect();
+        expect(acceptReservation).toHaveBeenLastCalledWith('same-turn');
+        const settled = new RecoveryStore(path).get('worker');
+        expect(settled.inFlight).toBeUndefined();
+        expect(settled.handledEvidence).toEqual([handledKey]);
+        expect(settled.attempts).toBe(1);
+        expect(settled.conversationId).toBe(THREAD);
+        expect(act).not.toHaveBeenCalled();
+      } finally {
+        controller.stop();
+        restored?.stop();
       }
-      controller.stop();
-      observation = { activity: 'unknown', reason: 'identity-unverified', at: NOW, safeToAct: false };
-      acceptReservation.mockResolvedValue(true);
-      restored = new RecoveryController(deps, accepted);
-      await restored.inspect();
-      expect(acceptReservation).toHaveBeenLastCalledWith('same-turn');
-      const settled = new RecoveryStore(path).get('worker');
-      expect(settled.inFlight).toBeUndefined();
-      expect(settled.handledEvidence).toEqual([handledKey]);
-      expect(settled.attempts).toBe(1);
-      expect(settled.conversationId).toBe(THREAD);
-      expect(act).not.toHaveBeenCalled();
-    } finally {
-      controller.stop();
-      restored?.stop();
     }
-  });
+  );
 
   it('starts disabled without a journal and does not create files during reads', async () => {
     const store = new RecoveryStore(path);
@@ -651,6 +676,7 @@ describe('corrupt journals fail closed', () => {
       { key: 'turn', conversationId: 'unverified', progressAt: NOW },
       { key: 'turn', conversationId: THREAD, progressAt: -1 },
       { key: 'turn', conversationId: THREAD, progressAt: NOW, transcript: 'raw sensitive text' },
+      { key: 'turn', conversationId: THREAD, progressAt: NOW, progressEvidenceKey: 'remote:unknown' },
     ].map((stallAlert) => [
       'invalid stall warning identity',
       { version: 1, sessions: { bad: { ...savedState(), stallAlert } } },

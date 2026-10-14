@@ -22,6 +22,7 @@ const THREAD = '11111111-2222-3333-4444-555555555555';
 const SIBLING = '66666666-7777-8888-9999-aaaaaaaaaaaa';
 const sha = (text: string) => createHash('sha256').update(text, 'utf8').digest('hex');
 export const kinds = ['input', 'restart', 'restore'] as const;
+export const REMOTE_READY_SCREEN = '›\n  fixture-model default · /fixture/work\n';
 type Kind = (typeof kinds)[number];
 type Mutation = 'none' | 'new-conflict' | 'changed-sibling' | 'swap-home' | 'swap-ancestor' | 'swap-directory';
 
@@ -51,6 +52,10 @@ export async function fixture(
       | 'pane-id'
       | 'signal-alias';
     prompt?: string;
+    composerAt?: 'before-input' | 'after-first-chunk' | 'before-enter';
+    composerScreen?: string;
+    initialScreen?: string;
+    witnessAt?: 'first-check' | 'final-check';
     workingDir?: string;
   }
 ) {
@@ -74,6 +79,35 @@ export async function fixture(
     await mkdir(bin);
     await writeFile(log, '');
     await writeFile(log + '.commands', '');
+    const initialScreen = correlation?.initialScreen ?? REMOTE_READY_SCREEN;
+    await writeFile(log + '.screen', initialScreen);
+    await writeFile(
+      log + '.change',
+      correlation?.composerScreen ?? '› Unsent owner draft\n  fixture-model default · /fixture/work\n'
+    );
+    await writeFile(log + '.requested', correlation?.prompt ?? 'fixture continuation');
+    const composer = join(root, 'composer.cjs');
+    await writeFile(
+      composer,
+      String.raw`
+const fs=require('fs'),base=process.env.EFFECT_LOG,screen=base+'.screen';
+const read=(name,fallback)=>{try{return fs.readFileSync(base+name,'utf8')}catch{return fallback}};
+const change=()=>fs.writeFileSync(screen,fs.readFileSync(base+'.change','utf8'));
+if(process.argv[2]==='capture'){
+ const current=fs.readFileSync(screen,'utf8'),count=Number(read('.captures','0'))+1;
+ fs.writeFileSync(base+'.captures',String(count));process.stdout.write(current);
+ if(process.env.COMPOSER_AT==='before-input'&&count===1)change();
+ const pasted=JSON.parse(read('.pasted','""'));
+ if((process.env.WITNESS_AT==='first-check'&&count===2)||(process.env.WITNESS_AT==='final-check'&&pasted&&pasted===read('.requested','')))
+  fs.appendFileSync(process.env.SELECTED_ROLLOUT,' ');
+}else{
+ const pasted=JSON.parse(read('.pasted','""'))+process.argv[3],count=Number(read('.pastes','0'))+1;
+ fs.writeFileSync(base+'.pasted',JSON.stringify(pasted));fs.writeFileSync(base+'.pastes',String(count));
+ fs.writeFileSync(screen,'› '+pasted+'\n  fixture-model default · /fixture/work\n');
+ if((process.env.COMPOSER_AT==='after-first-chunk'&&count===1)||(process.env.COMPOSER_AT==='before-enter'&&pasted===read('.requested','')))change();
+}
+`
+    );
     const at = Date.now() - 60_000;
     const prompt = 'fixture owner input';
     const header = (id: string, createdAt: number, cwd = remote.remotePath, originator = `codeman_${SESSION}`) =>
@@ -127,7 +161,7 @@ case "$*" in
     [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
     printf '1|%%9|9009|1||17000\n'
   elif [ "$KIND" = restart ]; then printf '1|1||%%7|4242\n'; else printf '0|||%%7|4242\n'; fi;;
-*capture-pane*) printf '›\n';;
+*capture-pane*) node "$COMPOSER_SCRIPT" capture;;
 *new-session*)
   [ "$KIND" = restore ] || exit 2
   printf created > "$RESTORE_STAGE_FILE"
@@ -143,7 +177,7 @@ case "$*" in
     [ "$7" = '%9' ] && [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
   fi
   printf '%s\n' "$*" >> "$EFFECT_LOG";;
-*send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG";;
+*send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG"; [ "$4" != -l ] || node "$COMPOSER_SCRIPT" paste "$7";;
 *) exit 2;;
 esac
 `
@@ -175,7 +209,7 @@ esac
         : kind === 'input'
           ? buildRemoteCodexInputCommand(remote, {
               ...request,
-              expected: { ...expectedIdentity, paneId: '%7', panePid: 4242, screenHash: sha('›\n') },
+              expected: { ...expectedIdentity, paneId: '%7', panePid: 4242, screenHash: sha(initialScreen) },
               prompt: correlation?.prompt ?? 'fixture continuation',
             })
           : kind === 'restart'
@@ -195,6 +229,10 @@ esac
       MUTATION: mutation,
       MUTATE_SCRIPT: mutate,
       EFFECT_LOG: log,
+      COMPOSER_SCRIPT: composer,
+      COMPOSER_AT: correlation?.composerAt ?? '',
+      WITNESS_AT: correlation?.witnessAt ?? '',
+      SELECTED_ROLLOUT: join(sessions, `rollout-selected-${THREAD}.jsonl`),
       RESTORE_STAGE_FILE: join(root, 'restore-stage'),
       SIBLING: sibling,
       CONFLICT: conflict,
@@ -213,7 +251,13 @@ esac
           })
         ).stdout;
       } catch (error) {
-        if (correlation?.paneRow === undefined && correlation?.beforeEffect === undefined) throw error;
+        if (
+          correlation?.paneRow === undefined &&
+          correlation?.beforeEffect === undefined &&
+          correlation?.composerAt === undefined &&
+          correlation?.witnessAt === undefined
+        )
+          throw error;
         refused = true;
         return typeof (error as { stdout?: unknown }).stdout === 'string' ? (error as { stdout: string }).stdout : '';
       }

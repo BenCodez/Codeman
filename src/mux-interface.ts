@@ -152,6 +152,8 @@ export interface CreateSessionOptions {
 export interface RecoveryMuxDispatchGuard {
   confirm(): boolean;
   noteDispatch(): void;
+  /** Certifies a native pre-effect refusal; it cannot release an already partial delivery. */
+  noteRefusal?(): void;
 }
 
 /** Options for respawning a dead pane. */

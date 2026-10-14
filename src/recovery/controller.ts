@@ -45,6 +45,7 @@ export class RecoveryController {
     kind: 'live-stall' | 'dead-stall' | 'failure';
     at: number;
     progressAt?: number;
+    progressEvidenceKey?: string;
     processKey?: string;
     observedAt?: number;
   };
@@ -145,11 +146,14 @@ export class RecoveryController {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const flight = this.state.inFlight;
-    const observeFlight = !!flight && !this.flightObservationComplete && this.state.lastReason !== 'persistence-failed';
+    const observeFlight =
+      !!flight &&
+      (flight.accepted || !this.flightObservationComplete) &&
+      this.state.lastReason !== 'persistence-failed';
     const automate = !flight && this.state.config.enabled && !this.state.circuitOpen;
     if (!this.stopped && (automate || observeFlight)) {
       const delay =
-        flight && observeFlight
+        flight && observeFlight && !flight.accepted
           ? Math.min(POLL_MS, Math.max(0, flight.startedAt + ACCEPTANCE_TIMEOUT_MS - this.now()))
           : POLL_MS;
       this.timer = setTimeout(() => {
@@ -428,8 +432,17 @@ export class RecoveryController {
     return observation;
   }
 
-  private stallHandledKey(key: string, progressAt: number): string {
-    return `stall:${createHash('sha256').update(key).digest('hex')}:${progressAt}`;
+  private stallHandledKey(key: string, progressAt: number, progressEvidenceKey?: string): string {
+    return `stall:${createHash('sha256').update(key).digest('hex')}:${progressEvidenceKey ?? progressAt}`;
+  }
+
+  private sameStallProgress(
+    previous: { progressAt?: number; progressEvidenceKey?: string },
+    observation: RecoveryObservation
+  ): boolean {
+    return previous.progressEvidenceKey !== undefined || observation.progressEvidenceKey !== undefined
+      ? previous.progressEvidenceKey !== undefined && previous.progressEvidenceKey === observation.progressEvidenceKey
+      : previous.progressAt === (observation.progressAt ?? observation.at);
   }
 
   private validStallProgress(observation: RecoveryObservation): boolean {
@@ -440,6 +453,13 @@ export class RecoveryController {
       progress > 0 &&
       progress <= Number.MAX_SAFE_INTEGER &&
       progress <= this.now() &&
+      ((observation.progressEvidenceKey === undefined && observation.progressLowerBound === undefined) ||
+        (typeof observation.progressEvidenceKey === 'string' &&
+          /^remote:[a-f0-9]{64}$/.test(observation.progressEvidenceKey) &&
+          typeof observation.progressLowerBound === 'number' &&
+          Number.isSafeInteger(observation.progressLowerBound) &&
+          observation.progressLowerBound > 0 &&
+          observation.progressLowerBound <= progress)) &&
       Number.isFinite(observation.at) &&
       observation.at > 0 &&
       observation.at <= Number.MAX_SAFE_INTEGER &&
@@ -487,7 +507,7 @@ export class RecoveryController {
       confirmation.key !== (stall ? observation.stallEvidenceKey : observation.evidenceKey) ||
       (confirmation.kind !== 'live-stall' &&
         confirmation.processKey !== (observation.processProofKey ?? observation.evidenceKey)) ||
-      (stall && confirmation.progressAt !== (observation.progressAt ?? observation.at))
+      (stall && !this.sameStallProgress(confirmation, observation))
     ) {
       this.confirmation = undefined;
     }
@@ -508,7 +528,12 @@ export class RecoveryController {
       (observation.conversationId !== undefined && !sameThread) ||
       (sameThread &&
         (observation.activity === 'completed' ||
-          (observation.progressAt !== undefined && observation.progressAt > baseline))) ||
+          (observation.progressEvidenceKey !== undefined &&
+          'progressEvidenceKey' in alert &&
+          alert.progressEvidenceKey !== undefined
+            ? observation.progressEvidenceKey !== alert.progressEvidenceKey
+            : observation.progressAt !== undefined &&
+              (observation.progressLowerBound ?? observation.progressAt) > baseline))) ||
       ('key' in alert && !!observation.stallEvidenceKey && observation.stallEvidenceKey !== alert.key) ||
       observation.reason === 'user-input' ||
       observation.reason === 'user-interrupted';
@@ -532,7 +557,14 @@ export class RecoveryController {
       observation.stallEvidenceKey &&
       this.stallObservationCanOwnAttention(observation)
     ) {
-      this.state.stallAlert = { key: observation.stallEvidenceKey, conversationId: alert.conversationId, progressAt };
+      this.state.stallAlert = {
+        key: observation.stallEvidenceKey,
+        conversationId: alert.conversationId,
+        progressAt,
+        ...(observation.progressEvidenceKey !== undefined
+          ? { progressEvidenceKey: observation.progressEvidenceKey }
+          : {}),
+      };
       this.legacyStallAlert = undefined;
     }
     // Inconclusive, child-work and blocked observations keep their current veto
@@ -555,7 +587,7 @@ export class RecoveryController {
     if (accepted) {
       this.handled(
         flight.reason === 'stalled' && flight.stallProgressAt !== undefined
-          ? this.stallHandledKey(flight.key, flight.stallProgressAt)
+          ? this.stallHandledKey(flight.key, flight.stallProgressAt, flight.stallProgressEvidenceKey)
           : flight.key
       );
       flight.accepted = true;
@@ -659,6 +691,7 @@ export class RecoveryController {
             kind: 'live-stall',
             at: this.now(),
             progressAt: observation.progressAt ?? observation.at,
+            progressEvidenceKey: observation.progressEvidenceKey,
           };
         else if (age >= CONFIRM_MS) {
           // Repeated silence cannot prove a live Codex turn stopped. Ask the owner to
@@ -667,6 +700,9 @@ export class RecoveryController {
             key,
             conversationId: observation.conversationId!,
             progressAt: this.stallQuietSince(observation),
+            ...(observation.progressEvidenceKey !== undefined
+              ? { progressEvidenceKey: observation.progressEvidenceKey }
+              : {}),
           };
           this.block('stall-unverified');
           if (JSON.stringify(this.state) !== before) await this.save();
@@ -717,20 +753,22 @@ export class RecoveryController {
     if (this.state.handledEvidence.includes(key)) return;
     if (restartableStall) {
       const progress = observation.progressAt!;
-      const handledKey = this.stallHandledKey(key, progress);
-      const prefix = handledKey.slice(0, handledKey.lastIndexOf(':') + 1);
+      const handledKey = this.stallHandledKey(key, progress, observation.progressEvidenceKey);
+      const prefix = `stall:${createHash('sha256').update(key).digest('hex')}:`;
       const previousCycles = this.state.handledEvidence.filter((entry) => entry.startsWith(prefix));
       if (
         previousCycles.includes(handledKey) ||
         (previousCycles.length > 0 &&
-          (progress <= (this.state.lastSuccessfulRecovery ?? Infinity) ||
+          ((observation.progressLowerBound ?? progress) <= (this.state.lastSuccessfulRecovery ?? Infinity) ||
             previousCycles.some((entry) => {
-              const previousProgress = Number(entry.slice(prefix.length));
+              const suffix = entry.slice(prefix.length);
+              if (/^remote:[a-f0-9]{64}$/.test(suffix)) return observation.progressEvidenceKey === undefined;
+              const previousProgress = Number(suffix);
               return (
                 !Number.isFinite(previousProgress) ||
                 previousProgress <= 0 ||
                 previousProgress > Number.MAX_SAFE_INTEGER ||
-                progress <= previousProgress
+                (observation.progressLowerBound ?? progress) <= previousProgress
               );
             })))
       )
@@ -772,6 +810,7 @@ export class RecoveryController {
           ...(restartableStall
             ? {
                 progressAt: observation.progressAt ?? observation.at,
+                progressEvidenceKey: observation.progressEvidenceKey,
                 observedAt: observation.stallObservedAt,
               }
             : {}),
@@ -815,7 +854,17 @@ export class RecoveryController {
       ...pending,
       startedAt: this.now(),
       previousSubmissionKey: observation.submissionKey,
-      ...(restartableStall ? { stallProgressAt: observation.progressAt! } : {}),
+      ...(restartableStall
+        ? {
+            stallProgressAt: observation.progressAt!,
+            ...(observation.progressEvidenceKey !== undefined
+              ? {
+                  stallProgressEvidenceKey: observation.progressEvidenceKey,
+                  stallQuietPeriodMs: this.state.config.stalledAfterMs,
+                }
+              : {}),
+          }
+        : {}),
     };
     this.flightObservationComplete = false;
     this.state.pending = undefined;
