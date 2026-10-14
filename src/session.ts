@@ -2386,17 +2386,6 @@ export class Session extends EventEmitter {
     this._recoveryDelivering = true;
     try {
       return await this._withPaneLifecycle(async () => {
-        const pane = await this.inspectRecoveryPane();
-        if (
-          expectedRecoveryPane &&
-          (!pane ||
-            pane.paneId !== expectedRecoveryPane.paneId ||
-            pane.panePid !== expectedRecoveryPane.panePid ||
-            pane.status !== expectedRecoveryPane.status ||
-            pane.signal !== expectedRecoveryPane.signal ||
-            (pane.paneSignalToken ?? '') !== (expectedRecoveryPane.paneSignalToken ?? ''))
-        )
-          return 'not-sent';
         const envToAuthorize =
           context.codexHome !== currentLocalCodexHome()
             ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
@@ -2427,6 +2416,19 @@ export class Session extends EventEmitter {
             return 'not-sent';
           }
         }
+        // Owner edits made directly in the TUI do not change our generation.
+        // Read the live pane after asynchronous authorization, then recheck every fence.
+        const pane = await this.inspectRecoveryPane();
+        if (
+          expectedRecoveryPane &&
+          (!pane ||
+            pane.paneId !== expectedRecoveryPane.paneId ||
+            pane.panePid !== expectedRecoveryPane.panePid ||
+            pane.status !== expectedRecoveryPane.status ||
+            pane.signal !== expectedRecoveryPane.signal ||
+            (pane.paneSignalToken ?? '') !== (expectedRecoveryPane.paneSignalToken ?? ''))
+        )
+          return 'not-sent';
         const currentContext = this.getRecoveryContext();
         if (
           granted.isCurrent() !== true ||
@@ -2481,7 +2483,13 @@ export class Session extends EventEmitter {
           noteDispatch: () => {
             dispatched = true;
           },
+          noteRefusal: () => {
+            if (!dispatched) refusedBeforeDispatch = true;
+          },
         };
+        // The pane read awaited after the earlier evidence check. Preserve this
+        // boundary's own final admission proof as well as the native mux guard.
+        if (!recoveryGuard.confirm()) return 'not-sent';
         this._submitVerifier?.cancel();
         this._submitVerifier = null;
         if (flight.action === 'restart') {
