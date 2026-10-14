@@ -167,6 +167,27 @@ export class RecoveryStore {
     return result;
   }
 
+  /** Remove unreachable settings only; a durable action reservation remains evidence. */
+  pruneOrphans(keep: (id: string) => boolean): Promise<number> {
+    if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
+    const result = this.writes.then(async () => {
+      const next = { ...this.records };
+      let removed = 0;
+      for (const [id, state] of Object.entries(next)) {
+        if (keep(id) || state.inFlight || state.pending || state.nextRetryAt !== undefined) continue;
+        delete next[id];
+        removed++;
+      }
+      if (removed > 0) {
+        await this.write(next);
+        this.records = next;
+      }
+      return removed;
+    });
+    this.writes = result.catch(() => {});
+    return result;
+  }
+
   private async write(records: Record<string, RecoveryState>): Promise<void> {
     const payload = JSON.stringify({ version: 1, sessions: records });
     if (Buffer.byteLength(payload, 'utf8') > MAX_JOURNAL_BYTES)
