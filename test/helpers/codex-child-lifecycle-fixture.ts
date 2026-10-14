@@ -40,7 +40,12 @@ export function returnedChildTail(type: string, status: unknown = 'running', fai
   );
 }
 
-export async function createChildLifecycleFixture(body: string, dead: boolean, storedExit = dead) {
+export async function createChildLifecycleFixture(
+  body: string,
+  dead: boolean,
+  storedExit = dead,
+  trackedSubmission = true
+) {
   const root = await fs.mkdtemp(join(homedir(), 'codex-child-lifecycle-'));
   const workspace = join(root, 'workspace');
   const codexHome = join(root, 'codex');
@@ -52,7 +57,6 @@ export async function createChildLifecycleFixture(body: string, dead: boolean, s
     type: 'session_meta',
     payload: { id: CHILD_THREAD, cwd: workspace, originator: `codeman_${CHILD_SESSION}` },
   });
-  await fs.writeFile(path, `${header}\n${body}`);
   const pane = { paneId: '%7', panePid: 700, dead, ...(dead ? { status: 9 } : {}), screen: dead ? null : CHILD_READY };
   const mux = { inspectPaneForRecovery: vi.fn(async () => pane) };
   const session = new Session({
@@ -71,6 +75,27 @@ export async function createChildLifecycleFixture(body: string, dead: boolean, s
     envOverrides: { CODEX_HOME: codexHome },
     ...(storedExit ? { paneExit: { at: CHILD_NOW - 20_000, status: 9 } } : {}),
   });
+  const prompt = 'Sanitized child lifecycle owner request';
+  if (trackedSubmission) {
+    // Establish the real owner-input proof before the fixture's existing work,
+    // without delivering any bytes or changing the caller's fake timer clock.
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(CHILD_NOW - 60_000);
+    try {
+      session.trackUserInput(prompt + '\r');
+    } finally {
+      clock.mockRestore();
+    }
+    const submission = session.getRecoveryContext().submission;
+    expect(submission).toMatchObject({ at: CHILD_NOW - 60_000 });
+    await fs.writeFile(
+      join(codexHome, 'history.jsonl'),
+      JSON.stringify({ session_id: CHILD_THREAD, ts: submission!.at / 1000, text: prompt }) + '\n'
+    );
+  }
+  await fs.writeFile(
+    path,
+    `${header}\n${trackedSubmission ? childEvent({ type: 'user_message', message: prompt }, 60_000) + '\n' : ''}${body}`
+  );
   expect(session.getRecoveryContext()).toMatchObject({ managed: true, noDaemon: true, switchPending: false });
   const delivered = vi.spyOn(session, 'deliverRecovery').mockResolvedValue('sent');
   const adapter = new CodexRecoveryAdapter(session, vi.fn());

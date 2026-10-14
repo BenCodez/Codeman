@@ -66,7 +66,7 @@ vi.mock('../../src/session.js', () => ({
       if (this.restoreGuard) {
         await this.restoreGuard.prepare();
         await afterGuardPrepare?.();
-        if (this.restoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+        if ((await this.restoreGuard.confirm()) !== true) throw new Error('Reboot restoration authority changed');
       }
       if (startShouldThrow) throw new Error('spawn claude ENOENT');
       if (this.restoreGuard) {

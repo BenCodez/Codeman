@@ -382,3 +382,136 @@ describe('accepted owner progress consumes only its observed report', () => {
     }
   });
 });
+
+const ownerIdentityFailures: Array<{
+  name: string;
+  conversationId: unknown;
+  reason?: 'identity-unverified' | 'identity-changed';
+}> = [
+  { name: 'missing', conversationId: undefined },
+  { name: 'empty', conversationId: '' },
+  { name: 'placeholder', conversationId: 'thread' },
+  { name: 'whitespace', conversationId: ` ${conversationId}` },
+  { name: 'null', conversationId: null },
+  { name: 'nonstring', conversationId: 123 },
+  { name: 'uncertain identity', conversationId, reason: 'identity-unverified' },
+  { name: 'changed identity', conversationId, reason: 'identity-changed' },
+];
+const ownerPatch = (kind: 'checkpoint' | 'command' | 'manual') => ({
+  outcome: 'unfinished' as const,
+  checkpoint: 'Owner verified this step',
+  nextAction: 'Continue this conversation',
+  ...(kind === 'checkpoint' ? {} : { verifiedCriteria: [kind] }),
+});
+async function configureIdentityOwner(f: ReturnType<typeof fixture>) {
+  await f.controller.update({
+    objective: 'Finish the authorized task',
+    criteria: [
+      { id: 'command', description: 'Run check', kind: 'command', command: 'npm test' },
+      { id: 'manual', description: 'Owner review', kind: 'manual' },
+    ],
+  });
+  await f.controller.pause();
+  f.observation.commands.set(commandHash('npm test'), { startedAt: 10_000, completedAt: 10_000 });
+}
+describe('owner progress requires a current canonical conversation', () => {
+  it.each(
+    ownerIdentityFailures.flatMap((failure) =>
+      (['checkpoint', 'command', 'manual'] as const).map((kind) => ({ ...failure, kind }))
+    )
+  )('rejects $kind with $name identity before kickoff without saving unbound evidence', async (failure) => {
+    const f = fixture();
+    try {
+      await configureIdentityOwner(f);
+      const before = f.controller.getStatus();
+      const durable = f.durable();
+      f.persist.mockClear();
+      f.observation.observation.conversationId = failure.conversationId as string | undefined;
+      if (failure.reason) {
+        f.observation.observation.activity = 'unknown';
+        f.observation.observation.reason = failure.reason;
+      }
+      await expect(f.controller.progress(ownerPatch(failure.kind))).rejects.toThrow(/conversation.*verified/);
+      expect(f.controller.getStatus()).toEqual(before);
+      expect(f.durable()).toEqual(durable);
+      expect(f.persist).not.toHaveBeenCalled();
+      expect(f.dispatch).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  });
+  it.each(
+    (['checkpoint', 'command', 'manual'] as const).flatMap((kind) =>
+      [undefined, otherConversationId].map((observedId) => ({ kind, observedId }))
+    )
+  )(
+    'rejects $kind when bound identity becomes $observedId without changing evidence or owner pause',
+    async ({ kind, observedId }) => {
+      const f = fixture();
+      try {
+        await configureIdentityOwner(f);
+        await f.controller.progress({ outcome: 'unknown', checkpoint: 'Bound owner checkpoint' });
+        const before = f.controller.getStatus();
+        const durable = f.durable();
+        f.persist.mockClear();
+        f.observation.observation.conversationId = observedId;
+        await expect(f.controller.progress(ownerPatch(kind))).rejects.toThrow(/conversation/);
+        expect(f.controller.getStatus()).toEqual(before);
+        expect(f.durable()).toEqual(durable);
+        expect(f.persist).not.toHaveBeenCalled();
+        expect(f.dispatch).not.toHaveBeenCalled();
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
+  it.each(['unknown-criterion', 'incomplete-acceptance', 'unverified-command'] as const)(
+    'does not pin a healthy observed UUID from a rejected $kind edit',
+    async (kind) => {
+      const f = fixture();
+      try {
+        await configureIdentityOwner(f);
+        if (kind === 'unverified-command') f.observation.commands.clear();
+        const before = f.controller.getStatus();
+        const durable = f.durable();
+        f.persist.mockClear();
+        const patch =
+          kind === 'unknown-criterion'
+            ? { outcome: 'unknown' as const, verifiedCriteria: ['missing'] }
+            : kind === 'incomplete-acceptance'
+              ? { outcome: 'completed' as const, verifiedCriteria: ['manual'] }
+              : ownerPatch('command');
+        await expect(f.controller.progress(patch)).rejects.toThrow(/criterion|criteria|evidence/);
+        expect(f.controller.getStatus()).toEqual(before);
+        expect(f.durable()).toEqual(durable);
+        expect(f.persist).not.toHaveBeenCalled();
+        expect(f.controller.getStatus().conversationId).toBeUndefined();
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
+  it('allows owner manual verification under a proven UUID despite a native authentication veto', async () => {
+    const f = fixture();
+    try {
+      await configureIdentityOwner(f);
+      f.observation.observation.activity = 'blocked';
+      f.observation.observation.reason = 'authentication-required';
+      await f.controller.progress({
+        outcome: 'unknown',
+        verifiedCriteria: ['manual'],
+        checkpoint: 'Owner reviewed this conversation',
+      });
+      expect(f.controller.getStatus()).toMatchObject({
+        conversationId,
+        phase: 'paused',
+        outcome: 'unknown',
+        criteria: [{ verified: false }, { verified: true, evidence: { source: 'owner' } }],
+      });
+      expect(f.durable().conversationId).toBe(conversationId);
+      expect(f.dispatch).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  });
+});

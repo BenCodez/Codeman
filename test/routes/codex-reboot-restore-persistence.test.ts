@@ -11,7 +11,7 @@ import { userCasesDir } from '../../src/config/multiuser.js';
 import { writeCustomModelHosts } from '../../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
 import { planVerifiedRebootRestore, verifyCodexRebootIdentity } from '../../src/reboot-restore.js';
-import * as identityWitness from '../../src/recovery/codex-identity.js';
+import * as identityWitness from '../../src/recovery/codex-witness-check.js';
 import { hashCodexPrompt, resolveCodexIdentity } from '../../src/recovery/codex-identity.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../src/recovery/reboot-identity-fence.js';
 import { rebootStateBinding } from '../../src/recovery/reboot-state-binding.js';
@@ -508,9 +508,9 @@ describe('durable Codex reboot completion', () => {
           return result;
         });
         if (stage === 'final-witness') {
-          const confirm = identityWitness.confirmCodexIdentityWitness;
-          vi.spyOn(identityWitness, 'confirmCodexIdentityWitness').mockImplementation((...args) => {
-            const result = confirm(...args);
+          const confirm = identityWitness.checkCodexIdentityWitness;
+          vi.spyOn(identityWitness, 'checkCodexIdentityWitness').mockImplementation(async (...args) => {
+            const result = await confirm(...args);
             if (prepared && !revoked) revoke();
             return result;
           });
