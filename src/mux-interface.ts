@@ -97,7 +97,7 @@ export interface MuxSessionWithStats extends MuxSession {
 /** Options for creating a new multiplexer session. */
 export interface CodexRestoreLaunchGuard {
   prepare(): Promise<void>;
-  confirm(): boolean;
+  confirm(): boolean | Promise<boolean>;
   /** Mark uncertainty before a worker launch can have effects. */
   noteDispatch?(): void;
 }
@@ -150,6 +150,10 @@ export interface CreateSessionOptions {
 
 /** Final synchronous authority for an automatic recovery effect, including partial delivery. */
 export interface RecoveryMuxDispatchGuard {
+  /** Exact observed live process for continuation; final native effects cannot target a replacement. */
+  expectedLivePane?: Pick<RecoveryPaneIdentity, 'paneId' | 'panePid'>;
+  /** Fresh bounded filesystem evidence before each effect; never a cached grant. */
+  prepareEvidence?(): Promise<boolean>;
   confirm(): boolean;
   noteDispatch(): void;
   /** Certifies a native pre-effect refusal; it cannot release an already partial delivery. */

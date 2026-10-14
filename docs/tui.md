@@ -29,7 +29,7 @@ What it needs:
 | Needs             | What you get                                                                                                                                                                                                                                                                                                                 |
 | ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Full features** | A running Codeman server (states, approvals, preview, prompts, search, digest). The TUI finds it the way `codeman attach` does: `CODEMAN_API_URL`, else loopback on `CODEMAN_PORT` for this `CODEMAN_INSTANCE`. The self-signed certificate an `--https` install generates is accepted, as it is everywhere else in the CLI. |
-| **Server down**   | It still starts in **degraded mode** and enumerates sessions from `tmux -L codeman` plus read-only `state.json`. Attachment remains available when its attach strip has no Codex pane. Codex attachment requires a reachable authenticated server to commit the input fence. See [Troubleshooting](#troubleshooting).        |
+| **Server down**   | It still starts in **degraded mode** and enumerates sessions from `tmux -L codeman` plus read-only `state.json`. Attachment remains available for proven non-Codex targets. Codex or unknown-mode attachment requires a reachable authenticated server to commit the input fence. See [Troubleshooting](#troubleshooting).   |
 | **A terminal**    | `codeman tui` refuses to run when stdin/stdout are not a TTY, and says to use `--list` instead. A cron job or a pipe therefore fails loudly rather than emitting escape codes into a log.                                                                                                                                    |
 
 ## What it looks like
@@ -181,25 +181,25 @@ You do not have to remember any of it. For as long as the attach lasts the pane
 wears a bar across the top:
 
 ```
- 1 w3-codeman-…  2 w4-codeman-…  3 testcase …     alt+1-9 switch · F1 back to the codeman dashboard
+ 1 w3-codeman-…                         F1 back to the codeman dashboard
 ```
 
-That is the **session strip**: the other sessions stay visible from inside a pane,
-numbered exactly as the dashboard numbers them, with the one you are in inverted.
-`Alt+1`..`Alt+9` switch between them without going back to the dashboard first. With
-more sessions than fit, the strip shows a window around the current one and marks
-each cut end with `…`; the way-out hint is measured first and always keeps its space.
+The bar identifies the attached session and the way back. Detach to the dashboard
+before selecting another session. TUI attaches do not install server-global
+`Alt+1`..`Alt+9` switch shortcuts: those keys would also affect other native clients
+on the same tmux socket. Existing user bindings are preserved. Recognizable old
+Codeman switch bindings stop a handoff until their owner removes them; the TUI
+does not infer stale ownership from the command text or sweep them away.
 
 Codeman keeps the status bar off on its panes (the web UI carries that information
-around the terminal instead), so the TUI turns it on for the attach and puts it back
-exactly as it was on detach, along with each window's size. Every session the strip
-can switch to is dressed and sized the same way, so switching is instant and lands
-in a pane that already fills your terminal.
+around the terminal instead), so the TUI turns it on for the attached session and
+puts it back on detach, along with the window's size.
 
 Codex reboot restoration depends on proving the exact conversation behind a pane.
 Before `codeman tui`, `codeman tui <n>`, or a supported direct attach hands stdin to
-tmux, Codeman durably marks every Codex pane reachable through the attach strip as
-having untracked input. That mark survives a server restart and a browser prompt
+tmux, Codeman durably marks the selected Codex pane as having untracked input.
+Missing or unknown mode metadata also requires this fence; degraded discovery
+cannot prove such a pane is safe to attach directly. That mark survives a server restart and a browser prompt
 cannot clear it, because more terminal input can still arrive afterward. Automatic
 Codex recovery and post-reboot restoration therefore stay fail-closed for that
 managed session after a direct handoff. Direct `tmux attach` and custom automation
@@ -207,8 +207,8 @@ that bypass Codeman's attach endpoint cannot create this mark; such automation m
 call the authenticated direct-attach fence endpoint before handing stdin to tmux.
 
 If the server or authenticated fence endpoint is unavailable, or the durable fence
-write fails, supported attachment is refused. This applies to a Codex target and
-to any attach strip that can switch to Codex, even in server-down degraded mode.
+write fails, attachment to a Codex target or a target with unknown mode is
+refused, including in server-down degraded mode.
 
 Explicit Codex reboot restoration rechecks the exact conversation, launch settings,
 current owner grants and input fences at the launch boundary. If a worker may have
@@ -262,8 +262,8 @@ where `codeman attach` already reads them from.
 
 **`server not running: attach only`** in a yellow banner. Nothing answered on the
 expected port, so the TUI fell back to enumerating tmux. You get names and eligible
-non-Codex attachment; a target or attach strip containing Codex is refused until
-the authenticated server can acknowledge its durable input fence. States,
+non-Codex attachment; Codex and unknown-mode targets are refused until the
+authenticated server can acknowledge their durable input fence. States,
 approvals and previews also require the server. Start the server (`codeman web -d`, or `systemctl --user start codeman-web`)
 and the banner clears on its own: the TUI keeps re-probing.
 

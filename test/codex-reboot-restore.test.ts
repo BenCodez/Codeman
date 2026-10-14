@@ -316,53 +316,58 @@ describe('verified local Codex reboot offers', () => {
     expect(await verifyCodexRebootIdentity(fixture({ workingDir: '/different/project' }))).toBeUndefined();
   });
 
-  it('indexes one shared CODEX_HOME once for many dead sessions', async () => {
-    const home = join(homedir(), 'custom-codex');
-    rmSync(join(home, 'sessions'), { recursive: true, force: true });
-    mkdirSync(join(home, 'sessions'), { recursive: true });
-    const persisted: Record<string, SessionState> = {};
-    const dead: string[] = [];
-    const history: string[] = [];
-    const baseAt = Date.parse('2026-10-13T15:01:00Z');
-    for (let i = 0; i < 24; i += 1) {
-      const id = `fresh-${i}`;
-      const conversationId = `12345678-1234-1234-1234-${i.toString().padStart(12, '0')}`;
-      const workingDir = `/workspace/project-${i}`;
-      const prompt = `exact task ${i}`;
-      const at = baseAt + i * 1_000;
-      writeFileSync(
-        join(home, 'sessions', `rollout-2026-10-13T15-00-${i.toString().padStart(2, '0')}-${conversationId}.jsonl`),
-        JSON.stringify({
-          type: 'session_meta',
-          timestamp: new Date(baseAt - 60_000 + i).toISOString(),
-          payload: { id: conversationId, cwd: workingDir, originator: `codeman_${id}` },
-        }) + '\n'
+  it.each(['seed', 'submission'] as const)(
+    'indexes one shared home while preserving exact identity authority (%s)',
+    async (authority) => {
+      const home = join(homedir(), 'custom-codex');
+      rmSync(join(home, 'sessions'), { recursive: true, force: true });
+      mkdirSync(join(home, 'sessions'), { recursive: true });
+      const persisted: Record<string, SessionState> = {};
+      const dead: string[] = [];
+      const history: string[] = [];
+      const baseAt = Date.parse('2026-10-13T15:01:00Z');
+      for (let i = 0; i < 24; i += 1) {
+        const id = `fresh-${i}`;
+        const conversationId = `12345678-1234-1234-1234-${i.toString().padStart(12, '0')}`;
+        const workingDir = `/workspace/project-${i}`;
+        const prompt = `exact task ${i}`;
+        const at = baseAt + i * 1_000;
+        writeFileSync(
+          join(home, 'sessions', `rollout-2026-10-13T15-00-${i.toString().padStart(2, '0')}-${conversationId}.jsonl`),
+          JSON.stringify({
+            type: 'session_meta',
+            timestamp: new Date(baseAt - 60_000 + i).toISOString(),
+            payload: { id: conversationId, cwd: workingDir, originator: `codeman_${id}` },
+          }) + '\n'
+        );
+        history.push(JSON.stringify({ session_id: conversationId, ts: at / 1000, text: prompt }));
+        persisted[id] = {
+          ...fixture(),
+          id,
+          workingDir,
+          codexConfig: { noDaemon: true, ...(authority === 'seed' ? { resumeSessionId: conversationId } : {}) },
+          recovery: initialRecoveryState(),
+          __envOverrides: { CODEX_HOME: home },
+          __codexRecoveryHome: home,
+          __codexRebootIdentity: {
+            switchPending: false,
+            ...(authority === 'submission' ? { submission: { at, hash: hashCodexPrompt(prompt) } } : {}),
+          },
+        } as SessionState;
+        dead.push(id);
+      }
+      writeFileSync(join(home, 'history.jsonl'), history.join('\n') + '\n');
+      const scan = vi.spyOn(fs, 'opendir');
+
+      const plan = await planVerifiedRebootRestore(dead, persisted, () => true);
+
+      expect(plan.restore.map((entry) => entry.sessionId)).toEqual(authority === 'seed' ? dead : ['fresh-23']);
+      expect(plan.skipped).toEqual(
+        authority === 'seed' ? [] : dead.slice(0, -1).map((sessionId) => ({ sessionId, reason: 'identity-unverified' }))
       );
-      history.push(JSON.stringify({ session_id: conversationId, ts: at / 1000, text: prompt }));
-      persisted[id] = {
-        ...fixture(),
-        id,
-        workingDir,
-        codexConfig: { noDaemon: true },
-        recovery: initialRecoveryState(),
-        __envOverrides: { CODEX_HOME: home },
-        __codexRecoveryHome: home,
-        __codexRebootIdentity: {
-          switchPending: false,
-          submission: { at, hash: hashCodexPrompt(prompt) },
-        },
-      } as SessionState;
-      dead.push(id);
+      expect(scan).toHaveBeenCalledTimes(1);
     }
-    writeFileSync(join(home, 'history.jsonl'), history.join('\n') + '\n');
-    const scan = vi.spyOn(fs, 'opendir');
-
-    const plan = await planVerifiedRebootRestore(dead, persisted, () => true);
-
-    expect(plan.restore).toHaveLength(dead.length);
-    expect(plan.skipped).toEqual([]);
-    expect(scan).toHaveBeenCalledTimes(1);
-  });
+  );
 });
 
 describe('durable reboot offer', () => {

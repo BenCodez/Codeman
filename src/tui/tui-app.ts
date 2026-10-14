@@ -248,9 +248,10 @@ export function planAttach(muxName: string | undefined, context: TuiAttachContex
   };
 }
 
-/** Only CLIs whose reboot recovery depends on exact conversation identity need the handoff fence. */
+/** Missing degraded metadata cannot prove that direct stdin is safe without an identity fence. */
 export function needsDirectAttachFence(session: Pick<TuiSessionRow, 'mode'>): boolean {
-  return !!session.mode && getCli(session.mode)?.capabilities.recovery === 'codex-rollout';
+  const cli = session.mode && getCli(session.mode);
+  return !cli || cli.capabilities.recovery === 'codex-rollout';
 }
 
 /**
@@ -359,8 +360,6 @@ export function buildAttachBanner(options: {
   tabs?: readonly TuiAttachTab[];
   /** The attaching terminal's width, so the strip can be kept clear of the hint. */
   cols?: number;
-  /** Alt+1..9 really switch sessions, so the bar may say so. */
-  switchKeys?: boolean;
 }): Record<string, string> {
   const chord = escapeTmuxFormat(detachChord(options.prefix, options.detachKey));
   // Named on the bar because it is what people actually type: keeping Ctrl held
@@ -376,13 +375,9 @@ export function buildAttachBanner(options: {
   // left. tmux truncates a status line that overflows, and what it drops is the
   // RIGHT-aligned segment — which is the hint, the one thing on the bar a user
   // cannot do without. Every width tested lost it before this budget existed.
-  // ⚠️ The switch hint appears only when the keys were actually claimed, the
-  // same rule the way-out key follows. A bar naming a key that does nothing is
-  // the bug this whole series started with.
-  const switchHint = options.switchKeys ? 'alt+1-9 switch · ' : '';
   const hint = options.oneKey
-    ? ` ${switchHint}${options.oneKey} ${ATTACH_BANNER_MARKER} `
-    : ` ${switchHint}${chord}${alias} ${ATTACH_BANNER_MARKER} `;
+    ? ` ${options.oneKey} ${ATTACH_BANNER_MARKER} `
+    : ` ${chord}${alias} ${ATTACH_BANNER_MARKER} `;
   const budget = Math.max(0, (options.cols ?? Number.POSITIVE_INFINITY) - hint.length - 1);
   // The strip names the session it highlights, so the standalone label is only
   // a fallback for when there is no strip to draw (degraded mode has no list).
@@ -398,8 +393,8 @@ export function buildAttachBanner(options: {
     // ONLY instruction a user gets during an attach, so it names the simplest
     // thing that is known to work, never a menu of ways.
     'status-format[0]': options.oneKey
-      ? `#[align=left]${left}#[align=right] ${switchHint}#[bold]${escapeTmuxFormat(options.oneKey)}#[nobold] ${ATTACH_BANNER_MARKER} #[default]`
-      : `#[align=left]${left}#[align=right] ${switchHint}#[bold]${chord}#[nobold]${alias} ${ATTACH_BANNER_MARKER} #[default]`,
+      ? `#[align=left]${left}#[align=right] #[bold]${escapeTmuxFormat(options.oneKey)}#[nobold] ${ATTACH_BANNER_MARKER} #[default]`
+      : `#[align=left]${left}#[align=right] #[bold]${chord}#[nobold]${alias} ${ATTACH_BANNER_MARKER} #[default]`,
   };
 }
 
@@ -536,6 +531,16 @@ export interface TuiAttachHandoff {
   restore(): Promise<void>;
 }
 
+/** A generated-looking global command is not proof of a dead owner's claim. */
+export async function assertSafeAttachSwitchControls(client: TuiClient): Promise<void> {
+  for (let index = 1; index <= 9; index++) {
+    const bound = await client.readAttachSwitchBinding(`M-${index}`);
+    if (bound !== null && isAttachSwitchBinding(bound)) {
+      throw new Error('Existing global attach switch controls require owner cleanup');
+    }
+  }
+}
+
 /**
  * Prepare a tmux window for a human terminal: let it follow the attaching
  * client's shape, and give it a status bar naming the way out. Both halves are
@@ -551,44 +556,18 @@ export async function beginAttachHandoff(
   cols?: number,
   rows?: number
 ): Promise<TuiAttachHandoff> {
-  // A killed older TUI may have left Alt jumps outside this tab set. Remove
-  // those before fencing: omitting an unsafe target must make it unreachable.
-  await client.clearLeakedAttachSwitchKeys();
-  // A user-owned Alt binding makes its proposed target unreachable. Inspect
-  // availability before fencing so that an untouched worker retains authority.
-  const availableSwitchTargets = new Set<TuiAttachTab>();
-  const unavailableSwitchTargets = new Set<TuiAttachTab>();
-  for (const tab of tabs.slice(0, 9)) {
-    if (!tab.muxName) continue;
-    const bound = await client.readAttachSwitchBinding(`M-${tab.index}`);
-    if (bound !== null && !isAttachSwitchBinding(bound)) unavailableSwitchTargets.add(tab);
-    else availableSwitchTargets.add(tab);
-  }
-  // Fence every reachable Codex target before installing a single switch
-  // binding. The actual primary attach remains reachable even with its key taken.
-  const fenced = new Set<string>();
-  const unsafeSwitchTargets = new Set<TuiAttachTab>();
-  const reachableTabs = [...availableSwitchTargets];
+  // Root switch bindings affect every client on the socket. Without a client-
+  // scoped native lease, leave them untouched and refuse inherited generated
+  // controls: their owner and target authority cannot be inferred from syntax.
+  await assertSafeAttachSwitchControls(client);
   const activeTab = tabs.find((tab) => tab.muxName === muxName);
-  if (activeTab && !reachableTabs.includes(activeTab)) reachableTabs.push(activeTab);
-  for (const tab of reachableTabs) {
-    if (!tab.muxName || !tab.requiresDirectAttachFence) continue;
-    const id = tab.directAttachFenceSessionId;
-    try {
-      if (!id) throw new Error('Codex target has no session id');
-      if (!fenced.has(id)) await client.fenceDirectAttach(id);
-      fenced.add(id);
-    } catch (error) {
-      // The selected target is the attach itself, so it must fail closed. A
-      // secondary target can instead be made unreachable by omitting its Alt
-      // binding; this preserves a Claude/shell attach when the server is down.
-      if (tab === activeTab) throw error;
-      unsafeSwitchTargets.add(tab);
-    }
+  if (activeTab?.requiresDirectAttachFence) {
+    const id = activeTab.directAttachFenceSessionId;
+    if (!id) throw new Error('Direct attach target has no session id');
+    await client.fenceDirectAttach(id);
+    await assertSafeAttachSwitchControls(client);
   }
-  const handoffTabs = tabs.filter(
-    (tab) => !unsafeSwitchTargets.has(tab) && (!unavailableSwitchTargets.has(tab) || tab === activeTab)
-  );
+  const handoffTabs = activeTab ? [activeTab] : [];
   const prefix = (await client.readPrefixKey(muxName)) ?? undefined;
   // Read, not assumed: see detachChord() for the `d` vs `D` mix-up this closes.
   const detachKey = (await client.readDetachKey()) ?? undefined;
@@ -617,29 +596,6 @@ export async function beginAttachHandoff(
       : existing === null
         ? await client.bindDetachKey(ONE_KEY_DETACH, 'root')
         : false;
-  // Alt+1..9 switch sessions from inside the pane, so the strip on the bar is
-  // usable rather than decorative. Only the first nine, only sessions that
-  // really have a pane, and only keys tmux reports as free — the same rule the
-  // way-out key follows, so a binding of the user's own is never shadowed.
-  const switchKeys: string[] = [];
-  const boundSwitchTargets = new Set<TuiAttachTab>();
-  for (const tab of handoffTabs.slice(0, 9)) {
-    if (!tab.muxName || !availableSwitchTargets.has(tab)) continue;
-    const key = `M-${tab.index}`;
-    let bound: string | null;
-    try {
-      bound = await client.readAttachSwitchBinding(key);
-    } catch {
-      // Earlier keys may already be installed. Omit this uncertain target and
-      // return the handoff so its caller can restore every successful claim.
-      continue;
-    }
-    if (bound !== null && !isAttachSwitchBinding(bound)) continue;
-    if (await client.bindSwitchKey(key, tab.muxName)) {
-      switchKeys.push(key);
-      boundSwitchTargets.add(tab);
-    }
-  }
   const bannerFor = (activeMux: string, ownLabel: string): Record<string, string> =>
     buildAttachBanner({
       ...(prefix ? { prefix } : {}),
@@ -647,46 +603,29 @@ export async function beginAttachHandoff(
       ...(claimed && alias ? { heldAlias: alias } : {}),
       ...(oneKey ? { oneKey: ONE_KEY_DETACH } : {}),
       ...(cols ? { cols } : {}),
-      ...(switchKeys.length > 0 ? { switchKeys: true } : {}),
       label: ownLabel,
       tabs: handoffTabs.map((tab) => ({ ...tab, active: tab.muxName === activeMux })),
     });
 
-  // ⚠️ The bar goes on EVERY session the strip can switch to, not just the one
-  // being attached. `switch-client` moves this client to another session, and
-  // that session draws its OWN status line: with the bar only on the first one,
-  // pressing Alt+2 landed the user in a pane with no strip and, worse, no way
-  // out on screen. Each copy highlights its own tab, so the strip tracks where
-  // you actually are.
+  // Only the selected session is decorated; other owners retain their options.
   const banner = bannerFor(muxName, label);
   const dressed: Array<{ muxName: string; options: TuiSessionOptions }> = [];
   const resized: Array<{ muxName: string; sizing: TuiWindowSizing }> = [];
   const targets = new Map<string, string>([[muxName, label]]);
-  for (const tab of handoffTabs.slice(0, 9)) {
-    if (tab.muxName && boundSwitchTargets.has(tab) && !targets.has(tab.muxName)) targets.set(tab.muxName, tab.label);
-  }
   for (const [target, targetLabel] of targets) {
     const snapshot = await client.readSessionOptions(target, Object.keys(banner));
     if (snapshot) dressed.push({ muxName: target, options: snapshot });
     await client.applySessionOptions(target, bannerFor(target, targetLabel));
-    // ⚠️ Sizing for EVERY switchable session, not just the one being attached.
-    // Codeman pins each window `window-size manual` at the BROWSER's size, so a
-    // session switched into from inside a pane stays pinned and tmux pads the
-    // gap with dots — the pane filled half the terminal and the rest was a dot
-    // grid (reported from the beta, with a screenshot, after Alt+N switching
-    // shipped). `latest` makes each window follow whichever client is looking
-    // at it, which is the same reason the attached one gets it.
+    // The selected window follows the attaching terminal and is restored on detach.
     const sizing = await client.readWindowSizing(target);
     if (sizing) resized.push({ muxName: target, sizing });
-    // Pre-size to this terminal so a switch has nothing left to resize, then
-    // let the session we are actually opening follow the terminal live.
+    // Pre-size to this terminal, then let the selected window follow it live.
     if (cols && rows && rows > 1) await client.presizeWindow(target, cols, rows - 1);
     if (target === muxName) await client.followAttachingClient(target);
   }
   return {
     chord: oneKey ? ONE_KEY_DETACH : detachChord(prefix, detachKey),
     async restore(): Promise<void> {
-      for (const key of switchKeys) await client.unbindSwitchKey(key);
       if (oneKey) await client.unbindDetachKey(ONE_KEY_DETACH, 'root');
       if (claimed && alias) await client.unbindDetachKey(alias);
       // Options first, then the size: dropping the status bar gives its row
@@ -2306,9 +2245,11 @@ class TuiApp {
       return;
     }
 
-    if (plan.kind === 'switch' && needsDirectAttachFence(row.session)) {
+    if (plan.kind === 'switch') {
       try {
-        await this.client.fenceDirectAttach(row.session.sessionId);
+        await assertSafeAttachSwitchControls(this.client);
+        if (needsDirectAttachFence(row.session)) await this.client.fenceDirectAttach(row.session.sessionId);
+        await assertSafeAttachSwitchControls(this.client);
       } catch (error) {
         this.message('err', `could not safely attach: ${getErrorMessage(error)}`);
         this.paint();
@@ -2761,13 +2702,13 @@ export async function runTuiAttach(position: number, options: TuiRunOptions = {}
       process.stderr.write(`${palette.warn(plan.message)}\n`);
       return 1;
     }
-    if (needsDirectAttachFence(row.session)) {
-      try {
-        await client.fenceDirectAttach(row.session.sessionId);
-      } catch (error) {
-        process.stderr.write(`${palette.err(`could not safely attach: ${getErrorMessage(error)}`)}\n`);
-        return 1;
-      }
+    try {
+      await assertSafeAttachSwitchControls(client);
+      if (needsDirectAttachFence(row.session)) await client.fenceDirectAttach(row.session.sessionId);
+      await assertSafeAttachSwitchControls(client);
+    } catch (error) {
+      process.stderr.write(`${palette.err(`could not safely attach: ${getErrorMessage(error)}`)}\n`);
+      return 1;
     }
     // Same handoff the dashboard does: the window follows this terminal and
     // wears a bar naming the way out. This path has no dashboard to come back

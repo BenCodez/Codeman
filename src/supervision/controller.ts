@@ -9,7 +9,12 @@ import {
   type TaskProgress,
 } from './schema.js';
 import { commandHash, type CommandSuccessEvidence, type TaskProgressMarker } from './evidence.js';
-import { CONTINUATION_PROMPT, hasFreshProcessReady, type RecoveryObservation } from '../recovery/types.js';
+import {
+  CONTINUATION_PROMPT,
+  hasFreshProcessReady,
+  type RecoveryObservation,
+  type RecoveryActionAuthority,
+} from '../recovery/types.js';
 export interface TaskObservation {
   observation: RecoveryObservation;
   commands: Map<string, CommandSuccessEvidence>;
@@ -19,12 +24,15 @@ export interface TaskDependencies {
   acceptReservation?(key: string): Promise<boolean>;
   resetReservation?(): Promise<void>;
   observe(): Promise<TaskObservation>;
-  recover?(observation: RecoveryObservation, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
+  recover?(
+    observation: RecoveryObservation,
+    isCurrent: RecoveryActionAuthority
+  ): Promise<'sent' | 'not-sent' | 'unknown'>;
   act(
     key: string,
     conversationId: string,
     prompt: string,
-    isCurrent: () => boolean
+    isCurrent: RecoveryActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'>;
   persist(state: TaskState): Promise<void>;
   changed(state: TaskState): void;
@@ -342,6 +350,13 @@ export class TaskController {
       this.requireCurrent(revision);
       const { commands, observation, marker } = await this.deps.observe();
       this.requireCurrent(revision);
+      if (
+        typeof observation.conversationId !== 'string' ||
+        !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(observation.conversationId) ||
+        observation.reason === 'identity-unverified' ||
+        observation.reason === 'identity-changed'
+      )
+        throw new TaskValidationError('Task conversation is not verified');
       if (this.state.conversationId && observation.conversationId !== this.state.conversationId)
         throw new TaskValidationError('Task conversation changed');
       const candidate = this.getStatus();
@@ -428,7 +443,7 @@ export class TaskController {
       return this.save('owner-paused');
     });
   }
-  resume(externallyCurrent: () => boolean = () => true, runtimeStartedAt?: number): Promise<TaskState> {
+  resume(externallyCurrent: RecoveryActionAuthority = () => true, runtimeStartedAt?: number): Promise<TaskState> {
     if (
       runtimeStartedAt !== undefined &&
       (!Number.isFinite(runtimeStartedAt) || runtimeStartedAt < 0 || runtimeStartedAt > this.now())
@@ -492,12 +507,12 @@ export class TaskController {
       await this.save('kickoff-reserved');
       const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent', true, externallyCurrent);
       if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-      const delivered = await this.deps.act(
-        key,
-        o.conversationId,
-        this.prompt(),
-        () => this.actionIsCurrent(revision) && externallyCurrent()
-      );
+      const canDispatch: RecoveryActionAuthority = () => this.actionIsCurrent(revision) && externallyCurrent();
+      if (externallyCurrent.prepareEvidence) {
+        canDispatch.prepareEvidence = async (source) =>
+          canDispatch() && (await externallyCurrent.prepareEvidence!(source)) === true && canDispatch();
+      }
+      const delivered = await this.deps.act(key, o.conversationId, this.prompt(), canDispatch);
       const cancelled = this.preserveCancelledDelivery(revision, delivered, true, externallyCurrent);
       if (cancelled) return cancelled;
       if (delivered === 'not-sent') {

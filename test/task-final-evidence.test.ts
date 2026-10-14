@@ -19,6 +19,8 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 it.each([
   'unchanged',
+  'missing-native-id',
+  'missing-native-pid',
   'child',
   'auth',
   'approval',
@@ -35,6 +37,8 @@ it.each([
   await fs.mkdir(join(home, 'sessions'));
   const path = join(home, 'sessions', `rollout-2026-10-13T12-00-00-${THREAD}.jsonl`);
   const pane = {
+    paneId: '%7',
+    panePid: 700,
     dead: false,
     status: undefined,
     signal: undefined,
@@ -44,7 +48,7 @@ it.each([
   const mux = {
     isAvailable: () => true,
     inspectPaneForRecovery: vi.fn(async () => {
-      if (++reads === 3 && change !== 'unchanged') {
+      if (++reads === 3 && !['unchanged', 'missing-native-id', 'missing-native-pid'].includes(change)) {
         const additions: Record<string, string> = {
           child: event({ type: 'collab_agent_spawn_begin', call_id: 'new-child' }),
           auth: event({
@@ -83,7 +87,10 @@ it.each([
           );
         } else await fs.appendFile(path, additions[change]);
       }
-      return { ...pane };
+      const current = { ...pane };
+      if (change === 'missing-native-id') Reflect.deleteProperty(current, 'paneId');
+      if (change === 'missing-native-pid') Reflect.deleteProperty(current, 'panePid');
+      return current;
     }),
     sendInput: vi.fn(async () => true),
     respawnPane: vi.fn(async () => 99999),

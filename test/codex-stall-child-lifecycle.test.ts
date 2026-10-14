@@ -37,6 +37,38 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('actual local stall controller with an abnormally dead owned pane', () => {
+  it.each([true, false])(
+    'keeps a pinned UUID and owned header without tracked input non-actionable (watcher=%s)',
+    async (storedExit) => {
+      const f = await createChildLifecycleFixture(
+        returnedChildTail('collab_resume_end', 'completed'),
+        true,
+        storedExit,
+        false
+      );
+      try {
+        expect(f.session.getRecoveryContext().submission).toBeUndefined();
+        expect(f.session.codexConfig?.resumeSessionId).toBe(CHILD_THREAD);
+        expect(await f.adapter.observe()).toMatchObject({
+          activity: 'unknown',
+          reason: 'identity-unverified',
+          safeToAct: false,
+        });
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 2_000);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 3_000);
+        await f.controller.retry();
+        expect(f.delivered).not.toHaveBeenCalled();
+        expect(f.controller.getStatus().attempts).toBe(0);
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+        expect(f.adapter.getVerifiedTail(CHILD_THREAD)).toBeUndefined();
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
   it('requires two fresh observations of one exact native process rather than mixing different dead pane PIDs', async () => {
     const f = await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, true);
     try {
