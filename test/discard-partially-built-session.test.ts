@@ -220,6 +220,7 @@ describe('custom-model reboot restore cleanup through the real server route', ()
       mode: 'codex',
       codexConfig: { noDaemon: true, resumeSessionId: REBOOT_UUID, model: 'custom-model' },
       __envOverrides: { CODEX_HOME: home },
+      __codexRecoveryHome: home,
       __customModel: {
         endpointId: 'reboot-custom-endpoint',
         modelId: 'custom-model',
@@ -335,6 +336,7 @@ describe('reboot recovery evidence fence', () => {
       ...session.toState(),
       pid: 1234,
       __envOverrides: { CODEX_HOME: home },
+      __codexRecoveryHome: home,
     };
     expect(await verifyCodexRebootIdentity(saved)).toBe(oldConversation);
     await internals.registerSessionWithLayout(session);

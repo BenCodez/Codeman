@@ -25,7 +25,7 @@ The session-create API accepts these optional Codex launch settings:
 
 Send this to `POST /api/sessions`, then use the normal Run control. Replace the example path/model with your own. Omit fields to retain Codex's defaults. These launch options are also accepted by quick-start. `noDaemon` and `noAltScreen` require a Codex installation that supports those flags. Unsupported flags fail the launch; recovery never substitutes sandbox bypass or a fresh conversation.
 
-Codeman records whether its actual local launch command disabled the daemon. An existing pane with only a newly edited setting cannot become eligible: use a newly launched session. A custom `CODEX_HOME` can be supplied through the existing `envOverrides` mechanism and remains subject to the owner's current privileges. Only this non-secret path is persisted; Codex API-key overrides are not written to session state.
+Codeman records whether its actual local launch command disabled the daemon. An existing pane with only a newly edited setting cannot become eligible: use a newly launched session. A custom `CODEX_HOME` can be supplied through the existing `envOverrides` mechanism and remains subject to the owner's current privileges. The actual effective local home, including an inherited `CODEX_HOME` or the default home, is pinned at launch and privately persisted. Older panes without launch-home provenance remain ineligible until a separately authorized new launch. Only this non-secret path is persisted; Codex API-key overrides are not written to session state.
 
 ## Controls and status
 

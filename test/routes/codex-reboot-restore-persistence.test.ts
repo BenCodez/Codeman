@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { dataPath, getDataDir } from '../../src/config/instance.js';
+import { userCasesDir } from '../../src/config/multiuser.js';
 import { writeCustomModelHosts } from '../../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
 import { planVerifiedRebootRestore, verifyCodexRebootIdentity } from '../../src/reboot-restore.js';
@@ -15,11 +16,12 @@ import { Session } from '../../src/session.js';
 import { TmuxManager } from '../../src/tmux-manager.js';
 import type { StateStore } from '../../src/state-store.js';
 import type { SessionState } from '../../src/types.js';
-import { createUser, invalidateUsersCache } from '../../src/user-store.js';
+import { createUser, invalidateUsersCache, updateUser } from '../../src/user-store.js';
 import { rebootRestoreRegistry } from '../../src/web/reboot-restore-registry.js';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { registerRebootRestoreRoutes } from '../../src/web/routes/reboot-restore-routes.js';
 import { WebServer } from '../../src/web/server.js';
+import * as launchGrants from '../../src/session-env-clamp.js';
 
 const UUID = '12345678-1234-1234-1234-123456789abc';
 const servers: WebServer[] = [];
@@ -54,11 +56,10 @@ async function harness() {
   registerRebootRestoreRoutes(app, ctx);
   installRouteErrorHandler(app);
   await app.ready();
-  return { server, app, store: Reflect.get(server, 'store') as StateStore };
+  return { server, app, ctx, store: Reflect.get(server, 'store') as StateStore };
 }
 
-function fixture(id: string, home = join(homedir(), '.codex')) {
-  const workspace = join(homedir(), 'reboot-workspaces', id);
+function fixture(id: string, home = join(homedir(), '.codex'), workspace = join(homedir(), 'reboot-workspaces', id)) {
   mkdirSync(workspace, { recursive: true });
   mkdirSync(join(home, 'sessions'), { recursive: true });
   const rollout = join(home, 'sessions', `rollout-2026-10-13T15-00-00-${UUID}.jsonl`);
@@ -80,7 +81,7 @@ function fixture(id: string, home = join(homedir(), '.codex')) {
     createdAt: Date.now() - 60_000,
     codexConfig: { noDaemon: true, sandbox: 'read-only', approvalPolicy: 'on-request' },
   };
-  Object.assign(state, { __envOverrides: { CODEX_HOME: home } });
+  Object.assign(state, { __envOverrides: { CODEX_HOME: home }, __codexRecoveryHome: home });
   return { state, home, rollout };
 }
 
@@ -103,6 +104,291 @@ afterEach(async () => {
 });
 
 describe('durable Codex reboot completion', () => {
+  it.each([
+    'create-response-lost',
+    'attachment-failure',
+    'finalization-failure',
+    'cancelled-after-create',
+    'cleanup-failure',
+  ])('preserves a possibly started worker and historical evidence after %s', async (uncertainty) => {
+    const id = `${hashCodexPrompt(uncertainty).slice(0, 8)}-5555-2222-3333-444444444444`;
+    const { state, home, rollout } = fixture(id, join(homedir(), 'uncertain-restore-homes', uncertainty));
+    state.codexConfig!.resumeSessionId = UUID;
+    await offer(state);
+    const { server, app, ctx, store } = await harness();
+    store.setSession(id, state);
+    store.flush();
+    const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
+    const priorRollout = readFileSync(rollout, 'utf8');
+    const kill = vi.spyOn(ctx.mux, 'killSession');
+    const originalCreate = ctx.mux.createSession.bind(ctx.mux);
+    vi.spyOn(ctx.mux, 'createSession').mockImplementation(async (options) => {
+      const result = await originalCreate(options);
+      if (uncertainty === 'create-response-lost' || uncertainty === 'cleanup-failure')
+        throw new Error('Fixture response lost after worker creation');
+      if (uncertainty === 'cancelled-after-create') rebootRestoreRegistry.clear(() => true);
+      return result;
+    });
+    if (uncertainty === 'attachment-failure') {
+      const setup = Reflect.get(Session.prototype, '_setupOrAttachMuxSession');
+      vi.spyOn(
+        Session.prototype as unknown as { _setupOrAttachMuxSession(options: unknown): Promise<unknown> },
+        '_setupOrAttachMuxSession'
+      ).mockImplementation(async function (options) {
+        await setup.call(this, options);
+        throw new Error('Fixture attachment response lost');
+      });
+    }
+    if (uncertainty === 'finalization-failure') {
+      const apply = ctx.reapplyPersistedSessionState.bind(ctx);
+      ctx.reapplyPersistedSessionState = async (...args) => {
+        if (args[2] === 'after-spawn') throw new Error('Fixture finalization unavailable');
+        await apply(...args);
+      };
+    }
+    if (uncertainty === 'cleanup-failure') {
+      const stop = Session.prototype.stop;
+      vi.spyOn(Session.prototype, 'stop').mockImplementation(async function (...args) {
+        await stop.apply(this, args);
+        throw new Error('Fixture cleanup response lost');
+      });
+    }
+    const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
+    expect(result.restored).toEqual([]);
+    expect(result.skipped).toEqual([{ sessionId: id, reason: 'restore-uncertain' }]);
+    expect(kill).not.toHaveBeenCalled();
+    expect(ctx.mux.getSession(id)).toBeDefined();
+    expect(sessionMap(server).has(id)).toBe(false);
+    expect(readFileSync(rollout, 'utf8')).toBe(priorRollout);
+    store.flush();
+    expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
+    expect(readRebootIdentityFence(id)).toMatchObject({ switchPending: true });
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+    expect(rebootRestoreRegistry.list(() => true)).toHaveLength(uncertainty === 'cancelled-after-create' ? 0 : 1);
+  });
+
+  it.each(['final-grant', 'mux-preparation'] as const)(
+    'refuses a saved privileged launch when its current grant is revoked during %s',
+    async (stage) => {
+      process.env.CODEMAN_MULTIUSER = '1';
+      invalidateUsersCache();
+      const username = `final-grant-${stage}`;
+      await createUser({ username, role: 'user', password: 'fixture-password', canBypassPermissions: true });
+      const id = `${hashCodexPrompt(stage).slice(0, 8)}-3333-2222-3333-444444444444`;
+      const { state } = fixture(id, join(homedir(), '.codex'), join(userCasesDir(username), 'project'));
+      state.owner = username;
+      state.codexConfig = {
+        noDaemon: true,
+        resumeSessionId: UUID,
+        sandbox: 'danger-full-access',
+        approvalPolicy: 'never',
+        dangerouslyBypassApprovals: true,
+      };
+      await offer(state);
+      const { server, app, ctx, store } = await harness();
+      store.setSession(id, state);
+      let revoked = false;
+      if (stage === 'final-grant') {
+        const clamp = launchGrants.clampExternalCliConfigsForOwner;
+        let calls = 0;
+        vi.spyOn(launchGrants, 'clampExternalCliConfigsForOwner').mockImplementation(async (...args) => {
+          const result = await clamp(...args);
+          if (++calls === 2) {
+            await updateUser(username, { canBypassPermissions: false });
+            revoked = true;
+          }
+          return result;
+        });
+      }
+      const originalCreate = ctx.mux.createSession.bind(ctx.mux);
+      const effects: string[] = [];
+      vi.spyOn(ctx.mux, 'createSession').mockImplementation(async (options) => {
+        if (stage === 'mux-preparation') {
+          await updateUser(username, { canBypassPermissions: false });
+          revoked = true;
+        }
+        const created = await originalCreate(options);
+        effects.push(created.sessionId);
+        return created;
+      });
+      const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
+      expect(revoked).toBe(true);
+      expect(result.restored).toEqual([]);
+      expect(effects).toEqual([]);
+      expect(sessionMap(server).has(id)).toBe(false);
+      expect(store.getSession(id)).toEqual(state);
+      expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([id]);
+    }
+  );
+
+  it.each(
+    ['final-grant', 'mux-preparation'].flatMap((stage) =>
+      [
+        'unchanged',
+        'child',
+        'auth',
+        'approval',
+        'unknown',
+        'malformed',
+        'truncated',
+        'history',
+        'identity',
+        'switch',
+        'untracked',
+        'submission',
+        'owner-input',
+      ].map((change) => ({ stage, change }))
+    )
+  )('retains reboot authority through $stage only with $change evidence', async ({ stage, change }) => {
+    const id = `${hashCodexPrompt(`${stage}:${change}`).slice(0, 8)}-1111-2222-3333-444444444444`;
+    const { state, home, rollout } = fixture(id, join(homedir(), 'guard-homes', `${stage}-${change}`));
+    state.codexConfig!.resumeSessionId = UUID;
+    const now = Date.now();
+    const prompt = 'Original exact owner task';
+    const submission = { at: now, hash: hashCodexPrompt(prompt) };
+    writeFileSync(
+      join(home, 'history.jsonl'),
+      JSON.stringify({ session_id: UUID, ts: now / 1000, text: prompt }) + '\n'
+    );
+    writeRebootIdentityFence(id, { switchPending: false, submission });
+    await offer(state);
+    const { server, app, ctx, store } = await harness();
+    store.setSession(id, state);
+    store.flush();
+    const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
+    let changed = false;
+    const mutate = () => {
+      if (changed) return;
+      changed = true;
+      const event = (payload: unknown) =>
+        JSON.stringify({ type: 'event_msg', timestamp: new Date(now).toISOString(), payload }) + '\n';
+      const additions: Record<string, string> = {
+        child: event({ type: 'collab_agent_spawn_begin', call_id: 'new-child' }),
+        auth: event({ type: 'error', message: 'Sanitized authentication fixture.', codex_error_info: 'Unauthorized' }),
+        approval: event({ type: 'exec_approval_request', call_id: 'new-approval' }),
+        unknown: event({
+          type: 'error',
+          message: 'Sanitized uncertainty fixture.',
+          codex_error_info: 'thread_rollback_failed',
+        }),
+        malformed: '{partial-fixture}\n',
+        truncated: JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(300 * 1024) } }) + '\n',
+      };
+      if (change in additions) appendFileSync(rollout, additions[change]);
+      else if (change === 'history')
+        appendFileSync(
+          join(home, 'history.jsonl'),
+          JSON.stringify({ session_id: '99999999-2222-3333-4444-555555555555', ts: now / 1000, text: prompt }) + '\n'
+        );
+      else if (change === 'identity') {
+        const other = '99999999-2222-3333-4444-555555555555';
+        writeFileSync(
+          join(home, 'sessions', `rollout-2026-10-13T23-00-00-${other}.jsonl`),
+          JSON.stringify({
+            type: 'session_meta',
+            timestamp: new Date(now + 1).toISOString(),
+            payload: { id: other, cwd: state.workingDir, originator: `codeman_${id}` },
+          }) + '\n'
+        );
+      } else if (change === 'switch') writeRebootIdentityFence(id, { switchPending: true });
+      else if (change === 'untracked') writeRebootIdentityFence(id, { switchPending: true, untrackedInput: true });
+      else if (change === 'submission')
+        writeRebootIdentityFence(id, {
+          switchPending: false,
+          submission: { at: now + 1, hash: hashCodexPrompt('New owner request') },
+        });
+      else if (change === 'owner-input')
+        expect(sessionMap(server).get(id)!.write('New owner request\r', { fromUser: true })).toBe(false);
+    };
+    if (stage === 'final-grant') {
+      const clamp = launchGrants.clampExternalCliConfigsForOwner;
+      let calls = 0;
+      vi.spyOn(launchGrants, 'clampExternalCliConfigsForOwner').mockImplementation(async (...args) => {
+        const result = await clamp(...args);
+        if (++calls === 2) mutate();
+        return result;
+      });
+    }
+    const originalCreate = ctx.mux.createSession.bind(ctx.mux);
+    const effects: string[] = [];
+    vi.spyOn(ctx.mux, 'createSession').mockImplementation(async (options) => {
+      if (stage === 'mux-preparation') mutate();
+      const result = await originalCreate(options);
+      effects.push(result.sessionId);
+      return result;
+    });
+    const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
+    expect(changed).toBe(true);
+    if (change === 'unchanged') {
+      expect(result.restored).toHaveLength(1);
+      expect(effects).toEqual([id]);
+    } else {
+      expect(result.restored).toEqual([]);
+      expect(effects).toEqual([]);
+      expect(sessionMap(server).has(id)).toBe(false);
+      store.flush();
+      expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
+      expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([id]);
+    }
+  });
+
+  it.each(['retained', 'revoked-before-click', 'revoked-during-preparation'] as const)(
+    'preserves exact saved Codex config only while owner grants are %s',
+    async (grant) => {
+      process.env.CODEMAN_MULTIUSER = '1';
+      invalidateUsersCache();
+      const username = `grant-${grant}`;
+      await createUser({ username, role: 'user', password: 'fixture-password', canBypassPermissions: true });
+      const id = `${grant === 'retained' ? '12345678' : grant === 'revoked-before-click' ? '23456789' : '34567890'}-1111-2222-3333-444444444444`;
+      const { state } = fixture(id, join(homedir(), '.codex'), join(userCasesDir(username), 'project'));
+      state.owner = username;
+      state.codexConfig = {
+        noDaemon: true,
+        noAltScreen: true,
+        resumeSessionId: UUID,
+        sandbox: 'danger-full-access',
+        approvalPolicy: 'never',
+        dangerouslyBypassApprovals: true,
+        model: 'example-model',
+        reasoningEffort: 'high',
+      };
+      Object.assign(state, { pinned: true, inputTokens: 234, outputTokens: 123, totalCost: 12 });
+      // The default home remains authorized after revocation, so this regression
+      // specifically exercises saved launch flags rather than home provenance.
+      delete (state as SessionState & { __envOverrides?: unknown }).__envOverrides;
+      await offer(state);
+      const { server, app, ctx, store } = await harness();
+      store.setSession(id, state);
+      store.flush();
+      const historicalSnapshot = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
+      const start = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue();
+      if (grant === 'revoked-before-click') await updateUser(username, { canBypassPermissions: false });
+      if (grant === 'revoked-during-preparation') {
+        const setup = ctx.setupSessionListeners.bind(ctx);
+        ctx.setupSessionListeners = async (session) => {
+          await setup(session);
+          await updateUser(username, { canBypassPermissions: false });
+        };
+      }
+      const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
+      if (grant === 'retained') {
+        expect(result.restored).toHaveLength(1);
+        expect(result.skipped).toEqual([]);
+        expect(start).toHaveBeenCalledTimes(1);
+        expect(sessionMap(server).get(id)!.toState().codexConfig).toEqual(state.codexConfig);
+      } else {
+        expect(result.restored).toEqual([]);
+        expect(result.skipped).toEqual([{ sessionId: id, reason: 'identity-unverified' }]);
+        expect(start).not.toHaveBeenCalled();
+        expect(sessionMap(server).has(id)).toBe(false);
+        store.flush();
+        expect(store.getSession(id)).toEqual(state);
+        expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historicalSnapshot);
+        expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([id]);
+      }
+    }
+  );
+
   it.each(
     (['failed', 'cancelled'] as const).flatMap((outcome) =>
       (['programmatic', 'user', 'direct-attach'] as const).map((input) => ({ outcome, input }))
@@ -197,7 +483,6 @@ describe('durable Codex reboot completion', () => {
     const restore = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
     try {
       await vi.waitFor(() => expect(launching).toBeDefined());
-      expect(launching!.write('unsent startup prompt\r', { fromUser: true })).toBe(false);
       expect(store.getSession(state.id)).toEqual(state);
     } finally {
       release();
@@ -211,8 +496,9 @@ describe('durable Codex reboot completion', () => {
       outputTokens: 123,
       totalCost: 12,
     });
-    expect(readRebootIdentityFence(state.id)).toMatchObject({ switchPending: true });
+    expect(readRebootIdentityFence(state.id)).toMatchObject({ switchPending: false, resumeSessionId: UUID });
     const session = sessionMap(server).get(state.id)!;
+    expect(session.codexRestoreWorkerMayExist).toBe(false);
     session.restoreTokens(235, 124, 13);
     expect(session.write('Current exact prompt\r', { fromUser: true })).toBe(true);
     expect(store.getSession(state.id)).toMatchObject({ inputTokens: 235, outputTokens: 124, totalCost: 13 });
@@ -301,7 +587,7 @@ describe('durable Codex reboot completion', () => {
     expect(await verifyCodexRebootIdentity(sessionMap(server).get(state.id)!.toState())).toBeUndefined();
   });
 
-  it('leaves the previous fence intact when a launched restore is dismissed', async () => {
+  it('preserves the old submission and fences an uncertain worker when a launched restore is dismissed', async () => {
     const { state, home } = fixture('dddddddd-1111-2222-3333-444444444444');
     const submission = { at: Date.now(), hash: hashCodexPrompt('pre-reboot task') };
     writeFileSync(
@@ -315,11 +601,14 @@ describe('durable Codex reboot completion', () => {
       await original.apply(this, args);
       if (args[2] === 'after-spawn') rebootRestoreRegistry.clear(() => true);
     });
-    const { server, app } = await harness();
+    const { server, app, ctx } = await harness();
+    const kill = vi.spyOn(ctx.mux, 'killSession');
     const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
-    expect(result.json().skipped).toEqual([{ sessionId: state.id, reason: 'restore-cancelled' }]);
+    expect(result.json().skipped).toEqual([{ sessionId: state.id, reason: 'restore-uncertain' }]);
     expect(sessionMap(server).has(state.id)).toBe(false);
-    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: false, submission });
+    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: true, submission });
+    expect(ctx.mux.getSession(state.id)).toBeDefined();
+    expect(kill).not.toHaveBeenCalled();
   });
 });
 

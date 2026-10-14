@@ -34,6 +34,7 @@ function fixture(restored = true) {
       mode: 'codex',
       attached: true,
       recoveryIsolated: true,
+      recoveryCodexHome: '/fixture/codex-home',
     } as MuxSession,
     preserveExitedPane: restored,
     codexConfig: { noDaemon: true, resumeSessionId: THREAD },
@@ -177,14 +178,16 @@ describe('Session records exact delivered browser submissions', () => {
     expect(onInput).toHaveBeenCalled();
     expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, submission: undefined });
     sent.resolve(false);
-    expect(await writing).toBe(false);
+    await expect(writing).rejects.toThrow('Mux input delivery could not be confirmed');
     expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, submission: undefined });
   });
 
   it('does not lift a restored veto when delivery of an exact ordinary submission fails', async () => {
     const { session, mux } = fixture();
     mux.sendInput.mockResolvedValueOnce(false);
-    expect(await session.writeViaMux('Undelivered fixture.\r', { fromUser: true })).toBe(false);
+    await expect(session.writeViaMux('Undelivered fixture.\r', { fromUser: true })).rejects.toThrow(
+      'Mux input delivery could not be confirmed'
+    );
     expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, submission: undefined });
   });
 

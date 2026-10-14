@@ -89,6 +89,7 @@ async function attachSavedPane(config: Partial<CodexConfig> = {}, env?: Record<s
     name: saved.name,
     owner: saved.owner,
     recoveryIsolated: true,
+    recoveryCodexHome: envOverrides.CODEX_HOME ?? join(homedir(), '.codex'),
   };
   const mux = new TmuxManager();
   multiplexers.push(mux);

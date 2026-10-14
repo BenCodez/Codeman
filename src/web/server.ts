@@ -1343,6 +1343,9 @@ export class WebServer extends EventEmitter {
             },
           }
         : {}),
+      ...(session.getRecoveryContext().codexHome
+        ? { __codexRecoveryHome: session.getRecoveryContext().codexHome }
+        : {}),
       ...(envOverrides ? { __envOverrides: envOverrides } : {}),
       ...(attachmentHistory ? { __attachmentHistory: attachmentHistory } : {}),
       ...(customModel ? { __customModel: customModel } : {}),
@@ -3516,7 +3519,7 @@ export class WebServer extends EventEmitter {
   async discardPartiallyBuiltSession(
     sessionId: string,
     expectedSession?: Session,
-    options?: { preserveCustomModelConfigDir?: boolean }
+    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean }
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     // Reboot restore reuses a historical id. A late failure or cancellation may
@@ -3579,12 +3582,13 @@ export class WebServer extends EventEmitter {
     if (!options?.preserveCustomModelConfigDir) removeConfigDir(customModelConfigDir(sessionId));
     try {
       session.removeAllListeners();
-      await session.stop(true);
+      await session.stop(!options?.preserveMuxPane);
     } catch (err) {
       console.warn(`[Server] stopping a partially built session failed: ${getErrorMessage(err)}`);
       // `stop()` kills the mux session in its last block, after destroying its
       // trackers, so a throw on the way there leaves the pane running.
-      await this.mux.killSession(sessionId).catch(() => {});
+      if (!options?.preserveMuxPane && !session.codexRestoreWorkerMayExist)
+        await this.mux.killSession(sessionId).catch(() => {});
     }
     try {
       await this.tabLayouts.sessionsRemoved([{ id: sessionId, owner: session.owner }]);

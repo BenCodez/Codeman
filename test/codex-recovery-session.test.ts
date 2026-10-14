@@ -27,6 +27,7 @@ function fixture(extra: Record<string, unknown> = {}) {
     muxName: 'codeman-aaaaaaaa',
     sessionId: SESSION,
     recoveryIsolated: true,
+    recoveryCodexHome: '/srv/example/codex-home',
     pid: 99999,
     createdAt: Date.now(),
     workingDir: '/tmp',
@@ -66,12 +67,21 @@ describe('the actual Session recovery boundary', () => {
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
   });
 
+  it('refuses legacy isolated panes without actual home provenance', async () => {
+    const f = fixture();
+    f.muxSession.recoveryCodexHome = undefined;
+    expect(f.session.getRecoveryContext().noDaemon).toBe(false);
+    expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
+    expect(f.mux.respawnPane).not.toHaveBeenCalled();
+  });
+
   it('pins the exact thread and preserves all launch settings and the session home on restart', async () => {
     const f = fixture();
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
     expect(f.mux.respawnPane).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         onlyIfDead: true,
+        recoveryCodexHome: '/srv/example/codex-home',
         sessionId: SESSION,
         workingDir: '/tmp',
         codexConfig: {
@@ -270,4 +280,13 @@ describe('Codeman reboot of its own server preserves crashed panes and circuit c
     expect(create).not.toHaveBeenCalled();
     expect(session.toState().codexConfig?.resumeSessionId).toBe(THREAD);
   });
+});
+
+it('refuses an asynchronous evidence predicate instead of granting a new await window', async () => {
+  const f = fixture();
+  expect(
+    await f.session.deliverRecovery(f.flight, 0, () => true, CONTINUATION_PROMPT, (() =>
+      Promise.resolve(true)) as never)
+  ).toBe('not-sent');
+  expect(f.mux.respawnPane).not.toHaveBeenCalled();
 });
