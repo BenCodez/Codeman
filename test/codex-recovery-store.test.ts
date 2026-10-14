@@ -83,6 +83,36 @@ describe('recovery journal durability', () => {
     await store.save('extra', large);
     expect(new RecoveryStore(path).get('extra')).toEqual(large);
   });
+  it('preserves the exact stall progress baseline across reservation and accepted-cycle reloads', async () => {
+    const store = new RecoveryStore(path);
+    const reserved = savedState({
+      inFlight: {
+        key: 'same-turn',
+        action: 'restart',
+        conversationId: THREAD,
+        startedAt: NOW,
+        reason: 'stalled',
+        stallProgressAt: NOW - 20_000,
+      },
+    });
+    await store.save('worker', reserved);
+    expect(new RecoveryStore(path).get('worker').inFlight).toEqual(reserved.inFlight);
+    const accepted = {
+      ...reserved,
+      inFlight: undefined,
+      handledEvidence: ['stall:' + 'a'.repeat(64) + ':' + (NOW - 20_000)],
+    };
+    await store.save('worker', accepted);
+    expect(new RecoveryStore(path).get('worker').handledEvidence).toEqual(accepted.handledEvidence);
+    expect(() =>
+      store.save('worker', {
+        ...reserved,
+        inFlight: { ...reserved.inFlight!, stallProgressAt: Number.MAX_SAFE_INTEGER + 1 },
+      })
+    ).toThrow();
+    expect(new RecoveryStore(path).get('worker')).toEqual(accepted);
+  });
+
   it('starts disabled without a journal and does not create files during reads', async () => {
     const store = new RecoveryStore(path);
     expect(store.loadFailed).toBe(false);

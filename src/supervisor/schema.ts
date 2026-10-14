@@ -1,6 +1,6 @@
 /** @fileoverview Bounded durable configuration for an opt-in Codex supervisor. */
 import { z } from 'zod';
-import { CriteriaSchema } from '../supervision/schema.js';
+import { CriteriaSchema, PromptTextSchema } from '../supervision/schema.js';
 import type {
   SupervisorConfig as PublicSupervisorConfig,
   SupervisorState as PublicSupervisorState,
@@ -12,7 +12,7 @@ const RequestId = z.string().regex(/^[\w:.-]{8,120}$/);
 export const SupervisorWorkerSchema = z
   .object({
     sessionId: SessionId,
-    task: z.string().min(1).max(4000),
+    task: PromptTextSchema.min(1).max(4000),
     criteria: CriteriaSchema,
     maxAssignments: z.number().int().min(1).max(10),
     maxRuntimeMs: z.number().int().min(1000).max(86_400_000),
@@ -24,7 +24,7 @@ export const SupervisorWorkerSchema = z
 
 export const SupervisorConfigSchema = z
   .object({
-    objective: z.string().min(1).max(3000),
+    objective: PromptTextSchema.min(1).max(3000),
     enabled: z.boolean(),
     workers: z
       .array(SupervisorWorkerSchema.omit({ assignments: true, startedAt: true, lastRequestId: true }))
@@ -41,7 +41,7 @@ export const SupervisorStateSchema = z
   .object({
     version: z.literal(1),
     supervisorSessionId: SessionId,
-    objective: z.string().max(3000),
+    objective: PromptTextSchema.max(3000),
     enabled: z.boolean(),
     phase: z.enum(['disabled', 'ready', 'active', 'paused', 'blocked']),
     reason: z.string().regex(/^[\w-]{1,80}$/),

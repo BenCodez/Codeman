@@ -286,3 +286,42 @@ it('drains a supervisor-only pending pause on server shutdown before flushing jo
     expect(new SupervisorStore(paths[3]).get(ID).reason).toBe('owner-paused');
   });
 });
+
+it('completes owner deletion after every controller drains when the supervisor journal is unreadable', async () => {
+  await fixture(
+    'recovery',
+    async ({ internals, session, workerDone, managerDone, workerPending, managerPending, paths }) => {
+      const damaged = '{unreadable-supervisor-journal}';
+      await fs.writeFile(paths[3], damaged);
+      internals.supervisorStore = new SupervisorStore(paths[3]);
+      expect(internals.supervisorStore.loadFailed).toBe(true);
+      const stop = vi.spyOn(session, 'stop').mockResolvedValue();
+      session.setPinned(true);
+      internals.store.setSession(ID, session.toState());
+      const drops = [
+        internals.supervisorStore,
+        internals.taskStore,
+        internals.actionReservationStore,
+        internals.recoveryStore,
+      ].map((journal) => vi.spyOn(journal, 'drop'));
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const cleanup = internals.cleanupSession(ID, true, 'fixture owner deletion');
+      try {
+        expect(stop).not.toHaveBeenCalled();
+        for (const drop of drops) expect(drop).not.toHaveBeenCalled();
+      } finally {
+        workerDone.resolve('unknown');
+        managerDone.resolve();
+        await Promise.allSettled([workerPending, managerPending]);
+        await cleanup;
+      }
+      for (const drop of drops) expect(drop).toHaveBeenCalledWith(ID);
+      expect(stop).toHaveBeenCalledWith(true);
+      expect(internals.sessions.has(ID)).toBe(false);
+      expect(internals.store.getSession(ID)).toMatchObject({ pinned: true, status: 'stopped' });
+      expect(await fs.readFile(paths[3], 'utf8')).toBe(damaged);
+      for (const path of paths.slice(0, 3))
+        expect(JSON.parse(await fs.readFile(path, 'utf8')).sessions[ID]).toBeUndefined();
+    }
+  );
+});

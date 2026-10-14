@@ -74,6 +74,29 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
 }
 
 describe('SupervisorController', () => {
+  it.each(
+    ['objective', 'task'].flatMap((field) => ['\0', '\x1b', '\x7f', '\x9b'].map((control) => ({ field, control })))
+  )(
+    'rejects terminal controls in manager $field before changing ownership or dispatching work',
+    async ({ field, control }) => {
+      const h = harness();
+      await h.controller.configure(config);
+      const before = h.controller.getStatus();
+      vi.mocked(h.deps.persist).mockClear();
+      const changed = structuredClone(config);
+      if (field === 'objective') changed.objective += control;
+      else changed.workers[0].task += control;
+      expect(() => h.controller.configure(changed)).toThrow();
+      expect(h.controller.getStatus()).toEqual(before);
+      expect(h.deps.persist).not.toHaveBeenCalled();
+      expect(h.deps.startManager).not.toHaveBeenCalled();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      await h.controller.start();
+      expect(h.deps.startManager).toHaveBeenCalledOnce();
+    }
+  );
+
   it.each(['assign', 'retry'] as const)(
     'acknowledges a durably accepted %s after reload without active workers or new effects',
     async (action) => {

@@ -581,6 +581,7 @@ export class CodexRecoveryAdapter {
         ? current.stallRestartable === true &&
           current.stallEvidenceKey === flight.key &&
           previous.stallProgressAt !== undefined &&
+          (flight.stallProgressAt === undefined || flight.stallProgressAt === previous.stallProgressAt) &&
           (current.progressAt ?? current.at) === previous.stallProgressAt
         : current.safeToAct && current.evidenceKey === flight.key;
     if (!isCurrent() || !currentProvesAction || !this.proof || this.proof.generation !== previous.generation)

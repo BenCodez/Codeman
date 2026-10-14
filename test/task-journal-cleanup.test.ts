@@ -8,6 +8,9 @@ import { Session } from '../src/session.js';
 import { subagentWatcher } from '../src/subagent-watcher.js';
 import { TaskStore } from '../src/supervision/store.js';
 import { initialTaskState } from '../src/supervision/schema.js';
+import { RecoveryStore } from '../src/recovery/store.js';
+import { initialRecoveryState } from '../src/recovery/types.js';
+import { StateStore } from '../src/state-store.js';
 import type { SessionMode } from '../src/types/session.js';
 
 type JournalKey = 'taskStore' | 'actionReservationStore';
@@ -15,6 +18,8 @@ interface CleanupInternals {
   sessions: Map<string, Session>;
   taskStore: TaskStore;
   actionReservationStore: TaskStore;
+  recoveryStore: RecoveryStore;
+  store: StateStore;
   _doCleanupSession(id: string, killMux: boolean, reason: string, coordinateLayout: boolean): Promise<void>;
 }
 
@@ -34,6 +39,9 @@ async function withJournals(
   const server = new WebServer(0, false, true);
   const internals = server as unknown as CleanupInternals;
   const id = `cleanup-domain-${mode}`;
+  internals.store = new StateStore(join(root, 'state.json'));
+  internals.recoveryStore = new RecoveryStore(join(root, 'recovery.json'));
+  await internals.recoveryStore.save(id, initialRecoveryState());
   for (const key of ['taskStore', 'actionReservationStore'] as const) {
     if (key === corruptKey) await fs.writeFile(paths[key], '{corrupt-journal}');
     internals[key] = new TaskStore(paths[key]);
@@ -48,6 +56,7 @@ async function withJournals(
   } finally {
     internals.sessions.delete(id);
     await server.stop();
+    internals.store.flushAll();
     await fs.rm(root, { recursive: true, force: true });
   }
 }
@@ -80,14 +89,22 @@ describe('domain-scoped task journal cleanup', () => {
     });
   });
 
-  it.each(['taskStore', 'actionReservationStore'] as const)('retains unreadable Codex %s evidence', async (key) => {
-    await withJournals('codex', key, async ({ internals, session, paths }) => {
-      await expect(internals._doCleanupSession(session.id, true, 'fixture deletion', false)).rejects.toThrow(
-        'Task journal could not be loaded'
-      );
-      expect(session.stop).not.toHaveBeenCalled();
-      expect(internals.sessions.get(session.id)).toBe(session);
-      expect(await fs.readFile(paths[key], 'utf8')).toBe('{corrupt-journal}');
-    });
-  });
+  it.each(['taskStore', 'actionReservationStore'] as const)(
+    'deletes the owned session while retaining unreadable Codex %s evidence',
+    async (key) => {
+      await withJournals('codex', key, async ({ internals, session, paths }) => {
+        vi.spyOn(console, 'warn').mockImplementation(() => {});
+        const drops = [internals.taskStore, internals.actionReservationStore, internals.recoveryStore].map((journal) =>
+          vi.spyOn(journal, 'drop')
+        );
+        await expect(internals._doCleanupSession(session.id, true, 'fixture deletion', false)).resolves.toBeUndefined();
+        expect(session.stop).toHaveBeenCalledWith(true);
+        expect(internals.sessions.has(session.id)).toBe(false);
+        for (const drop of drops) expect(drop).toHaveBeenCalledWith(session.id);
+        expect(await fs.readFile(paths[key], 'utf8')).toBe('{corrupt-journal}');
+        const healthyKey = key === 'taskStore' ? 'actionReservationStore' : 'taskStore';
+        expect(JSON.parse(await fs.readFile(paths[healthyKey], 'utf8')).sessions).toEqual({});
+      });
+    }
+  );
 });

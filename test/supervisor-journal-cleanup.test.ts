@@ -8,11 +8,20 @@ import { Session } from '../src/session.js';
 import { subagentWatcher } from '../src/subagent-watcher.js';
 import { SupervisorStore } from '../src/supervisor/store.js';
 import { initialSupervisorState } from '../src/supervisor/schema.js';
+import { TaskStore } from '../src/supervision/store.js';
+import { initialTaskState } from '../src/supervision/schema.js';
+import { RecoveryStore } from '../src/recovery/store.js';
+import { initialRecoveryState } from '../src/recovery/types.js';
+import { StateStore } from '../src/state-store.js';
 import type { SessionMode } from '../src/types/session.js';
 
 interface CleanupInternals {
   sessions: Map<string, Session>;
   supervisorStore: SupervisorStore;
+  taskStore: TaskStore;
+  actionReservationStore: TaskStore;
+  recoveryStore: RecoveryStore;
+  store: StateStore;
   _doCleanupSession(id: string, killMux: boolean, reason: string, coordinateLayout: boolean): Promise<void>;
 }
 
@@ -31,6 +40,13 @@ async function withJournal(
   if (!corrupt) await journal.save(id, initialSupervisorState(id));
   const server = new WebServer(0, false, true);
   const internals = server as unknown as CleanupInternals;
+  internals.store = new StateStore(join(root, 'state.json'));
+  internals.taskStore = new TaskStore(join(root, 'tasks.json'));
+  internals.actionReservationStore = new TaskStore(join(root, 'actions.json'));
+  internals.recoveryStore = new RecoveryStore(join(root, 'recovery.json'));
+  await internals.taskStore.save(id, initialTaskState());
+  await internals.actionReservationStore.save(id, initialTaskState());
+  await internals.recoveryStore.save(id, initialRecoveryState());
   const session = new Session({ id, workingDir: root, mode, useMux: false });
   internals.sessions.set(id, session);
   internals.supervisorStore = journal;
@@ -41,6 +57,7 @@ async function withJournal(
   } finally {
     internals.sessions.delete(id);
     await server.stop();
+    internals.store.flushAll();
     await fs.rm(root, { recursive: true, force: true });
   }
 }
@@ -66,13 +83,19 @@ describe('domain-scoped supervisor cleanup', () => {
     });
   });
 
-  it('preserves an unreadable Codex supervisor journal instead of overwriting it', async () => {
+  it('deletes the owned session while preserving an unreadable Codex supervisor journal', async () => {
     await withJournal('codex', true, async ({ internals, session, path }) => {
-      await expect(internals._doCleanupSession(session.id, true, 'fixture deletion', false)).rejects.toThrow(
-        'Supervisor journal failed to load'
-      );
-      expect(session.stop).not.toHaveBeenCalled();
-      expect(internals.sessions.get(session.id)).toBe(session);
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const drops = [
+        internals.supervisorStore,
+        internals.taskStore,
+        internals.actionReservationStore,
+        internals.recoveryStore,
+      ].map((journal) => vi.spyOn(journal, 'drop'));
+      await expect(internals._doCleanupSession(session.id, true, 'fixture deletion', false)).resolves.toBeUndefined();
+      expect(session.stop).toHaveBeenCalledWith(true);
+      expect(internals.sessions.has(session.id)).toBe(false);
+      for (const drop of drops) expect(drop).toHaveBeenCalledWith(session.id);
       expect(await fs.readFile(path, 'utf8')).toBe('{corrupt-journal}');
     });
   });

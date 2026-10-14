@@ -513,6 +513,7 @@ export class TaskController {
         const flight = this.state.inFlight;
         if (this.reconcileAcceptedFlight(this.state, o)) {
           await this.save('continuation-accepted');
+          if (this.stopped || revision !== this.revision) return this.getStatus();
         } else if (['paused', 'blocked', 'unknown'].includes(o.activity) || this.now() - flight.startedAt >= 60000) {
           this.state.phase = o.activity === 'blocked' ? 'blocked' : 'paused';
           return this.save('acceptance-unverified');
@@ -578,6 +579,7 @@ export class TaskController {
               p.outcome === 'unfinished' ? p.nextAction! : (p.nextAction ?? this.state.nextAction);
             this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
             await this.save('progress-recorded');
+            if (this.stopped || revision !== this.revision) return this.getStatus();
           }
         } else return this.recordAgentAttention(marker, 'task-evidence-unknown');
       }

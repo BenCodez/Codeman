@@ -18,6 +18,37 @@ afterEach(async () => {
 });
 
 describe('SupervisorStore', () => {
+  it.each(['objective', 'task'] as const)(
+    'preserves a historical %s containing terminal controls without re-enabling a manager',
+    async (field) => {
+      const { path } = await journal();
+      const state = {
+        ...initialSupervisorState(SID),
+        objective: 'Coordinate work',
+        enabled: true,
+        workers: [
+          {
+            sessionId: '22222222-2222-4222-8222-222222222222',
+            task: 'Owner task',
+            criteria: [{ id: 'review', kind: 'manual', description: 'Owner accepts' }],
+            assignments: 0,
+            maxAssignments: 1,
+            maxRuntimeMs: 60000,
+          },
+        ],
+      };
+      if (field === 'objective') state.objective += '\0';
+      else state.workers[0].task += '\0';
+      const bytes = JSON.stringify({ version: 1, supervisors: { [SID]: state } });
+      await writeFile(path, bytes);
+      const store = new SupervisorStore(path);
+      expect(store.loadFailed).toBe(true);
+      expect(store.get(SID)).toMatchObject({ enabled: false, phase: 'blocked', reason: 'persistence-failed' });
+      await expect(store.save(SID, initialSupervisorState(SID))).rejects.toThrow();
+      expect(await readFile(path, 'utf8')).toBe(bytes);
+    }
+  );
+
   it('reclaims 100 unreachable settled managers before admitting a new record', async () => {
     const { path } = await journal();
     const records = Object.fromEntries(

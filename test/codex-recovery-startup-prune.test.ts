@@ -151,7 +151,7 @@ describe('Codex recovery journal startup pruning', () => {
     });
   });
 
-  it('retains absent durable flights and pending action ownership without retaining ordinary settings', async () => {
+  it('retains absent durable flights while reclaiming unsent pending/retry intentions and ordinary settings', async () => {
     const flight = { key: 'proof', action: 'restart' as const, conversationId: THREAD, startedAt: Date.now() };
     const pending = { key: 'proof', action: 'continue' as const, conversationId: THREAD };
     const records = {
@@ -163,8 +163,28 @@ describe('Codex recovery journal startup pruning', () => {
     await withStartup(records, async ({ path, internals }) => {
       await internals.cleanupStaleSessions();
       const remaining = JSON.parse(await fs.readFile(path, 'utf8')).sessions;
-      expect(remaining).toEqual({ flight: records.flight, pending: records.pending, retry: records.retry });
+      expect(remaining).toEqual({ flight: records.flight });
       expect(new RecoveryStore(path).loadFailed).toBe(false);
+    });
+  });
+
+  it('reclaims a full orphan scheduling journal while preserving intentions belonging to retained owners', async () => {
+    const pending = { key: 'proof', action: 'continue' as const, conversationId: THREAD };
+    const scheduled = { ...initialRecoveryState(), pending, nextRetryAt: Date.now() + 1000 };
+    const records = Object.fromEntries(Array.from({ length: 198 }, (_, i) => [`orphan-${i}`, scheduled]));
+    records.live = scheduled;
+    records.pinned = scheduled;
+    await withStartup(records, async ({ path, internals, store, journal, add }) => {
+      const live = add('live');
+      internals.sessions.set(live.id, live);
+      const pinned = add('pinned');
+      store.setSession(pinned.id, { ...pinned.toState(), pinned: true });
+      await expect(journal.save('new-session', initialRecoveryState())).rejects.toThrow(/capacity/);
+      await internals.cleanupStaleSessions();
+      expect(JSON.parse(await fs.readFile(path, 'utf8')).sessions).toEqual({ live: scheduled, pinned: scheduled });
+      await expect(journal.save('new-session', initialRecoveryState())).resolves.toBeUndefined();
+      expect(new RecoveryStore(path).get('live')).toEqual(scheduled);
+      expect(new RecoveryStore(path).get('pinned')).toEqual(scheduled);
     });
   });
 

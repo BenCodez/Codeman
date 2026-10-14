@@ -20,7 +20,7 @@
 import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
-import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { dataPath, getDataDir } from '../../src/config/instance.js';
@@ -31,6 +31,7 @@ import { createUser, deleteUser, invalidateUsersCache } from '../../src/user-sto
 /** Set per test: whether the mocked `startInteractive()` rejects. */
 let startShouldThrow = false;
 let startBarrier: Promise<void> | undefined;
+let afterGuardPrepare: (() => Promise<void>) | undefined;
 /** Ordering log, so a test can assert what ran before the pane spawned. */
 const callOrder: string[] = [];
 const launchConfigs: Record<string, unknown>[] = [];
@@ -64,6 +65,7 @@ vi.mock('../../src/session.js', () => ({
       await startBarrier;
       if (this.restoreGuard) {
         await this.restoreGuard.prepare();
+        await afterGuardPrepare?.();
         if (this.restoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
       }
       if (startShouldThrow) throw new Error('spawn claude ENOENT');
@@ -140,6 +142,7 @@ async function createHarness(ctx: ReturnType<typeof createMockRouteContext>): Pr
 beforeEach(() => {
   startShouldThrow = false;
   startBarrier = undefined;
+  afterGuardPrepare = undefined;
   callOrder.length = 0;
   launchConfigs.length = 0;
 });
@@ -671,6 +674,109 @@ describe('Codex reboot launch and cancellation', () => {
         else process.env.CODEMAN_MULTIUSER = previousMultiuser;
         if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
         else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
+      }
+    }
+  );
+  it.each(
+    ['setup', 'final-confirm'].flatMap((stage) =>
+      [
+        'removed',
+        'url',
+        'key',
+        'models',
+        'config',
+        'malformed',
+        'invalid-utf8',
+        'duplicate',
+        'unchanged',
+        'unrelated',
+      ].map((change) => ({ stage, change }))
+    )
+  )(
+    'rechecks current custom profile $change at $stage without changing historical state',
+    async ({ stage, change }) => {
+      const endpoint: CustomModelHost = {
+        id: 'admin-endpoint',
+        label: 'Admin endpoint fixture',
+        baseUrl: 'http://127.0.0.1:8080',
+        apiKey: 'fixture-key',
+        models: ['custom-model'],
+      };
+      await writeCustomModelHosts(getDataDir(), [endpoint]);
+      const entry = codexOffer();
+      const trustedHome = customModelConfigDir(entry.sessionId);
+      mkdirSync(join(trustedHome, 'sessions'), { recursive: true });
+      const rolloutPath = join(trustedHome, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`);
+      const rollout =
+        JSON.stringify({
+          type: 'session_meta',
+          timestamp: '2026-10-13T15:00:00Z',
+          payload: {
+            id: uuid,
+            cwd: WORKSPACE,
+            originator: 'codeman_codex-original',
+          },
+        }) + '\n';
+      writeFileSync(rolloutPath, rollout);
+      (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = trustedHome;
+      (entry.state as unknown as Record<string, unknown>).__customModel = {
+        endpointId: endpoint.id,
+        modelId: 'custom-model',
+        envKeys: ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'],
+        configDir: trustedHome,
+      };
+      const savedState = structuredClone(entry.state);
+      const mutate = async () => {
+        if (change === 'removed') await writeCustomModelHosts(getDataDir(), []);
+        if (change === 'url')
+          await writeCustomModelHosts(getDataDir(), [{ ...endpoint, baseUrl: 'http://127.0.0.1:8081' }]);
+        if (change === 'key')
+          await writeCustomModelHosts(getDataDir(), [{ ...endpoint, apiKey: 'changed-fixture-key' }]);
+        if (change === 'models') await writeCustomModelHosts(getDataDir(), [{ ...endpoint, models: [] }]);
+        if (change === 'config') writeFileSync(join(trustedHome, 'config.toml'), 'changed-config-fixture');
+        if (change === 'malformed') writeFileSync(dataPath('custom-model-hosts.json'), '{incomplete');
+        if (change === 'invalid-utf8') {
+          const store = JSON.stringify([{ ...endpoint, label: 'invalid-byte-placeholder' }]);
+          writeFileSync(
+            dataPath('custom-model-hosts.json'),
+            Buffer.concat([
+              Buffer.from(store.slice(0, store.indexOf('invalid-byte-placeholder'))),
+              Buffer.from([0xff]),
+              Buffer.from(store.slice(store.indexOf('invalid-byte-placeholder') + 'invalid-byte-placeholder'.length)),
+            ])
+          );
+        }
+        if (change === 'duplicate') await writeCustomModelHosts(getDataDir(), [endpoint, { ...endpoint }]);
+        if (change === 'unrelated')
+          await writeCustomModelHosts(getDataDir(), [endpoint, { ...endpoint, id: 'other-endpoint' }]);
+      };
+      rebootRestoreRegistry.set([entry]);
+      const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+      if (stage === 'setup') ctx.setupSessionListeners.mockImplementation(mutate);
+      else afterGuardPrepare = mutate;
+      const app = await createHarness(ctx);
+      try {
+        const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json()
+          .data;
+        const allowed = change === 'unchanged' || change === 'unrelated';
+        expect(result.restored).toHaveLength(allowed ? 1 : 0);
+        expect(entry.state).toEqual(savedState);
+        expect(readFileSync(rolloutPath, 'utf8')).toBe(rollout);
+        if (!allowed) {
+          expect(result.skipped).toEqual([{ sessionId: entry.sessionId, reason: 'rebuild-failed' }]);
+          expect(ctx.sessions.has(entry.sessionId)).toBe(false);
+          expect(rebootRestoreRegistry.list(() => true)).toEqual([entry]);
+          expect(ctx.persistRebootRestoreDurably).not.toHaveBeenCalled();
+          expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith(
+            entry.sessionId,
+            expect.objectContaining({ codexRestoreWorkerMayExist: false }),
+            { preserveCustomModelConfigDir: true }
+          );
+        }
+        if (change === 'config')
+          expect(readFileSync(join(trustedHome, 'config.toml'), 'utf8')).toBe('changed-config-fixture');
+      } finally {
+        await app.close();
       }
     }
   );

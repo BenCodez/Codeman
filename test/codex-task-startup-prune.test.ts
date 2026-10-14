@@ -113,11 +113,10 @@ describe('task and shared-action startup journal cleanup', () => {
       'task-flight',
       'action-flight',
       'recovery-flight',
-      'recovery-pending',
       'live-task',
       'live-arbiter',
     ];
-    const allIds = [...ownedIds, 'orphan'];
+    const allIds = [...ownedIds, 'recovery-pending', 'recovery-retry', 'orphan'];
     const tasks = Object.fromEntries(allIds.map((id) => [id, initialTaskState()]));
     tasks.objective = {
       ...initialTaskState(),
@@ -139,6 +138,7 @@ describe('task and shared-action startup journal cleanup', () => {
       ...initialRecoveryState(),
       pending: { key: 'proof', action: 'continue', conversationId: THREAD },
     };
+    recovery['recovery-retry'] = { ...initialRecoveryState(), nextRetryAt: Date.now() + 1000 };
     await withStartup({ recovery, tasks, actions }, async ({ internals, ids }) => {
       internals.taskControllers.set('live-task', {});
       internals.actionArbiters.set('live-arbiter', {});

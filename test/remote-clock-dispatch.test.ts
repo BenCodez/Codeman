@@ -91,14 +91,32 @@ async function fixture(kind: Kind, jump: number, phase: Phase = 'pane') {
     await writeFile(join(bin, 'login-shell'), '#!/bin/sh\nfor arg do last=$arg; done\nexec /bin/sh -c "$last"\n');
     await writeFile(
       join(bin, 'tmux'),
-      `#!/bin/sh
+      String.raw`#!/bin/sh
 step() { printf '%s' "$CLOCK_JUMP" > "$CLOCK_OFFSET_FILE"; }
 case "$*" in
 *has-session*) [ "$CLOCK_PHASE" = pane ] && step; [ "$KIND" = restore ] && exit 1; exit 0;;
-*list-panes*) if [ "$KIND" = restart ]; then printf '1|1||%%7|700\\n'; else printf '0|||%%7|700\\n'; fi;;
-*capture-pane*) printf '›\\n';;
-*send-keys*) printf '%s\\n' "$*" >> "$EFFECT_LOG"; case "$*" in *' -l '*) [ "$CLOCK_PHASE" = text ] && step;; *' Enter') [ "$CLOCK_PHASE" = enter ] && step;; esac; exit 0;;
-*respawn-pane*|*new-session*) printf '%s\\n' "$*" >> "$EFFECT_LOG"; [ "$CLOCK_PHASE" = effect ] && step; exit 0;;
+*list-panes*)
+  if [ "$5" = '$17' ]; then
+    [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
+    printf '1|%%9|9009|1|17000\n'
+  elif [ "$KIND" = restart ]; then printf '1|1||%%7|700\n'; else printf '0|||%%7|700\n'; fi;;
+*capture-pane*) printf '›\n';;
+*send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG"; case "$*" in *' -l '*) [ "$CLOCK_PHASE" = text ] && step;; *' Enter') [ "$CLOCK_PHASE" = enter ] && step;; esac; exit 0;;
+*new-session*)
+  [ "$KIND" = restore ] || exit 2
+  printf created > "$RESTORE_STAGE_FILE"
+  printf '%s\n' '$17|%9|9009|17000';;
+*set-option*)
+  [ "$(cat "$RESTORE_STAGE_FILE")" = created ] || exit 2
+  printf configured > "$RESTORE_STAGE_FILE";;
+*wait-for*)
+  [ "$(cat "$RESTORE_STAGE_FILE")" = configured ] || exit 2
+  printf released > "$RESTORE_STAGE_FILE";;
+*respawn-pane*)
+  if [ "$KIND" = restore ]; then
+    [ "$7" = '%9' ] && [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
+  fi
+  printf '%s\n' "$*" >> "$EFFECT_LOG"; [ "$CLOCK_PHASE" = effect ] && step; exit 0;;
 *) exit 2;;
 esac
 `
@@ -114,6 +132,7 @@ esac
       CLOCK_PHASE: phase,
       KIND: kind,
       EFFECT_LOG: log,
+      RESTORE_STAGE_FILE: join(root, 'restore-stage'),
     };
     const run = (command: string) =>
       execFileAsync('/bin/sh', ['-c', command], { env, timeout: 5000, maxBuffer: 768 * 1024 });
@@ -171,9 +190,7 @@ describe.each(['input', 'restart', 'restore'] as const)('actual %s clock veto be
       expect(parseRemoteCodexAction((await f.run(command)).stdout)).toBe('sent');
       const effects = (await readFile(f.log, 'utf8')).trim().split('\n');
       expect(effects).toHaveLength(kind === 'input' ? 2 : 1);
-      expect(effects[0]).toContain(
-        kind === 'input' ? 'send-keys -l' : kind === 'restart' ? 'respawn-pane' : 'new-session'
-      );
+      expect(effects[0]).toContain(kind === 'input' ? 'send-keys -l' : 'respawn-pane');
       if (kind === 'input') expect(effects[1]).toContain('Enter');
     } finally {
       await f.cleanup();

@@ -27,6 +27,174 @@ const SUPERVISOR_UI_REASONS = Object.freeze({
 function supervisorUiTranslate(text) {
   return window.CodemanI18n?.t(text) ?? text;
 }
+const SUPERVISOR_UI_REQUEST_STORAGE = 'codeman:supervisorWorkerRequests:v1';
+function supervisorUiRequestLedger() {
+  const raw = sessionStorage.getItem(SUPERVISOR_UI_REQUEST_STORAGE);
+  if (raw === null) return [];
+  const records = JSON.parse(raw);
+  if (!Array.isArray(records) || records.length > 64) throw new Error('Invalid request ledger');
+  const keys = new Set();
+  for (const record of records) {
+    if (
+      !record ||
+      !['sessionId', 'workerId'].every(
+        (key) => typeof record[key] === 'string' && /^[\w-]{8,100}$/.test(record[key])
+      ) ||
+      typeof record.requestId !== 'string' ||
+      !/^[\w:.-]{8,120}$/.test(record.requestId) ||
+      !['assign', 'retry'].includes(record.action)
+    )
+      throw new Error('Invalid request ledger');
+    const key = JSON.stringify([record.sessionId, record.workerId, record.action]);
+    if (keys.has(key)) throw new Error('Conflicting request ledger');
+    keys.add(key);
+  }
+  return records;
+}
+function supervisorUiRequestId(sessionId, workerId, action) {
+  if (![sessionId, workerId].every((id) => typeof id === 'string' && /^[\w-]{8,100}$/.test(id)))
+    throw new Error('Invalid request identity');
+  const records = supervisorUiRequestLedger();
+  const existing = records.find(
+    (record) => record.sessionId === sessionId && record.workerId === workerId && record.action === action
+  );
+  if (existing) return existing.requestId;
+  if (records.length >= 64) throw new Error('Pending request capacity reached');
+  const requestId = globalThis.crypto?.randomUUID?.() ?? `owner-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  records.push({ sessionId, workerId, action, requestId });
+  sessionStorage.setItem(SUPERVISOR_UI_REQUEST_STORAGE, JSON.stringify(records));
+  return requestId;
+}
+function supervisorUiCompleteRequest(sessionId, workerId, action, requestId) {
+  const records = supervisorUiRequestLedger();
+  sessionStorage.setItem(
+    SUPERVISOR_UI_REQUEST_STORAGE,
+    JSON.stringify(
+      records.filter(
+        (record) =>
+          !(
+            record.sessionId === sessionId &&
+            record.workerId === workerId &&
+            record.action === action &&
+            record.requestId === requestId
+          )
+      )
+    )
+  );
+}
+function supervisorUiStateValid(state, sessionId) {
+  if (
+    state?.version !== 1 ||
+    state.supervisorSessionId !== sessionId ||
+    typeof state.objective !== 'string' ||
+    typeof state.enabled !== 'boolean' ||
+    typeof state.phase !== 'string' ||
+    !Object.hasOwn(SUPERVISOR_UI_PHASES, state.phase) ||
+    typeof state.reason !== 'string' ||
+    !/^[\w-]{1,80}$/.test(state.reason) ||
+    !Array.isArray(state.workers) ||
+    state.workers.length > 12 ||
+    !Array.isArray(state.history) ||
+    state.history.length > 100 ||
+    !Array.isArray(state.handledRequestIds) ||
+    state.handledRequestIds.length > 128 ||
+    !Array.isArray(state.handledRequestBindings) ||
+    state.handledRequestIds.length !== state.handledRequestBindings.length
+  )
+    return false;
+  const id = (value) => typeof value === 'string' && /^[\w-]{8,100}$/.test(value);
+  const requestId = (value) => typeof value === 'string' && /^[\w:.-]{8,120}$/.test(value);
+  const text = (value, min, max) =>
+    typeof value === 'string' &&
+    value.length >= min &&
+    value.length <= max &&
+    /^[^\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f]*$/.test(value);
+  const number = (value) => typeof value === 'number' && Number.isFinite(value);
+  const range = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
+  const workers = new Set();
+  for (const worker of state.workers) {
+    if (
+      !worker ||
+      !id(worker.sessionId) ||
+      workers.has(worker.sessionId) ||
+      !text(worker.task, 1, 4000) ||
+      !range(worker.assignments, 0, 10) ||
+      !range(worker.maxAssignments, 1, 10) ||
+      !range(worker.maxRuntimeMs, 1000, 86400000) ||
+      (worker.startedAt !== undefined && !number(worker.startedAt)) ||
+      (worker.lastRequestId !== undefined && !requestId(worker.lastRequestId)) ||
+      !Array.isArray(worker.criteria) ||
+      !worker.criteria.length ||
+      worker.criteria.length > 30
+    )
+      return false;
+    workers.add(worker.sessionId);
+    const criteria = new Set();
+    for (const criterion of worker.criteria) {
+      if (
+        !criterion ||
+        typeof criterion.id !== 'string' ||
+        !/^[\w-]{1,80}$/.test(criterion.id) ||
+        criteria.has(criterion.id) ||
+        !text(criterion.description, 1, 1000) ||
+        !['manual', 'command'].includes(criterion.kind) ||
+        (criterion.kind === 'command' && !text(criterion.command, 1, 1000)) ||
+        (criterion.kind === 'manual' && criterion.command !== undefined)
+      )
+        return false;
+      criteria.add(criterion.id);
+    }
+  }
+  if (
+    !text(state.objective, 0, 3000) ||
+    (state.startedAt !== undefined && !number(state.startedAt)) ||
+    state.history.some(
+      (event) =>
+        !event ||
+        !number(event.at) ||
+        typeof event.reason !== 'string' ||
+        !/^[\w-]{1,80}$/.test(event.reason) ||
+        (event.workerId !== undefined && !id(event.workerId))
+    )
+  )
+    return false;
+  if (state.inFlight !== undefined) {
+    const flight = state.inFlight;
+    if (
+      !flight ||
+      !requestId(flight.requestId) ||
+      !id(flight.workerId) ||
+      !['assign', 'retry'].includes(flight.action) ||
+      !number(flight.reservedAt)
+    )
+      return false;
+  }
+  const ids = new Set(state.handledRequestIds);
+  if (ids.size !== state.handledRequestIds.length) return false;
+  const boundIds = new Set();
+  for (const binding of state.handledRequestBindings) {
+    if (
+      !binding ||
+      !requestId(binding.requestId) ||
+      typeof binding.workerId !== 'string' ||
+      !/^[\w-]{8,100}$/.test(binding.workerId) ||
+      !['assign', 'retry'].includes(binding.action) ||
+      !ids.has(binding.requestId) ||
+      boundIds.has(binding.requestId)
+    )
+      return false;
+    boundIds.add(binding.requestId);
+  }
+  return true;
+}
+function supervisorUiAcceptedRequest(state, sessionId, workerId, action, requestId) {
+  return (
+    supervisorUiStateValid(state, sessionId) &&
+    state.handledRequestBindings.some(
+      (binding) => binding.requestId === requestId && binding.workerId === workerId && binding.action === action
+    )
+  );
+}
 Object.assign(CodemanApp.prototype, {
   openSupervisorOptions(sessionId) {
     this.closeSupervisorOptions();
@@ -50,7 +218,7 @@ Object.assign(CodemanApp.prototype, {
     const state = await this._apiJson(`/api/sessions/${encodeURIComponent(view.sessionId)}/supervisor`);
     if (this._supervisorView !== view) return;
     view.busy = false;
-    view.state = state?.version === 1 ? state : null;
+    view.state = supervisorUiStateValid(state, view.sessionId) ? state : null;
     this._renderSupervisorStatus(true);
     if (view.state?.phase === 'active') await this.loadSupervisorWorkers();
   },
@@ -128,26 +296,60 @@ Object.assign(CodemanApp.prototype, {
     });
     if (this._supervisorView !== view) return;
     view.workersBusy = false;
-    view.workerStatus = Array.isArray(workers) ? workers : [];
+    view.workerStatus =
+      Array.isArray(workers) &&
+      workers.length <= 12 &&
+      workers.every(
+        (worker) =>
+          worker &&
+          typeof worker.sessionId === 'string' &&
+          /^[\w-]{8,100}$/.test(worker.sessionId) &&
+          typeof worker.health === 'string' &&
+          (worker.task?.phase === undefined || typeof worker.task.phase === 'string')
+      ) &&
+      new Set(workers.map((worker) => worker.sessionId)).size === workers.length
+        ? workers
+        : [];
     this._renderSupervisorStatus();
   },
   async supervisorWorkerAction(workerId, action) {
     const view = this._supervisorView;
     if (!view || view.workersBusy || !['assign', 'retry'].includes(action)) return;
+    let requestId;
+    try {
+      requestId = supervisorUiRequestId(view.sessionId, workerId, action);
+    } catch {
+      this.showToast(
+        supervisorUiTranslate('Worker action could not be recorded safely. Refresh status before trying again.'),
+        'error'
+      );
+      return;
+    }
     view.workersBusy = true;
     this._renderSupervisorStatus();
-    const requestId = globalThis.crypto?.randomUUID?.() ?? `owner-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    const state = await this._apiJson(
-      `/api/sessions/${encodeURIComponent(view.sessionId)}/supervisor/workers/${encodeURIComponent(workerId)}/${action}`,
-      {
-        method: 'POST',
-        headers: { 'X-Codeman-Supervisor-Session': view.sessionId },
-        body: { requestId },
+    let state;
+    try {
+      state = await this._apiJson(
+        `/api/sessions/${encodeURIComponent(view.sessionId)}/supervisor/workers/${encodeURIComponent(workerId)}/${action}`,
+        {
+          method: 'POST',
+          headers: { 'X-Codeman-Supervisor-Session': view.sessionId },
+          body: { requestId },
+        }
+      );
+    } catch {
+      state = null;
+    }
+    if (supervisorUiAcceptedRequest(state, view.sessionId, workerId, action, requestId)) {
+      try {
+        supervisorUiCompleteRequest(view.sessionId, workerId, action, requestId);
+      } catch {
+        // Retaining an accepted ID is safer than replacing it after a storage failure.
       }
-    );
+    }
     if (this._supervisorView !== view) return;
     view.workersBusy = false;
-    if (state?.version === 1) view.state = state;
+    if (supervisorUiStateValid(state, view.sessionId)) view.state = state;
     else this.showToast(supervisorUiTranslate('Worker action was refused or its delivery is uncertain.'), 'error');
     this._renderSupervisorStatus(true);
     if (view.state?.phase === 'active') await this.loadSupervisorWorkers();
@@ -186,7 +388,7 @@ Object.assign(CodemanApp.prototype, {
     });
     if (this._supervisorView !== view) return;
     view.busy = false;
-    view.state = state?.version === 1 ? state : null;
+    view.state = supervisorUiStateValid(state, view.sessionId) ? state : null;
     if (!view.state)
       this.showToast(supervisorUiTranslate('Supervisor action failed. Refresh status before trying again.'), 'error');
     this._renderSupervisorStatus(true);

@@ -92,7 +92,11 @@ const StateSchema = z
     circuitOpen: z.boolean(),
     needsAttention: z.boolean(),
     stallAlert: z.object({ key: Evidence, conversationId: IdSchema, progressAt: Stamp }).strict().optional(),
-    inFlight: Pending.extend({ startedAt: Stamp, previousSubmissionKey: z.string().max(100).optional() }).optional(),
+    inFlight: Pending.extend({
+      startedAt: Stamp,
+      previousSubmissionKey: z.string().max(100).optional(),
+      stallProgressAt: Stamp.positive().max(Number.MAX_SAFE_INTEGER).optional(),
+    }).optional(),
     pending: Pending.optional(),
     handledEvidence: z.array(Evidence).max(32),
     history: z
@@ -176,14 +180,14 @@ export class RecoveryStore {
     return result;
   }
 
-  /** Remove unreachable settings only; a durable action reservation remains evidence. */
+  /** Remove unreachable settings/intentions; a durable delivery reservation remains evidence. */
   pruneOrphans(keep: (id: string) => boolean): Promise<number> {
     if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
     const result = this.writes.then(async () => {
       const next = { ...this.records };
       let removed = 0;
       for (const [id, state] of Object.entries(next)) {
-        if (keep(id) || state.inFlight || state.pending || state.nextRetryAt !== undefined) continue;
+        if (keep(id) || state.inFlight) continue;
         delete next[id];
         removed++;
       }

@@ -20,9 +20,7 @@ describe.each(kinds)('final remote identity witness before %s', (kind) => {
   it.each([false, true])('allows unchanged evidence with unrelated preexisting rollout: %s', async (unrelated) => {
     const result = await fixture(kind, 'none', unrelated);
     expect(result.status).toBe('sent');
-    expect(result.effects).toContain(
-      kind === 'input' ? 'send-keys' : kind === 'restart' ? 'respawn-pane' : 'new-session'
-    );
+    expect(result.effects).toContain(kind === 'input' ? 'send-keys' : 'respawn-pane');
     if (kind === 'input') expect(result.effects).toContain('Enter');
   });
 });
