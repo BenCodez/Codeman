@@ -14,6 +14,8 @@ import {
 
 export interface RecoveryDependencies {
   resetReservation?(): Promise<void>;
+  /** Shared task ownership may revoke authority while a delivery reservation is saving. */
+  hasActionAuthority?(): boolean;
   observe(): Promise<RecoveryObservation>;
   /** 'unknown' includes any possibly-partially-delivered operation; it must never be replayed. */
   act(flight: RecoveryFlight, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
@@ -422,7 +424,11 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const isCurrent = () => !this.stopped && revision === this.revision && !this.recoveryWindowExpired();
+    const isCurrent = () =>
+      !this.stopped &&
+      revision === this.revision &&
+      !this.recoveryWindowExpired() &&
+      (this.deps.hasActionAuthority ? this.deps.hasActionAuthority() === true : true);
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
       outcome = isCurrent() ? await this.deps.act(this.state.inFlight, isCurrent) : 'not-sent';

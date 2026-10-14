@@ -27,7 +27,17 @@ import { execSync, exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execAsync = promisify(exec);
-import { existsSync, readFileSync, mkdirSync } from 'node:fs';
+import {
+  existsSync,
+  readFileSync,
+  mkdirSync,
+  openSync,
+  closeSync,
+  fsyncSync,
+  writeFileSync,
+  renameSync,
+  unlinkSync,
+} from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { homedir } from 'node:os';
@@ -109,6 +119,7 @@ import type {
   CreateSessionOptions,
   RespawnPaneOptions,
   PaneCaptureOptions,
+  RecoveryMuxDispatchGuard,
 } from './mux-interface.js';
 import {
   decideReconnect,
@@ -1683,9 +1694,23 @@ function setCliConfigContent(tmuxCmd: string, muxName: string, varName: string, 
  * await manager.killSession(sessionId);
  * ```
  */
+function confirmRecoveryMuxDispatch(guard: RecoveryMuxDispatchGuard): boolean {
+  try {
+    const verdict: unknown = guard.confirm();
+    if (verdict instanceof Promise) {
+      void verdict.catch(() => {});
+      return false;
+    }
+    return verdict === true;
+  } catch {
+    return false;
+  }
+}
+
 export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   readonly backend = 'tmux' as const;
   private sessions: Map<string, MuxSession> = new Map();
+  private sessionSaves: Promise<void> = Promise.resolve();
   private readonly tmuxSocket = resolveConfiguredTmuxSocket();
   private statsInterval: NodeJS.Timeout | null = null;
   private mouseSyncInterval: NodeJS.Timeout | null = null;
@@ -1854,13 +1879,52 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const json = JSON.stringify(data, null, 2);
 
       const tempPath = MUX_SESSIONS_FILE + '.tmp';
-      writeFile(tempPath, json, 'utf-8')
-        .then(() => rename(tempPath, MUX_SESSIONS_FILE))
+      this.sessionSaves = this.sessionSaves
+        .then(async () => {
+          await writeFile(tempPath, json, 'utf-8');
+          await rename(tempPath, MUX_SESSIONS_FILE);
+        })
         .catch((err) => {
           console.error('[TmuxManager] Failed to save sessions:', err);
         });
     } catch (err) {
       console.error('[TmuxManager] Failed to save sessions:', err);
+    }
+  }
+
+  /** Drain old snapshots and acknowledge file plus directory durability before consuming a reboot offer. */
+  async flushSessionsDurably(isCurrent: () => boolean = () => true): Promise<void> {
+    let pending: Promise<void>;
+    do {
+      pending = this.sessionSaves;
+      await pending;
+    } while (pending !== this.sessionSaves);
+    if (!isCurrent()) throw new Error('Reboot restoration was cancelled before mux persistence');
+    if (existsSync(MUX_SESSIONS_FILE) && !Array.isArray(JSON.parse(readFileSync(MUX_SESSIONS_FILE, 'utf8'))))
+      throw new Error('Mux metadata is malformed');
+    mkdirSync(dirname(MUX_SESSIONS_FILE), { recursive: true, mode: 0o700 });
+    const temporary = `${MUX_SESSIONS_FILE}.${process.pid}.${Date.now()}.reboot.tmp`;
+    try {
+      const fd = openSync(temporary, 'wx', 0o600);
+      try {
+        writeFileSync(fd, JSON.stringify(Array.from(this.sessions.values()), null, 2));
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, MUX_SESSIONS_FILE);
+      const directory = openSync(dirname(MUX_SESSIONS_FILE), 'r');
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+    } finally {
+      try {
+        unlinkSync(temporary);
+      } catch {
+        /* Already renamed or never created. */
+      }
     }
   }
 
@@ -2510,6 +2574,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : undefined;
     // Recovery cannot turn current server defaults into provenance for an old pane.
     if (options.onlyIfDead && localCodex && !recoveryCodexHome) return null;
+    const guard = options.recoveryDispatchGuard;
+    const canDispatch = () =>
+      !guard ||
+      (options.onlyIfDead === true &&
+        localCodex &&
+        this.sessions.get(sessionId) === session &&
+        session.muxName === muxName &&
+        confirmRecoveryMuxDispatch(guard));
+    if (!canDispatch()) return null;
 
     if (!isValidMuxName(muxName) || !isValidPath(workingDir)) return null;
 
@@ -2555,6 +2628,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : localFullCmd;
 
     try {
+      if (!canDispatch()) return null;
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
       this._configureCliEnv(
         muxName,
@@ -2571,6 +2645,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      if (!canDispatch()) return null;
+      guard?.noteDispatch();
       await execAsync(
         `${this.tmux()} respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
         {
@@ -3673,7 +3749,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * - `Enter` key is sent as a SEPARATE tmux invocation after a small delay
    * - Ink (Claude CLI) needs text and Enter split to avoid treating Enter as a newline
    */
-  async sendInput(sessionId: string, input: string): Promise<boolean> {
+  async sendInput(sessionId: string, input: string, recoveryGuard?: RecoveryMuxDispatchGuard): Promise<boolean> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       console.error(
@@ -3682,8 +3758,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       return false;
     }
 
+    const muxName = session.muxName;
+    const canDispatch = () =>
+      !recoveryGuard ||
+      (this.sessions.get(sessionId) === session &&
+        session.muxName === muxName &&
+        confirmRecoveryMuxDispatch(recoveryGuard));
+    if (!canDispatch()) return false;
+
     // TEST MODE: No-op — don't send input to real tmux sessions
     if (IS_TEST_MODE && !this.inputCommandRunner) {
+      recoveryGuard?.noteDispatch();
       return true;
     }
 
@@ -3711,14 +3796,22 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
         // character in the input buffer rather than as form submission.
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await run(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`);
         await new Promise((resolve) => setTimeout(resolve, 50));
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await run(`${this.tmux()} send-keys -t "${session.muxName}" Enter`);
       } else if (textPart) {
         // Text only, no Enter
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await run(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`);
       } else if (hasCarriageReturn) {
         // Enter only
+        if (!canDispatch()) return false;
+        recoveryGuard?.noteDispatch();
         await run(`${this.tmux()} send-keys -t "${session.muxName}" Enter`);
       }
 

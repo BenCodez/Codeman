@@ -239,7 +239,7 @@ describe('TerminalTile input through the exactly-once queue', () => {
 });
 
 describe('named newline key lifetime', () => {
-  it('bounds a stalled key request, aborting it without replay and releasing later text', async () => {
+  it('bounds a stalled key request, aborting it without replay or releasing dependent text', async () => {
     vi.useFakeTimers();
     const app = makeApp();
     const { term } = await connectTile(app);
@@ -262,8 +262,28 @@ describe('named newline key lifetime', () => {
     await vi.advanceTimersByTimeAsync(10000);
     expect(signal?.aborted).toBe(true);
     expect(keys).toEqual(['S-Enter']);
-    expect(input).toEqual(['after']);
-    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('could not be confirmed'), 'error');
+    expect(input).toEqual([]);
+    expect(app._pendingDeliveries.size).toBe(0);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'error');
+  });
+
+  it('destroying a tile during uncertain key delivery refuses its dependent text', async () => {
+    const app = makeApp();
+    const { tile, term } = await connectTile(app);
+    const requests: string[] = [];
+    fetchMock.mockImplementation(async (url: string, init?: { signal?: AbortSignal }) => {
+      requests.push(url);
+      return new Promise((_resolve, reject) =>
+        init?.signal?.addEventListener('abort', () => reject(new Error('unknown')))
+      );
+    });
+    term.keyHandler?.({ type: 'keydown', key: 'Enter', ctrlKey: true });
+    term.type('after');
+    tile.destroy();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(requests).toEqual(['/api/sessions/s-tile/send-key']);
+    expect(app._pendingDeliveries.size).toBe(0);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
   });
 
   it('destroying a tile cancels the retry from its shipped key handler without losing ordinary queued text', async () => {

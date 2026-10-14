@@ -142,8 +142,16 @@ export interface CreateSessionOptions {
   owner?: string;
 }
 
+/** Final synchronous authority for an automatic recovery effect, including partial delivery. */
+export interface RecoveryMuxDispatchGuard {
+  confirm(): boolean;
+  noteDispatch(): void;
+}
+
 /** Options for respawning a dead pane. */
 export interface RespawnPaneOptions {
+  /** Automatic local recovery checks authority again immediately before its worker effect. */
+  recoveryDispatchGuard?: RecoveryMuxDispatchGuard;
   /** Recovery refuses a pane that became live by omitting tmux's kill-live-pane flag. Local only. */
   onlyIfDead?: boolean;
   sessionId: string;
@@ -251,6 +259,8 @@ export interface TerminalMultiplexer extends EventEmitter {
    * The session runs the appropriate command (claude, opencode, or shell) in detached mode.
    */
   createSession(options: CreateSessionOptions): Promise<MuxSession>;
+  /** Strict metadata acknowledgement for owner-controlled reboot restoration. */
+  flushSessionsDurably(isCurrent?: () => boolean): Promise<void>;
 
   /**
    * Kill a session and all its child processes.
@@ -280,7 +290,7 @@ export interface TerminalMultiplexer extends EventEmitter {
   /**
    * Send input to a session via tmux send-keys.
    */
-  sendInput(sessionId: string, input: string): Promise<boolean>;
+  sendInput(sessionId: string, input: string, recoveryGuard?: RecoveryMuxDispatchGuard): Promise<boolean>;
 
   // ========== Metadata ==========
 
