@@ -317,6 +317,94 @@ describe('recovery journal durability', () => {
     expect(act).not.toHaveBeenCalled();
   });
 
+  it.each(['unchanged', 'progress', 'dead-pane'] as const)(
+    'loads an actual parent-version stalled warning and preserves its warning-only authority for %s',
+    async (nextEvidence) => {
+      let now = NOW;
+      const observation = {
+        activity: 'working' as const,
+        reason: 'turn-running' as const,
+        at: NOW - 20_000,
+        progressAt: NOW - 20_000,
+        conversationId: THREAD,
+        stallEvidenceKey: 'parent-v1-turn',
+        stallRestartable: false,
+        safeToAct: false,
+      };
+      const state = savedState({
+        activity: 'working',
+        phase: 'paused',
+        needsAttention: true,
+        lastReason: 'stalled',
+        attempts: 1,
+        failedAttempts: 1,
+        windowStartedAt: NOW - 1000,
+        history: [{ at: NOW, kind: 'attention', reason: 'stalled', attempt: 1 }],
+      });
+      state.config.detectStalls = true;
+      state.config.stalledAfterMs = 10_000;
+      // This is the complete old on-disk shape: no new stallAlert field or reason.
+      await journal({ version: 1, sessions: { work: state } });
+      const store = new RecoveryStore(path);
+      expect(store.loadFailed).toBe(false);
+      expect(store.get('work')).toEqual(state);
+      const act = vi.fn(async () => 'sent' as const);
+      const controller = new RecoveryController(
+        {
+          observe: async () => observation,
+          act,
+          persist: (next) => store.save('work', next),
+          changed: () => {},
+          now: () => now,
+        },
+        store.get('work')
+      );
+      try {
+        await controller.inspect();
+        for (let i = 0; i < 3; i++) {
+          now += 5000;
+          await controller.refresh();
+          expect(controller.getStatus()).toMatchObject({
+            phase: 'paused',
+            needsAttention: true,
+            lastReason: 'stall-unverified',
+            attempts: 1,
+            failedAttempts: 1,
+            windowStartedAt: NOW - 1000,
+          });
+          expect(controller.getStatus().history.filter((event) => event.kind === 'attention')).toHaveLength(1);
+          expect(controller.getStatus().pending).toBeUndefined();
+          expect(controller.getStatus().inFlight).toBeUndefined();
+        }
+        expect(act).not.toHaveBeenCalled();
+        expect(new RecoveryStore(path).get('work')).toMatchObject({
+          needsAttention: true,
+          stallAlert: { key: 'parent-v1-turn', conversationId: THREAD, progressAt: NOW - 20_000 },
+        });
+        if (nextEvidence === 'progress') {
+          observation.progressAt += 1000;
+          await controller.inspect();
+          expect(controller.getStatus().needsAttention).toBe(false);
+          expect(controller.getStatus().stallAlert).toBeUndefined();
+          expect(new RecoveryStore(path).get('work').needsAttention).toBe(false);
+        } else if (nextEvidence === 'dead-pane') {
+          observation.stallRestartable = true;
+          await controller.retry();
+          expect(act).not.toHaveBeenCalled();
+          now += 1999;
+          await controller.retry();
+          expect(act).not.toHaveBeenCalled();
+          now += 1;
+          await controller.retry();
+          expect(act).toHaveBeenCalledOnce();
+          expect(controller.getStatus().attempts).toBe(2);
+        }
+      } finally {
+        controller.stop();
+      }
+    }
+  );
+
   it('preserves a saved stall warning through reconstruction, GET inspection and timer polling until progress', async () => {
     vi.useFakeTimers();
     let now = NOW;

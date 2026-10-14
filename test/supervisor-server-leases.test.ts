@@ -11,6 +11,9 @@ import type { SupervisorStore } from '../src/supervisor/store.js';
 import type { StateStore } from '../src/state-store.js';
 import { rebootRestoreRegistry } from '../src/web/reboot-restore-registry.js';
 import type { RebootRestoreEntry } from '../src/reboot-restore.js';
+import type { TaskStore } from '../src/supervision/store.js';
+import { initialTaskState } from '../src/supervision/schema.js';
+import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 
 const OLD = '11111111-1111-4111-8111-111111111111';
 const NEXT = '22222222-2222-4222-8222-222222222222';
@@ -33,6 +36,7 @@ interface Internals {
   sessions: Map<string, Session>;
   store: StateStore;
   supervisorStore: SupervisorStore;
+  taskStore: TaskStore;
   tabLayouts: { markRestorationComplete(): void };
   cleanupStaleSessions(): Promise<number>;
   getSupervisorController(session: Session): SupervisorController | undefined;
@@ -187,5 +191,35 @@ describe('server supervisor lease reconciliation', () => {
     rebootRestoreRegistry.clear(() => true);
     expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBeUndefined();
     expect(internals.supervisorStore.get(OLD).inFlight).toEqual(journal.inFlight);
+  });
+
+  it('refuses assignment while a durable agent stop remains after the live task is cleared, then accepts committed owner release', async () => {
+    await internals.supervisorStore.save(OLD, initialSupervisorState(OLD));
+    const manager = internals.getSupervisorController(internals.sessions.get(NEXT)!)!;
+    await manager.configure(config);
+    // A fake already-running manager: this test never launches a manager CLI.
+    Reflect.set(manager, 'state', { ...manager.getStatus(), phase: 'active', startedAt: Date.now() });
+    const act = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
+    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+      observation: {
+        activity: 'idle',
+        reason: 'observing',
+        at: Date.now(),
+        conversationId: '44444444-4444-4444-8444-444444444444',
+        processReady: true,
+        safeToAct: false,
+      },
+      commands: new Map(),
+    }));
+    await internals.taskStore.save(WORKER, { ...initialTaskState(), agentProgressVeto: true });
+    await expect(manager.assign(WORKER, 'durable-stop')).rejects.toThrow('cancelled');
+    expect(act).not.toHaveBeenCalled();
+    expect(manager.getStatus().workers[0].assignments).toBe(0);
+    expect(manager.getStatus().inFlight).toBeUndefined();
+    await internals.taskStore.save(WORKER, initialTaskState());
+    await expect(manager.assign(WORKER, 'owner-released')).resolves.toMatchObject({
+      workers: [expect.objectContaining({ assignments: 1 })],
+    });
+    expect(act).toHaveBeenCalledOnce();
   });
 });

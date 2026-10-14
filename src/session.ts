@@ -149,6 +149,12 @@ import { CONTINUATION_PROMPT, type RecoveryFlight } from './recovery/types.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
 import { readRebootIdentityFence, RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
 import {
+  sampleRemoteCodexClock,
+  validRemoteClock,
+  type RemoteClockWitness,
+  type RecoverySubmission,
+} from './recovery/remote-clock.js';
+import {
   clampRecoveryLaunchForOwner,
   clampExternalCliConfigsForOwner,
   clampEnvOverridesForOwner,
@@ -2290,13 +2296,21 @@ export class Session extends EventEmitter {
   private _recoveryDelivering = false;
   private _namedKeyAbort: AbortController | null = null;
   private _ordinaryInputWrites = 0;
-  private _recoverySubmission?: { at: number; hash: string };
+  private _recoverySubmission?: RecoverySubmission;
+  private _remoteClockPreparing = false;
+  private _preparedRemoteClock?: { clock: RemoteClockWitness; generation: number; configuration: string };
+  private _remoteRecoveryGrantToken?: {
+    conversationId: string;
+    generation: number;
+    configuration: string;
+    isCurrent: () => boolean;
+  };
   private _recoveryIntentionalStopAt = 0;
   private _recoverySwitchPending = false;
   private _recoveryUntrackedInput = false;
 
   get recoveryInputReserved(): boolean {
-    return this._recoveryDelivering || this._namedKeyAbort !== null;
+    return this._recoveryDelivering || this._namedKeyAbort !== null || this._remoteClockPreparing;
   }
 
   /** Lifecycle/recovery admission also excludes ordinary sends already in flight. */
@@ -2317,6 +2331,10 @@ export class Session extends EventEmitter {
     try {
       this._submitVerifier?.cancel();
       this._submitVerifier = null;
+      if (this.requiresRemoteInputClock(data, { fromUser: true })) {
+        const admission = await this.prepareUserInputClock(data, { fromUser: true });
+        if (!admission || admission() !== true) return false;
+      }
       const submitted = this._trackSubmit(data, { fromUser: true });
       if (abort.signal.aborted) return false;
       await dispatch(abort.signal);
@@ -2401,12 +2419,85 @@ export class Session extends EventEmitter {
     return this._mux?.inspectPaneForRecovery?.(this._muxSession.muxName) ?? null;
   }
 
+  /** Revalidate configuration and current grants after waiting for the shared SSH slot. */
+  async confirmRemoteRecoveryAuthority(
+    conversationId: string,
+    generation: number,
+    isCurrent: () => boolean,
+    expectedConfiguration: string
+  ): Promise<boolean> {
+    this._remoteRecoveryGrantToken = undefined;
+    if (!this._remoteRecoveryContextCurrent(conversationId, generation, isCurrent, expectedConfiguration)) return false;
+    const launch = await clampRecoveryLaunchForOwner(
+      this.owner,
+      { codexConfig: this._codexConfig },
+      this._envOverrides
+    );
+    const grantCurrent = launch.isCurrent;
+    const accepted =
+      typeof grantCurrent === 'function' &&
+      grantCurrent() === true &&
+      this._remoteRecoveryContextCurrent(conversationId, generation, isCurrent, expectedConfiguration) &&
+      JSON.stringify(launch.configs.codexConfig) === JSON.stringify(this._codexConfig) &&
+      JSON.stringify(launch.env) === JSON.stringify(this._envOverrides);
+    if (accepted)
+      this._remoteRecoveryGrantToken = {
+        conversationId,
+        generation,
+        configuration: expectedConfiguration,
+        isCurrent: grantCurrent!,
+      };
+    return accepted;
+  }
+
+  isRemoteRecoveryAuthorityCurrent(
+    conversationId: string,
+    generation: number,
+    isCurrent: () => boolean,
+    expectedConfiguration: string
+  ): boolean {
+    const grant = this._remoteRecoveryGrantToken;
+    return (
+      this._remoteRecoveryContextCurrent(conversationId, generation, isCurrent, expectedConfiguration) &&
+      grant?.conversationId === conversationId &&
+      grant.generation === generation &&
+      grant.configuration === expectedConfiguration &&
+      grant.isCurrent() === true
+    );
+  }
+
+  private _remoteRecoveryContextCurrent(
+    conversationId: string,
+    generation: number,
+    isCurrent: () => boolean,
+    expectedConfiguration: string
+  ): boolean {
+    const context = this.getRecoveryContext();
+    return (
+      isCurrent() === true &&
+      expectedConfiguration === this.remoteRecoveryConfiguration() &&
+      context.generation === generation &&
+      context.managed &&
+      context.remoteOwned &&
+      context.noDaemon &&
+      !context.switchPending &&
+      !context.untrackedInput &&
+      this._codexConfig?.resumeSessionId === conversationId
+    );
+  }
+
+  remoteRecoveryConfiguration(): string {
+    return JSON.stringify([this.owner, this._remote, this._codexConfig, this._envOverrides, this.workingDir]);
+  }
+
   /** Deliver after the adapter has revalidated remote rollout and pane evidence. */
   async deliverRemoteRecoveryInput(
     conversationId: string,
     generation: number,
     prompt: string,
-    dispatch: () => Promise<{ status: 'sent'; submittedAt: number } | { status: 'not-sent' | 'unknown' }>,
+    dispatch: () => Promise<
+      { status: 'sent'; submittedAt: number; clock?: RemoteClockWitness } | { status: 'not-sent' | 'unknown' }
+    >,
     isCurrent: () => boolean = () => true
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
@@ -2479,7 +2570,12 @@ export class Session extends EventEmitter {
         const result = receipt?.status;
         if (
           !['sent', 'not-sent', 'unknown'].includes(result ?? '') ||
-          (result === 'sent' && (!Number.isSafeInteger(receipt.submittedAt) || receipt.submittedAt <= 0))
+          (result === 'sent' &&
+            (!Number.isSafeInteger(receipt.submittedAt) ||
+              receipt.submittedAt <= 0 ||
+              !validRemoteClock(receipt.clock) ||
+              receipt.submittedAt < receipt.clock.remoteBefore ||
+              receipt.submittedAt > receipt.clock.remoteAfter))
         )
           return 'unknown';
         if (result === 'sent') {
@@ -2491,7 +2587,12 @@ export class Session extends EventEmitter {
             !afterDispatch.switchPending &&
             !afterDispatch.untrackedInput
           ) {
-            this._recoverySubmission = { at: receipt.submittedAt, hash: hashCodexPrompt(prompt) };
+            this._recoverySubmission = {
+              at: receipt.submittedAt,
+              hash: hashCodexPrompt(prompt),
+              clockDomain: 'remote',
+              ...(receipt.clock ? { clock: receipt.clock } : {}),
+            };
             this._recoverySwitchPending = false;
             this._publishRecoveryIdentityAfterDispatch();
           }
@@ -2724,12 +2825,21 @@ export class Session extends EventEmitter {
           context.codexHome !== currentLocalCodexHome()
             ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
             : this._envOverrides;
+        const launchSnapshot = JSON.stringify([
+          this.owner,
+          this.workingDir,
+          this._codexConfig,
+          this._envOverrides,
+          context.codexHome,
+          this._muxSession?.muxName,
+        ]);
         const granted = await clampRecoveryLaunchForOwner(
           this.owner,
           { codexConfig: this._codexConfig },
           envToAuthorize
         );
         if (
+          granted.isCurrent() !== true ||
           JSON.stringify(granted.configs.codexConfig) !== JSON.stringify(this._codexConfig) ||
           JSON.stringify(granted.env) !== JSON.stringify(envToAuthorize)
         )
@@ -2743,6 +2853,7 @@ export class Session extends EventEmitter {
         }
         const currentContext = this.getRecoveryContext();
         if (
+          granted.isCurrent() !== true ||
           !isCurrent() ||
           !pane ||
           !currentContext.managed ||
@@ -2753,14 +2864,61 @@ export class Session extends EventEmitter {
           this._codexConfig?.resumeSessionId !== flight.conversationId
         )
           return 'not-sent';
+        let dispatched = false;
+        let refusedBeforeDispatch = false;
+        const contextCurrent = (): boolean => {
+          const current = this.getRecoveryContext();
+          return (
+            current.managed &&
+            current.noDaemon &&
+            !current.switchPending &&
+            current.generation === generation &&
+            this._codexConfig?.resumeSessionId === flight.conversationId &&
+            JSON.stringify([
+              this.owner,
+              this.workingDir,
+              this._codexConfig,
+              this._envOverrides,
+              current.codexHome,
+              this._muxSession?.muxName,
+            ]) === launchSnapshot &&
+            (flight.action === 'restart' || (!this.isBusy() && !this.watching))
+          );
+        };
+        const recoveryGuard = {
+          confirm: (): boolean => {
+            let accepted = false;
+            try {
+              accepted =
+                granted.isCurrent() === true &&
+                isCurrent() === true &&
+                contextCurrent() &&
+                (!confirmEvidence || confirmEvidence() === true) &&
+                granted.isCurrent() === true &&
+                isCurrent() === true &&
+                contextCurrent();
+            } catch {
+              accepted = false;
+            }
+            if (!accepted && !dispatched) refusedBeforeDispatch = true;
+            return accepted;
+          },
+          noteDispatch: () => {
+            dispatched = true;
+          },
+        };
         this._submitVerifier?.cancel();
         this._submitVerifier = null;
         if (flight.action === 'restart') {
           if (!pane.dead || !((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0))
             return 'not-sent';
           // Same current settings and exact resume id through the registry; no fallback to a fresh conversation.
-          const pid = await this._mux!.respawnPane({ ...this._buildRespawnPaneOptions(), onlyIfDead: true });
-          if (!pid) return 'unknown';
+          const pid = await this._mux!.respawnPane({
+            ...this._buildRespawnPaneOptions(),
+            onlyIfDead: true,
+            recoveryDispatchGuard: recoveryGuard,
+          });
+          if (!pid) return refusedBeforeDispatch && !dispatched ? 'not-sent' : 'unknown';
           this.clearPaneExitForNewPane();
           return 'sent';
         }
@@ -2774,8 +2932,8 @@ export class Session extends EventEmitter {
         )
           return 'not-sent';
         // Browser frames report false during this short reservation so durable clients retain and retry them.
-        const sent = await this._mux!.sendInput(this.id, `${prompt}\r`);
-        if (!sent) return 'unknown'; // text may have landed even when Enter failed
+        const sent = await this._mux!.sendInput(this.id, `${prompt}\r`, recoveryGuard);
+        if (!sent) return refusedBeforeDispatch && !dispatched ? 'not-sent' : 'unknown'; // text may have landed even when Enter failed
         this._lastSubmitAt = Date.now();
         // Recovery acceptance comes from structured journal evidence. Do not arm the
         // generic submit verifier: its delayed Enter retries are separate input actions
@@ -5054,6 +5212,58 @@ export class Session extends EventEmitter {
     }
   }
 
+  /** Only an owner Enter for an eligible owned SSH worker needs a pre-input clock proof. */
+  requiresRemoteInputClock(data: string, options: SessionWriteOptions = {}): boolean {
+    const context = this.getRecoveryContext();
+    return (
+      options.fromUser === true &&
+      getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
+      data.includes('\r') &&
+      this._acceptsPrompts &&
+      context.managed &&
+      context.remoteOwned &&
+      context.noDaemon &&
+      !context.untrackedInput
+    );
+  }
+
+  /** Async browser admission captures provenance before bytes; sampling failure never guesses a clock. */
+  async prepareUserInputClock(data: string, options: SessionWriteOptions = {}): Promise<(() => boolean) | undefined> {
+    if (!this.requiresRemoteInputClock(data, options)) return () => true;
+    if (this._remoteClockPreparing) throw new Error('Remote input clock preparation is already in progress');
+    this._remoteClockPreparing = true;
+    this._preparedRemoteClock = undefined;
+    const generation = this._recoveryGeneration;
+    const remote = this._remote!;
+    const configuration = this.remoteRecoveryConfiguration();
+    const isCurrent = () => {
+      const context = this.getRecoveryContext();
+      const current =
+        generation === this._recoveryGeneration &&
+        configuration === this.remoteRecoveryConfiguration() &&
+        context.managed &&
+        context.remoteOwned &&
+        context.noDaemon &&
+        !context.untrackedInput &&
+        !this._closing &&
+        !this._isStopped &&
+        this._paneLifecycleOps === 0;
+      if (!current) this._preparedRemoteClock = undefined;
+      return current;
+    };
+    try {
+      // Owner intent cancels old automation before the read-only SSH await.
+      this._invalidateRecoverySubmission();
+      this.emit('recoveryUserInput');
+      const clock = await sampleRemoteCodexClock(remote).catch(() => undefined);
+      if (!isCurrent()) return undefined;
+      if (clock) this._preparedRemoteClock = { clock, generation, configuration };
+      return isCurrent;
+    } finally {
+      this._remoteClockPreparing = false;
+    }
+  }
+
   private _emitSubmittedPrompt(submitted: {
     prompts: string[];
     recovery?: CodexInputProof & { generation: number; at: number };
@@ -5062,7 +5272,19 @@ export class Session extends EventEmitter {
     if (proof && proof.generation === this._recoveryGeneration && !proof.invalidated && proof.prompts.length === 1) {
       const prompt = proof.prompts[0];
       if (prompt !== undefined && !prompt.trimStart().startsWith('/')) {
-        this._recoverySubmission = { at: proof.at, hash: hashCodexPrompt(prompt) };
+        const prepared = this._preparedRemoteClock;
+        this._recoverySubmission = {
+          at: proof.at,
+          hash: hashCodexPrompt(prompt),
+          ...(this._remote &&
+          prepared?.generation === proof.generation - 1 &&
+          prepared.configuration === this.remoteRecoveryConfiguration() &&
+          proof.at >= prepared.clock.localAfter &&
+          proof.at - prepared.clock.localAfter <= 2000
+            ? { clockDomain: 'local' as const, clock: prepared.clock }
+            : {}),
+        };
+        this._preparedRemoteClock = undefined;
         // Direct tmux stdin remains concurrent and invisible for the lifetime of
         // the handoff taint. A tracked browser prompt cannot prove that no later
         // untracked /resume or edit changed the conversation underneath it.
@@ -5201,6 +5423,10 @@ export class Session extends EventEmitter {
   }
 
   private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
+    if (this.requiresRemoteInputClock(data, options)) {
+      const admission = await this.prepareUserInputClock(data, options);
+      if (!admission || admission() !== true) throw new Error('Owner input admission changed before dispatch');
+    }
     const submittedPrompt = this._trackSubmit(data, options, !!(this._mux && this._muxSession));
     if (this._mux && this._muxSession) {
       let sent: boolean;

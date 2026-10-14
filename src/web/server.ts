@@ -769,6 +769,7 @@ export class WebServer extends EventEmitter {
       sessions: this.sessions as ReadonlyMap<string, Session>,
       addSession: this.registerSessionWithLayout.bind(this),
       commitSessionRegistration: this.commitSessionRegistration.bind(this),
+      persistRebootRestoreDurably: this.persistRebootRestoreDurably.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
@@ -1343,6 +1344,22 @@ export class WebServer extends EventEmitter {
     // not-yet-created PTY. Its separate identity fence remains durable, while
     // the tentative constructor snapshot must never replace historical state.
     if (this.tentativeSessionRegistrations.has(session) || this.sessions.get(session.id) !== session) return;
+    this.store.setSession(session.id, this.buildPersistedSessionState(session));
+  }
+
+  private async persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void> {
+    const current = () =>
+      isCurrent() && this.sessions.get(session.id) === session && this.tentativeSessionRegistrations.has(session);
+    if (!current()) throw new Error('Reboot restoration was cancelled before durable commit');
+    await this.mux.flushSessionsDurably(current);
+    await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
+    if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
+    this.persistDeb.cancelKey(session.id);
+    this.commitSessionRegistration(session);
+  }
+
+  /** Private complete snapshot; tentative restorations can serialize without overwriting historical memory. */
+  private buildPersistedSessionState(session: Session): SessionState {
     // See session-manager.updateSessionState: __envOverrides is an internal disk-only
     // field kept off SessionState to avoid leaking via API broadcasts.
     const base = session.toState();
@@ -1393,7 +1410,7 @@ export class WebServer extends EventEmitter {
         state.respawnEnabled = false;
       }
     }
-    this.store.setSession(session.id, state);
+    return state;
   }
 
   private saveRespawnConfig(sessionId: string, config: RespawnConfig, durationMinutes?: number): void {
@@ -2480,6 +2497,9 @@ export class WebServer extends EventEmitter {
         persist: (state) => this.supervisorStore.save(session.id, state),
         withLeases: (fn) => this.withSupervisorLeases(fn),
         leaseHolder: (workerId, excluding) => this.supervisorLeaseHolder(workerId, excluding),
+        agentProgressVeto: (id) =>
+          this.taskControllers.get(id)?.getStatus().agentProgressVeto === true ||
+          this.taskStore.get(id).agentProgressVeto === true,
         startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
           const task = this.getTaskController(session);
           if (!task) throw new Error('Supervisor task controller is unavailable');
@@ -2578,10 +2598,19 @@ export class WebServer extends EventEmitter {
     let previousReason = '';
     const taskBlocksRecovery = () => {
       const task = this.taskControllers.get(session.id)?.getStatus();
-      return task?.phase === 'watching' || this.controllerHasTaskFlight(session.id);
+      const durableTask = this.taskStore.get(session.id);
+      // A failed or unfinished task-state save must not let the sibling recovery
+      // controller bypass an explicit agent uncertainty or block.
+      return (
+        task?.phase === 'watching' ||
+        task?.agentProgressVeto === true ||
+        durableTask.agentProgressVeto === true ||
+        this.controllerHasTaskFlight(session.id)
+      );
     };
     const controller = new RecoveryController(
       {
+        hasActionAuthority: () => !taskBlocksRecovery(),
         observe: async () => {
           const observation = await adapter.observe();
           // Defer before RecoveryController reserves or charges an attempt. The task
@@ -2599,9 +2628,8 @@ export class WebServer extends EventEmitter {
           }),
         restoreMissingRemote: (isCurrent) =>
           this.getActionArbiter(session.id).run('recovery', () => {
-            const task = this.taskControllers.get(session.id)?.getStatus();
-            if (task?.phase === 'watching' || task?.inFlight) return Promise.resolve('not-sent');
-            return adapter.restoreMissingRemote(isCurrent);
+            if (taskBlocksRecovery()) return Promise.resolve('not-sent');
+            return adapter.restoreMissingRemote(() => isCurrent() && !taskBlocksRecovery());
           }),
         persist: (state) => this.recoveryStore.save(session.id, state),
         changed: (state) => {

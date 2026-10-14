@@ -52,6 +52,8 @@ export interface SupervisorDependencies {
   persist(state: SupervisorState): Promise<void>;
   withLeases<T>(fn: () => Promise<T>): Promise<T>;
   leaseHolder(workerId: string, excludingSupervisor: string): string | undefined;
+  /** Preserve a worker's durable attention veto while its live state changes. */
+  agentProgressVeto?(workerId: string): boolean;
   startManager(
     objective: string,
     workers: readonly SupervisorState['workers'][number][],
@@ -435,6 +437,8 @@ export class SupervisorController {
     const ownRecoveryRefusal =
       dispatchReserved && action === 'retry' && !recovery.inFlight && recovery.lastReason === 'delivery-failed';
     if (
+      task.agentProgressVeto === true ||
+      this.deps.agentProgressVeto?.(configured.sessionId) === true ||
       (task.phase === 'paused' && !ownTaskUncertainty) ||
       task.phase === 'blocked' ||
       task.outcome === 'blocked' ||

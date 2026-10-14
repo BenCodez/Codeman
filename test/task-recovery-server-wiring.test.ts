@@ -15,6 +15,7 @@ import { initialTaskState } from '../src/supervision/schema.js';
 import { TaskStore } from '../src/supervision/store.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import { SessionActionArbiter } from '../src/supervision/action-arbiter.js';
+import { createDeferred } from './mocks/index.js';
 import {
   CONTINUATION_PROMPT,
   initialRecoveryState,
@@ -282,6 +283,299 @@ describe('task and recovery server action wiring', () => {
       } finally {
         task.stop();
         recovery.stop();
+      }
+    }
+  );
+
+  it.each(['unknown', 'blocked', 'incomplete', 'malformed'] as const)(
+    'retains an agent %s progress veto across sibling recovery, settings and controller restart',
+    async (kind) => {
+      let now = Date.now();
+      let marker: Awaited<ReturnType<TaskDependencies['observe']>>['marker'];
+      const taskObservation: RecoveryObservation = {
+        activity: 'working',
+        reason: 'turn-running',
+        at: now,
+        conversationId: flight.conversationId,
+        submissionKey: 'agent-veto-submission',
+        processReady: false,
+        safeToAct: false,
+      };
+      vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+        observation: taskObservation,
+        commands: new Map(),
+        marker,
+      }));
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => ({
+        activity: 'crashed',
+        reason: 'process-crashed',
+        at: now,
+        conversationId: flight.conversationId,
+        evidenceKey: `agent-${kind}-crash`,
+        safeToAct: true,
+      }));
+      const taskRecover = vi.spyOn(CodexTaskAdapter.prototype, 'recover').mockResolvedValue('sent');
+      const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const id = `agent-progress-veto-${kind}`;
+      const { task, taskDeps, recovery, recoveryDeps } = controllers(id);
+      taskDeps.now = recoveryDeps.now = () => now;
+      await task.update({
+        objective: 'Finish the owner task',
+        criteria: [{ id: 'review', description: 'Owner acceptance', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      await task.progress({ outcome: 'unfinished', checkpoint: 'Earlier checkpoint', nextAction: 'Earlier action' });
+      now++;
+      marker = {
+        key: `agent-${kind}-marker`,
+        at: now,
+        submissionKey: taskObservation.submissionKey,
+        progress:
+          kind === 'malformed'
+            ? { outcome: 'unsupported' }
+            : kind === 'incomplete'
+              ? { outcome: 'unfinished', checkpoint: 'Fresh checkpoint without an action' }
+              : { outcome: kind },
+      };
+      await task.refresh();
+      expect(task.getStatus()).toMatchObject({
+        phase: kind === 'blocked' ? 'blocked' : 'paused',
+        agentProgressVeto: true,
+      });
+      expect(internals.taskStore.get(id).agentProgressVeto).toBe(true);
+      expect(new TaskStore().get(id).agentProgressVeto).toBe(true);
+      await recovery.retry();
+      expect(recovery.getStatus().attempts).toBe(0);
+      expect(recovery.getStatus().inFlight).toBeUndefined();
+      await task.update({ config: { enabled: false, maxContinuations: 1 } });
+      await task.pause();
+      expect(task.getStatus().agentProgressVeto).toBe(true);
+      await recovery.retry();
+      expect(recoveryAct).not.toHaveBeenCalled();
+
+      const session = internals.sessions.get(id)!;
+      await internals.stopRecoveryController(id, false);
+      const restoredTask = internals.getTaskController(session)!;
+      const restoredRecovery = internals.getRecoveryController(session)!;
+      expect(restoredTask.getStatus().agentProgressVeto).toBe(true);
+      await restoredRecovery.retry();
+      expect(restoredRecovery.getStatus().attempts).toBe(0);
+      expect(recoveryAct).not.toHaveBeenCalled();
+      expect(taskRecover).not.toHaveBeenCalled();
+
+      await restoredTask.reset();
+      await restoredRecovery.retry();
+      expect(recoveryAct).toHaveBeenCalledOnce();
+      expect(restoredRecovery.getStatus().attempts).toBe(1);
+    }
+  );
+
+  it('checks both live and durable progress vetoes while task journal writes are pending', async () => {
+    let now = Date.now();
+    let marker: Awaited<ReturnType<TaskDependencies['observe']>>['marker'];
+    const observation: RecoveryObservation = {
+      activity: 'working',
+      reason: 'turn-running',
+      at: now,
+      conversationId: flight.conversationId,
+      submissionKey: 'pending-veto-submission',
+      safeToAct: false,
+    };
+    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+      observation,
+      commands: new Map(),
+      marker,
+    }));
+    const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+    const id = 'pending-progress-veto-journal';
+    const { task, taskDeps, recoveryDeps } = controllers(id);
+    taskDeps.now = () => now;
+    await task.update({
+      objective: 'Keep the task veto durable',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { enabled: true },
+    });
+    await task.progress({ outcome: 'unfinished', checkpoint: 'Previous checkpoint', nextAction: 'Previous action' });
+    now++;
+    marker = {
+      key: 'pending-unknown-progress',
+      at: now,
+      submissionKey: observation.submissionKey,
+      progress: { outcome: 'unknown' },
+    };
+    const originalPersist = taskDeps.persist;
+    const entered = createDeferred();
+    const release = createDeferred();
+    taskDeps.persist = async (state) => {
+      entered.resolve();
+      await release.promise;
+      await originalPersist(state);
+    };
+    const refreshing = task.refresh();
+    await entered.promise;
+    try {
+      expect(task.getStatus()).toMatchObject({ phase: 'paused', agentProgressVeto: true });
+      expect(internals.taskStore.get(id).agentProgressVeto).toBeUndefined();
+      expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+    } finally {
+      release.resolve();
+    }
+    await refreshing;
+
+    const clearingEntered = createDeferred();
+    const clearingRelease = createDeferred();
+    taskDeps.persist = async (state) => {
+      clearingEntered.resolve();
+      await clearingRelease.promise;
+      await originalPersist(state);
+    };
+    task.noteUserInput();
+    await clearingEntered.promise;
+    try {
+      expect(task.getStatus().agentProgressVeto).not.toBe(true);
+      expect(internals.taskStore.get(id).agentProgressVeto).toBe(true);
+      expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+    } finally {
+      clearingRelease.resolve();
+    }
+    await task.drain();
+    taskDeps.persist = originalPersist;
+    expect(internals.taskStore.get(id).agentProgressVeto).not.toBe(true);
+    expect(await recoveryDeps.act(flight, () => true)).toBe('sent');
+    expect(recoveryAct).toHaveBeenCalledOnce();
+  });
+
+  it('keeps a newly observed live agent veto when its journal write fails', async () => {
+    let now = Date.now();
+    let marker: Awaited<ReturnType<TaskDependencies['observe']>>['marker'];
+    const observation: RecoveryObservation = {
+      activity: 'working',
+      reason: 'turn-running',
+      at: now,
+      conversationId: flight.conversationId,
+      submissionKey: 'failed-save-submission',
+      safeToAct: false,
+    };
+    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+      observation,
+      commands: new Map(),
+      marker,
+    }));
+    const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+    const id = 'failed-progress-veto-write';
+    const { task, taskDeps, recoveryDeps } = controllers(id);
+    taskDeps.now = () => now;
+    await task.update({
+      objective: 'Preserve uncertainty after a failed save',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { enabled: true },
+    });
+    await task.progress({ outcome: 'unfinished', checkpoint: 'Earlier checkpoint', nextAction: 'Earlier action' });
+    now++;
+    marker = {
+      key: 'failed-write-unknown-progress',
+      at: now,
+      submissionKey: observation.submissionKey,
+      progress: { outcome: 'unknown' },
+    };
+    const originalPersist = taskDeps.persist;
+    taskDeps.persist = async () => {
+      throw new Error('Fixture journal write failure');
+    };
+    try {
+      await expect(task.refresh()).rejects.toThrow('Task state could not be saved');
+      expect(task.getStatus()).toMatchObject({
+        phase: 'blocked',
+        reason: 'persistence-failed',
+        agentProgressVeto: true,
+      });
+      expect(internals.taskStore.get(id).agentProgressVeto).toBeUndefined();
+      expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+      expect(recoveryAct).not.toHaveBeenCalled();
+    } finally {
+      taskDeps.persist = originalPersist;
+    }
+    await task.reset();
+    expect(await recoveryDeps.act(flight, () => true)).toBe('sent');
+    expect(recoveryAct).toHaveBeenCalledOnce();
+  });
+
+  it.each(['unchanged', 'late-agent-veto'] as const)(
+    'rechecks shared task authority after a delayed recovery reservation: %s',
+    async (change) => {
+      let now = Date.now();
+      let marker: Awaited<ReturnType<TaskDependencies['observe']>>['marker'];
+      const observation: RecoveryObservation = {
+        activity: 'working',
+        reason: 'turn-running',
+        at: now,
+        conversationId: flight.conversationId,
+        submissionKey: 'late-task-veto-submission',
+        safeToAct: false,
+      };
+      vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+        observation,
+        commands: new Map(),
+        marker,
+      }));
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => ({
+        activity: 'crashed',
+        reason: 'process-crashed',
+        at: now,
+        conversationId: flight.conversationId,
+        evidenceKey: `late-task-veto-${change}`,
+        safeToAct: true,
+      }));
+      const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const { task, taskDeps, recovery, recoveryDeps } = controllers(`delayed-recovery-${change}`);
+      taskDeps.now = recoveryDeps.now = () => now;
+      await task.update({
+        objective: 'The owner worker task',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+        config: { enabled: false },
+      });
+      const originalPersist = recoveryDeps.persist;
+      const entered = createDeferred();
+      const release = createDeferred();
+      recoveryDeps.persist = async (state) => {
+        if (state.inFlight) {
+          entered.resolve();
+          await release.promise;
+        }
+        await originalPersist(state);
+      };
+      const retrying = recovery.retry();
+      await entered.promise;
+      try {
+        if (change === 'late-agent-veto') {
+          await task.update({ config: { enabled: true } });
+          await task.progress({ outcome: 'unfinished', checkpoint: 'Owner checkpoint', nextAction: 'Owner action' });
+          now++;
+          marker = {
+            key: 'late-unknown-agent-marker',
+            at: now,
+            submissionKey: observation.submissionKey,
+            progress: { outcome: 'unknown' },
+          };
+          await task.refresh();
+          await task.update({ config: { enabled: false } });
+          expect(task.getStatus()).toMatchObject({ phase: 'disabled', agentProgressVeto: true });
+        }
+      } finally {
+        release.resolve();
+      }
+      await retrying;
+      recoveryDeps.persist = originalPersist;
+      expect(recoveryAct).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+      expect(recovery.getStatus()).toMatchObject({
+        attempts: change === 'unchanged' ? 1 : 0,
+        failedAttempts: 0,
+        circuitOpen: false,
+      });
+      if (change === 'late-agent-veto') {
+        expect(recovery.getStatus().inFlight).toBeUndefined();
+        expect(recovery.getStatus().pending).toBeUndefined();
+        expect(recovery.getStatus().windowStartedAt).toBeUndefined();
       }
     }
   );

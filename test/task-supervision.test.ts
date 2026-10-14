@@ -830,7 +830,7 @@ describe('task supervision', () => {
     f.set({ activity: 'idle' });
     await f.controller.resume();
     expect(f.act).toHaveBeenCalledOnce();
-    expect(f.act.mock.calls[0][2]).toContain('Fix bug');
+    expect((f.act.mock.calls as unknown as unknown[][])[0][2]).toContain('Fix bug');
     const flight = f.controller.getStatus().inFlight!;
     expect(flight.promptHash).toBeTruthy();
     f.set({ activity: 'working', submissionHash: flight.promptHash, submissionKey: 'new-submission' });
@@ -1404,7 +1404,7 @@ describe('task supervision', () => {
     };
     await c.refresh();
     expect(c.getStatus()).toMatchObject({
-      outcome: 'unfinished',
+      outcome: 'unknown',
       checkpoint: '',
       nextAction: '',
       phase: 'paused',
@@ -1748,3 +1748,638 @@ describe('newest exact command execution owns success evidence', () => {
     );
   }
 });
+
+describe('fresh agent progress authorizes only its own next action', () => {
+  it.each(['checkpoint', 'nextAction', 'both', 'blank'])(
+    'refuses a new unfinished marker missing %s after an earlier actionable turn',
+    async (missing) => {
+      const f = fixture();
+      try {
+        await configure(f.controller);
+        f.clock(10002);
+        f.marker({
+          key: 'first-agent-progress',
+          at: 10001,
+          submissionKey: 'fixture-submission',
+          progress: {
+            outcome: 'unfinished',
+            checkpoint: 'External record is pending',
+            nextAction: 'Write the external record once',
+          },
+        });
+        await f.controller.refresh();
+        expect(f.act).toHaveBeenCalledOnce();
+        const firstFlight = f.controller.getStatus().inFlight!;
+        f.clock(10004);
+        f.set({
+          activity: 'completed',
+          at: 10003,
+          turnId: 'second-turn',
+          submissionKey: 'second-submission',
+          submissionHash: firstFlight.promptHash,
+        });
+        const progress = {
+          outcome: 'unfinished',
+          ...(missing === 'nextAction' ? { checkpoint: 'The external record was written' } : {}),
+          ...(missing === 'checkpoint' ? { nextAction: 'Inspect the record' } : {}),
+          ...(missing === 'blank' ? { checkpoint: '  ', nextAction: '\t' } : {}),
+        };
+        f.marker({ key: 'incomplete-new-progress', at: 10003, submissionKey: 'second-submission', progress });
+        await f.controller.refresh();
+        expect(f.act).toHaveBeenCalledOnce();
+        expect(f.recover).not.toHaveBeenCalled();
+        expect(f.controller.getStatus()).toMatchObject({
+          phase: 'paused',
+          outcome: 'unknown',
+          checkpoint: '',
+          nextAction: '',
+          reason: 'task-evidence-unknown',
+          agentProgressVeto: true,
+        });
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
+
+  it.each(['crashed', 'interrupted'] as const)(
+    'pauses an explicit unknown marker immediately while working and refuses a later %s',
+    async (activity) => {
+      const f = fixture();
+      try {
+        await configure(f.controller);
+        f.clock(10002);
+        f.set({ activity: 'working', reason: 'turn-running', at: 10001, safeToAct: false });
+        f.marker({
+          key: 'explicit-agent-uncertainty',
+          at: 10001,
+          submissionKey: 'fixture-submission',
+          progress: { outcome: 'unknown' },
+        });
+        await f.controller.refresh();
+        expect(f.controller.getStatus()).toMatchObject({
+          phase: 'paused',
+          outcome: 'unknown',
+          checkpoint: '',
+          nextAction: '',
+          reason: 'task-evidence-unknown',
+          agentProgressVeto: true,
+        });
+        f.clock(10004);
+        f.set({
+          activity,
+          reason: activity === 'crashed' ? 'process-crashed' : 'turn-interrupted',
+          at: 10003,
+          safeToAct: true,
+          evidenceKey: 'failure-after-explicit-unknown',
+        });
+        await f.controller.refresh();
+        expect(f.recover).not.toHaveBeenCalled();
+        expect(f.act).not.toHaveBeenCalled();
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
+
+  it('continues with fresh complete agent details instead of the preceding external action', async () => {
+    const f = fixture();
+    try {
+      await configure(f.controller);
+      f.clock(10002);
+      f.marker({
+        key: 'first-actionable-progress',
+        at: 10001,
+        submissionKey: 'fixture-submission',
+        progress: {
+          outcome: 'unfinished',
+          checkpoint: 'External record is pending',
+          nextAction: 'Write the external record once',
+        },
+      });
+      await f.controller.refresh();
+      const firstFlight = f.controller.getStatus().inFlight!;
+      f.clock(10004);
+      f.set({
+        activity: 'completed',
+        at: 10003,
+        turnId: 'second-turn',
+        submissionKey: 'second-submission',
+        submissionHash: firstFlight.promptHash,
+      });
+      f.marker({
+        key: 'second-actionable-progress',
+        at: 10003,
+        submissionKey: 'second-submission',
+        progress: {
+          outcome: 'unfinished',
+          checkpoint: 'The external record was written',
+          nextAction: 'Inspect the record without changing it',
+        },
+      });
+      await f.controller.refresh();
+      expect(f.act).toHaveBeenCalledTimes(2);
+      expect((f.act.mock.calls as unknown as unknown[][])[1][2]).toContain('The external record was written');
+      expect((f.act.mock.calls as unknown as unknown[][])[1][2]).toContain('Inspect the record without changing it');
+      expect((f.act.mock.calls as unknown as unknown[][])[1][2]).not.toContain('Write the external record once');
+    } finally {
+      f.controller.stop();
+    }
+  });
+
+  it('still recovers a verified pre-marker crash when no agent has declared uncertainty', async () => {
+    const f = fixture();
+    try {
+      await f.controller.update({
+        objective: 'Owner task',
+        criteria: [{ id: 'review', description: 'Owner accepts', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      expect(f.controller.getStatus().outcome).toBe('unknown');
+      f.clock(10002);
+      f.set({
+        activity: 'crashed',
+        reason: 'process-crashed',
+        at: 10001,
+        safeToAct: true,
+        evidenceKey: 'pre-marker-crash',
+      });
+      await f.controller.refresh();
+      expect(f.recover).toHaveBeenCalledOnce();
+      expect(f.act).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  });
+
+  it('retains explicit owner authority to edit progress incrementally', async () => {
+    const f = fixture();
+    try {
+      await configure(f.controller);
+      await f.controller.progress({ outcome: 'unfinished', checkpoint: 'The owner checked the latest work' });
+      await f.controller.refresh();
+      expect(f.act).toHaveBeenCalledOnce();
+      expect((f.act.mock.calls as unknown as unknown[][])[0][2]).toContain('The owner checked the latest work');
+      expect((f.act.mock.calls as unknown as unknown[][])[0][2]).toContain('Apply fix');
+    } finally {
+      f.controller.stop();
+    }
+  });
+});
+
+describe('agent attention survives unrelated edits until newer owner authority', () => {
+  it.each(['settings', 'disable-enable', 'pause', 'criteria-edit', 'restart'] as const)(
+    'retains the explicit unknown marker veto across %s',
+    async (operation) => {
+      const f = fixture();
+      let restored: TaskController | undefined;
+      try {
+        await configure(f.controller);
+        f.clock(10002);
+        f.set({ activity: 'working', reason: 'turn-running', at: 10001 });
+        f.marker({
+          key: 'owner-attention-required',
+          at: 10001,
+          submissionKey: 'fixture-submission',
+          progress: { outcome: 'unknown' },
+        });
+        await f.controller.refresh();
+        if (operation === 'settings') await f.controller.update({ config: { maxContinuations: 7 } });
+        if (operation === 'disable-enable') {
+          await f.controller.update({ config: { enabled: false } });
+          await f.controller.update({ config: { enabled: true } });
+        }
+        if (operation === 'pause') await f.controller.pause();
+        if (operation === 'criteria-edit')
+          await f.controller.update({ criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }] });
+        if (operation === 'restart') {
+          restored = new TaskController(
+            {
+              observe: async () => ({
+                observation: {
+                  activity: 'crashed',
+                  reason: 'process-crashed',
+                  at: 10003,
+                  conversationId: id,
+                  safeToAct: true,
+                  evidenceKey: 'later-crash',
+                },
+                commands: new Map(),
+              }),
+              act: f.act,
+              recover: f.recover,
+              persist: async () => {},
+              changed: () => {},
+              now: () => 10004,
+            },
+            f.controller.getStatus()
+          );
+          await restored.refresh();
+          expect(restored.getStatus().agentProgressVeto).toBe(true);
+        }
+        expect(f.controller.getStatus()).toMatchObject({ agentProgressVeto: true, phase: 'paused' });
+        f.set({
+          activity: 'crashed',
+          reason: 'process-crashed',
+          at: 10003,
+          safeToAct: true,
+          evidenceKey: 'later-crash',
+        });
+        await f.controller.refresh();
+        expect(f.recover).not.toHaveBeenCalled();
+      } finally {
+        restored?.stop();
+        f.controller.stop();
+      }
+    }
+  );
+  it.each(['unfinished', 'completed', 'new-objective', 'reset', 'input-while-disabled', 'resume'] as const)(
+    'allows explicit newer owner authority to release the veto via %s',
+    async (operation) => {
+      const f = fixture();
+      try {
+        await f.controller.update({
+          objective: 'Review the fix',
+          criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+          config: { enabled: true },
+        });
+        await f.controller.progress({ outcome: 'unfinished', checkpoint: 'Review pending', nextAction: 'Inspect' });
+        f.clock(10002);
+        f.set({ activity: 'working', reason: 'turn-running', at: 10001 });
+        f.marker({
+          key: 'owner-attention-required',
+          at: 10001,
+          submissionKey: 'fixture-submission',
+          progress: { outcome: 'unknown' },
+        });
+        await f.controller.refresh();
+        expect(f.controller.getStatus().agentProgressVeto).toBe(true);
+        f.set({ activity: 'idle', reason: 'observing', at: 10003 });
+        if (operation === 'unfinished')
+          await f.controller.progress({
+            outcome: 'unfinished',
+            checkpoint: 'Owner inspected current work',
+            nextAction: 'Proceed safely',
+          });
+        if (operation === 'completed')
+          await f.controller.progress({ outcome: 'completed', verifiedCriteria: ['review'] });
+        if (operation === 'new-objective') await f.controller.update({ objective: 'The owner chose a new task' });
+        if (operation === 'reset') await f.controller.reset();
+        if (operation === 'input-while-disabled') {
+          await f.controller.update({ config: { enabled: false } });
+          f.controller.noteUserInput();
+          await f.controller.drain();
+          expect(
+            (f.persist.mock.calls as unknown as Array<[ReturnType<TaskController['getStatus']>]>).at(-1)?.[0]
+              .agentProgressVeto
+          ).toBeUndefined();
+        }
+        if (operation === 'resume') await f.controller.resume();
+        expect(f.controller.getStatus().agentProgressVeto).toBeUndefined();
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
+});
+
+it('retains newly observed agent uncertainty when its journal write fails', async () => {
+  const f = fixture();
+  try {
+    await configure(f.controller);
+    f.clock(10002);
+    f.set({ activity: 'working', reason: 'turn-running', at: 10001 });
+    f.marker({
+      key: 'unwritten-agent-uncertainty',
+      at: 10001,
+      submissionKey: 'fixture-submission',
+      progress: { outcome: 'unknown' },
+    });
+    f.persist.mockRejectedValueOnce(new Error('Sanitized journal unavailable'));
+    await expect(f.controller.refresh()).rejects.toThrow('Task state could not be saved');
+    expect(f.controller.getStatus()).toMatchObject({
+      agentProgressVeto: true,
+      phase: 'blocked',
+      reason: 'persistence-failed',
+    });
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.recover).not.toHaveBeenCalled();
+  } finally {
+    f.controller.stop();
+  }
+});
+
+it.each(['blocked', 'completed', 'malformed'] as const)(
+  'retains a non-actionable %s agent report until owner attention',
+  async (outcome) => {
+    const f = fixture();
+    try {
+      await configure(f.controller);
+      f.clock(10002);
+      f.set({ activity: 'working', reason: 'turn-running', at: 10001 });
+      f.marker({
+        key: `agent-${outcome}-attention`,
+        at: 10001,
+        submissionKey: 'fixture-submission',
+        progress: outcome === 'malformed' ? null : { outcome },
+      });
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({
+        agentProgressVeto: true,
+        phase: outcome === 'blocked' ? 'blocked' : 'paused',
+        outcome: outcome === 'blocked' ? 'blocked' : 'unknown',
+        criteria: [{ verified: false }],
+      });
+      f.clock(10004);
+      f.set({
+        activity: 'crashed',
+        reason: 'process-crashed',
+        at: 10003,
+        safeToAct: true,
+        evidenceKey: 'crash-after-agent-attention',
+      });
+      await f.controller.refresh();
+      expect(f.recover).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  }
+);
+
+it.each(['unknown', 'blocked'] as const)(
+  'does not let owner %s progress release existing agent uncertainty',
+  async (outcome) => {
+    const f = fixture();
+    try {
+      await configure(f.controller);
+      f.clock(10002);
+      f.set({ activity: 'working', reason: 'turn-running', at: 10001 });
+      f.marker({
+        key: 'existing-agent-uncertainty',
+        at: 10001,
+        submissionKey: 'fixture-submission',
+        progress: { outcome: 'unknown' },
+      });
+      await f.controller.refresh();
+      await f.controller.progress({ outcome });
+      expect(f.controller.getStatus().agentProgressVeto).toBe(true);
+      expect(f.recover).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  }
+);
+
+it('does not mistake an old submission uncertainty marker for the current owner task', async () => {
+  const f = fixture();
+  try {
+    await configure(f.controller);
+    f.clock(10002);
+    f.set({ activity: 'working', reason: 'turn-running', at: 10001 });
+    f.marker({
+      key: 'foreign-submission-uncertainty',
+      at: 10001,
+      submissionKey: 'other-submission',
+      progress: { outcome: 'unknown' },
+    });
+    await f.controller.refresh();
+    expect(f.controller.getStatus().agentProgressVeto).toBeUndefined();
+    expect(f.controller.getStatus().phase).toBe('watching');
+    f.clock(10004);
+    f.set({
+      activity: 'crashed',
+      reason: 'process-crashed',
+      at: 10003,
+      safeToAct: true,
+      evidenceKey: 'current-owner-crash',
+    });
+    await f.controller.refresh();
+    expect(f.recover).toHaveBeenCalledOnce();
+  } finally {
+    f.controller.stop();
+  }
+});
+
+describe('final evidence refusals retain task authority across recovery domains', () => {
+  it.each(['kickoff', 'continuation', 'recovery'] as const)(
+    'seals a same-owner %s final evidence refusal until newer owner intent',
+    async (kind) => {
+      let observation: TaskObservation = {
+        observation: {
+          activity: 'completed',
+          reason: 'turn-completed',
+          at: 10001,
+          conversationId: id,
+          turnId: 'finished-turn',
+          submissionKey: 'original-submission',
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      };
+      let controller!: TaskController;
+      let now = 10000;
+      const dispatch = vi.fn(async () => {
+        // The adapter saw newer uncertainty during its final reads and certified no effect.
+        observation.marker = {
+          key: 'late-uncertainty',
+          at: 10004,
+          submissionKey: 'original-submission',
+          progress: { outcome: 'unknown' },
+        };
+        return 'not-sent' as const;
+      });
+      const journal: ReturnType<TaskController['getStatus']>[] = [];
+      controller = new TaskController({
+        now: () => now,
+        observe: async () => observation,
+        act: dispatch,
+        recover: dispatch,
+        persist: async (state) => {
+          journal.push(structuredClone(state));
+        },
+        changed: () => {},
+      });
+      try {
+        await controller.update({
+          objective: 'Owner objective',
+          criteria: [{ id: 'review', description: 'Owner accepts', kind: 'manual' }],
+          config: { enabled: true },
+        });
+        await controller.progress({
+          outcome: 'unfinished',
+          checkpoint: 'Previous step',
+          nextAction: 'Previous external action',
+        });
+        now = 10003;
+        if (kind === 'recovery')
+          observation.observation = {
+            ...observation.observation,
+            activity: 'crashed',
+            reason: 'process-crashed',
+            at: 10004,
+            safeToAct: true,
+            evidenceKey: 'native-crash',
+          };
+        if (kind === 'kickoff') await controller.resume();
+        else await controller.refresh();
+        expect(dispatch).toHaveBeenCalledOnce();
+        expect(controller.getStatus()).toMatchObject({
+          phase: 'paused',
+          agentProgressVeto: true,
+          outcome: 'unknown',
+          checkpoint: '',
+          nextAction: '',
+        });
+        expect(controller.getStatus().inFlight).toBeUndefined();
+        expect(journal.at(-1)?.agentProgressVeto).toBe(true);
+        observation.observation = {
+          ...observation.observation,
+          activity: 'crashed',
+          reason: 'process-crashed',
+          at: 10005,
+          safeToAct: true,
+          evidenceKey: 'later-native-crash',
+        };
+        await controller.refresh();
+        expect(dispatch).toHaveBeenCalledOnce();
+        controller.noteUserInput();
+        await controller.drain();
+        expect(controller.getStatus().agentProgressVeto).toBeUndefined();
+      } finally {
+        controller.stop();
+      }
+    }
+  );
+
+  it.each(['input', 'owner-pause', 'external-pause', 'runtime'] as const)(
+    'keeps genuine %s cancellation separate from a final evidence refusal',
+    async (kind) => {
+      let now = 10000;
+      let externallyCurrent = true;
+      let controller!: TaskController;
+      const act = vi.fn(async () => {
+        if (kind === 'input') controller.noteUserInput();
+        if (kind === 'owner-pause') void controller.pause();
+        if (kind === 'external-pause') externallyCurrent = false;
+        if (kind === 'runtime') now += 1000;
+        return 'not-sent' as const;
+      });
+      controller = new TaskController({
+        now: () => now,
+        observe: async () => ({
+          observation: {
+            activity: 'idle',
+            reason: 'observing',
+            at: now,
+            conversationId: id,
+            processReady: true,
+            safeToAct: false,
+          },
+          commands: new Map(),
+        }),
+        act,
+        persist: async () => {},
+        changed: () => {},
+      });
+      try {
+        await controller.update({
+          objective: 'Owner objective',
+          criteria: [{ id: 'review', description: 'Owner accepts', kind: 'manual' }],
+          config: { maxRuntimeMs: 1000 },
+        });
+        await controller.resume(() => externallyCurrent);
+        await controller.drain();
+        expect(act).toHaveBeenCalledOnce();
+        expect(controller.getStatus().agentProgressVeto).toBeUndefined();
+        expect(controller.getStatus().inFlight).toBeUndefined();
+        expect(controller.getStatus().phase).toBe(kind === 'runtime' ? 'blocked' : 'paused');
+      } finally {
+        controller.stop();
+      }
+    }
+  );
+});
+
+it.each(['kickoff', 'continuation', 'recovery'] as const)(
+  'retains final %s evidence refusal when a settings-only update races it',
+  async (kind) => {
+    let now = 10000;
+    let controller!: TaskController;
+    let editing: Promise<ReturnType<TaskController['getStatus']>> | undefined;
+    const journal: ReturnType<TaskController['getStatus']>[] = [];
+    const observation: TaskObservation = {
+      observation: {
+        activity: 'completed',
+        reason: 'turn-completed',
+        at: 10001,
+        conversationId: id,
+        turnId: 'finished-turn',
+        submissionKey: 'owned-submission',
+        processReady: true,
+        safeToAct: false,
+      },
+      commands: new Map(),
+    };
+    const refusing = vi.fn(async () => {
+      observation.marker = {
+        key: 'late-unknown-with-settings-edit',
+        at: now + 1,
+        submissionKey: 'owned-submission',
+        progress: { outcome: 'unknown' },
+      };
+      editing = controller.update({ config: { maxContinuations: 7 } });
+      return 'not-sent' as const;
+    });
+    controller = new TaskController({
+      now: () => now,
+      observe: async () => observation,
+      act: refusing,
+      recover: refusing,
+      persist: async (state) => {
+        journal.push(structuredClone(state));
+      },
+      changed: () => {},
+    });
+    try {
+      await controller.update({
+        objective: 'Owner goal',
+        criteria: [{ id: 'review', description: 'Owner reviews', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      await controller.progress({
+        outcome: 'unfinished',
+        checkpoint: 'Last owner checkpoint',
+        nextAction: 'Last owner action',
+      });
+      now = 10002;
+      if (kind === 'recovery')
+        observation.observation = {
+          ...observation.observation,
+          activity: 'crashed',
+          reason: 'process-crashed',
+          safeToAct: true,
+          evidenceKey: 'current-crash',
+        };
+      if (kind === 'kickoff') await controller.resume();
+      else await controller.refresh();
+      await editing;
+      expect(refusing).toHaveBeenCalledOnce();
+      expect(controller.getStatus()).toMatchObject({
+        phase: 'paused',
+        outcome: 'unknown',
+        agentProgressVeto: true,
+        checkpoint: '',
+        nextAction: '',
+        config: { maxContinuations: 7 },
+      });
+      expect(controller.getStatus().inFlight).toBeUndefined();
+      expect(journal.at(-1)?.agentProgressVeto).toBe(true);
+      expect(journal.some((state) => state.reason === 'delivery-cancelled' && state.agentProgressVeto === true)).toBe(
+        true
+      );
+    } finally {
+      controller.stop();
+    }
+  }
+);

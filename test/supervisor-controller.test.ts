@@ -165,15 +165,29 @@ describe('SupervisorController', () => {
           await task.refresh();
           freshCompletionClaim = false;
           expect(task.getStatus()).toMatchObject({
-            phase: 'watching',
+            phase: 'paused',
             outcome: 'unknown',
             criteria: [{ kind: 'manual', verified: false }],
+            agentProgressVeto: true,
           });
         }
         now = 10_000;
         await h.controller.configure(plan);
         await h.controller.start();
-        await h.controller.assign(WORKER, `request-budget-${caseName}`);
+        const assignment = h.controller.assign(WORKER, `request-budget-${caseName}`);
+        if (caseName === 'claimed-completed') {
+          await expect(assignment).rejects.toThrow(/cancelled|owner attention/);
+          expect(act).not.toHaveBeenCalled();
+          expect(task.getStatus()).toMatchObject({
+            phase: 'paused',
+            config: { enabled: true, maxContinuations: 1, maxRuntimeMs: 60_000 },
+            startedAt: 9_000,
+            agentProgressVeto: true,
+            criteria: [{ kind: 'manual', verified: false }],
+          });
+          return;
+        }
+        await assignment;
         expect(act).toHaveBeenCalledOnce();
         const expected =
           caseName === 'new-task'
@@ -301,6 +315,39 @@ describe('SupervisorController', () => {
     expect(h.controller.getStatus().inFlight).toBeUndefined();
     expect(h.controller.getStatus().workers[0].assignments).toBe(0);
   });
+
+  it.each(['assign', 'retry'] as const)(
+    'retains live and durable agent vetoes on a disabled worker before manager %s',
+    async (action) => {
+      const h = harness();
+      let durableVeto = false;
+      h.deps.agentProgressVeto = (workerId) => workerId === WORKER && durableVeto;
+      h.taskState.phase = 'disabled';
+      h.taskState.agentProgressVeto = true;
+      h.recoveryState.activity = 'crashed';
+      vi.mocked(h.worker.recovery.retry).mockResolvedValue({
+        ...initialRecoveryState(),
+        phase: 'recovering',
+        lastReason: 'process-resumed',
+        inFlight: { key: 'owner-authorized-crash', action: 'restart', conversationId: WORKER, startedAt: 10_000 },
+      });
+      await h.controller.configure(config);
+      await h.controller.start();
+      await expect(h.controller[action](WORKER, `request-live-veto-${action}`)).rejects.toThrow(/cancelled|attention/);
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      expect(h.worker.recovery.retry).not.toHaveBeenCalled();
+      delete h.taskState.agentProgressVeto;
+      durableVeto = true;
+      await expect(h.controller[action](WORKER, `request-durable-veto-${action}`)).rejects.toThrow(
+        /cancelled|attention/
+      );
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      expect(h.worker.recovery.retry).not.toHaveBeenCalled();
+      durableVeto = false; // The owner's release has now committed to the worker journal.
+      await h.controller[action](WORKER, `request-owner-cleared-${action}`);
+      expect(action === 'assign' ? h.worker.task.resume : h.worker.recovery.retry).toHaveBeenCalledOnce();
+    }
+  );
 
   it('refuses to reassign the same verified completed task until the owner changes the plan', async () => {
     const h = harness();

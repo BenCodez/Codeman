@@ -1961,8 +1961,12 @@ export function registerSessionRoutes(
         fromUser: true,
         ...(tagged && !workerDead ? { inputSeq: { clientId: clientId as string, seq: seq as number } } : {}),
       };
-      const directWrite = () => {
+      const directWrite = async () => {
         try {
+          if (session.requiresRemoteInputClock?.(inputStr, writeOptions)) {
+            const admission = await session.prepareUserInputClock(inputStr, writeOptions);
+            if (!admission || admission() !== true) return false;
+          }
           return session.write(inputStr, writeOptions);
         } catch (error) {
           if (error instanceof RebootIdentityFenceError) undoOnFailure();
@@ -1999,7 +2003,7 @@ export function registerSessionRoutes(
           delivered = true;
         } else {
           console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-          delivered = directWrite();
+          delivered = await directWrite();
           if (!delivered) undoOnFailure();
         }
       } else if (autoMux || (useMux && (tagged || getCli(session.mode)?.capabilities.recovery === 'codex-rollout'))) {
@@ -2012,7 +2016,7 @@ export function registerSessionRoutes(
           delivered = true;
         } else {
           console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-          delivered = directWrite();
+          delivered = await directWrite();
           if (!delivered) undoOnFailure();
         }
       } else if (useMux) {
@@ -2031,7 +2035,7 @@ export function registerSessionRoutes(
       } else {
         // A tagged no-PTY write is retryable below. Legacy untagged callers keep
         // their historical response when a session has not been started yet.
-        delivered = directWrite();
+        delivered = await directWrite();
         if (!delivered && tagged) {
           session.forgetInputSeq(clientId as string, seq as number);
         }

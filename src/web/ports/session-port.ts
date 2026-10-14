@@ -13,6 +13,8 @@ export interface SessionPort {
   /** Tentative restores preserve the historical record through every state writer until committed. */
   addSession(session: Session, options?: { tentative?: boolean }): Promise<void>;
   commitSessionRegistration(session: Session): void;
+  /** Strict main-state and mux-metadata acknowledgement before a reboot offer is consumed. */
+  persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void>;
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
   persistSessionState(session: Session): void;

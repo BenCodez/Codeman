@@ -401,11 +401,15 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 ? { ...ownerEnv, CODEX_HOME: recoveryHome! }
                 : ownerEnv;
             let granted = false;
+            let grantIsCurrent = () => false;
             session.setCodexRestoreLaunchGuard({
               prepare: async () => {
                 granted = false;
+                grantIsCurrent = () => false;
                 const current = await clampRecoveryLaunchForOwner(saved.owner, { codexConfig }, envToAuthorize);
+                grantIsCurrent = current.isCurrent;
                 granted =
+                  grantIsCurrent() === true &&
                   sameCodexLaunchConfig(current.configs.codexConfig as CodexConfig | undefined, codexConfig!) &&
                   JSON.stringify(current.env) === JSON.stringify(envToAuthorize);
               },
@@ -413,6 +417,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 const peers = [...ctx.sessions.values()].filter((other) => other !== session);
                 return (
                   granted &&
+                  grantIsCurrent() === true &&
                   rebootRestoreRegistry.isHeld(entry, owner) &&
                   ctx.sessions.get(session.id) === session &&
                   JSON.stringify(readRebootIdentityFence(session.id)) === fence &&
@@ -421,7 +426,8 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                     new Set(peers.map((other) => other.id)),
                     new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
                   ).skipped.length === 0 &&
-                  confirmCodexIdentityWitness(finalEvidence!)
+                  confirmCodexIdentityWitness(finalEvidence!) &&
+                  grantIsCurrent() === true
                 );
               },
             });
@@ -491,10 +497,9 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             }
           }
 
-          // No awaited finalization remains after this write. A Dismiss that
-          // lands during state restoration, hook installation or preamble setup
-          // is therefore observed and cleaned up before the rebuilt record can
-          // replace the pre-reboot snapshot.
+          // Preserve current identity before the final metadata/state durability
+          // waits. Cancellation is rechecked throughout that commit, and the
+          // historical offer remains durable until both snapshots are acknowledged.
           if (usesCodexRecovery) {
             const identity = session.getRecoveryContext();
             writeRebootIdentityFence(session.id, {
@@ -506,8 +511,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               untrackedInput: identity.untrackedInput,
             });
           }
-          ctx.commitSessionRegistration(session);
-          ctx.persistSessionState(session);
+          await ctx.persistRebootRestoreDurably(session, () => rebootRestoreRegistry.isHeld(entry, owner));
+          if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+            await discardCancelledRestore();
+            continue;
+          }
 
           getLifecycleLog().log({ event: 'recovered', sessionId: session.id, name: session.name });
           // Every other open tab and phone needs this; the clicking tab already has

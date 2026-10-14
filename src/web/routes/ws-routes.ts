@@ -171,7 +171,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
 
       // Attach message handler synchronously BEFORE any async work
       // (@fastify/websocket requirement to avoid dropped messages).
-      socket.on('message', (raw) => {
+      socket.on('message', async (raw) => {
         try {
           const msg = JSON.parse(String(raw));
           if (msg.t === 'i' && typeof msg.d === 'string') {
@@ -206,10 +206,14 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               if (holdsDesktopClaim) session.noteDesktopActivity();
               // Browser keystrokes are the user's own, so they may name the tab.
               try {
-                delivered = session.write(msg.d, {
+                const writeOptions = {
                   fromUser: true,
                   ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
-                });
+                };
+                if (session.requiresRemoteInputClock?.(msg.d, writeOptions)) {
+                  const admission = await session.prepareUserInputClock(msg.d, writeOptions);
+                  delivered = !!admission && admission() === true && session.write(msg.d, writeOptions);
+                } else delivered = session.write(msg.d, writeOptions);
               } catch (err) {
                 if (cid && seq !== null) session.forgetInputSeq(cid, seq);
                 throw err;
