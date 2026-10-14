@@ -2589,6 +2589,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       if (!canDispatch()) return null;
+      if (guard?.prepareEvidence && (await guard.prepareEvidence()) !== true) return null;
+      if (!canDispatch()) return null;
       guard?.noteDispatch();
       const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${expected ? shellescape(expected.paneId) : `"${muxName}"`} bash -c ${expected ? shellescape(launchCmd) : JSON.stringify(launchCmd)}`;
       const predicate = expected
@@ -3716,6 +3718,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     const muxName = session.muxName;
+    const livePane = recoveryGuard?.expectedLivePane && { ...recoveryGuard.expectedLivePane };
+    if (
+      recoveryGuard &&
+      (!livePane ||
+        !/^%(?:0|[1-9]\d{0,9})$/.test(livePane.paneId) ||
+        !Number.isSafeInteger(livePane.panePid) ||
+        livePane.panePid <= 0 ||
+        !/^[1-9]\d{0,9}$/.test(String(livePane.panePid)))
+    ) {
+      recoveryGuard.noteRefusal?.();
+      return false;
+    }
     const canDispatch = () =>
       !recoveryGuard ||
       (this.sessions.get(sessionId) === session &&
@@ -3725,6 +3739,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     // TEST MODE: No-op — don't send input to real tmux sessions
     if (IS_TEST_MODE) {
+      if (recoveryGuard?.prepareEvidence && (await recoveryGuard.prepareEvidence()) !== true) return false;
+      if (!canDispatch()) return false;
       recoveryGuard?.noteDispatch();
       return true;
     }
@@ -3739,15 +3755,53 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     try {
+      const prepared = async (): Promise<boolean> => {
+        try {
+          return (!recoveryGuard?.prepareEvidence || (await recoveryGuard.prepareEvidence()) === true) && canDispatch();
+        } catch {
+          recoveryGuard?.noteRefusal?.();
+          return false;
+        }
+      };
       const hasCarriageReturn = input.includes('\r');
       const textPart = input.replace(/\r/g, '').replace(/\n/g, '').trimEnd();
+      let composerScreen: string | undefined;
+      const nativePredicate = livePane
+        ? [
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${livePane.paneId}}`,
+            `#{==:#{pane_pid},${livePane.panePid}}`,
+            '#{==:#{pane_dead},0}',
+            '#{==:#{pane_dead_status},}',
+            '#{==:#{pane_dead_signal},}',
+          ].reduce((all, term) => `#{&&:${all},${term}}`)
+        : undefined;
+      const inputCommand = (keys: string) => {
+        const send = `send-keys -t ${livePane ? shellescape(livePane.paneId) : `"${muxName}"`} ${keys}`;
+        return nativePredicate
+          ? `${this.tmux()} if-shell -F -t ${shellescape(livePane!.paneId)} ${shellescape(nativePredicate)} ${shellescape(send)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}`
+          : `${this.tmux()} ${send}`;
+      };
+      const dispatchInput = async (keys: string): Promise<boolean> => {
+        const { stdout } = await execAsync(inputCommand(keys), { timeout: EXEC_TIMEOUT_MS });
+        return !nativePredicate || stdout.trim() !== 'CODEMAN_RECOVERY_PANE_REFUSED';
+      };
       const composerCurrent = (expected?: string): boolean => {
         if (!recoveryGuard) return true;
         // This synchronous read follows queued/async preparation. -J joins native
         // wrapped rows without guessing whitespace or multiline draft indentation.
         let accepted = false;
         try {
-          const screen = execSync(`${this.tmux()} capture-pane -p -J -t ${shellescape(muxName)}`, {
+          const row = execSync(
+            `${this.tmux()} display-message -p -t ${shellescape(livePane!.paneId)} '#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}'`,
+            { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS, maxBuffer: 16_384 }
+          );
+          const frame = row.endsWith('\n') ? row.slice(0, -1) : undefined;
+          if (frame !== `${muxName}|${livePane!.paneId}|${livePane!.panePid}|0||`) {
+            recoveryGuard.noteRefusal?.();
+            return false;
+          }
+          const screen = execSync(`${this.tmux()} capture-pane -p -J -t ${shellescape(livePane!.paneId)}`, {
             encoding: 'utf-8',
             timeout: EXEC_TIMEOUT_MS,
             maxBuffer: 64 * 1024,
@@ -3768,11 +3822,37 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             (expected === undefined
               ? hasCodexComposerText(screen, '') || hasCodexComposerText(screen, 'Ask Codex to do anything')
               : hasCodexComposerText(screen, expected));
+          if (accepted) composerScreen = screen;
         } catch {
           // No native input has been attempted by this read.
         }
         if (!accepted) recoveryGuard.noteRefusal?.();
         return accepted;
+      };
+      type DispatchAdmission = { screen?: string; started: number };
+      const prepareDispatch = async (expected?: string): Promise<DispatchAdmission | undefined> => {
+        const started = performance.now();
+        if (!recoveryGuard) return { started };
+        if (!(await prepared()) || !composerCurrent(expected)) return undefined;
+        const screen = composerScreen;
+        if (!(await prepared())) return undefined;
+        return { screen, started };
+      };
+      const confirmDispatch = (admission: DispatchAdmission | undefined, expected?: string): boolean => {
+        if (!admission) return false;
+        if (!recoveryGuard) return true;
+        // Keep this last capture and scope check synchronous with dispatch: an
+        // async helper returning after capture would introduce another wait gap.
+        if (
+          !composerCurrent(expected) ||
+          composerScreen !== admission.screen ||
+          performance.now() - admission.started > 2_000 ||
+          !canDispatch()
+        ) {
+          recoveryGuard.noteRefusal?.();
+          return false;
+        }
+        return true;
       };
 
       if (textPart && hasCarriageReturn) {
@@ -3780,31 +3860,27 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
         // character in the input buffer rather than as form submission.
-        if (!canDispatch() || !composerCurrent() || !canDispatch()) return false;
+        const admission = await prepareDispatch();
+        if (!confirmDispatch(admission) || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        if (!(await dispatchInput(`-l ${shellescape(textPart)}`))) return false;
         await new Promise((resolve) => setTimeout(resolve, 50));
-        if (!canDispatch() || !composerCurrent(textPart) || !canDispatch()) return false;
+        const enterAdmission = await prepareDispatch(textPart);
+        if (!confirmDispatch(enterAdmission, textPart) || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        if (!(await dispatchInput('Enter'))) return false;
       } else if (textPart) {
         // Text only, no Enter
-        if (!canDispatch() || !composerCurrent() || !canDispatch()) return false;
+        const admission = await prepareDispatch();
+        if (!confirmDispatch(admission) || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        if (!(await dispatchInput(`-l ${shellescape(textPart)}`))) return false;
       } else if (hasCarriageReturn) {
         // Enter only
-        if (!canDispatch() || !composerCurrent() || !canDispatch()) return false;
+        const admission = await prepareDispatch();
+        if (!confirmDispatch(admission) || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        if (!(await dispatchInput('Enter'))) return false;
       }
 
       return true;

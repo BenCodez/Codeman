@@ -116,6 +116,8 @@ describe.each(['continue', 'restart'] as const)('actual local %s grant boundary'
       const home = join(directory, 'codex');
       mkdirSync(home);
       const pane = {
+        paneId: '%7',
+        panePid: 700,
         dead: action === 'restart',
         status: action === 'restart' ? 1 : undefined,
         screen: action === 'restart' ? null : '›\n  fixture-model high · /tmp\n',

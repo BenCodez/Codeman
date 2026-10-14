@@ -15,7 +15,14 @@ afterEach(async () => {
 });
 
 function fixture(extra: Record<string, unknown> = {}) {
-  const pane = { dead: true, status: 1, signal: undefined as number | undefined, screen: null as string | null };
+  const pane = {
+    paneId: '%7',
+    panePid: 700,
+    dead: true,
+    status: 1 as number | undefined,
+    signal: undefined as number | undefined,
+    screen: null as string | null,
+  };
   const mux = {
     isAvailable: () => true,
     inspectPaneForRecovery: vi.fn(async () => ({ ...pane })),
@@ -124,7 +131,7 @@ describe('the actual Session recovery boundary', () => {
       '›\n  user multiline draft\n  example-model high · /tmp\n',
     ]) {
       const f = fixture();
-      Object.assign(f.pane, { dead: false, screen });
+      Object.assign(f.pane, { dead: false, status: undefined, screen });
       f.flight.action = 'continue';
       expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
       expect(f.mux.sendInput).not.toHaveBeenCalled();
@@ -133,7 +140,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('delivers one single-line continuation through mux input', async () => {
     const f = fixture();
-    Object.assign(f.pane, { dead: false, screen: '›\n  example-model high · /tmp\n' });
+    Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
     f.flight.action = 'continue';
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
     expect(f.mux.sendInput).toHaveBeenCalledExactlyOnceWith(
@@ -147,7 +154,7 @@ describe('the actual Session recovery boundary', () => {
   it('never re-presses Enter for an unaccepted continuation or a subsequently edited draft', async () => {
     vi.useFakeTimers();
     const f = fixture();
-    Object.assign(f.pane, { dead: false, screen: '›\n  example-model high · /tmp\n' });
+    Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
     Object.assign(f.mux, { capturePaneText: vi.fn(() => `› ${CONTINUATION_PROMPT} edited draft\n`) });
     f.flight.action = 'continue';
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
@@ -208,7 +215,8 @@ describe('the actual Session recovery boundary', () => {
     async (action) => {
       const f = fixture();
       f.flight.action = action;
-      if (action === 'continue') Object.assign(f.pane, { dead: false, screen: '›\n  example-model high · /tmp\n' });
+      if (action === 'continue')
+        Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
       const pending = createDeferred<typeof f.pane>();
       f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
       let current = true;
@@ -290,11 +298,28 @@ describe('Codeman reboot of its own server preserves crashed panes and circuit c
   });
 });
 
-it('refuses an asynchronous evidence predicate instead of granting a new await window', async () => {
-  const f = fixture();
-  expect(
-    await f.session.deliverRecovery(f.flight, 0, () => true, CONTINUATION_PROMPT, (() =>
-      Promise.resolve(true)) as never)
-  ).toBe('not-sent');
-  expect(f.mux.respawnPane).not.toHaveBeenCalled();
-});
+it.each(['unchanged', 'cancelled'] as const)(
+  'awaits fresh asynchronous evidence while retaining pure current authority: %s',
+  async (change) => {
+    const f = fixture();
+    const entered = createDeferred<void>();
+    const held = createDeferred<boolean>();
+    let current = true;
+    const delivery = f.session.deliverRecovery(
+      f.flight,
+      0,
+      () => current,
+      CONTINUATION_PROMPT,
+      async () => {
+        entered.resolve();
+        return held.promise;
+      }
+    );
+    await entered.promise;
+    expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    if (change === 'cancelled') current = false;
+    held.resolve(true);
+    expect(await delivery).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+    expect(f.mux.respawnPane).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+  }
+);

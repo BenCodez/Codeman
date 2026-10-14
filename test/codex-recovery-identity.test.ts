@@ -144,6 +144,65 @@ describe('isolated fresh Codex identity', () => {
 });
 
 describe('exact submitted-prompt history attribution', () => {
+  it.each([-1000, 0, 1000, 3000, 40_000])(
+    'vetoes an older same-cwd thread appended after the recorded history match (%s ms)',
+    async (delta) => {
+      await rollout(A);
+      await rollout(B, { originator: 'codex-tui' }, '2026-10-09T12:00:00.000Z');
+      await history([
+        { session_id: A, ts: SUBMITTED / 1000, text: PROMPT },
+        { session_id: B, ts: (SUBMITTED + delta) / 1000, text: 'Direct TUI resume to the older thread' },
+      ]);
+      expect(await resolveCodexIdentity(submitted({ resumeId: A, previousId: A }))).toEqual({ reason: 'unverified' });
+    }
+  );
+
+  it('never chooses an unknown latest UUID instead of the exact recorded match', async () => {
+    await rollout(A);
+    await history([
+      { session_id: A, ts: SUBMITTED / 1000, text: PROMPT },
+      { session_id: C, ts: (SUBMITTED + 3000) / 1000, text: 'Unknown latest conversation' },
+    ]);
+    expect(await resolveCodexIdentity(submitted({ resumeId: A }))).toEqual({ reason: 'unverified' });
+  });
+  it.each([0, 2_000, 2_001])('retains the local clock boundary for later same-UUID history at %i ms', async (delta) => {
+    await rollout();
+    await history([
+      { session_id: A, ts: SUBMITTED / 1000, text: PROMPT },
+      { session_id: A, ts: (SUBMITTED + delta) / 1000, text: 'Later exact conversation input' },
+    ]);
+    const now = vi.spyOn(Date, 'now').mockReturnValue(SUBMITTED);
+    try {
+      const identity = await resolveCodexIdentity(submitted());
+      expect(identity.reason).toBe(delta > 2_000 ? 'unverified' : 'verified');
+      expect(identity.conversationId).toBe(delta > 2_000 ? undefined : A);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('keeps later same-UUID history eligible for current identity', async () => {
+    await rollout(A);
+    await history([
+      { session_id: A, ts: SUBMITTED / 1000, text: PROMPT },
+      { session_id: A, ts: (SUBMITTED + 3000) / 1000, text: 'Accepted automatic continuation' },
+    ]);
+    expect(await resolveCodexIdentity(submitted())).toMatchObject({ reason: 'verified', conversationId: A });
+  });
+
+  it('requires a new exact recorded submission to authorize the latest older UUID', async () => {
+    await rollout(A);
+    await rollout(B, { originator: 'codex-tui' }, '2026-10-09T12:00:00.000Z');
+    const text = 'New tracked owner prompt in the resumed conversation';
+    await history([
+      { session_id: A, ts: SUBMITTED / 1000, text: PROMPT },
+      { session_id: B, ts: (SUBMITTED + 3000) / 1000, text },
+    ]);
+    expect(
+      await resolveCodexIdentity(submitted({ submission: { at: SUBMITTED + 3000, hash: hashCodexPrompt(text) } }))
+    ).toMatchObject({ reason: 'verified', conversationId: B });
+  });
+
   it('verifies a resumed thread through exact text and ±2 seconds', async () => {
     await rollout(A, { originator: 'codex-tui' });
     await history([{ session_id: A, ts: Math.floor(SUBMITTED / 1000), text: PROMPT }]);
@@ -276,6 +335,16 @@ describe('exact submitted-prompt history attribution', () => {
 });
 
 describe('resume and home confinement', () => {
+  it('keeps an explicit owner resume seed eligible with unrelated historical prompts', async () => {
+    await rollout(A, { originator: 'codex-tui' });
+    await rollout(B, { originator: 'codex-tui' }, '2026-10-09T12:00:00.000Z');
+    await history([{ session_id: B, ts: Date.parse('2026-10-09T12:01:00.000Z') / 1000, text: 'Historical prompt' }]);
+    expect(await resolveCodexIdentity(request({ resumeId: A }))).toMatchObject({
+      reason: 'verified',
+      conversationId: A,
+    });
+  });
+
   it('verifies an explicit resume seed with a matching header, without guessing by cwd', async () => {
     await rollout(A, { originator: 'codex-tui' });
     expect(await resolveCodexIdentity(request({ resumeId: A }))).toMatchObject({

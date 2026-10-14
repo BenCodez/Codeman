@@ -13,7 +13,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, type Stats } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, parse, resolve, sep } from 'node:path';
@@ -52,55 +52,8 @@ export interface CodexIdentityResult {
   witness?: CodexIdentityWitness;
 }
 
-/** Final bounded synchronous check, after launch preparation and the last owner-grant await. */
-export function confirmCodexIdentityWitness(identity: CodexIdentityResult): boolean {
-  if (!identity.path || !identity.witness || identity.tailTruncated !== false || identity.tail === undefined)
-    return false;
-  const leaf = identity.witness.paths.find((input) => input.path === identity.path && input.kind === 'file');
-  if (!leaf || leaf.size === undefined || leaf.mtimeMs === undefined || leaf.ctimeMs === undefined) return false;
-  const matchesLeaf = (stat: Stats) =>
-    stat.isFile() &&
-    stat.dev === leaf.dev &&
-    stat.ino === leaf.ino &&
-    stat.size === leaf.size &&
-    stat.mtimeMs === leaf.mtimeMs &&
-    stat.ctimeMs === leaf.ctimeMs;
-  const witnessIsCurrent = () => {
-    for (const input of identity.witness!.paths) {
-      const stat = lstatSync(input.path);
-      if (
-        stat.isSymbolicLink() ||
-        (input.kind === 'file' ? !stat.isFile() : !stat.isDirectory()) ||
-        stat.dev !== input.dev ||
-        stat.ino !== input.ino ||
-        (input.size !== undefined && stat.size !== input.size) ||
-        (input.mtimeMs !== undefined && stat.mtimeMs !== input.mtimeMs) ||
-        (input.ctimeMs !== undefined && stat.ctimeMs !== input.ctimeMs)
-      )
-        return false;
-    }
-    return true;
-  };
-  let fd: number | undefined;
-  try {
-    if (!witnessIsCurrent()) return false;
-    fd = openSync(identity.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
-    const before = fstatSync(fd);
-    if (!matchesLeaf(before) || before.size > 262_144) return false;
-    const bytes = Buffer.alloc(before.size);
-    if (readSync(fd, bytes, 0, before.size, 0) !== before.size) return false;
-    const after = fstatSync(fd);
-    return (
-      matchesLeaf(after) &&
-      witnessIsCurrent() &&
-      createHash('sha256').update(bytes).digest('hex') === createHash('sha256').update(identity.tail).digest('hex')
-    );
-  } catch {
-    return false;
-  } finally {
-    if (fd !== undefined) closeSync(fd);
-  }
-}
+/** Fresh bounded final verification runs off the server event loop. */
+export { checkCodexIdentityWitness as confirmCodexIdentityWitness } from './codex-witness-check.js';
 
 const HEAD_BYTES = 128 * 1024;
 const TAIL_BYTES = 256 * 1024;
@@ -382,7 +335,8 @@ async function matchingHistory(
       throw new Refusal('unverified');
     }
     const at = entry.ts * 1000;
-    if (!Number.isFinite(at) || at <= 0 || at > Number.MAX_SAFE_INTEGER) throw new Refusal('unverified');
+    if (!Number.isFinite(at) || at <= 0 || at > Number.MAX_SAFE_INTEGER || at > Date.now() + 2_000)
+      throw new Refusal('unverified');
     history.push({ id: entry.session_id, at, hash: hashCodexPrompt(entry.text) });
   }
   if (history.some((entry, i) => i > 0 && entry.at < history[i - 1].at)) throw new Refusal('unverified');
@@ -394,6 +348,10 @@ async function matchingHistory(
   );
   if (matches.length > 1) throw new Refusal('ambiguous');
   if (matches.length !== 1) throw new Refusal('unverified');
+  // Direct TUI /resume can activate an older thread without changing the saved
+  // submission. Historical attribution must also agree with the latest history
+  // UUID; a different or unknown current thread cannot rebind this authority.
+  if (history.at(-1)?.id !== matches[0].id) throw new Refusal('unverified');
   return matches[0];
 }
 

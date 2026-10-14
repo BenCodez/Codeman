@@ -92,7 +92,10 @@ function fixture() {
       intentionalStopAt: 0,
       switchPending: false,
       codexHome: '/fixture/codex-home' as string | undefined,
-      submission: undefined as { at: number; hash: string } | undefined,
+      submission: {
+        at: NOW - 10_000,
+        hash: createHash('sha256').update('Sanitized fixture request.').digest('hex'),
+      } as { at: number; hash: string } | undefined,
     },
     pane: { paneId: '%7', panePid: 700, dead: false, screen: READY } as Pane | null,
     identity: {
@@ -151,6 +154,14 @@ async function withRollout(
     const writeBody = async (nextBody: string): Promise<void> => {
       await fs.writeFile(path, `${header}\n${nextBody}`);
     };
+    await fs.writeFile(
+      join(home, 'history.jsonl'),
+      JSON.stringify({
+        session_id: THREAD,
+        ts: f.context.submission!.at / 1000,
+        text: 'Sanitized fixture request.',
+      }) + '\n'
+    );
     await writeBody(body);
     const actual = await vi.importActual<typeof import('../src/recovery/codex-identity.js')>(
       '../src/recovery/codex-identity.js'
@@ -185,6 +196,33 @@ function flight(observation: RecoveryObservation, action: RecoveryFlight['action
 }
 
 describe('exact current identity and delivery proof', () => {
+  it.each([false, true])(
+    'refuses seed-only automatic authority and clears previous evidence (%s)',
+    async (previous) => {
+      const f = fixture();
+      let reserved: RecoveryFlight = {
+        key: `${THREAD}:seed`,
+        action: 'continue',
+        conversationId: THREAD,
+        startedAt: NOW,
+      };
+      if (previous) {
+        reserved = flight(await f.adapter.observe());
+        expect(f.adapter.getVerifiedTail(THREAD)).toBe(f.identity.tail);
+      }
+      f.context.submission = undefined;
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'unknown',
+        reason: 'identity-unverified',
+        safeToAct: false,
+      });
+      expect(f.adapter.getVerifiedTail(THREAD)).toBeUndefined();
+      expect(await f.adapter.act(reserved)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+      expect(f.session.pinRecoveryConversation).not.toHaveBeenCalled();
+    }
+  );
+
   it('passes the session-specific home, exact resume seed and exact prompt hash to the resolver', async () => {
     const f = fixture();
     f.context.submission = {

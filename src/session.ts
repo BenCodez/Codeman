@@ -2366,9 +2366,9 @@ export class Session extends EventEmitter {
   async deliverRecovery(
     flight: RecoveryFlight,
     generation: number,
-    isCurrent: () => boolean = () => true,
+    isCurrent: import('./recovery/types.js').RecoveryActionAuthority = () => true,
     prompt: string = CONTINUATION_PROMPT,
-    confirmEvidence?: () => boolean,
+    confirmEvidence?: import('./recovery/types.js').RecoveryEvidenceGuard,
     expectedRecoveryPane?: import('./mux-interface.js').RecoveryPaneIdentity
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
@@ -2411,7 +2411,7 @@ export class Session extends EventEmitter {
           return 'not-sent';
         if (confirmEvidence) {
           try {
-            if (confirmEvidence() !== true) return 'not-sent';
+            if ((await confirmEvidence()) !== true) return 'not-sent';
           } catch {
             return 'not-sent';
           }
@@ -2441,6 +2441,18 @@ export class Session extends EventEmitter {
           this._codexConfig?.resumeSessionId !== flight.conversationId
         )
           return 'not-sent';
+        if (
+          flight.action === 'continue' &&
+          (pane.dead !== false ||
+            !/^%(?:0|[1-9]\d{0,9})$/.test(pane.paneId ?? '') ||
+            !Number.isSafeInteger(pane.panePid) ||
+            (pane.panePid ?? 0) <= 0 ||
+            !/^[1-9]\d{0,9}$/.test(String(pane.panePid)) ||
+            pane.status !== undefined ||
+            pane.signal !== undefined ||
+            (pane.paneSignalToken ?? '') !== '')
+        )
+          return 'not-sent';
         let dispatched = false;
         let refusedBeforeDispatch = false;
         const contextCurrent = (): boolean => {
@@ -2463,17 +2475,13 @@ export class Session extends EventEmitter {
           );
         };
         const recoveryGuard = {
+          ...(flight.action === 'continue'
+            ? { expectedLivePane: { paneId: pane.paneId!, panePid: pane.panePid! } }
+            : {}),
           confirm: (): boolean => {
             let accepted = false;
             try {
-              accepted =
-                granted.isCurrent() === true &&
-                isCurrent() === true &&
-                contextCurrent() &&
-                (!confirmEvidence || confirmEvidence() === true) &&
-                granted.isCurrent() === true &&
-                isCurrent() === true &&
-                contextCurrent();
+              accepted = granted.isCurrent() === true && isCurrent() === true && contextCurrent();
             } catch {
               accepted = false;
             }
@@ -2486,10 +2494,33 @@ export class Session extends EventEmitter {
           noteRefusal: () => {
             if (!dispatched) refusedBeforeDispatch = true;
           },
+          prepareEvidence: async (): Promise<boolean> => {
+            let accepted = false;
+            try {
+              accepted = recoveryGuard.confirm();
+              if (accepted && confirmEvidence) accepted = (await confirmEvidence()) === true;
+              accepted = accepted && recoveryGuard.confirm();
+              if (accepted && isCurrent.prepareEvidence) {
+                const source = confirmEvidence?.getEvidenceSource?.();
+                if (confirmEvidence?.getEvidenceSource && (!source || source.sessionId !== this.id)) accepted = false;
+                if (accepted) accepted = (await isCurrent.prepareEvidence(source)) === true;
+                accepted = accepted && recoveryGuard.confirm();
+                // Real issuer verification shares a final witness scan with the
+                // worker. Legacy standalone guards have no witness to combine.
+                if (accepted && confirmEvidence && !confirmEvidence.getEvidenceSource)
+                  accepted = (await confirmEvidence()) === true;
+              }
+              accepted = accepted && recoveryGuard.confirm();
+            } catch {
+              accepted = false;
+            }
+            if (!accepted && !dispatched) refusedBeforeDispatch = true;
+            return accepted;
+          },
         };
         // The pane read awaited after the earlier evidence check. Preserve this
         // boundary's own final admission proof as well as the native mux guard.
-        if (!recoveryGuard.confirm()) return 'not-sent';
+        if (!(await recoveryGuard.prepareEvidence()) || !recoveryGuard.confirm()) return 'not-sent';
         this._submitVerifier?.cancel();
         this._submitVerifier = null;
         if (flight.action === 'restart') {
