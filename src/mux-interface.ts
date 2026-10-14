@@ -35,6 +35,8 @@ export interface MuxSession {
   codexRestoreUncertain?: boolean;
   /** Non-secret exact argv settings recorded before an uncertain reboot worker effect. */
   codexRestoreConfig?: CodexConfig;
+  /** Non-secret identity digest of the main-state snapshot expected after a reboot launch. */
+  codexRestoreStateBinding?: string;
   /** Persisted launch fact: the owned pane's actual registry command disabled the shared daemon. */
   recoveryIsolated?: boolean;
   /** Exact non-secret local Codex home pinned at an owned launch, never inferred on attach. */
@@ -153,6 +155,14 @@ export interface RecoveryMuxDispatchGuard {
 }
 
 /** Options for respawning a dead pane. */
+export interface RecoveryPaneIdentity {
+  paneId: string;
+  panePid: number;
+  status?: number;
+  signal?: number;
+  paneSignalToken?: string;
+}
+
 export interface RespawnPaneOptions {
   /** Automatic local recovery checks authority again immediately before its worker effect. */
   recoveryDispatchGuard?: RecoveryMuxDispatchGuard;
@@ -160,6 +170,8 @@ export interface RespawnPaneOptions {
   onlyIfDead?: boolean;
   /** Owned SSH recovery may attach to an existing private remote tmux, never create it. */
   remoteAttachOnly?: boolean;
+  /** Ephemeral inspected native process identity; never restored from disk. */
+  expectedRecoveryPane?: RecoveryPaneIdentity;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;

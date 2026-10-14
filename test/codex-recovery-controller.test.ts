@@ -144,6 +144,7 @@ describe('recovery action authority', () => {
       at: NOW,
       conversationId: THREAD,
       processReady: true,
+      processReadyAt: NOW,
       safeToAct: false,
     };
     await vi.advanceTimersByTimeAsync(5000);
@@ -175,6 +176,7 @@ describe('recovery action authority', () => {
       at: NOW,
       conversationId: THREAD,
       processReady: true,
+      processReadyAt: NOW,
       safeToAct: false,
     };
     await vi.advanceTimersByTimeAsync(5000);
@@ -189,6 +191,7 @@ describe('recovery action authority', () => {
       at: Date.now(),
       conversationId: THREAD,
       processReady: true,
+      processReadyAt: Date.now(),
       safeToAct: false,
     };
     await vi.advanceTimersByTimeAsync(5000);
@@ -224,6 +227,26 @@ describe('recovery action authority', () => {
     const observations = f.observe.mock.calls.length;
     await vi.advanceTimersByTimeAsync(300_000);
     expect(f.observe).toHaveBeenCalledTimes(observations);
+  });
+
+  it('requires new repeated confirmation when native incarnation changes under the same evidence key', async () => {
+    const f = fixture(enabledState());
+    f.observation = failure('same-cached-exit', { processProofKey: 'native-incarnation-1' });
+    await f.controller.refresh();
+    advance(2000);
+    f.observation = failure('same-cached-exit', { processProofKey: 'native-incarnation-2' });
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    advance(1999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.act).not.toHaveBeenCalled();
+    advance(1);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toMatchObject({ key: 'same-cached-exit' });
+    advance(1000);
+    await f.controller.refresh();
+    expect(f.act).toHaveBeenCalledOnce();
   });
 
   it('is disabled by default and does not poll or act without opt-in', async () => {

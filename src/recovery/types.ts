@@ -80,6 +80,8 @@ export type RecoveryReason =
   | 'manual-reset';
 
 export interface RecoveryObservation {
+  /** Ephemeral native process discriminator, never durable action authority. */
+  processProofKey?: string;
   activity: RecoveryActivity;
   reason: RecoveryReason;
   at: number;

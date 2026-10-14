@@ -25,6 +25,8 @@ const io = vi.hoisted(() => ({
   blockedWrite: undefined as Promise<void> | undefined,
   blockPrefix: '',
   entered: false,
+  targetSessionId: '',
+  finalizingMux: false,
 }));
 vi.mock('node:fs', async () => {
   const real = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -35,13 +37,25 @@ vi.mock('node:fs', async () => {
   };
   const sync = (fd: number) => {
     const path = io.paths.get(fd) ?? '';
-    if (!real.fstatSync(fd).isDirectory()) io.lastFile = path;
+    if (!real.fstatSync(fd).isDirectory()) {
+      io.lastFile = path;
+      if (path.includes('mux-sessions.json.')) {
+        const records = JSON.parse(real.readFileSync(path, 'utf8')) as Array<{
+          sessionId: string;
+          codexRestoreUncertain?: boolean;
+        }>;
+        io.finalizingMux =
+          records.find((record) => record.sessionId === io.targetSessionId)?.codexRestoreUncertain === false;
+      }
+    }
     const domain = io.lastFile.includes('mux-sessions.json.')
       ? 'mux'
       : io.lastFile.includes('state.json.')
         ? 'state'
         : '';
-    const phase = domain ? `${domain}-${real.fstatSync(fd).isDirectory() ? 'directory' : 'file'}` : '';
+    const phase = domain
+      ? `${domain}${domain === 'mux' && io.finalizingMux ? '-clear' : ''}-${real.fstatSync(fd).isDirectory() ? 'directory' : 'file'}`
+      : '';
     if (phase) io.phases.push(phase);
     if (phase && io.fault === phase) {
       io.fault = '';
@@ -147,6 +161,8 @@ async function fixture(label: string, pruned = false) {
   const historical = fs.readFileSync(dataPath('state.json'), 'utf8');
   io.phases = [];
   io.lastFile = '';
+  io.targetSessionId = id;
+  io.finalizingMux = false;
   return {
     id,
     state,
@@ -182,14 +198,21 @@ it.each([false, true])(
     expect(disk.pid).not.toBe(1234);
     expect(JSON.parse(fs.readFileSync(dataPath('mux-sessions.json'), 'utf8'))).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ sessionId: f.id, recoveryCodexHome: f.home, recoveryIsolated: true }),
+        expect.objectContaining({
+          sessionId: f.id,
+          recoveryCodexHome: f.home,
+          recoveryIsolated: true,
+          codexRestoreUncertain: false,
+        }),
       ])
     );
     expect(io.phases.indexOf('mux-directory')).toBeLessThan(io.phases.indexOf('state-file'));
     expect(io.phases).toContain('state-directory');
+    expect(io.phases.indexOf('mux-clear-directory')).toBeLessThan(io.phases.indexOf('state-file'));
+    expect(f.ctx.sessions.get(f.id)!.codexRestoreWorkerMayExist).toBe(false);
   }
 );
-it.each(['state-file', 'state-directory', 'mux-file', 'mux-directory'])(
+it.each(['state-file', 'state-directory', 'mux-file', 'mux-directory', 'mux-clear-file', 'mux-clear-directory'])(
   'retains history, offer, and possibly running worker when %s durability fails',
   async (fault) => {
     const f = await fixture(fault);
@@ -203,7 +226,15 @@ it.each(['state-file', 'state-directory', 'mux-file', 'mux-directory'])(
     expect(fs.readFileSync(dataPath('state.json'), 'utf8')).toBe(f.historical);
     expect(f.store.getSession(f.id)).toEqual(f.state);
     expect(kill).not.toHaveBeenCalled();
-    expect(f.ctx.mux.getSession(f.id)).toBeDefined();
+    expect(f.ctx.mux.getSession(f.id)).toMatchObject({
+      codexRestoreUncertain: true,
+      recoveryCodexHome: f.home,
+      codexRestoreConfig: f.state.codexConfig,
+    });
+    expect(f.ctx.sessions.get(f.id)!.codexRestoreWorkerMayExist).toBe(true);
+    expect(JSON.parse(fs.readFileSync(dataPath('mux-sessions.json'), 'utf8'))).toEqual(
+      expect.arrayContaining([expect.objectContaining({ sessionId: f.id, codexRestoreUncertain: true })])
+    );
   }
 );
 it.each(['complete', 'cancel'])(
@@ -234,6 +265,71 @@ it.each(['complete', 'cancel'])(
     if (outcome === 'cancel') expect(fs.readFileSync(dataPath('state.json'), 'utf8')).toBe(f.historical);
   }
 );
+it.each(['complete', 'cancel', 'state-failure'] as const)(
+  'holds the offer and live worker veto after durable uncertainty clearance until state commit (%s)',
+  async (outcome) => {
+    const f = await fixture(`mux-clear-${outcome}`);
+    const gate = createDeferred<void>();
+    const entered = createDeferred<void>();
+    const flush = f.ctx.mux.flushSessionsDurably.bind(f.ctx.mux);
+    const kill = vi.spyOn(f.ctx.mux, 'killSession');
+    let held = false;
+    vi.spyOn(f.ctx.mux, 'flushSessionsDurably').mockImplementation(async (current) => {
+      await flush(current);
+      if (!held && f.ctx.mux.getSession(f.id)?.codexRestoreUncertain === false) {
+        held = true;
+        entered.resolve();
+        await gate.promise;
+      }
+    });
+    const restoring = f.restore();
+    await entered.promise;
+    try {
+      expect(offers()).toHaveLength(1);
+      expect(fs.readFileSync(dataPath('state.json'), 'utf8')).toBe(f.historical);
+      expect(f.store.getSession(f.id)).toEqual(f.state);
+      const worker = f.ctx.sessions.get(f.id)!;
+      expect(worker.codexRestoreWorkerMayExist).toBe(true);
+      expect(worker.getRecoveryContext().managed).toBe(false);
+      expect(JSON.parse(fs.readFileSync(dataPath('mux-sessions.json'), 'utf8'))).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            sessionId: f.id,
+            codexRestoreUncertain: false,
+            recoveryCodexHome: f.home,
+            codexRestoreConfig: f.state.codexConfig,
+          }),
+        ])
+      );
+      if (outcome === 'cancel') rebootRestoreRegistry.clear(() => true);
+      if (outcome === 'state-failure')
+        vi.spyOn(f.store, 'persistSessionDurably').mockRejectedValueOnce(
+          new Error('Fixture state journal unavailable')
+        );
+    } finally {
+      gate.resolve();
+    }
+    const reply = (await restoring).json();
+    expect(reply.restored).toHaveLength(outcome === 'complete' ? 1 : 0);
+    expect(kill).not.toHaveBeenCalled();
+    expect(offers()).toHaveLength(outcome === 'state-failure' ? 1 : 0);
+    const record = f.ctx.mux.getSession(f.id)!;
+    expect(record.codexRestoreUncertain).toBe(outcome !== 'complete');
+    expect(record.codexRestoreConfig).toEqual(f.state.codexConfig);
+    expect(record.recoveryCodexHome).toBe(f.home);
+    expect(JSON.parse(fs.readFileSync(dataPath('mux-sessions.json'), 'utf8'))).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ sessionId: f.id, codexRestoreUncertain: outcome !== 'complete' }),
+      ])
+    );
+    if (outcome !== 'complete') {
+      expect(fs.readFileSync(dataPath('state.json'), 'utf8')).toBe(f.historical);
+      expect(f.store.getSession(f.id)).toEqual(f.state);
+      expect(f.ctx.sessions.get(f.id)!.codexRestoreWorkerMayExist).toBe(true);
+    }
+  }
+);
+
 it('waits for an older asynchronous main-state snapshot so it cannot overwrite the acknowledged restored record', async () => {
   const f = await fixture('older');
   const gate = createDeferred<void>();
@@ -281,7 +377,12 @@ it('waits for an older mux rename before acknowledging current exact home and is
   expect((await result).json().restored).toHaveLength(1);
   expect(JSON.parse(fs.readFileSync(dataPath('mux-sessions.json'), 'utf8'))).toEqual(
     expect.arrayContaining([
-      expect.objectContaining({ sessionId: f.id, recoveryCodexHome: f.home, recoveryIsolated: true }),
+      expect.objectContaining({
+        sessionId: f.id,
+        recoveryCodexHome: f.home,
+        recoveryIsolated: true,
+        codexRestoreUncertain: false,
+      }),
     ])
   );
 });

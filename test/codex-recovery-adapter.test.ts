@@ -101,7 +101,7 @@ function fixture() {
       codexHome: '/fixture/codex-home' as string | undefined,
       submission: undefined as RecoverySubmission | undefined,
     },
-    pane: { dead: false, screen: READY } as Pane | null,
+    pane: { paneId: '%7', panePid: 700, dead: false, screen: READY } as Pane | null,
     transportPane: { dead: true, status: 255, screen: null } as Pane | null,
     identity: {
       reason: 'verified',
@@ -527,7 +527,7 @@ describe('ownership, location and isolated-launch gates', () => {
       safeToAct: false,
       processReady: false,
     });
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', safeToAct: false });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
@@ -563,7 +563,7 @@ describe('bounded real rollout lifecycle evidence', () => {
         noDaemon: true,
       });
       expect(identity).toMatchObject({ reason: 'verified', conversationId: THREAD, tailTruncated: false });
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
       expect(await f.adapter.observe()).toMatchObject({ activity: 'unknown', safeToAct: false });
       const unproved: RecoveryFlight = {
         key: `${THREAD}:pane:${f.session.paneExit!.at}:1`,
@@ -578,7 +578,7 @@ describe('bounded real rollout lifecycle evidence', () => {
 
   it.each(invalidLifecycleRows)('vetoes a restart reservation when final evidence has $name', async ({ row }) => {
     await withRollout(failedTail(), async (f, writeBody) => {
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
       const reservation = flight(await f.adapter.observe(), 'restart');
       await writeBody(failedTail(event(CHILD_SPAWN, NOW - 9_500), row));
       expect(await f.adapter.act(reservation)).toBe('not-sent');
@@ -598,7 +598,7 @@ describe('bounded real rollout lifecycle evidence', () => {
       });
       expect(identity).toMatchObject({ reason: 'verified', conversationId: THREAD, tailTruncated: false });
       expect(identity.tail).toContain('collab_agent_spawn_end');
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
       expect(await f.adapter.observe()).toMatchObject({
         activity: 'watching',
         reason: 'background-work',
@@ -617,7 +617,7 @@ describe('bounded real rollout lifecycle evidence', () => {
 
   it('vetoes a dead-pane restart reservation when the final complete rollout reveals pending child work', async () => {
     await withRollout(failedTail(), async (f, writeBody) => {
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
       const reservation = flight(await f.adapter.observe(), 'restart');
       await writeBody(failedTail() + event(CHILD_SPAWN, NOW - 8_500) + '\n');
       expect(await f.adapter.act(reservation)).toBe('not-sent');
@@ -627,7 +627,7 @@ describe('bounded real rollout lifecycle evidence', () => {
 
   it('keeps a verified dead pane without pending children eligible for restart', async () => {
     await withRollout(failedTail(), async (f) => {
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
       const observation = await f.adapter.observe();
       expect(observation).toMatchObject({ activity: 'crashed', reason: 'process-crashed', safeToAct: true });
       expect(await f.adapter.act(flight(observation, 'restart'))).toBe('sent');
@@ -669,7 +669,7 @@ describe('bounded real rollout lifecycle evidence', () => {
     'reprobes the actual tail and vetoes %s if earlier child evidence has fallen outside the window',
     async (action) => {
       await withRollout(failedTail(), async (f, writeBody) => {
-        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null };
+        if (action === 'restart') f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
         const reservation = flight(await f.adapter.observe(), action);
         await writeBody(hiddenLiveChildTail());
         expect(await f.adapter.act(reservation)).toBe('not-sent');
@@ -696,7 +696,7 @@ describe('bounded real rollout lifecycle evidence', () => {
         '\n' +
         failedTail();
       await withRollout(body, async (f) => {
-        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null };
+        if (action === 'restart') f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
         const observation = await f.adapter.observe();
         expect(observation).toMatchObject({
           activity: action === 'restart' ? 'crashed' : 'interrupted',
@@ -746,7 +746,7 @@ describe('human input invalidates the current epoch', () => {
 
   it('does not revive a process after the user deliberately interrupted it', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 130, signal: undefined, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 130, signal: undefined, screen: null };
     f.session.paneExit = { at: NOW - 1_000, status: 130 };
     f.context.intentionalStopAt = NOW - 1_500;
     expect(await f.adapter.observe()).toMatchObject({
@@ -759,9 +759,38 @@ describe('human input invalidates the current epoch', () => {
 });
 
 describe('authoritative agent exits and process readiness', () => {
+  it.each(['unchanged', 'PID', 'pane-ID', 'raw-signal', 'missing-ID', 'stale-read'] as const)(
+    'binds crash delivery to the observed native incarnation while cached exit evidence stays unchanged: %s',
+    async (change) => {
+      const f = fixture();
+      f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
+      if (change === 'raw-signal') {
+        f.pane.status = undefined;
+        f.pane.signal = 9;
+        f.pane.paneSignalToken = '9';
+        f.session.paneExit = { at: NOW - 10_000, signal: 9 };
+      }
+      const before = await f.adapter.observe();
+      expect(before.safeToAct).toBe(true);
+      const exit = structuredClone(f.session.paneExit);
+      if (change === 'PID') f.pane.panePid = 701;
+      if (change === 'pane-ID') f.pane.paneId = '%8';
+      if (change === 'raw-signal') f.pane.paneSignalToken = 'KILL';
+      if (change === 'missing-ID') f.pane.paneId = undefined;
+      if (change === 'stale-read')
+        f.session.inspectRecoveryPane.mockImplementationOnce(async () => {
+          vi.setSystemTime(NOW + 16_000);
+          return f.pane;
+        });
+      expect(await f.adapter.act(flight(before, 'restart'))).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+      expect(f.session.paneExit).toEqual(exit);
+      expect(f.session.deliverRecovery).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+    }
+  );
+
   it('authorizes restart only for a confirmed matching abnormal local exit', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     const observation = await f.adapter.observe();
     expect(observation).toMatchObject({
       activity: 'crashed',
@@ -775,13 +804,14 @@ describe('authoritative agent exits and process readiness', () => {
       3,
       expect.any(Function),
       CONTINUATION_PROMPT,
-      expect.any(Function)
+      expect.any(Function),
+      { paneId: '%7', panePid: 700, status: 1, signal: undefined, paneSignalToken: undefined }
     );
   });
 
   it('an explicit status 0 is a clean intentional exit and cannot revive', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 0, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 0, screen: null };
     f.session.paneExit = { at: NOW - 10_000, status: 0 };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'exited', reason: 'clean-exit', safeToAct: false });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
@@ -789,13 +819,13 @@ describe('authoritative agent exits and process readiness', () => {
 
   it('requires a positive signal or numeric abnormal status and agreement with stored exit evidence', async () => {
     const f = fixture();
-    f.pane = { dead: true, signal: 9, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, signal: 9, paneSignalToken: '9', screen: null };
     f.session.paneExit = { at: NOW - 10_000, signal: 9 };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', safeToAct: true });
-    f.pane = { dead: true, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, screen: null };
     f.session.paneExit = { at: NOW - 10_000 };
     expect(await f.adapter.observe()).toMatchObject({ reason: 'pane-unverified', safeToAct: false });
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     f.session.paneExit = { at: NOW - 10_000, status: 2 };
     expect(await f.adapter.observe()).toMatchObject({ reason: 'pane-unverified', safeToAct: false });
     f.session.paneExit = undefined;
@@ -813,9 +843,9 @@ describe('authoritative agent exits and process readiness', () => {
       processReady: true,
       safeToAct: false,
     });
-    f.pane = { dead: false, screen: '› Unsent fixture draft\n' };
+    f.pane = { paneId: '%7', panePid: 700, dead: false, screen: '› Unsent fixture draft\n' };
     expect(await f.adapter.observe()).toMatchObject({ processReady: false, safeToAct: false });
-    f.pane = { dead: false, screen: `Sanitized sign in requirement\n${READY}` };
+    f.pane = { paneId: '%7', panePid: 700, dead: false, screen: `Sanitized sign in requirement\n${READY}` };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'blocked', processReady: false, safeToAct: false });
   });
 });
@@ -1704,7 +1734,7 @@ function deadPaneVetoTail(payload: Record<string, unknown>): string {
 describe('dead local panes preserve structured recovery vetoes', () => {
   it.each(DEAD_PANE_VETOES)('preserves $reason before authorizing a crash', async ({ payload, activity, reason }) => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     f.identity.tail = deadPaneVetoTail(payload);
     expect(await f.adapter.observe()).toMatchObject({ activity, reason, safeToAct: false });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
@@ -1712,7 +1742,7 @@ describe('dead local panes preserve structured recovery vetoes', () => {
 
   it.each(DEAD_PANE_VETOES)('rechecks $reason before delivering a reserved restart', async ({ payload }) => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     const reserved = flight(await f.adapter.observe(), 'restart');
     f.identity.tail = deadPaneVetoTail(payload);
     expect(await f.adapter.act(reserved)).toBe('not-sent');
@@ -1721,7 +1751,7 @@ describe('dead local panes preserve structured recovery vetoes', () => {
 
   it('still resumes a verified abnormal exit without a structured veto', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     expect(await f.adapter.act(flight(await f.adapter.observe(), 'restart'))).toBe('sent');
     expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
   });
@@ -1730,7 +1760,7 @@ describe('dead local panes preserve structured recovery vetoes', () => {
 describe('malformed error variants cannot spend an existing recovery reservation', () => {
   it.each([false, true])('denies final recovery with a contradictory error enum (dead=%s)', async (dead) => {
     const f = fixture();
-    if (dead) f.pane = { dead: true, status: 1, screen: null };
+    if (dead) f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     const reserved = flight(await f.adapter.observe(), dead ? 'restart' : 'continue');
     f.identity.tail = deadPaneVetoTail({
       type: 'task_complete',

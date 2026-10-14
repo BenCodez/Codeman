@@ -166,6 +166,7 @@ import { CodexTaskAdapter } from '../supervision/adapter.js';
 import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { RecoveryController } from '../recovery/controller.js';
 import { RecoveryStore } from '../recovery/store.js';
+import { rebootStateBinding } from '../recovery/reboot-state-binding.js';
 import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
@@ -1343,10 +1344,29 @@ export class WebServer extends EventEmitter {
       isCurrent() && this.sessions.get(session.id) === session && this.tentativeSessionRegistrations.has(session);
     if (!current()) throw new Error('Reboot restoration was cancelled before durable commit');
     await this.mux.flushSessionsDurably(current);
-    await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
-    if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
-    this.persistDeb.cancelKey(session.id);
-    this.commitSessionRegistration(session);
+    const nativeRestorePending = session.codexRestoreWorkerMayExist;
+    try {
+      if (nativeRestorePending) {
+        // A successful offer must not reopen as uncertain on the next boot.
+        // Keep the Session's live veto until mux and historical state both acknowledge.
+        const binding = rebootStateBinding(this.buildPersistedSessionState(session));
+        if (!binding) throw new Error('Reboot state identity is incomplete');
+        session.prepareCodexRestoreLaunchCommit(binding);
+        await this.mux.flushSessionsDurably(current);
+      }
+      await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
+      if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
+      this.persistDeb.cancelKey(session.id);
+      this.commitSessionRegistration(session);
+    } catch (error) {
+      if (nativeRestorePending) {
+        session.retainCodexRestoreLaunchUncertainty();
+        // Even cancellation retains our own possibly running worker. Never delete
+        // it or publish a replacement historical record to make rollback look clean.
+        await this.mux.flushSessionsDurably().catch(() => {});
+      }
+      throw error;
+    }
   }
 
   /** Private complete snapshot; tentative restorations can serialize without overwriting historical memory. */
@@ -2443,10 +2463,15 @@ export class WebServer extends EventEmitter {
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('task', !this.controllerHasRecoveryFlight(session.id)),
         recover: (observation, isCurrent) =>
-          this.getActionArbiter(session.id).run('task', observation.evidenceKey ?? '', () => {
-            if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
-            return adapter.recover(observation, isCurrent);
-          }),
+          this.getActionArbiter(session.id).run(
+            'task',
+            observation.evidenceKey ?? '',
+            () => {
+              if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
+              return adapter.recover(observation, isCurrent);
+            },
+            observation.activity === 'crashed'
+          ),
         act: (key, conversationId, prompt, isCurrent) =>
           this.getActionArbiter(session.id).run('task', key, () => {
             if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
@@ -3745,6 +3770,7 @@ export class WebServer extends EventEmitter {
         this.persistDeb.cancelKey(sessionId);
         // Keep tentative protection: the historical state record must remain intact.
         await this.mux.flushSessionsDurably();
+        if (this.sessions.get(sessionId) !== session) return;
         this.broadcast(SseEvent.SessionCreated, this.getSessionStateWithRespawn(session));
         return;
       }
@@ -3837,6 +3863,33 @@ export class WebServer extends EventEmitter {
         console.log(`[Server] Discovered ${discovered.length} unknown mux session(s)`);
       }
 
+      for (const muxSession of this.mux.getSessions()) {
+        if (muxSession.mode !== 'codex' || muxSession.codexRestoreStateBinding === undefined) continue;
+        const savedState = this.store.getSession(muxSession.sessionId);
+        const nativeBinding = savedState
+          ? rebootStateBinding({
+              ...savedState,
+              id: muxSession.sessionId,
+              mode: muxSession.mode,
+              owner: muxSession.owner,
+              workingDir: muxSession.workingDir,
+              codexConfig: muxSession.codexRestoreConfig,
+              __codexRecoveryHome: muxSession.recoveryCodexHome,
+            })
+          : undefined;
+        if (
+          !/^[a-f0-9]{64}$/.test(muxSession.codexRestoreStateBinding) ||
+          rebootStateBinding(savedState) !== muxSession.codexRestoreStateBinding ||
+          nativeBinding !== muxSession.codexRestoreStateBinding
+        ) {
+          // A crash between mux and state acknowledgements leaves only the native
+          // launch's actual configuration trustworthy. Inspection cannot launch
+          // or recover it, and tentative state cannot overwrite its history.
+          muxSession.codexRestoreUncertain = true;
+          this.mux.registerSession(muxSession);
+        }
+      }
+
       // Build the reboot-restore offer HERE: `dead` is only known after
       // reconciliation, and the records it reads are pruned by
       // `cleanupStaleSessions()` as soon as `finalizeRestoredState()` runs.
@@ -3869,7 +3922,6 @@ export class WebServer extends EventEmitter {
           if (!this.sessions.has(muxSession.sessionId)) {
             // Restore session settings from state.json (single source of truth)
             const savedState = this.store.getSession(muxSession.sessionId);
-
             // Determine the correct session name (priority: savedState > muxSession > muxName)
             // This ensures renamed sessions keep their name after server restart
             const sessionName = savedState?.name || muxSession.name || muxSession.muxName;

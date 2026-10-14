@@ -1,9 +1,10 @@
 /** @fileoverview Codex-specific recovery authority for verified local and owned SSH panes. */
 import { createHash } from 'node:crypto';
-import { openSync, closeSync, fstatSync, lstatSync, readSync, constants as fsConstants } from 'node:fs';
 import type { Session } from '../session.js';
+import type { RecoveryPaneIdentity } from '../mux-interface.js';
+import { matchesNativePaneSignal } from './native-pane-signal.js';
 import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../session-env-clamp.js';
-import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
+import { resolveCodexIdentity, confirmCodexIdentityWitness, type CodexIdentityWitness } from './codex-identity.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './codex-home.js';
 import { classifyCodexTail, hasEmptyCodexComposer } from './codex-classifier.js';
 import {
@@ -139,6 +140,8 @@ export class CodexRecoveryAdapter {
     generation: number;
     conversationId: string;
     remotePane?: RemoteCodexRestartRequest['expectedPane'] & RemoteCodexIdentityGuard;
+    nativePane?: RecoveryPaneIdentity;
+    processProofKey?: string;
   };
   private remotePromptProof?: {
     generation: number;
@@ -150,6 +153,7 @@ export class CodexRecoveryAdapter {
   private verifiedTail?: {
     conversationId: string;
     tail: string;
+    tailTruncated?: boolean;
     path?: string;
     witness?: CodexIdentityWitness;
     config?: string;
@@ -254,7 +258,12 @@ export class CodexRecoveryAdapter {
       const remoteTail = evidence.identity.tail;
       const remoteTailTruncated = evidence.identity.tailTruncated;
       const remoteClock = evidence.clock;
-      this.verifiedTail = { conversationId, tail: evidence.identity.tail, clock: evidence.clock };
+      this.verifiedTail = {
+        conversationId,
+        tail: evidence.identity.tail,
+        tailTruncated: evidence.identity.tailTruncated,
+        clock: evidence.clock,
+      };
       const classifyRemoteTail = (screen: string | null, busy: boolean): RecoveryObservation => {
         const clock = remoteClock;
         const result = classifyCodexTail(remoteTail, {
@@ -469,6 +478,7 @@ export class CodexRecoveryAdapter {
       this.verifiedTail = {
         conversationId: identity.conversationId,
         tail: identity.tail,
+        tailTruncated: identity.tailTruncated,
         path: identity.path,
         witness: identity.witness,
         config: JSON.stringify(this.session.codexConfig),
@@ -559,6 +569,30 @@ export class CodexRecoveryAdapter {
       observation.liveProofAt = this.livePaneProof.at;
       this.latestLiveProofAt = this.livePaneProof.at;
     } else this.livePaneProof = undefined;
+    const nativePane =
+      pane.dead &&
+      /^%(?:0|[1-9]\d{0,9})$/.test(pane.paneId ?? '') &&
+      Number.isSafeInteger(Number(pane.paneId?.slice(1))) &&
+      Number.isSafeInteger(pane.panePid) &&
+      /^[1-9]\d{0,9}$/.test(String(pane.panePid)) &&
+      pane.panePid! > 0 &&
+      (pane.status === undefined ||
+        (Number.isSafeInteger(pane.status) && pane.status >= 0 && pane.status <= 255 && !(pane.signal! > 0))) &&
+      matchesNativePaneSignal(pane.signal, pane.paneSignalToken) &&
+      ((pane.status ?? 0) > 0 || (pane.signal ?? 0) > 0) &&
+      Date.now() >= paneReadStartedAt &&
+      Date.now() - paneReadStartedAt <= 15_000
+        ? {
+            paneId: pane.paneId!,
+            panePid: pane.panePid!,
+            status: pane.status,
+            signal: pane.signal,
+            paneSignalToken: pane.paneSignalToken,
+          }
+        : undefined;
+    if (nativePane) observation.processProofKey = createHash('sha256').update(JSON.stringify(nativePane)).digest('hex');
+    if (observation.activity === 'crashed' && !nativePane) observation.safeToAct = false;
+
     // A bounded suffix can hide an earlier still-live child, including after the parent process exits.
     observation.safeToAct = observation.safeToAct && identity.tailTruncated === false;
     if (observation.safeToAct && observation.evidenceKey) {
@@ -566,6 +600,7 @@ export class CodexRecoveryAdapter {
         key: observation.evidenceKey,
         generation: context.generation,
         conversationId: identity.conversationId,
+        ...(nativePane ? { nativePane, processProofKey: observation.processProofKey } : {}),
       };
     }
     return observation;
@@ -602,40 +637,16 @@ export class CodexRecoveryAdapter {
       expected.env !== JSON.stringify(this.session.getEnvOverridesForPersist())
     )
       return false;
-    let fd: number | undefined;
-    try {
-      // Any changed history binding, conflicting rollout or ancestor invalidates this observation.
-      for (const input of expected.witness.paths) {
-        const stat = lstatSync(input.path);
-        if (
-          stat.isSymbolicLink() ||
-          (input.kind === 'file' ? !stat.isFile() : !stat.isDirectory()) ||
-          stat.dev !== input.dev ||
-          stat.ino !== input.ino ||
-          (input.size !== undefined && stat.size !== input.size) ||
-          (input.mtimeMs !== undefined && stat.mtimeMs !== input.mtimeMs) ||
-          (input.ctimeMs !== undefined && stat.ctimeMs !== input.ctimeMs)
-        )
-          return false;
-      }
-      // This bounded synchronous proof introduces no new await after Session's final owner-grant read.
-      fd = openSync(expected.path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
-      const before = fstatSync(fd);
-      if (!before.isFile() || before.size > 262_144) return false;
-      const bytes = Buffer.alloc(before.size);
-      if (readSync(fd, bytes, 0, before.size, 0) !== before.size) return false;
-      const after = fstatSync(fd);
-      return (
-        after.size === before.size &&
-        after.mtimeMs === before.mtimeMs &&
-        this.session.getRecoveryContext().generation === generation &&
-        createHash('sha256').update(bytes).digest('hex') === createHash('sha256').update(expected.tail).digest('hex')
-      );
-    } catch {
-      return false;
-    } finally {
-      if (fd !== undefined) closeSync(fd);
-    }
+    return (
+      confirmCodexIdentityWitness({
+        reason: 'verified',
+        conversationId,
+        path: expected.path,
+        tail: expected.tail,
+        tailTruncated: expected.tailTruncated,
+        witness: expected.witness,
+      }) && this.session.getRecoveryContext().generation === generation
+    );
   }
 
   async act(flight: RecoveryFlight, isCurrent: () => boolean = () => true): Promise<'sent' | 'not-sent' | 'unknown'> {
@@ -649,7 +660,10 @@ export class CodexRecoveryAdapter {
       !current.safeToAct ||
       current.evidenceKey !== flight.key ||
       !this.proof ||
-      this.proof.generation !== previous.generation
+      this.proof.generation !== previous.generation ||
+      (flight.action === 'restart' &&
+        !this.session.remote &&
+        (!previous.nativePane || previous.processProofKey !== this.proof.processProofKey))
     )
       return 'not-sent';
     let result: 'sent' | 'not-sent' | 'unknown';
@@ -693,9 +707,18 @@ export class CodexRecoveryAdapter {
       }
     } else {
       const generation = this.proof.generation;
-      result = await this.session.deliverRecovery(flight, generation, isCurrent, CONTINUATION_PROMPT, () =>
-        this.confirmLocalEvidence(flight.conversationId, generation)
-      );
+      const confirmEvidence = () => this.confirmLocalEvidence(flight.conversationId, generation);
+      result =
+        flight.action === 'restart'
+          ? await this.session.deliverRecovery(
+              flight,
+              generation,
+              isCurrent,
+              CONTINUATION_PROMPT,
+              confirmEvidence,
+              previous.nativePane
+            )
+          : await this.session.deliverRecovery(flight, generation, isCurrent, CONTINUATION_PROMPT, confirmEvidence);
     }
     if (result === 'sent') this.persistSession();
     return result;

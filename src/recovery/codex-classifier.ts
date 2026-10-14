@@ -263,6 +263,11 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
   result.submissionKey = submissionKey;
   result.submissionHash = submissionHash;
   result.progressAt = progressAt || result.at;
+  if (result.activity === 'interrupted' && turnId && (context.lastIntentionalStopAt ?? 0) >= result.at - 2000) {
+    result = { ...result, activity: 'paused', reason: 'user-interrupted', safeToAct: false };
+  }
+  const structuredVeto = ['unknown', 'blocked', 'paused'].includes(result.activity);
+  if (context.screen === null && structuredVeto) return result;
   if (context.screen === null && (context.watching || pendingAgents.size)) {
     return { ...result, activity: 'watching', reason: 'background-work', safeToAct: false };
   }
@@ -278,17 +283,16 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     if (/would you like|approve this|allow this|press enter to confirm/i.test(screen)) {
       return { ...result, activity: 'paused', reason: 'approval-required', safeToAct: false };
     }
-    if (/esc to interrupt|reconnecting\.\.\.|retrying\.\.\./i.test(screen) || context.busy) {
-      return { ...result, activity: 'working', reason: 'turn-running', safeToAct: false };
-    }
+    // Native busy hints cannot clear structured vetoes or active child work.
+    if (structuredVeto) return result;
     if (context.watching || pendingAgents.size) {
       return { ...result, activity: 'watching', reason: 'background-work', safeToAct: false };
     }
+    if (/esc to interrupt|reconnecting\.\.\.|retrying\.\.\./i.test(screen) || context.busy) {
+      return { ...result, activity: 'working', reason: 'turn-running', safeToAct: false };
+    }
     if (result.activity === 'interrupted' && turnId) {
       result.evidenceKey = `${context.conversationId}:${turnId}:${result.at}:${result.reason}`;
-      if ((context.lastIntentionalStopAt ?? 0) >= result.at - 2000) {
-        return { ...result, activity: 'paused', reason: 'user-interrupted', safeToAct: false };
-      }
       result.safeToAct = context.tailTruncated === false && hasTurnStart && hasEmptyCodexComposer(screen);
     }
   }

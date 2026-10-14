@@ -47,6 +47,7 @@ import { getCli } from './config/cli-registry/registry.js';
 import { resolveCodexIdentities, resolveCodexIdentity, type CodexIdentityRequest } from './recovery/codex-identity.js';
 import { readRebootIdentityFence } from './recovery/reboot-identity-fence.js';
 import { normalizedCodexHome } from './recovery/codex-home.js';
+import { isCodexRestoreConfig } from './recovery/reboot-state-binding.js';
 import { classifyCodexTail } from './recovery/codex-classifier.js';
 import type { CodexIdentityResult } from './recovery/codex-identity.js';
 import { isCleanPaneExit } from './pane-exit-sweep.js';
@@ -313,6 +314,7 @@ interface CodexRebootIdentityCandidate {
 function codexRebootIdentityCandidate(state: SessionState): CodexRebootIdentityCandidate | undefined {
   if (getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' || state.remote || state.docker)
     return undefined;
+  if (!isCodexRestoreConfig(state.codexConfig)) return undefined;
   const proof =
     readRebootIdentityFence(state.id) ??
     (
@@ -329,7 +331,10 @@ function codexRebootIdentityCandidate(state: SessionState): CodexRebootIdentityC
   const home = normalizedCodexHome((state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome);
   const explicitHome = (state as { __envOverrides?: Record<string, string> }).__envOverrides?.CODEX_HOME;
   // An old record without actual launch provenance cannot establish its original ambient home.
-  if (!home || (explicitHome !== undefined && normalizedCodexHome(explicitHome) !== home)) return undefined;
+  // Launch treats the literal empty override as omission. Only the captured
+  // launch home supplies provenance in that case; current defaults never do.
+  if (!home || (explicitHome !== undefined && explicitHome !== '' && normalizedCodexHome(explicitHome) !== home))
+    return undefined;
   // A completed reboot restore replaces the consumed submission with its exact
   // launched UUID synchronously. It may be newer than the debounced state record.
   const id = proof?.resumeSessionId ?? state.recovery?.conversationId ?? state.codexConfig?.resumeSessionId;

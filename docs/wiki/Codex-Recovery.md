@@ -35,6 +35,8 @@ Defaults are three attempts, a 15-second initial delay, exponential backoff capp
 
 The status shows observed Codex activity separately from recovery-controller state, the abbreviated conversation ID, attempts, failed deliveries, reason, next retry, last accepted recovery and history. A successful Codex turn stops recovery; it is not evidence that the overall task meets its acceptance criteria.
 
+**Continue Until Complete** task supervision is also available for eligible Codex sessions. It tracks an explicit objective, checkpoints and owner-defined acceptance criteria with bounded continuations. See [Codex task supervision](../codex-task-supervision.md) for its controls and completion rules.
+
 ## Safety and identity
 
 - Recovery reads bounded structured Codex rollout events. `stream_error` is an internal retry, and steering is not a failure. Assistant prose and historical terminal text cannot authorize a restart.
@@ -48,11 +50,19 @@ The status shows observed Codex activity separately from recovery-controller sta
 - Every action is reserved atomically before dispatch. A possibly partial delivery or restart during an in-flight action pauses for inspection instead of replaying it. Inspect the terminal before resetting an uncertain reservation.
 - Supported direct terminal attachment requires an authenticated server to durably fence Codex input first. When the server or fence endpoint is unavailable, or that write fails, Codex attachment is refused even in degraded TUI mode; this also applies to an attach strip that can switch into Codex.
 - Continuations are confirmed by structured Codex input events. Recovery does not schedule unattended Enter retransmissions; a missed Enter remains an unconfirmed reservation requiring inspection.
-- Codeman's own server restart attaches to exited Codex panes without automatically relaunching them outside the controller. Previously tripped breakers stay tripped. Restored panes pause identity verification because the pane may have switched threads or retained a draft while the server was down. The first Enter clears unknown draft tracking; a subsequent exact ordinary submission from a clean composer establishes the current conversation. A dead pane without fresh verifiable identity requires manual intervention. Host-reboot restoration is a separate follow-up.
+- Codeman's own server restart attaches to exited Codex panes without automatically relaunching them outside the controller. Previously tripped breakers stay tripped. Restored panes pause identity verification because the pane may have switched threads or retained a draft while the server was down. The first Enter clears unknown draft tracking; a subsequent exact ordinary submission from a clean composer establishes the current conversation. A dead pane without fresh verifiable identity requires manual intervention.
 
 The journal is `recovery.json` under the instance-aware data directory, mode `0600`, written by atomic rename. It contains sanitized reason codes and identifiers, never prompts, rollout text, SSH diagnostics or credentials. A corrupt/unwritable journal disables automation. History is capped at 100 events; handled evidence at 32 entries. Filesystem scans have explicit byte, entry and time budgets and pause when evidence is incomplete or inaccessible.
 
 Explicit owner deletion stops and drains recovery even if journal cleanup fails; unreadable or unwritable journal evidence is preserved for inspection. After verified startup restoration, orphan records with only unsent scheduling intentions can be reclaimed. Actual in-flight delivery reservations and records belonging to retained sessions or pending restores remain protected.
+
+## Restore after a host reboot
+
+After a host reboot destroys the panes, Codeman can offer verified local Codex sessions in the **Restore** banner. Restoration requires an explicit click by the session owner or an authorized administrator. Boot detection creates the offer; it never launches an agent automatically.
+
+Restoration verifies the exact conversation UUID using bounded rollout and history scans, then rechecks it before launch. It preserves the original managed session ID, launch configuration and captured effective Codex home, including an inherited or default home. Changed server defaults cannot move the conversation. Current owner grants must still authorize the saved settings and home. Missing provenance, ambiguous identity, pending child work, owner interruption, approval, authentication or uncertain evidence prevents launch. Restoration never falls back to a fresh conversation.
+
+The private offer and historical session record remain available until launch metadata and session state are durably committed. Existing recovery settings, retry budgets and unresolved reservations survive; pre-reboot pending actions are disarmed. **Dismiss** cancels a pending restore. If a worker may already have started, Codeman retains its exact pane for owner inspection and preserves historical state instead of replaying the launch. Inspect that pane before attempting another restoration. A restored pane has no previous terminal scrollback.
 
 ## API and events
 
@@ -68,9 +78,9 @@ All routes use existing authentication and session ownership checks. `/api/v1` a
 
 The API returns `{ "success": true, "data": ... }` or the existing error envelope. The owner-scoped SSE event `session:recovery` carries `{ sessionId, state }`. Attention events use the existing push/webhook integrations and sanitized reason codes; ordinary successful retries do not send notifications.
 
-## Follow-up work
+## Requirements and limits
 
-Remote recovery requires Node.js and tmux on the remote host for its bounded evidence probe. It does not restart a prolonged stall or repeatedly continue an ordinary completed/idle turn.
+Remote recovery requires Node.js and tmux on the remote host for its bounded evidence probe. It does not restart a prolonged stall or repeatedly continue an ordinary completed/idle turn outside an explicitly configured task.
 
 Codex event fixtures follow [`openai/codex` `rust-v0.162.1` protocol definitions](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/protocol/src/protocol.rs). Unsupported or incomplete event variants remain non-actionable. No live Codex service or private SSH host is needed by the automated recovery tests.
 

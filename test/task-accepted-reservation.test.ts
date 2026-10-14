@@ -38,7 +38,7 @@ async function fixture(domain: Domain) {
     processReady: true,
     safeToAct: false,
   };
-  const effect = vi.fn(async () => 'unknown' as const);
+  const effect = vi.fn(async () => (domain === 'task-restart' ? 'sent' : 'unknown') as 'sent' | 'unknown');
   const commonPersist = vi.fn(async (key: string | undefined) => {
     const state = initialTaskState();
     if (key) state.inFlight = { key, startedAt: now };
@@ -74,7 +74,7 @@ async function fixture(domain: Domain) {
           changed: () => {},
           acceptReservation: accepted,
           act: (key) => arbiter.run(owner, key, effect),
-          recover: (o) => arbiter.run(owner, o.evidenceKey!, effect),
+          recover: (o) => arbiter.run(owner, o.evidenceKey!, effect, o.activity === 'crashed'),
         },
         restored as TaskState | undefined
       );
@@ -342,7 +342,7 @@ describe('accepted common reservations', () => {
   );
 
   it.each(
-    ['task', 'recovery'].flatMap((domain) =>
+    ['task', 'task-restart', 'recovery'].flatMap((domain) =>
       ['other-owner', 'newer-operation', 'legacy'].map((mismatch) => ({ domain: domain as Domain, mismatch }))
     )
   )('$domain accepted evidence cannot release a $mismatch reservation', async ({ domain, mismatch }) => {

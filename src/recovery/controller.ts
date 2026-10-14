@@ -39,7 +39,7 @@ export class RecoveryController {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
   private revision = 0;
-  private confirmation?: { key: string; at: number };
+  private confirmation?: { key: string; at: number; processKey?: string };
   private restoredFlight: boolean;
   private flightObservationComplete = false;
 
@@ -527,9 +527,15 @@ export class RecoveryController {
         observation.liveProofAt > observation.at ||
         observation.liveProofAt < armedAt);
     if (!manual && (observation.at < armedAt || invalidLiveProof)) return;
-    if (!manual && (this.confirmation?.key !== key || this.now() - this.confirmation.at < CONFIRM_MS)) {
-      this.confirmation ??= { key, at: this.now() };
-      if (this.confirmation.key !== key) this.confirmation = { key, at: this.now() };
+    const processKey = observation.processProofKey ?? key;
+    if (
+      !manual &&
+      (this.confirmation?.key !== key ||
+        this.confirmation.processKey !== processKey ||
+        this.now() - this.confirmation.at < CONFIRM_MS)
+    ) {
+      if (!this.confirmation || this.confirmation.key !== key || this.confirmation.processKey !== processKey)
+        this.confirmation = { key, at: this.now(), processKey };
       return;
     }
     this.state.windowStartedAt ??= this.now();

@@ -38,6 +38,8 @@ for (const action of ['continue', 'restart'] as const) {
     await fs.mkdir(join(home, 'sessions'));
     const path = join(home, 'sessions', `rollout-2026-10-13T12-00-00-${THREAD}.jsonl`);
     const pane = {
+      paneId: '%7',
+      panePid: 700,
       dead: action === 'restart',
       status: action === 'restart' ? 1 : undefined,
       signal: undefined,
@@ -182,6 +184,25 @@ for (const action of ['continue', 'restart'] as const) {
       expect(reads).toBe(3);
       expect(mux.sendInput).toHaveBeenCalledTimes(permitted && action === 'continue' ? 1 : 0);
       expect(mux.respawnPane).toHaveBeenCalledTimes(permitted && action === 'restart' ? 1 : 0);
+      if (permitted && action === 'restart')
+        expect(mux.respawnPane).toHaveBeenCalledWith(
+          expect.objectContaining({
+            onlyIfDead: true,
+            expectedRecoveryPane: {
+              paneId: '%7',
+              panePid: 700,
+              status: 1,
+              signal: undefined,
+              paneSignalToken: undefined,
+            },
+            codexConfig: expect.objectContaining({
+              noDaemon: true,
+              resumeSessionId: THREAD,
+              sandbox: 'workspace-write',
+              approvalPolicy: 'on-request',
+            }),
+          })
+        );
     } finally {
       await session.stop(false);
       await fs.rm(home, { recursive: true, force: true });

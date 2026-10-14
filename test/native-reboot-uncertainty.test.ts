@@ -6,6 +6,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import type { MuxSession } from '../src/mux-interface.js';
 import type { Session as SessionType } from '../src/session.js';
 import type { TmuxManager as ManagerType } from '../src/tmux-manager.js';
+import type { WebServer as ServerType } from '../src/web/server.js';
+import type { SessionState } from '../src/types.js';
+import { rebootStateBinding } from '../src/recovery/reboot-state-binding.js';
 
 const effects = vi.hoisted(() => ({ sync: vi.fn(), exec: vi.fn(), attach: vi.fn() }));
 vi.mock('node:child_process', async (original) => {
@@ -28,11 +31,13 @@ vi.mock('node:child_process', async (original) => {
 vi.mock('node-pty', () => ({ spawn: effects.attach }));
 let TmuxManager: typeof import('../src/tmux-manager.js').TmuxManager;
 let Session: typeof import('../src/session.js').Session;
+let WebServer: typeof import('../src/web/server.js').WebServer;
 let root: string;
 let metadata: string;
 let previousData: string | undefined;
 const sessions: SessionType[] = [];
 const managers: ManagerType[] = [];
+const servers: ServerType[] = [];
 const ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const THREAD = '11111111-2222-3333-4444-555555555555';
 const config = {
@@ -52,6 +57,7 @@ beforeAll(async () => {
   try {
     ({ TmuxManager } = await import('../src/tmux-manager.js'));
     ({ Session } = await import('../src/session.js'));
+    ({ WebServer } = await import('../src/web/server.js'));
   } finally {
     if (vitest !== undefined) process.env.VITEST = vitest;
   }
@@ -70,6 +76,7 @@ beforeEach(() => {
   rmSync(metadata, { force: true });
 });
 afterEach(async () => {
+  for (const server of servers.splice(0)) await server.stop();
   for (const session of sessions.splice(0)) await session.stop(false);
   for (const manager of managers.splice(0)) await Reflect.get(manager, 'sessionSaves');
   vi.restoreAllMocks();
@@ -330,40 +337,329 @@ describe('native uncertain Codex reboot ownership', () => {
     }
   );
 
-  it.each(['empty', 'failed'] as const)(
-    'reconciliation retains uncertain identity when the pane listing is %s',
+  it.each([
+    'empty',
+    'other-live',
+    'own-live',
+    'failed',
+    'malformed',
+    'truncated',
+    'invalid-exit',
+    'invalid-pid',
+    'nul-name',
+    'control-name',
+    'missing-final-newline',
+    'blank-line',
+    'crlf',
+  ] as const)('retires uncertain identity only after a complete pane listing proves absence (%s)', async (listing) => {
+    const { manager, home } = fixture();
+    const record: MuxSession = {
+      sessionId: ID,
+      muxName: 'codeman-aaaaaaaa',
+      pid: 0,
+      createdAt: Date.now(),
+      workingDir: root,
+      mode: 'codex',
+      owner: 'worker',
+      attached: false,
+      recoveryCodexHome: home,
+      codexRestoreUncertain: true,
+      codexRestoreConfig: config,
+    };
+    manager.registerSession(record);
+    await manager.flushSessionsDurably();
+    const sep = '|'; // Exact native PANE_LIST_FORMAT separator.
+    const valid = (name: string, pid: string) => [name, pid, '0', '', ''].join(sep) + '\n';
+    effects.sync.mockImplementation((command: string) => {
+      expect(command).not.toContain('|| true');
+      if (listing === 'failed') throw new Error('Fixture pane listing unavailable');
+      return listing === 'empty'
+        ? ''
+        : listing === 'other-live'
+          ? valid('codeman-other', '123')
+          : listing === 'own-live'
+            ? valid(record.muxName, '700')
+            : listing === 'malformed'
+              ? 'not-a-pane-frame\n'
+              : listing === 'truncated'
+                ? 'x'.repeat(600 * 1024)
+                : listing === 'invalid-exit'
+                  ? [record.muxName, '700', '0', '0', ''].join(sep) + '\n'
+                  : listing === 'invalid-pid'
+                    ? valid(record.muxName, '700junk')
+                    : listing === 'nul-name'
+                      ? valid('codeman-other\0', '123')
+                      : listing === 'control-name'
+                        ? valid('codeman-other\t', '123')
+                        : listing === 'missing-final-newline'
+                          ? valid('codeman-other', '123').slice(0, -1)
+                          : listing === 'blank-line'
+                            ? valid('codeman-other', '123') + '\n'
+                            : valid('codeman-other', '123').replace(/\n$/, '\r\n');
+    });
+    const died = vi.fn();
+    manager.on('sessionDied', died);
+    const result = await manager.reconcileSessions();
+    const absent = listing === 'empty' || listing === 'other-live';
+    expect(manager.getSession(ID)).toBe(absent ? undefined : record);
+    if (absent) {
+      expect(result.dead).toContain(ID);
+      expect(died).toHaveBeenCalledExactlyOnceWith({ sessionId: ID });
+    } else {
+      expect(result.dead).not.toContain(ID);
+      expect(died).not.toHaveBeenCalled();
+      expect(record.pid).toBe(listing === 'own-live' ? 700 : 0);
+      expect(record.codexRestoreUncertain).toBe(true);
+      expect(record.codexRestoreConfig).toEqual(config);
+      expect(record.recoveryCodexHome).toBe(home);
+    }
+    await manager.flushSessionsDurably();
+    const persisted = JSON.parse(readFileSync(metadata, 'utf8')) as MuxSession[];
+    expect(persisted.some((saved) => saved.sessionId === ID)).toBe(!absent);
+    expect(effects.sync.mock.calls).toHaveLength(1);
+  });
+
+  it.each(['failed', 'malformed', 'truncated', 'healthy', 'absent'] as const)(
+    'rebuilds a completed bound worker for inspection without pruning history after a %s listing',
     async (listing) => {
       const { manager, home } = fixture();
+      const state: SessionState & { __codexRecoveryHome: string; __envOverrides: Record<string, string> } = {
+        id: ID,
+        mode: 'codex',
+        owner: 'worker',
+        workingDir: root,
+        pid: 700,
+        status: 'idle',
+        currentTaskId: null,
+        createdAt: Date.now() - 60_000,
+        name: 'Historical bound worker',
+        codexConfig: { ...config },
+        __codexRecoveryHome: home,
+        __envOverrides: { CODEX_HOME: home },
+      };
+      const binding = rebootStateBinding(state)!;
+      expect(binding).toMatch(/^[a-f0-9]{64}$/);
       const record: MuxSession = {
         sessionId: ID,
         muxName: 'codeman-aaaaaaaa',
-        pid: 0,
-        createdAt: Date.now(),
+        pid: 700,
+        createdAt: state.createdAt,
         workingDir: root,
         mode: 'codex',
         owner: 'worker',
         attached: false,
+        name: state.name,
         recoveryCodexHome: home,
-        codexRestoreUncertain: true,
-        codexRestoreConfig: config,
+        recoveryIsolated: true,
+        codexRestoreUncertain: false,
+        codexRestoreConfig: { ...config },
+        codexRestoreStateBinding: binding,
       };
       manager.registerSession(record);
-      const other = { ...record, sessionId: 'ordinary', muxName: 'codeman-ordinary', codexRestoreUncertain: false };
-      manager.registerSession(other);
       await manager.flushSessionsDurably();
-      effects.sync.mockImplementation(() => {
-        if (listing === 'failed') throw new Error('Fixture pane listing unavailable');
-        return '';
+      vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+      const server = new WebServer(0, false, true);
+      servers.push(server);
+      Reflect.set(server, 'mux', manager);
+      const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+      store.setSession(ID, state);
+      store.flush();
+      const historical = structuredClone(store.getSession(ID));
+      vi.spyOn(
+        server as unknown as { getWorkspaceHooksEnabled(): Promise<boolean> },
+        'getWorkspaceHooksEnabled'
+      ).mockResolvedValue(false);
+      for (const method of [
+        'startStatsCollection',
+        'startMouseModeSync',
+        'startPaneExitWatcher',
+        'startRemoteReconnectWatcher',
+        'destroy',
+      ] as const)
+        vi.spyOn(manager, method).mockImplementation(() => {});
+      const create = vi.spyOn(manager, 'createSession');
+      const respawn = vi.spyOn(manager, 'respawnPane');
+      const kill = vi.spyOn(manager, 'killSession');
+      vi.spyOn(manager, 'muxSessionExists').mockReturnValue(listing !== 'absent');
+      vi.spyOn(manager, 'isPaneDead').mockReturnValue(false);
+      effects.sync.mockImplementation((command: string) => {
+        expect(command).toContain(' list-panes ');
+        if (listing === 'failed') throw new Error('Fixture native listing unavailable');
+        return listing === 'malformed'
+          ? 'not-a-pane-frame\n'
+          : listing === 'truncated'
+            ? 'codeman-aaaaaaaa|700|0||'
+            : listing === 'absent'
+              ? ''
+              : 'codeman-aaaaaaaa|700|0||\n';
       });
-      const died = vi.fn();
-      manager.on('sessionDied', died);
-      await manager.reconcileSessions();
-      expect(manager.getSession(ID)).toBe(record);
-      expect(manager.getSession(other.sessionId)).toBeUndefined();
-      expect(died).toHaveBeenCalledExactlyOnceWith({ sessionId: other.sessionId });
-      await manager.flushSessionsDurably();
-      expect(JSON.parse(readFileSync(metadata, 'utf8'))).toEqual([record]);
-      expect(effects.sync.mock.calls).toHaveLength(1);
+      let reconciliation: Awaited<ReturnType<ManagerType['reconcileSessions']>> | undefined;
+      const reconcile = manager.reconcileSessions.bind(manager);
+      vi.spyOn(manager, 'reconcileSessions').mockImplementation(async () => {
+        reconciliation = await reconcile();
+        return reconciliation;
+      });
+      const restored = await Reflect.get(server, 'restoreMuxSessions').call(server);
+      const board = Reflect.get(server, 'sessions') as Map<string, SessionType>;
+      const worker = board.get(ID);
+      if (worker) sessions.push(worker);
+      await Reflect.get(server, 'finalizeRestoredState').call(server, restored);
+      const uncertain = !['healthy', 'absent'].includes(listing);
+      expect(restored).toBe(true);
+      expect(create).not.toHaveBeenCalled();
+      expect(respawn).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+      if (listing === 'absent') {
+        expect(worker).toBeUndefined();
+        expect(manager.getSession(ID)).toBeUndefined();
+        expect(reconciliation?.dead).toEqual([ID]);
+      } else {
+        expect(worker).toBeDefined();
+        expect(manager.getSession(ID)).toBe(record);
+        expect(record.codexRestoreUncertain).toBe(uncertain);
+        expect(record.codexRestoreStateBinding).toBe(binding);
+        expect(record.codexRestoreConfig).toEqual(config);
+        expect(worker!.codexRestoreWorkerMayExist).toBe(uncertain);
+        expect(worker!.getRecoveryContext().managed).toBe(!uncertain);
+        expect(reconciliation).toEqual({ alive: uncertain ? [] : [ID], dead: [], discovered: [] });
+        if (uncertain) {
+          expect(store.getSession(ID)).toEqual(historical);
+          const disk = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+          expect(disk.sessions[ID]).toEqual(historical);
+        }
+        await manager.flushSessionsDurably();
+        const saved = JSON.parse(readFileSync(metadata, 'utf8')).find((row: MuxSession) => row.sessionId === ID);
+        expect(saved).toMatchObject({
+          codexRestoreUncertain: uncertain,
+          codexRestoreStateBinding: binding,
+          codexRestoreConfig: config,
+        });
+      }
     }
   );
+
+  it.each([
+    'sent',
+    'lost-receipt',
+    'revoked-before',
+    'revoked-during-retirement',
+    'retirement-file-failure',
+    'record-replaced',
+  ] as const)('retires a previous reboot binding before any later native respawn effect (%s)', async (outcome) => {
+    const { manager, home } = fixture();
+    const record: MuxSession = {
+      sessionId: ID,
+      muxName: 'codeman-aaaaaaaa',
+      pid: 700,
+      createdAt: Date.now(),
+      workingDir: root,
+      mode: 'codex',
+      owner: 'worker',
+      attached: false,
+      recoveryCodexHome: home,
+      recoveryIsolated: true,
+      codexRestoreUncertain: false,
+      codexRestoreConfig: config,
+      codexRestoreStateBinding: 'a'.repeat(64),
+    };
+    manager.registerSession(record);
+    await manager.flushSessionsDurably();
+    let authorized = outcome !== 'revoked-before';
+    const flush = manager.flushSessionsDurably.bind(manager);
+    if (outcome === 'revoked-during-retirement')
+      vi.spyOn(manager, 'flushSessionsDurably').mockImplementationOnce(async (current) => {
+        await flush(current);
+        authorized = false;
+      });
+    if (outcome === 'retirement-file-failure')
+      vi.spyOn(manager, 'flushSessionsDurably').mockRejectedValueOnce(new Error('Fixture metadata fsync refused'));
+    let replacement: MuxSession | undefined;
+    if (outcome === 'record-replaced')
+      vi.spyOn(manager, 'flushSessionsDurably').mockImplementationOnce(async (current) => {
+        await flush(current);
+        replacement = {
+          ...record,
+          codexRestoreStateBinding: 'b'.repeat(64),
+          codexRestoreConfig: { ...config, model: 'replacement-model' },
+        };
+        manager.registerSession(replacement);
+      });
+    effects.exec.mockImplementation(async (command: string) => {
+      if (command.includes(' respawn-pane ')) {
+        const saved = JSON.parse(readFileSync(metadata, 'utf8')).find((row: MuxSession) => row.sessionId === ID);
+        expect(saved.codexRestoreStateBinding).toBeUndefined();
+        expect(saved.codexRestoreConfig).toBeUndefined();
+        expect(saved.recoveryCodexHome).toBe(home);
+        if (outcome === 'lost-receipt') throw new Error('Fixture response lost after respawn');
+      }
+      return { stdout: '', stderr: '' };
+    });
+    const result = await manager.respawnPane({
+      sessionId: ID,
+      workingDir: root,
+      mode: 'codex',
+      owner: 'worker',
+      codexConfig: { ...config, model: 'new-owner-model' },
+      recoveryCodexHome: home,
+      onlyIfDead: true,
+      recoveryDispatchGuard: { confirm: () => authorized, noteDispatch: vi.fn() },
+    });
+    expect(result).toBe(outcome === 'sent' ? 99999 : null);
+    expect(effects.exec.mock.calls.filter(([command]) => String(command).includes(' respawn-pane '))).toHaveLength(
+      outcome === 'sent' || outcome === 'lost-receipt' ? 1 : 0
+    );
+    if (['revoked-before', 'revoked-during-retirement', 'retirement-file-failure'].includes(outcome)) {
+      await manager.flushSessionsDurably();
+      const saved = JSON.parse(readFileSync(metadata, 'utf8')).find((row: MuxSession) => row.sessionId === ID);
+      expect(saved.codexRestoreStateBinding).toBe('a'.repeat(64));
+      expect(saved.codexRestoreConfig).toEqual(config);
+      expect(record.codexRestoreStateBinding).toBe('a'.repeat(64));
+      expect(record.codexRestoreConfig).toEqual(config);
+    } else {
+      expect(record.codexRestoreStateBinding).toBeUndefined();
+      expect(record.codexRestoreConfig).toBeUndefined();
+      if (outcome === 'record-replaced') {
+        expect(manager.getSession(ID)).toBe(replacement);
+        expect(replacement!.codexRestoreStateBinding).toBe('b'.repeat(64));
+        expect(replacement!.codexRestoreConfig!.model).toBe('replacement-model');
+      }
+    }
+  });
+
+  it.each([false, true])('honors explicit owner stop(killMux=%s) for an uncertain worker', async (killMux) => {
+    const { manager, home } = fixture();
+    const record: MuxSession = {
+      sessionId: ID,
+      muxName: 'codeman-aaaaaaaa',
+      pid: 0,
+      createdAt: Date.now(),
+      workingDir: root,
+      mode: 'codex',
+      owner: 'worker',
+      attached: false,
+      recoveryCodexHome: home,
+      codexRestoreUncertain: true,
+      codexRestoreConfig: config,
+    };
+    manager.registerSession(record);
+    const kill = vi.spyOn(manager, 'killSession').mockResolvedValue(true);
+    const session = new Session({
+      id: ID,
+      mode: 'codex',
+      owner: 'worker',
+      workingDir: root,
+      useMux: true,
+      mux: manager,
+      muxSession: record,
+      codexConfig: config,
+      recoveryCodexHome: home,
+    });
+    sessions.push(session);
+    await session.stop(killMux);
+    expect(kill).toHaveBeenCalledTimes(killMux ? 1 : 0);
+    if (killMux) expect(kill).toHaveBeenCalledWith(ID);
+    else expect(manager.getSession(ID)).toBe(record);
+    expect(effects.sync).not.toHaveBeenCalled();
+    expect(effects.attach).not.toHaveBeenCalled();
+  });
 });
