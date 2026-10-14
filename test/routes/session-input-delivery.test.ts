@@ -122,6 +122,25 @@ describe('POST /api/sessions/:id/input rollback wiring', () => {
   const post = (body: Record<string, unknown>, id = 'test-session-1') =>
     harness.app.inject({ method: 'POST', url: `/api/sessions/${id}/input`, payload: body });
 
+  it('returns the actual duplicate watermark in an HTTP ACK header, retaining its successful envelope', async () => {
+    const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'codex' });
+    (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+    session.shouldApplyInput('two-tabs', 10);
+    const direct = vi.spyOn(session, 'write').mockReturnValue(true);
+    const duplicate = await post({ input: 'before', clientId: 'two-tabs', seq: 1 });
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json()).toEqual({ success: true, data: {} });
+    expect(JSON.parse(String(duplicate.headers['x-codeman-input-ack']))).toEqual({ seq: 1, dup: true, last: 10 });
+    expect(direct).not.toHaveBeenCalled();
+    const corrected = await post({ input: 'before', clientId: 'two-tabs', seq: 11 });
+    expect(corrected.statusCode).toBe(200);
+    expect(corrected.headers['x-codeman-input-ack']).toBeUndefined();
+    expect(direct).toHaveBeenCalledTimes(1);
+    const retry = await post({ input: 'before', clientId: 'two-tabs', seq: 11 });
+    expect(JSON.parse(String(retry.headers['x-codeman-input-ack']))).toEqual({ seq: 11, dup: true, last: 11 });
+    expect(direct).toHaveBeenCalledTimes(1);
+  });
+
   it('rolls the seq back when both the mux write and the direct write fail', async () => {
     const session = harness.ctx.sessions.get('test-session-1')!;
     session.failWrites = true; // writeViaMux false AND write() false

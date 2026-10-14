@@ -77,6 +77,19 @@ export class MockSession extends EventEmitter {
   /** Mirrors Session.trackUserInput (the send-key route feeds it around the write path). */
   trackUserInput(_data: string): void {}
 
+  /** Mirrors the owned Session named-key boundary, without executing a child. */
+  async sendNamedKey(data: string, dispatch: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
+    if (this.recoveryInputReserved) return false;
+    this.recoveryInputReserved = true;
+    try {
+      this.trackUserInput(data);
+      await dispatch(new AbortController().signal);
+      return true;
+    } finally {
+      this.recoveryInputReserved = false;
+    }
+  }
+
   private _muxName: string | null = null;
 
   constructor(id: string = 'mock-session-id') {

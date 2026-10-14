@@ -367,13 +367,7 @@
         // Swallow keypress/keyup too (xterm would send \r for a Shift-only keypress); only keydown sends.
         if (ev.key === 'Enter' && (ev.shiftKey || ev.ctrlKey)) {
           if (ev.type === 'keydown') {
-            fetch(`/api/sessions/${this.sessionId}/send-key`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ key: ev.ctrlKey ? 'C-Enter' : 'S-Enter' }),
-            }).catch(() => {
-              /* Best-effort, matching this pane's tolerance elsewhere. */
-            });
+            global.app?._sendNamedKey?.(this.sessionId, ev.ctrlKey ? 'C-Enter' : 'S-Enter', this);
           }
           return false;
         }
@@ -1504,6 +1498,7 @@
 
     destroy() {
       this._destroyed = true;
+      global.app?._cancelPendingKeys?.(this);
       // Anything still queued for this session stays in the app's queue and is
       // delivered over HTTP by the redelivery sweep, so closing the pane mid-
       // keystroke loses nothing.
