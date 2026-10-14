@@ -2370,6 +2370,7 @@ export class WebServer extends EventEmitter {
   private getRecoveryController(session: Session): RecoveryController | undefined {
     if (
       this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
       this.sessions.get(session.id) !== session ||
       getCli(session.mode)?.capabilities.recovery !== 'codex-rollout'
     )
@@ -2443,7 +2444,15 @@ export class WebServer extends EventEmitter {
       await controller.drain();
       this.recoveryControllers.delete(id);
     }
-    if (drop && ownsRecoveryState) await this.recoveryStore.drop(id);
+    if (drop && ownsRecoveryState) {
+      try {
+        await this.recoveryStore.drop(id);
+      } catch (err) {
+        // Journal integrity vetoes automation, never an explicit owner deletion.
+        // Failed writes retain the existing evidence for later inspection.
+        console.warn(`[Server] Recovery journal deletion failed: ${getErrorMessage(err)}`);
+      }
+    }
   }
 
   /**
