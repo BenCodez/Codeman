@@ -64,6 +64,9 @@ const DEC_2026_END = '\x1b[?2026l';
 /** Max concurrent WS connections per session. Prevents listener/bandwidth multiplication. */
 const MAX_WS_PER_SESSION = 5;
 
+/** Bound queued owner input while an SSH clock read is pending. */
+const MAX_WS_PENDING_INPUT_FRAMES = 512;
+
 /**
  * Track live WS connections per session, keyed by clientId (COD-137).
  * Replaces a bare counter that over-counted across the async-close gap on
@@ -169,11 +172,15 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
       const sizingToken = Symbol('ws-desktop-sizing');
       let holdsDesktopClaim = false;
 
-      // Attach message handler synchronously BEFORE any async work
-      // (@fastify/websocket requirement to avoid dropped messages).
-      socket.on('message', async (raw) => {
+      // EventEmitter does not await message listeners. Keep this socket's input
+      // in arrival order through asynchronous clock admission; resize/pong/close
+      // remain immediate. Tagged identities enter the Session FIFO on arrival.
+      let inputTail = Promise.resolve();
+      let pendingInputFrames = 0;
+      let pendingInputBytes = 0;
+      const handleMessage = async (msg: Record<string, unknown>) => {
         try {
-          const msg = JSON.parse(String(raw));
+          if (socket.readyState !== 1 || ctx.sessions.get(id) !== session) return;
           if (msg.t === 'i' && typeof msg.d === 'string') {
             if (msg.d.length > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame
@@ -191,10 +198,6 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             // (legacy/other tools) are applied as-is — no behavior change.
             const cid = typeof msg.cid === 'string' ? msg.cid : null;
             const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
-            if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
-              if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
-              return;
-            }
             // A rejected frame must not claim a delivery identity. Otherwise a
             // burst during recovery can manufacture a watermark for lost bytes.
             if (session.recoveryInputReserved) return;
@@ -212,7 +215,12 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
                 };
                 if (session.requiresRemoteInputClock?.(msg.d, writeOptions)) {
                   const admission = await session.prepareUserInputClock(msg.d, writeOptions);
-                  delivered = !!admission && admission() === true && session.write(msg.d, writeOptions);
+                  delivered =
+                    socket.readyState === 1 &&
+                    ctx.sessions.get(id) === session &&
+                    !!admission &&
+                    admission() === true &&
+                    session.write(msg.d, writeOptions);
                 } else delivered = session.write(msg.d, writeOptions);
               } catch (err) {
                 if (cid && seq !== null) session.forgetInputSeq(cid, seq);
@@ -256,6 +264,8 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             }
           } else if (
             msg.t === 'z' &&
+            typeof msg.c === 'number' &&
+            typeof msg.r === 'number' &&
             Number.isInteger(msg.c) &&
             Number.isInteger(msg.r) &&
             msg.c >= 1 &&
@@ -291,6 +301,42 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
           }
         } catch {
           // Ignore malformed messages
+        }
+      };
+      // Attach synchronously before any asynchronous work (@fastify/websocket).
+      socket.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(String(raw)) as Record<string, unknown>;
+          if (msg.t !== 'i' || typeof msg.d !== 'string' || msg.d.length > MAX_INPUT_LENGTH) {
+            void handleMessage(msg);
+            return;
+          }
+          const cid = typeof msg.cid === 'string' ? msg.cid : null;
+          const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
+          if (
+            pendingInputFrames >= MAX_WS_PENDING_INPUT_FRAMES ||
+            pendingInputBytes + msg.d.length > MAX_INPUT_LENGTH
+          ) {
+            if (cid && seq !== null) {
+              if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
+            } else socket.close(4008, 'Input backlog full');
+            return;
+          }
+          if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
+            if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
+            return;
+          }
+          const bytes = msg.d.length;
+          pendingInputFrames++;
+          pendingInputBytes += bytes;
+          inputTail = inputTail
+            .then(() => handleMessage(msg))
+            .finally(() => {
+              pendingInputFrames--;
+              pendingInputBytes -= bytes;
+            });
+        } catch {
+          // Ignore malformed messages without disturbing the input queue.
         }
       });
 

@@ -96,7 +96,7 @@ export class RecoveryController {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const flight = this.state.inFlight;
-    const observeFlight = !!flight && !this.flightObservationComplete;
+    const observeFlight = !!flight && !this.flightObservationComplete && this.state.lastReason !== 'persistence-failed';
     const automate = !flight && this.state.config.enabled && !this.state.circuitOpen;
     if (!this.stopped && (automate || observeFlight)) {
       const delay =
@@ -153,18 +153,32 @@ export class RecoveryController {
     this.state.history = this.state.history.slice(-100);
   }
 
-  private async save(): Promise<void> {
+  private async save(retainedStateOnFailure?: { state: RecoveryState; revision: number }): Promise<boolean> {
     try {
       await this.deps.persist(this.getStatus());
     } catch {
+      if (retainedStateOnFailure) {
+        const newerOwnerIntent = this.revision !== retainedStateOnFailure.revision;
+        const armedAt = this.state.armedAt;
+        this.state = retainedStateOnFailure.state;
+        if (newerOwnerIntent) {
+          // Input/cancellation can arrive while the failed write is awaited.
+          // Restore uncertain delivery evidence without resurrecting unsent intentions.
+          this.state.armedAt = armedAt;
+          this.state.pending = undefined;
+          this.state.nextRetryAt = undefined;
+        }
+      }
       this.state.phase = 'blocked';
       this.state.needsAttention = true;
       this.state.circuitOpen = true;
       this.event('attention', 'persistence-failed');
       this.deps.changed(this.getStatus());
+      if (retainedStateOnFailure) return false;
       throw new Error('Recovery state could not be saved');
     }
     this.deps.changed(this.getStatus());
+    return true;
   }
 
   async updateConfig(patch: Partial<RecoveryConfig>): Promise<RecoveryState> {
@@ -290,13 +304,23 @@ export class RecoveryController {
         const revision = this.revision;
         const observation = await this.deps.observe();
         if (this.stopped || revision !== this.revision) return this.getStatus();
-        const before = JSON.stringify(this.state);
+        const retained = this.getStatus();
+        const restoredFlight = this.restoredFlight;
+        const flightObservationComplete = this.flightObservationComplete;
+        const before = JSON.stringify(retained);
         this.state.activity = observation.activity;
         this.state.conversationId = observation.conversationId;
         const hadFlight = !!this.state.inFlight;
         if (hadFlight) this.reconcileFlight(observation);
         else if (!this.state.pending && !this.state.circuitOpen) this.state.lastReason = observation.reason;
-        if (JSON.stringify(this.state) !== before) await this.save();
+        if (JSON.stringify(this.state) !== before) {
+          if (!(await this.save({ state: retained, revision }))) {
+            // A read still reports the durable uncertainty and persistence veto.
+            // Mutation/action callers keep the throwing save contract.
+            this.restoredFlight = restoredFlight;
+            this.flightObservationComplete = flightObservationComplete;
+          }
+        }
         return this.getStatus();
       } finally {
         this.arm();

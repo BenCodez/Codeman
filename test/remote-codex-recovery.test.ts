@@ -2,7 +2,7 @@
 import { describe, expect, it } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { access, chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
@@ -253,12 +253,13 @@ describe('remote Codex evidence protocol', () => {
       const screenFile = join(root, 'screen');
       const actionLog = join(root, 'actions');
       const promptFile = join(root, 'last-prompt');
+      const restoreStateFile = join(root, 'restore-state.json');
       await writeFile(paneFile, '0|||%7|4242\n');
       await writeFile(screenFile, '›\n');
       await writeFile(actionLog, '');
       await writeFile(
         fakeTmux,
-        `#!/bin/sh\ncase "$*" in\n  *has-session*)\n    [ -n "$FIXTURE_PROBE_APPEND_FILE" ] && printf '%s\\n' "$FIXTURE_PROBE_APPEND_ROW" >> "$FIXTURE_PROBE_APPEND_FILE"\n    [ "$FIXTURE_SESSION_MISSING" = "1" ] && exit 1\n    exit 0 ;;\n  *list-panes*) cat "$FIXTURE_PANE_FILE" ;;\n  *capture-pane*) cat "$FIXTURE_SCREEN_FILE" ;;\n  *send-keys*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    for arg do last="$arg"; done\n    if [ "$4" = "-l" ]; then\n      [ -n "$FIXTURE_LITERAL_DELAY" ] && sleep "$FIXTURE_LITERAL_DELAY"\n      node -e 'require("fs").writeFileSync(process.env.FIXTURE_PROMPT_FILE,process.argv[1])' "$last"\n    elif [ "$last" = "Enter" ] && [ "$FIXTURE_APPEND_HISTORY" = "1" ]; then\n      node -e 'const fs=require("fs");fs.appendFileSync(process.env.FIXTURE_HISTORY_FILE,JSON.stringify({session_id:process.env.FIXTURE_HISTORY_SESSION,ts:Date.now()/1000,text:fs.readFileSync(process.env.FIXTURE_PROMPT_FILE,"utf8")})+"\\n")'\n    fi\n    ;;\n  *new-session*)\n    [ "$FIXTURE_RESTORE_RACE" = "1" ] && exit 1\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG" ;;\n  *respawn-pane*) printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG" ;;\n  *) exit 2 ;;\nesac\n`
+        `#!/bin/sh\ncase "$*" in\n  *has-session*)\n    [ -n "$FIXTURE_PROBE_APPEND_FILE" ] && printf '%s\\n' "$FIXTURE_PROBE_APPEND_ROW" >> "$FIXTURE_PROBE_APPEND_FILE"\n    [ "$FIXTURE_SESSION_MISSING" = "1" ] && exit 1\n    exit 0 ;;\n  *list-panes*)\n    if [ "$5" = '$17' ]; then\n      node -e 'const fs=require("fs"),s=JSON.parse(fs.readFileSync(process.env.FIXTURE_RESTORE_STATE_FILE,"utf8"));console.log((s.released?"1":"0")+"|%9|"+(process.env.FIXTURE_RESTORE_REPLACEMENT?9008:9009)+"|"+(s.released?(process.env.FIXTURE_STUB_BAD_EXIT?"0":"1"):"")+"|"+(process.env.FIXTURE_RESTORE_SERVER_RESTART?17001:17000))'\n    else cat "$FIXTURE_PANE_FILE"; fi ;;\n  *capture-pane*) cat "$FIXTURE_SCREEN_FILE" ;;\n  *send-keys*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    for arg do last="$arg"; done\n    if [ "$4" = "-l" ]; then\n      [ -n "$FIXTURE_LITERAL_DELAY" ] && sleep "$FIXTURE_LITERAL_DELAY"\n      node -e 'require("fs").writeFileSync(process.env.FIXTURE_PROMPT_FILE,process.argv[1])' "$last"\n    elif [ "$last" = "Enter" ] && [ "$FIXTURE_APPEND_HISTORY" = "1" ]; then\n      node -e 'const fs=require("fs");fs.appendFileSync(process.env.FIXTURE_HISTORY_FILE,JSON.stringify({session_id:process.env.FIXTURE_HISTORY_SESSION,ts:Date.now()/1000,text:fs.readFileSync(process.env.FIXTURE_PROMPT_FILE,"utf8")})+"\\n")'\n    fi\n    ;;\n  *new-session*)\n    [ "$FIXTURE_RESTORE_RACE" = "1" ] && exit 1\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    node -e 'require("fs").writeFileSync(process.env.FIXTURE_RESTORE_STATE_FILE,JSON.stringify({createdArgs:process.argv.slice(1),released:false,configured:false,workerStarted:false}))' -- "$@"\n    printf '%s\\n' '$17|%9|9009|17000' ;;\n  *set-option*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    [ "$FIXTURE_CONFIG_FAILURE" = "1" ] && exit 1\n    node -e 'const fs=require("fs"),p=process.env.FIXTURE_RESTORE_STATE_FILE,s=JSON.parse(fs.readFileSync(p,"utf8"));s.configured=true;s.configArgs=process.argv.slice(1);fs.writeFileSync(p,JSON.stringify(s));if(process.env.FIXTURE_RESTORE_CONFIG_APPEND_FILE)fs.appendFileSync(process.env.FIXTURE_RESTORE_CONFIG_APPEND_FILE,process.env.FIXTURE_RESTORE_CONFIG_APPEND_ROW+"\\n")' -- "$@" ;;\n  *wait-for*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    node -e 'const fs=require("fs"),p=process.env.FIXTURE_RESTORE_STATE_FILE,s=JSON.parse(fs.readFileSync(p,"utf8"));if(!s.configured)process.exit(2);s.released=!process.env.FIXTURE_HOLD_RELEASE;fs.writeFileSync(p,JSON.stringify(s))' ;;\n  *respawn-pane*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    if [ "$7" = '%9' ]; then\n      node -e 'const fs=require("fs"),p=process.env.FIXTURE_RESTORE_STATE_FILE,s=JSON.parse(fs.readFileSync(p,"utf8"));if(!s.released||!s.configured||process.env.FIXTURE_LIVE_BEFORE_RESPAWN)process.exit(2);s.workerStarted=true;s.workerArgs=process.argv.slice(1);s.workerDead=process.env.FIXTURE_FAST_CODEX_FAILURE==="1";s.workerStatus=s.workerDead?17:undefined;s.workerScreen=s.workerDead?"Authentication failed fixture":undefined;fs.writeFileSync(p,JSON.stringify(s))' -- "$@"\n    fi ;;\n  *) exit 2 ;;\nesac\n`
       );
       await chmod(fakeTmux, 0o755);
       await writeFile(
@@ -289,6 +290,7 @@ describe('remote Codex evidence protocol', () => {
             FIXTURE_SCREEN_FILE: screenFile,
             FIXTURE_ACTION_LOG: actionLog,
             FIXTURE_PROMPT_FILE: promptFile,
+            FIXTURE_RESTORE_STATE_FILE: restoreStateFile,
           },
           timeout: 5_000,
           maxBuffer: 768 * 1024,
@@ -319,6 +321,7 @@ describe('remote Codex evidence protocol', () => {
             FIXTURE_SCREEN_FILE: screenFile,
             FIXTURE_ACTION_LOG: actionLog,
             FIXTURE_PROMPT_FILE: promptFile,
+            FIXTURE_RESTORE_STATE_FILE: restoreStateFile,
             ...extraEnv,
           },
           timeout: 10_000,
@@ -416,7 +419,7 @@ describe('remote Codex evidence protocol', () => {
         },
       });
       await task.update({
-        objective: 'Complete the bounded remote fixture task with safe Unicode Ω 😀 and a tab\t.',
+        objective: 'Complete the bounded remote fixture task with safe Unicode Ω 😀 and multiline\ntext.',
         criteria: Array.from({ length: 9 }, (_, index) => ({
           id: `criterion-${index}`,
           description: 'd'.repeat(1000),
@@ -487,10 +490,126 @@ describe('remote Codex evidence protocol', () => {
         )
       ).toBe('sent');
       const restoredArgs = await (await import('node:fs/promises')).readFile(actionLog, 'utf8');
-      expect(restoredArgs).toContain('new-session -d -s codeman-');
+      expect(restoredArgs).toContain('new-session -d -P -F');
       expect(restoredArgs).toContain(`resume ${resumed}`);
       expect(restoredArgs).toContain(home);
       expect(restoredArgs).not.toMatch(/(?:^|\s)-(?:A|k)(?:\s|$)/);
+      const restoredState = JSON.parse(await readFile(restoreStateFile, 'utf8'));
+      expect(restoredState.createdArgs.slice(-3)).toEqual([
+        '/bin/sh',
+        '-c',
+        expect.stringMatching(/^tmux -L codeman-remote wait-for codeman-restore-[a-f0-9]{32}; exit 1$/),
+      ]);
+      expect(restoredState.createdArgs.join(' ')).not.toContain(`resume ${resumed}`);
+      expect(restoredState.configArgs).toEqual([
+        '-L',
+        'codeman-remote',
+        'set-option',
+        '-t',
+        '$17',
+        'status',
+        'off',
+        ';',
+        'set-option',
+        '-t',
+        '$17',
+        'mouse',
+        'off',
+        ';',
+        'set-option',
+        '-t',
+        '$17',
+        'prefix',
+        'C-q',
+        ';',
+        'set-option',
+        '-s',
+        'escape-time',
+        '0',
+        ';',
+        'set-option',
+        '-t',
+        '$17',
+        'window-size',
+        'latest',
+        ';',
+        'set-option',
+        '-t',
+        '$17',
+        'remain-on-exit',
+        'failed',
+      ]);
+      const normalLaunch = buildRemoteLaunchCommand({ remote, mode: 'codex', sessionId: SESSION });
+      for (const setting of [
+        'status off',
+        'mouse off',
+        'prefix C-q',
+        'escape-time 0',
+        'window-size latest',
+        'remain-on-exit failed',
+      ])
+        expect(normalLaunch).toContain(setting);
+      const restoreLines = restoredArgs.trim().split('\n');
+      expect(restoreLines).toHaveLength(4);
+      expect(restoreLines[0]).toContain('new-session');
+      expect(restoreLines[1]).toContain('remain-on-exit failed');
+      expect(restoreLines[2]).toContain('wait-for -S');
+      expect(restoreLines[3]).toContain('respawn-pane');
+      expect(restoredState).toMatchObject({ configured: true, released: true, workerStarted: true });
+      // The fake actual command executor fails Codex immediately on dispatch.
+      // The configuration must already retain its diagnostic pane at that point.
+      await writeFile(actionLog, '');
+      expect(
+        parseRemoteCodexAction(
+          await runCommand(restoreCommand, home, {
+            FIXTURE_SESSION_MISSING: '1',
+            FIXTURE_FAST_CODEX_FAILURE: '1',
+          })
+        )
+      ).toBe('sent');
+      expect(JSON.parse(await readFile(restoreStateFile, 'utf8'))).toMatchObject({
+        configured: true,
+        released: true,
+        workerStarted: true,
+        workerDead: true,
+        workerStatus: 17,
+        workerScreen: 'Authentication failed fixture',
+      });
+      for (const refusal of [
+        'FIXTURE_CONFIG_FAILURE',
+        'FIXTURE_HOLD_RELEASE',
+        'FIXTURE_RESTORE_REPLACEMENT',
+        'FIXTURE_LIVE_BEFORE_RESPAWN',
+        'FIXTURE_STUB_BAD_EXIT',
+        'FIXTURE_RESTORE_SERVER_RESTART',
+      ]) {
+        await writeFile(actionLog, '');
+        await expect(
+          runCommand(restoreCommand, home, {
+            FIXTURE_SESSION_MISSING: '1',
+            [refusal]: '1',
+          })
+        ).rejects.toThrow();
+        const refusedState = JSON.parse(await readFile(restoreStateFile, 'utf8'));
+        expect(refusedState.workerStarted).toBe(false);
+        expect(await readFile(actionLog, 'utf8')).not.toMatch(/(?:^|\s)-(?:A|k)(?:\s|$)/);
+      }
+
+      // New evidence during inert-pane setup must veto the final real worker dispatch.
+      await writeFile(actionLog, '');
+      await expect(
+        runCommand(restoreCommand, home, {
+          FIXTURE_SESSION_MISSING: '1',
+          FIXTURE_RESTORE_CONFIG_APPEND_FILE: resumedRollout.file,
+          FIXTURE_RESTORE_CONFIG_APPEND_ROW: JSON.stringify({
+            type: 'event_msg',
+            payload: { type: 'task_started', turn_id: 'new-owner-turn' },
+          }),
+        })
+      ).rejects.toThrow();
+      expect(JSON.parse(await readFile(restoreStateFile, 'utf8')).workerStarted).toBe(false);
+      expect(await readFile(actionLog, 'utf8')).not.toContain('respawn-pane');
+      await writeFile(resumedRollout.file, resumedRollout.text);
       await writeFile(actionLog, '');
       await expect(
         runCommand(restoreCommand, home, {

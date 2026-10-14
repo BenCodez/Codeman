@@ -951,6 +951,12 @@ export class TuiClient {
     }
   }
 
+  /** Switch admission must distinguish an unavailable key-table read from a free key. */
+  async readAttachSwitchBinding(key: string): Promise<string | null> {
+    const { stdout } = await this.exec('tmux', ['-L', this.socket, 'list-keys', '-T', 'root']);
+    return parsePrefixBinding(stdout, key, 'root');
+  }
+
   /**
    * Claim a key for `detach-client`. Best effort; a failure is not fatal to an
    * attach, and the caller advertises the key only if this returned true.

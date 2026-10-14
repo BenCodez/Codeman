@@ -2586,11 +2586,21 @@ export class WebServer extends EventEmitter {
     if (task) this.taskControllers.delete(id);
     if (controller) this.recoveryControllers.delete(id);
     this.actionArbiters.delete(id);
-    if (drop && ownsTaskState) {
-      await this.taskStore.drop(id);
-      await this.actionReservationStore.drop(id);
+    if (drop) {
+      for (const [name, owned, journal] of [
+        ['Task', ownsTaskState, this.taskStore],
+        ['Action reservation', ownsTaskState, this.actionReservationStore],
+        ['Recovery', ownsRecoveryState, this.recoveryStore],
+      ] as const) {
+        if (!owned) continue;
+        try {
+          await journal.drop(id);
+        } catch (err) {
+          // The owner may delete a worker even when optional evidence cannot be removed.
+          console.warn(`[Server] ${name} journal deletion failed: ${getErrorMessage(err)}`);
+        }
+      }
     }
-    if (drop && ownsRecoveryState) await this.recoveryStore.drop(id);
   }
 
   /**
@@ -2679,8 +2689,6 @@ export class WebServer extends EventEmitter {
       this.actionArbiters.has(id) ||
       rebootRestoreRegistry.hasOutstanding(id) ||
       !!recovery.inFlight ||
-      !!recovery.pending ||
-      recovery.nextRetryAt !== undefined ||
       taskJournalHasOwnership(this.taskStore.get(id)) ||
       taskJournalHasOwnership(this.actionReservationStore.get(id))
     );

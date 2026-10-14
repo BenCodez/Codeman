@@ -167,14 +167,14 @@ export class RecoveryStore {
     return result;
   }
 
-  /** Remove unreachable settings only; a durable action reservation remains evidence. */
+  /** Remove unreachable settings/intentions; a durable delivery reservation remains evidence. */
   pruneOrphans(keep: (id: string) => boolean): Promise<number> {
     if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
     const result = this.writes.then(async () => {
       const next = { ...this.records };
       let removed = 0;
       for (const [id, state] of Object.entries(next)) {
-        if (keep(id) || state.inFlight || state.pending || state.nextRetryAt !== undefined) continue;
+        if (keep(id) || state.inFlight) continue;
         delete next[id];
         removed++;
       }
