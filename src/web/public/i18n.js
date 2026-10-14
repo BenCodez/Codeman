@@ -137,9 +137,9 @@
     'Recover crashes': '恢复崩溃',
     'Resume the same verified conversation after an unexpected process exit.':
       '进程意外退出后，恢复同一个已验证的对话。',
-    'Detect stalls (alert only)': '检测停滞（仅提醒）',
-    'Raise an alert for stalled work. Silence alone never triggers recovery.':
-      '工作停滞时发出提醒。仅凭静默不会触发恢复。',
+    'Recover confirmed stalls': '恢复已确认的停滞',
+    'Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local pane died abnormally. Live silence only asks for attention.':
+      '仅当重复的结构化证据指向同一未完成轮次，且新探测确认其本地窗格异常退出时才重启。运行中的静默只会请求处理。',
     'Retry limits': '重试限制',
     'Maximum retries': '最大重试次数',
     'Stop automatic attempts when this limit is reached.': '达到此限制时停止自动尝试。',
@@ -150,8 +150,9 @@
     'Must be at least the initial retry delay.': '必须不小于初始重试延迟。',
     'Maximum recovery duration (seconds)': '最大恢复时长（秒）',
     'Stop trying after this total recovery window.': '超过此恢复总时长后停止尝试。',
-    'Stall alert delay (seconds)': '停滞提醒延迟（秒）',
-    'How long working activity can remain unchanged before an alert.': '工作活动保持不变多久后发出提醒。',
+    'Stall threshold (seconds)': '停滞阈值（秒）',
+    'How long the current structured turn can lack progress before confirmation begins.':
+      '当前结构化轮次多久没有进展后开始确认。',
     'Recent recovery events': '最近的恢复事件',
     'No recovery events yet': '尚无恢复事件',
     Action: '操作',
@@ -200,7 +201,9 @@
     'The process crashed': '进程已崩溃',
     'The process exited normally': '进程正常退出',
     'Terminal safety could not be verified': '无法验证终端安全条件',
-    'Working activity stalled; attention is required': '工作活动已停滞，需要处理',
+    'An unfinished turn and abnormal dead pane were confirmed': '已确认未完成轮次和异常退出的窗格',
+    'No progress was observed; inspect the live agent and retry from its terminal':
+      '未观察到进展；请检查运行中的代理并从其终端重试',
     'Recovery is scheduled': '已安排恢复',
     'Continuation sent; awaiting confirmation': '已发送继续指令，等待确认',
     'Conversation resumed; awaiting confirmation': '对话已恢复，等待确认',

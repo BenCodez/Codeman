@@ -1566,8 +1566,8 @@
                       <label class="switch switch-sm"><input type="checkbox" id="recoveryCrashes" checked aria-label="Recover crashes" onchange="app.saveRecoverySetting('recoverCrashes', this)"><span class="slider"></span></label>
                     </div>
                     <div class="set-row">
-                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Detect stalls (alert only)</label><span class="set-row-desc">Raise an alert for stalled work. Silence alone never triggers recovery.</span></div>
-                      <label class="switch switch-sm"><input type="checkbox" id="recoveryStalls" aria-label="Detect stalls (alert only)" onchange="app.saveRecoverySetting('detectStalls', this)"><span class="slider"></span></label>
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Recover confirmed stalls</label><span class="set-row-desc">Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local pane died abnormally. Live silence only asks for attention.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryStalls" aria-label="Recover confirmed stalls" onchange="app.saveRecoverySetting('detectStalls', this)"><span class="slider"></span></label>
                     </div>
                   </div>
                 </div>
@@ -1591,7 +1591,7 @@
                       <input class="set-input recovery-number" id="recoveryMaxDuration" type="number" min="10" max="3600" step="1" value="900" onchange="app.saveRecoverySetting('maxRecoveryDurationMs', this)">
                     </div>
                     <div class="set-row">
-                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalledAfter">Stall alert delay (seconds)</label><span class="set-row-desc">How long working activity can remain unchanged before an alert.</span></div>
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalledAfter">Stall threshold (seconds)</label><span class="set-row-desc">How long the current structured turn can lack progress before confirmation begins.</span></div>
                       <input class="set-input recovery-number" id="recoveryStalledAfter" type="number" min="10" max="3600" step="1" value="300" onchange="app.saveRecoverySetting('stalledAfterMs', this)">
                     </div>
                   </div>

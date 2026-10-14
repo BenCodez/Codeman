@@ -117,6 +117,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
   let submissionHash: string | undefined;
   let progressAt = 0;
   let hasTurnStart = false;
+  let turnStartedAt = 0;
   const pendingAgents = new Set<string>();
   const updateChild = (rawId: unknown, status: unknown): boolean => {
     const id = token(rawId);
@@ -164,12 +165,14 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
       // A new prompt can precede task_started in the journal. It already supersedes the old failure.
       turnId = undefined;
       hasTurnStart = false;
+      turnStartedAt = 0;
       terminalError = undefined;
       update('working', 'turn-running');
     }
     if (p.type === 'task_started' || p.type === 'turn_started') {
       turnId = token(p.turn_id);
       hasTurnStart = !!turnId;
+      turnStartedAt = turnId ? at : 0;
       terminalError = undefined;
       update(turnId ? 'working' : 'unknown', turnId ? 'turn-running' : 'observing');
     } else if (p.type === 'stream_error' || p.type === 'auth_recovery_started') {
@@ -242,6 +245,10 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
   result.submissionKey = submissionKey;
   result.submissionHash = submissionHash;
   result.progressAt = progressAt || result.at;
+  if (result.activity === 'working' && result.reason === 'turn-running' && hasTurnStart && turnId && turnStartedAt) {
+    result.stallEvidenceKey = `${context.conversationId}:${turnId}:${turnStartedAt}:stalled`;
+  }
+  // Structured child activity still vetoes recovery when a dead parent has no screen.
   if (context.screen === null && (context.watching || pendingAgents.size)) {
     return { ...result, activity: 'watching', reason: 'background-work', safeToAct: false };
   }

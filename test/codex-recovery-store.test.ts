@@ -6,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import { initialRecoveryState, type RecoveryReason, type RecoveryState } from '../src/recovery/types.js';
+import { registerRecoveryRoutes } from '../src/web/routes/recovery-routes.js';
+import { createRouteTestHarness } from './routes/_route-test-utils.js';
 import { safeRmHomeTree } from './mocks/index.js';
 
 const NOW = Date.UTC(2026, 9, 13, 12);
@@ -98,10 +100,11 @@ describe('recovery journal durability', () => {
       nextRetryAt: NOW + 3000,
       phase: 'recovering',
       inFlight: {
-        key: 'failure-2',
-        action: 'continue',
+        key: 'stall-turn-2',
+        action: 'restart',
         conversationId: THREAD,
         startedAt: NOW,
+        reason: 'stalled',
         previousSubmissionKey: 'last-user-message',
       },
       handledEvidence: ['failure-1'],
@@ -313,6 +316,97 @@ describe('recovery journal durability', () => {
     restarted.stop();
     expect(act).not.toHaveBeenCalled();
   });
+
+  it('preserves a saved stall warning through reconstruction, GET inspection and timer polling until progress', async () => {
+    vi.useFakeTimers();
+    let now = NOW;
+    const act = vi.fn(async () => 'sent' as const);
+    const observation = {
+      activity: 'working' as const,
+      reason: 'turn-running' as const,
+      at: NOW - 20_000,
+      progressAt: NOW - 20_000,
+      conversationId: THREAD,
+      stallEvidenceKey: 'unfinished-turn',
+      safeToAct: false,
+    };
+    const store = new RecoveryStore(path);
+    const state = savedState({ attempts: 1, failedAttempts: 1, windowStartedAt: NOW - 1000 });
+    state.config.detectStalls = true;
+    state.config.stalledAfterMs = 10_000;
+    const controller = new RecoveryController(
+      {
+        observe: async () => observation,
+        act,
+        persist: (next) => store.save('work', next),
+        changed: () => {},
+        now: () => now,
+      },
+      state
+    );
+    let restarted: RecoveryController | undefined;
+    let harness: Awaited<ReturnType<typeof createRouteTestHarness>> | undefined;
+    try {
+      await controller.refresh();
+      now += 2000;
+      await controller.refresh();
+      controller.stop();
+      await store.flush();
+      const restoredStore = new RecoveryStore(path);
+      restarted = new RecoveryController(
+        {
+          observe: async () => observation,
+          act,
+          persist: (next) => restoredStore.save('work', next),
+          changed: () => {},
+          now: () => now,
+        },
+        restoredStore.get('work')
+      );
+      harness = await createRouteTestHarness((app, ctx) =>
+        registerRecoveryRoutes(app, { ...ctx, getRecoveryController: () => restarted! })
+      );
+      Object.assign(harness.ctx._session, { mode: 'codex' });
+      const response = await harness.app.inject({ method: 'GET', url: '/api/sessions/test-session-1/recovery' });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data).toMatchObject({
+        phase: 'paused',
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+        attempts: 1,
+      });
+      now += 5000;
+      await vi.advanceTimersByTimeAsync(5000);
+      await restarted.drain();
+      expect(restarted.getStatus()).toMatchObject({
+        phase: 'paused',
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+        attempts: 1,
+      });
+      expect(restarted.getStatus().pending).toBeUndefined();
+      expect(restarted.getStatus().inFlight).toBeUndefined();
+      expect(act).not.toHaveBeenCalled();
+
+      observation.progressAt += 1000; // New structured progress clears attention even when it is already old.
+      await restarted.inspect();
+      expect(restarted.getStatus()).toMatchObject({
+        needsAttention: false,
+        lastReason: 'turn-running',
+        attempts: 1,
+        failedAttempts: 1,
+        windowStartedAt: NOW - 1000,
+      });
+      await restarted.refresh();
+      expect(restarted.getStatus().needsAttention).toBe(false);
+      expect(act).not.toHaveBeenCalled();
+    } finally {
+      controller.stop();
+      restarted?.stop();
+      if (harness) await harness.app.close();
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe('corrupt journals fail closed', () => {
@@ -342,6 +436,15 @@ describe('corrupt journals fail closed', () => {
       { version: 1, sessions: { bad: { ...savedState(), lastReason: 'raw secret diagnostic' } } },
     ],
     ['unknown state field', { version: 1, sessions: { bad: { ...savedState(), transcript: 'raw sensitive text' } } }],
+    ...[
+      { key: 'raw private diagnostic', conversationId: THREAD, progressAt: NOW },
+      { key: 'turn', conversationId: 'unverified', progressAt: NOW },
+      { key: 'turn', conversationId: THREAD, progressAt: -1 },
+      { key: 'turn', conversationId: THREAD, progressAt: NOW, transcript: 'raw sensitive text' },
+    ].map((stallAlert) => [
+      'invalid stall warning identity',
+      { version: 1, sessions: { bad: { ...savedState(), stallAlert } } },
+    ]),
     [
       'unknown config field',
       { version: 1, sessions: { bad: { ...savedState(), config: { ...savedState().config, command: 'arbitrary' } } } },

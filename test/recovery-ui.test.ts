@@ -87,6 +87,24 @@ function enabledState(): RecoveryState {
 }
 
 describe('Recovery Session Options', () => {
+  it('allows guarded manual stall retries while automatic recovery is off', async () => {
+    const state = initialRecoveryState();
+    state.config.detectStalls = true;
+    state.activity = 'working';
+    state.lastReason = 'turn-running';
+    const h = harness(state);
+    await h.open();
+    expect(h.button('recoveryRetryBtn').disabled).toBe(false);
+    await h.app.retryRecovery();
+    await vi.waitFor(() =>
+      expect(h.fetchMock).toHaveBeenCalledWith(
+        '/api/sessions/session-a/recovery/retry',
+        expect.objectContaining({ method: 'POST' })
+      )
+    );
+    h.app._onSessionRecovery({ sessionId: 'session-a', state: { ...state, circuitOpen: true } });
+    expect(h.button('recoveryRetryBtn').disabled).toBe(true);
+  });
   it('gates the tab on catalog capability and does not fetch unsupported modes', () => {
     const h = harness();
     h.browser.__codemanCliCatalog = [{ id: 'codex', external: true }];
@@ -148,7 +166,7 @@ describe('Recovery Session Options', () => {
       ['/api/sessions/session-a/recovery/config', 'PUT', { retryDelayMs: 25_000 }],
     ]);
     expect(h.input('recoveryRetryDelay').value).toBe('25');
-    expect(h.get('recovery-tab').textContent).toContain('Silence alone never triggers recovery.');
+    expect(h.get('recovery-tab').textContent).toContain('Live silence only asks for attention.');
   });
 
   it('rejects invalid limits and preserves the confirmed values', async () => {

@@ -67,6 +67,7 @@ export type RecoveryReason =
   | 'clean-exit'
   | 'pane-unverified'
   | 'stalled'
+  | 'stall-unverified'
   | 'scheduled'
   | 'continuation-sent'
   | 'process-resumed'
@@ -86,6 +87,10 @@ export interface RecoveryObservation {
   conversationId?: string;
   /** Current-turn failure or process-exit identity. Repeated observations share this key. */
   evidenceKey?: string;
+  /** Stable identity for a structured turn that started but has no terminal event. */
+  stallEvidenceKey?: string;
+  /** True only when a fresh local pane probe also proves an abnormal dead process. */
+  stallRestartable?: boolean;
   /** Last structured user-message identity, for verifying that a continuation was accepted. */
   submissionKey?: string;
   turnId?: string;
@@ -110,6 +115,7 @@ export interface RecoveryFlight {
   action: RecoveryAction;
   conversationId: string;
   startedAt: number;
+  reason?: RecoveryReason;
   previousSubmissionKey?: string;
 }
 
@@ -128,8 +134,10 @@ export interface RecoveryState {
   lastReason: RecoveryReason;
   circuitOpen: boolean;
   needsAttention: boolean;
+  /** Durable warning identity only. Fresh private dead-pane confirmations are still required to restart. */
+  stallAlert?: { key: string; conversationId: string; progressAt: number };
   inFlight?: RecoveryFlight;
-  pending?: { key: string; action: RecoveryAction; conversationId: string };
+  pending?: { key: string; action: RecoveryAction; conversationId: string; reason?: RecoveryReason };
   handledEvidence: string[];
   history: RecoveryEvent[];
 }

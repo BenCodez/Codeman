@@ -16,7 +16,7 @@ import { resolveCodexIdentity, type CodexIdentityResult } from '../src/recovery/
 import type { RecoveryFlight, RecoveryObservation } from '../src/recovery/types.js';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
-import { createDeferred } from './mocks/index.js';
+import { createDeferred, safeRmHomeTree } from './mocks/index.js';
 
 vi.mock('../src/recovery/codex-identity.js', () => ({ resolveCodexIdentity: vi.fn() }));
 vi.mock('../src/session-env-clamp.js', () => ({
@@ -74,6 +74,10 @@ function completedTail(): string {
       event({ type: 'task_complete', turn_id: 'fixture-turn', last_agent_message: null }, NOW - 9_000),
     ].join('\n') + '\n'
   );
+}
+
+function activeTail(): string {
+  return event({ type: 'task_started', turn_id: 'fixture-turn', model_context_window: null }, NOW - 20_000) + '\n';
 }
 
 beforeEach(() => {
@@ -645,6 +649,44 @@ describe('human input invalidates the current epoch', () => {
 });
 
 describe('authoritative agent exits and process readiness', () => {
+  it.each([true, false])(
+    'keeps unknown dead-pane lifecycle non-restartable with stored exit:%s',
+    async (storedExit) => {
+      for (const row of [
+        '{broken-json}',
+        event({ type: 'task_complete', turn_id: { unsupported: 'fixture-turn' } }, NOW - 9_000),
+      ]) {
+        const body = activeTail() + event(CHILD_SPAWN, NOW - 10_000) + '\n' + row + '\n';
+        await withRollout(body, async (f) => {
+          f.pane = { dead: true, status: 9, screen: null };
+          f.session.paneExit = storedExit ? { at: NOW - 10_000, status: 9 } : undefined;
+          expect(await f.adapter.observe()).toMatchObject({ activity: 'unknown', safeToAct: false });
+          expect((await f.adapter.observe()).stallRestartable).toBeUndefined();
+          expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+        });
+      }
+    }
+  );
+
+  it('vetoes a stall reservation when its final complete lifecycle becomes unknown', async () => {
+    await withRollout(activeTail(), async (f, writeBody) => {
+      f.pane = { dead: true, status: 9, screen: null };
+      f.session.paneExit = undefined;
+      const initial = await f.adapter.observe();
+      expect(initial.stallRestartable).toBe(true);
+      const reservation: RecoveryFlight = {
+        key: initial.stallEvidenceKey!,
+        action: 'restart',
+        reason: 'stalled',
+        conversationId: THREAD,
+        startedAt: NOW,
+      };
+      await writeBody(activeTail() + event(CHILD_SPAWN, NOW - 10_000) + '\n{broken-json}\n');
+      expect(await f.adapter.act(reservation)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    });
+  });
+
   it('authorizes restart only for a confirmed matching abnormal local exit', async () => {
     const f = fixture();
     f.pane = { dead: true, status: 1, screen: null };
@@ -669,6 +711,202 @@ describe('authoritative agent exits and process readiness', () => {
     f.session.paneExit = { at: NOW - 10_000, status: 0 };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'exited', reason: 'clean-exit', safeToAct: false });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it('marks an unfinished current turn restartable only with a fresh abnormal dead-pane probe', async () => {
+    const f = fixture();
+    f.identity.tail = activeTail();
+    f.pane = { dead: true, status: 9, screen: null };
+    f.session.paneExit = undefined;
+    const observation = await f.adapter.observe();
+    expect(observation).toMatchObject({
+      activity: 'working',
+      reason: 'turn-running',
+      stallRestartable: true,
+      safeToAct: false,
+    });
+    expect(observation.stallEvidenceKey).toContain(`${THREAD}:fixture-turn:`);
+    const reservation: RecoveryFlight = {
+      key: observation.stallEvidenceKey!,
+      action: 'restart',
+      reason: 'stalled',
+      conversationId: THREAD,
+      startedAt: NOW,
+    };
+    expect(await f.adapter.act(reservation)).toBe('sent');
+  });
+
+  it.each([true, undefined])(
+    'vetoes stall restart proof from an incomplete local lifecycle tail (%s)',
+    async (tailTruncated) => {
+      const f = fixture();
+      f.identity.tail = activeTail();
+      f.identity.tailTruncated = tailTruncated;
+      f.pane = { dead: true, status: 9, screen: null };
+      f.session.paneExit = undefined;
+      const observation = await f.adapter.observe();
+      expect(observation.safeToAct).toBe(false);
+      expect(observation.stallRestartable).toBeUndefined();
+      const reservation: RecoveryFlight = {
+        key: observation.stallEvidenceKey!,
+        action: 'restart',
+        reason: 'stalled',
+        conversationId: THREAD,
+        startedAt: NOW,
+      };
+      expect(await f.adapter.act(reservation)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([false, true])(
+    'vetoes a dead parent while its structured child remains unfinished (stored exit %s)',
+    async (storedExit) => {
+      const f = fixture();
+      f.identity.tail =
+        activeTail() +
+        JSON.stringify({
+          timestamp: new Date(NOW - 10_000).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'collab_agent_spawn_end', new_thread_id: 'child-fixture' },
+        }) +
+        '\n';
+      f.pane = { dead: true, status: 9, screen: null };
+      f.session.paneExit = storedExit ? { at: NOW - 10_000, status: 9 } : undefined;
+      const observation = await f.adapter.observe();
+      expect(observation).toMatchObject({ activity: 'watching', reason: 'background-work', safeToAct: false });
+      expect(observation.stallRestartable).toBeUndefined();
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    }
+  );
+
+  it('cancels a stall restart when the final pane probe is live', async () => {
+    const f = fixture();
+    f.identity.tail = activeTail();
+    f.pane = { dead: true, status: 9, screen: null };
+    f.session.paneExit = undefined;
+    const observation = await f.adapter.observe();
+    const reservation: RecoveryFlight = {
+      key: observation.stallEvidenceKey!,
+      action: 'restart',
+      reason: 'stalled',
+      conversationId: THREAD,
+      startedAt: NOW,
+    };
+    f.pane = { dead: false, screen: READY };
+    expect(await f.adapter.act(reservation)).toBe('not-sent');
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { label: 'fresh progress', progressAge: 1951 },
+    { label: 'progress that is already silent again', progressAge: 15_000 },
+    { label: 'unchanged progress', progressAge: undefined },
+  ])('revalidates $label after a stall restart is durably reserved', async ({ progressAge }) => {
+    const f = fixture();
+    const root = await fs.mkdtemp(join(homedir(), 'codex-stall-delivery-'));
+    const directory = join(root, 'sessions', '2026', '10', '13');
+    const rollout = join(directory, `rollout-2026-10-13T11-59-00-${THREAD}.jsonl`);
+    f.session.workingDir = join(root, 'workspace');
+    f.context.codexHome = root;
+    f.pane = { dead: true, status: 9, screen: null };
+    f.session.paneExit = undefined;
+    await fs.mkdir(directory, { recursive: true });
+    await fs.mkdir(f.session.workingDir);
+    await fs.writeFile(
+      rollout,
+      JSON.stringify({
+        timestamp: new Date(NOW - 60_000).toISOString(),
+        type: 'session_meta',
+        payload: { id: THREAD, cwd: f.session.workingDir, originator: `codeman_${SESSION}` },
+      }) +
+        '\n' +
+        activeTail()
+    );
+    const actualIdentity = await vi.importActual<typeof import('../src/recovery/codex-identity.js')>(
+      '../src/recovery/codex-identity.js'
+    );
+    resolver.mockImplementation(actualIdentity.resolveCodexIdentity);
+    const store = new RecoveryStore(join(root, 'recovery.json'));
+    const observations: RecoveryObservation[] = [];
+    let reserved = false;
+    const controller = new RecoveryController({
+      observe: async () => {
+        const observation = await f.adapter.observe();
+        observations.push(structuredClone(observation));
+        return observation;
+      },
+      act: (reservation, isCurrent) => f.adapter.act(reservation, isCurrent),
+      persist: async (state) => {
+        await store.save(SESSION, state);
+        if (state.inFlight && !reserved) {
+          reserved = true;
+          expect(new RecoveryStore(join(root, 'recovery.json')).get(SESSION).inFlight).toEqual(state.inFlight);
+          expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+          if (progressAge !== undefined) {
+            await fs.appendFile(
+              rollout,
+              event({ type: 'exec_command_end', call_id: 'fixture-exec' }, Date.now() - progressAge) + '\n'
+            );
+          }
+        }
+      },
+      changed: () => {},
+      now: () => Date.now(),
+    });
+    try {
+      await controller.updateConfig({ enabled: true, detectStalls: true, stalledAfterMs: 10_000, retryDelayMs: 1000 });
+      await controller.refresh();
+      vi.setSystemTime(NOW + 2000);
+      await controller.refresh();
+      expect(controller.getStatus().pending).toMatchObject({
+        action: 'restart',
+        reason: 'stalled',
+        conversationId: THREAD,
+      });
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+      vi.setSystemTime(NOW + 3000);
+      await controller.refresh();
+      expect(reserved).toBe(true);
+      expect(observations.at(-1)).toMatchObject({ stallRestartable: true, progressAt: NOW - 20_000 });
+      const finalObservation = await f.adapter.observe();
+      expect(finalObservation.stallEvidenceKey).toBe(observations.at(-1)?.stallEvidenceKey);
+      expect(finalObservation.stallRestartable).toBe(true);
+      if (progressAge !== undefined) {
+        expect(finalObservation.progressAt).toBe(Date.now() - progressAge);
+        expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+        expect(controller.getStatus()).toMatchObject({ lastReason: 'delivery-failed', attempts: 1, failedAttempts: 1 });
+        expect(controller.getStatus().inFlight).toBeUndefined();
+        expect(controller.getStatus().history.some((entry) => entry.reason === 'process-resumed')).toBe(false);
+      } else {
+        expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+        expect(controller.getStatus()).toMatchObject({ lastReason: 'process-resumed', attempts: 1, failedAttempts: 0 });
+        expect(controller.getStatus().inFlight).toMatchObject({ action: 'restart', conversationId: THREAD });
+      }
+    } finally {
+      controller.stop();
+      await safeRmHomeTree(root);
+    }
+  });
+
+  it('never makes a live silent turn, clean dead pane, or user stop restartable', async () => {
+    const live = fixture();
+    live.identity.tail = activeTail();
+    expect(await live.adapter.observe()).toMatchObject({ activity: 'working', safeToAct: false });
+    expect((await live.adapter.observe()).stallRestartable).toBeUndefined();
+
+    const clean = fixture();
+    clean.identity.tail = activeTail();
+    clean.pane = { dead: true, status: 0, screen: null };
+    clean.session.paneExit = { at: NOW - 1_000, status: 0 };
+    expect(await clean.adapter.observe()).toMatchObject({ activity: 'exited', safeToAct: false });
+
+    const stopped = fixture();
+    stopped.identity.tail = activeTail();
+    stopped.pane = { dead: true, status: 9, screen: null };
+    stopped.session.paneExit = undefined;
+    stopped.context.intentionalStopAt = NOW - 19_000;
+    expect(await stopped.adapter.observe()).toMatchObject({ reason: 'pane-unverified', safeToAct: false });
   });
 
   it('requires a positive signal or numeric abnormal status and agreement with stored exit evidence', async () => {

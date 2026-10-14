@@ -119,6 +119,16 @@ describe('the actual Session recovery boundary', () => {
     }
   );
 
+  it('does not let a stall reservation weaken the dead abnormal-pane restart boundary', async () => {
+    for (const patch of [{ dead: false }, { dead: true, status: 0 }, { dead: true, status: undefined }]) {
+      const f = fixture();
+      f.flight.reason = 'stalled';
+      Object.assign(f.pane, patch);
+      expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
+      expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    }
+  });
+
   it('pauses instead of inventing a new conversation when the exact identity differs', async () => {
     const f = fixture();
     f.flight.conversationId = '22222222-2222-3333-4444-555555555555';

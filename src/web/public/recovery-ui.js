@@ -46,7 +46,8 @@ const RECOVERY_UI_REASONS = Object.freeze({
   'process-crashed': 'The process crashed',
   'clean-exit': 'The process exited normally',
   'pane-unverified': 'Terminal safety could not be verified',
-  stalled: 'Working activity stalled; attention is required',
+  stalled: 'An unfinished turn and abnormal dead pane were confirmed',
+  'stall-unverified': 'No progress was observed; inspect the live agent and retry from its terminal',
   scheduled: 'Recovery is scheduled',
   'continuation-sent': 'Continuation sent; awaiting confirmation',
   'process-resumed': 'Conversation resumed; awaiting confirmation',
@@ -209,7 +210,10 @@ Object.assign(CodemanApp.prototype, {
         view.loading ||
         state.circuitOpen ||
         !!state.inFlight ||
-        !['interrupted', 'crashed'].includes(state.activity) ||
+        !(
+          ['interrupted', 'crashed'].includes(state.activity) ||
+          (state.config.detectStalls && state.activity === 'working')
+        ) ||
         ['managed-daemon', 'unsupported-location', 'unowned-session'].includes(state.lastReason);
     }
     const reset = document.getElementById('recoveryResetBtn');

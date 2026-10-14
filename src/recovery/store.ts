@@ -37,6 +37,7 @@ const ReasonSchema = z.enum([
   'clean-exit',
   'pane-unverified',
   'stalled',
+  'stall-unverified',
   'scheduled',
   'continuation-sent',
   'process-resumed',
@@ -55,7 +56,14 @@ const Evidence = z
   .string()
   .max(250)
   .regex(/^[\w:.-]+$/);
-const Pending = z.object({ key: Evidence, action: z.enum(['continue', 'restart']), conversationId: IdSchema }).strict();
+const Pending = z
+  .object({
+    key: Evidence,
+    action: z.enum(['continue', 'restart']),
+    conversationId: IdSchema,
+    reason: ReasonSchema.optional(),
+  })
+  .strict();
 const StateSchema = z
   .object({
     version: z.literal(1),
@@ -83,6 +91,7 @@ const StateSchema = z
     lastReason: ReasonSchema,
     circuitOpen: z.boolean(),
     needsAttention: z.boolean(),
+    stallAlert: z.object({ key: Evidence, conversationId: IdSchema, progressAt: Stamp }).strict().optional(),
     inFlight: Pending.extend({ startedAt: Stamp, previousSubmissionKey: z.string().max(100).optional() }).optional(),
     pending: Pending.optional(),
     handledEvidence: z.array(Evidence).max(32),

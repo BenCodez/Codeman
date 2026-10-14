@@ -66,6 +66,7 @@ export class CodexRecoveryAdapter {
     key: string;
     generation: number;
     conversationId: string;
+    stallProgressAt?: number;
     remotePane?: RemoteCodexRestartRequest['expectedPane'] & RemoteCodexIdentityGuard;
   };
   private remotePromptProof?: {
@@ -362,8 +363,19 @@ export class CodexRecoveryAdapter {
     let observation: RecoveryObservation;
     if (pane.dead) {
       const exit = session.paneExit;
+      const classified = classifyCodexTail(identity.tail, {
+        conversationId: identity.conversationId,
+        now: Date.now(),
+        screen: null,
+        busy: false,
+        watching: !!session.watching,
+        tailTruncated: identity.tailTruncated,
+        lastIntentionalStopAt: context.intentionalStopAt,
+      });
       if (pane.status === 0 && !pane.signal) {
         observation = { activity: 'exited', reason: 'clean-exit', at: exit?.at ?? Date.now(), safeToAct: false };
+      } else if (classified.activity === 'watching' || classified.activity === 'unknown') {
+        observation = classified;
       } else if (
         exit &&
         pane.status === exit.status &&
@@ -390,6 +402,16 @@ export class CodexRecoveryAdapter {
                 evidenceKey: `${identity.conversationId}:pane:${exit.at}:${pane.status ?? pane.signal}`,
                 safeToAct: context.intentionalStopAt < exit.at - 2000,
               };
+      } else if (
+        classified.activity === 'working' &&
+        classified.reason === 'turn-running' &&
+        classified.stallEvidenceKey &&
+        ((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0) &&
+        context.intentionalStopAt < (classified.progressAt ?? classified.at) - 2000
+      ) {
+        // The rollout proves which current turn is unfinished; the fresh pane probe proves
+        // the process is abnormally dead. Neither fact alone authorizes a restart.
+        observation = { ...classified, stallRestartable: true };
       } else observation = unknown('pane-unverified');
     } else {
       observation = classifyCodexTail(identity.tail, {
@@ -410,11 +432,18 @@ export class CodexRecoveryAdapter {
     observation.conversationId = identity.conversationId;
     // A bounded suffix can hide an earlier still-live child, including after the parent process exits.
     observation.safeToAct = observation.safeToAct && identity.tailTruncated === false;
-    if (observation.safeToAct && observation.evidenceKey) {
+    if (identity.tailTruncated !== false) delete observation.stallRestartable;
+    const proofKey = observation.safeToAct
+      ? observation.evidenceKey
+      : observation.stallRestartable
+        ? observation.stallEvidenceKey
+        : undefined;
+    if (proofKey) {
       this.proof = {
-        key: observation.evidenceKey,
+        key: proofKey,
         generation: context.generation,
         conversationId: identity.conversationId,
+        ...(observation.stallRestartable ? { stallProgressAt: observation.progressAt ?? observation.at } : {}),
       };
     }
     return observation;
@@ -426,13 +455,16 @@ export class CodexRecoveryAdapter {
       return 'not-sent';
     // Reads are repeated immediately before execution; a completed turn or new user input vetoes an old reservation.
     const current = await this.observe();
-    if (
-      !isCurrent() ||
-      !current.safeToAct ||
-      current.evidenceKey !== flight.key ||
-      !this.proof ||
-      this.proof.generation !== previous.generation
-    )
+    // The turn key survives appended progress. A stall needs the same silence
+    // baseline that the controller confirmed before its durable reservation.
+    const currentProvesAction =
+      flight.reason === 'stalled'
+        ? current.stallRestartable === true &&
+          current.stallEvidenceKey === flight.key &&
+          previous.stallProgressAt !== undefined &&
+          (current.progressAt ?? current.at) === previous.stallProgressAt
+        : current.safeToAct && current.evidenceKey === flight.key;
+    if (!isCurrent() || !currentProvesAction || !this.proof || this.proof.generation !== previous.generation)
       return 'not-sent';
     let result: 'sent' | 'not-sent' | 'unknown';
     if (this.session.remote) {

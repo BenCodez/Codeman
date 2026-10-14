@@ -210,6 +210,82 @@ describe('task and recovery server action wiring', () => {
     expect(task.getStatus()).toMatchObject({ reason: 'recovery-sent', continuations: 1, outcome: 'unknown' });
   });
 
+  it.each(['watching', 'paused', 'in-flight'] as const)(
+    'defers dead-turn stall attempts while the task owns recovery (%s)',
+    async (owner) => {
+      let now = Date.now();
+      vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({
+        observation: {
+          activity: 'idle',
+          reason: 'observing',
+          at: now,
+          conversationId: flight.conversationId,
+          submissionKey: 'before-kickoff',
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      });
+      vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockResolvedValue({
+        activity: 'working',
+        reason: 'turn-running',
+        at: now - 20_000,
+        progressAt: now - 20_000,
+        conversationId: flight.conversationId,
+        stallEvidenceKey: 'task-owned-stall',
+        stallRestartable: true,
+        safeToAct: false,
+      });
+      const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const { task, recovery, recoveryDeps } = controllers(`task-owned-stall-${owner}`);
+      recoveryDeps.now = () => now;
+      try {
+        await task.update({
+          objective: 'Finish the supervised work',
+          criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+          config: { enabled: true },
+        });
+        if (owner === 'in-flight') await task.resume();
+        if (owner === 'paused') await task.pause();
+        expect(task.getStatus().phase).toBe(owner === 'paused' ? 'paused' : 'watching');
+        expect(!!task.getStatus().inFlight).toBe(owner === 'in-flight');
+        await recovery.updateConfig({ detectStalls: true, stalledAfterMs: 10_000, maxRetries: 1 });
+
+        await recovery.retry();
+        now += 2000;
+        await recovery.retry();
+        if (owner === 'paused') {
+          expect(recoveryAct).toHaveBeenCalledOnce();
+          expect(recovery.getStatus()).toMatchObject({ attempts: 1, failedAttempts: 0, circuitOpen: false });
+        } else {
+          expect(recoveryAct).not.toHaveBeenCalled();
+          expect(recovery.getStatus()).toMatchObject({ attempts: 0, failedAttempts: 0, circuitOpen: false });
+          expect(recovery.getStatus().inFlight).toBeUndefined();
+          expect(recovery.getStatus().pending).toBeUndefined();
+          expect(recovery.getStatus().windowStartedAt).toBeUndefined();
+
+          await task.pause();
+          await recovery.retry();
+          now += 2000;
+          await recovery.retry();
+          if (owner === 'in-flight') {
+            expect(task.getStatus()).toMatchObject({ phase: 'paused', inFlight: expect.any(Object) });
+            expect(recoveryAct).not.toHaveBeenCalled();
+            expect(recovery.getStatus()).toMatchObject({ attempts: 0, failedAttempts: 0, circuitOpen: false });
+            expect(recovery.getStatus().inFlight).toBeUndefined();
+          } else {
+            expect(recoveryAct).toHaveBeenCalledOnce();
+            expect(recovery.getStatus()).toMatchObject({ attempts: 1, failedAttempts: 0, circuitOpen: false });
+          }
+        }
+      } finally {
+        task.stop();
+        recovery.stop();
+      }
+    }
+  );
+
   it('settles an accepted kickoff when the owner completes the task before the acceptance poll', async () => {
     const observe = vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({
       observation: {

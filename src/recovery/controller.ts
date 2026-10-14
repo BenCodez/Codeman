@@ -27,6 +27,7 @@ export interface RecoveryDependencies {
 const POLL_MS = 5000;
 const ACCEPTANCE_TIMEOUT_MS = 60_000;
 const CONFIRM_MS = 2000;
+const STALL_CONFIRM_MAX_MS = 15_000;
 const promptHash = createHash('sha256').update(CONTINUATION_PROMPT).digest('hex');
 
 export class RecoveryController {
@@ -35,7 +36,13 @@ export class RecoveryController {
   private timer: ReturnType<typeof setTimeout> | undefined;
   private stopped = false;
   private revision = 0;
-  private confirmation?: { key: string; at: number };
+  private confirmation?: {
+    key: string;
+    kind: 'live-stall' | 'dead-stall' | 'failure';
+    at: number;
+    progressAt?: number;
+  };
+  private legacyStallAlert?: { conversationId: string; at: number };
   private restoredFlight: boolean;
   private flightObservationComplete = false;
 
@@ -44,6 +51,16 @@ export class RecoveryController {
     restored?: RecoveryState
   ) {
     this.state = structuredClone(restored ?? initialRecoveryState());
+    if (!this.state.stallAlert && this.state.lastReason === 'stall-unverified' && this.state.needsAttention) {
+      const alert = [...this.state.history]
+        .reverse()
+        .find((event) => event.kind === 'attention' && event.reason === 'stall-unverified');
+      if (alert && this.state.conversationId) {
+        // Older v1 journals have only a sanitized warning timestamp. Bind their
+        // warning to the next unchanged turn, without restoring action proof.
+        this.legacyStallAlert = { conversationId: this.state.conversationId, at: alert.at };
+      }
+    }
     const restoredPending = !!this.state.pending || this.state.nextRetryAt !== undefined;
     if (restoredPending) {
       // A pending action is only an intention, not a delivery reservation. It may be
@@ -125,14 +142,20 @@ export class RecoveryController {
   /** Cancel scheduled actions on ANY user input; an Escape is not an invitation to restart. */
   noteUserInput(): void {
     const canceledScheduledAction = !!this.state.pending || this.state.nextRetryAt !== undefined;
+    const canceledStallAlert = !!this.state.stallAlert || !!this.legacyStallAlert;
     this.revision++;
     this.confirmation = undefined;
+    this.state.stallAlert = undefined;
+    this.legacyStallAlert = undefined;
     this.state.armedAt = this.now();
     this.state.pending = undefined;
     this.state.nextRetryAt = undefined;
-    if (canceledScheduledAction && !this.stopped) {
-      this.state.phase = this.state.config.enabled ? 'watching' : 'idle';
-      this.event('state', 'user-input');
+    if ((canceledScheduledAction || canceledStallAlert) && !this.stopped) {
+      if (!this.state.inFlight && !this.state.circuitOpen) {
+        this.state.phase = this.state.config.enabled ? 'watching' : 'idle';
+        if (canceledStallAlert) this.state.needsAttention = false;
+        this.event('state', 'user-input');
+      }
       // Keep the input callback synchronous while serializing its cancellation
       // after any already-running observation/reservation save.
       void this.enqueue(async () => {
@@ -146,6 +169,11 @@ export class RecoveryController {
   }
 
   private event(kind: RecoveryEvent['kind'], reason: RecoveryReason): void {
+    if (kind === 'attention' && reason !== 'stall-unverified') {
+      // A newer attention event owns the warning; the old stall marker must not clear it.
+      this.state.stallAlert = undefined;
+      this.legacyStallAlert = undefined;
+    }
     this.state.lastReason = reason;
     this.state.history.push({ at: this.now(), kind, reason, attempt: this.state.attempts });
     this.state.history = this.state.history.slice(-100);
@@ -200,6 +228,8 @@ export class RecoveryController {
       this.state.phase = 'idle';
       this.restoredFlight = false;
       this.confirmation = undefined;
+      this.state.stallAlert = undefined;
+      this.legacyStallAlert = undefined;
       this.state.armedAt = this.now();
       this.event('reset', 'manual-reset');
       await this.save();
@@ -290,11 +320,19 @@ export class RecoveryController {
         const observation = await this.deps.observe();
         if (this.stopped || revision !== this.revision) return this.getStatus();
         const before = JSON.stringify(this.state);
+        this.invalidateConfirmation(observation);
+        const unchangedStall = this.retainStallAlert(observation);
         this.state.activity = observation.activity;
         this.state.conversationId = observation.conversationId;
         const hadFlight = !!this.state.inFlight;
         if (hadFlight) this.reconcileFlight(observation);
-        else if (!this.state.pending && !this.state.circuitOpen) this.state.lastReason = observation.reason;
+        else if (!this.state.pending && !this.state.circuitOpen) {
+          if (unchangedStall) {
+            this.state.lastReason = 'stall-unverified';
+            this.state.needsAttention = true;
+            this.state.phase = 'paused';
+          } else this.state.lastReason = observation.reason;
+        }
         if (JSON.stringify(this.state) !== before) await this.save();
         return this.getStatus();
       } finally {
@@ -314,6 +352,66 @@ export class RecoveryController {
     this.state.nextRetryAt = undefined;
     this.state.circuitOpen ||= circuit;
     this.event('attention', reason);
+  }
+
+  private detectsStall(observation: RecoveryObservation): boolean {
+    return (
+      this.state.config.detectStalls &&
+      observation.activity === 'working' &&
+      observation.reason === 'turn-running' &&
+      !!observation.conversationId &&
+      !!observation.stallEvidenceKey &&
+      this.now() - (observation.progressAt ?? observation.at) >= this.state.config.stalledAfterMs
+    );
+  }
+
+  /** Status reads may invalidate proof but never count as an action confirmation. */
+  private invalidateConfirmation(observation: RecoveryObservation): void {
+    const confirmation = this.confirmation;
+    if (!confirmation) return;
+    const stall = this.detectsStall(observation);
+    const kind = stall ? (observation.stallRestartable === true ? 'dead-stall' : 'live-stall') : 'failure';
+    const failure = observation.activity === 'interrupted' || observation.activity === 'crashed';
+    if (
+      (!stall && (!failure || !observation.safeToAct)) ||
+      confirmation.kind !== kind ||
+      confirmation.key !== (stall ? observation.stallEvidenceKey : observation.evidenceKey) ||
+      (stall && confirmation.progressAt !== (observation.progressAt ?? observation.at))
+    ) {
+      this.confirmation = undefined;
+    }
+  }
+
+  /** Durable alerts carry warning identity, never the fresh pane proof required for an action. */
+  private retainStallAlert(observation: RecoveryObservation): boolean {
+    const progressAt = observation.progressAt ?? observation.at;
+    const alert = this.state.stallAlert ?? this.legacyStallAlert;
+    if (!alert) return false;
+    const sameThread = observation.conversationId === alert.conversationId;
+    const baseline = 'progressAt' in alert ? alert.progressAt : alert.at;
+    const resolved =
+      (observation.conversationId !== undefined && !sameThread) ||
+      (sameThread &&
+        (observation.activity === 'completed' ||
+          (observation.progressAt !== undefined && observation.progressAt > baseline))) ||
+      ('key' in alert && !!observation.stallEvidenceKey && observation.stallEvidenceKey !== alert.key) ||
+      observation.reason === 'user-input' ||
+      observation.reason === 'user-interrupted';
+    if (resolved) {
+      this.state.stallAlert = undefined;
+      this.legacyStallAlert = undefined;
+      if (!this.state.inFlight && !this.state.circuitOpen) {
+        // Settings may replace lastReason while this marker still owns attention.
+        this.state.needsAttention = false;
+        this.state.phase = observation.activity === 'completed' ? 'completed' : 'watching';
+      }
+      return false;
+    }
+    if (!this.state.stallAlert && sameThread && observation.stallEvidenceKey) {
+      this.state.stallAlert = { key: observation.stallEvidenceKey, conversationId: alert.conversationId, progressAt };
+      this.legacyStallAlert = undefined;
+    }
+    return true;
   }
 
   /** Reconcile only a known durable delivery reservation; this never authorizes an action. */
@@ -357,6 +455,8 @@ export class RecoveryController {
       observation = { activity: 'unknown', reason: 'identity-unverified', at: this.now(), safeToAct: false };
     }
     if (this.stopped || revision !== this.revision) return;
+    this.invalidateConfirmation(observation);
+    const unchangedStallAlert = this.retainStallAlert(observation);
     this.state.activity = observation.activity;
     this.state.conversationId = observation.conversationId;
 
@@ -374,12 +474,45 @@ export class RecoveryController {
     }
     if (this.state.circuitOpen) return;
     const failure = observation.activity === 'interrupted' || observation.activity === 'crashed';
+    const stallDetected = this.detectsStall(observation);
+    const restartableStall = stallDetected && observation.stallRestartable === true;
     const permitted =
       observation.activity === 'crashed' ? this.state.config.recoverCrashes : this.state.config.recoverInterrupted;
-    if (!failure || !permitted || !observation.safeToAct || !observation.conversationId || !observation.evidenceKey) {
+    const actionableFailure =
+      failure && permitted && observation.safeToAct && !!observation.conversationId && !!observation.evidenceKey;
+    if (!actionableFailure && !restartableStall) {
       this.state.pending = undefined;
       this.state.nextRetryAt = undefined;
-      this.confirmation = undefined;
+      if (unchangedStallAlert) {
+        this.state.phase = 'paused';
+        this.state.needsAttention = true;
+        this.state.lastReason = 'stall-unverified';
+        if (JSON.stringify(this.state) !== before) await this.save();
+        return;
+      }
+      if (stallDetected) {
+        const key = observation.stallEvidenceKey!;
+        const age = this.confirmation?.key === key ? this.now() - this.confirmation.at : Infinity;
+        if (this.confirmation?.key !== key || age > STALL_CONFIRM_MAX_MS)
+          this.confirmation = {
+            key,
+            kind: 'live-stall',
+            at: this.now(),
+            progressAt: observation.progressAt ?? observation.at,
+          };
+        else if (age >= CONFIRM_MS) {
+          // Repeated silence cannot prove a live Codex turn stopped. Ask the owner to
+          // inspect/retry it; never send Escape, continuation input, or kill the pane.
+          this.state.stallAlert = {
+            key,
+            conversationId: observation.conversationId!,
+            progressAt: observation.progressAt ?? observation.at,
+          };
+          this.block('stall-unverified');
+          if (JSON.stringify(this.state) !== before) await this.save();
+          return;
+        }
+      } else this.confirmation = undefined;
       if (observation.activity === 'completed') {
         this.state.phase = 'completed';
         this.state.needsAttention = false;
@@ -406,18 +539,18 @@ export class RecoveryController {
           this.state.needsAttention = false;
         }
       }
-      if (
-        this.state.config.detectStalls &&
-        observation.activity === 'working' &&
-        this.now() - (observation.progressAt ?? observation.at) >= this.state.config.stalledAfterMs
-      ) {
-        if (this.state.lastReason !== 'stalled') this.block('stalled');
-      } else if (this.state.lastReason !== observation.reason) this.event('state', observation.reason);
+      if (!stallDetected && this.state.lastReason !== observation.reason) this.event('state', observation.reason);
       if (JSON.stringify(this.state) !== before) await this.save();
       return;
     }
 
-    const key = observation.evidenceKey;
+    const key = restartableStall ? observation.stallEvidenceKey! : observation.evidenceKey!;
+    const action = restartableStall
+      ? ('restart' as const)
+      : observation.activity === 'crashed'
+        ? ('restart' as const)
+        : ('continue' as const);
+    const actionReason: RecoveryReason = restartableStall ? 'stalled' : observation.reason;
     if (this.state.handledEvidence.includes(key)) return;
     // Enabling recovery never replays old failures from a historical rollout. Manual Retry is explicit.
     const armedAt = this.state.armedAt ?? this.now();
@@ -427,10 +560,26 @@ export class RecoveryController {
       (!Number.isFinite(observation.liveProofAt) ||
         observation.liveProofAt > observation.at ||
         observation.liveProofAt < armedAt);
-    if (!manual && (observation.at < armedAt || invalidLiveProof)) return;
-    if (!manual && (this.confirmation?.key !== key || this.now() - this.confirmation.at < CONFIRM_MS)) {
-      this.confirmation ??= { key, at: this.now() };
-      if (this.confirmation.key !== key) this.confirmation = { key, at: this.now() };
+    if (!restartableStall && !manual && (observation.at < armedAt || invalidLiveProof)) return;
+    // A stall always needs repeated fresh probes. A manual click may waive delay for
+    // an explicit terminal failure, but it cannot turn one dead-pane read into proof.
+    if (
+      (restartableStall || !manual) &&
+      (this.confirmation?.key !== key ||
+        this.now() - this.confirmation.at < CONFIRM_MS ||
+        (restartableStall && this.now() - this.confirmation.at > STALL_CONFIRM_MAX_MS))
+    ) {
+      if (
+        !this.confirmation ||
+        this.confirmation.key !== key ||
+        (restartableStall && this.now() - this.confirmation.at > STALL_CONFIRM_MAX_MS)
+      )
+        this.confirmation = {
+          key,
+          kind: restartableStall ? 'dead-stall' : 'failure',
+          at: this.now(),
+          ...(restartableStall ? { progressAt: observation.progressAt ?? observation.at } : {}),
+        };
       return;
     }
     this.state.windowStartedAt ??= this.now();
@@ -447,8 +596,9 @@ export class RecoveryController {
     if (!this.state.pending || this.state.pending.key !== key) {
       this.state.pending = {
         key,
-        action: observation.activity === 'crashed' ? 'restart' : 'continue',
-        conversationId: observation.conversationId,
+        action,
+        conversationId: observation.conversationId!,
+        reason: actionReason,
       };
       const delay = Math.min(
         this.state.config.maxRetryDelayMs,
@@ -457,6 +607,7 @@ export class RecoveryController {
       this.state.nextRetryAt = manual ? this.now() : this.now() + delay;
       this.state.phase = 'watching';
       this.state.needsAttention = false;
+      if (restartableStall && this.state.lastReason !== 'stalled') this.event('state', 'stalled');
       this.event('scheduled', 'scheduled');
       await this.save();
     }

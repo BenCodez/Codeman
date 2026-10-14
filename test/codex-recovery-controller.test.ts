@@ -104,6 +104,19 @@ function acceptedSubmission(patch: Partial<RecoveryObservation> = {}): RecoveryO
   };
 }
 
+function stalled(key = 'stall-turn-1', restartable = false): RecoveryObservation {
+  return {
+    activity: 'working',
+    reason: 'turn-running',
+    at: NOW - 20_000,
+    progressAt: NOW - 20_000,
+    conversationId: THREAD,
+    stallEvidenceKey: key,
+    stallRestartable: restartable || undefined,
+    safeToAct: false,
+  };
+}
+
 describe('recovery action authority', () => {
   it('durably reserves an explicit missing-remote restore and never duplicates an in-flight action', async () => {
     const f = fixture();
@@ -385,6 +398,311 @@ describe('recovery action authority', () => {
     await f.controller.retry();
     expect(f.controller.getStatus().lastReason).toBe('identity-unverified');
     expect(f.act).not.toHaveBeenCalled();
+  });
+
+  it('restarts a confirmed abnormal dead pane only after repeated same-turn probes and delay', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('stall-turn', true);
+    await f.controller.refresh();
+    advance(1999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    advance(1);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toMatchObject({
+      key: 'stall-turn',
+      action: 'restart',
+      reason: 'stalled',
+    });
+    expect(f.controller.getStatus().history.slice(-2)).toMatchObject([
+      { kind: 'state', reason: 'stalled' },
+      { kind: 'scheduled', reason: 'scheduled' },
+    ]);
+    advance(1000);
+    await f.controller.refresh();
+    expect(f.act).toHaveBeenCalledTimes(1);
+    expect(f.act.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
+  });
+
+  it('requests attention for repeated live-turn silence and never acts, even on manual Retry', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('silent-live-turn');
+    await f.controller.refresh();
+    advance(2000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({
+      activity: 'working',
+      needsAttention: true,
+      lastReason: 'stall-unverified',
+    });
+    expect(f.controller.getStatus().history.at(-1)).toMatchObject({
+      kind: 'attention',
+      reason: 'stall-unverified',
+    });
+    const attentionEvents = f.controller.getStatus().history.filter((event) => event.kind === 'attention').length;
+    for (let i = 0; i < 6; i++) {
+      advance(5000);
+      await f.controller.inspect();
+      expect(f.controller.getStatus()).toMatchObject({ needsAttention: true, lastReason: 'stall-unverified' });
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({
+        phase: 'paused',
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+      });
+    }
+    expect(f.controller.getStatus().history.filter((event) => event.kind === 'attention')).toHaveLength(
+      attentionEvents
+    );
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+  });
+
+  it('permits two guarded manual probes of a dead-pane stall with automation off', async () => {
+    const state = initialRecoveryState();
+    state.config.detectStalls = true;
+    state.config.stalledAfterMs = 10_000;
+    const f = fixture(state);
+    f.observation = stalled('manual-dead-pane', true);
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+    advance(2000);
+    await f.controller.retry();
+    expect(f.act).toHaveBeenCalledTimes(1);
+    expect(f.act.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
+    expect(f.controller.getStatus().config.enabled).toBe(false);
+  });
+
+  it.each([true, false])(
+    'requires two fresh dead probes after a live silence alert (automatic: %s)',
+    async (enabled) => {
+      const f = fixture(enabledState({}, { enabled, detectStalls: true, stalledAfterMs: 10_000 }));
+      f.observation = stalled('live-then-dead');
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.controller.getStatus().lastReason).toBe('stall-unverified');
+
+      advance(1);
+      f.observation = stalled('live-then-dead', true);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().pending).toBeUndefined();
+      advance(1999);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      advance(1);
+      await f.controller.retry();
+      expect(f.act).toHaveBeenCalledTimes(1);
+      expect(f.act.mock.calls[0]?.[0]).toMatchObject({ key: 'live-then-dead', action: 'restart', reason: 'stalled' });
+    }
+  );
+
+  it.each(['live pane', 'progress'] as const)(
+    'invalidates dead proof when status inspection observes %s',
+    async (change) => {
+      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      f.observation = stalled('intervening-healthy-read', true);
+      await f.controller.retry();
+      advance(2000);
+      f.observation = {
+        ...stalled('intervening-healthy-read', change === 'progress'),
+        ...(change === 'progress' ? { progressAt: NOW - 15_000 } : {}),
+      };
+      await f.controller.inspect();
+      f.observation.stallRestartable = true;
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      advance(1999);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      advance(1);
+      await f.controller.retry();
+      expect(f.act).toHaveBeenCalledTimes(1);
+    }
+  );
+
+  it('keeps a restored stall warning separate from fresh restart confirmation', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('restored-warning');
+    await f.controller.retry();
+    advance(2000);
+    await f.controller.retry();
+    f.controller.stop();
+    const restored = fixture(f.journal.at(-1)!);
+    restored.observation = stalled('restored-warning', true);
+    await restored.controller.inspect();
+    await restored.controller.retry();
+    expect(restored.act).not.toHaveBeenCalled();
+    advance(1999);
+    await restored.controller.retry();
+    expect(restored.act).not.toHaveBeenCalled();
+    advance(1);
+    await restored.controller.retry();
+    expect(restored.act).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves legacy v1 stall warnings without treating their alert time as dead proof', async () => {
+    const f = fixture(
+      enabledState(
+        {
+          conversationId: THREAD,
+          phase: 'paused',
+          lastReason: 'stall-unverified',
+          needsAttention: true,
+          history: [{ at: NOW, kind: 'attention', reason: 'stall-unverified', attempt: 0 }],
+        },
+        { detectStalls: true, stalledAfterMs: 10_000 }
+      )
+    );
+    f.observation = stalled('legacy-warning');
+    await f.controller.inspect();
+    advance(5000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({
+      needsAttention: true,
+      lastReason: 'stall-unverified',
+      stallAlert: { key: 'legacy-warning', conversationId: THREAD, progressAt: NOW - 20_000 },
+    });
+    f.observation.stallRestartable = true;
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+  });
+
+  it('retains a stall warning through inconclusive evidence and clears it on owner input', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('warning-owner-cancel');
+    await f.controller.retry();
+    advance(2000);
+    await f.controller.retry();
+    f.observation = { activity: 'unknown', reason: 'identity-unverified', at: Date.now(), safeToAct: false };
+    await f.controller.inspect();
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({ needsAttention: true, lastReason: 'stall-unverified' });
+    f.controller.noteUserInput();
+    await f.controller.drain();
+    expect(f.journal.at(-1)).toMatchObject({ needsAttention: false, lastReason: 'user-input', stallAlert: undefined });
+    expect(f.act).not.toHaveBeenCalled();
+  });
+
+  it('restarts stall confirmation when the current turn changes or user input intervenes', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('turn-a');
+    await f.controller.refresh();
+    advance(2000);
+    f.observation = stalled('turn-b');
+    await f.controller.refresh();
+    expect(f.controller.getStatus().lastReason).not.toBe('stall-unverified');
+    f.controller.noteUserInput();
+    advance(2000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().lastReason).not.toBe('stall-unverified');
+    advance(2000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().lastReason).toBe('stall-unverified');
+    expect(f.act).not.toHaveBeenCalled();
+  });
+
+  it('expires widely spaced stall probes instead of combining stale reads', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('bounded-stall', true);
+    await f.controller.refresh();
+    advance(15_001);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    advance(1999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    advance(1);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().pending?.key).toBe('bounded-stall');
+  });
+
+  it('clears an ambiguous stall alert when progress resumes', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('resumed-turn');
+    await f.controller.refresh();
+    advance(2000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().needsAttention).toBe(true);
+    f.observation = { ...stalled('resumed-turn'), progressAt: Date.now() };
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({ needsAttention: false, lastReason: 'turn-running' });
+  });
+
+  it.each([true, false])(
+    'clears owned stall attention after settings change its reason (automatic: %s)',
+    async (enabled) => {
+      const f = fixture(enabledState({}, { enabled, detectStalls: true, stalledAfterMs: 10_000 }));
+      f.observation = stalled('settings-during-stall');
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.controller.getStatus()).toMatchObject({ needsAttention: true, lastReason: 'stall-unverified' });
+
+      await f.controller.updateConfig({ maxRetries: 4 });
+      expect(f.controller.getStatus()).toMatchObject({
+        needsAttention: true,
+        lastReason: enabled ? 'observing' : 'disabled',
+      });
+      f.observation.progressAt = Date.now();
+      await f.controller.inspect();
+      expect(f.controller.getStatus()).toMatchObject({ needsAttention: false, lastReason: 'turn-running' });
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      await f.controller.refresh();
+      expect(f.journal.at(-1)?.needsAttention).toBe(false);
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  );
+
+  it('relinquishes stall attention ownership to a newer delivery failure', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    f.observation = stalled('replaced-stall-alert');
+    await f.controller.retry();
+    advance(2000);
+    await f.controller.retry();
+    f.observation.stallRestartable = true;
+    await f.controller.retry();
+    advance(2000);
+    f.outcome = 'not-sent';
+    await f.controller.retry();
+    expect(f.controller.getStatus()).toMatchObject({
+      needsAttention: true,
+      lastReason: 'delivery-failed',
+      circuitOpen: false,
+    });
+    expect(f.controller.getStatus().stallAlert).toBeUndefined();
+
+    await f.controller.updateConfig({ enabled: false });
+    f.observation.progressAt = Date.now();
+    await f.controller.inspect();
+    await f.controller.refresh();
+    expect(f.controller.getStatus().needsAttention).toBe(true);
+    expect(f.act).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['stall detection off', { detectStalls: false }, stalled('off', true)],
+    ['below threshold', { detectStalls: true, stalledAfterMs: 30_000 }, stalled('recent', true)],
+    [
+      'provider retry',
+      { detectStalls: true, stalledAfterMs: 10_000 },
+      { ...stalled('retry'), reason: 'internal-retry' },
+    ],
+    [
+      'background work',
+      { detectStalls: true, stalledAfterMs: 10_000 },
+      { ...stalled('agent'), activity: 'watching', reason: 'background-work' },
+    ],
+  ] as const)('keeps %s non-actionable', async (_label, config, observation) => {
+    const f = fixture(enabledState({}, config));
+    f.observation = observation;
+    await f.controller.refresh();
+    advance(60_000);
+    await f.controller.refresh();
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.controller.getStatus().lastReason).not.toBe('stalled');
   });
 
   it('reconciles a manual retry while automation is disabled, then stops observing', async () => {

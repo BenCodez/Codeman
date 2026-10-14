@@ -2467,8 +2467,9 @@ export class WebServer extends EventEmitter {
         observe: async () => {
           const observation = await adapter.observe();
           // Defer before RecoveryController reserves or charges an attempt. The task
-          // controller owns exact crash recovery while it is actively supervising.
-          return taskBlocksRecovery() ? { ...observation, safeToAct: false } : observation;
+          // controller owns exact crash recovery while it is actively supervising,
+          // including dead-turn stalls whose authority is independent of safeToAct.
+          return taskBlocksRecovery() ? { ...observation, safeToAct: false, stallRestartable: false } : observation;
         },
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('recovery', !this.controllerHasTaskFlight(session.id)),

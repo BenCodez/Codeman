@@ -53,6 +53,28 @@ function failed(...after: Payload[]): string {
 }
 
 describe('official Codex turn lifecycle shapes', () => {
+  it('vetoes unresolved structured child work even when the parent pane has no screen', () => {
+    const pending = tail(start(), { type: 'collab_agent_spawn_end', new_thread_id: AGENT });
+    expect(classifyCodexTail(pending, context({ screen: null }))).toMatchObject({
+      activity: 'watching',
+      reason: 'background-work',
+      safeToAct: false,
+    });
+    expect(classifyCodexTail(tail(start()), context({ screen: null, watching: true }))).toMatchObject({
+      activity: 'watching',
+      reason: 'background-work',
+      safeToAct: false,
+    });
+    const settled = tail(
+      start(),
+      { type: 'collab_agent_spawn_end', new_thread_id: AGENT },
+      { type: 'collab_wait_end', statuses: { [AGENT]: { completed: 'done' } } }
+    );
+    expect(classifyCodexTail(settled, context({ screen: null }))).toMatchObject({
+      activity: 'working',
+      reason: 'turn-running',
+    });
+  });
   it.each([
     ['task_started', 'task_complete'],
     ['turn_started', 'turn_complete'],
@@ -89,6 +111,18 @@ describe('official Codex turn lifecycle shapes', () => {
     expect(
       classifyCodexTail(tail({ type: 'agent_message', message: 'The fixture is complete.' }), context()).safeToAct
     ).toBe(false);
+  });
+
+  it('identifies the same unfinished structured turn without making silence actionable', () => {
+    const result = classifyCodexTail(tail(start()), context());
+    expect(result).toMatchObject({
+      activity: 'working',
+      reason: 'turn-running',
+      turnId: TURN,
+      safeToAct: false,
+    });
+    expect(result.stallEvidenceKey).toBe(`${THREAD}:${TURN}:${NOW - 10_000}:stalled`);
+    expect(classifyCodexTail(tail(start('next-turn')), context()).stallEvidenceKey).not.toBe(result.stallEvidenceKey);
   });
 
   it('allows a legacy terminal ErrorEvent followed by task_complete without error', () => {
