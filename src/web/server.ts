@@ -3559,7 +3559,7 @@ export class WebServer extends EventEmitter {
   async discardPartiallyBuiltSession(
     sessionId: string,
     expectedSession?: Session,
-    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean }
+    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean; retainForInspection?: boolean }
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     // Reboot restore reuses a historical id. A late failure or cancellation may
@@ -3567,6 +3567,15 @@ export class WebServer extends EventEmitter {
     // exact tentative instance the caller owns.
     if (!session || (expectedSession && session !== expectedSession)) return;
     await this.stopRecoveryController(sessionId, false);
+    if (options?.retainForInspection && options.preserveMuxPane && session.codexRestoreWorkerMayExist) {
+      session.adoptUncertainCodexRestore();
+      this.persistDeb.cancelKey(sessionId);
+      // Keep tentative protection: the historical state record must remain intact.
+      // Existing listeners and layout make the original identity inspectable by its owner.
+      await this.mux.flushSessionsDurably();
+      this.broadcast(SseEvent.SessionCreated, this.getSessionStateWithRespawn(session));
+      return;
+    }
     this.sessions.delete(sessionId);
 
     // --- the inverse of setupSessionListeners(), in reverse order ---
@@ -3665,7 +3674,11 @@ export class WebServer extends EventEmitter {
         console.error('[Server] Building the reboot-restore offer failed; continuing recovery:', err);
       }
 
-      if (alive.length > 0 || discovered.length > 0) {
+      if (
+        alive.length > 0 ||
+        discovered.length > 0 ||
+        this.mux.getSessions().some((session) => session.codexRestoreUncertain === true)
+      ) {
         console.log(`[Server] Found ${alive.length + discovered.length} alive mux session(s) from previous run`);
 
         // For each alive mux session, create a Session object if it doesn't exist
@@ -3725,7 +3738,12 @@ export class WebServer extends EventEmitter {
               claudeMode: recoveryClaudeMode.claudeMode,
               allowedTools: recoveryClaudeMode.allowedTools,
               openCodeConfig: muxSession.mode === 'opencode' ? savedState?.openCodeConfig : undefined,
-              codexConfig: muxSession.mode === 'codex' ? savedState?.codexConfig : undefined,
+              codexConfig:
+                muxSession.mode === 'codex'
+                  ? muxSession.codexRestoreUncertain === true
+                    ? muxSession.codexRestoreConfig
+                    : savedState?.codexConfig
+                  : undefined,
               preserveExitedPane: getCli(muxSession.mode)?.capabilities.recovery === 'codex-rollout',
               geminiConfig: muxSession.mode === 'gemini' ? savedState?.geminiConfig : undefined,
               antigravityConfig: muxSession.mode === 'antigravity' ? savedState?.antigravityConfig : undefined,
@@ -3923,6 +3941,7 @@ export class WebServer extends EventEmitter {
               }
             }
 
+            if (session.codexRestoreWorkerMayExist) this.tentativeSessionRegistrations.add(session);
             this.sessions.set(session.id, session);
             await this.setupSessionListeners(session);
 

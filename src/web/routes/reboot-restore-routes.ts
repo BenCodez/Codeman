@@ -157,10 +157,15 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         let restoreCompleted = false;
         const discardTentativeSession = (session: Session): Promise<void> => {
           if (session.codexRestoreWorkerMayExist) {
-            writeRebootIdentityFence(session.id, { ...readRebootIdentityFence(session.id), switchPending: true });
+            writeRebootIdentityFence(session.id, {
+              ...readRebootIdentityFence(session.id),
+              switchPending: true,
+              untrackedInput: true,
+            });
             return ctx.discardPartiallyBuiltSession(entry.sessionId, session, {
               preserveCustomModelConfigDir: true,
               preserveMuxPane: true,
+              retainForInspection: true,
             });
           }
           return preserveCustomModelConfigDir

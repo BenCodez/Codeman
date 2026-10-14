@@ -94,6 +94,7 @@ async function offer(state: SessionState): Promise<void> {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const server of [...servers]) await closeServer(server);
   for (const app of apps.splice(0)) await app.close();
   rebootRestoreRegistry.reset();
@@ -105,6 +106,56 @@ afterEach(async () => {
 });
 
 describe('durable Codex reboot completion', () => {
+  it.each(['live', 'dead', 'missing', 'no-history'] as const)(
+    'retains the uncertain original board identity and historical state after server reconstruction: %s',
+    async (pane) => {
+      const id = `aabbccdd-5555-2222-3333-${hashCodexPrompt(pane).slice(0, 12)}`;
+      const { state, home } = fixture(id);
+      state.name = 'Historical worker';
+      state.codexConfig!.model = 'historical-model';
+      const actualConfig = { ...state.codexConfig, model: 'actual-worker-model', resumeSessionId: UUID };
+      const { server, ctx, store } = await harness();
+      if (pane !== 'no-history') store.setSession(id, state);
+      store.flush();
+      const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
+      writeRebootIdentityFence(id, { resumeSessionId: UUID, switchPending: true, untrackedInput: true });
+      ctx.mux.registerSession({
+        sessionId: id,
+        muxName: `codeman-${id.slice(0, 8)}`,
+        pid: 0,
+        createdAt: state.createdAt,
+        workingDir: state.workingDir,
+        mode: 'codex',
+        attached: false,
+        name: 'Historical worker',
+        recoveryCodexHome: home,
+        codexRestoreUncertain: true,
+        codexRestoreConfig: actualConfig,
+      });
+      vi.spyOn(ctx.mux, 'reconcileSessions').mockResolvedValue({ alive: [], dead: [id], discovered: [] });
+      vi.spyOn(ctx.mux, 'muxSessionExists').mockReturnValue(pane !== 'missing');
+      vi.spyOn(ctx.mux, 'isPaneDead').mockReturnValue(pane === 'dead');
+      const create = vi.spyOn(ctx.mux, 'createSession');
+      const respawn = vi.spyOn(ctx.mux, 'respawnPane');
+      const kill = vi.spyOn(ctx.mux, 'killSession');
+      await Reflect.get(server, 'restoreMuxSessions').call(server);
+      const session = sessionMap(server).get(id)!;
+      expect(session).toBeDefined();
+      expect(session.name).toBe(state.name);
+      expect(session.claudeSessionId).toBe(UUID);
+      expect(session.toState().codexConfig).toEqual(actualConfig);
+      expect(session.codexRestoreWorkerMayExist).toBe(true);
+      expect(session.getRecoveryContext()).toMatchObject({ managed: false, untrackedInput: true });
+      ctx.persistSessionState(session);
+      Reflect.get(server, '_persistSessionStateNow').call(server, session);
+      store.flush();
+      expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
+      expect(create).not.toHaveBeenCalled();
+      expect(respawn).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+    }
+  );
+
   it.each([
     'create-response-lost',
     'attachment-failure',
@@ -159,7 +210,13 @@ describe('durable Codex reboot completion', () => {
     expect(result.skipped).toEqual([{ sessionId: id, reason: 'restore-uncertain' }]);
     expect(kill).not.toHaveBeenCalled();
     expect(ctx.mux.getSession(id)).toBeDefined();
-    expect(sessionMap(server).has(id)).toBe(false);
+    expect(sessionMap(server).has(id)).toBe(true);
+    expect(sessionMap(server).get(id)?.codexRestoreWorkerMayExist).toBe(true);
+    expect(sessionMap(server).get(id)?.getRecoveryContext()).toMatchObject({ managed: false, untrackedInput: true });
+    expect(ctx.mux.getSession(id)).toMatchObject({
+      codexRestoreUncertain: true,
+      codexRestoreConfig: { resumeSessionId: UUID },
+    });
     expect(readFileSync(rollout, 'utf8')).toBe(priorRollout);
     store.flush();
     expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
@@ -631,8 +688,8 @@ describe('durable Codex reboot completion', () => {
     const kill = vi.spyOn(ctx.mux, 'killSession');
     const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
     expect(result.json().skipped).toEqual([{ sessionId: state.id, reason: 'restore-uncertain' }]);
-    expect(sessionMap(server).has(state.id)).toBe(false);
-    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: true, submission });
+    expect(sessionMap(server).has(state.id)).toBe(true);
+    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: true, untrackedInput: true, submission });
     expect(ctx.mux.getSession(state.id)).toBeDefined();
     expect(kill).not.toHaveBeenCalled();
   });

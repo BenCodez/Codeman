@@ -31,6 +31,10 @@ import type {
  * Multiplexer session metadata.
  */
 export interface MuxSession {
+  /** A guarded reboot launch may have started; preserve this exact pane until owner inspection. */
+  codexRestoreUncertain?: boolean;
+  /** Non-secret exact argv settings recorded before an uncertain reboot worker effect. */
+  codexRestoreConfig?: CodexConfig;
   /** Set by a successful local launch whose actual registry command disabled the shared daemon. */
   recoveryIsolated?: boolean;
   /** Exact non-secret local Codex home pinned at an owned launch, never inferred on attach. */
@@ -413,8 +417,12 @@ export interface TerminalMultiplexer extends EventEmitter {
   /** Fresh, bounded local-pane evidence for recovery. A missing/ambiguous probe is UNKNOWN. */
   inspectPaneForRecovery?(muxName: string): Promise<{
     dead: boolean;
+    paneId?: string;
+    panePid?: number;
     status?: number;
     signal?: number;
+    /** Validated exact native signal token, retained only for a final pane-identity fence. */
+    paneSignalToken?: string;
     screen: string | null;
   } | null>;
 }

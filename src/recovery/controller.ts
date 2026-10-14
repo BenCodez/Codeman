@@ -122,13 +122,19 @@ export class RecoveryController {
   /** Cancel scheduled actions on ANY user input; an Escape is not an invitation to restart. */
   noteUserInput(): void {
     const canceledScheduledAction = !!this.state.pending || this.state.nextRetryAt !== undefined;
+    const dismissedStall =
+      this.state.lastReason === 'stalled' &&
+      this.state.needsAttention &&
+      !this.state.inFlight &&
+      !this.state.circuitOpen;
     this.revision++;
     this.confirmation = undefined;
     this.state.armedAt = this.now();
     this.state.pending = undefined;
     this.state.nextRetryAt = undefined;
-    if (canceledScheduledAction && !this.stopped) {
+    if ((canceledScheduledAction || dismissedStall) && !this.stopped) {
       this.state.phase = this.state.config.enabled ? 'watching' : 'idle';
+      if (dismissedStall) this.state.needsAttention = false;
       this.event('state', 'user-input');
       // Keep the input callback synchronous while serializing its cancellation
       // after any already-running observation/reservation save.
@@ -181,6 +187,7 @@ export class RecoveryController {
     this.revision++;
     return this.enqueue(async () => {
       const config = RecoveryConfigSchema.parse({ ...this.state.config, ...patch }) as RecoveryConfig;
+      const hadStall = this.state.lastReason === 'stalled' && this.state.needsAttention;
       const enabledNow = config.enabled && !this.state.config.enabled;
       this.state.config = config;
       if (enabledNow) this.state.armedAt = this.now();
@@ -189,7 +196,14 @@ export class RecoveryController {
         this.state.nextRetryAt = undefined;
         if (!this.state.inFlight) this.state.phase = 'idle';
       }
-      this.event('state', config.enabled ? 'observing' : 'disabled');
+      if (hadStall && (!config.enabled || !config.detectStalls) && !this.state.inFlight && !this.state.circuitOpen) {
+        this.state.needsAttention = false;
+        this.state.phase = config.enabled ? 'watching' : 'idle';
+      }
+      this.event(
+        'state',
+        hadStall && config.enabled && config.detectStalls ? 'stalled' : config.enabled ? 'observing' : 'disabled'
+      );
       await this.save();
       this.arm();
       return this.getStatus();
@@ -257,7 +271,22 @@ export class RecoveryController {
         this.state.conversationId = observation.conversationId;
         const hadFlight = !!this.state.inFlight;
         if (hadFlight) this.reconcileFlight(observation);
-        else if (!this.state.pending && !this.state.circuitOpen) this.state.lastReason = observation.reason;
+        else if (!this.state.pending && !this.state.circuitOpen) {
+          const hadStall = this.state.lastReason === 'stalled' && this.state.needsAttention;
+          if (hadStall && this.isStalled(observation)) {
+            this.state.phase = 'paused';
+            this.state.needsAttention = true;
+          } else {
+            if (hadStall) {
+              const uncertain = ['blocked', 'paused', 'unknown', 'interrupted', 'crashed'].includes(
+                observation.activity
+              );
+              this.state.phase = uncertain ? 'paused' : observation.activity === 'completed' ? 'completed' : 'watching';
+              this.state.needsAttention = uncertain && this.state.config.enabled;
+            }
+            this.state.lastReason = observation.reason;
+          }
+        }
         if (JSON.stringify(this.state) !== before) {
           if (!(await this.save({ state: retained, revision }))) {
             // A read still reports the durable uncertainty and persistence veto.
@@ -323,6 +352,21 @@ export class RecoveryController {
     return !Number.isFinite(origin) || origin < 0 || elapsed < 0 || elapsed >= this.state.config.maxRecoveryDurationMs;
   }
 
+  private isStalled(observation: RecoveryObservation): boolean {
+    const progressAt = observation.progressAt ?? observation.at;
+    const quietSince = Math.max(progressAt, this.state.armedAt ?? 0);
+    return (
+      this.state.config.detectStalls &&
+      observation.activity === 'working' &&
+      observation.reason === 'turn-running' &&
+      Number.isFinite(progressAt) &&
+      progressAt >= 0 &&
+      Number.isFinite(quietSince) &&
+      quietSince >= 0 &&
+      this.now() - quietSince >= this.state.config.stalledAfterMs
+    );
+  }
+
   private async evaluate(manual: boolean): Promise<void> {
     if (this.stopped) return;
     const revision = this.revision;
@@ -383,12 +427,11 @@ export class RecoveryController {
           this.state.needsAttention = false;
         }
       }
-      if (
-        this.state.config.detectStalls &&
-        observation.activity === 'working' &&
-        this.now() - (observation.progressAt ?? observation.at) >= this.state.config.stalledAfterMs
-      ) {
-        if (this.state.lastReason !== 'stalled') this.block('stalled');
+      if (this.isStalled(observation)) {
+        // State retention is independent of deduplicating attention events.
+        this.state.phase = 'paused';
+        this.state.needsAttention = true;
+        if (this.state.lastReason !== 'stalled') this.event('attention', 'stalled');
       } else if (this.state.lastReason !== observation.reason) this.event('state', observation.reason);
       if (JSON.stringify(this.state) !== before) await this.save();
       return;
