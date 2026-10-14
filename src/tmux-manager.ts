@@ -42,6 +42,7 @@ import { writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
+import { hasCodexComposerText } from './recovery/codex-classifier.js';
 import {
   dataPath,
   DEFAULT_TMUX_SOCKET,
@@ -3917,33 +3918,66 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     try {
       const hasCarriageReturn = input.includes('\r');
       const textPart = input.replace(/\r/g, '').replace(/\n/g, '').trimEnd();
+      const composerCurrent = (expected?: string): boolean => {
+        if (!recoveryGuard) return true;
+        // This synchronous read follows queued/async preparation. -J joins native
+        // wrapped rows without guessing whitespace or multiline draft indentation.
+        let accepted = false;
+        try {
+          const screen = execSync(`${this.tmux()} capture-pane -p -J -t ${shellescape(muxName)}`, {
+            encoding: 'utf-8',
+            timeout: EXEC_TIMEOUT_MS,
+            maxBuffer: 64 * 1024,
+          });
+          // Our own literal task text may mention a veto phrase. Only its exact
+          // composer row is excluded; changed drafts and surrounding UI still veto.
+          const chrome =
+            expected === undefined
+              ? screen
+              : screen
+                  .split('\n')
+                  .filter((row) => !(/^\s*›(?:\s|$)/u.test(row) && row.replace(/^\s*› ?/u, '') === expected))
+                  .join('\n');
+          accepted =
+            !/esc to interrupt|reconnecting|would you like|approve this|sign in|log in|authentication failed|usage limit|limit reached/i.test(
+              chrome
+            ) &&
+            (expected === undefined
+              ? hasCodexComposerText(screen, '') || hasCodexComposerText(screen, 'Ask Codex to do anything')
+              : hasCodexComposerText(screen, expected));
+        } catch {
+          // No native input has been attempted by this read.
+        }
+        if (!accepted) recoveryGuard.noteRefusal?.();
+        return accepted;
+      };
 
       if (textPart && hasCarriageReturn) {
         // Send text first, then Enter as a SEPARATE tmux command after a short delay.
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
         // character in the input buffer rather than as form submission.
-        if (!canDispatch()) return false;
+        if (!canDispatch() || !composerCurrent() || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
           timeout: EXEC_TIMEOUT_MS,
         });
         await new Promise((resolve) => setTimeout(resolve, 50));
-        if (!canDispatch()) return false;
+        if (!canDispatch() || !composerCurrent(textPart) || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
           timeout: EXEC_TIMEOUT_MS,
         });
       } else if (textPart) {
         // Text only, no Enter
-        if (!canDispatch()) return false;
+        if (!canDispatch() || !composerCurrent() || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
           timeout: EXEC_TIMEOUT_MS,
         });
       } else if (hasCarriageReturn) {
         // Enter only
-        if (!canDispatch()) return false;
+        if (!canDispatch() || !composerCurrent() || !canDispatch()) return false;
         recoveryGuard?.noteDispatch();
         await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
           timeout: EXEC_TIMEOUT_MS,
