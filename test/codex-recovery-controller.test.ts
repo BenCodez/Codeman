@@ -313,6 +313,31 @@ describe('recovery action authority', () => {
     expect(f.act).toHaveBeenCalledTimes(1);
   });
 
+  it('retains failed read-only flight reconciliation across automatic timers until a later read can commit', async () => {
+    const flight = { key: 'crash-proof', action: 'restart' as const, conversationId: THREAD, startedAt: NOW };
+    const f = fixture({ ...initialRecoveryState(), conversationId: THREAD, inFlight: flight });
+    f.observation = acceptedSubmission({ processReady: true });
+    f.persist.mockRejectedValue(new Error('Disk unavailable'));
+    await expect(f.controller.inspect()).resolves.toMatchObject({
+      inFlight: flight,
+      phase: 'blocked',
+      circuitOpen: true,
+      lastReason: 'persistence-failed',
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.observe).toHaveBeenCalledTimes(1);
+    expect(f.controller.getStatus().inFlight).toEqual(flight);
+    expect(f.changes.every((state) => state.inFlight?.key === flight.key)).toBe(true);
+    expect(f.changes.some((state) => state.history.some((event) => event.kind === 'accepted'))).toBe(false);
+    f.persist.mockImplementation(async (state) => {
+      f.journal.push(structuredClone(state));
+    });
+    await expect(f.controller.inspect()).resolves.toMatchObject({ lastReason: 'recovery-accepted' });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.journal.at(-1)?.inFlight).toBeUndefined();
+    expect(f.act).not.toHaveBeenCalled();
+  });
+
   it('bounds disabled in-flight observation at the acceptance timeout', async () => {
     const f = fixture();
     await f.controller.retry();

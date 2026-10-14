@@ -2337,6 +2337,7 @@ export class Session extends EventEmitter {
         this._muxSession?.recoveryIsolated === true &&
         normalizedCodexHome(this._muxSession.recoveryCodexHome) !== undefined &&
         (this._envOverrides?.CODEX_HOME === undefined ||
+          this._envOverrides.CODEX_HOME === '' ||
           normalizedCodexHome(this._envOverrides.CODEX_HOME) ===
             normalizedCodexHome(this._muxSession.recoveryCodexHome)) &&
         this._codexConfig?.noDaemon === true &&
