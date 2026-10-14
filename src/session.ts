@@ -143,10 +143,11 @@ import type { SessionAttachmentHistoryItem, DisplayModel } from './types/session
 import { resolveConfigModel } from './model-config-resolvers.js';
 import { legacyConfigForMode, buildSpawnCommandFromRegistry } from './session-cli-registry-bridge.js';
 import { hashCodexPrompt } from './recovery/codex-identity.js';
+import { currentLocalCodexHome, normalizedCodexHome } from './recovery/codex-home.js';
 import { CodexInputProofTracker, type CodexInputProof } from './recovery/codex-input-proof.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight } from './recovery/types.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
-import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from './session-env-clamp.js';
+import { clampRecoveryLaunchForOwner } from './session-env-clamp.js';
 import {
   launchModelFor,
   readScreenModel,
@@ -663,6 +664,7 @@ export class Session extends EventEmitter {
   private _mux: TerminalMultiplexer | null = null;
   private _muxSession: MuxSession | null = null;
   private _preserveExitedPane = false;
+  private _recoveryCodexHome?: string;
   private _useMux: boolean = false;
   /**
    * The agent in this session's local tmux pane has exited (Ark0N/Codeman#446).
@@ -876,6 +878,8 @@ export class Session extends EventEmitter {
       lastSubmitAt?: number;
       /** Boot recovery attaches to an exited Codex pane; only its durable controller may relaunch it. */
       preserveExitedPane?: boolean;
+      /** Trusted exact local home from verified launch provenance, private to restoration. */
+      recoveryCodexHome?: string;
       /** Restored conversation chain, oldest first (see `claudeSessionChain`). */
       claudeSessionChain?: string[];
       /** Restored agent-exit observation for this session's pane (see `paneExit`). */
@@ -961,6 +965,7 @@ export class Session extends EventEmitter {
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this._muxSession = config.muxSession || null;
     this._preserveExitedPane = config.preserveExitedPane ?? false;
+    this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
     // Input while the server was down cannot be reconstructed from a launch resume id.
     // A fresh exact ordinary submission must re-verify the physical pane's current thread.
     this._recoverySwitchPending = this._preserveExitedPane;
@@ -2330,9 +2335,13 @@ export class Session extends EventEmitter {
       managed: this.paneExitApplies && !this._closing && !this._isStopped && !this._respawnBlocked,
       noDaemon:
         this._muxSession?.recoveryIsolated === true &&
+        normalizedCodexHome(this._muxSession.recoveryCodexHome) !== undefined &&
+        (this._envOverrides?.CODEX_HOME === undefined ||
+          normalizedCodexHome(this._envOverrides.CODEX_HOME) ===
+            normalizedCodexHome(this._muxSession.recoveryCodexHome)) &&
         this._codexConfig?.noDaemon === true &&
         /(?:^|\s)--no-daemon(?:\s|$)/.test(command ?? ''),
-      codexHome: this._envOverrides?.CODEX_HOME,
+      codexHome: normalizedCodexHome(this._muxSession?.recoveryCodexHome),
     };
   }
 
@@ -2356,7 +2365,9 @@ export class Session extends EventEmitter {
   async deliverRecovery(
     flight: RecoveryFlight,
     generation: number,
-    isCurrent: () => boolean = () => true
+    isCurrent: () => boolean = () => true,
+    prompt: string = CONTINUATION_PROMPT,
+    confirmEvidence?: () => boolean
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
     if (
@@ -2374,13 +2385,27 @@ export class Session extends EventEmitter {
     try {
       return await this._withPaneLifecycle(async () => {
         const pane = await this.inspectRecoveryPane();
-        const safeConfig = await clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig });
-        const safeEnv = await clampEnvOverridesForOwner(this.owner, this._envOverrides);
+        const envToAuthorize =
+          context.codexHome !== currentLocalCodexHome()
+            ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
+            : this._envOverrides;
+        const granted = await clampRecoveryLaunchForOwner(
+          this.owner,
+          { codexConfig: this._codexConfig },
+          envToAuthorize
+        );
         if (
-          JSON.stringify(safeConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
-          JSON.stringify(safeEnv) !== JSON.stringify(this._envOverrides)
+          JSON.stringify(granted.configs.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(granted.env) !== JSON.stringify(envToAuthorize)
         )
           return 'not-sent';
+        if (confirmEvidence) {
+          try {
+            if (confirmEvidence() !== true) return 'not-sent';
+          } catch {
+            return 'not-sent';
+          }
+        }
         const currentContext = this.getRecoveryContext();
         if (
           !isCurrent() ||
@@ -2413,7 +2438,7 @@ export class Session extends EventEmitter {
         )
           return 'not-sent';
         // Browser frames report false during this short reservation so durable clients retain and retry them.
-        const sent = await this._mux!.sendInput(this.id, `${CONTINUATION_PROMPT}\r`);
+        const sent = await this._mux!.sendInput(this.id, `${prompt}\r`);
         if (!sent) return 'unknown'; // text may have landed even when Enter failed
         this._lastSubmitAt = Date.now();
         // Recovery acceptance comes from structured journal evidence. Do not arm the
@@ -2488,6 +2513,7 @@ export class Session extends EventEmitter {
       ompConfig: this._ompConfig,
       resumeSessionId: this._resumeSessionId,
       envOverrides: this._envOverrides,
+      recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
       unsetEnvKeys: this._pendingEnvUnsets.size > 0 ? [...this._pendingEnvUnsets] : undefined,
       effort: this._effort,
       advisorModel: this._advisorModel,
@@ -2964,6 +2990,7 @@ export class Session extends EventEmitter {
             ompConfig: this._ompConfig,
             resumeSessionId: this._resumeSessionId,
             envOverrides: this._envOverrides,
+            recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
             effort: this._effort,
             advisorModel: this._advisorModel,
             historyLimit: this._tmuxHistoryLimit,
@@ -3877,6 +3904,7 @@ export class Session extends EventEmitter {
             mode: 'shell',
             niceConfig: this._niceConfig,
             envOverrides: this._envOverrides,
+            recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
             historyLimit: this._tmuxHistoryLimit,
             remote: this._remote,
             docker: this._docker,
@@ -3889,6 +3917,7 @@ export class Session extends EventEmitter {
             name: this._name,
             niceConfig: this._niceConfig,
             envOverrides: this._envOverrides,
+            recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
             historyLimit: this._tmuxHistoryLimit,
             remote: this._remote,
             docker: this._docker,
@@ -4770,7 +4799,7 @@ export class Session extends EventEmitter {
         this._commitWriteInput(options); // unknown partial send, never reopen for replay
         throw err;
       }
-      if (!sent && options.inputSeq) {
+      if (!sent) {
         // The mux can type text successfully and fail its separate Enter send.
         // A false result after dispatch is not a certificate that nothing landed.
         this._commitWriteInput(options);

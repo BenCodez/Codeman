@@ -158,7 +158,11 @@ describe('session-routes', () => {
         mode: 'codex',
         useMux: true,
         mux: mux as unknown as TerminalMultiplexer,
-        muxSession: { muxName: 'codeman-test-key', recoveryIsolated: true } as MuxSession,
+        muxSession: {
+          muxName: 'codeman-test-key',
+          recoveryIsolated: true,
+          recoveryCodexHome: '/fixture/codex-home',
+        } as MuxSession,
         codexConfig: { noDaemon: true, resumeSessionId: thread },
       });
       (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);

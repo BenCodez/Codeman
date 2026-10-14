@@ -12,7 +12,7 @@ import type { CodexConfig } from '../src/types/session.js';
 import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../src/session-env-clamp.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import { resolveCodexIdentity, type CodexIdentityResult } from '../src/recovery/codex-identity.js';
-import type { RecoveryFlight, RecoveryObservation } from '../src/recovery/types.js';
+import { CONTINUATION_PROMPT, type RecoveryFlight, type RecoveryObservation } from '../src/recovery/types.js';
 import { createDeferred } from './mocks/index.js';
 
 vi.mock('../src/recovery/codex-identity.js', () => ({ resolveCodexIdentity: vi.fn() }));
@@ -217,6 +217,8 @@ describe('exact current identity and delivery proof', () => {
     expect(f.session.deliverRecovery).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: THREAD }),
       3,
+      expect.any(Function),
+      CONTINUATION_PROMPT,
       expect.any(Function)
     );
     expect(f.persist).toHaveBeenCalledTimes(2);
@@ -598,7 +600,11 @@ describe('human input invalidates the current epoch', () => {
     f.pane = { dead: true, status: 130, signal: undefined, screen: null };
     f.session.paneExit = { at: NOW - 1_000, status: 130 };
     f.context.intentionalStopAt = NOW - 1_500;
-    expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', safeToAct: false });
+    expect(await f.adapter.observe()).toMatchObject({
+      activity: 'paused',
+      reason: 'user-interrupted',
+      safeToAct: false,
+    });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
 });
@@ -618,6 +624,8 @@ describe('authoritative agent exits and process readiness', () => {
     expect(f.session.deliverRecovery).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'restart', conversationId: THREAD }),
       3,
+      expect.any(Function),
+      CONTINUATION_PROMPT,
       expect.any(Function)
     );
   });
@@ -762,6 +770,95 @@ describe('current owner grants', () => {
       reason: 'approval-required',
       safeToAct: false,
     });
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+});
+
+const DEAD_PANE_VETOES = [
+  {
+    payload: { type: 'error', message: 'Sanitized rollback fixture.', codex_error_info: 'thread_rollback_failed' },
+    activity: 'unknown',
+    reason: 'observing',
+  },
+  {
+    payload: {
+      type: 'error',
+      message: 'Sanitized steering fixture.',
+      codex_error_info: { active_turn_not_steerable: { turn_kind: 'review' } },
+    },
+    activity: 'unknown',
+    reason: 'observing',
+  },
+
+  {
+    payload: { type: 'error', message: 'Sanitized authentication fixture.', codex_error_info: 'Unauthorized' },
+    activity: 'blocked',
+    reason: 'authentication-required',
+  },
+  {
+    payload: { type: 'error', message: 'Sanitized limit fixture.', codex_error_info: 'UsageLimitExceeded' },
+    activity: 'blocked',
+    reason: 'usage-limit',
+  },
+  { payload: { type: 'error', message: 'Sanitized unknown error fixture.' }, activity: 'blocked', reason: 'observing' },
+  {
+    payload: { type: 'exec_approval_request', call_id: 'approval-fixture' },
+    activity: 'paused',
+    reason: 'approval-required',
+  },
+  {
+    payload: { type: 'turn_aborted', turn_id: 'fixture-turn', reason: 'interrupted' },
+    activity: 'paused',
+    reason: 'user-interrupted',
+  },
+];
+
+function deadPaneVetoTail(payload: Record<string, unknown>): string {
+  return (
+    event({ type: 'task_started', turn_id: 'fixture-turn' }, NOW - 20_000) + '\n' + event(payload, NOW - 11_000) + '\n'
+  );
+}
+
+describe('dead local panes preserve structured recovery vetoes', () => {
+  it.each(DEAD_PANE_VETOES)('preserves $reason before authorizing a crash', async ({ payload, activity, reason }) => {
+    const f = fixture();
+    f.pane = { dead: true, status: 1, screen: null };
+    f.identity.tail = deadPaneVetoTail(payload);
+    expect(await f.adapter.observe()).toMatchObject({ activity, reason, safeToAct: false });
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it.each(DEAD_PANE_VETOES)('rechecks $reason before delivering a reserved restart', async ({ payload }) => {
+    const f = fixture();
+    f.pane = { dead: true, status: 1, screen: null };
+    const reserved = flight(await f.adapter.observe(), 'restart');
+    f.identity.tail = deadPaneVetoTail(payload);
+    expect(await f.adapter.act(reserved)).toBe('not-sent');
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it('still resumes a verified abnormal exit without a structured veto', async () => {
+    const f = fixture();
+    f.pane = { dead: true, status: 1, screen: null };
+    expect(await f.adapter.act(flight(await f.adapter.observe(), 'restart'))).toBe('sent');
+    expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+  });
+});
+
+describe('malformed error variants cannot spend an existing recovery reservation', () => {
+  it.each([false, true])('denies final recovery with a contradictory error enum (dead=%s)', async (dead) => {
+    const f = fixture();
+    if (dead) f.pane = { dead: true, status: 1, screen: null };
+    const reserved = flight(await f.adapter.observe(), dead ? 'restart' : 'continue');
+    f.identity.tail = deadPaneVetoTail({
+      type: 'task_complete',
+      turn_id: 'fixture-turn',
+      error: {
+        message: 'Conversation interrupted.',
+        codex_error_info: { response_stream_disconnected: { http_status_code: null }, unauthorized: null },
+      },
+    });
+    expect(await f.adapter.act(reserved)).toBe('not-sent');
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
 });

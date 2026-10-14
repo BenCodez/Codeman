@@ -33,6 +33,8 @@ import type {
 export interface MuxSession {
   /** Set by a successful local launch whose actual registry command disabled the shared daemon. */
   recoveryIsolated?: boolean;
+  /** Exact non-secret local Codex home pinned at an owned launch, never inferred on attach. */
+  recoveryCodexHome?: string;
   /** Codeman session ID */
   sessionId: string;
   /** Multiplexer session name (e.g., "codeman-abc12345") */
@@ -115,6 +117,8 @@ export interface CreateSessionOptions {
   resumeSessionId?: string;
   /** Extra env vars exported before launching the CLI (e.g., CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). Ephemeral — not written to disk. */
   envOverrides?: Record<string, string>;
+  /** Trusted previously verified local home for exact recovery/reboot launch. */
+  recoveryCodexHome?: string;
   /** Claude CLI effort level, injected as a `--settings` soft default (overridable via /effort in-session) */
   effort?: EffortLevel;
   /** Claude advisor model, merged into the same `--settings` JSON (overridable via /advisor in-session) */
@@ -161,6 +165,8 @@ export interface RespawnPaneOptions {
   resumeSessionId?: string;
   /** Extra env vars exported before launching the CLI (preserved across respawns). */
   envOverrides?: Record<string, string>;
+  /** Trusted previously verified local home for exact recovery/reboot launch. */
+  recoveryCodexHome?: string;
   /**
    * Env vars to REMOVE from the tmux session (`setenv -u`) before `envOverrides` is
    * applied. `setenv` persists at the tmux-session level and is inherited by

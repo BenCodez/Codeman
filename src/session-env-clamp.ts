@@ -42,7 +42,11 @@ export async function clampExternalCliConfigsForOwner(
   owner: string | undefined,
   configs: Record<string, unknown>
 ): Promise<Record<string, unknown>> {
-  if (await canUsernameRunPrivilegedCommands(owner)) return configs;
+  return clampConfigsWithGrant(configs, await canUsernameRunPrivilegedCommands(owner));
+}
+
+function clampConfigsWithGrant(configs: Record<string, unknown>, privileged: boolean): Record<string, unknown> {
+  if (privileged) return configs;
 
   const out = { ...configs };
   for (const entry of enabledClis()) {
@@ -125,8 +129,26 @@ export async function clampEnvOverridesForOwner(
   if (!envOverrides) return envOverrides;
   const keys = ownerClampedEnvKeys();
   if (!keys.some((key) => key in envOverrides)) return envOverrides;
-  if (await canUsernameRunPrivilegedCommands(owner)) return envOverrides;
+  return clampEnvWithGrant(envOverrides, await canUsernameRunPrivilegedCommands(owner));
+}
+
+function clampEnvWithGrant(
+  envOverrides: Record<string, string> | undefined,
+  privileged: boolean
+): Record<string, string> | undefined {
+  if (!envOverrides || privileged) return envOverrides;
+  const keys = ownerClampedEnvKeys();
   const clamped = { ...envOverrides };
   for (const key of keys) delete clamped[key];
   return clamped;
+}
+
+/** One current owner-grant snapshot for a final configuration/environment decision. */
+export async function clampRecoveryLaunchForOwner(
+  owner: string | undefined,
+  configs: Record<string, unknown>,
+  env: Record<string, string> | undefined
+) {
+  const privileged = await canUsernameRunPrivilegedCommands(owner);
+  return { configs: clampConfigsWithGrant(configs, privileged), env: clampEnvWithGrant(env, privileged) };
 }

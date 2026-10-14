@@ -1328,6 +1328,9 @@ export class WebServer extends EventEmitter {
     const state = {
       ...base,
       recovery: this.recoveryControllers.get(session.id)?.getStatus(),
+      ...(session.getRecoveryContext().codexHome
+        ? { __codexRecoveryHome: session.getRecoveryContext().codexHome }
+        : {}),
       ...(envOverrides ? { __envOverrides: envOverrides } : {}),
       ...(attachmentHistory ? { __attachmentHistory: attachmentHistory } : {}),
       ...(customModel ? { __customModel: customModel } : {}),

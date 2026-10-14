@@ -7,13 +7,13 @@
  * authorizes recovery. Incomplete identity evidence supplies no id; a verified id
  * with a truncated rollout tail remains non-actionable.
  *
- * All filesystem work is asynchronous and serial within one home. An outstanding
+ * Identity scanning is asynchronous and serial within one home. An outstanding
  * operation retains its single-flight slot even after the caller's deadline expires,
  * so a stalled network filesystem cannot accumulate new workers on every tick.
  */
 
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, parse, resolve, sep } from 'node:path';
@@ -28,6 +28,19 @@ export interface CodexIdentityRequest {
   previousId?: string;
 }
 
+/** Bounded private identity inputs; their freshness must survive the final pane/grant awaits. */
+export interface CodexIdentityWitness {
+  paths: Array<{
+    path: string;
+    kind: 'directory' | 'file';
+    dev: number;
+    ino: number;
+    size?: number;
+    mtimeMs?: number;
+    ctimeMs?: number;
+  }>;
+}
+
 export interface CodexIdentityResult {
   conversationId?: string;
   path?: string;
@@ -36,6 +49,7 @@ export interface CodexIdentityResult {
   tail?: string;
   /** Only false certifies that the tail contains the rollout's complete lifecycle history. */
   tailTruncated?: boolean;
+  witness?: CodexIdentityWitness;
 }
 
 const HEAD_BYTES = 128 * 1024;
@@ -81,6 +95,20 @@ class Budget {
   files = 0;
   directories = 0;
   entries = 0;
+  readonly witness = new Map<string, CodexIdentityWitness['paths'][number]>();
+
+  record(path: string, stat: Stats, contents: boolean): void {
+    const next: CodexIdentityWitness['paths'][number] = {
+      path,
+      kind: stat.isDirectory() ? 'directory' : 'file',
+      dev: stat.dev,
+      ino: stat.ino,
+      ...(contents ? { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } : {}),
+    };
+    const previous = this.witness.get(path);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(next)) throw new Refusal('unverified');
+    this.witness.set(path, next);
+  }
 
   check(): void {
     if (performance.now() >= this.deadline) throw new Refusal('unreadable');
@@ -116,6 +144,7 @@ async function validateHome(home: string, budget: Budget): Promise<void> {
     path = join(path, component);
     const stat = await checked(budget, () => fs.lstat(path));
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Refusal('unverified');
+    budget.record(path, stat, false);
   }
 }
 
@@ -134,12 +163,22 @@ async function readWindow(
   try {
     budget.check();
     const stat = await checked(budget, () => file.stat());
-    if (!stat.isFile() || stat.ino !== before.ino || stat.dev !== before.dev) throw new Refusal('unverified');
+    if (
+      !stat.isFile() ||
+      stat.ino !== before.ino ||
+      stat.dev !== before.dev ||
+      stat.size !== before.size ||
+      stat.mtimeMs !== before.mtimeMs ||
+      stat.ctimeMs !== before.ctimeMs
+    )
+      throw new Refusal('unverified');
+    budget.record(path, stat, true);
     const length = Math.min(bytes, stat.size);
     const buffer = Buffer.alloc(length);
     const offset = tail ? Math.max(0, stat.size - length) : 0;
     const { bytesRead } = await checked(budget, () => file.read(buffer, 0, length, offset));
     if (bytesRead !== length) throw new Refusal('unverified');
+    budget.record(path, await checked(budget, () => file.stat()), true);
     let text = buffer.toString('utf8');
     const truncated = stat.size > bytes;
     if (tail && truncated) {
@@ -215,6 +254,7 @@ async function scanRollouts(home: string, budget: Budget): Promise<RolloutIdenti
     if (depth > MAX_DEPTH || ++budget.directories > MAX_DIRECTORIES) throw new Refusal('unverified');
     const stat = await checked(budget, () => fs.lstat(directory));
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Refusal('unverified');
+    budget.record(directory, stat, true);
     budget.check();
     // Stream entries in small batches: readdir() would allocate an arbitrarily large
     // listing before the entry budget got a chance to refuse it.
@@ -239,6 +279,7 @@ async function scanRollouts(home: string, budget: Budget): Promise<RolloutIdenti
     } finally {
       await handle.close();
     }
+    budget.record(directory, await checked(budget, () => fs.lstat(directory)), true);
   };
   try {
     await visit(join(home, 'sessions'), 0);
@@ -354,6 +395,7 @@ async function resolveInternal(
       head,
       tail: tail.text,
       tailTruncated: tail.truncated,
+      witness: { paths: [...budget.witness.values()] },
     };
   } catch (error) {
     return { reason: error instanceof Refusal ? error.reason : isAbsent(error) ? 'unverified' : 'unreadable' };

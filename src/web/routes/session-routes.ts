@@ -1960,10 +1960,10 @@ export function registerSessionRoutes(
         fromUser: true,
         ...(tagged && !workerDead ? { inputSeq: { clientId: clientId as string, seq: seq as number } } : {}),
       };
-      const failedMuxWrite = (err: unknown): false => {
-        // Never fall back or reopen an identity after bytes may have committed.
-        if (tagged && session.hasAppliedInputSeq(clientId as string, seq as number)) throw err;
-        return false;
+      const failedMuxWrite = (err: unknown): never => {
+        // An exception can follow a partial mux or PTY send even without a delivery identity.
+        // Only a certified false before dispatch permits the direct-write fallback.
+        throw err;
       };
 
       // Whether the bytes actually reached a write path. The tagged POST fallback is
@@ -2017,7 +2017,7 @@ export function registerSessionRoutes(
             if (!session.write(inputStr, writeOptions)) undoOnFailure();
           })
           .catch(() => {
-            if (!session.write(inputStr, writeOptions)) undoOnFailure();
+            console.warn(`[Server] Mux input delivery could not be confirmed for session ${id}`);
           });
       } else {
         // A tagged no-PTY write is retryable below. Legacy untagged callers keep
