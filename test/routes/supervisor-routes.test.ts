@@ -6,7 +6,6 @@ import {
   SupervisorValidationError,
   type SupervisorDependencies,
 } from '../../src/supervisor/controller.js';
-import { TaskValidationError } from '../../src/supervision/controller.js';
 import { initialTaskState } from '../../src/supervision/schema.js';
 import { initialRecoveryState } from '../../src/recovery/types.js';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
@@ -55,7 +54,6 @@ describe('supervisor routes', () => {
       inspectWorkers: vi.fn(async () => []),
       assign: vi.fn(),
       retry: vi.fn(),
-      report: vi.fn(),
     };
     h = await createRouteTestHarness(
       (app, ctx) => registerSupervisorRoutes(app, { ...ctx, getSupervisorController: () => controller }),
@@ -66,7 +64,6 @@ describe('supervisor routes', () => {
     for (const method of ['getStatus', 'configure', 'start', 'pause', 'reset', 'assign', 'retry'])
       controller[method].mockResolvedValue?.(state);
     controller.getStatus.mockReturnValue(state);
-    controller.report.mockResolvedValue({ version: 1 });
   });
   afterEach(async () => {
     controller.stop?.();
@@ -164,7 +161,6 @@ describe('supervisor routes', () => {
           getStatus: () => taskState,
           update: async () => taskState,
           resume,
-          progress: async () => taskState,
         },
         recovery: {
           getStatus: initialRecoveryState,
@@ -195,17 +191,21 @@ describe('supervisor routes', () => {
     expect(resume).toHaveBeenCalledOnce();
   });
 
-  it('keeps task evidence refusals in worker progress a sanitized validation failure', async () => {
-    controller.report.mockRejectedValueOnce(new TaskValidationError('/private/criterion lacks evidence'));
+  it('refuses manager-authored progress instead of rearming a worker or certifying criteria', async () => {
     const res = await h.app.inject({
       method: 'POST',
       url: `/api/sessions/${h.ctx._sessionId}/supervisor/workers/${workerId}/progress`,
       headers: { 'x-codeman-supervisor-session': h.ctx._sessionId },
-      payload: { outcome: 'completed' },
+      payload: {
+        outcome: 'unfinished',
+        checkpoint: 'Manager-authored checkpoint',
+        nextAction: 'Continue without owner resume',
+        verifiedCriteria: ['review'],
+      },
     });
-    expect(res.statusCode).toBe(400);
-    expect(res.json().errorCode).toBe('INVALID_INPUT');
-    expect(res.body).not.toContain('/private');
+    expect(res.statusCode).toBe(404);
+    expect(controller.assign).not.toHaveBeenCalled();
+    expect(controller.retry).not.toHaveBeenCalled();
   });
 
   it('treats the supervisor header as attribution, while still owner-scoping the resource', async () => {
@@ -230,7 +230,7 @@ describe('supervisor routes', () => {
     expect(foreign.statusCode).toBe(404);
   });
 
-  it('passes bounded durable request ids to worker operations and agent progress cannot gain owner authority', async () => {
+  it('passes bounded durable request ids to worker assignments and rejects invalid retry ids', async () => {
     const workerId = '22222222-2222-4222-8222-222222222222';
     const headers = { 'x-codeman-supervisor-session': h.ctx._sessionId };
     const assign = await h.app.inject({
@@ -241,15 +241,6 @@ describe('supervisor routes', () => {
     });
     expect(assign.statusCode).toBe(200);
     expect(controller.assign).toHaveBeenCalledWith(workerId, 'request-1234');
-    const progress = { outcome: 'unfinished', verifiedCriteria: ['command-check'] };
-    const report = await h.app.inject({
-      method: 'POST',
-      url: `/api/sessions/${h.ctx._sessionId}/supervisor/workers/${workerId}/progress`,
-      headers,
-      payload: progress,
-    });
-    expect(report.statusCode).toBe(200);
-    expect(controller.report).toHaveBeenCalledWith(workerId, progress);
     expect(
       (
         await h.app.inject({

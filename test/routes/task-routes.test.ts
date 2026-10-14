@@ -48,6 +48,55 @@ describe('task routes ownership and bounded inputs', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json().data.config.enabled).toBe(false);
   });
+  it.each(['x-codeman-parent-session', 'x-codeman-supervisor-session'] as const)(
+    'refuses agent-attributed progress via %s while preserving direct owner verification',
+    async (header) => {
+      const observe = vi.fn(async () => ({
+        observation: { activity: 'completed' as const, reason: 'turn-completed' as const, at: 10000 },
+        commands: new Map(),
+      }));
+      const persist = vi.fn(async () => {});
+      const actual = new TaskController({
+        now: () => 10000,
+        observe,
+        persist,
+        act: async () => 'not-sent',
+        changed: () => {},
+      });
+      await actual.update({
+        objective: 'Review the result',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      await actual.pause();
+      const before = actual.getStatus();
+      persist.mockClear();
+      getController.mockReturnValue(actual);
+      const progress = { outcome: 'completed', verifiedCriteria: ['review'] };
+      for (const attribution of [h.ctx._sessionId, 'unresolvable-agent', '']) {
+        const res = await h.app.inject({
+          method: 'POST',
+          url: `/api/sessions/${h.ctx._sessionId}/task/progress`,
+          headers: { [header]: attribution },
+          payload: progress,
+        });
+        expect(res.statusCode).toBe(400);
+        expect(res.json()).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
+        expect(actual.getStatus()).toEqual(before);
+      }
+      expect(observe).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      const owner = await h.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${h.ctx._sessionId}/task/progress`,
+        payload: progress,
+      });
+      expect(owner.statusCode).toBe(200);
+      expect(owner.json().data).toMatchObject({ phase: 'completed', outcome: 'completed' });
+      expect(owner.json().data.criteria[0].evidence.source).toBe('owner');
+      actual.stop();
+    }
+  );
   it('rejects unbounded and unknown config options', async () => {
     for (const config of [{ maxContinuations: 11 }, { maxRuntimeMs: 86400001 }, { executeShell: true }]) {
       const res = await h.app.inject({

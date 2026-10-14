@@ -158,7 +158,11 @@ describe('session-routes', () => {
         mode: 'codex',
         useMux: true,
         mux: mux as unknown as TerminalMultiplexer,
-        muxSession: { muxName: 'codeman-test-key', recoveryIsolated: true } as MuxSession,
+        muxSession: {
+          muxName: 'codeman-test-key',
+          recoveryIsolated: true,
+          recoveryCodexHome: '/fixture/codex-home',
+        } as MuxSession,
         codexConfig: { noDaemon: true, resumeSessionId: thread },
       });
       (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
@@ -2300,7 +2304,7 @@ describe('session-routes', () => {
           {
             id: 'gpu-box',
             label: 'GPU Box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             commands: { codex: 'exec codx personal' },
           },
@@ -2322,7 +2326,7 @@ describe('session-routes', () => {
           workingDir: '/home/ubuntu/work',
           remote: expect.objectContaining({
             hostId: 'gpu-box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             remotePath: '/home/ubuntu/work',
             commands: { codex: 'exec codx personal' },
@@ -2340,7 +2344,7 @@ describe('session-routes', () => {
           {
             id: 'gpu-box',
             label: 'GPU Box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             commands: { codex: 'exec codx personal' },
           },
@@ -2362,7 +2366,7 @@ describe('session-routes', () => {
           workingDir: '/home/ubuntu/work',
           remote: expect.objectContaining({
             hostId: 'gpu-box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             remotePath: '/home/ubuntu/work',
           }),
@@ -2373,7 +2377,7 @@ describe('session-routes', () => {
     });
 
     it('rejects a remote quick-start that carries envOverrides (inert over ssh)', async () => {
-      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu' }];
       remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
 
       const res = await harness.app.inject({
@@ -2393,7 +2397,7 @@ describe('session-routes', () => {
           {
             id: 'gpu-box',
             label: 'GPU Box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             port: 2222,
             identityFile: '/keys/gpu',
@@ -2442,7 +2446,7 @@ describe('session-routes', () => {
       { envOverrides: { CODEX_HOME: 'relative/home' } },
       { envOverrides: { CODEX_HOME: '/home/ubuntu/.codex', OPENAI_API_KEY: 'secret' } },
     ])('rejects unsafe remote Codex environment overrides: %j', async (extra) => {
-      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu' }];
       remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
 
       const res = await harness.app.inject({
@@ -2460,7 +2464,7 @@ describe('session-routes', () => {
         {
           id: 'gpu-box',
           label: 'GPU Box',
-          host: '10.0.0.42',
+          host: '192.0.2.42',
           username: 'ubuntu',
           commands: { codex: 'codex --profile remote' },
         },
@@ -2478,11 +2482,11 @@ describe('session-routes', () => {
     });
 
     it('rejects a remote quick-start when the remote host lacks tmux', async () => {
-      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu' }];
       remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
       remoteStore.tmuxCheck = {
         ok: false,
-        error: 'remote host 10.0.0.42 needs tmux installed for durable remote sessions',
+        error: 'remote host 192.0.2.42 needs tmux installed for durable remote sessions',
       };
 
       const res = await harness.app.inject({
@@ -2634,7 +2638,7 @@ describe('session-routes', () => {
       const startInteractive = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
       try {
         remoteStore.hosts = [
-          { id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: { codex: 'exec codx' } },
+          { id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu', commands: { codex: 'exec codx' } },
         ];
         remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
 

@@ -10,7 +10,7 @@ import { initialTaskState } from '../src/supervision/schema.js';
 import { TaskController, type TaskObservation } from '../src/supervision/controller.js';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { initialRecoveryState, type RecoveryObservation } from '../src/recovery/types.js';
-import { buildSupervisorManagerTask } from '../src/supervisor/manager-task.js';
+import { buildSupervisorManagerTask, SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from '../src/supervisor/manager-task.js';
 import { SupervisorConfigSchema } from '../src/supervisor/schema.js';
 
 const SUPERVISOR = '11111111-1111-4111-8111-111111111111';
@@ -44,7 +44,6 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
         kickoffAt: 10_000,
         inFlight: { key: 'task-kickoff', startedAt: 10_000 },
       })),
-      progress: vi.fn(async () => structuredClone(taskState)),
     },
     recovery: {
       getStatus: vi.fn(() => structuredClone(recoveryState)),
@@ -76,7 +75,7 @@ describe('SupervisorController', () => {
     const h = harness();
     await h.controller.configure(config);
     await h.controller.start();
-    expect(h.deps.startManager).toHaveBeenCalledWith(config.objective, expect.any(Array), expect.any(Function));
+    expect(h.deps.startManager).toHaveBeenCalledWith(config.objective, expect.any(Array), expect.any(Function), 10_000);
     await h.controller.assign(WORKER, 'request-0001');
     expect(h.worker.task.update).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -97,6 +96,210 @@ describe('SupervisorController', () => {
     await h.controller.configure(config);
     await expect(h.controller.start()).rejects.toThrow(/not ready/);
     expect(h.controller.getStatus()).toMatchObject({ phase: 'paused', reason: 'manager-start-refused' });
+  });
+
+  it.each(['owner-stricter', 'plan-stricter', 'same-inactive', 'new-task', 'claimed-completed'] as const)(
+    'keeps the tighter actual worker task budgets for %s',
+    async (caseName) => {
+      const plan = {
+        ...config,
+        workers: config.workers.map((worker) => ({
+          ...worker,
+          criteria:
+            caseName === 'claimed-completed'
+              ? [{ id: 'review', description: 'Owner acceptance', kind: 'manual' as const }]
+              : worker.criteria,
+          maxAssignments: caseName === 'plan-stricter' ? 2 : 10,
+          maxRuntimeMs: caseName === 'plan-stricter' ? 60_000 : 600_000,
+        })),
+      };
+      let now = 9_000;
+      let freshCompletionClaim = false;
+      const act = vi.fn(async () => 'sent' as const);
+      const task = new TaskController({
+        now: () => now,
+        observe: async () => ({
+          observation: {
+            activity: freshCompletionClaim ? 'working' : 'idle',
+            reason: freshCompletionClaim ? 'turn-running' : 'observing',
+            at: now,
+            conversationId: WORKER,
+            processReady: true,
+            safeToAct: false,
+            submissionKey: 'claimed-task-submission',
+          },
+          commands: new Map(),
+          ...(freshCompletionClaim
+            ? {
+                marker: {
+                  key: 'claimed-task-completion',
+                  at: now,
+                  submissionKey: 'claimed-task-submission',
+                  progress: { outcome: 'completed' as const },
+                },
+              }
+            : {}),
+        }),
+        act,
+        persist: async () => {},
+        changed: () => {},
+      });
+      const h = harness();
+      h.worker.task = task;
+      try {
+        if (caseName !== 'new-task')
+          await task.update({
+            objective: plan.workers[0].task,
+            criteria: plan.workers[0].criteria,
+            config: {
+              enabled: caseName !== 'same-inactive',
+              maxContinuations: caseName === 'plan-stricter' ? 10 : 1,
+              maxRuntimeMs: caseName === 'plan-stricter' ? 900_000 : 60_000,
+            },
+          });
+        if (caseName === 'claimed-completed') {
+          await task.progress({ outcome: 'unfinished', checkpoint: 'Pending owner acceptance', nextAction: 'Review' });
+          await expect(task.progress({ outcome: 'completed' })).rejects.toThrow(/criteria remain unverified/);
+          now = 10_000;
+          freshCompletionClaim = true;
+          await task.refresh();
+          freshCompletionClaim = false;
+          expect(task.getStatus()).toMatchObject({
+            phase: 'watching',
+            outcome: 'unknown',
+            criteria: [{ kind: 'manual', verified: false }],
+          });
+        }
+        now = 10_000;
+        await h.controller.configure(plan);
+        await h.controller.start();
+        await h.controller.assign(WORKER, `request-budget-${caseName}`);
+        expect(act).toHaveBeenCalledOnce();
+        const expected =
+          caseName === 'new-task'
+            ? { maxContinuations: 10, maxRuntimeMs: 600_000 }
+            : caseName === 'plan-stricter'
+              ? { maxContinuations: 2, maxRuntimeMs: 60_000 }
+              : { maxContinuations: 1, maxRuntimeMs: 60_000 };
+        expect(task.getStatus()).toMatchObject({
+          phase: 'watching',
+          config: { enabled: true, ...expected },
+          startedAt: caseName === 'new-task' || caseName === 'same-inactive' ? 10_000 : 9_000,
+        });
+      } finally {
+        task.stop();
+        h.controller.stop();
+      }
+    }
+  );
+
+  it.each(['paused', 'blocked', 'other-task', 'owner-cleared'] as const)(
+    'preserves actual worker task ownership for %s before a manager assignment',
+    async (state) => {
+      const act = vi.fn(async () => 'sent' as const);
+      const task = new TaskController({
+        now: () => 10_000,
+        observe: async () => ({
+          observation: {
+            activity: 'idle',
+            reason: 'observing',
+            at: 10_000,
+            conversationId: WORKER,
+            processReady: true,
+            safeToAct: false,
+          },
+          commands: new Map(),
+        }),
+        act,
+        persist: async () => {},
+        changed: () => {},
+      });
+      const h = harness();
+      h.worker.task = task;
+      try {
+        await task.update({
+          objective: 'The owner worker objective',
+          criteria: [{ id: 'review', description: 'Owner acceptance', kind: 'manual' }],
+          config: { enabled: true },
+        });
+        if (state === 'blocked') await task.progress({ outcome: 'blocked', checkpoint: 'Owner decision needed' });
+        else if (state !== 'other-task') await task.pause();
+        if (state === 'owner-cleared') await task.reset();
+        const before = task.getStatus();
+        await h.controller.configure(config);
+        await h.controller.start();
+        const assigning = h.controller.assign(WORKER, `request-owner-${state}`);
+        if (state === 'owner-cleared') {
+          await assigning;
+          expect(act).toHaveBeenCalledOnce();
+          expect(task.getStatus()).toMatchObject({ objective: config.workers[0].task, phase: 'watching' });
+        } else {
+          await expect(assigning).rejects.toThrow(/cancelled|owner attention/);
+          expect(act).not.toHaveBeenCalled();
+          expect(task.getStatus()).toEqual(before);
+          expect(h.controller.getStatus().inFlight).toBeUndefined();
+          expect(h.controller.getStatus().workers[0].assignments).toBe(0);
+        }
+      } finally {
+        task.stop();
+        h.controller.stop();
+      }
+    }
+  );
+
+  it.each(['assign', 'retry'] as const)(
+    'keeps task/recovery attention vetoes for manager %s until the owner clears them',
+    async (action) => {
+      for (const domain of ['task-pause', 'task-block', 'recovery-pause', 'recovery-block'] as const) {
+        const h = harness();
+        if (domain === 'task-pause') h.taskState.phase = 'paused';
+        else if (domain === 'task-block') h.taskState.phase = 'blocked';
+        else if (domain === 'recovery-pause') h.recoveryState.phase = 'paused';
+        else h.recoveryState.phase = 'blocked';
+        await h.controller.configure(config);
+        await h.controller.start();
+        await expect(h.controller[action](WORKER, `request-${action}-${domain}`)).rejects.toThrow(
+          /cancelled|owner attention/
+        );
+        expect(h.worker.task.update).not.toHaveBeenCalled();
+        expect(h.worker.task.resume).not.toHaveBeenCalled();
+        expect(h.worker.recovery.retry).not.toHaveBeenCalled();
+        expect(h.controller.getStatus().workers[0].assignments).toBe(0);
+      }
+    }
+  );
+
+  it.each(['assign', 'retry'] as const)(
+    'rechecks worker owner pause after the durable %s reservation',
+    async (action) => {
+      const h = harness();
+      h.recoveryState.activity = 'crashed';
+      vi.mocked(h.deps.persist).mockImplementation(async (snapshot) => {
+        if (snapshot.reason === `${action}-reserved`) h.taskState.phase = 'paused';
+      });
+      await h.controller.configure(config);
+      await h.controller.start();
+      await expect(h.controller[action](WORKER, `request-race-${action}`)).rejects.toThrow(/cancelled/);
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      expect(h.worker.recovery.retry).not.toHaveBeenCalled();
+      expect(h.controller.getStatus().inFlight).toBeUndefined();
+      expect(h.controller.getStatus().workers[0].assignments).toBe(0);
+    }
+  );
+
+  it('does not resume a worker paused while assignment configuration is saved', async () => {
+    const h = harness();
+    vi.mocked(h.worker.task.update).mockImplementationOnce(async () => {
+      h.taskState.phase = 'paused';
+      return structuredClone(h.taskState);
+    });
+    await h.controller.configure(config);
+    await h.controller.start();
+    await expect(h.controller.assign(WORKER, 'request-worker-paused-update')).rejects.toThrow(/cancelled/);
+    expect(h.worker.task.resume).not.toHaveBeenCalled();
+    expect(h.controller.getStatus().inFlight).toBeUndefined();
+    expect(h.controller.getStatus().workers[0].assignments).toBe(0);
   });
 
   it('refuses to reassign the same verified completed task until the owner changes the plan', async () => {
@@ -149,12 +352,11 @@ describe('SupervisorController', () => {
     await expect(h.controller.assign(WORKER, 'request-0003')).rejects.toThrow(/not active/);
   });
 
-  it('does not let the manager self-certify manual criteria', async () => {
+  it('exposes no manager-authored worker progress operation', async () => {
     const h = harness();
     await h.controller.configure(config);
     await h.controller.start();
-    await h.controller.report(WORKER, { outcome: 'unfinished', verifiedCriteria: [] });
-    expect(h.worker.task.progress).toHaveBeenCalledWith(expect.any(Object), false);
+    expect('report' in h.controller).toBe(false);
   });
 
   it('retries only through recovery and refuses clean exits and ineffective retries', async () => {
@@ -458,9 +660,9 @@ describe('SupervisorController', () => {
       changed: () => {},
     });
     const h = harness({
-      startManager: async (objective, _workers, isCurrent) => {
+      startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
         await managerTask.update(buildSupervisorManagerTask(objective));
-        const outcome = classifyTaskKickoff(await managerTask.resume(isCurrent));
+        const outcome = classifyTaskKickoff(await managerTask.resume(isCurrent, runtimeStartedAt));
         if (outcome === 'uncertain') throw new Error('Manager task delivery acceptance is uncertain');
         return outcome === 'accepted';
       },
@@ -493,10 +695,10 @@ describe('SupervisorController', () => {
       changed: () => {},
     });
     const h = harness({
-      startManager: async (objective, _workers, isCurrent) => {
+      startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
         await managerTask.update(buildSupervisorManagerTask(objective));
         if (!isCurrent()) return false;
-        const started = await managerTask.resume(isCurrent);
+        const started = await managerTask.resume(isCurrent, runtimeStartedAt);
         if (!isCurrent()) {
           if (started.inFlight) throw new Error('Manager delivery is uncertain');
           return false;
@@ -738,6 +940,7 @@ describe('SupervisorController', () => {
       let armed = false;
       let effects = 0;
       let observations = 0;
+      let taskObservation: TaskObservation | undefined;
       const boundary = (name: string) => {
         if (armed && options.expireAt === name) now = deadline;
       };
@@ -753,6 +956,7 @@ describe('SupervisorController', () => {
         now: () => now,
         observe: async () => {
           boundary('task-observation');
+          if (taskObservation) return taskObservation;
           return {
             observation: {
               activity: 'idle',
@@ -824,6 +1028,9 @@ describe('SupervisorController', () => {
         effects: () => effects,
         setNow: (value: number) => {
           now = value;
+        },
+        setTaskObservation: (value: TaskObservation) => {
+          taskObservation = value;
         },
         stop: () => {
           controller.stop();
@@ -903,6 +1110,25 @@ describe('SupervisorController', () => {
     );
 
     it.each(['assign', 'retry'] as const)(
+      'refuses %s when a saved worker origin is in the future or invalid',
+      async (action) => {
+        for (const options of [
+          { startedAt: 10_000, initialNow: 9999 },
+          { startedAt: -1, initialNow: 0 },
+        ]) {
+          const h = await runtimeHarness(options);
+          try {
+            await expect(h.controller[action](WORKER, 'request-clock-regression')).rejects.toThrow(/budget exhausted/);
+            expect(h.act).not.toHaveBeenCalled();
+            expect(h.controller.getStatus().inFlight).toBeUndefined();
+          } finally {
+            h.stop();
+          }
+        }
+      }
+    );
+
+    it.each(['assign', 'retry'] as const)(
       'releases only a certified unsent %s after adapter preflight expiry',
       async (action) => {
         const h = await runtimeHarness({ expireAt: 'adapter-preflight' });
@@ -972,5 +1198,173 @@ describe('SupervisorController', () => {
         h.stop();
       }
     });
+
+    it.each([-1, 0])('bounds later worker continuations at the shared plan deadline (%s ms)', async (offset) => {
+      const h = await runtimeHarness();
+      try {
+        await h.controller.assign(WORKER, 'request-late-kickoff');
+        expect(h.task.getStatus().startedAt).toBe(10_000);
+        const flight = h.task.getStatus().inFlight!;
+        h.setNow(10_600);
+        const accepted: RecoveryObservation = {
+          activity: 'working',
+          reason: 'turn-running',
+          at: 10_600,
+          conversationId: WORKER,
+          submissionKey: 'accepted-kickoff',
+          submissionHash: flight.promptHash,
+          processReady: true,
+          safeToAct: false,
+        };
+        h.setTaskObservation({ observation: accepted, commands: new Map() });
+        await h.task.refresh();
+        expect(h.task.getStatus().inFlight).toBeUndefined();
+        const at = 11_000 + offset;
+        h.setNow(at);
+        h.setTaskObservation({
+          observation: { ...accepted, activity: 'completed', reason: 'turn-completed', at, turnId: 'finished-turn' },
+          commands: new Map(),
+          marker: {
+            key: 'fresh-worker-progress',
+            at,
+            submissionKey: 'accepted-kickoff',
+            progress: { outcome: 'unfinished', checkpoint: 'Parser implemented', nextAction: 'Run the check' },
+          },
+        });
+        await h.task.refresh();
+        expect(h.effects()).toBe(offset < 0 ? 2 : 1);
+        expect(h.task.getStatus().reason).toBe(offset < 0 ? 'continuation-sent' : 'budget-exhausted');
+      } finally {
+        h.stop();
+      }
+    });
+
+    it('charges task configuration time against the first worker runtime before later polling', async () => {
+      const h = await runtimeHarness({ firstOperation: true });
+      try {
+        h.setNow(10_000);
+        const update = h.task.update.bind(h.task);
+        vi.spyOn(h.task, 'update').mockImplementation(async (patch) => {
+          const updated = await update(patch);
+          h.setNow(10_800);
+          return updated;
+        });
+        await h.controller.assign(WORKER, 'request-preflight-origin');
+        expect(h.controller.getStatus().workers[0].startedAt).toBe(10_000);
+        expect(h.task.getStatus().startedAt).toBe(10_000);
+        expect(h.effects()).toBe(1);
+      } finally {
+        h.stop();
+      }
+    });
+  });
+
+  it.each(['assign', 'retry'] as const)(
+    'refuses %s after the manager runtime even with fresh worker budget',
+    async (action) => {
+      let now = 10_000;
+      const h = harness({ now: () => now });
+      await h.controller.configure(config);
+      await h.controller.start();
+      now += SUPERVISOR_MANAGER_MAX_RUNTIME_MS;
+      await expect(h.controller[action](WORKER, 'request-manager-expired')).rejects.toThrow(/budget exhausted/);
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.recovery.inspect).not.toHaveBeenCalled();
+      expect(h.controller.getStatus().inFlight).toBeUndefined();
+    }
+  );
+
+  it.each([-1, 10_001])('refuses manager startup with an invalid or future runtime origin (%s)', async (startedAt) => {
+    const h = harness();
+    await h.controller.configure(config);
+    const restored = { ...h.controller.getStatus(), startedAt };
+    const controller = new SupervisorController(h.deps, SUPERVISOR, restored);
+    await expect(controller.start()).rejects.toThrow(/cancelled/);
+    expect(h.deps.startManager).not.toHaveBeenCalled();
+    expect(controller.getStatus()).toMatchObject({ phase: 'paused', reason: 'manager-start-refused' });
+  });
+
+  it.each([-1, 0])('preserves the manager runtime through late kickoff and later polling (%s ms)', async (offset) => {
+    const origin = 10_000;
+    const deadline = origin + SUPERVISOR_MANAGER_MAX_RUNTIME_MS;
+    let now = deadline - 500;
+    let observation: RecoveryObservation = {
+      activity: 'idle',
+      reason: 'observing',
+      at: now,
+      conversationId: SUPERVISOR,
+      submissionKey: 'before-manager-kickoff',
+      processReady: true,
+      safeToAct: false,
+    };
+    let marker: TaskObservation['marker'];
+    const act = vi.fn(async () => 'sent' as const);
+    const task = new TaskController({
+      now: () => now,
+      observe: async () => ({ observation, commands: new Map(), marker }),
+      act,
+      persist: async () => {},
+      changed: () => {},
+    });
+    const h = harness({
+      now: () => now,
+      startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
+        await task.update(buildSupervisorManagerTask(objective));
+        return classifyTaskKickoff(await task.resume(isCurrent, runtimeStartedAt)) === 'accepted';
+      },
+    });
+    await h.controller.configure(config);
+    const controller = new SupervisorController(h.deps, SUPERVISOR, {
+      ...h.controller.getStatus(),
+      startedAt: origin,
+    });
+    try {
+      await controller.start();
+      expect(task.getStatus().startedAt).toBe(origin);
+      const flight = task.getStatus().inFlight!;
+      now += 1;
+      observation = {
+        ...observation,
+        activity: 'working',
+        reason: 'turn-running',
+        at: now,
+        submissionKey: 'accepted-manager-kickoff',
+        submissionHash: flight.promptHash,
+      };
+      await task.refresh();
+      expect(task.getStatus().inFlight).toBeUndefined();
+      now = deadline + offset;
+      observation = {
+        ...observation,
+        activity: 'completed',
+        reason: 'turn-completed',
+        at: now,
+        turnId: 'manager-turn',
+      };
+      marker = {
+        key: 'fresh-manager-progress',
+        at: now,
+        submissionKey: 'accepted-manager-kickoff',
+        progress: { outcome: 'unfinished', checkpoint: 'Worker evidence checked', nextAction: 'Inspect again' },
+      };
+      await task.refresh();
+      expect(act).toHaveBeenCalledTimes(offset < 0 ? 2 : 1);
+      expect(task.getStatus().reason).toBe(offset < 0 ? 'continuation-sent' : 'budget-exhausted');
+    } finally {
+      task.stop();
+      controller.stop();
+    }
+  });
+
+  it.each(['assign', 'retry'] as const)('cancels %s when the clock moves before the manager origin', async (action) => {
+    let now = 10_000;
+    const h = harness({ now: () => now });
+    await h.controller.configure(config);
+    await h.controller.start();
+    now = 9999;
+    await expect(h.controller[action](WORKER, 'request-manager-clock')).rejects.toThrow(/budget exhausted/);
+    expect(h.worker.task.update).not.toHaveBeenCalled();
+    expect(h.worker.recovery.inspect).not.toHaveBeenCalled();
+    expect(h.controller.getStatus().inFlight).toBeUndefined();
   });
 });

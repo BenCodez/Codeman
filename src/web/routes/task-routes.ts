@@ -32,10 +32,12 @@ export function registerTaskRoutes(app: FastifyInstance, ctx: SessionPort & Task
           execute = () => c.update(patch);
         } else if (action === 'progress') {
           const patch = parseBody(TaskProgressSchema, req.body, 'Invalid task progress');
-          const agentAttributed =
-            req.headers['x-codeman-parent-session'] !== undefined ||
-            req.headers['x-codeman-supervisor-session'] !== undefined;
-          execute = () => c.progress(patch, !agentAttributed);
+          // Agent attribution only narrows authority. It cannot certify owner
+          // criteria or replace a task checkpoint through the ordinary owner API.
+          const owner =
+            req.headers['x-codeman-parent-session'] === undefined &&
+            req.headers['x-codeman-supervisor-session'] === undefined;
+          execute = () => c.progress(patch, owner);
         } else {
           if (req.body !== undefined) parseBody(TaskActionSchema, req.body, 'Task action does not accept options');
           execute = () => c[action]();

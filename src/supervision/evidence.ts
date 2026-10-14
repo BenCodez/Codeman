@@ -23,6 +23,9 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
   const result = new Map<string, CommandSuccessEvidence>();
   if (Buffer.byteLength(tail) > 262144 || !tail.endsWith('\n')) return result;
   const pending = new Map<string, { command: string; at: number }>();
+  const begunCalls = new Set<string>();
+  const endedCalls = new Set<string>();
+  const latest = new Map<string, { at: number; callId: string }>();
   for (const line of tail.split('\n')) {
     if (!line.trim()) continue;
     let row;
@@ -34,30 +37,52 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
     if (!row || typeof row !== 'object' || Array.isArray(row)) return new Map();
     const at = Date.parse(row.timestamp);
     const p = row.payload;
+    if (row.type !== 'event_msg') continue;
     if (
-      row.type !== 'event_msg' ||
       !p ||
       typeof p !== 'object' ||
+      Array.isArray(p) ||
+      typeof row.timestamp !== 'string' ||
       !Number.isFinite(at) ||
-      at < since ||
       at > now + 2000
     )
-      continue;
-    if (
-      p.type === 'exec_command_begin' &&
-      typeof p.call_id === 'string' &&
-      Array.isArray(p.command) &&
-      p.command.every((x: unknown) => typeof x === 'string')
-    ) {
+      return new Map();
+    if (at < since) continue;
+    if (p.type === 'exec_command_begin') {
+      // Reused call identities cannot attribute an end to exactly one execution.
+      // Include unsupported invocations so they cannot reuse a prior accepted begin.
+      if (typeof p.call_id !== 'string' || !p.call_id || begunCalls.has(p.call_id) || endedCalls.has(p.call_id))
+        return new Map();
+      begunCalls.add(p.call_id);
+      if (!Array.isArray(p.command) || !p.command.every((x: unknown) => typeof x === 'string')) return new Map();
       // Shell invocation must match the owner's EXACT command, without normalization.
       const c = p.command;
       const command =
         c.length === 3 && SUPPORTED_POSIX_SHELLS.has(c[0]) && ['-lc', '-c'].includes(c[1]) ? c[2] : undefined;
-      if (command && command.length <= 1000 && pending.size < 100) pending.set(p.call_id, { command, at });
+      if (command && command.length <= 1000) {
+        const hash = commandHash(command);
+        const prior = latest.get(hash);
+        // Journal order says this execution began later; a backwards clock cannot preserve an older success.
+        if (prior && at < prior.at) return new Map();
+        if (!prior || at >= prior.at) {
+          latest.set(hash, { at, callId: p.call_id });
+          result.delete(hash); // a newer execution is not successful while pending or failed
+        }
+        if (pending.size < 100) pending.set(p.call_id, { command, at });
+      }
     }
-    if (p.type === 'exec_command_end' && typeof p.call_id === 'string') {
+    if (p.type === 'exec_command_end') {
+      if (typeof p.call_id !== 'string' || !p.call_id || !Number.isInteger(p.exit_code) || endedCalls.has(p.call_id))
+        return new Map();
+      endedCalls.add(p.call_id);
       const begin = pending.get(p.call_id);
-      if (p.exit_code === 0 && begin && at >= begin.at) {
+      if (begin && at < begin.at) return new Map();
+      if (
+        p.exit_code === 0 &&
+        begin &&
+        at >= begin.at &&
+        latest.get(commandHash(begin.command))?.callId === p.call_id
+      ) {
         const hash = commandHash(begin.command);
         const prior = result.get(hash);
         // A late completion of older work must not erase a newer execution's freshness proof.

@@ -33,6 +33,8 @@ import type {
 export interface MuxSession {
   /** Persisted launch fact: the owned pane's actual registry command disabled the shared daemon. */
   recoveryIsolated?: boolean;
+  /** Exact non-secret local Codex home pinned at an owned launch, never inferred on attach. */
+  recoveryCodexHome?: string;
   /** Codeman session ID */
   sessionId: string;
   /** Multiplexer session name (e.g., "codeman-abc12345") */
@@ -87,6 +89,13 @@ export interface MuxSessionWithStats extends MuxSession {
 }
 
 /** Options for creating a new multiplexer session. */
+export interface CodexRestoreLaunchGuard {
+  prepare(): Promise<void>;
+  confirm(): boolean;
+  /** Mark uncertainty before a worker launch can have effects. */
+  noteDispatch?(): void;
+}
+
 export interface CreateSessionOptions {
   sessionId: string;
   workingDir: string;
@@ -115,6 +124,10 @@ export interface CreateSessionOptions {
   resumeSessionId?: string;
   /** Extra env vars exported before launching the CLI (e.g., CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). Ephemeral — not written to disk. */
   envOverrides?: Record<string, string>;
+  /** Trusted previously verified local home for exact recovery/reboot launch. */
+  recoveryCodexHome?: string;
+  /** Ephemeral local reboot authority; never serialized or exposed to a client. */
+  codexRestoreGuard?: CodexRestoreLaunchGuard;
   /** Claude CLI effort level, injected as a `--settings` soft default (overridable via /effort in-session) */
   effort?: EffortLevel;
   /** Claude advisor model, merged into the same `--settings` JSON (overridable via /advisor in-session) */
@@ -163,6 +176,8 @@ export interface RespawnPaneOptions {
   resumeSessionId?: string;
   /** Extra env vars exported before launching the CLI (preserved across respawns). */
   envOverrides?: Record<string, string>;
+  /** Trusted previously verified local home for exact recovery/reboot launch. */
+  recoveryCodexHome?: string;
   /**
    * Env vars to REMOVE from the tmux session (`setenv -u`) before `envOverrides` is
    * applied. `setenv` persists at the tmux-session level and is inherited by

@@ -1,3 +1,4 @@
+import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 /** @fileoverview Supervisor leases follow surviving/restorable manager identities after boot. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebServer } from '../src/web/server.js';
@@ -45,6 +46,7 @@ function session(id: string): Session {
     sessionId: id,
     muxName: `fixture-${id}`,
     recoveryIsolated: true,
+    recoveryCodexHome: currentLocalCodexHome(),
     workingDir: process.cwd(),
     mode: 'codex',
     attached: true,

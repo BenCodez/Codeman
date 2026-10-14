@@ -39,10 +39,15 @@ import { rebootRestoreRegistry } from '../reboot-restore-registry.js';
 import {
   rejectAlreadyLive,
   verifyCodexRebootIdentity,
+  verifyCodexRebootEvidence,
   type RebootRestoreEntry,
   type RebootRestoreRejection,
 } from '../../reboot-restore.js';
-import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../../session-env-clamp.js';
+import {
+  clampEnvOverridesForOwner,
+  clampExternalCliConfigsForOwner,
+  clampRecoveryLaunchForOwner,
+} from '../../session-env-clamp.js';
 import { Session } from '../../session.js';
 import { resolveClaudeModeForUsername } from '../../user-store.js';
 import { getCli } from '../../config/cli-registry/registry.js';
@@ -53,10 +58,23 @@ import { SseEvent } from '../sse-events.js';
 import type { CodexConfig, CustomModelBookkeeping, SessionAttachmentHistoryItem } from '../../types.js';
 import { rebuildPersistedCustomModelEnv } from '../../custom-model-recovery.js';
 import { customModelConfigDir, removeConfigDir } from '../../custom-model-injection-apply.js';
-import { writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
+import { readRebootIdentityFence, writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
+import { confirmCodexIdentityWitness } from '../../recovery/codex-identity.js';
+import { currentLocalCodexHome, normalizedCodexHome } from '../../recovery/codex-home.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 type RebootRestoreCtx = SessionPort & EventPort & ConfigPort & InfraPort;
+
+function sameCodexLaunchConfig(actual: CodexConfig | undefined, preserved: CodexConfig): boolean {
+  if (!actual) return false;
+  // The owner clamp may materialize the CLI's already-safe absent bypass flag.
+  // Its absence and false launch identically; every other saved setting is exact.
+  const comparable = (config: CodexConfig) => ({
+    ...config,
+    dangerouslyBypassApprovals: config.dangerouslyBypassApprovals ?? false,
+  });
+  return JSON.stringify(comparable(actual)) === JSON.stringify(comparable(preserved));
+}
 
 /** The banner's view of one restorable session. The record itself never leaves the server. */
 function toBannerItem(entry: RebootRestoreEntry) {
@@ -137,10 +155,18 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         let newlyCreatedCustomModelConfigDir: string | undefined;
         let preserveCustomModelConfigDir = false;
         let restoreCompleted = false;
-        const discardTentativeSession = (session: Session): Promise<void> =>
-          preserveCustomModelConfigDir
+        const discardTentativeSession = (session: Session): Promise<void> => {
+          if (session.codexRestoreWorkerMayExist) {
+            writeRebootIdentityFence(session.id, { ...readRebootIdentityFence(session.id), switchPending: true });
+            return ctx.discardPartiallyBuiltSession(entry.sessionId, session, {
+              preserveCustomModelConfigDir: true,
+              preserveMuxPane: true,
+            });
+          }
+          return preserveCustomModelConfigDir
             ? ctx.discardPartiallyBuiltSession(entry.sessionId, session, { preserveCustomModelConfigDir: true })
             : ctx.discardPartiallyBuiltSession(entry.sessionId, session);
+        };
         // The already-live check, re-run against the board as it is NOW. The pass
         // above decided the batch; this catches a conversation that went live while
         // an earlier entry in this same batch was starting. Spent rather than
@@ -221,7 +247,20 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             };
           }
           let codexConfig: CodexConfig | undefined;
+          const recoveryHome = normalizedCodexHome(
+            (saved as typeof saved & { __codexRecoveryHome?: string }).__codexRecoveryHome
+          );
+          const homeCurrentlyAuthorized = async (): Promise<boolean> => {
+            if (!usesCodexRecovery || savedCustomModel || recoveryHome === currentLocalCodexHome()) return true;
+            if (!recoveryHome) return false;
+            const authorized = await clampEnvOverridesForOwner(saved.owner, { CODEX_HOME: recoveryHome });
+            return authorized?.CODEX_HOME === recoveryHome;
+          };
           if (usesCodexRecovery) {
+            if (!(await homeCurrentlyAuthorized())) {
+              failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+              continue;
+            }
             // Validate the actual launch home AFTER applying current owner grants.
             const verified = await verifyCodexRebootIdentity({
               ...saved,
@@ -231,10 +270,16 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
               continue;
             }
-            const configs = await clampExternalCliConfigsForOwner(saved.owner, {
-              codexConfig: { ...saved.codexConfig, resumeSessionId: verified },
-            });
-            codexConfig = configs.codexConfig as CodexConfig;
+            const preservedConfig: CodexConfig = { ...saved.codexConfig, resumeSessionId: verified };
+            const configs = await clampExternalCliConfigsForOwner(saved.owner, { codexConfig: preservedConfig });
+            // Restoration preserves the original launch configuration. A revoked
+            // grant must refuse restoration, rather than launch the conversation
+            // under a silently downgraded set of permissions.
+            if (!sameCodexLaunchConfig(configs.codexConfig as CodexConfig | undefined, preservedConfig)) {
+              failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+              continue;
+            }
+            codexConfig = preservedConfig;
           }
           const claudeModeConfig = await ctx.getClaudeModeConfig();
           const session = new Session({
@@ -263,6 +308,9 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             // Re-resolved against the owner's CURRENT grant, never replayed from the
             // record: a grant held when the record was written may be gone now.
             envOverrides,
+            recoveryCodexHome: usesCodexRecovery
+              ? (saved as typeof saved & { __codexRecoveryHome?: string }).__codexRecoveryHome
+              : undefined,
             effort: saved.effort,
             model: saved.model,
             advisorModel: saved.advisorModel,
@@ -297,7 +345,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           await ctx.setupSessionListeners(session);
           const discardCancelledRestore = async (): Promise<void> => {
             await discardTentativeSession(session);
-            failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
+            failures.push({
+              sessionId: entry.sessionId,
+              reason: session.codexRestoreWorkerMayExist ? 'restore-uncertain' : 'restore-cancelled',
+            });
             unspent.delete(entry);
           };
           if (!rebootRestoreRegistry.isHeld(entry, owner)) {
@@ -315,6 +366,65 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             failures.push(racedConversation);
             unspent.delete(entry);
             continue;
+          }
+          if (usesCodexRecovery) {
+            // Startup preparation awaits owner settings/listeners. Re-read complete
+            // lifecycle evidence and current launch grants at the final boundary.
+            const fence = JSON.stringify(readRebootIdentityFence(session.id));
+            const finalEvidence = await verifyCodexRebootEvidence({
+              ...saved,
+              __envOverrides: envOverrides,
+            } as typeof saved);
+            const finalConfig = await clampExternalCliConfigsForOwner(saved.owner, { codexConfig });
+            if (
+              finalEvidence?.conversationId !== entry.resumeConversationId ||
+              !(await homeCurrentlyAuthorized()) ||
+              !sameCodexLaunchConfig(finalConfig.codexConfig as CodexConfig | undefined, codexConfig!)
+            ) {
+              await discardTentativeSession(session);
+              failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+              continue;
+            }
+            if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+              await discardCancelledRestore();
+              continue;
+            }
+            // Trusted current admin-derived profile keys retain their existing exemption.
+            // Every owner-authored privilege-bearing value uses one current grant snapshot.
+            const ownerEnv = savedCustomModel
+              ? Object.fromEntries(
+                  Object.entries(envOverrides ?? {}).filter(([key]) => !savedCustomModel.envKeys.includes(key))
+                )
+              : envOverrides;
+            const envToAuthorize =
+              !savedCustomModel && recoveryHome !== currentLocalCodexHome()
+                ? { ...ownerEnv, CODEX_HOME: recoveryHome! }
+                : ownerEnv;
+            let granted = false;
+            session.setCodexRestoreLaunchGuard({
+              prepare: async () => {
+                granted = false;
+                const current = await clampRecoveryLaunchForOwner(saved.owner, { codexConfig }, envToAuthorize);
+                granted =
+                  sameCodexLaunchConfig(current.configs.codexConfig as CodexConfig | undefined, codexConfig!) &&
+                  JSON.stringify(current.env) === JSON.stringify(envToAuthorize);
+              },
+              confirm: () => {
+                const peers = [...ctx.sessions.values()].filter((other) => other !== session);
+                return (
+                  granted &&
+                  rebootRestoreRegistry.isHeld(entry, owner) &&
+                  ctx.sessions.get(session.id) === session &&
+                  JSON.stringify(readRebootIdentityFence(session.id)) === fence &&
+                  rejectAlreadyLive(
+                    [entry],
+                    new Set(peers.map((other) => other.id)),
+                    new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
+                  ).skipped.length === 0 &&
+                  confirmCodexIdentityWitness(finalEvidence!)
+                );
+              },
+            });
           }
           await session.startInteractive();
           // Launch is a real await: Dismiss can remove this parked offer while
@@ -405,6 +515,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           ctx.broadcast(SseEvent.SessionCreated, ctx.getSessionStateWithRespawn(session));
           restored.push(toBannerItem(entry));
           restoreCompleted = true;
+          session.commitCodexRestoreLaunch();
         } catch (err) {
           // One entry that will not start must not stop the rest of the pass, and
           // must not leave a registered session with no pane behind it: by this
@@ -428,15 +539,19 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               console.error(`[reboot-restore] discarding a failed rebuild failed: ${getErrorMessage(discardErr)}`)
             );
           }
-          failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
+          failures.push({
+            sessionId: entry.sessionId,
+            reason: builtSession?.codexRestoreWorkerMayExist ? 'restore-uncertain' : 'rebuild-failed',
+          });
           // Left on offer: the user can put the binary back and click again.
           continue;
         } finally {
+          builtSession?.setCodexRestoreLaunchGuard(undefined);
           // Identity rejection or cancellation can happen before the tentative
           // Session is registered, when discardPartiallyBuiltSession() has
           // nothing to own. Remove only a profile proven absent before this
           // attempt; a pre-existing tree may contain the original conversation.
-          if (!restoreCompleted && newlyCreatedCustomModelConfigDir) {
+          if (!restoreCompleted && newlyCreatedCustomModelConfigDir && !builtSession?.codexRestoreWorkerMayExist) {
             removeConfigDir(newlyCreatedCustomModelConfigDir);
           }
         }

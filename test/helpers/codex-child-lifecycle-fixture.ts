@@ -62,7 +62,11 @@ export async function createChildLifecycleFixture(body: string, dead: boolean, s
     mode: 'codex',
     useMux: true,
     mux: mux as unknown as TerminalMultiplexer,
-    muxSession: { muxName: 'codeman-child-fixture', recoveryIsolated: true } as MuxSession,
+    muxSession: {
+      muxName: 'codeman-child-fixture',
+      recoveryIsolated: true,
+      recoveryCodexHome: codexHome,
+    } as MuxSession,
     codexConfig: { noDaemon: true, resumeSessionId: CHILD_THREAD },
     envOverrides: { CODEX_HOME: codexHome },
     ...(storedExit ? { paneExit: { at: CHILD_NOW - 20_000, status: 9 } } : {}),

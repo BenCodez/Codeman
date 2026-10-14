@@ -54,7 +54,7 @@ export interface SessionPort {
   discardPartiallyBuiltSession(
     sessionId: string,
     expectedSession?: Session,
-    options?: { preserveCustomModelConfigDir?: boolean }
+    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean }
   ): Promise<void>;
   getSessionStateWithRespawn(session: Session): unknown;
 }

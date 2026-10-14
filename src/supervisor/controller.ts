@@ -1,7 +1,8 @@
 /** @fileoverview Codex manager authority, expressed only through guarded worker controllers. */
 import type { RecoveryState } from '../recovery/types.js';
-import type { TaskProgress, TaskState, TaskUpdate } from '../supervision/schema.js';
+import type { TaskState, TaskUpdate } from '../supervision/schema.js';
 import type { SupervisorWorkerInspection } from '../types/supervisor.js';
+import { SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from './manager-task.js';
 import {
   SupervisorConfigSchema,
   SupervisorRequestSchema,
@@ -36,8 +37,7 @@ export interface SupervisorWorkerHandle {
   task: {
     getStatus(): TaskState;
     update(patch: TaskUpdate): Promise<TaskState>;
-    resume(isCurrent?: () => boolean): Promise<TaskState>;
-    progress(patch: TaskProgress, owner?: boolean): Promise<TaskState>;
+    resume(isCurrent?: () => boolean, runtimeStartedAt?: number): Promise<TaskState>;
   };
   recovery: {
     getStatus(): RecoveryState;
@@ -55,7 +55,8 @@ export interface SupervisorDependencies {
   startManager(
     objective: string,
     workers: readonly SupervisorState['workers'][number][],
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    runtimeStartedAt: number
   ): Promise<boolean>;
   pauseManager(): Promise<void>;
   resetManager(): Promise<void>;
@@ -102,6 +103,11 @@ export class SupervisorController {
 
   private now(): number {
     return (this.deps.now ?? Date.now)();
+  }
+  private hasRuntimeBudget(startedAt: number | undefined, maxRuntimeMs: number): boolean {
+    if (startedAt === undefined || !Number.isFinite(startedAt) || startedAt < 0) return false;
+    const elapsed = this.now() - startedAt;
+    return Number.isFinite(elapsed) && elapsed >= 0 && elapsed < maxRuntimeMs;
   }
   private enqueue<T>(fn: () => Promise<T>): Promise<T> {
     const guarded = async () => {
@@ -180,13 +186,16 @@ export class SupervisorController {
           if (holder) throw new SupervisorValidationError('Worker already has an active supervisor');
         }
         this.state.phase = 'active';
-        this.state.startedAt ??= this.now();
+        const runtimeStartedAt = (this.state.startedAt ??= this.now());
         await this.save('manager-start-reserved');
         try {
-          const isCurrent = () => !this.stopped && this.revision === revision;
+          const isCurrent = () =>
+            !this.stopped &&
+            this.revision === revision &&
+            this.hasRuntimeBudget(runtimeStartedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS);
           if (!isCurrent()) throw new SupervisorOperationRefused('Manager start was cancelled');
           this.deps.validateWorkers(this.state.workers.map((worker) => worker.sessionId));
-          if (!(await this.deps.startManager(this.state.objective, this.state.workers, isCurrent)))
+          if (!(await this.deps.startManager(this.state.objective, this.state.workers, isCurrent, runtimeStartedAt)))
             throw new SupervisorOperationRefused('Manager conversation is not ready for task kickoff');
         } catch (error) {
           this.state.phase = 'paused';
@@ -329,7 +338,23 @@ export class SupervisorController {
             'Worker already completed the configured task; owner reconfiguration is required'
           );
       },
-      async (worker, configured, isCurrent) => {
+      async (worker, configured, isCurrent, runtimeStartedAt) => {
+        const existing = worker.task.getStatus();
+        // A matching unfinished task retains the owner's tighter limits and its
+        // existing runtime origin; a manager grant can only narrow those limits.
+        const preservesTask =
+          existing.objective === configured.task &&
+          existing.outcome !== 'completed' &&
+          existing.criteria.length === configured.criteria.length &&
+          existing.criteria.every((criterion, index) => {
+            const expected = configured.criteria[index];
+            return (
+              criterion.id === expected.id &&
+              criterion.description === expected.description &&
+              criterion.kind === expected.kind &&
+              criterion.command === expected.command
+            );
+          });
         await worker.task.update({
           objective: configured.task,
           criteria: configured.criteria,
@@ -337,12 +362,19 @@ export class SupervisorController {
             // Configuration is inert until the guarded resume below accepts the
             // supervisor's live cancellation token.
             enabled: false,
-            maxContinuations: Math.min(10, configured.maxAssignments),
-            maxRuntimeMs: configured.maxRuntimeMs,
+            maxContinuations: Math.min(
+              10,
+              configured.maxAssignments,
+              preservesTask ? existing.config.maxContinuations : 10
+            ),
+            maxRuntimeMs: Math.min(
+              configured.maxRuntimeMs,
+              preservesTask ? existing.config.maxRuntimeMs : configured.maxRuntimeMs
+            ),
           },
         });
         if (!isCurrent()) throw new SupervisorOperationRefused('Worker assignment was cancelled');
-        const started = await worker.task.resume(isCurrent);
+        const started = await worker.task.resume(isCurrent, runtimeStartedAt);
         if (!isCurrent()) {
           if (started.inFlight) throw new Error('Worker task delivery may have started before cancellation');
           throw new SupervisorOperationRefused('Worker assignment was cancelled');
@@ -381,12 +413,51 @@ export class SupervisorController {
     );
   }
 
-  report(workerId: string, progress: TaskProgress): Promise<TaskState> {
-    if (this.state.phase !== 'active' || !this.state.workers.some((w) => w.sessionId === workerId))
-      return Promise.reject(new SupervisorValidationError('Worker is outside this supervisor'));
-    const worker = this.deps.worker(workerId);
-    if (!worker) return Promise.reject(new SupervisorValidationError('Worker is unavailable'));
-    return worker.task.progress(progress, false);
+  /** A manager's plan never clears a later worker pause, block, or competing task. */
+  private workerAllowsAction(
+    worker: SupervisorWorkerHandle,
+    configured: SupervisorState['workers'][number],
+    action: 'assign' | 'retry',
+    includeFlights: boolean
+  ): boolean {
+    const task = worker.task.getStatus();
+    const recovery = worker.recovery.getStatus();
+    // The current dispatch may itself finish uncertain. Retain that result's
+    // original classification; it is still an admission veto for every later action.
+    const dispatchReserved =
+      !includeFlights &&
+      this.state.inFlight?.workerId === configured.sessionId &&
+      this.state.inFlight.action === action;
+    const ownTaskUncertainty =
+      dispatchReserved && action === 'assign' && task.inFlight && task.reason === 'delivery-unknown';
+    const ownRecoveryUncertainty =
+      dispatchReserved && action === 'retry' && recovery.inFlight && recovery.lastReason === 'acceptance-unverified';
+    const ownRecoveryRefusal =
+      dispatchReserved && action === 'retry' && !recovery.inFlight && recovery.lastReason === 'delivery-failed';
+    if (
+      (task.phase === 'paused' && !ownTaskUncertainty) ||
+      task.phase === 'blocked' ||
+      task.outcome === 'blocked' ||
+      (recovery.phase === 'paused' && !ownRecoveryUncertainty && !ownRecoveryRefusal) ||
+      recovery.phase === 'blocked' ||
+      recovery.circuitOpen ||
+      (includeFlights && (task.inFlight || recovery.inFlight))
+    )
+      return false;
+    if (action !== 'assign' || !task.config.enabled || task.phase === 'completed' || !task.objective) return true;
+    return (
+      task.objective === configured.task &&
+      task.criteria.length === configured.criteria.length &&
+      task.criteria.every((criterion, index) => {
+        const expected = configured.criteria[index];
+        return (
+          criterion.id === expected.id &&
+          criterion.description === expected.description &&
+          criterion.kind === expected.kind &&
+          criterion.command === expected.command
+        );
+      })
+    );
   }
 
   private operation(
@@ -397,7 +468,8 @@ export class SupervisorController {
     dispatch: (
       worker: SupervisorWorkerHandle,
       configured: SupervisorState['workers'][number],
-      isCurrent: () => boolean
+      isCurrent: () => boolean,
+      runtimeStartedAt: number
     ) => Promise<void>
   ): Promise<SupervisorState> {
     const revision = this.revision;
@@ -421,14 +493,23 @@ export class SupervisorController {
       // only once dispatch is accepted; a certified unsent refusal starts no budget.
       const runtimeStartedAt = configured.startedAt ?? this.now();
       const hasBudget = () =>
-        configured.assignments < configured.maxAssignments && this.now() - runtimeStartedAt < configured.maxRuntimeMs;
+        configured.assignments < configured.maxAssignments &&
+        this.hasRuntimeBudget(runtimeStartedAt, configured.maxRuntimeMs) &&
+        this.hasRuntimeBudget(this.state.startedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS);
       const isCurrent = () =>
-        !this.stopped && this.revision === revision && this.state.phase === 'active' && hasBudget();
+        !this.stopped &&
+        this.revision === revision &&
+        this.state.phase === 'active' &&
+        hasBudget() &&
+        !!worker &&
+        this.workerAllowsAction(worker, configured, action, false);
       const requireCurrent = () => {
         if (!hasBudget()) throw new SupervisorOperationRefused('Worker assignment budget exhausted');
         if (!isCurrent()) throw new SupervisorOperationRefused('Supervisor operation was cancelled');
       };
       requireCurrent();
+      if (!this.workerAllowsAction(worker, configured, action, true))
+        throw new SupervisorValidationError('Worker task or recovery requires owner attention');
       await preflight(worker, configured);
       requireCurrent();
       this.state.inFlight = { requestId, workerId, action, reservedAt: this.now() };
@@ -446,8 +527,10 @@ export class SupervisorController {
           throw new SupervisorOperationRefused('Worker lease changed');
         worker = this.deps.worker(workerId);
         if (!worker) throw new SupervisorOperationRefused('Worker is no longer available');
+        if (!this.workerAllowsAction(worker, configured, action, true))
+          throw new SupervisorOperationRefused('Worker task or recovery requires owner attention');
         requireCurrent();
-        await dispatch(worker, configured, isCurrent);
+        await dispatch(worker, configured, isCurrent, runtimeStartedAt);
       } catch (error) {
         if (error instanceof SupervisorOperationRefused) {
           delete this.state.inFlight;

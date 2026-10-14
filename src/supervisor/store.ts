@@ -20,10 +20,15 @@ export class SupervisorStore {
         const info = lstatSync(path);
         if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_BYTES) throw new Error('Invalid journal');
         const parsed = z
-          .object({ version: z.literal(1), supervisors: z.record(z.string(), SupervisorStateSchema) })
+          .object({
+            version: z.literal(1),
+            supervisors: z.record(z.string().regex(/^[\w-]{8,100}$/), SupervisorStateSchema),
+          })
           .strict()
           .parse(JSON.parse(readFileSync(path, 'utf8')));
         if (Object.keys(parsed.supervisors).length > 100) throw new Error('Journal is over capacity');
+        if (Object.entries(parsed.supervisors).some(([id, state]) => state.supervisorSessionId !== id))
+          throw new Error('Supervisor journal identity mismatch');
         this.records = parsed.supervisors;
       }
     } catch {
@@ -49,6 +54,7 @@ export class SupervisorStore {
   save(id: string, state: SupervisorState): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
     if (!/^[\w-]{8,100}$/.test(id)) return Promise.reject(new Error('Invalid supervisor identity'));
+    if (state.supervisorSessionId !== id) return Promise.reject(new Error('Supervisor journal identity mismatch'));
     SupervisorStateSchema.parse(state);
     const copy = structuredClone(state);
     const result = this.writes.then(async () => {

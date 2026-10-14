@@ -981,7 +981,6 @@ All routes are owner-scoped and available through `/api/v1` aliases. Configurati
 | `GET` | `/api/sessions/:id/supervisor/workers` | none | Manager view of selected workers' task checkpoints, verified criteria, recovery state, normalized health, observation time, and freshness. |
 | `POST` | `/api/sessions/:id/supervisor/workers/:workerId/assign` | `{ requestId }` | Start the exact owner-configured task through the worker task controller. |
 | `POST` | `/api/sessions/:id/supervisor/workers/:workerId/retry` | `{ requestId }` | Ask the recovery controller to retry a currently validated crash. |
-| `POST` | `/api/sessions/:id/supervisor/workers/:workerId/progress` | task progress | Record evidence without owner authority; manual criteria cannot be verified here. |
 
 `GET .../workers` inspects at most four workers concurrently within a ten-second request deadline. Each item includes `observedAt` and `stale`; a timed-out or unavailable worker is returned with `health: "unknown"` and `stale: true` so verified results from other workers remain usable. Concurrent reads share one inspection, and unfinished per-worker inspections are not duplicated.
 

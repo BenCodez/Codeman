@@ -4,7 +4,6 @@ import { ZodError } from 'zod';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { SupervisorActionSchema, SupervisorConfigSchema, SupervisorRequestSchema } from '../../supervisor/schema.js';
 import { SupervisorValidationError } from '../../supervisor/controller.js';
-import { TaskProgressSchema } from '../../supervision/schema.js';
 import { TaskValidationError } from '../../supervision/controller.js';
 import { findSessionOrFail, parseBody } from '../route-helpers.js';
 import type { SessionPort, SupervisorPort } from '../ports/index.js';
@@ -99,14 +98,4 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
       }
     });
   }
-  app.post('/api/sessions/:id/supervisor/workers/:workerId/progress', async (req, reply) => {
-    const { workerId } = req.params as { workerId: string };
-    const scoped = manager(req);
-    const progress = parseBody(TaskProgressSchema, req.body, 'Invalid worker progress');
-    try {
-      return { success: true, data: await scoped.report(workerId, progress) };
-    } catch (error) {
-      return operationFailure(reply, error, 'Worker progress lacks verified evidence');
-    }
-  });
 }

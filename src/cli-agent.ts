@@ -792,12 +792,13 @@ export async function agentSupervisor(
 ): Promise<number> {
   if ((options.action === 'assign' || options.action === 'retry') && !options.workerId)
     return fail(deps, 'worker id is required', EXIT.refused);
-  let workerId = options.workerId;
+  const workerId = options.workerId;
   if (workerId) {
-    const target = await resolveSessionId(deps, workerId);
-    if ('error' in target) return fail(deps, target.error, target.code);
-    if (isSelfSession(deps.ctx.selfId, target.id)) return fail(deps, 'a supervisor cannot manage itself', EXIT.refused);
-    workerId = target.id;
+    // The configured worker list supplies full IDs. Generic prefix resolution
+    // would inspect unselected sessions and let them change scoped ambiguity.
+    if (workerId.length !== FULL_ID_LENGTH || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(workerId))
+      return fail(deps, 'a supervisor worker requires its full configured session id', EXIT.refused);
+    if (isSelfSession(deps.ctx.selfId, workerId)) return fail(deps, 'a supervisor cannot manage itself', EXIT.refused);
   }
   const base = `/api/v1/sessions/${encodeURIComponent(deps.ctx.selfId)}/supervisor`;
   const path =
