@@ -96,27 +96,44 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
   return result;
 }
 
-export function latestProgressMarker(
-  tail: string,
-  since: number,
-  now: number
-): { key: string; progress: unknown; at: number; submissionKey?: string } | undefined {
-  if (Buffer.byteLength(tail) > 262144 || !tail.endsWith('\n')) return undefined;
-  let marker: { key: string; progress: unknown; at: number; submissionKey?: string } | undefined;
+export interface TaskProgressMarker {
+  key: string;
+  progress: unknown;
+  at: number;
+  submissionKey?: string;
+  /** A recognizable report lacks a complete, trustworthy frame or timestamp. */
+  uncertain?: boolean;
+}
+
+export function latestProgressMarker(tail: string, since: number, now: number): TaskProgressMarker | undefined {
+  if (Buffer.byteLength(tail) > 262144) return undefined;
+  const complete = tail.endsWith('\n');
+  let marker: TaskProgressMarker | undefined;
   let submissionKey: string | undefined;
-  for (const line of tail.split('\n')) {
+  const uncertain = (line: string): TaskProgressMarker | undefined =>
+    marker || line.includes('CODEMAN_TASK_PROGRESS ')
+      ? {
+          key: 'progress:' + createHash('sha256').update(line).digest('hex'),
+          at: now,
+          submissionKey,
+          progress: null,
+          uncertain: true,
+        }
+      : undefined;
+  const lines = tail.split('\n');
+  for (const [index, line] of lines.entries()) {
     if (!line.trim()) continue;
     let row;
     try {
       row = JSON.parse(line);
     } catch {
-      return undefined;
+      return uncertain(line);
     }
-    if (!row || typeof row !== 'object' || Array.isArray(row)) return undefined;
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return uncertain(line);
     const at = Date.parse(row.timestamp);
     const p = row.payload;
     if (row.type !== 'event_msg' || !p || typeof p !== 'object') continue;
-    if (!Number.isFinite(at) || at > now + 2000) return undefined;
+    if (!Number.isFinite(at) || at > now + 2000) return uncertain(line);
     if (p.type === 'user_message' || (p.type === 'item_completed' && p.item?.type === 'UserMessage')) {
       // Use the classifier's exact structured submission identity. Row order, not a timestamp,
       // prevents a future-dated prior turn marker from crossing a new user submission.
@@ -126,7 +143,18 @@ export function latestProgressMarker(
     }
     if (p.type !== 'agent_message' || typeof p.message !== 'string' || at < since) continue;
     const message = p.message.trim();
-    if (!message.startsWith('CODEMAN_TASK_PROGRESS ') || message.length > 16000) continue;
+    if (!message.startsWith('CODEMAN_TASK_PROGRESS ')) continue;
+    if (!complete && index === lines.length - 1) return uncertain(line);
+    if (message.length > 16000) {
+      // A recognized but oversized report is malformed evidence, never an absent report.
+      marker = {
+        at,
+        submissionKey,
+        key: 'progress:' + createHash('sha256').update(line).digest('hex'),
+        progress: null,
+      };
+      continue;
+    }
     try {
       marker = {
         at,
@@ -143,5 +171,5 @@ export function latestProgressMarker(
       };
     }
   }
-  return marker;
+  return !complete && marker ? uncertain(lines.at(-1) ?? '') : marker;
 }

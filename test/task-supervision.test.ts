@@ -1097,6 +1097,77 @@ describe('task supervision', () => {
     expect(f.act).not.toHaveBeenCalled();
     f.controller.stop();
   });
+  it.each([
+    { name: 'blocked', progress: { outcome: 'blocked' } },
+    { name: 'unknown', progress: { outcome: 'unknown' } },
+    { name: 'malformed', progress: null },
+    { name: 'uncertified completion', progress: { outcome: 'completed' } },
+    { name: 'incomplete step', progress: { outcome: 'unfinished', checkpoint: 'No next step' } },
+    {
+      name: 'manual claim',
+      progress: { outcome: 'unfinished', checkpoint: 'Claim', nextAction: 'Continue', verifiedCriteria: ['review'] },
+    },
+  ])('retains a newly appended $name report at the previous report timestamp', async ({ progress }) => {
+    const f = fixture();
+    try {
+      await f.controller.update({
+        objective: 'Review the fix',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      await f.controller.progress({ outcome: 'unfinished', checkpoint: 'Initial step', nextAction: 'Continue' });
+      f.set({ activity: 'working', reason: 'turn-running' });
+      f.clock(10001);
+      f.marker({
+        key: 'first-report',
+        submissionKey: 'fixture-submission',
+        at: 10001,
+        progress: { outcome: 'unfinished', checkpoint: 'Verified step', nextAction: 'Next step' },
+      });
+      await f.controller.refresh();
+      expect(f.controller.getStatus().lastProgressAt).toBe(10001);
+      f.clock(10002);
+      f.set({ activity: 'completed', reason: 'turn-completed' });
+      f.marker({ key: 'later-report-same-timestamp', submissionKey: 'fixture-submission', at: 10001, progress });
+      await f.controller.refresh();
+      expect(f.controller.getStatus().agentProgressVeto).toBe(true);
+      expect(f.controller.getStatus().handledEvidence).toContain('later-report-same-timestamp');
+      expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+      expect(f.act).not.toHaveBeenCalled();
+      expect(f.recover).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  });
+  it('accepts a distinct actionable report at the same timestamp without replaying a handled report', async () => {
+    const f = fixture();
+    try {
+      await configure(f.controller);
+      f.set({ activity: 'working', reason: 'turn-running' });
+      f.clock(10001);
+      f.marker({
+        key: 'first-report',
+        submissionKey: 'fixture-submission',
+        at: 10001,
+        progress: { outcome: 'unfinished', checkpoint: 'First step', nextAction: 'Continue' },
+      });
+      await f.controller.refresh();
+      f.marker({
+        key: 'second-report',
+        submissionKey: 'fixture-submission',
+        at: 10001,
+        progress: { outcome: 'unfinished', checkpoint: 'Second step', nextAction: 'Next step' },
+      });
+      await f.controller.refresh();
+      expect(f.controller.getStatus().checkpoint).toBe('Second step');
+      const before = f.controller.getStatus();
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toEqual(before);
+      expect(f.act).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  });
   it('runtime begins on enable rather than disabled task configuration', async () => {
     const f = fixture();
     await f.controller.update({
@@ -1360,7 +1431,7 @@ describe('task supervision', () => {
       expect(c.getStatus().outcome).toBe('unknown');
       if (activity === 'interrupted') {
         expect(c.getStatus().inFlight?.promptHash).toBe(createHash('sha256').update(CONTINUATION_PROMPT).digest('hex'));
-      } else expect(c.getStatus().inFlight).toBeUndefined();
+      } else expect(c.getStatus().inFlight).toMatchObject({ action: 'restart', key: `failure-${activity}` });
       observation = {
         observation: {
           activity: 'completed',
@@ -1370,6 +1441,7 @@ describe('task supervision', () => {
           turnId: 'recovered-turn',
           safeToAct: false,
           processReady: true,
+          processReadyAt: 12002,
           submissionKey: 'recovery-submission',
           submissionHash: createHash('sha256').update(CONTINUATION_PROMPT).digest('hex'),
         },
@@ -1488,6 +1560,8 @@ describe('task supervision', () => {
         at: 12003,
         conversationId: id,
         submissionKey: 'fixture-submission',
+        processReady: true,
+        processReadyAt: 12002,
         safeToAct: false,
       },
       commands: new Map(),
