@@ -68,6 +68,17 @@ export class TaskController {
   getStatus(): TaskState {
     return structuredClone(this.state);
   }
+  /** Bind delegated action authority to this owner revision; later Task intent requires a new grant. */
+  captureActionAuthority(): () => boolean {
+    const revision = this.revision;
+    return () =>
+      this.actionIsCurrent(revision) &&
+      this.state.config.enabled &&
+      this.state.phase === 'watching' &&
+      !this.state.agentProgressVeto &&
+      !['blocked', 'completed'].includes(this.state.outcome) &&
+      this.state.continuations < this.state.config.maxContinuations;
+  }
   private now(): number {
     return (this.deps.now ?? Date.now)();
   }
@@ -178,6 +189,15 @@ export class TaskController {
   async drain(): Promise<void> {
     await this.queue;
   }
+  /** Refund only a delivery certified to have had no effect; uncertain flights keep their budget and replay fence. */
+  private releaseUnsentFlight(kickoff = false): void {
+    const flight = this.state.inFlight;
+    if (!flight || flight.accepted) return;
+    this.state.handledEvidence = this.state.handledEvidence.filter((key) => key !== flight.key);
+    if (kickoff) delete this.state.kickoffAt;
+    else this.state.continuations = Math.max(0, this.state.continuations - 1);
+    delete this.state.inFlight;
+  }
   /** Delivery may finish after the Session input guard releases, user input, or the runtime deadline.
    * Keep any possibly delivered reservation unresolved and never re-arm stale authority.
    */
@@ -197,8 +217,7 @@ export class TaskController {
         this.lastOwnerPauseRevision <= revision
       )
         this.retainFinalEvidenceRefusal();
-      delete this.state.inFlight;
-      if (kickoff) delete this.state.kickoffAt;
+      this.releaseUnsentFlight(kickoff);
     }
     this.state.outcome = 'unknown';
     this.state.phase = deadlineExpired ? 'blocked' : 'paused';
@@ -328,11 +347,13 @@ export class TaskController {
     const revision = ++this.revision;
     return this.enqueue(async () => {
       this.requireCurrent(revision);
-      const { commands, observation } = await this.deps.observe();
+      const { commands, observation, marker } = await this.deps.observe();
       this.requireCurrent(revision);
       if (this.state.conversationId && observation.conversationId !== this.state.conversationId)
         throw new TaskValidationError('Task conversation changed');
       const candidate = this.getStatus();
+      // Progress and command evidence belong to the first observed conversation, even before kickoff.
+      candidate.conversationId ??= observation.conversationId;
       this.reconcileAcceptedFlight(candidate, observation);
       for (const id of patch.verifiedCriteria ?? []) {
         const c = candidate.criteria.find((c) => c.id === id);
@@ -355,6 +376,27 @@ export class TaskController {
       if (patch.outcome === 'unfinished' || patch.outcome === 'completed') delete candidate.agentProgressVeto;
       const acceptedFlight = candidate.inFlight?.accepted;
       if (!acceptedFlight) candidate.submissionKey = observation.submissionKey;
+      if (
+        observation.conversationId &&
+        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(observation.conversationId) &&
+        candidate.conversationId === observation.conversationId &&
+        marker &&
+        typeof marker.key === 'string' &&
+        /^progress:[a-f0-9]{64}$/.test(marker.key) &&
+        marker.submissionKey &&
+        marker.submissionKey === observation.submissionKey &&
+        !candidate.handledEvidence.includes(marker.key)
+      ) {
+        // This exact report was already visible before the owner accepted their
+        // update. A later distinct report may share its timestamp, but this one
+        // must not overwrite the owner's checkpoint or authorize an older step.
+        const flightKey = candidate.inFlight?.key;
+        candidate.handledEvidence = [
+          ...candidate.handledEvidence.filter((key) => key !== flightKey),
+          ...(flightKey ? [flightKey] : []),
+          marker.key,
+        ].slice(-32);
+      }
       this.state = candidate;
       this.state.lastProgressAt = this.now();
       this.state.outcome = acceptanceCriteriaComplete(this.state) ? 'completed' : patch.outcome;
@@ -467,8 +509,7 @@ export class TaskController {
       if (cancelled) return cancelled;
       if (delivered === 'not-sent') {
         this.retainFinalEvidenceRefusal();
-        delete this.state.inFlight;
-        delete this.state.kickoffAt;
+        this.releaseUnsentFlight(true);
       }
       this.state.outcome = 'unknown';
       this.state.phase = delivered === 'sent' ? 'watching' : 'paused';
@@ -566,14 +607,14 @@ export class TaskController {
           Number.isFinite(marker.latestAt) &&
           marker.latestAt >= marker.at &&
           marker.latestAt - marker.at <= 1000;
-        const possiblyFresh = marker.latestAt >= configurationBoundary && marker.latestAt > progressBoundary;
-        const definitelyFresh = marker.at >= configurationBoundary && marker.at > progressBoundary;
+        const possiblyFresh = marker.latestAt >= configurationBoundary && marker.latestAt >= progressBoundary;
+        const definitelyFresh = marker.at >= configurationBoundary && marker.at >= progressBoundary;
         // A remote marker overlapping newer owner intent cannot be dismissed as
         // stale and thereby release the previous action. Uncertainty is attention.
         if (!intervalValid || (possiblyFresh && (!definitelyFresh || marker.latestAt > this.now())))
           return this.recordAgentAttention(marker, 'task-evidence-unknown');
       }
-      if (markerIsCurrent && marker.at >= configurationBoundary && marker.at > progressBoundary) {
+      if (markerIsCurrent && marker.at >= configurationBoundary && marker.at >= progressBoundary) {
         const parsed = TaskProgressSchema.safeParse(marker.progress);
         if (parsed.success) {
           const p = parsed.data;
@@ -664,8 +705,10 @@ export class TaskController {
           const result = await this.deps.recover(o, () => this.actionIsCurrent(revision));
           const cancelled = this.preserveCancelledDelivery(revision, result);
           if (cancelled) return cancelled;
-          if (result === 'not-sent') this.retainFinalEvidenceRefusal();
-          if (result === 'not-sent' || (result === 'sent' && o.activity === 'crashed')) delete this.state.inFlight;
+          if (result === 'not-sent') {
+            this.retainFinalEvidenceRefusal();
+            this.releaseUnsentFlight();
+          }
           if (result === 'sent') {
             // Successful recovery invalidates the pre-recovery declaration of unfinished work.
             // A new marker or owner progress update must establish the next actionable checkpoint.
@@ -726,9 +769,9 @@ export class TaskController {
         this.state.phase = 'paused';
         return this.save('delivery-unknown');
       }
-      if (result === 'not-sent') delete this.state.inFlight;
       if (result === 'not-sent') {
         this.retainFinalEvidenceRefusal();
+        this.releaseUnsentFlight();
         this.state.phase = 'paused';
         return this.save('delivery-cancelled');
       }

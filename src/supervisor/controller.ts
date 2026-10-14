@@ -55,6 +55,10 @@ export interface SupervisorDependencies {
   leaseHolder(workerId: string, excludingSupervisor: string): string | undefined;
   /** Preserve a worker's durable attention veto while its live state changes. */
   agentProgressVeto?(workerId: string): boolean;
+  /** Current manager Task grant, including durable attention vetoes and exact controller binding. */
+  hasManagerAuthority(): boolean;
+  /** Read-only native manager revalidation; never refresh/dispatch its Task controller here. */
+  validateManagerAuthority(): Promise<boolean>;
   startManager(
     objective: string,
     workers: readonly SupervisorState['workers'][number][],
@@ -253,7 +257,8 @@ export class SupervisorController {
     const revision = this.revision;
     const configured = [...this.state.workers];
     const result = new Array<SupervisorWorkerInspection>(configured.length);
-    const deadline = Date.now() + (this.deps.inspectionTimeoutMs ?? 10_000);
+    // A wall-clock adjustment must not extend or prematurely exhaust the shared plan budget.
+    const deadline = performance.now() + (this.deps.inspectionTimeoutMs ?? 10_000);
     const concurrency = Math.max(1, Math.min(4, this.deps.inspectionConcurrency ?? 4));
     let cursor = 0;
     const inspectOne = async (index: number): Promise<void> => {
@@ -273,7 +278,7 @@ export class SupervisorController {
       }
       const task = worker.task.getStatus();
       const fallback = worker.recovery.getStatus();
-      const remaining = deadline - Date.now();
+      const remaining = deadline - performance.now();
       if (remaining <= 0) {
         result[index] = {
           sessionId: workerId,
@@ -586,6 +591,7 @@ export class SupervisorController {
         !this.stopped &&
         this.revision === revision &&
         this.state.phase === 'active' &&
+        this.deps.hasManagerAuthority?.() === true &&
         hasBudget() &&
         !!worker &&
         this.workerAllowsAction(worker, configured, action, false);
@@ -593,14 +599,30 @@ export class SupervisorController {
         if (!hasBudget()) throw new SupervisorOperationRefused('Worker assignment budget exhausted');
         if (!isCurrent()) throw new SupervisorOperationRefused('Supervisor operation was cancelled');
       };
+      const requireManagerAuthority = async () => {
+        let authorized = false;
+        try {
+          authorized = (await this.deps.validateManagerAuthority()) && this.deps.hasManagerAuthority();
+        } catch {
+          // A failed manager read grants no authority and has made no worker effect.
+        }
+        if (!authorized) {
+          this.state.phase = 'paused';
+          await this.save('manager-attention-required');
+          throw new SupervisorOperationRefused('Manager task requires owner Start');
+        }
+      };
+      await requireManagerAuthority();
       requireCurrent();
       if (!this.workerAllowsAction(worker, configured, action, true))
         throw new SupervisorValidationError('Worker task or recovery requires owner attention');
       await preflight(worker, configured);
+      await requireManagerAuthority();
       requireCurrent();
       this.state.inFlight = { requestId, workerId, action, reservedAt: this.now() };
       await this.save(`${action}-reserved`, workerId);
       try {
+        await requireManagerAuthority();
         requireCurrent();
         try {
           this.deps.validateWorkers([workerId]);
@@ -620,6 +642,7 @@ export class SupervisorController {
       } catch (error) {
         if (error instanceof SupervisorOperationRefused) {
           delete this.state.inFlight;
+          if (!this.deps.hasManagerAuthority()) this.state.phase = 'paused';
           await this.save(`${action}-refused`, workerId);
           throw error;
         }

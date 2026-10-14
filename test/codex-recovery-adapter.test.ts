@@ -105,7 +105,7 @@ function fixture() {
       codexHome: '/fixture/codex-home' as string | undefined,
       submission: undefined as RecoverySubmission | undefined,
     },
-    pane: { dead: false, screen: READY } as Pane | null,
+    pane: { paneId: '%7', panePid: 700, dead: false, screen: READY } as Pane | null,
     transportPane: { dead: true, status: 255, screen: null } as Pane | null,
     identity: {
       reason: 'verified',
@@ -881,7 +881,10 @@ describe('authoritative agent exits and process readiness', () => {
       try {
         await controller.updateConfig({ enabled: true, detectStalls: true, stalledAfterMs: 10_000, maxRetries: 2 });
         await controller.retry();
-        vi.setSystemTime(NOW + 2000);
+        expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+        vi.setSystemTime(NOW + 10_000);
+        await controller.retry();
+        vi.setSystemTime(NOW + 12_000);
         await controller.retry();
         expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
         const firstKey = controller.getStatus().inFlight!.key;
@@ -942,9 +945,38 @@ describe('authoritative agent exits and process readiness', () => {
     });
   });
 
+  it.each(['unchanged', 'PID', 'pane-ID', 'raw-signal', 'missing-ID', 'stale-read'] as const)(
+    'binds crash delivery to the observed native incarnation while cached exit evidence stays unchanged: %s',
+    async (change) => {
+      const f = fixture();
+      f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
+      if (change === 'raw-signal') {
+        f.pane.status = undefined;
+        f.pane.signal = 9;
+        f.pane.paneSignalToken = '9';
+        f.session.paneExit = { at: NOW - 10_000, signal: 9 };
+      }
+      const before = await f.adapter.observe();
+      expect(before.safeToAct).toBe(true);
+      const exit = structuredClone(f.session.paneExit);
+      if (change === 'PID') f.pane.panePid = 701;
+      if (change === 'pane-ID') f.pane.paneId = '%8';
+      if (change === 'raw-signal') f.pane.paneSignalToken = 'KILL';
+      if (change === 'missing-ID') f.pane.paneId = undefined;
+      if (change === 'stale-read')
+        f.session.inspectRecoveryPane.mockImplementationOnce(async () => {
+          vi.setSystemTime(NOW + 16_000);
+          return f.pane;
+        });
+      expect(await f.adapter.act(flight(before, 'restart'))).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+      expect(f.session.paneExit).toEqual(exit);
+      expect(f.session.deliverRecovery).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+    }
+  );
+
   it('authorizes restart only for a confirmed matching abnormal local exit', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
+    f.pane = { paneId: '%7', panePid: 700, dead: true, status: 1, screen: null };
     const observation = await f.adapter.observe();
     expect(observation).toMatchObject({
       activity: 'crashed',
@@ -959,7 +991,7 @@ describe('authoritative agent exits and process readiness', () => {
       expect.any(Function),
       CONTINUATION_PROMPT,
       expect.any(Function),
-      expect.objectContaining({ paneId: '%7', panePid: 700, status: 1 })
+      { paneId: '%7', panePid: 700, status: 1, signal: undefined, paneSignalToken: undefined }
     );
   });
 
@@ -1139,7 +1171,10 @@ describe('authoritative agent exits and process readiness', () => {
     try {
       await controller.updateConfig({ enabled: true, detectStalls: true, stalledAfterMs: 10_000, retryDelayMs: 1000 });
       await controller.refresh();
-      vi.setSystemTime(NOW + 2000);
+      expect(controller.getStatus().pending).toBeUndefined();
+      vi.setSystemTime(NOW + 10_000);
+      await controller.refresh();
+      vi.setSystemTime(NOW + 12_000);
       await controller.refresh();
       expect(controller.getStatus().pending).toMatchObject({
         action: 'restart',
@@ -1147,7 +1182,7 @@ describe('authoritative agent exits and process readiness', () => {
         conversationId: THREAD,
       });
       expect(f.session.deliverRecovery).not.toHaveBeenCalled();
-      vi.setSystemTime(NOW + 3000);
+      vi.setSystemTime(NOW + 13_000);
       await controller.refresh();
       expect(reserved).toBe(true);
       expect(observations.at(-1)).toMatchObject({ stallRestartable: true, progressAt: NOW - 20_000 });
@@ -1217,9 +1252,9 @@ describe('authoritative agent exits and process readiness', () => {
       processReady: true,
       safeToAct: false,
     });
-    f.pane = { dead: false, screen: '› Unsent fixture draft\n' };
+    f.pane = { paneId: '%7', panePid: 700, dead: false, screen: '› Unsent fixture draft\n' };
     expect(await f.adapter.observe()).toMatchObject({ processReady: false, safeToAct: false });
-    f.pane = { dead: false, screen: `Sanitized sign in requirement\n${READY}` };
+    f.pane = { paneId: '%7', panePid: 700, dead: false, screen: `Sanitized sign in requirement\n${READY}` };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'blocked', processReady: false, safeToAct: false });
   });
 });

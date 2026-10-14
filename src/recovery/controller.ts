@@ -247,8 +247,9 @@ export class RecoveryController {
     return this.enqueue(async () => {
       const config = RecoveryConfigSchema.parse({ ...this.state.config, ...patch }) as RecoveryConfig;
       const enabledNow = config.enabled && !this.state.config.enabled;
+      const stallEnabledNow = config.detectStalls && !this.state.config.detectStalls;
       this.state.config = config;
-      if (enabledNow) this.state.armedAt = this.now();
+      if (enabledNow || stallEnabledNow) this.state.armedAt = this.now();
       if (!config.enabled) {
         this.state.pending = undefined;
         this.state.nextRetryAt = undefined;
@@ -490,9 +491,13 @@ export class RecoveryController {
   }
 
   private stallQuietSince(observation: RecoveryObservation): number {
-    // Old rollout progress cannot count as silence accumulated after an accepted
-    // recovery. Persist this baseline so a journal reload keeps the same interval.
-    return Math.max(observation.progressAt ?? observation.at, this.state.lastSuccessfulRecovery ?? 0);
+    // Historical silence cannot satisfy a newly armed policy or an accepted
+    // recovery. Both durable baselines survive a journal reload.
+    return Math.max(
+      observation.progressAt ?? observation.at,
+      this.state.armedAt ?? 0,
+      this.state.lastSuccessfulRecovery ?? 0
+    );
   }
 
   /** Status reads may invalidate proof but never count as an action confirmation. */
@@ -767,11 +772,13 @@ export class RecoveryController {
         observation.liveProofAt > observation.at ||
         observation.liveProofAt < armedAt);
     if (!restartableStall && !manual && (observation.at < armedAt || invalidLiveProof)) return;
+    const processKey = observation.processProofKey ?? observation.evidenceKey;
     // A stall always needs repeated fresh probes. A manual click may waive delay for
     // an explicit terminal failure, but it cannot turn one dead-pane read into proof.
     if (
       (restartableStall || !manual) &&
       (this.confirmation?.key !== key ||
+        this.confirmation.processKey !== processKey ||
         this.now() - this.confirmation.at < CONFIRM_MS ||
         (restartableStall &&
           observation.stallObservedAt !== undefined &&
@@ -781,13 +788,14 @@ export class RecoveryController {
       if (
         !this.confirmation ||
         this.confirmation.key !== key ||
+        this.confirmation.processKey !== processKey ||
         (restartableStall && this.now() - this.confirmation.at > STALL_CONFIRM_MAX_MS)
       )
         this.confirmation = {
           key,
           kind: restartableStall ? 'dead-stall' : 'failure',
           at: this.now(),
-          processKey: observation.processProofKey ?? observation.evidenceKey,
+          processKey,
           ...(restartableStall
             ? {
                 progressAt: observation.progressAt ?? observation.at,

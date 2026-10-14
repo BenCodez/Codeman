@@ -166,7 +166,7 @@ describe('Recovery Session Options', () => {
       ['/api/sessions/session-a/recovery/config', 'PUT', { retryDelayMs: 25_000 }],
     ]);
     expect(h.input('recoveryRetryDelay').value).toBe('25');
-    expect(h.get('recovery-tab').textContent).toContain('Live silence only asks for attention.');
+    expect(h.get('recovery-tab').textContent).toContain('Live silence and transport failures only ask for attention.');
   });
 
   it('rejects invalid limits and preserves the confirmed values', async () => {

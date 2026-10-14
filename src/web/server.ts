@@ -161,15 +161,19 @@ import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
 import { TaskController } from '../supervision/controller.js';
 import { TaskStore, taskJournalHasOwnership } from '../supervision/store.js';
-import { initialTaskState } from '../supervision/schema.js';
+import { initialTaskState, TaskStateSchema, type TaskState } from '../supervision/schema.js';
 import { CodexTaskAdapter } from '../supervision/adapter.js';
 import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
-import { buildSupervisorManagerTask } from '../supervisor/manager-task.js';
+import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
 import { SupervisorStore } from '../supervisor/store.js';
 import { RecoveryController } from '../recovery/controller.js';
+import { hasFreshProcessReady, type RecoveryObservation } from '../recovery/types.js';
 import { RecoveryStore } from '../recovery/store.js';
+import { rebootStateBinding } from '../recovery/reboot-state-binding.js';
 import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
+import { currentLocalCodexHome } from '../recovery/codex-home.js';
+import { clampRecoveryLaunchForOwner } from '../session-env-clamp.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
@@ -1352,10 +1356,29 @@ export class WebServer extends EventEmitter {
       isCurrent() && this.sessions.get(session.id) === session && this.tentativeSessionRegistrations.has(session);
     if (!current()) throw new Error('Reboot restoration was cancelled before durable commit');
     await this.mux.flushSessionsDurably(current);
-    await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
-    if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
-    this.persistDeb.cancelKey(session.id);
-    this.commitSessionRegistration(session);
+    const nativeRestorePending = session.codexRestoreWorkerMayExist;
+    try {
+      if (nativeRestorePending) {
+        // A successful offer must not reopen as uncertain on the next boot.
+        // Keep the Session's live veto until mux and historical state both acknowledge.
+        const binding = rebootStateBinding(this.buildPersistedSessionState(session));
+        if (!binding) throw new Error('Reboot state identity is incomplete');
+        session.prepareCodexRestoreLaunchCommit(binding);
+        await this.mux.flushSessionsDurably(current);
+      }
+      await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
+      if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
+      this.persistDeb.cancelKey(session.id);
+      this.commitSessionRegistration(session);
+    } catch (error) {
+      if (nativeRestorePending) {
+        session.retainCodexRestoreLaunchUncertainty();
+        // Even cancellation retains our own possibly running worker. Never delete
+        // it or publish a replacement historical record to make rollback look clean.
+        await this.mux.flushSessionsDurably().catch(() => {});
+      }
+      throw error;
+    }
   }
 
   /** Private complete snapshot; tentative restorations can serialize without overwriting historical memory. */
@@ -2464,6 +2487,92 @@ export class WebServer extends EventEmitter {
       return undefined;
     const existing = this.supervisorControllers.get(session.id);
     if (existing) return existing;
+    const managerAdapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+    const managerScope = () => {
+      const context = session.getRecoveryContext();
+      return JSON.stringify({
+        generation: context.generation,
+        codexHome: context.codexHome,
+        config: session.codexConfig,
+        env: session.getEnvOverridesForPersist(),
+        mode: session.mode,
+        owner: session.owner,
+      });
+    };
+    let managerGrant: { task: TaskController; state: TaskState; isCurrent: () => boolean; scope: string } | undefined;
+    let managerEvidence:
+      | {
+          conversationId: string;
+          generation: number;
+          observation: RecoveryObservation;
+          grantIsCurrent: () => boolean;
+        }
+      | undefined;
+    const hasManagerTaskAuthority = () => {
+      const grant = managerGrant;
+      const context = session.getRecoveryContext();
+      if (
+        !grant ||
+        this.recoveryStopping ||
+        this.cleaningUp.has(session.id) ||
+        this.sessions.get(session.id) !== session ||
+        this.taskControllers.get(session.id) !== grant.task ||
+        this.taskStore.loadFailed ||
+        !context.managed ||
+        !context.noDaemon ||
+        context.switchPending ||
+        context.untrackedInput ||
+        session.paneLifecycleInFlight ||
+        session.paneExit !== undefined ||
+        session.remote ||
+        session.docker ||
+        session.codexConfig?.resumeSessionId !== grant.state.conversationId ||
+        managerScope() !== grant.scope
+      )
+        return false;
+      const live = grant.task.getStatus();
+      if (!TaskStateSchema.safeParse(live).success || !grant.isCurrent()) return false;
+      // A newer live veto and an older durable veto each retain authority until owner Start.
+      return [live, this.taskStore.get(session.id)].every((state) => {
+        if (!TaskStateSchema.safeParse(state).success) return false;
+        const elapsed = Date.now() - (state.startedAt ?? NaN);
+        return (
+          state.config.enabled &&
+          state.phase === 'watching' &&
+          !state.agentProgressVeto &&
+          !['blocked', 'completed'].includes(state.outcome) &&
+          !state.criteria.every((criterion) => criterion.verified) &&
+          state.continuations < state.config.maxContinuations &&
+          Number.isFinite(elapsed) &&
+          (state.startedAt ?? -1) >= 0 &&
+          elapsed >= 0 &&
+          elapsed < state.config.maxRuntimeMs &&
+          !!grant.state.conversationId &&
+          state.conversationId === grant.state.conversationId &&
+          state.objective === grant.state.objective &&
+          JSON.stringify(state.config) === JSON.stringify(grant.state.config) &&
+          state.criteria.length === grant.state.criteria.length &&
+          state.criteria.every((criterion, index) => {
+            const expected = grant.state.criteria[index];
+            return (
+              criterion.id === expected.id &&
+              criterion.description === expected.description &&
+              criterion.kind === expected.kind &&
+              criterion.command === expected.command
+            );
+          })
+        );
+      });
+    };
+    const hasManagerAuthority = () =>
+      hasManagerTaskAuthority() &&
+      !!managerEvidence &&
+      !!managerGrant &&
+      managerEvidence.grantIsCurrent() &&
+      managerAdapter.confirmLocalEvidence(managerEvidence.conversationId, managerEvidence.generation) &&
+      managerEvidence.grantIsCurrent() &&
+      hasManagerTaskAuthority() &&
+      hasFreshProcessReady(managerEvidence.observation, managerGrant.state.startedAt ?? NaN, Date.now());
     const controller = new SupervisorController(
       {
         validateWorkers: (ids) => {
@@ -2501,7 +2610,52 @@ export class WebServer extends EventEmitter {
         agentProgressVeto: (id) =>
           this.taskControllers.get(id)?.getStatus().agentProgressVeto === true ||
           this.taskStore.get(id).agentProgressVeto === true,
+        hasManagerAuthority,
+        validateManagerAuthority: async () => {
+          managerEvidence = undefined;
+          if (!hasManagerTaskAuthority()) return false;
+          const scope = managerScope();
+          const managerConfig = session.codexConfig;
+          const context = session.getRecoveryContext();
+          const persistedEnv = session.getEnvOverridesForPersist();
+          const env =
+            context.codexHome && context.codexHome !== currentLocalCodexHome()
+              ? { ...persistedEnv, CODEX_HOME: context.codexHome }
+              : persistedEnv;
+          const grant = await clampRecoveryLaunchForOwner(session.owner, { codexConfig: managerConfig }, env);
+          if (
+            !hasManagerTaskAuthority() ||
+            managerScope() !== scope ||
+            !grant.isCurrent() ||
+            JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(managerConfig) ||
+            JSON.stringify(grant.env) !== JSON.stringify(env)
+          )
+            return false;
+          const observation = await managerAdapter.observe();
+          const tail = observation.conversationId && managerAdapter.getVerifiedTail(observation.conversationId);
+          if (
+            hasManagerTaskAuthority() &&
+            managerScope() === scope &&
+            grant.isCurrent() &&
+            observation.conversationId === managerGrant?.state.conversationId &&
+            hasFreshProcessReady(observation, managerGrant?.state.startedAt ?? NaN, Date.now()) &&
+            tail !== undefined &&
+            !!managerGrant &&
+            managerProgressAllowsAction(managerGrant.task.getStatus(), observation, tail, Date.now())
+          ) {
+            managerEvidence = {
+              conversationId: observation.conversationId!,
+              generation: session.getRecoveryContext().generation,
+              observation: { ...observation },
+              grantIsCurrent: grant.isCurrent,
+            };
+            return hasManagerAuthority();
+          }
+          return false;
+        },
         startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
+          managerGrant = undefined;
+          managerEvidence = undefined;
           const task = this.getTaskController(session);
           if (!task) throw new Error('Supervisor task controller is unavailable');
           await task.update(buildSupervisorManagerTask(objective));
@@ -2513,6 +2667,8 @@ export class WebServer extends EventEmitter {
           }
           const outcome = classifyTaskKickoff(started);
           if (outcome === 'uncertain') throw new Error('Manager task delivery acceptance is uncertain');
+          if (outcome === 'accepted')
+            managerGrant = { task, state: started, isCurrent: task.captureActionAuthority(), scope: managerScope() };
           return outcome === 'accepted';
         },
         pauseManager: async () => {
@@ -2562,10 +2718,15 @@ export class WebServer extends EventEmitter {
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('task', !this.controllerHasRecoveryFlight(session.id)),
         recover: (observation, isCurrent) =>
-          this.getActionArbiter(session.id).run('task', observation.evidenceKey ?? '', () => {
-            if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
-            return adapter.recover(observation, isCurrent);
-          }),
+          this.getActionArbiter(session.id).run(
+            'task',
+            observation.evidenceKey ?? '',
+            () => {
+              if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
+              return adapter.recover(observation, isCurrent);
+            },
+            observation.activity === 'crashed'
+          ),
         act: (key, conversationId, prompt, isCurrent) =>
           this.getActionArbiter(session.id).run('task', key, () => {
             if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
@@ -3902,6 +4063,7 @@ export class WebServer extends EventEmitter {
         this.persistDeb.cancelKey(sessionId);
         // Keep tentative protection: the historical state record must remain intact.
         await this.mux.flushSessionsDurably();
+        if (this.sessions.get(sessionId) !== session) return;
         this.broadcast(SseEvent.SessionCreated, this.getSessionStateWithRespawn(session));
         return;
       }
@@ -3994,6 +4156,33 @@ export class WebServer extends EventEmitter {
         console.log(`[Server] Discovered ${discovered.length} unknown mux session(s)`);
       }
 
+      for (const muxSession of this.mux.getSessions()) {
+        if (muxSession.mode !== 'codex' || muxSession.codexRestoreStateBinding === undefined) continue;
+        const savedState = this.store.getSession(muxSession.sessionId);
+        const nativeBinding = savedState
+          ? rebootStateBinding({
+              ...savedState,
+              id: muxSession.sessionId,
+              mode: muxSession.mode,
+              owner: muxSession.owner,
+              workingDir: muxSession.workingDir,
+              codexConfig: muxSession.codexRestoreConfig,
+              __codexRecoveryHome: muxSession.recoveryCodexHome,
+            })
+          : undefined;
+        if (
+          !/^[a-f0-9]{64}$/.test(muxSession.codexRestoreStateBinding) ||
+          rebootStateBinding(savedState) !== muxSession.codexRestoreStateBinding ||
+          nativeBinding !== muxSession.codexRestoreStateBinding
+        ) {
+          // A crash between mux and state acknowledgements leaves only the native
+          // launch's actual configuration trustworthy. Inspection cannot launch
+          // or recover it, and tentative state cannot overwrite its history.
+          muxSession.codexRestoreUncertain = true;
+          this.mux.registerSession(muxSession);
+        }
+      }
+
       // Build the reboot-restore offer HERE: `dead` is only known after
       // reconciliation, and the records it reads are pruned by
       // `cleanupStaleSessions()` as soon as `finalizeRestoredState()` runs.
@@ -4026,7 +4215,6 @@ export class WebServer extends EventEmitter {
           if (!this.sessions.has(muxSession.sessionId)) {
             // Restore session settings from state.json (single source of truth)
             const savedState = this.store.getSession(muxSession.sessionId);
-
             // Determine the correct session name (priority: savedState > muxSession > muxName)
             // This ensures renamed sessions keep their name after server restart
             const sessionName = savedState?.name || muxSession.name || muxSession.muxName;

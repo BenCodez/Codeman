@@ -138,8 +138,8 @@
     'Resume the same verified conversation after an unexpected process exit.':
       '进程意外退出后，恢复同一个已验证的对话。',
     'Recover confirmed stalls': '恢复已确认的停滞',
-    'Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local pane died abnormally. Live silence only asks for attention.':
-      '仅当重复的结构化证据指向同一未完成轮次，且新探测确认其本地窗格异常退出时才重启。运行中的静默只会请求处理。',
+    'Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local or owned SSH pane died abnormally. Live silence and transport failures only ask for attention.':
+      '仅当重复的结构化证据指向同一未完成轮次，且新探测确认其本地或归属的 SSH 窗格异常退出时才重启。运行中的静默和传输故障只会请求处理。',
     'Retry limits': '重试限制',
     'Maximum retries': '最大重试次数',
     'Stop automatic attempts when this limit is reached.': '达到此限制时停止自动尝试。',
@@ -252,6 +252,7 @@
     'Manager start reserved': '已保留管理器启动操作',
     'Manager start is uncertain; owner reset required': '管理器启动状态不确定；需要所有者重置',
     'Manager conversation is not ready; run one normal turn first': '管理器对话尚未就绪；请先正常运行一轮',
+    'Manager task needs attention; owner Start required': '管理器任务需要处理；需要所有者点击启动',
     'Manager started': '管理器已启动',
     'Supervisor reset and disabled': '主管已重置并禁用',
     'Unresolved operation after restart; owner reset required': '重启后存在未解决操作；需要所有者重置',

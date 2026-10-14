@@ -197,6 +197,8 @@ describe('SupervisorStore', () => {
                 state.workers.some((plan) => plan.sessionId === id)
             )?.supervisorSessionId,
         startManager: async () => true,
+        hasManagerAuthority: () => true,
+        validateManagerAuthority: async () => true,
         pauseManager: async () => {},
         resetManager: async () => {},
         changed: () => {},

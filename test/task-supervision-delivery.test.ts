@@ -501,7 +501,8 @@ describe('transport canonical task prompts', () => {
       deliverRemote: vi.fn(async (_remote, request) => {
         expect(() => buildRemoteCodexInputCommand(_remote, request)).not.toThrow();
         delivered.push(request.prompt);
-        return { status: 'sent', submittedAt: Date.now(), clock: clockAt() };
+        const submittedAt = Date.now();
+        return { status: 'sent', submittedAt, clock: clockAt(submittedAt, submittedAt) };
       }),
     };
     session = new Session({

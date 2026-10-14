@@ -70,6 +70,8 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
     withLeases: (fn) => fn(),
     leaseHolder: vi.fn(() => undefined),
     startManager: vi.fn(async () => true),
+    hasManagerAuthority: vi.fn(() => true),
+    validateManagerAuthority: vi.fn(async () => true),
     pauseManager: vi.fn(async () => {}),
     resetManager: vi.fn(async () => {}),
     changed: vi.fn(),
@@ -1271,6 +1273,63 @@ describe('SupervisorController', () => {
     });
     expect(expired.worker.recovery.inspect).not.toHaveBeenCalled();
   });
+
+  it.each(
+    [-60_000, 60_000].flatMap((clockStep) => (['timeout', 'ready'] as const).map((outcome) => ({ clockStep, outcome })))
+  )(
+    'keeps the whole inspection plan bounded after a $clockStep ms clock step ($outcome)',
+    async ({ clockStep, outcome }) => {
+      vi.useFakeTimers({ toFake: ['Date', 'performance', 'setTimeout', 'clearTimeout'] });
+      vi.setSystemTime(new Date('2026-10-14T00:00:00Z'));
+      const h = harness({ inspectionTimeoutMs: 100, inspectionConcurrency: 1, now: () => Date.now() });
+      const nextWorker = '33333333-3333-4333-8333-333333333333';
+      const releases: Array<(state: ReturnType<typeof initialRecoveryState>) => void> = [];
+      vi.mocked(h.worker.recovery.inspect).mockImplementation(() => new Promise((resolve) => releases.push(resolve)));
+      let read: Promise<unknown> | undefined;
+      try {
+        await h.controller.configure({
+          ...config,
+          workers: [...config.workers, { ...config.workers[0], sessionId: nextWorker }],
+        });
+        await h.controller.start();
+        let settled = false;
+        read = h.controller.inspectWorkers().then((rows) => {
+          settled = true;
+          return rows;
+        });
+        expect(h.worker.recovery.inspect).toHaveBeenCalledOnce();
+        await vi.advanceTimersByTimeAsync(20);
+        vi.setSystemTime(Date.now() + clockStep);
+        await vi.advanceTimersByTimeAsync(20);
+        releases[0]({ ...initialRecoveryState(), activity: 'working' });
+        await vi.advanceTimersByTimeAsync(0);
+        expect(h.worker.recovery.inspect).toHaveBeenCalledTimes(2);
+        const remaining = outcome === 'ready' ? 20 : 60;
+        await vi.advanceTimersByTimeAsync(remaining - 1);
+        expect(settled).toBe(false);
+        if (outcome === 'ready') releases[1]({ ...initialRecoveryState(), activity: 'working' });
+        await vi.advanceTimersByTimeAsync(1);
+        expect(settled).toBe(true);
+        await expect(read).resolves.toMatchObject([
+          { sessionId: WORKER, health: 'working', taskStale: true, recoveryStale: false },
+          {
+            sessionId: nextWorker,
+            health: outcome === 'ready' ? 'working' : 'unknown',
+            taskStale: true,
+            recoveryStale: outcome !== 'ready',
+          },
+        ]);
+        expect(h.worker.task.update).not.toHaveBeenCalled();
+        expect(h.worker.task.resume).not.toHaveBeenCalled();
+        expect(h.worker.recovery.retry).not.toHaveBeenCalled();
+      } finally {
+        for (const release of releases) release(initialRecoveryState());
+        await vi.advanceTimersByTimeAsync(0);
+        await read;
+        vi.useRealTimers();
+      }
+    }
+  );
 
   it('keeps the largest valid owner objective inside the guarded manager task schema', () => {
     const maximal = { ...config, objective: 'x'.repeat(3000) };

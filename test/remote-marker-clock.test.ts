@@ -128,6 +128,18 @@ describe('uncertain remote marker age cannot release an earlier action', () => {
     expect(f.persist.mock.calls.at(-1)?.[0]).toMatchObject({ agentProgressVeto: true });
   });
 
+  it.each([{ outcome: 'unknown' }, { outcome: 'unfinished', checkpoint: 'Agent step', nextAction: 'Agent action' }])(
+    'retains uncertainty when the latest possible timestamp equals the owner boundary: %j',
+    async (progress) => {
+      const f = await fixture();
+      f.report(progress, 9500);
+      expect((await f.adapter.observe()).marker).toMatchObject({ at: 9000, latestAt: 10000 });
+      await f.controller.refresh();
+      expect(f.deliver).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().agentProgressVeto).toBe(true);
+    }
+  );
+
   it('also vetoes an interval crossing newer owner progress while definitely after configuration', async () => {
     const f = await fixture(true, 10500);
     f.report({ outcome: 'unknown' }, 11000);

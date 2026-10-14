@@ -243,6 +243,7 @@ export function buildMagicPacket(mac: number[]): Buffer {
 export interface WakeableSession {
   readonly id: string;
   readonly remote: WakeableRemote | undefined;
+  readonly paneStartedAt?: number;
   /** COD-108 reattach: respawns the local ssh pane, idempotently attaching the durable remote tmux. */
   reattachRemote(): Promise<boolean>;
   /** Write bytes to the session's pane. `fromUser` marks input a person typed (or an agent sent for them). */
@@ -337,6 +338,7 @@ interface WakeState {
  */
 export class RemoteWakeRegistry {
   private readonly states = new Map<string, WakeState>();
+  private readonly reattachments = new WeakMap<WakeableSession, { before?: number; after?: number }>();
   /**
    * Aborted by {@link stop} on shutdown. Every in-flight readiness poll is holding an
    * HTTP request open (the wake route blocks on it), and Fastify's `close()` waits for
@@ -492,6 +494,21 @@ export class RemoteWakeRegistry {
     return this.wake(session, { timeoutMs: opts.timeoutMs });
   }
 
+  /** Admit only this wake's reattach, never an unrelated pane replacement during the wait. */
+  async ensureAwakeForInput(
+    session: WakeableSession & { readonly paneStartedAt: number },
+    paneStartedAt: number
+  ): Promise<number | null> {
+    const previous = this.reattachments.get(session);
+    if (!(await this.ensureAwake(session))) return null;
+    const transition = this.reattachments.get(session);
+    const current = session.paneStartedAt;
+    return current === paneStartedAt ||
+      (transition !== previous && transition?.before === paneStartedAt && transition?.after === current)
+      ? current
+      : null;
+  }
+
   /**
    * Host-scoped reachability, for a caller that has no session yet (create/attach).
    * Shares the per-HOST probe state with {@link ensureHostAwake}, so the probe the
@@ -593,11 +610,13 @@ export class RemoteWakeRegistry {
         const ready = await this._wakeAndWait(remote, state, { sessionId: id, timeoutMs: opts.timeoutMs });
         if (!ready) return false;
 
+        const before = session.paneStartedAt;
         const reattached = await session.reattachRemote();
         if (!reattached) {
           this.deps.log?.(`[RemoteWake] ${remote.label} is up but the pane could not be reattached`);
           return false;
         }
+        this.reattachments.set(session, { before, after: session.paneStartedAt });
         // The reset also clears an EXHAUSTED COD-108 backoff, which otherwise
         // never fires again for this session (see remote-reconnect.ts).
         this.deps.noteReconnected?.(id, true);

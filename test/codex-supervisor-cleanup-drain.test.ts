@@ -140,6 +140,8 @@ async function fixture(
         await internals.supervisorStore.save(ID, state);
       },
       startManager: vi.fn(async () => true),
+      hasManagerAuthority: () => true,
+      validateManagerAuthority: async () => true,
       pauseManager: async () => {},
       resetManager: async () => {},
       changed: () => {},

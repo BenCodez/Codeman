@@ -16,6 +16,7 @@ import {
   restartRemoteCodexPane,
   restoreRemoteCodexWorker,
 } from '../src/recovery/remote-codex.js';
+import { guardedNativeTmuxFixture } from './mocks/remote-native-tmux.js';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import type { RecoveryObservation } from '../src/recovery/types.js';
@@ -90,7 +91,7 @@ async function fixture(kind: Kind, jump: number, phase: Phase = 'pane') {
     await writeFile(join(bin, 'ssh'), '#!/bin/sh\nfor arg do last=$arg; done\nexec /bin/sh -c "$last"\n');
     await writeFile(join(bin, 'login-shell'), '#!/bin/sh\nfor arg do last=$arg; done\nexec /bin/sh -c "$last"\n');
     await writeFile(
-      join(bin, 'tmux'),
+      join(bin, 'tmux-base'),
       String.raw`#!/bin/sh
 step() { printf '%s' "$CLOCK_JUMP" > "$CLOCK_OFFSET_FILE"; }
 case "$*" in
@@ -98,7 +99,7 @@ case "$*" in
 *list-panes*)
   if [ "$5" = '$17' ]; then
     [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
-    printf '1|%%9|9009|1|17000\n'
+    printf '1|%%9|9009|1||17000\n'
   elif [ "$KIND" = restart ]; then printf '1|1||%%7|700\n'; else printf '0|||%%7|700\n'; fi;;
 *capture-pane*) printf '›\n';;
 *send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG"; case "$*" in *' -l '*) [ "$CLOCK_PHASE" = text ] && step;; *' Enter') [ "$CLOCK_PHASE" = enter ] && step;; esac; exit 0;;
@@ -121,7 +122,8 @@ case "$*" in
 esac
 `
     );
-    await Promise.all(['ssh', 'login-shell', 'tmux'].map((name) => chmod(join(bin, name), 0o700)));
+    await writeFile(join(bin, 'tmux'), guardedNativeTmuxFixture(join(bin, 'tmux-base')));
+    await Promise.all(['ssh', 'login-shell', 'tmux', 'tmux-base'].map((name) => chmod(join(bin, name), 0o700)));
     const env = {
       ...process.env,
       PATH: `${bin}:${process.env.PATH}`,
@@ -131,6 +133,7 @@ esac
       CLOCK_JUMP: String(jump),
       CLOCK_PHASE: phase,
       KIND: kind,
+      FIXTURE_PANE_PID: '700',
       EFFECT_LOG: log,
       RESTORE_STAGE_FILE: join(root, 'restore-stage'),
     };

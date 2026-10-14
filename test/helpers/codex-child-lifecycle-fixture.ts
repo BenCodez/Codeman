@@ -53,7 +53,7 @@ export async function createChildLifecycleFixture(body: string, dead: boolean, s
     payload: { id: CHILD_THREAD, cwd: workspace, originator: `codeman_${CHILD_SESSION}` },
   });
   await fs.writeFile(path, `${header}\n${body}`);
-  const pane = { dead, paneId: '%7', panePid: 700, ...(dead ? { status: 9 } : {}), screen: dead ? null : CHILD_READY };
+  const pane = { paneId: '%7', panePid: 700, dead, ...(dead ? { status: 9 } : {}), screen: dead ? null : CHILD_READY };
   const mux = { inspectPaneForRecovery: vi.fn(async () => pane) };
   const session = new Session({
     id: CHILD_SESSION,

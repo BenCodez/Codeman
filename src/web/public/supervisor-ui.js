@@ -17,6 +17,7 @@ const SUPERVISOR_UI_REASONS = Object.freeze({
   'manager-start-reserved': 'Manager start reserved',
   'manager-start-uncertain': 'Manager start is uncertain; owner reset required',
   'manager-start-refused': 'Manager conversation is not ready; run one normal turn first',
+  'manager-attention-required': 'Manager task needs attention; owner Start required',
   'owner-started': 'Manager started',
   'owner-paused': 'Paused by owner',
   'owner-reset': 'Supervisor reset and disabled',

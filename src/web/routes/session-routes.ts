@@ -1814,7 +1814,7 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const { input, useMux, seq, clientId, wait, waitTimeout } = parseBody(SessionInputWithLimitSchema, req.body);
     const session = findSessionOrFail(ctx, id, req);
-    const inputPaneStartedAt = session.paneStartedAt;
+    let inputPaneStartedAt = session.paneStartedAt;
 
     const inputStr = String(input);
     if (inputStr.length > MAX_INPUT_LENGTH) {
@@ -1868,10 +1868,25 @@ export function registerSessionRoutes(
     // Admission is not delivery. Any exit before commit releases this exact
     // reservation without changing a genuinely applied watermark.
     let abortWait: AbortController | undefined;
+    let ownerIntentNoted = false;
+    const noteLifecycleOwnerIntent = () => {
+      if (
+        !duplicate &&
+        !ownerIntentNoted &&
+        ctx.sessions.get(id) === session &&
+        !abortWait?.signal.aborted &&
+        canAccessOwned(getAuthUser(req), session.owner) &&
+        session.inputDispatchAllowed === false
+      ) {
+        ownerIntentNoted = true;
+        session.noteRejectedOwnerInput?.(inputStr);
+      }
+    };
     let stopDeathWatch = () => {};
     try {
       const abort = abortOnClientHangUp(reply);
       abortWait = abort;
+      noteLifecycleOwnerIntent();
       // Wake-on-LAN (remote-wake.ts): a wake-enabled remote host that suspended leaves
       // the local ssh pane STALLED, and `send-keys` succeeds against it — the bytes
       // would vanish with no error anywhere. Give the registry the chance to probe the
@@ -1889,12 +1904,16 @@ export function registerSessionRoutes(
           // paths: writing into the stalled pane would answer `delivered:true` plus a
           // timeout, which is the combination the API docs send callers to the wrong
           // recovery for.
-          if (!(await remoteWake.ensureAwake(session))) {
+          const awakePaneStartedAt = await remoteWake.ensureAwakeForInput(session, inputPaneStartedAt);
+          if (awakePaneStartedAt === null) {
             return createErrorResponse(
               ApiErrorCode.OPERATION_FAILED,
               `${session.remote?.label ?? 'the remote host'} did not come back after a wake-on-LAN request — nothing was sent`
             );
           }
+          // The registry certifies its own reattach epoch. Capturing the epoch
+          // after an arbitrary await would also admit an unrelated replacement.
+          inputPaneStartedAt = awakePaneStartedAt;
         } else {
           const outcome = await remoteWake.handleInput(session, inputStr);
           // The registry holds the bytes and flushes them in order once the pane is
@@ -1949,12 +1968,19 @@ export function registerSessionRoutes(
         ...(tagged && !workerDead ? { inputSeq: { clientId: clientId as string, seq: seq as number } } : {}),
       };
       let legacyBackground = false;
-      const inputCurrent = () =>
-        ctx.sessions.get(id) === session &&
-        session.paneStartedAt === inputPaneStartedAt &&
-        session.inputDispatchAllowed !== false &&
-        (legacyBackground || !abort.signal.aborted) &&
-        canAccessOwned(getAuthUser(req), session.owner);
+      const inputCurrent = () => {
+        if (
+          ctx.sessions.get(id) !== session ||
+          !(legacyBackground || !abort.signal.aborted) ||
+          !canAccessOwned(getAuthUser(req), session.owner)
+        )
+          return false;
+        if (session.inputDispatchAllowed === false) {
+          noteLifecycleOwnerIntent();
+          return false;
+        }
+        return session.paneStartedAt === inputPaneStartedAt;
+      };
       const directWrite = async () => {
         try {
           if (!inputCurrent()) return false;
@@ -2056,7 +2082,7 @@ export function registerSessionRoutes(
         // Recovery may acquire the pane while an awaited mux write is in progress.
         // In that race the initial reservation check passed, but both guarded writes
         // still return false. Keep a tagged browser frame retryable and unacknowledged.
-        if (!duplicate && tagged && !delivered) {
+        if (!duplicate && (tagged || wantsWait) && !delivered) {
           return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input was not delivered; retry the input');
         }
         return {};
@@ -2337,13 +2363,25 @@ export function registerSessionRoutes(
       // user's default server and never find this session (same #80 regression class).
       const abort = abortOnClientHangUp(reply);
       const keyPaneStartedAt = session.paneStartedAt;
-      const keyCurrent = () =>
-        ctx.sessions.get(id) === session &&
-        session.paneStartedAt === keyPaneStartedAt &&
-        session.inputDispatchAllowed !== false &&
-        !abort.signal.aborted &&
-        canAccessOwned(getAuthUser(req), session.owner);
       const rawKey = hex.map((byte) => String.fromCharCode(parseInt(byte, 16))).join('');
+      let ownerIntentNoted = false;
+      const keyCurrent = () => {
+        if (
+          ctx.sessions.get(id) !== session ||
+          abort.signal.aborted ||
+          !canAccessOwned(getAuthUser(req), session.owner)
+        )
+          return false;
+        if (session.inputDispatchAllowed === false) {
+          if (!ownerIntentNoted) {
+            ownerIntentNoted = true;
+            session.noteRejectedOwnerInput?.(rawKey);
+          }
+          return false;
+        }
+        return session.paneStartedAt === keyPaneStartedAt;
+      };
+      keyCurrent(); // Record authorized owner intent before the shared queue can delay admission.
       const sent = await queueInputDispatch(session, rawKey.length, async () => {
         if (!keyCurrent()) return false;
         return session.sendNamedKey(

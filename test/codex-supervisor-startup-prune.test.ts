@@ -175,6 +175,8 @@ it('retains pinned, offered, taken, live and uncertain manager/worker ownership 
         withLeases: (fn) => fn(),
         leaseHolder: () => undefined,
         startManager: async () => true,
+        hasManagerAuthority: () => true,
+        validateManagerAuthority: async () => true,
         pauseManager: async () => {},
         resetManager: async () => {},
         changed: () => {},

@@ -61,6 +61,7 @@ import { customModelConfigDir, removeConfigDir } from '../../custom-model-inject
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
 import { confirmCodexIdentityWitness } from '../../recovery/codex-identity.js';
 import { currentLocalCodexHome, normalizedCodexHome } from '../../recovery/codex-home.js';
+import { isCodexRestoreConfig } from '../../recovery/reboot-state-binding.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 type RebootRestoreCtx = SessionPort & EventPort & ConfigPort & InfraPort;
@@ -214,6 +215,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         try {
           const saved = entry.state;
           const usesCodexRecovery = getCli(saved.mode ?? 'claude')?.capabilities.recovery === 'codex-rollout';
+          if (usesCodexRecovery && !isCodexRestoreConfig(saved.codexConfig)) {
+            failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+            continue;
+          }
           if (!rebootRestoreRegistry.isHeld(entry, owner)) {
             failures.push({ sessionId: entry.sessionId, reason: 'restore-cancelled' });
             unspent.delete(entry);
@@ -290,6 +295,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               continue;
             }
             const preservedConfig: CodexConfig = { ...saved.codexConfig, resumeSessionId: verified };
+            if (!isCodexRestoreConfig(preservedConfig, true)) {
+              failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+              continue;
+            }
             const configs = await clampExternalCliConfigsForOwner(saved.owner, { codexConfig: preservedConfig });
             // Restoration preserves the original launch configuration. A revoked
             // grant must refuse restoration, rather than launch the conversation

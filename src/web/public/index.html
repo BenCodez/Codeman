@@ -1568,7 +1568,7 @@
                       <label class="switch switch-sm"><input type="checkbox" id="recoveryCrashes" checked aria-label="Recover crashes" onchange="app.saveRecoverySetting('recoverCrashes', this)"><span class="slider"></span></label>
                     </div>
                     <div class="set-row">
-                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Recover confirmed stalls</label><span class="set-row-desc">Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local pane died abnormally. Live silence only asks for attention.</span></div>
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Recover confirmed stalls</label><span class="set-row-desc">Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local or owned SSH pane died abnormally. Live silence and transport failures only ask for attention.</span></div>
                       <label class="switch switch-sm"><input type="checkbox" id="recoveryStalls" aria-label="Recover confirmed stalls" onchange="app.saveRecoverySetting('detectStalls', this)"><span class="slider"></span></label>
                     </div>
                   </div>
