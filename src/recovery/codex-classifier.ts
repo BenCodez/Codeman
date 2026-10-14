@@ -28,15 +28,35 @@ function terminalChildStatus(status: unknown): boolean {
   );
 }
 
-function errorKind(error: JsonObject): string {
+function errorKind(error: JsonObject): string | undefined {
+  if (error.codex_error_info !== undefined && error.codexErrorInfo !== undefined) return undefined;
   const info = error.codex_error_info ?? error.codexErrorInfo;
-  const name = typeof info === 'string' ? info : Object.keys(object(info) ?? {})[0];
-  return (name ?? '').replace(/_/g, '').toLowerCase();
+  if (info === undefined || info === null) return '';
+  const variants = object(info);
+  if (typeof info !== 'string' && (!variants || Object.keys(variants).length !== 1)) return undefined;
+  const name = typeof info === 'string' ? info : Object.keys(variants!)[0];
+  const kind = name.replace(/_/g, '').toLowerCase();
+  if (
+    ['responsestreamdisconnected', 'responsestreamconnectionfailed', 'responsetoomanyfailedattempts'].includes(kind)
+  ) {
+    // These are struct variants in the pinned Codex protocol, never unit strings.
+    const details = variants && object(variants[name]);
+    if (!details || Object.keys(details).some((key) => key !== 'http_status_code')) return undefined;
+    const status = details.http_status_code;
+    if (
+      status !== undefined &&
+      status !== null &&
+      !(Number.isInteger(status) && Number(status) >= 0 && Number(status) <= 65535)
+    )
+      return undefined;
+  }
+  return kind;
 }
 
 function classifyError(error: JsonObject): { activity: RecoveryActivity; reason: RecoveryReason } {
   if (typeof error.message !== 'string') return { activity: 'unknown', reason: 'observing' };
   const kind = errorKind(error);
+  if (kind === undefined) return { activity: 'blocked', reason: 'observing' };
   const message = typeof error.message === 'string' ? error.message.slice(0, 2048) : '';
   if (['usagelimitexceeded', 'ratelimitexceeded', 'sessionbudgetexceeded'].includes(kind)) {
     return { activity: 'blocked', reason: 'usage-limit' };
@@ -53,6 +73,7 @@ function classifyError(error: JsonObject): { activity: RecoveryActivity; reason:
   ) {
     return { activity: 'interrupted', reason: 'turn-failed' };
   }
+  if (kind !== '') return { activity: 'blocked', reason: 'observing' };
   if (/^Conversation interrupted(?:[.!:]|$)/i.test(message.trim())) {
     return { activity: 'interrupted', reason: 'turn-interrupted' };
   }
@@ -185,8 +206,8 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     } else if (p.type === 'error') {
       if (typeof p.message !== 'string') return unknown;
       const e = classifyError(p);
-      if (e.activity === 'interrupted' || e.activity === 'blocked') terminalError = p;
-      if (e.activity !== 'unknown') update(e.activity, e.reason);
+      terminalError = e.activity === 'interrupted' || e.activity === 'blocked' ? p : undefined;
+      update(e.activity, e.reason);
     } else if (p.type === 'task_complete' || p.type === 'turn_complete') {
       const id = token(p.turn_id);
       if (!id || (turnId && id !== turnId)) return unknown;

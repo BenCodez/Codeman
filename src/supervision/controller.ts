@@ -105,7 +105,11 @@ export class TaskController {
     }
   }
   private runtimeBudgetExpired(): boolean {
-    return this.state.startedAt !== undefined && this.now() - this.state.startedAt >= this.state.config.maxRuntimeMs;
+    if (this.state.startedAt === undefined) return false;
+    const elapsed = this.now() - this.state.startedAt;
+    return (
+      this.state.startedAt < 0 || !Number.isFinite(elapsed) || elapsed < 0 || elapsed >= this.state.config.maxRuntimeMs
+    );
   }
   private commandEvidenceIsCurrent(evidence: CommandSuccessEvidence | undefined): evidence is CommandSuccessEvidence {
     return (
@@ -170,10 +174,11 @@ export class TaskController {
   private preserveCancelledDelivery(
     revision: number,
     result: 'sent' | 'not-sent' | 'unknown',
-    kickoff = false
+    kickoff = false,
+    externallyCurrent: () => boolean = () => true
   ): Promise<TaskState> | undefined {
     const deadlineExpired = !this.stopped && this.revision === revision && this.runtimeBudgetExpired();
-    if (!this.stopped && this.revision === revision && !deadlineExpired) return undefined;
+    if (!this.stopped && this.revision === revision && !deadlineExpired && externallyCurrent()) return undefined;
     if (result === 'not-sent') {
       delete this.state.inFlight;
       if (kickoff) delete this.state.kickoffAt;
@@ -278,6 +283,7 @@ export class TaskController {
     });
   }
   progress(patch: TaskProgress, owner = true): Promise<TaskState> {
+    if (!owner) throw new TaskValidationError('Task progress requires owner authority');
     TaskProgressSchema.parse(patch);
     const revision = ++this.revision;
     return this.enqueue(async () => {
@@ -333,23 +339,42 @@ export class TaskController {
       return this.save('owner-paused');
     });
   }
-  resume(): Promise<TaskState> {
+  resume(externallyCurrent: () => boolean = () => true, runtimeStartedAt?: number): Promise<TaskState> {
+    if (
+      runtimeStartedAt !== undefined &&
+      (!Number.isFinite(runtimeStartedAt) || runtimeStartedAt < 0 || runtimeStartedAt > this.now())
+    )
+      throw new TaskValidationError('Task runtime origin is invalid');
     const revision = ++this.revision;
     return this.enqueue(async () => {
       this.requireCurrent(revision);
       if (this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
       if (!this.state.objective || !this.state.criteria.length || this.state.outcome === 'completed')
         throw new TaskValidationError('No unfinished task to supervise');
+      const beforeObserveCancelled = this.preserveCancelledDelivery(revision, 'not-sent', false, externallyCurrent);
+      if (beforeObserveCancelled) return beforeObserveCancelled;
       this.state.config.enabled = true;
-      this.state.startedAt ??= this.now();
+      if (this.runtimeBudgetExpired()) {
+        this.state.phase = 'blocked';
+        return this.save('budget-exhausted');
+      }
+      this.state.startedAt = Math.min(this.state.startedAt ?? this.now(), runtimeStartedAt ?? this.now());
+      if (this.runtimeBudgetExpired()) {
+        this.state.phase = 'blocked';
+        return this.save('budget-exhausted');
+      }
       if (this.state.kickoffAt !== undefined) {
         this.state.phase = 'watching';
         const result = await this.save('owner-resumed');
+        const cancelled = this.preserveCancelledDelivery(revision, 'not-sent', false, externallyCurrent);
+        if (cancelled) return cancelled;
         this.arm();
         return result;
       }
       const { observation: o, marker } = await this.deps.observe();
       this.requireCurrent(revision);
+      const observationCancelled = this.preserveCancelledDelivery(revision, 'not-sent', false, externallyCurrent);
+      if (observationCancelled) return observationCancelled;
       if (!o.conversationId || !o.processReady || !['idle', 'completed'].includes(o.activity)) {
         this.state.phase = 'paused';
         return this.save('kickoff-not-ready');
@@ -358,7 +383,7 @@ export class TaskController {
         this.state.phase = 'blocked';
         return this.save('identity-changed');
       }
-      if (this.now() - this.state.startedAt >= this.state.config.maxRuntimeMs) {
+      if (this.runtimeBudgetExpired()) {
         this.state.phase = 'blocked';
         return this.save('budget-exhausted');
       }
@@ -374,10 +399,15 @@ export class TaskController {
       this.state.kickoffAt = this.now();
       this.reserveProgressBoundary(o, marker, true);
       await this.save('kickoff-reserved');
-      const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent', true);
+      const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent', true, externallyCurrent);
       if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-      const delivered = await this.deps.act(key, o.conversationId, this.prompt(), () => this.actionIsCurrent(revision));
-      const cancelled = this.preserveCancelledDelivery(revision, delivered, true);
+      const delivered = await this.deps.act(
+        key,
+        o.conversationId,
+        this.prompt(),
+        () => this.actionIsCurrent(revision) && externallyCurrent()
+      );
+      const cancelled = this.preserveCancelledDelivery(revision, delivered, true, externallyCurrent);
       if (cancelled) return cancelled;
       if (delivered === 'not-sent') {
         delete this.state.inFlight;
@@ -388,6 +418,8 @@ export class TaskController {
       const result = await this.save(
         delivered === 'sent' ? 'kickoff-sent' : delivered === 'unknown' ? 'delivery-unknown' : 'delivery-cancelled'
       );
+      const afterSaveCancelled = this.preserveCancelledDelivery(revision, delivered, true, externallyCurrent);
+      if (afterSaveCancelled) return afterSaveCancelled;
       this.arm();
       return result;
     });
@@ -504,10 +536,7 @@ export class TaskController {
         o.evidenceKey &&
         (this.state.outcome === 'unfinished' || (this.state.outcome === 'unknown' && o.activity === 'crashed'))
       ) {
-        if (
-          this.state.continuations >= this.state.config.maxContinuations ||
-          this.now() - (this.state.startedAt ?? this.now()) >= this.state.config.maxRuntimeMs
-        ) {
+        if (this.state.continuations >= this.state.config.maxContinuations || this.runtimeBudgetExpired()) {
           this.state.phase = 'blocked';
           return this.save('budget-exhausted');
         }
@@ -557,10 +586,7 @@ export class TaskController {
       // Limits prevent another dispatch; keep observing work already in progress
       // so its completion and verification evidence can still settle the task.
       if (o.activity === 'working' || o.activity === 'watching') return this.getStatus();
-      if (
-        this.now() - (this.state.startedAt ?? this.now()) >= this.state.config.maxRuntimeMs ||
-        this.state.continuations >= this.state.config.maxContinuations
-      ) {
+      if (this.runtimeBudgetExpired() || this.state.continuations >= this.state.config.maxContinuations) {
         this.state.phase = 'blocked';
         return this.save('budget-exhausted');
       }

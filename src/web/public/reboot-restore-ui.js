@@ -45,6 +45,8 @@ function rebootSkipReason(reason) {
       return 'conversation identity could not be verified';
     case 'restore-cancelled':
       return 'restore offer was dismissed';
+    case 'restore-uncertain':
+      return 'the worker may be running; inspect its pane before retrying';
     case 'rebuild-failed':
       return 'the agent would not start';
     default:

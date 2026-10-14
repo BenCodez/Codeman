@@ -1,3 +1,4 @@
+import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 /** Real Session + real tmux input normalization, with an injected recording runner and no processes. */
 import { afterEach, describe, it, expect, vi } from 'vitest';
 import { Session } from '../src/session.js';
@@ -6,6 +7,10 @@ import type { MuxSession } from '../src/mux-interface.js';
 import { TaskController } from '../src/supervision/controller.js';
 import { classifyCodexTail } from '../src/recovery/codex-classifier.js';
 import { latestProgressMarker } from '../src/supervision/evidence.js';
+import { CodexTaskAdapter } from '../src/supervision/adapter.js';
+import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
+import * as codexIdentity from '../src/recovery/codex-identity.js';
+import { commandHash } from '../src/supervision/evidence.js';
 const THREAD = '11111111-2222-3333-4444-555555555555';
 const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 let session: Session | undefined;
@@ -19,6 +24,173 @@ afterEach(async () => {
 const line = (at: number, payload: unknown) =>
   JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
 describe('transport canonical task prompts', () => {
+  it.each(['unchanged', 'missing-tail', 'generation-changed'])(
+    'uses one coherent recovery snapshot for task evidence: %s',
+    async (change) => {
+      let generation = 1;
+      const now = Date.now();
+      const tail =
+        line(now - 4, { type: 'user_message', message: 'Authorized task' }) +
+        line(now - 3, { type: 'task_started', turn_id: 'task-turn' }) +
+        line(now - 2, { type: 'exec_command_begin', call_id: 'acceptance', command: ['bash', '-lc', 'npm test'] }) +
+        line(now - 1, { type: 'exec_command_end', call_id: 'acceptance', exit_code: 0 }) +
+        line(now, { type: 'task_complete', turn_id: 'task-turn' }) +
+        line(now, { type: 'agent_message', message: 'CODEMAN_TASK_PROGRESS {"outcome":"completed"}' });
+      const fakeSession = {
+        id: SESSION,
+        workingDir: '/fixture/workspace',
+        getRecoveryContext: () => ({ generation, noDaemon: true, codexHome: '/fixture/codex-home' }),
+      } as unknown as Session;
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => {
+        const observation = {
+          ...classifyCodexTail(tail, {
+            conversationId: THREAD,
+            now,
+            screen: '›\n',
+            busy: false,
+            watching: false,
+            tailTruncated: false,
+          }),
+          processReady: true,
+        };
+        if (change === 'generation-changed') generation++;
+        return observation;
+      });
+      const cachedTail = vi
+        .spyOn(CodexRecoveryAdapter.prototype, 'getVerifiedTail')
+        .mockReturnValue(change === 'missing-tail' ? undefined : tail);
+      const secondScan = vi
+        .spyOn(codexIdentity, 'resolveCodexIdentity')
+        .mockRejectedValue(new Error('A task observation must not perform a second identity scan'));
+      const result = await new CodexTaskAdapter(fakeSession, () => {}).observe();
+      expect(secondScan).not.toHaveBeenCalled();
+      if (change === 'unchanged') {
+        expect(cachedTail).toHaveBeenCalledWith(THREAD);
+        expect(result.observation.activity).toBe('completed');
+        expect(result.commands.get(commandHash('npm test'))).toEqual({ startedAt: now - 2, completedAt: now - 1 });
+        expect(result.marker?.progress).toEqual({ outcome: 'completed' });
+      } else {
+        expect(result.observation).toMatchObject({ activity: 'unknown', safeToAct: false });
+        expect(result.commands.size).toBe(0);
+        expect(result.marker).toBeUndefined();
+      }
+    }
+  );
+
+  it.each(['unchanged', 'blocked', 'unknown', 'malformed', 'checkpoint', 'submission', 'completed', 'owner-progress'])(
+    'rechecks %s task evidence after the durable continuation reservation',
+    async (change) => {
+      let now = 10_000;
+      let tail =
+        line(9999, { type: 'user_message', message: 'Authorized task' }) +
+        line(10_000, { type: 'task_started', turn_id: 'task-turn' }) +
+        line(10_000, { type: 'task_complete', turn_id: 'task-turn' });
+      const marker = (progress: unknown) =>
+        line(now, {
+          type: 'agent_message',
+          message: 'CODEMAN_TASK_PROGRESS ' + JSON.stringify(progress),
+        });
+      const initialProgress = { outcome: 'unfinished', checkpoint: 'Verified step', nextAction: 'Run the check' };
+      if (change !== 'owner-progress') tail += marker(initialProgress);
+      const deliver = vi.fn(async () => 'sent' as const);
+      const fakeSession = {
+        id: SESSION,
+        workingDir: '/fixture/workspace',
+        getRecoveryContext: () => ({ generation: 1, noDaemon: true, codexHome: '/fixture/codex-home' }),
+        deliverRecovery: deliver,
+      } as unknown as Session;
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => ({
+        ...classifyCodexTail(tail, {
+          conversationId: THREAD,
+          now,
+          screen: '›\n',
+          busy: false,
+          watching: false,
+          tailTruncated: false,
+        }),
+        processReady: true,
+      }));
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'getVerifiedTail').mockImplementation(() => tail);
+      const adapter = new CodexTaskAdapter(fakeSession, () => {});
+      const task = new TaskController({
+        now: () => now,
+        observe: () => adapter.observe(),
+        act: (key, conversationId, prompt, current) => adapter.act(key, conversationId, prompt, current),
+        changed: () => {},
+        persist: async (state) => {
+          if (state.reason !== 'continuation-reserved') return;
+          now += 1;
+          if (change === 'submission') tail += line(now, { type: 'user_message', message: 'New owner request' });
+          else if (change === 'malformed')
+            tail += line(now, { type: 'agent_message', message: 'CODEMAN_TASK_PROGRESS {broken' });
+          else if (change === 'checkpoint') tail += marker({ ...initialProgress, checkpoint: 'Different step' });
+          else if (!['unchanged', 'owner-progress'].includes(change)) tail += marker({ outcome: change });
+        },
+      });
+      try {
+        await task.update({
+          objective: 'Finish the task',
+          criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+          config: { enabled: true },
+        });
+        await task.progress(initialProgress as { outcome: 'unfinished'; checkpoint: string; nextAction: string });
+        await task.refresh();
+        const accepted = ['unchanged', 'owner-progress'].includes(change);
+        expect(deliver).toHaveBeenCalledTimes(accepted ? 1 : 0);
+        expect(task.getStatus().reason).toBe(accepted ? 'continuation-sent' : 'delivery-cancelled');
+        expect(!!task.getStatus().inFlight).toBe(accepted);
+      } finally {
+        task.stop();
+      }
+    }
+  );
+
+  it('allows an explicit kickoff despite a historical blocked progress marker', async () => {
+    const now = 10_000;
+    const tail =
+      line(9997, { type: 'user_message', message: 'Historical task' }) +
+      line(9998, { type: 'task_complete', turn_id: 'previous-turn' }) +
+      line(9999, { type: 'agent_message', message: 'CODEMAN_TASK_PROGRESS {"outcome":"blocked"}' });
+    const deliver = vi.fn(async () => 'sent' as const);
+    const fakeSession = {
+      id: SESSION,
+      workingDir: '/fixture/workspace',
+      getRecoveryContext: () => ({ generation: 1, noDaemon: true, codexHome: '/fixture/codex-home' }),
+      deliverRecovery: deliver,
+    } as unknown as Session;
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => ({
+      ...classifyCodexTail(tail, {
+        conversationId: THREAD,
+        now,
+        screen: '›\n',
+        busy: false,
+        watching: false,
+        tailTruncated: false,
+      }),
+      processReady: true,
+    }));
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'getVerifiedTail').mockReturnValue(tail);
+    const adapter = new CodexTaskAdapter(fakeSession, () => {});
+    const task = new TaskController({
+      now: () => now,
+      observe: () => adapter.observe(),
+      act: (key, id, prompt, current) => adapter.act(key, id, prompt, current),
+      persist: async () => {},
+      changed: () => {},
+    });
+    try {
+      await task.update({
+        objective: 'Start new owner task',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      });
+      await task.resume();
+      expect(deliver).toHaveBeenCalledOnce();
+      expect(task.getStatus().reason).toBe('kickoff-sent');
+    } finally {
+      task.stop();
+    }
+  });
+
   it('accepts both real kickoff and continuation bytes and processes subsequent structured progress', async () => {
     const delivered: string[] = [];
     let enters = 0;
@@ -37,6 +209,7 @@ describe('transport canonical task prompts', () => {
       mode: 'codex',
       attached: true,
       recoveryIsolated: true,
+      recoveryCodexHome: currentLocalCodexHome(),
     } as MuxSession;
     mux.registerSession(muxSession);
     const screen = '›\n  example-model high · /tmp\n';

@@ -61,6 +61,7 @@ import {
   type PaneExit,
 } from './types.js';
 import { getCli } from './config/cli-registry/registry.js';
+import { currentLocalCodexHome, normalizedCodexHome } from './recovery/codex-home.js';
 import { missingCliMessage, resolveCliBinDir } from './utils/cli-resolver.js';
 import {
   buildSpawnCommandFromRegistry,
@@ -1970,6 +1971,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
   }
 
+  /** Unlike optional env forwarding, failed home pinning must prevent the Codex launch. */
+  private pinCodexLaunchHome(muxName: string, home: string): void {
+    execSync(`${this.tmux()} setenv -t ${shellescape(muxName)} CODEX_HOME ${shellescape(home)}`, {
+      timeout: EXEC_TIMEOUT_MS,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+  }
+
   /**
    * Resolve the CLI binary directory and return the PATH export prefix string.
    * Returns '' if no override is needed (shell mode) or the binary dir is not found.
@@ -2104,6 +2113,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       owner,
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
+    const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
+    const recoveryCodexHome = localCodex
+      ? normalizedCodexHome(options.recoveryCodexHome ?? envOverrides?.CODEX_HOME ?? currentLocalCodexHome())
+      : undefined;
+    if (localCodex && !recoveryCodexHome) throw new Error('Local Codex launch home is unverified');
+    if (options.codexRestoreGuard && (!localCodex || !codexConfig?.resumeSessionId || !codexConfig.noDaemon))
+      throw new Error('Reboot restoration guard requires an exact isolated local Codex launch');
 
     if (!isValidMuxName(muxName)) {
       throw new Error('Invalid session name: contains unsafe characters');
@@ -2114,10 +2130,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     // TEST MODE: Create in-memory session only — no real tmux session
     if (IS_TEST_MODE) {
+      if (options.codexRestoreGuard) {
+        await options.codexRestoreGuard.prepare();
+        if (options.codexRestoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+        options.codexRestoreGuard.noteDispatch?.();
+      }
       const session: MuxSession = {
         sessionId,
         muxName,
         pid: 99999,
+        recoveryCodexHome,
+        recoveryIsolated: localCodex && codexConfig?.noDaemon === true,
         createdAt: Date.now(),
         workingDir,
         remote,
@@ -2193,6 +2216,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const config = niceConfig || DEFAULT_NICE_CONFIG;
     const cmd = wrapWithNice(baseCmd, config);
 
+    let createdRestoreShell = false;
+    let launchedRestoreWorker = false;
     try {
       // Build the full command to run inside tmux
       const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
@@ -2220,15 +2245,22 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // global option can resize (and when lowered, trim) unrelated live panes.
       const safeHistoryLimit =
         Number.isSafeInteger(historyLimit) && historyLimit > 0 ? Math.trunc(historyLimit) : DEFAULT_TMUX_HISTORY_LIMIT;
+      // Multi-argument argv bypasses a user's default-command and starts only this known inert process.
+      const restorePlaceholder = options.codexRestoreGuard ? ' /bin/sleep 86400' : '';
       const createSessionCommand = this.supportsLiveHistoryResize()
-        ? `${this.tmux()} new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`
-        : `${this.tmux()} set-option -g history-limit ${safeHistoryLimit} \\; new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`;
+        ? `${this.tmux()} new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}${restorePlaceholder} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`
+        : `${this.tmux()} set-option -g history-limit ${safeHistoryLimit} \\; new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}${restorePlaceholder} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`;
+      if (options.codexRestoreGuard) {
+        await options.codexRestoreGuard.prepare();
+        if (options.codexRestoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+      }
       execSync(createSessionCommand, {
         cwd: TMUX_LAUNCH_CWD,
         timeout: EXEC_TIMEOUT_MS,
         stdio: 'ignore',
         env: cleanEnv,
       });
+      createdRestoreShell = !!options.codexRestoreGuard;
       this.resizeWindow(muxName, 120, 40);
 
       // Set remain-on-exit now that the server is running — must be before respawn-pane
@@ -2254,10 +2286,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Apply user-supplied env overrides (e.g., CLAUDE_CODE_EFFORT_LEVEL) via tmux setenv
       // so secret values stay off the bash command line. Must run before respawn-pane.
       this.applyEnvOverrides(muxName, envOverrides);
+      if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
 
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      if (options.codexRestoreGuard) {
+        await options.codexRestoreGuard.prepare();
+        if (options.codexRestoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+      }
+      // Dispatch can start a worker before a timeout/exception is returned. Seal before sending bytes.
+      launchedRestoreWorker = !!options.codexRestoreGuard;
+      options.codexRestoreGuard?.noteDispatch?.();
       execSync(
         `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
         {
@@ -2319,6 +2359,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         sessionId,
         muxName,
         pid,
+        recoveryCodexHome,
         recoveryIsolated:
           !remote &&
           !docker &&
@@ -2340,6 +2381,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       return session;
     } catch (err) {
+      if (createdRestoreShell && !launchedRestoreWorker) {
+        // Only the new-session command above established this ownership. An existing pane is never targeted.
+        try {
+          execSync(`${this.tmux()} kill-session -t "${muxName}"`, { timeout: EXEC_TIMEOUT_MS, stdio: 'ignore' });
+        } catch {
+          /* Preserve the launch refusal even when cleanup of its empty shell fails. */
+        }
+      }
       throw new Error(`Failed to create tmux session: ${getErrorMessage(err)}`);
     }
   }
@@ -2448,6 +2497,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const session = this.sessions.get(sessionId);
     if (!session) return null;
     const muxName = session.muxName;
+    const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
+    const recoveryCodexHome = localCodex
+      ? normalizedCodexHome(
+          options.onlyIfDead
+            ? (options.recoveryCodexHome ?? session.recoveryCodexHome)
+            : (envOverrides?.CODEX_HOME ??
+                options.recoveryCodexHome ??
+                session.recoveryCodexHome ??
+                currentLocalCodexHome())
+        )
+      : undefined;
+    // Recovery cannot turn current server defaults into provenance for an old pane.
+    if (options.onlyIfDead && localCodex && !recoveryCodexHome) return null;
 
     if (!isValidMuxName(muxName) || !isValidPath(workingDir)) return null;
 
@@ -2505,6 +2567,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Re-apply user env overrides before respawn so the new shell inherits them,
       // dropping the ones the caller retired first (see applyEnvOverrides).
       this.applyEnvOverrides(muxName, envOverrides, unsetEnvKeys);
+      if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
 
       // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
@@ -2524,6 +2587,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const pid = this.getPanePid(muxName);
       if (pid) {
         session.pid = pid;
+        session.recoveryCodexHome = recoveryCodexHome;
         session.recoveryIsolated =
           !remote &&
           !docker &&

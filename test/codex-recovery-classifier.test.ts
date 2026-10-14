@@ -313,7 +313,7 @@ describe('approval, authentication and usage require attention', () => {
           context()
         )
       ).toMatchObject({
-        activity: 'working',
+        activity: 'unknown',
         safeToAct: false,
       });
     }
@@ -439,4 +439,78 @@ describe('unknown, corrupt and incomplete observations', () => {
     const error = { codex_error_info: { response_stream_disconnected: { http_status_code: null } } };
     expect(classifyCodexTail(tail(start(), complete(error)), context()).safeToAct).toBe(false);
   });
+});
+
+describe('error variant shape is required for recovery authority', () => {
+  it.each([
+    7,
+    ['response_stream_disconnected'],
+    { response_stream_disconnected: { http_status_code: null }, unauthorized: null },
+    { response_stream_disconnected: null },
+    { response_stream_disconnected: { http_status_code: '503' } },
+    { response_stream_disconnected: { http_status_code: -1 } },
+    { response_stream_disconnected: { http_status_code: 65536 } },
+    { response_stream_disconnected: { http_status_code: 503, unknown: true } },
+    'response_stream_disconnected',
+    'unknown_variant',
+  ])('refuses malformed/unsupported error info %j even with interruption prose', (codex_error_info) => {
+    expect(
+      classifyCodexTail(tail(start(), complete({ message: 'Conversation interrupted.', codex_error_info })), context())
+    ).toMatchObject({ safeToAct: false });
+  });
+
+  it('refuses simultaneous conflicting error-info aliases', () => {
+    expect(
+      classifyCodexTail(
+        tail(
+          start(),
+          complete({ message: 'Conversation interrupted.', codex_error_info: null, codexErrorInfo: 'Unauthorized' })
+        ),
+        context()
+      ).safeToAct
+    ).toBe(false);
+  });
+
+  it.each(['response_stream_disconnected', 'response_stream_connection_failed', 'response_too_many_failed_attempts'])(
+    'allows the supported %s struct with an optional bounded status',
+    (kind) => {
+      for (const details of [{}, { http_status_code: null }, { http_status_code: 503 }]) {
+        expect(
+          classifyCodexTail(
+            tail(start(), complete({ message: 'Sanitized stream failure.', codex_error_info: { [kind]: details } })),
+            context()
+          )
+        ).toMatchObject({ activity: 'interrupted', safeToAct: true });
+      }
+    }
+  );
+});
+
+describe('fresh uncertain control errors supersede failed-turn evidence', () => {
+  it.each(['thread_rollback_failed', { active_turn_not_steerable: { turn_kind: 'review' } }])(
+    'invalidates a previous recoverable failure for %j',
+    (codex_error_info) => {
+      expect(
+        classifyCodexTail(
+          tail(
+            start(),
+            { type: 'error', message: 'Conversation interrupted.', codex_error_info: null },
+            { type: 'error', message: 'Sanitized control failure.', codex_error_info }
+          ),
+          context()
+        )
+      ).toMatchObject({ activity: 'unknown', safeToAct: false });
+      expect(
+        classifyCodexTail(
+          tail(
+            start(),
+            { type: 'error', message: 'Conversation interrupted.', codex_error_info: null },
+            { type: 'error', message: 'Sanitized control failure.', codex_error_info },
+            complete()
+          ),
+          context()
+        )
+      ).toMatchObject({ activity: 'completed', safeToAct: false });
+    }
+  );
 });

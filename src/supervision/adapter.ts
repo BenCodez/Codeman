@@ -1,11 +1,17 @@
 /** @fileoverview Same-owner attributed task observations and guarded delivery. */
 import type { Session } from '../session.js';
 import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
-import { resolveCodexIdentity } from '../recovery/codex-identity.js';
 import { successfulCommands, latestProgressMarker } from './evidence.js';
 import type { TaskObservation } from './controller.js';
 export class CodexTaskAdapter {
   private readonly recovery: CodexRecoveryAdapter;
+  private continuationProof?: {
+    generation: number;
+    conversationId: string;
+    turnId: string;
+    submissionKey?: string;
+    markerKey?: string;
+  };
   constructor(
     private readonly session: Session,
     persist: () => void
@@ -13,29 +19,36 @@ export class CodexTaskAdapter {
     this.recovery = new CodexRecoveryAdapter(session, persist);
   }
   async observe(): Promise<TaskObservation> {
-    const observation = await this.recovery.observe();
+    this.continuationProof = undefined;
     const context = this.session.getRecoveryContext();
+    const observation = await this.recovery.observe();
     if (!observation.conversationId || ['unknown', 'blocked', 'paused'].includes(observation.activity))
       return { observation, commands: new Map() };
-    const identity = await resolveCodexIdentity({
-      sessionId: this.session.id,
-      workingDir: this.session.workingDir,
-      codexHome: context.codexHome,
-      noDaemon: context.noDaemon,
-      resumeId: observation.conversationId,
-      submission: context.submission,
-    });
-    if (
-      identity.reason !== 'verified' ||
-      identity.conversationId !== observation.conversationId ||
-      context.generation !== this.session.getRecoveryContext().generation
-    )
+    const tail = this.recovery.getVerifiedTail(observation.conversationId);
+    if (tail === undefined || context.generation !== this.session.getRecoveryContext().generation)
       return { observation: { ...observation, activity: 'unknown', safeToAct: false }, commands: new Map() };
-    return {
-      observation,
-      commands: successfulCommands(identity.tail ?? '', 0, Date.now()),
-      marker: latestProgressMarker(identity.tail ?? '', 0, Date.now()),
-    };
+    const now = Date.now();
+    return this.recordObservation(
+      {
+        observation,
+        commands: successfulCommands(tail, 0, now),
+        marker: latestProgressMarker(tail, 0, now),
+      },
+      context.generation
+    );
+  }
+  private recordObservation(result: TaskObservation, generation: number): TaskObservation {
+    const { observation } = result;
+    if (observation.activity === 'completed' && observation.conversationId && observation.turnId) {
+      this.continuationProof = {
+        generation,
+        conversationId: observation.conversationId,
+        turnId: observation.turnId,
+        submissionKey: observation.submissionKey,
+        markerKey: result.marker?.key,
+      };
+    }
+    return result;
   }
   async recover(
     observation: import('../recovery/types.js').RecoveryObservation,
@@ -62,21 +75,31 @@ export class CodexTaskAdapter {
     isCurrent: () => boolean
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.session.getRecoveryContext();
-    const { observation: o } = await this.observe();
+    const proof = this.continuationProof;
+    const kickoff = key.startsWith(`${conversationId}:task-start:`);
+    const { observation: o, marker } = await this.observe();
     if (
       !isCurrent() ||
       context.generation !== this.session.getRecoveryContext().generation ||
       o.conversationId !== conversationId ||
-      !['completed', ...(key.startsWith(`${conversationId}:task-start:`) ? ['idle'] : [])].includes(o.activity) ||
+      !['completed', ...(kickoff ? ['idle'] : [])].includes(o.activity) ||
       !o.processReady ||
-      (!key.startsWith(`${conversationId}:task-start:`) && key !== `${conversationId}:task:${o.turnId}`)
+      (!kickoff &&
+        (!proof ||
+          proof.generation !== context.generation ||
+          proof.conversationId !== conversationId ||
+          proof.turnId !== o.turnId ||
+          proof.submissionKey !== o.submissionKey ||
+          proof.markerKey !== marker?.key ||
+          key !== `${conversationId}:task:${o.turnId}`))
     )
       return 'not-sent';
     return this.session.deliverRecovery(
       { key, conversationId, action: 'continue', startedAt: Date.now() },
       context.generation,
       isCurrent,
-      prompt
+      prompt,
+      () => this.recovery.confirmLocalEvidence(conversationId, context.generation)
     );
   }
 }

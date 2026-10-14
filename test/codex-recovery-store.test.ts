@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import { initialRecoveryState, type RecoveryState } from '../src/recovery/types.js';
-import { safeRmHomeTree } from './mocks/index.js';
+import { safeRmHomeTree, createDeferred } from './mocks/index.js';
 
 const NOW = Date.UTC(2026, 9, 13, 12);
 const THREAD = '11111111-2222-3333-4444-555555555555';
@@ -376,4 +376,41 @@ describe('corrupt journals fail closed', () => {
     expect(store.loadFailed).toBe(true);
     expect(store.get('work').config.enabled).toBe(false);
   });
+});
+
+it('does not acknowledge a recovery reservation until its directory rename is synced', async () => {
+  const entered = createDeferred<void>();
+  const release = createDeferred<void>();
+  const probe = await fs.open(join(root, 'handle-probe'), 'w');
+  const prototype = Object.getPrototypeOf(probe);
+  await probe.close();
+  const originalSync = prototype.sync;
+  const synced = vi.spyOn(prototype, 'sync').mockImplementation(async function (this: typeof probe) {
+    if ((await this.stat()).isDirectory()) {
+      entered.resolve();
+      await release.promise;
+    }
+    await originalSync.call(this);
+  });
+  try {
+    const store = new RecoveryStore(path);
+    let acknowledged = false;
+    const state = savedState({
+      inFlight: { key: 'durable-flight', action: 'restart', conversationId: THREAD, startedAt: NOW },
+      attempts: 1,
+    });
+    const saving = store.save('owned-session', state).then(() => {
+      acknowledged = true;
+    });
+    await entered.promise;
+    expect(acknowledged).toBe(false);
+    expect(store.get('owned-session').inFlight).toBeUndefined();
+    release.resolve();
+    await saving;
+    expect(acknowledged).toBe(true);
+    expect(new RecoveryStore(path).get('owned-session').inFlight).toEqual(state.inFlight);
+  } finally {
+    release.resolve();
+    synced.mockRestore();
+  }
 });
