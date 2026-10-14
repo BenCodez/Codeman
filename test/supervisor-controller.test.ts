@@ -12,6 +12,9 @@ import { RecoveryController } from '../src/recovery/controller.js';
 import { initialRecoveryState, type RecoveryObservation } from '../src/recovery/types.js';
 import { buildSupervisorManagerTask, SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from '../src/supervisor/manager-task.js';
 import { SupervisorConfigSchema } from '../src/supervisor/schema.js';
+import { SupervisorStore } from '../src/supervisor/store.js';
+import { dataPath } from '../src/config/instance.js';
+import { readFileSync } from 'node:fs';
 
 const SUPERVISOR = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
@@ -71,6 +74,62 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
 }
 
 describe('SupervisorController', () => {
+  it.each(['assign', 'retry'] as const)(
+    'acknowledges a durably accepted %s after reload without active workers or new effects',
+    async (action) => {
+      const path = dataPath(`supervisor-accepted-${action}.json`);
+      const store = new SupervisorStore(path);
+      const h = harness({ persist: (state) => store.save(SUPERVISOR, state) });
+      await h.controller.configure(config);
+      await h.controller.start();
+      h.recoveryState.activity = 'crashed';
+      vi.mocked(h.worker.recovery.retry).mockResolvedValue({
+        ...h.recoveryState,
+        phase: 'recovering',
+        lastReason: 'process-resumed',
+        inFlight: { key: 'accepted-retry', action: 'restart', conversationId: WORKER, startedAt: 10_000 },
+      });
+      const requestId = `request-durable-${action}`;
+      await h.controller[action](WORKER, requestId);
+      const bytes = readFileSync(path, 'utf8');
+      const persisted = new SupervisorStore(path).get(SUPERVISOR);
+      const worker = vi.fn(() => undefined);
+      const persist = vi.fn(async () => {});
+      const restarted = new SupervisorController(
+        { ...h.deps, worker, persist, now: () => 1_000_000 },
+        SUPERVISOR,
+        persisted
+      );
+      expect(restarted.getStatus().phase).toBe('paused');
+      const accepted = await restarted[action](WORKER, requestId);
+      expect(accepted).toMatchObject({ phase: 'paused', handledRequestIds: [requestId] });
+      expect(accepted.workers[0].assignments).toBe(1);
+      await expect(restarted[action](SUPERVISOR, requestId)).rejects.toThrow(/different operation/);
+      await expect(restarted[action === 'assign' ? 'retry' : 'assign'](WORKER, requestId)).rejects.toThrow(
+        /different operation/
+      );
+      await expect(restarted[action](WORKER, 'request-new-after-reload')).rejects.toThrow(/not active/);
+      expect(worker).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).toHaveBeenCalledTimes(action === 'assign' ? 1 : 0);
+      expect(h.worker.recovery.retry).toHaveBeenCalledTimes(action === 'retry' ? 1 : 0);
+      expect(readFileSync(path, 'utf8')).toBe(bytes);
+    }
+  );
+
+  it('acknowledges an accepted request queued before a newer owner pause without replaying it', async () => {
+    const h = harness();
+    await h.controller.configure(config);
+    await h.controller.start();
+    await h.controller.assign(WORKER, 'request-before-pause');
+    const duplicate = h.controller.assign(WORKER, 'request-before-pause');
+    const pause = h.controller.pause();
+    await expect(duplicate).resolves.toMatchObject({ handledRequestIds: ['request-before-pause'] });
+    await pause;
+    expect(h.controller.getStatus().phase).toBe('paused');
+    expect(h.worker.task.resume).toHaveBeenCalledOnce();
+  });
+
   it('starts the real manager task, then assigns the exact owner-configured worker task once per durable request', async () => {
     const h = harness();
     await h.controller.configure(config);

@@ -60,28 +60,7 @@ export class SupervisorStore {
     const result = this.writes.then(async () => {
       const next = { ...this.records, [id]: copy };
       if (Object.keys(next).length > 100) throw new Error('Supervisor journal is over capacity');
-      const serialized = JSON.stringify({ version: 1, supervisors: next });
-      if (Buffer.byteLength(serialized) > MAX_BYTES) throw new Error('Supervisor journal is over byte capacity');
-      await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
-      const temp = `${this.path}.${randomUUID()}.tmp`;
-      try {
-        const handle = await open(temp, 'wx', 0o600);
-        try {
-          await handle.writeFile(serialized);
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        await rename(temp, this.path);
-        const dir = await open(dirname(this.path), 'r');
-        try {
-          await dir.sync();
-        } finally {
-          await dir.close();
-        }
-      } finally {
-        await unlink(temp).catch(() => {});
-      }
+      await this.write(next);
       this.records = next;
     });
     this.writes = result.catch(() => {});
@@ -94,31 +73,57 @@ export class SupervisorStore {
       if (!this.records[id]) return;
       const next = { ...this.records };
       delete next[id];
-      const serialized = JSON.stringify({ version: 1, supervisors: next });
-      await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
-      const temp = `${this.path}.${randomUUID()}.tmp`;
-      try {
-        const handle = await open(temp, 'wx', 0o600);
-        try {
-          await handle.writeFile(serialized);
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        await rename(temp, this.path);
-        const dir = await open(dirname(this.path), 'r');
-        try {
-          await dir.sync();
-        } finally {
-          await dir.close();
-        }
-      } finally {
-        await unlink(temp).catch(() => {});
-      }
+      await this.write(next);
       this.records = next;
     });
     this.writes = result.catch(() => {});
     return result;
+  }
+
+  /** Retire only unreachable settled manager records; uncertain operations retain their binding. */
+  pruneOrphans(keep: (id: string) => boolean): Promise<number> {
+    if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
+    const result = this.writes.then(async () => {
+      const next = { ...this.records };
+      let removed = 0;
+      for (const [id, state] of Object.entries(next)) {
+        if (keep(id) || state.inFlight) continue;
+        delete next[id];
+        removed++;
+      }
+      if (removed) {
+        await this.write(next);
+        this.records = next;
+      }
+      return removed;
+    });
+    this.writes = result.catch(() => {});
+    return result;
+  }
+
+  private async write(next: Record<string, SupervisorState>): Promise<void> {
+    const serialized = JSON.stringify({ version: 1, supervisors: next });
+    if (Buffer.byteLength(serialized) > MAX_BYTES) throw new Error('Supervisor journal is over byte capacity');
+    await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
+    const temp = `${this.path}.${randomUUID()}.tmp`;
+    try {
+      const handle = await open(temp, 'wx', 0o600);
+      try {
+        await handle.writeFile(serialized);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      await rename(temp, this.path);
+      const dir = await open(dirname(this.path), 'r');
+      try {
+        await dir.sync();
+      } finally {
+        await dir.close();
+      }
+    } finally {
+      await unlink(temp).catch(() => {});
+    }
   }
 
   async flush(): Promise<void> {

@@ -160,7 +160,7 @@ import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
 import { TaskController } from '../supervision/controller.js';
-import { TaskStore } from '../supervision/store.js';
+import { TaskStore, taskJournalHasOwnership } from '../supervision/store.js';
 import { initialTaskState } from '../supervision/schema.js';
 import { CodexTaskAdapter } from '../supervision/adapter.js';
 import { SessionActionArbiter } from '../supervision/action-arbiter.js';
@@ -2453,6 +2453,7 @@ export class WebServer extends EventEmitter {
   private getSupervisorController(session: Session): SupervisorController | undefined {
     if (
       this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
       this.sessions.get(session.id) !== session ||
       getCli(session.mode)?.capabilities.recovery !== 'codex-rollout' ||
       session.remote ||
@@ -2546,6 +2547,7 @@ export class WebServer extends EventEmitter {
   private getTaskController(session: Session): TaskController | undefined {
     if (
       this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
       this.sessions.get(session.id) !== session ||
       getCli(session.mode)?.capabilities.recovery !== 'codex-rollout'
     )
@@ -2587,6 +2589,7 @@ export class WebServer extends EventEmitter {
   private getRecoveryController(session: Session): RecoveryController | undefined {
     if (
       this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
       this.sessions.get(session.id) !== session ||
       getCli(session.mode)?.capabilities.recovery !== 'codex-rollout'
     )
@@ -2678,49 +2681,42 @@ export class WebServer extends EventEmitter {
     const ownsSupervisorState =
       !!supervisor ||
       (supervisorMode !== undefined && getCli(supervisorMode)?.capabilities.recovery === 'codex-rollout');
-    if (supervisor) {
-      supervisor.stop();
-      await supervisor.drain();
-      this.supervisorControllers.delete(id);
-    }
-    if (drop && ownsSupervisorState) await this.supervisorStore.drop(id);
     const task = this.taskControllers.get(id);
     const taskInput = this.taskInputListeners.get(id);
+    const controller = this.recoveryControllers.get(id);
+    const listener = this.recoveryInputListeners.get(id);
+    const identityListener = this.rebootIdentityListeners.get(id);
     const taskMode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
     const ownsTaskState =
       !!task ||
       !!taskInput ||
       this.actionArbiters.has(id) ||
       (taskMode !== undefined && getCli(taskMode)?.capabilities.recovery === 'codex-rollout');
-    if (taskInput) this.sessions.get(id)?.off('recoveryUserInput', taskInput);
-    this.taskInputListeners.delete(id);
-    if (task) {
-      task.stop();
-      await task.drain();
-      this.taskControllers.delete(id);
-    }
-    this.actionArbiters.delete(id);
-    if (drop && ownsTaskState) {
-      await this.taskStore.drop(id);
-      await this.actionReservationStore.drop(id);
-    }
-    const controller = this.recoveryControllers.get(id);
-    const listener = this.recoveryInputListeners.get(id);
-    const identityListener = this.rebootIdentityListeners.get(id);
-    const mode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
     const ownsRecoveryState =
       !!controller ||
       !!listener ||
       !!identityListener ||
-      (mode !== undefined && getCli(mode)?.capabilities.recovery === 'codex-rollout');
+      (taskMode !== undefined && getCli(taskMode)?.capabilities.recovery === 'codex-rollout');
+    if (taskInput) this.sessions.get(id)?.off('recoveryUserInput', taskInput);
     if (listener) this.sessions.get(id)?.off('recoveryUserInput', listener);
     if (identityListener) this.sessions.get(id)?.off('recoveryIdentityChanged', identityListener);
+    this.taskInputListeners.delete(id);
     this.rebootIdentityListeners.delete(id);
     this.recoveryInputListeners.delete(id);
-    if (controller) {
-      controller.stop();
-      await controller.drain();
-      this.recoveryControllers.delete(id);
+    // Worker and manager controllers may still be writing shared ownership.
+    // Revoke all synchronously, then finish every receipt before deletion.
+    supervisor?.stop();
+    task?.stop();
+    controller?.stop();
+    await Promise.all([supervisor?.drain(), task?.drain(), controller?.drain()]);
+    if (supervisor) this.supervisorControllers.delete(id);
+    if (task) this.taskControllers.delete(id);
+    if (controller) this.recoveryControllers.delete(id);
+    this.actionArbiters.delete(id);
+    if (drop && ownsSupervisorState) await this.supervisorStore.drop(id);
+    if (drop && ownsTaskState) {
+      await this.taskStore.drop(id);
+      await this.actionReservationStore.drop(id);
     }
     if (drop && ownsRecoveryState) await this.recoveryStore.drop(id);
   }
@@ -2777,11 +2773,74 @@ export class WebServer extends EventEmitter {
     const result = await this.tabLayouts.runStaleSessionCleanup(activeSessionIds, (ids) =>
       this.store.cleanupSessionsByIds(ids)
     );
+    // Prior boots may already have removed state.json rows. Prune the whole
+    // readable journal, retaining live/history/restore owners and reservations.
+    // This optional domain must not block unrelated state/layout cleanup.
+    for (const [name, journal] of [
+      ['Recovery', this.recoveryStore],
+      ['Task', this.taskStore],
+      ['Shared action', this.actionReservationStore],
+      ['Supervisor', this.supervisorStore],
+    ] as const) {
+      try {
+        await journal.pruneOrphans((id) => this.codexJournalHasOwner(id));
+      } catch (err) {
+        console.warn(`[Server] ${name} journal cleanup failed: ${getErrorMessage(err)}`);
+      }
+    }
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
     }
     return result.count;
+  }
+
+  private codexJournalHasOwner(id: string): boolean {
+    // Unknown sibling journals cannot establish that an action has no owner.
+    if (
+      this.recoveryStore.loadFailed ||
+      this.taskStore.loadFailed ||
+      this.actionReservationStore.loadFailed ||
+      this.supervisorStore.loadFailed
+    )
+      return true;
+    const recovery = this.recoveryStore.get(id);
+    return (
+      this.sessions.has(id) ||
+      this.store.getSession(id) !== null ||
+      this.recoveryControllers.has(id) ||
+      this.taskControllers.has(id) ||
+      this.actionArbiters.has(id) ||
+      this.supervisorControllers.has(id) ||
+      rebootRestoreRegistry.hasOutstanding(id) ||
+      !!recovery.inFlight ||
+      !!recovery.pending ||
+      recovery.nextRetryAt !== undefined ||
+      taskJournalHasOwnership(this.taskStore.get(id)) ||
+      taskJournalHasOwnership(this.actionReservationStore.get(id)) ||
+      this.supervisorJournalHasOwner(id)
+    );
+  }
+
+  private supervisorJournalHasOwner(id: string): boolean {
+    const states = [
+      ...this.supervisorStore.all(),
+      ...[...this.supervisorControllers.values()].map((controller) => controller.getStatus()),
+    ];
+    return states.some((state) => {
+      const manager = state.supervisorSessionId;
+      const reachable =
+        this.sessions.has(manager) ||
+        this.store.getSession(manager) !== null ||
+        this.supervisorControllers.has(manager) ||
+        rebootRestoreRegistry.hasOutstanding(manager);
+      // An unreachable settled manager cannot hold a lease forever. An unresolved
+      // operation still owns its manager and exact worker without any live pane.
+      return (
+        ((state.enabled && reachable) || !!state.inFlight) &&
+        (manager === id || state.inFlight?.workerId === id || state.workers.some((worker) => worker.sessionId === id))
+      );
+    });
   }
 
   /**
@@ -3822,8 +3881,20 @@ export class WebServer extends EventEmitter {
     // arrive after another path has replaced that map entry, so only unwind the
     // exact tentative instance the caller owns.
     if (!session || (expectedSession && session !== expectedSession)) return;
-    await this.stopRecoveryController(sessionId, false);
-    this.sessions.delete(sessionId);
+    const ownsCleanupFence = !this.cleaningUp.has(sessionId);
+    this.cleaningUp.add(sessionId);
+    session.markClosing(true);
+    try {
+      await this.stopRecoveryController(sessionId, false);
+      if (this.sessions.get(sessionId) !== session) return;
+      this.sessions.delete(sessionId);
+    } finally {
+      if (ownsCleanupFence) {
+        this.cleaningUp.delete(sessionId);
+        // A failed drain leaves the tentative session registered and retryable.
+        if (this.sessions.get(sessionId) === session) session.markClosing(false);
+      }
+    }
 
     // --- the inverse of setupSessionListeners(), in reverse order ---
     // Listeners first: while they are attached, one of them can still reach a
@@ -4396,10 +4467,14 @@ export class WebServer extends EventEmitter {
   async stop(): Promise<void> {
     this.recoveryStopping = true;
     for (const controller of this.supervisorControllers.values()) controller.stop();
-    await Promise.all([...this.supervisorControllers.values()].map((controller) => controller.drain()));
-    this.supervisorControllers.clear();
     for (const controller of this.recoveryControllers.values()) controller.stop();
-    await Promise.all([...this.recoveryControllers.keys()].map((id) => this.stopRecoveryController(id, false)));
+    for (const controller of this.taskControllers.values()) controller.stop();
+    const automationIds = new Set([
+      ...this.supervisorControllers.keys(),
+      ...this.recoveryControllers.keys(),
+      ...this.taskControllers.keys(),
+    ]);
+    await Promise.all([...automationIds].map((id) => this.stopRecoveryController(id, false)));
     await this.recoveryStore.flush();
     await this.taskStore.flush();
     await this.actionReservationStore.flush();

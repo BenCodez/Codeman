@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { registerSupervisorRoutes } from '../../src/web/routes/supervisor-routes.js';
-import { initialSupervisorState } from '../../src/supervisor/schema.js';
+import { initialSupervisorState, type SupervisorState } from '../../src/supervisor/schema.js';
 import {
   SupervisorController,
   SupervisorValidationError,
@@ -27,7 +27,7 @@ describe('supervisor routes', () => {
       },
     ],
   };
-  const actualController = (overrides: Partial<SupervisorDependencies> = {}) =>
+  const actualController = (overrides: Partial<SupervisorDependencies> = {}, restored?: SupervisorState) =>
     new SupervisorController(
       {
         validateWorkers: () => {},
@@ -41,7 +41,8 @@ describe('supervisor routes', () => {
         changed: () => {},
         ...overrides,
       },
-      h.ctx._sessionId
+      h.ctx._sessionId,
+      restored
     );
   beforeEach(async () => {
     vi.stubEnv('CODEMAN_MULTIUSER', '1');
@@ -188,6 +189,47 @@ describe('supervisor routes', () => {
       handledRequestIds: [],
     });
     expect((await h.app.inject(request)).statusCode).toBe(400);
+    expect(resume).toHaveBeenCalledOnce();
+  });
+
+  it('recovers an accepted response after reload while preserving owner, attribution and operation binding', async () => {
+    const task = initialTaskState();
+    const resume = vi.fn(async () => ({ ...task, phase: 'watching' as const, reason: 'kickoff-sent' }));
+    controller = actualController({
+      worker: () => ({
+        task: { getStatus: () => task, update: async () => task, resume },
+        recovery: {
+          getStatus: initialRecoveryState,
+          inspect: async () => initialRecoveryState(),
+          retry: async () => initialRecoveryState(),
+        },
+      }),
+    });
+    await controller.configure(config);
+    await controller.start();
+    const request = {
+      method: 'POST' as const,
+      url: `/api/sessions/${h.ctx._sessionId}/supervisor/workers/${workerId}/assign`,
+      headers: { 'x-codeman-supervisor-session': h.ctx._sessionId },
+      payload: { requestId: 'request-accepted-reload' },
+    };
+    expect((await h.app.inject(request)).statusCode).toBe(200);
+    const accepted = controller.getStatus();
+    controller.stop();
+    const lookup = vi.fn(() => undefined);
+    controller = actualController({ worker: lookup }, accepted);
+    const duplicate = await h.app.inject(request);
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json().data).toMatchObject({ phase: 'paused', handledRequestIds: ['request-accepted-reload'] });
+    expect((await h.app.inject({ ...request, payload: { requestId: 'request-fresh-reload' } })).statusCode).toBe(400);
+    expect((await h.app.inject({ ...request, url: request.url.replace('/assign', '/retry') })).statusCode).toBe(400);
+    expect((await h.app.inject({ ...request, url: request.url.replace(workerId, h.ctx._sessionId) })).statusCode).toBe(
+      400
+    );
+    expect((await h.app.inject({ ...request, headers: {} })).statusCode).toBe(403);
+    Object.assign(h.ctx._session, { owner: 'bob' });
+    expect((await h.app.inject(request)).statusCode).toBe(404);
+    expect(lookup).not.toHaveBeenCalled();
     expect(resume).toHaveBeenCalledOnce();
   });
 

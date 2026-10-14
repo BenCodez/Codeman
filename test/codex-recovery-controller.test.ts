@@ -596,6 +596,211 @@ describe('recovery action authority', () => {
     expect(f.act).not.toHaveBeenCalled();
   });
 
+  it.each(['inspect', 'refresh'] as const)(
+    'clears accepted stall restart attention through %s and requires a full fresh quiet interval before warning again',
+    async (acceptanceRead) => {
+      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      f.observation = stalled('accepted-stall-warning');
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      const originalAlerts = f.controller.getStatus().history.filter((event) => event.kind === 'attention').length;
+      expect(f.controller.getStatus().stallAlert).toBeDefined();
+      f.observation.stallRestartable = true;
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.act).toHaveBeenCalledOnce();
+      expect(f.controller.getStatus().inFlight).toBeDefined();
+      f.observation = { ...stalled('accepted-stall-warning'), processReady: true };
+      await f.controller[acceptanceRead]();
+      const acceptedAt = Date.now();
+      expect(f.controller.getStatus()).toMatchObject({
+        needsAttention: false,
+        phase: 'watching',
+        lastSuccessfulRecovery: acceptedAt,
+      });
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      expect(f.controller.getStatus().inFlight).toBeUndefined();
+      f.controller.stop();
+      const restarted = fixture(f.journal.at(-1)!);
+      restarted.observation = structuredClone(f.observation);
+      for (const offset of [1, 2001, 9999]) {
+        vi.setSystemTime(acceptedAt + offset);
+        await restarted.controller.inspect();
+        await restarted.controller.refresh();
+        expect(restarted.controller.getStatus()).toMatchObject({ needsAttention: false, phase: 'watching' });
+        expect(restarted.controller.getStatus().stallAlert).toBeUndefined();
+        expect(restarted.controller.getStatus().history.filter((event) => event.kind === 'attention')).toHaveLength(
+          originalAlerts
+        );
+      }
+      vi.setSystemTime(acceptedAt + 10_000);
+      await restarted.controller.refresh();
+      expect(restarted.controller.getStatus().needsAttention).toBe(false);
+      advance(1999);
+      await restarted.controller.refresh();
+      expect(restarted.controller.getStatus().needsAttention).toBe(false);
+      advance(1);
+      await restarted.controller.refresh();
+      expect(restarted.controller.getStatus()).toMatchObject({
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+        stallAlert: { key: 'accepted-stall-warning', conversationId: THREAD, progressAt: acceptedAt },
+      });
+      expect(restarted.controller.getStatus().history.filter((event) => event.kind === 'attention')).toHaveLength(
+        originalAlerts + 1
+      );
+      expect(restarted.act).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['observing', 'disabled'] as const)(
+    'migrates the latest unresolved parent stall attention after settings changed lastReason to %s',
+    async (lastReason) => {
+      const f = fixture(
+        enabledState(
+          {
+            conversationId: THREAD,
+            phase: lastReason === 'disabled' ? 'idle' : 'paused',
+            needsAttention: true,
+            lastReason,
+            history: [
+              { at: NOW - 1, kind: 'attention', reason: 'stalled', attempt: 0 },
+              { at: NOW, kind: 'state', reason: lastReason, attempt: 0 },
+            ],
+          },
+          { enabled: lastReason !== 'disabled', detectStalls: true, stalledAfterMs: 10_000 }
+        )
+      );
+      f.observation = stalled('settings-parent-warning');
+      await f.controller.inspect();
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({ needsAttention: true, lastReason: 'stall-unverified' });
+      expect(f.controller.getStatus().stallAlert).toBeDefined();
+      expect(f.controller.getStatus().history.filter((event) => event.kind === 'attention')).toHaveLength(1);
+      f.observation.progressAt = NOW + 1;
+      advance(1);
+      await f.controller.inspect();
+      expect(f.controller.getStatus().needsAttention).toBe(false);
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['sent', 'unknown', 'not-sent'] as const)(
+    'does not grant a new quiet baseline or lose warning ownership for an unaccepted %s restart',
+    async (outcome) => {
+      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      f.observation = stalled('unaccepted-stall-warning');
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      f.observation.stallRestartable = true;
+      await f.controller.retry();
+      advance(2000);
+      f.outcome = outcome;
+      await f.controller.retry();
+      expect(f.act).toHaveBeenCalledOnce();
+      await f.controller.updateConfig({ enabled: false });
+      f.observation = { ...stalled('unaccepted-stall-warning'), processReady: false };
+      await f.controller.inspect();
+      await f.controller.refresh();
+      expect(f.controller.getStatus().lastSuccessfulRecovery).toBeUndefined();
+      if (outcome === 'sent') {
+        // Sending starts acceptance observation; it has not resolved the warning.
+        expect(f.controller.getStatus().stallAlert).toBeDefined();
+        advance(60_000);
+        await f.controller.inspect();
+        expect(f.controller.getStatus().lastReason).toBe('acceptance-unverified');
+      } else expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      expect(f.controller.getStatus().needsAttention).toBe(true);
+      expect(f.controller.getStatus().lastSuccessfulRecovery).toBeUndefined();
+      expect(!!f.controller.getStatus().inFlight).toBe(outcome !== 'not-sent');
+      expect(f.act).toHaveBeenCalledOnce();
+    }
+  );
+
+  it.each(['newer-attention', 'accepted', 'reset', 'user-input'] as const)(
+    'does not restore parent stall ownership after a newer %s event',
+    async (replacement) => {
+      const newer =
+        replacement === 'newer-attention'
+          ? { at: NOW, kind: 'attention' as const, reason: 'approval-required' as const, attempt: 0 }
+          : replacement === 'accepted'
+            ? { at: NOW, kind: 'accepted' as const, reason: 'recovery-accepted' as const, attempt: 1 }
+            : replacement === 'reset'
+              ? { at: NOW, kind: 'reset' as const, reason: 'manual-reset' as const, attempt: 0 }
+              : { at: NOW, kind: 'state' as const, reason: 'user-input' as const, attempt: 0 };
+      const f = fixture(
+        enabledState(
+          {
+            conversationId: THREAD,
+            needsAttention: true,
+            lastReason: 'observing',
+            history: [{ at: NOW - 1, kind: 'attention', reason: 'stalled', attempt: 0 }, newer],
+          },
+          { detectStalls: false }
+        )
+      );
+      f.observation = { ...stalled('superseded-parent-warning'), progressAt: NOW + 1 };
+      advance(1);
+      await f.controller.inspect();
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      expect(f.controller.getStatus().needsAttention).toBe(true);
+      expect(f.controller.getStatus().lastReason).toBe('turn-running');
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['approval-required', 'observing', 'disabled'] as const)(
+    'does not let a parent stall warning own a newer blocked warning after lastReason becomes %s',
+    async (lastReason) => {
+      const f = fixture(
+        enabledState(
+          {
+            conversationId: THREAD,
+            needsAttention: true,
+            phase: 'paused',
+            lastReason,
+            history: [
+              { at: NOW - 1, kind: 'attention', reason: 'stalled', attempt: 0 },
+              { at: NOW, kind: 'state', reason: 'approval-required', attempt: 0 },
+              ...(lastReason === 'approval-required'
+                ? []
+                : [{ at: NOW, kind: 'state' as const, reason: lastReason, attempt: 0 }]),
+            ],
+          },
+          { detectStalls: true }
+        )
+      );
+      f.observation = {
+        activity: 'blocked',
+        reason: 'approval-required',
+        at: NOW + 1,
+        progressAt: NOW + 1,
+        conversationId: THREAD,
+        safeToAct: false,
+      };
+      advance(1);
+      await f.controller.inspect();
+      expect(f.controller.getStatus()).toMatchObject({
+        needsAttention: true,
+        lastReason: 'approval-required',
+        phase: 'paused',
+      });
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({
+        needsAttention: true,
+        lastReason: 'approval-required',
+        phase: 'paused',
+      });
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      expect(f.act).not.toHaveBeenCalled();
+    }
+  );
+
   it('restarts stall confirmation when the current turn changes or user input intervenes', async () => {
     const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('turn-a');

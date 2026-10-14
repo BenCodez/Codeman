@@ -478,14 +478,14 @@ export class SupervisorController {
   ): Promise<SupervisorState> {
     const revision = this.revision;
     return this.enqueue(async () => {
-      if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
-      if (this.state.phase !== 'active') throw new SupervisorValidationError('Supervisor is not active');
       if (this.state.handledRequestIds.includes(requestId)) {
         const binding = this.state.handledRequestBindings.find((entry) => entry.requestId === requestId);
         if (!binding || binding.workerId !== workerId || binding.action !== action)
           throw new SupervisorValidationError('Supervisor request id is bound to a different operation');
         return this.getStatus();
       }
+      if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
+      if (this.state.phase !== 'active') throw new SupervisorValidationError('Supervisor is not active');
       if (this.state.handledRequestIds.length >= 128)
         throw new SupervisorValidationError('Supervisor request journal is full');
       if (this.state.inFlight)

@@ -55,15 +55,42 @@ export class RecoveryController {
     this.state = structuredClone(restored ?? initialRecoveryState());
     if (
       !this.state.stallAlert &&
-      ['stalled', 'stall-unverified'].includes(this.state.lastReason) &&
-      this.state.needsAttention
+      this.state.needsAttention &&
+      ['stalled', 'stall-unverified', 'observing', 'disabled'].includes(this.state.lastReason)
     ) {
-      const alert = [...this.state.history]
-        .reverse()
-        .find((event) => event.kind === 'attention' && event.reason === this.state.lastReason);
-      if (alert && this.state.conversationId) {
+      let alertIndex = this.state.history.length - 1;
+      while (alertIndex >= 0 && this.state.history[alertIndex].kind !== 'attention') alertIndex--;
+      const alert = this.state.history[alertIndex];
+      const released = this.state.history
+        .slice(alertIndex + 1)
+        .some(
+          (event) =>
+            event.kind === 'accepted' ||
+            event.kind === 'reset' ||
+            event.reason === 'user-input' ||
+            event.reason === 'user-interrupted' ||
+            event.reason === 'turn-completed' ||
+            (event.kind === 'state' &&
+              [
+                'approval-required',
+                'authentication-required',
+                'usage-limit',
+                'identity-unverified',
+                'identity-changed',
+                'managed-daemon',
+                'unsupported-location',
+                'transport-unreachable',
+                'transport-unavailable',
+                'remote-inspector-unavailable',
+                'remote-session-missing',
+                'unowned-session',
+                'pane-unverified',
+              ].includes(event.reason))
+        );
+      if (alert && ['stalled', 'stall-unverified'].includes(alert.reason) && !released && this.state.conversationId) {
         // Parent-version v1 journals called attention-only silence "stalled".
-        // Bind either legacy warning name to the next unchanged turn, never action proof.
+        // Settings can replace lastReason without releasing the latest warning.
+        // Bind its identity to the next unchanged turn, never action proof.
         this.legacyStallAlert = { conversationId: this.state.conversationId, at: alert.at };
       }
     }
@@ -366,8 +393,14 @@ export class RecoveryController {
       observation.reason === 'turn-running' &&
       !!observation.conversationId &&
       !!observation.stallEvidenceKey &&
-      this.now() - (observation.progressAt ?? observation.at) >= this.state.config.stalledAfterMs
+      this.now() - this.stallQuietSince(observation) >= this.state.config.stalledAfterMs
     );
+  }
+
+  private stallQuietSince(observation: RecoveryObservation): number {
+    // Old rollout progress cannot count as silence accumulated after an accepted
+    // recovery. Persist this baseline so a journal reload keeps the same interval.
+    return Math.max(observation.progressAt ?? observation.at, this.state.lastSuccessfulRecovery ?? 0);
   }
 
   /** Status reads may invalidate proof but never count as an action confirmation. */
@@ -437,6 +470,9 @@ export class RecoveryController {
       this.restoredFlight = false;
       this.flightObservationComplete = true;
       this.state.lastSuccessfulRecovery = this.now();
+      this.confirmation = undefined;
+      this.state.stallAlert = undefined;
+      this.legacyStallAlert = undefined;
       this.state.needsAttention = false;
       this.state.phase = 'watching';
       this.event('accepted', 'recovery-accepted');
@@ -469,7 +505,7 @@ export class RecoveryController {
     }
     if (!isCurrent()) return;
     this.invalidateConfirmation(observation);
-    const unchangedStallAlert = this.retainStallAlert(observation);
+    let unchangedStallAlert = this.retainStallAlert(observation);
     this.state.activity = observation.activity;
     this.state.conversationId = observation.conversationId;
 
@@ -479,6 +515,8 @@ export class RecoveryController {
         if (JSON.stringify(this.state) !== before) await this.save();
         return;
       }
+      // Acceptance released the warning after this observation first retained it.
+      unchangedStallAlert = false;
     }
 
     if (!manual && !this.state.config.enabled) {
@@ -519,7 +557,7 @@ export class RecoveryController {
           this.state.stallAlert = {
             key,
             conversationId: observation.conversationId!,
-            progressAt: observation.progressAt ?? observation.at,
+            progressAt: this.stallQuietSince(observation),
           };
           this.block('stall-unverified');
           if (JSON.stringify(this.state) !== before) await this.save();

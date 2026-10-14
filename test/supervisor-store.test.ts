@@ -18,6 +18,74 @@ afterEach(async () => {
 });
 
 describe('SupervisorStore', () => {
+  it('reclaims 100 unreachable settled managers before admitting a new record', async () => {
+    const { path } = await journal();
+    const records = Object.fromEntries(
+      Array.from({ length: 100 }, (_, i) => {
+        const id = `orphan-manager-${i}`;
+        return [id, initialSupervisorState(id)];
+      })
+    );
+    await writeFile(path, JSON.stringify({ version: 1, supervisors: records }));
+    const store = new SupervisorStore(path);
+    await expect(store.save(SID, initialSupervisorState(SID))).rejects.toThrow(/capacity/);
+    expect(await store.pruneOrphans(() => false)).toBe(100);
+    await store.save(SID, initialSupervisorState(SID));
+    expect(new SupervisorStore(path).all()).toEqual([initialSupervisorState(SID)]);
+  });
+
+  it('keeps accepted bindings for current managers without rewriting an unchanged journal', async () => {
+    const { path } = await journal();
+    const store = new SupervisorStore(path);
+    const state = {
+      ...initialSupervisorState(SID),
+      handledRequestIds: ['request-accepted'],
+      handledRequestBindings: [{ requestId: 'request-accepted', workerId: SID, action: 'assign' as const }],
+    };
+    await store.save(SID, state);
+    const before = await stat(path);
+    expect(await store.pruneOrphans((id) => id === SID)).toBe(0);
+    expect((await stat(path)).ino).toBe(before.ino);
+    expect(new SupervisorStore(path).get(SID)).toEqual(state);
+  });
+
+  it('serializes pruning behind uncertain operation reservations and preserves their exact binding', async () => {
+    const { path } = await journal();
+    const store = new SupervisorStore(path);
+    await store.save('orphan-manager', initialSupervisorState('orphan-manager'));
+    const reserved = {
+      ...initialSupervisorState(SID),
+      inFlight: {
+        requestId: 'request-uncertain',
+        workerId: SID,
+        action: 'assign' as const,
+        reservedAt: Date.now(),
+      },
+    };
+    const save = store.save(SID, reserved);
+    const prune = store.pruneOrphans(() => false);
+    await save;
+    expect(await prune).toBe(1);
+    expect(new SupervisorStore(path).all()).toEqual([reserved]);
+  });
+
+  it('preserves unreadable bytes and readable records when orphan replacement fails', async () => {
+    const { path } = await journal();
+    await writeFile(path, '{unreadable}');
+    await expect(new SupervisorStore(path).pruneOrphans(() => false)).rejects.toThrow(/failed to load/);
+    expect(await readFile(path, 'utf8')).toBe('{unreadable}');
+    await rm(path);
+    const store = new SupervisorStore(path);
+    await store.save(SID, initialSupervisorState(SID));
+    const before = await readFile(path, 'utf8');
+    Reflect.set(store, 'path', join(path, 'blocked'));
+    await expect(store.pruneOrphans(() => false)).rejects.toThrow();
+    expect(await readFile(path, 'utf8')).toBe(before);
+    expect(store.all()).toEqual([initialSupervisorState(SID)]);
+    Reflect.set(store, 'path', path);
+    expect(await store.pruneOrphans(() => false)).toBe(1);
+  });
+
   it('atomically round-trips a bounded journal with owner-only file permissions', async () => {
     const { path } = await journal();
     const store = new SupervisorStore(path);
