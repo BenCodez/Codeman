@@ -14,7 +14,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { constants } from 'node:fs';
+import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, parse, resolve, sep } from 'node:path';
@@ -29,6 +29,19 @@ export interface CodexIdentityRequest {
   previousId?: string;
 }
 
+/** Bounded private identity inputs; their freshness must survive the final pane/grant awaits. */
+export interface CodexIdentityWitness {
+  paths: Array<{
+    path: string;
+    kind: 'directory' | 'file';
+    dev: number;
+    ino: number;
+    size?: number;
+    mtimeMs?: number;
+    ctimeMs?: number;
+  }>;
+}
+
 export interface CodexIdentityResult {
   conversationId?: string;
   path?: string;
@@ -37,6 +50,45 @@ export interface CodexIdentityResult {
   tail?: string;
   /** Only false certifies that the tail contains the rollout's complete lifecycle history. */
   tailTruncated?: boolean;
+  witness?: CodexIdentityWitness;
+}
+
+/** Final bounded synchronous check, after launch preparation and the last owner-grant await. */
+export function confirmCodexIdentityWitness(identity: CodexIdentityResult): boolean {
+  if (!identity.path || !identity.witness || identity.tailTruncated !== false || identity.tail === undefined)
+    return false;
+  let fd: number | undefined;
+  try {
+    for (const input of identity.witness.paths) {
+      const stat = lstatSync(input.path);
+      if (
+        stat.isSymbolicLink() ||
+        (input.kind === 'file' ? !stat.isFile() : !stat.isDirectory()) ||
+        stat.dev !== input.dev ||
+        stat.ino !== input.ino ||
+        (input.size !== undefined && stat.size !== input.size) ||
+        (input.mtimeMs !== undefined && stat.mtimeMs !== input.mtimeMs) ||
+        (input.ctimeMs !== undefined && stat.ctimeMs !== input.ctimeMs)
+      )
+        return false;
+    }
+    fd = openSync(identity.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0));
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.size > 262_144) return false;
+    const bytes = Buffer.alloc(before.size);
+    if (readSync(fd, bytes, 0, before.size, 0) !== before.size) return false;
+    const after = fstatSync(fd);
+    return (
+      before.size === after.size &&
+      before.mtimeMs === after.mtimeMs &&
+      before.ctimeMs === after.ctimeMs &&
+      createHash('sha256').update(bytes).digest('hex') === createHash('sha256').update(identity.tail).digest('hex')
+    );
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 const HEAD_BYTES = 128 * 1024;
@@ -87,6 +139,20 @@ class Budget {
   files = 0;
   directories = 0;
   entries = 0;
+  readonly witness = new Map<string, CodexIdentityWitness['paths'][number]>();
+
+  record(path: string, stat: Stats, contents: boolean): void {
+    const next: CodexIdentityWitness['paths'][number] = {
+      path,
+      kind: stat.isDirectory() ? 'directory' : 'file',
+      dev: stat.dev,
+      ino: stat.ino,
+      ...(contents ? { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs } : {}),
+    };
+    const previous = this.witness.get(path);
+    if (previous && JSON.stringify(previous) !== JSON.stringify(next)) throw new Refusal('unverified');
+    this.witness.set(path, next);
+  }
 
   check(): void {
     if (performance.now() >= this.deadline) throw new Refusal('unreadable');
@@ -122,6 +188,7 @@ async function validateHome(home: string, budget: Budget): Promise<void> {
     path = join(path, component);
     const stat = await checked(budget, () => fs.lstat(path));
     if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Refusal('unverified');
+    budget.record(path, stat, false);
   }
 }
 
@@ -140,12 +207,22 @@ async function readWindow(
   try {
     budget.check();
     const stat = await checked(budget, () => file.stat());
-    if (!stat.isFile() || stat.ino !== before.ino || stat.dev !== before.dev) throw new Refusal('unverified');
+    if (
+      !stat.isFile() ||
+      stat.ino !== before.ino ||
+      stat.dev !== before.dev ||
+      stat.size !== before.size ||
+      stat.mtimeMs !== before.mtimeMs ||
+      stat.ctimeMs !== before.ctimeMs
+    )
+      throw new Refusal('unverified');
+    budget.record(path, stat, true);
     const length = Math.min(bytes, stat.size);
     const buffer = Buffer.alloc(length);
     const offset = tail ? Math.max(0, stat.size - length) : 0;
     const { bytesRead } = await checked(budget, () => file.read(buffer, 0, length, offset));
     if (bytesRead !== length) throw new Refusal('unverified');
+    budget.record(path, await checked(budget, () => file.stat()), true);
     let text = buffer.toString('utf8');
     const truncated = stat.size > bytes;
     if (tail && truncated) {
@@ -221,6 +298,7 @@ async function scanRollouts(home: string, budget: Budget): Promise<RolloutIdenti
     if (depth > MAX_DEPTH || ++budget.directories > MAX_DIRECTORIES) throw new Refusal('unverified');
     const stat = await checked(budget, () => fs.lstat(directory));
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Refusal('unverified');
+    budget.record(directory, stat, true);
     budget.check();
     // Stream entries in small batches: readdir() would allocate an arbitrarily large
     // listing before the entry budget got a chance to refuse it.
@@ -245,6 +323,7 @@ async function scanRollouts(home: string, budget: Budget): Promise<RolloutIdenti
     } finally {
       await handle.close();
     }
+    budget.record(directory, await checked(budget, () => fs.lstat(directory)), true);
   };
   try {
     await visit(join(home, 'sessions'), 0);
@@ -359,6 +438,7 @@ async function resolveFromIndex(
       head,
       tail: tail.text,
       tailTruncated: tail.truncated,
+      witness: { paths: [...budget.witness.values()] },
     };
   } catch (error) {
     return { reason: error instanceof Refusal ? error.reason : isAbsent(error) ? 'unverified' : 'unreadable' };

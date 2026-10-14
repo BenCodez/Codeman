@@ -46,6 +46,9 @@ import type { SessionState } from './types.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { resolveCodexIdentities, resolveCodexIdentity, type CodexIdentityRequest } from './recovery/codex-identity.js';
 import { readRebootIdentityFence } from './recovery/reboot-identity-fence.js';
+import { normalizedCodexHome } from './recovery/codex-home.js';
+import { classifyCodexTail } from './recovery/codex-classifier.js';
+import type { CodexIdentityResult } from './recovery/codex-identity.js';
 import { isCleanPaneExit } from './pane-exit-sweep.js';
 
 /** Session statuses a reboot restore may rebuild. `stopped` is the kill marker. */
@@ -132,6 +135,7 @@ export interface RebootRestoreRejection {
     | 'unsupported-mode'
     | 'identity-unverified'
     | 'restore-cancelled'
+    | 'restore-uncertain'
     | 'no-working-dir'
     | 'workspace-missing'
     | 'workspace-forbidden'
@@ -322,6 +326,10 @@ function codexRebootIdentityCandidate(state: SessionState): CodexRebootIdentityC
       }
     ).__codexRebootIdentity;
   if (proof?.switchPending || proof?.untrackedInput) return undefined;
+  const home = normalizedCodexHome((state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome);
+  const explicitHome = (state as { __envOverrides?: Record<string, string> }).__envOverrides?.CODEX_HOME;
+  // An old record without actual launch provenance cannot establish its original ambient home.
+  if (!home || (explicitHome !== undefined && normalizedCodexHome(explicitHome) !== home)) return undefined;
   // A completed reboot restore replaces the consumed submission with its exact
   // launched UUID synchronously. It may be newer than the debounced state record.
   const id = proof?.resumeSessionId ?? state.recovery?.conversationId ?? state.codexConfig?.resumeSessionId;
@@ -338,7 +346,7 @@ function codexRebootIdentityCandidate(state: SessionState): CodexRebootIdentityC
     request: {
       sessionId: state.id,
       workingDir: state.workingDir,
-      codexHome: (state as { __envOverrides?: Record<string, string> }).__envOverrides?.CODEX_HOME,
+      codexHome: home,
       resumeId: id,
       submission: proof?.submission,
       noDaemon: state.codexConfig?.noDaemon === true,
@@ -346,15 +354,49 @@ function codexRebootIdentityCandidate(state: SessionState): CodexRebootIdentityC
   };
 }
 
+/** Explicit restore still retains child, owner-intent and permission vetoes from complete evidence. */
+function permitsCodexRebootRestore(identity: CodexIdentityResult): boolean {
+  if (
+    !identity.conversationId ||
+    identity.tail === undefined ||
+    identity.tailTruncated !== false ||
+    !identity.tail.endsWith('\n') ||
+    Buffer.byteLength(identity.tail, 'utf8') > 262_144
+  )
+    return false;
+  const classification = classifyCodexTail(identity.tail, {
+    conversationId: identity.conversationId,
+    now: Date.now(),
+    screen: '',
+    busy: false,
+    watching: false,
+    tailTruncated: false,
+  });
+  if (['watching', 'blocked', 'paused'].includes(classification.activity)) return false;
+  if (classification.activity !== 'unknown') return true;
+  // A newly-created exact conversation can legitimately have only metadata.
+  // That explicit owner restoration needs no failed-turn evidence, but malformed
+  // or uncertain lifecycle rows must not be mistaken for this empty history.
+  try {
+    const rows = identity.tail.split('\n').filter((row) => row.trim());
+    return rows.length === 1 && JSON.parse(rows[0])?.type === 'session_meta';
+  } catch {
+    return false;
+  }
+}
+
 /** Revalidate saved exact evidence; cwd and timestamps alone never authorize a thread. */
 export async function verifyCodexRebootIdentity(state: SessionState): Promise<string | undefined> {
+  return (await verifyCodexRebootEvidence(state))?.conversationId;
+}
+
+/** Preserve the verified private inputs until the actual launch boundary. */
+export async function verifyCodexRebootEvidence(state: SessionState): Promise<CodexIdentityResult | undefined> {
   const candidate = codexRebootIdentityCandidate(state);
   if (!candidate) return undefined;
   const identity = await resolveCodexIdentity(candidate.request);
-  if (identity.reason !== 'verified' || !identity.conversationId) return undefined;
-  return candidate.expectedId === undefined || identity.conversationId === candidate.expectedId
-    ? identity.conversationId
-    : undefined;
+  if (identity.reason !== 'verified' || !permitsCodexRebootRestore(identity)) return undefined;
+  return candidate.expectedId === undefined || identity.conversationId === candidate.expectedId ? identity : undefined;
 }
 
 /** Disk verification is bounded and serial; the pure planner remains usable by callers/tests. */
@@ -389,6 +431,7 @@ export async function planVerifiedRebootRestore(
     const id = resolution.conversationId;
     if (
       resolution.reason === 'verified' &&
+      permitsCodexRebootRestore(resolution) &&
       id &&
       (candidate.identity.expectedId === undefined || candidate.identity.expectedId === id)
     ) {

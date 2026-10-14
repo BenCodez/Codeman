@@ -4,6 +4,7 @@
  */
 import { EventEmitter } from 'node:events';
 import { vi } from 'vitest';
+import type { CodexRestoreLaunchGuard } from '../../src/mux-interface.js';
 import type {
   SessionAttachmentHistoryItem,
   SessionStatus,
@@ -456,8 +457,23 @@ export class MockSession extends EventEmitter {
   /** Stub for runPrompt */
   runPrompt = vi.fn(async () => {});
 
-  /** Stub for startInteractive */
-  startInteractive = vi.fn(async () => {});
+  private codexRestoreGuard?: CodexRestoreLaunchGuard;
+  codexRestoreWorkerMayExist = false;
+  commitCodexRestoreLaunch = vi.fn(() => {
+    this.codexRestoreWorkerMayExist = false;
+  });
+  setCodexRestoreLaunchGuard = vi.fn((guard: CodexRestoreLaunchGuard | undefined) => {
+    this.codexRestoreGuard = guard;
+  });
+  /** Fake launch effect retains the production reboot authority gate. */
+  startInteractive = vi.fn(async () => {
+    if (this.codexRestoreGuard) {
+      await this.codexRestoreGuard.prepare();
+      if (this.codexRestoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+      this.codexRestoreWorkerMayExist = true;
+      this.codexRestoreGuard.noteDispatch?.();
+    }
+  });
 
   /** Stub for resetRespawnBreaker (COD-118) */
   resetRespawnBreaker = vi.fn();

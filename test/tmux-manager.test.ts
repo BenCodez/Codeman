@@ -742,9 +742,8 @@ describe('TmuxManager (unit)', () => {
 
     it('passes exact remote launch bytes as one bash argv for create and respawn', async () => {
       vi.doMock('../src/utils/cli-resolver.js', async () => {
-        const actual = await vi.importActual<typeof import('../src/utils/cli-resolver.js')>(
-          '../src/utils/cli-resolver.js'
-        );
+        const actual =
+          await vi.importActual<typeof import('../src/utils/cli-resolver.js')>('../src/utils/cli-resolver.js');
         return { ...actual, resolveCliBinDir: vi.fn(() => '/fixture/bin') };
       });
       const realFs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
@@ -835,6 +834,72 @@ describe('TmuxManager (unit)', () => {
         nonTestManager.destroy();
         vi.doUnmock('../src/utils/cli-resolver.js');
         await realFs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      'unchanged',
+      'before-create',
+      'before-worker',
+      'grant-revoked-during-shell-prep',
+      'dispatch-uncertain',
+      'async-confirm',
+    ])('scopes guarded reboot launch effects and cleanup for %s', async (outcome) => {
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+      vi.spyOn(
+        nonTestManager as unknown as { buildPathExport(mode: string): { dir: string; pathExport: string } },
+        'buildPathExport'
+      ).mockReturnValue({ dir: '/fixture/bin', pathExport: 'export PATH=/fixture/bin:$PATH && ' });
+      let workerMayBeRunning = false;
+      let grant = true;
+      mockedExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes('respawn-pane') && outcome === 'dispatch-uncertain') {
+          workerMayBeRunning = true;
+          throw new Error('Fixture response lost after worker dispatch');
+        }
+        if (cmd.includes('which tmux')) return '/usr/bin/tmux\n';
+        if (cmd.includes('setenv') && outcome === 'grant-revoked-during-shell-prep') grant = false;
+        if (cmd.includes('display-message') && cmd.includes('#{pane_pid}')) return '4242\n';
+        return '';
+      });
+      let confirmations = 0;
+      let authorized = false;
+      const launch = nonTestManager.createSession({
+        sessionId: 'aabbccdd-1234-5678-90ab-cdef12345678',
+        workingDir: '/fixture/workspace',
+        mode: 'codex',
+        codexConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
+        recoveryCodexHome: '/fixture/codex-home',
+        codexRestoreGuard: {
+          prepare: async () => {
+            await Promise.resolve();
+            authorized = grant && outcome !== 'before-create';
+          },
+          confirm: () => {
+            confirmations++;
+            if (outcome === 'async-confirm') return Promise.resolve(true) as never;
+            return authorized && (outcome !== 'before-worker' || confirmations === 1);
+          },
+        },
+      });
+      try {
+        if (outcome === 'unchanged') expect((await launch).pid).toBe(4242);
+        else await expect(launch).rejects.toThrow();
+        const commands = mockedExecSync.mock.calls.map(([cmd]) => String(cmd));
+        expect(commands.some((cmd) => cmd.includes('new-session'))).toBe(
+          !['before-create', 'async-confirm'].includes(outcome)
+        );
+        expect(commands.some((cmd) => cmd.includes('respawn-pane'))).toBe(
+          ['unchanged', 'dispatch-uncertain'].includes(outcome)
+        );
+        expect(commands.filter((cmd) => cmd.includes('kill-session'))).toHaveLength(
+          ['before-worker', 'grant-revoked-during-shell-prep'].includes(outcome) ? 1 : 0
+        );
+        expect(workerMayBeRunning).toBe(outcome === 'dispatch-uncertain');
+        if (outcome === 'dispatch-uncertain') expect(nonTestManager.getSessions()).toEqual([]);
+      } finally {
+        nonTestManager.destroy();
       }
     });
 

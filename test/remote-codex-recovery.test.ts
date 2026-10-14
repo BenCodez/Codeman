@@ -13,6 +13,7 @@ import {
   buildRemoteCodexEvidenceCommand,
   buildRemoteCodexInputCommand,
   buildRemoteCodexRestartCommand,
+  buildRemoteCodexRestoreCommand,
   classifyRemoteCodexExecFailure,
   deliverRemoteCodexInput,
   inspectRemoteCodex,
@@ -257,7 +258,7 @@ describe('remote Codex evidence protocol', () => {
       await writeFile(actionLog, '');
       await writeFile(
         fakeTmux,
-        `#!/bin/sh\ncase "$*" in\n  *has-session*) exit 0 ;;\n  *list-panes*) cat "$FIXTURE_PANE_FILE" ;;\n  *capture-pane*) cat "$FIXTURE_SCREEN_FILE" ;;\n  *send-keys*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    for arg do last="$arg"; done\n    if [ "$4" = "-l" ]; then\n      [ -n "$FIXTURE_LITERAL_DELAY" ] && sleep "$FIXTURE_LITERAL_DELAY"\n      node -e 'require("fs").writeFileSync(process.env.FIXTURE_PROMPT_FILE,process.argv[1])' "$last"\n    elif [ "$last" = "Enter" ] && [ "$FIXTURE_APPEND_HISTORY" = "1" ]; then\n      node -e 'const fs=require("fs");fs.appendFileSync(process.env.FIXTURE_HISTORY_FILE,JSON.stringify({session_id:process.env.FIXTURE_HISTORY_SESSION,ts:Date.now()/1000,text:fs.readFileSync(process.env.FIXTURE_PROMPT_FILE,"utf8")})+"\\n")'\n    fi\n    ;;\n  *respawn-pane*) printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG" ;;\n  *) exit 2 ;;\nesac\n`
+        `#!/bin/sh\ncase "$*" in\n  *has-session*)\n    [ -n "$FIXTURE_PROBE_APPEND_FILE" ] && printf '%s\\n' "$FIXTURE_PROBE_APPEND_ROW" >> "$FIXTURE_PROBE_APPEND_FILE"\n    [ "$FIXTURE_SESSION_MISSING" = "1" ] && exit 1\n    exit 0 ;;\n  *list-panes*) cat "$FIXTURE_PANE_FILE" ;;\n  *capture-pane*) cat "$FIXTURE_SCREEN_FILE" ;;\n  *send-keys*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    for arg do last="$arg"; done\n    if [ "$4" = "-l" ]; then\n      [ -n "$FIXTURE_LITERAL_DELAY" ] && sleep "$FIXTURE_LITERAL_DELAY"\n      node -e 'require("fs").writeFileSync(process.env.FIXTURE_PROMPT_FILE,process.argv[1])' "$last"\n    elif [ "$last" = "Enter" ] && [ "$FIXTURE_APPEND_HISTORY" = "1" ]; then\n      node -e 'const fs=require("fs");fs.appendFileSync(process.env.FIXTURE_HISTORY_FILE,JSON.stringify({session_id:process.env.FIXTURE_HISTORY_SESSION,ts:Date.now()/1000,text:fs.readFileSync(process.env.FIXTURE_PROMPT_FILE,"utf8")})+"\\n")'\n    fi\n    ;;\n  *new-session*)\n    [ "$FIXTURE_RESTORE_RACE" = "1" ] && exit 1\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG" ;;\n  *respawn-pane*) printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG" ;;\n  *) exit 2 ;;\nesac\n`
       );
       await chmod(fakeTmux, 0o755);
       await writeFile(
@@ -295,18 +296,13 @@ describe('remote Codex evidence protocol', () => {
         return parseRemoteCodexEvidence(stdout);
       };
 
-      expect(await run({ ...request, codexHome: undefined })).toMatchObject({
-        transport: 'reachable',
-        session: 'present',
-        identity: { reason: 'verified', conversationId: resumed, tailTruncated: false },
-        pane: { dead: false, paneId: '%7', panePid: 4242, screen: '›\n' },
-      });
+      await expect(run({ ...request, codexHome: undefined })).rejects.toThrow('unverified');
       expect(await run(request, 'relative/ignored-because-explicit')).toMatchObject({
         transport: 'reachable',
         identity: { reason: 'verified', conversationId: resumed },
       });
-      await expect(run({ ...request, codexHome: undefined }, 'relative/codex-home')).rejects.toThrow('unreadable');
-      await expect(run({ ...request, codexHome: undefined }, `/${'x'.repeat(4097)}`)).rejects.toThrow('unreadable');
+      await expect(run({ ...request, codexHome: undefined }, 'relative/codex-home')).rejects.toThrow('unverified');
+      await expect(run({ ...request, codexHome: undefined }, `/${'x'.repeat(4097)}`)).rejects.toThrow('unverified');
       expect(await run({ ...request, submission: { ...request.submission, hash: '0'.repeat(64) } })).toMatchObject({
         identity: { reason: 'unverified' },
       });
@@ -349,8 +345,14 @@ describe('remote Codex evidence protocol', () => {
         },
         prompt: 'Continue the sanitized fixture task.',
       };
+      await expect(
+        runInput(buildRemoteCodexInputCommand(remote, { ...inputRequest, codexHome: undefined }))
+      ).rejects.toThrow('unverified');
+      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
       expect(
-        await runInput(buildRemoteCodexInputCommand(remote, { ...inputRequest, codexHome: undefined }))
+        parseRemoteCodexInputResult(
+          await runCommand(buildRemoteCodexInputCommand(remote, inputRequest), 'relative/ignored-because-explicit')
+        )
       ).toMatchObject({ status: 'sent', submittedAt: expect.any(Number) });
       expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toContain(
         'Continue the sanitized fixture task.'
@@ -459,6 +461,89 @@ describe('remote Codex evidence protocol', () => {
       await writeFile(paneFile, '0|||%7|4242\n');
       expect(await runAction(buildRemoteCodexRestartCommand(remote, restartRequest))).toBe('not-sent');
       expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
+
+      const restoreRequest = {
+        sessionId: SESSION,
+        resumeId: resumed,
+        submission: request.submission,
+        expectedIdentity,
+        codexConfig: restartRequest.codexConfig,
+        codexHome: home,
+      };
+      expect(() => buildRemoteCodexRestoreCommand(remote, { ...restoreRequest, codexHome: undefined })).toThrow(
+        'exact isolated conversation'
+      );
+      expect(() => buildRemoteCodexRestoreCommand(remote, { ...restoreRequest, resumeId: older })).toThrow(
+        'exact isolated conversation'
+      );
+      const restoreCommand = buildRemoteCodexRestoreCommand(remote, restoreRequest);
+      expect(await runAction(restoreCommand)).toBe('not-sent');
+      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
+      expect(
+        parseRemoteCodexAction(
+          await runCommand(restoreCommand, join(root, 'different ambient home'), {
+            FIXTURE_SESSION_MISSING: '1',
+          })
+        )
+      ).toBe('sent');
+      const restoredArgs = await (await import('node:fs/promises')).readFile(actionLog, 'utf8');
+      expect(restoredArgs).toContain('new-session -d -s codeman-');
+      expect(restoredArgs).toContain(`resume ${resumed}`);
+      expect(restoredArgs).toContain(home);
+      expect(restoredArgs).not.toMatch(/(?:^|\s)-(?:A|k)(?:\s|$)/);
+      await writeFile(actionLog, '');
+      await expect(
+        runCommand(restoreCommand, home, {
+          FIXTURE_SESSION_MISSING: '1',
+          FIXTURE_RESTORE_RACE: '1',
+        })
+      ).rejects.toThrow();
+      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
+
+      // A tmux probe is a separate process: work can change after the initial
+      // profile read, while the final missing/live/dead pane query is in flight.
+      for (const row of [
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'collab_agent_spawn_end',
+            call_id: 'late-spawn',
+            new_thread_id: '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+            status: 'running',
+          },
+        }),
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'late-owner-turn' } }),
+        JSON.stringify({
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: 'CODEMAN_TASK_BLOCKED: owner permission needed' },
+        }),
+        '{malformed-final-checkpoint',
+      ]) {
+        for (const kind of ['input', 'restart', 'restore'] as const) {
+          await writeFile(resumedRollout.file, resumedRollout.text);
+          await writeFile(paneFile, kind === 'restart' ? '1|17||%7|4242\n' : '0|||%7|4242\n');
+          await writeFile(actionLog, '');
+          const command =
+            kind === 'input'
+              ? buildRemoteCodexInputCommand(remote, inputRequest)
+              : kind === 'restart'
+                ? buildRemoteCodexRestartCommand(remote, restartRequest)
+                : restoreCommand;
+          expect(
+            parseRemoteCodexAction(
+              await runCommand(command, home, {
+                FIXTURE_SESSION_MISSING: kind === 'restore' ? '1' : '0',
+                FIXTURE_PROBE_APPEND_FILE: resumedRollout.file,
+                FIXTURE_PROBE_APPEND_ROW: row,
+              })
+            ),
+            `${kind}: ${row}`
+          ).toBe('not-sent');
+          expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
+        }
+      }
+      await writeFile(resumedRollout.file, resumedRollout.text);
+      await writeFile(paneFile, '0|||%7|4242\n');
 
       const emptyLargeEvent = `${JSON.stringify({
         type: 'event_msg',

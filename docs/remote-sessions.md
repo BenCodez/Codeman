@@ -258,6 +258,13 @@ stale `true` from one transport drop can never revive the NEXT clean exit.
 
 ## Owned remote Codex recovery
 
+Remote recovery, task supervision and supervisor assignments require an explicit
+absolute per-session `envOverrides.CODEX_HOME` at launch. That non-secret path is
+persisted and reused for evidence, exact restart and reboot restoration. A worker
+launched with an ambient or default remote home remains ineligible because a
+remote login environment can change between observations. Codeman never guesses
+the home or rewrites an existing worker to make it eligible.
+
 Recovery treats the local SSH pane as transport only. Its exit status is never
 used as evidence that Codex crashed. A bounded SSH inspection independently
 reads the private remote tmux pane and the exact Codex rollout under the
@@ -282,7 +289,11 @@ If a host reboot removed the owned private tmux session, automatic recovery
 stops at `remote-session-missing`. The owner can use **Restore remote worker**;
 that route performs fresh identity and ownership checks, reserves the action in
 the durable recovery journal, and recreates the missing session with the exact
-pinned launch configuration. Unreachable transport is reported separately and
+pinned launch configuration. The final remote mutation rereads the exact complete
+rollout and current submission after its pane probes, then uses `new-session`
+without attach-or-replace flags. A worker created concurrently causes refusal;
+after remote creation, an uncertain acknowledgement or failed local attachment
+remains sealed against replay. Unreachable transport is reported separately and
 never authorizes recreation. The dead local SSH wrapper must also show an
 abnormal transport exit; its status-zero path is the clean `/exit` veto, not
 remote-agent crash evidence.

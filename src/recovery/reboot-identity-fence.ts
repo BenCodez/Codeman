@@ -55,7 +55,17 @@ export function writeRebootIdentityFence(id: string, identity: RebootIdentityFen
   committedVetoes.delete(path);
   const temporary = `${path}.${randomUUID()}.tmp`;
   try {
-    mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+    const fenceDirectory = dirname(path);
+    mkdirSync(fenceDirectory, { recursive: true, mode: 0o700 });
+    // The first fence creates this child directory. Its parent link must be durable too:
+    // syncing only the file and child directory can lose the entire fence after reboot.
+    // Repeat after a failed parent sync, even though mkdir now finds the directory.
+    const parent = openSync(dirname(fenceDirectory), 'r');
+    try {
+      fsyncSync(parent);
+    } finally {
+      closeSync(parent);
+    }
     const fd = openSync(temporary, 'wx', 0o600);
     try {
       writeFileSync(fd, JSON.stringify({ version: 1, ...durableIdentity }));

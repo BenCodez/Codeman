@@ -13,10 +13,18 @@ import { readRebootIdentityFence, writeRebootIdentityFence } from '../src/recove
 import { dataPath } from '../src/config/instance.js';
 import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../src/session-env-clamp.js';
 
-vi.mock('../src/session-env-clamp.js', () => ({
-  clampExternalCliConfigsForOwner: vi.fn(async (_owner, configs) => configs),
-  clampEnvOverridesForOwner: vi.fn(async (_owner, env) => env),
-}));
+vi.mock('../src/session-env-clamp.js', () => {
+  const config = vi.fn(async (_owner, configs) => configs);
+  const environment = vi.fn(async (_owner, env) => env);
+  return {
+    clampExternalCliConfigsForOwner: config,
+    clampEnvOverridesForOwner: environment,
+    clampRecoveryLaunchForOwner: vi.fn(async (owner, configs, env) => ({
+      configs: await config(owner, configs),
+      env: await environment(owner, env),
+    })),
+  };
+});
 
 const THREAD = '11111111-2222-3333-4444-555555555555';
 const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -46,6 +54,7 @@ function fixture(extra: Record<string, unknown> = {}) {
     muxName: 'codeman-aaaaaaaa',
     sessionId: SESSION,
     recoveryIsolated: true,
+    recoveryCodexHome: '/srv/example/codex-home',
     pid: 99999,
     createdAt: Date.now(),
     workingDir: '/tmp',
@@ -85,12 +94,21 @@ describe('the actual Session recovery boundary', () => {
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
   });
 
+  it('refuses legacy isolated panes without actual home provenance', async () => {
+    const f = fixture();
+    f.muxSession.recoveryCodexHome = undefined;
+    expect(f.session.getRecoveryContext().noDaemon).toBe(false);
+    expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
+    expect(f.mux.respawnPane).not.toHaveBeenCalled();
+  });
+
   it('pins the exact thread and preserves all launch settings and the session home on restart', async () => {
     const f = fixture();
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
     expect(f.mux.respawnPane).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         onlyIfDead: true,
+        recoveryCodexHome: '/srv/example/codex-home',
         sessionId: SESSION,
         workingDir: '/tmp',
         codexConfig: {
@@ -278,6 +296,32 @@ describe('the actual owned remote Session boundary', () => {
     owned: true,
   };
 
+  it.each([undefined, '', 'relative/home'])(
+    'refuses every remote mutation with an unpinned worker home (%s)',
+    async (codexHome) => {
+      const f = fixture({
+        remote: ownedRemote,
+        envOverrides: codexHome === undefined ? {} : { CODEX_HOME: codexHome },
+      });
+      const input = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now() }));
+      const restart = vi.fn(async () => 'sent' as const);
+      expect(f.session.getRecoveryContext().noDaemon).toBe(false);
+      expect(await f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, input)).toBe('not-sent');
+      expect(await f.session.restartRemoteRecoveryPane(THREAD, 0, () => true, restart)).toBe('not-sent');
+      expect(
+        await f.session.restoreMissingRemoteWorker(
+          THREAD,
+          0,
+          () => true,
+          async () => 'sent'
+        )
+      ).toBe('not-sent');
+      expect(input).not.toHaveBeenCalled();
+      expect(restart).not.toHaveBeenCalled();
+      expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    }
+  );
+
   it('reattaches a healthy worker with attach-only and then delivers once', async () => {
     const f = fixture({ remote: ownedRemote });
     const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now() }));
@@ -349,7 +393,14 @@ describe('the actual owned remote Session boundary', () => {
       expect(await f.session.restartRemoteRecoveryPane(THREAD, context.generation, () => true, restart)).toBe(
         'not-sent'
       );
-      expect(await f.session.restoreMissingRemoteWorker(THREAD, context.generation)).toBe('not-sent');
+      expect(
+        await f.session.restoreMissingRemoteWorker(
+          THREAD,
+          context.generation,
+          () => true,
+          async () => 'sent'
+        )
+      ).toBe('not-sent');
       expect(deliver).not.toHaveBeenCalled();
       expect(restart).not.toHaveBeenCalled();
       expect(f.mux.inspectPaneForRecovery).not.toHaveBeenCalled();
@@ -496,7 +547,12 @@ describe('the actual owned remote Session boundary', () => {
           await deferred.promise;
           return 99999;
         });
-        operation = f.session.restoreMissingRemoteWorker(THREAD, 0);
+        operation = f.session.restoreMissingRemoteWorker(
+          THREAD,
+          0,
+          () => true,
+          async () => 'sent'
+        );
       }
       await vi.advanceTimersByTimeAsync(60_000);
       expect(f.mux.capturePaneText).not.toHaveBeenCalled();
@@ -519,10 +575,18 @@ describe('the actual owned remote Session boundary', () => {
 
   it('explicitly rebuilds a missing worker only through a confirmed dead local wrapper', async () => {
     const f = fixture({ remote: ownedRemote });
-    expect(await f.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('sent');
+    expect(
+      await f.session.restoreMissingRemoteWorker(
+        THREAD,
+        0,
+        () => true,
+        async () => 'sent'
+      )
+    ).toBe('sent');
     expect(f.mux.respawnPane).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
         onlyIfDead: true,
+        remoteAttachOnly: true,
         remote: ownedRemote,
         codexConfig: expect.objectContaining({ resumeSessionId: THREAD }),
         envOverrides: { CODEX_HOME: '/srv/example/codex-home' },
@@ -530,26 +594,182 @@ describe('the actual owned remote Session boundary', () => {
     );
     const live = fixture({ remote: ownedRemote });
     Object.assign(live.pane, { dead: false, status: undefined, screen: 'ssh attached' });
-    expect(await live.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
+    expect(
+      await live.session.restoreMissingRemoteWorker(
+        THREAD,
+        0,
+        () => true,
+        async () => 'sent'
+      )
+    ).toBe('not-sent');
     expect(live.mux.respawnPane).not.toHaveBeenCalled();
 
     const clean = fixture({ remote: ownedRemote });
     Object.assign(clean.pane, { dead: true, status: 0, signal: undefined, screen: null });
-    expect(await clean.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
+    expect(
+      await clean.session.restoreMissingRemoteWorker(
+        THREAD,
+        0,
+        () => true,
+        async () => 'sent'
+      )
+    ).toBe('not-sent');
     expect(clean.mux.respawnPane).not.toHaveBeenCalled();
   });
 
-  it.each(['closing', 'config', 'grant'] as const)(
+  it.each(['unchanged', 'child', 'identity'] as const)(
+    'dispatches missing-worker recreation under the final remote proof after late %s evidence',
+    async (change) => {
+      const f = fixture({ remote: ownedRemote });
+      f.session.trackUserInput('exact fixture restore prompt\r');
+      const now = Date.now();
+      const baseTail =
+        [
+          {
+            timestamp: new Date(now - 2000).toISOString(),
+            type: 'event_msg',
+            payload: { type: 'task_started', turn_id: 'restore-turn' },
+          },
+          {
+            timestamp: new Date(now - 1000).toISOString(),
+            type: 'event_msg',
+            payload: { type: 'task_complete', turn_id: 'restore-turn' },
+          },
+        ]
+          .map((row) => JSON.stringify(row))
+          .join('\n') + '\n';
+      let currentTail = baseTail;
+      let currentThread = THREAD;
+      let probes = 0;
+      f.mux.inspectPaneForRecovery.mockImplementation(async () => {
+        if (++probes === 3) {
+          if (change === 'child')
+            currentTail +=
+              JSON.stringify({
+                type: 'event_msg',
+                payload: {
+                  type: 'collab_agent_spawn_end',
+                  call_id: 'late-spawn',
+                  new_thread_id: '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
+                  status: 'running',
+                },
+              }) + '\n';
+          else if (change === 'identity') currentThread = '22222222-2222-3333-4444-555555555555';
+        }
+        return { ...f.pane };
+      });
+      let creations = 0;
+      const restoreRemote = vi.fn(async (_remote, request) => {
+        if (
+          request.expectedIdentity.conversationId !== currentThread ||
+          request.expectedIdentity.tailHash !== createHash('sha256').update(currentTail).digest('hex')
+        )
+          return 'not-sent' as const;
+        creations++;
+        return 'sent' as const;
+      });
+      const deps: CodexRecoveryAdapterDeps = {
+        inspectRemote: vi.fn(async () => ({
+          transport: 'reachable',
+          session: 'missing',
+          identity: {
+            reason: 'verified',
+            conversationId: THREAD,
+            tail: baseTail,
+            tailTruncated: false,
+            changedAt: now - 1000,
+          },
+        })),
+        restoreRemote,
+        restartRemote: vi.fn(async () => 'not-sent'),
+        deliverRemote: vi.fn(async () => ({ status: 'not-sent' })),
+      };
+      const adapter = new CodexRecoveryAdapter(f.session, () => {}, deps);
+      expect(await adapter.restoreMissingRemote()).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+      expect(deps.inspectRemote).toHaveBeenCalledTimes(2);
+      expect(restoreRemote).toHaveBeenCalledOnce();
+      expect(probes).toBe(3);
+      expect(creations).toBe(change === 'unchanged' ? 1 : 0);
+      expect(f.mux.respawnPane).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+      expect(f.mux.sendInput).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['not-sent', 'unknown'] as const)('does not attach after guarded remote creation is %s', async (outcome) => {
+    const f = fixture({ remote: ownedRemote });
+    expect(
+      await f.session.restoreMissingRemoteWorker(
+        THREAD,
+        0,
+        () => true,
+        async () => outcome
+      )
+    ).toBe(outcome);
+    expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    expect(f.session.recoveryInputReserved).toBe(false);
+  });
+
+  it('refuses an unguarded missing-worker restore', async () => {
+    const f = fixture({ remote: ownedRemote });
+    expect(await f.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
+    expect(f.mux.inspectPaneForRecovery).not.toHaveBeenCalled();
+    expect(f.mux.respawnPane).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancel', 'grant', 'home', 'attach-failure'] as const)(
+    'retains uncertainty when %s happens after remote creation',
+    async (change) => {
+      const f = fixture({ remote: ownedRemote });
+      let current = true;
+      const dispatch = vi.fn(async () => {
+        if (change === 'cancel') current = false;
+        else if (change === 'grant') configClamp.mockImplementation(async () => ({ codexConfig: undefined }));
+        else if (change === 'home') f.session.setCustomModel(undefined, { CODEX_HOME: '/srv/example/changed-home' });
+        else f.mux.respawnPane.mockResolvedValueOnce(0);
+        return 'sent' as const;
+      });
+      expect(await f.session.restoreMissingRemoteWorker(THREAD, 0, () => current, dispatch)).toBe('unknown');
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(f.mux.respawnPane).toHaveBeenCalledTimes(change === 'attach-failure' ? 1 : 0);
+      expect(f.session.recoveryInputReserved).toBe(false);
+    }
+  );
+
+  it.each(['cancel', 'home', 'grant'] as const)(
+    'retains uncertainty if %s changes while the local wrapper reattaches',
+    async (change) => {
+      const f = fixture({ remote: ownedRemote });
+      let current = true;
+      f.mux.respawnPane.mockImplementationOnce(async () => {
+        if (change === 'cancel') current = false;
+        else if (change === 'home') f.session.setCustomModel(undefined, { CODEX_HOME: '/srv/example/changed-home' });
+        else configClamp.mockImplementation(async () => ({ codexConfig: undefined }));
+        return 99999;
+      });
+      const dispatch = vi.fn(async () => 'sent' as const);
+      expect(await f.session.restoreMissingRemoteWorker(THREAD, 0, () => current, dispatch)).toBe('unknown');
+      expect(dispatch).toHaveBeenCalledOnce();
+      expect(f.mux.respawnPane).toHaveBeenCalledOnce();
+    }
+  );
+
+  it.each(['closing', 'config', 'grant', 'home'] as const)(
     'rechecks %s authority after the missing-worker transport probe',
     async (change) => {
       const f = fixture({ remote: ownedRemote });
       const pending = createDeferred<typeof f.pane>();
       f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
-      const restore = f.session.restoreMissingRemoteWorker(THREAD, 0);
+      const restore = f.session.restoreMissingRemoteWorker(
+        THREAD,
+        0,
+        () => true,
+        async () => 'sent'
+      );
       await vi.waitFor(() => expect(f.mux.inspectPaneForRecovery).toHaveBeenCalledOnce());
 
       if (change === 'closing') f.session.markClosing(true);
       else if (change === 'config') f.session.pinRecoveryConversation('22222222-2222-3333-4444-555555555555');
+      else if (change === 'home') f.session.setCustomModel(undefined, { CODEX_HOME: '/srv/example/changed-home' });
       else configClamp.mockImplementation(async () => ({ codexConfig: undefined }));
 
       pending.resolve(f.pane);
@@ -567,7 +787,14 @@ describe('the actual owned remote Session boundary', () => {
         submittedAt: Date.now(),
       }))
     ).toBe('not-sent');
-    expect(await f.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
+    expect(
+      await f.session.restoreMissingRemoteWorker(
+        THREAD,
+        0,
+        () => true,
+        async () => 'sent'
+      )
+    ).toBe('not-sent');
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
     expect(f.mux.sendInput).not.toHaveBeenCalled();
   });
@@ -604,4 +831,13 @@ describe('Codeman reboot of its own server preserves crashed panes and circuit c
     expect(create).not.toHaveBeenCalled();
     expect(session.toState().codexConfig?.resumeSessionId).toBe(THREAD);
   });
+});
+
+it('refuses an asynchronous evidence predicate instead of granting a new await window', async () => {
+  const f = fixture();
+  expect(
+    await f.session.deliverRecovery(f.flight, 0, () => true, CONTINUATION_PROMPT, (() =>
+      Promise.resolve(true)) as never)
+  ).toBe('not-sent');
+  expect(f.mux.respawnPane).not.toHaveBeenCalled();
 });

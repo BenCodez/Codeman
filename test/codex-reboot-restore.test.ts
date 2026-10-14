@@ -41,6 +41,7 @@ function fixture(overrides: Partial<SessionState> = {}): SessionState {
       noAltScreen: true,
     },
     __envOverrides: { CODEX_HOME: home },
+    __codexRecoveryHome: home,
     ...overrides,
   } as SessionState;
 }
@@ -54,6 +55,83 @@ beforeEach(() => {
 });
 
 describe('verified local Codex reboot offers', () => {
+  it.each([
+    { type: 'collab_agent_spawn_end', call_id: 'spawn', new_thread_id: 'child', status: 'running' },
+    { type: 'exec_approval_request' },
+    { type: 'error', message: 'Sanitized authentication fixture.', codex_error_info: 'unauthorized' },
+    { type: 'turn_aborted', turn_id: 'fixture-turn', reason: 'interrupted' },
+  ])('preserves lifecycle veto $type during explicit reboot restoration', async (payload) => {
+    const state = fixture();
+    const home = (state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome;
+    const path = join(home, 'sessions', `rollout-2026-10-13T15-00-00-${UUID}.jsonl`);
+    await fs.appendFile(
+      path,
+      JSON.stringify({ timestamp: new Date(Date.now() - 1000).toISOString(), type: 'event_msg', payload }) + '\n'
+    );
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+    expect((await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true)).restore).toEqual([]);
+  });
+
+  it('refuses a truncated rollout which can hide earlier live children', async () => {
+    const state = fixture();
+    const home = (state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome;
+    const path = join(home, 'sessions', `rollout-2026-10-13T15-00-00-${UUID}.jsonl`);
+    await fs.appendFile(
+      path,
+      JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(300 * 1024) } }) + '\n'
+    );
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+  });
+
+  it.each(['task_started', 'task_complete'])('retains a healthy %s exact restore without child work', async (type) => {
+    const state = fixture();
+    const home = (state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome;
+    const path = join(home, 'sessions', `rollout-2026-10-13T15-00-00-${UUID}.jsonl`);
+    await fs.appendFile(
+      path,
+      JSON.stringify({
+        timestamp: new Date(Date.now() - 1000).toISOString(),
+        type: 'event_msg',
+        payload: { type, turn_id: 'fixture-turn' },
+      }) + '\n'
+    );
+    expect(await verifyCodexRebootIdentity(state)).toBe(UUID);
+  });
+
+  it('refuses unterminated metadata-only rollout evidence', async () => {
+    const state = fixture();
+    const home = (state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome;
+    const path = join(home, 'sessions', `rollout-2026-10-13T15-00-00-${UUID}.jsonl`);
+    const complete = await fs.readFile(path, 'utf8');
+    await fs.writeFile(path, complete.trimEnd());
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+  });
+
+  it('refuses malformed complete rollout rows while retaining a healthy exact resume', async () => {
+    const state = fixture();
+    expect(await verifyCodexRebootIdentity(state)).toBe(UUID);
+    const home = (state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome;
+    await fs.appendFile(join(home, 'sessions', `rollout-2026-10-13T15-00-00-${UUID}.jsonl`), '{bad lifecycle}\n');
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+  });
+
+  it('refuses an exact UUID without launch-home provenance even with an explicit saved override', async () => {
+    const state = fixture();
+    delete (state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome;
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+  });
+
+  it('verifies the original inherited home when the ambient profile changed', async () => {
+    const state = fixture();
+    delete (state as SessionState & { __envOverrides?: unknown }).__envOverrides;
+    vi.stubEnv('CODEX_HOME', join(homedir(), 'new-profile'));
+    try {
+      expect(await verifyCodexRebootIdentity(state)).toBe(UUID);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('honors a newer durable fence over an older debounced state snapshot', async () => {
     const state = fixture();
     (state as unknown as Record<string, unknown>).__codexRebootIdentity = { switchPending: false };
@@ -207,6 +285,7 @@ describe('verified local Codex reboot offers', () => {
         codexConfig: { noDaemon: true },
         recovery: initialRecoveryState(),
         __envOverrides: { CODEX_HOME: home },
+        __codexRecoveryHome: home,
         __codexRebootIdentity: {
           switchPending: false,
           submission: { at, hash: hashCodexPrompt(prompt) },

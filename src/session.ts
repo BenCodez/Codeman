@@ -69,7 +69,7 @@ import { claudeTranscriptExists } from './utils/claude-transcript.js';
 import { matchesPattern } from './config/cli-registry/patterns.js';
 import { probeDockerCliVersion } from './docker-hosts.js';
 import { probeRemoteCliVersion } from './remote-hosts.js';
-import type { TerminalMultiplexer, MuxSession } from './mux-interface.js';
+import type { TerminalMultiplexer, MuxSession, CodexRestoreLaunchGuard } from './mux-interface.js';
 import { TaskTracker, type BackgroundTask } from './task-tracker.js';
 import { RalphTracker } from './ralph-tracker.js';
 import { BashToolParser } from './bash-tool-parser.js';
@@ -143,11 +143,16 @@ import type { SessionAttachmentHistoryItem, DisplayModel } from './types/session
 import { resolveConfigModel } from './model-config-resolvers.js';
 import { legacyConfigForMode, buildSpawnCommandFromRegistry } from './session-cli-registry-bridge.js';
 import { hashCodexPrompt } from './recovery/codex-identity.js';
+import { currentLocalCodexHome, normalizedCodexHome } from './recovery/codex-home.js';
 import { CodexInputProofTracker, type CodexInputProof } from './recovery/codex-input-proof.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight } from './recovery/types.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
 import { readRebootIdentityFence, RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
-import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from './session-env-clamp.js';
+import {
+  clampRecoveryLaunchForOwner,
+  clampExternalCliConfigsForOwner,
+  clampEnvOverridesForOwner,
+} from './session-env-clamp.js';
 import {
   launchModelFor,
   readScreenModel,
@@ -664,6 +669,9 @@ export class Session extends EventEmitter {
   private _mux: TerminalMultiplexer | null = null;
   private _muxSession: MuxSession | null = null;
   private _preserveExitedPane = false;
+  private _recoveryCodexHome?: string;
+  private _codexRestoreGuard?: CodexRestoreLaunchGuard;
+  private _codexRestoreWorkerMayExist = false;
   private _useMux: boolean = false;
   /**
    * The agent in this session's local tmux pane has exited (Ark0N/Codeman#446).
@@ -877,6 +885,8 @@ export class Session extends EventEmitter {
       lastSubmitAt?: number;
       /** Boot recovery attaches to an exited Codex pane; only its durable controller may relaunch it. */
       preserveExitedPane?: boolean;
+      /** Trusted exact local home from verified launch provenance, private to restoration. */
+      recoveryCodexHome?: string;
       /** Restored conversation chain, oldest first (see `claudeSessionChain`). */
       claudeSessionChain?: string[];
       /** Restored agent-exit observation for this session's pane (see `paneExit`). */
@@ -962,6 +972,7 @@ export class Session extends EventEmitter {
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this._muxSession = config.muxSession || null;
     this._preserveExitedPane = config.preserveExitedPane ?? false;
+    this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
     this._recoveryUntrackedInput =
       getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
       readRebootIdentityFence(this.id)?.untrackedInput === true;
@@ -2080,6 +2091,7 @@ export class Session extends EventEmitter {
     spawnErrLabel: string;
   }): Promise<{ isRestored: boolean; respawnedResumeId?: string; respawnedDeadPane: boolean }> {
     const mux = this._mux!;
+    if (this._codexRestoreGuard && this._muxSession) throw new Error('Reboot restoration cannot attach to a pane');
     const preserveExitedPane = this._preserveExitedPane;
     this._preserveExitedPane = false;
 
@@ -2156,6 +2168,11 @@ export class Session extends EventEmitter {
           options.createSessionOptions.resumeSessionId = pinned;
           this._resumeSessionId = pinned;
         }
+      }
+      if (this._codexRestoreGuard) {
+        await this._codexRestoreGuard.prepare();
+        if (this._codexRestoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+        options.createSessionOptions.codexRestoreGuard = this._codexRestoreGuard;
       }
       this._muxSession = await mux.createSession(options.createSessionOptions);
       console.log('[Session] Created mux session:', this._muxSession.muxName);
@@ -2348,9 +2365,17 @@ export class Session extends EventEmitter {
       remoteOwned: !!this._remote && this._remote.owned !== false,
       noDaemon:
         this._muxSession?.recoveryIsolated === true &&
+        (this._remote
+          ? normalizedCodexHome(this._envOverrides?.CODEX_HOME) !== undefined
+          : normalizedCodexHome(this._muxSession.recoveryCodexHome) !== undefined &&
+            (this._envOverrides?.CODEX_HOME === undefined ||
+              normalizedCodexHome(this._envOverrides.CODEX_HOME) ===
+                normalizedCodexHome(this._muxSession.recoveryCodexHome))) &&
         this._codexConfig?.noDaemon === true &&
         /(?:^|\s)--no-daemon(?:\s|$)/.test(command ?? ''),
-      codexHome: this._envOverrides?.CODEX_HOME,
+      codexHome: this._remote
+        ? this._envOverrides?.CODEX_HOME
+        : normalizedCodexHome(this._muxSession?.recoveryCodexHome),
     };
   }
 
@@ -2539,10 +2564,12 @@ export class Session extends EventEmitter {
   async restoreMissingRemoteWorker(
     conversationId: string,
     generation: number,
-    isCurrent: () => boolean = () => true
+    isCurrent: () => boolean = () => true,
+    dispatch?: () => Promise<'sent' | 'not-sent' | 'unknown'>
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
     if (
+      !dispatch ||
       !isCurrent() ||
       !context.managed ||
       !context.remoteOwned ||
@@ -2557,6 +2584,8 @@ export class Session extends EventEmitter {
       !this._muxSession
     )
       return 'not-sent';
+    const launchConfig = JSON.stringify(this._codexConfig);
+    const launchEnv = JSON.stringify(this._envOverrides);
     this._recoveryDelivering = true;
     this._submitVerifier?.cancel();
     this._submitVerifier = null;
@@ -2574,6 +2603,8 @@ export class Session extends EventEmitter {
           current.untrackedInput ||
           current.generation !== generation ||
           this._codexConfig?.resumeSessionId !== conversationId ||
+          JSON.stringify(this._codexConfig) !== launchConfig ||
+          JSON.stringify(this._envOverrides) !== launchEnv ||
           JSON.stringify(safeConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
           JSON.stringify(safeEnv) !== JSON.stringify(this._envOverrides)
         )
@@ -2595,15 +2626,66 @@ export class Session extends EventEmitter {
           final.untrackedInput ||
           generation !== final.generation ||
           this._codexConfig?.resumeSessionId !== conversationId ||
+          JSON.stringify(this._codexConfig) !== launchConfig ||
+          JSON.stringify(this._envOverrides) !== launchEnv ||
           !this._mux ||
           !this._muxSession ||
           JSON.stringify(finalConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
           JSON.stringify(finalEnv) !== JSON.stringify(this._envOverrides)
         )
           return 'not-sent';
-        const pid = await this._mux!.respawnPane({ ...this._buildRespawnPaneOptions(), onlyIfDead: true });
+        // The remote mutation rechecks exact identity/home/tail and requires the
+        // owned session to still be absent. A generic wrapper launch could
+        // otherwise recreate work from a stale local transport observation.
+        const result = await dispatch();
+        if (result === 'not-sent') return 'not-sent';
+        if (result !== 'sent') return 'unknown';
+        const [attachedConfig, attachedEnv] = await Promise.all([
+          clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig }),
+          clampEnvOverridesForOwner(this.owner, this._envOverrides),
+        ]);
+        const afterCreate = this.getRecoveryContext();
+        if (
+          !isCurrent() ||
+          !afterCreate.managed ||
+          !afterCreate.remoteOwned ||
+          !afterCreate.noDaemon ||
+          afterCreate.switchPending ||
+          afterCreate.untrackedInput ||
+          afterCreate.generation !== generation ||
+          this._codexConfig?.resumeSessionId !== conversationId ||
+          JSON.stringify(this._codexConfig) !== launchConfig ||
+          JSON.stringify(this._envOverrides) !== launchEnv ||
+          JSON.stringify(attachedConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(attachedEnv) !== JSON.stringify(this._envOverrides)
+        )
+          return 'unknown'; // Remote creation already happened; never certify an unsent cancellation.
+        const pid = await this._mux!.respawnPane({
+          ...this._buildRespawnPaneOptions(),
+          onlyIfDead: true,
+          remoteAttachOnly: true,
+        });
         if (!pid) return 'unknown';
         this.clearPaneExitForNewPane();
+        const [settledConfig, settledEnv] = await Promise.all([
+          clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig }),
+          clampEnvOverridesForOwner(this.owner, this._envOverrides),
+        ]);
+        const afterAttach = this.getRecoveryContext();
+        if (
+          !isCurrent() ||
+          !afterAttach.managed ||
+          !afterAttach.remoteOwned ||
+          !afterAttach.noDaemon ||
+          afterAttach.switchPending ||
+          afterAttach.untrackedInput ||
+          afterAttach.generation !== generation ||
+          JSON.stringify(this._codexConfig) !== launchConfig ||
+          JSON.stringify(this._envOverrides) !== launchEnv ||
+          JSON.stringify(settledConfig.codexConfig) !== launchConfig ||
+          JSON.stringify(settledEnv) !== launchEnv
+        )
+          return 'unknown';
         return 'sent';
       });
     } catch {
@@ -2618,7 +2700,8 @@ export class Session extends EventEmitter {
     flight: RecoveryFlight,
     generation: number,
     isCurrent: () => boolean = () => true,
-    prompt: string = CONTINUATION_PROMPT
+    prompt: string = CONTINUATION_PROMPT,
+    confirmEvidence?: () => boolean
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
     if (
@@ -2637,13 +2720,27 @@ export class Session extends EventEmitter {
     try {
       return await this._withPaneLifecycle(async () => {
         const pane = await this.inspectRecoveryPane();
-        const safeConfig = await clampExternalCliConfigsForOwner(this.owner, { codexConfig: this._codexConfig });
-        const safeEnv = await clampEnvOverridesForOwner(this.owner, this._envOverrides);
+        const envToAuthorize =
+          context.codexHome !== currentLocalCodexHome()
+            ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
+            : this._envOverrides;
+        const granted = await clampRecoveryLaunchForOwner(
+          this.owner,
+          { codexConfig: this._codexConfig },
+          envToAuthorize
+        );
         if (
-          JSON.stringify(safeConfig.codexConfig) !== JSON.stringify(this._codexConfig) ||
-          JSON.stringify(safeEnv) !== JSON.stringify(this._envOverrides)
+          JSON.stringify(granted.configs.codexConfig) !== JSON.stringify(this._codexConfig) ||
+          JSON.stringify(granted.env) !== JSON.stringify(envToAuthorize)
         )
           return 'not-sent';
+        if (confirmEvidence) {
+          try {
+            if (confirmEvidence() !== true) return 'not-sent';
+          } catch {
+            return 'not-sent';
+          }
+        }
         const currentContext = this.getRecoveryContext();
         if (
           !isCurrent() ||
@@ -2752,6 +2849,7 @@ export class Session extends EventEmitter {
       ompConfig: this._ompConfig,
       resumeSessionId: this._resumeSessionId,
       envOverrides: this._envOverrides,
+      recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
       unsetEnvKeys: this._pendingEnvUnsets.size > 0 ? [...this._pendingEnvUnsets] : undefined,
       effort: this._effort,
       advisorModel: this._advisorModel,
@@ -3089,6 +3187,49 @@ export class Session extends EventEmitter {
     this.emit('output', data);
   }
 
+  /** Private route-to-launch authority for one tentative local Codex reboot restoration. */
+  setCodexRestoreLaunchGuard(guard: CodexRestoreLaunchGuard | undefined): void {
+    if (
+      guard &&
+      (this._remote ||
+        this._docker ||
+        this._muxSession ||
+        !this._useMux ||
+        !this._mux ||
+        this._codexConfig?.noDaemon !== true ||
+        getCli(this.mode)?.capabilities.recovery !== 'codex-rollout')
+    )
+      throw new Error('Reboot restoration guard requires local Codex');
+    const generation = this._recoveryGeneration;
+    const config = JSON.stringify(this._codexConfig);
+    const env = JSON.stringify(this._envOverrides);
+    this._codexRestoreGuard = guard
+      ? {
+          prepare: () => guard.prepare(),
+          noteDispatch: () => {
+            this._codexRestoreWorkerMayExist = true;
+            guard.noteDispatch?.();
+          },
+          confirm: () =>
+            !this._closing &&
+            !this._isStopped &&
+            generation === this._recoveryGeneration &&
+            config === JSON.stringify(this._codexConfig) &&
+            env === JSON.stringify(this._envOverrides) &&
+            guard.confirm() === true,
+        }
+      : undefined;
+  }
+
+  get codexRestoreWorkerMayExist(): boolean {
+    return this._codexRestoreWorkerMayExist;
+  }
+
+  /** Release tentative protection only after a complete successful restoration commit. */
+  commitCodexRestoreLaunch(): void {
+    this._codexRestoreWorkerMayExist = false;
+  }
+
   async startInteractive(): Promise<void> {
     if (this._inputDeliveryInFlight) throw new Error('Session recovery is in progress');
     if (this.ptyProcess) {
@@ -3228,6 +3369,7 @@ export class Session extends EventEmitter {
             ompConfig: this._ompConfig,
             resumeSessionId: this._resumeSessionId,
             envOverrides: this._envOverrides,
+            recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
             effort: this._effort,
             advisorModel: this._advisorModel,
             historyLimit: this._tmuxHistoryLimit,
@@ -3317,6 +3459,7 @@ export class Session extends EventEmitter {
           this._armPaneSettle(true);
         }
       } catch (err) {
+        if (this._codexRestoreGuard) throw err;
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;
         this._muxSession = null;
@@ -4141,6 +4284,7 @@ export class Session extends EventEmitter {
             mode: 'shell',
             niceConfig: this._niceConfig,
             envOverrides: this._envOverrides,
+            recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
             historyLimit: this._tmuxHistoryLimit,
             remote: this._remote,
             docker: this._docker,
@@ -4153,6 +4297,7 @@ export class Session extends EventEmitter {
             name: this._name,
             niceConfig: this._niceConfig,
             envOverrides: this._envOverrides,
+            recoveryCodexHome: this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
             historyLimit: this._tmuxHistoryLimit,
             remote: this._remote,
             docker: this._docker,
@@ -5065,7 +5210,7 @@ export class Session extends EventEmitter {
         this._commitWriteInput(options); // unknown partial send, never reopen for replay
         throw err;
       }
-      if (!sent && options.inputSeq) {
+      if (!sent) {
         // The mux can type text successfully and fail its separate Enter send.
         // A false result after dispatch is not a certificate that nothing landed.
         this._commitWriteInput(options);
@@ -5358,6 +5503,7 @@ export class Session extends EventEmitter {
    * ```
    */
   async stop(killMux: boolean = true): Promise<void> {
+    if (this._codexRestoreWorkerMayExist) killMux = false;
     // Set stopped flag first to prevent new timers from being created
     this._isStopped = true;
     this._namedKeyAbort?.abort();

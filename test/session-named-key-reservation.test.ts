@@ -21,6 +21,7 @@ function fixture() {
     muxName: 'codeman-aaaaaaaa',
     sessionId: SID,
     recoveryIsolated: true,
+    recoveryCodexHome: '/fixture/codex-home',
     pid: 99999,
     createdAt: Date.now(),
     workingDir: '/tmp',
