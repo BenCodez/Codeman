@@ -96,11 +96,14 @@ export class RecoveryController {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
     const flight = this.state.inFlight;
-    const observeFlight = !!flight && !this.flightObservationComplete && this.state.lastReason !== 'persistence-failed';
+    const observeFlight =
+      !!flight &&
+      (flight.accepted || !this.flightObservationComplete) &&
+      this.state.lastReason !== 'persistence-failed';
     const automate = !flight && this.state.config.enabled && !this.state.circuitOpen;
     if (!this.stopped && (automate || observeFlight)) {
       const delay =
-        flight && observeFlight
+        flight && observeFlight && !flight.accepted
           ? Math.min(POLL_MS, Math.max(0, flight.startedAt + ACCEPTANCE_TIMEOUT_MS - this.now()))
           : POLL_MS;
       this.timer = setTimeout(() => {
