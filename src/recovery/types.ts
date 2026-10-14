@@ -92,10 +92,28 @@ export interface RecoveryObservation {
   progressAt?: number;
   submissionHash?: string;
   processReady?: boolean;
-  /** A matching remote pane was directly observed live at this time before a newly detected crash. */
+  /** Conservative start of the current bounded live-pane read, independent of historical rollout time. */
+  processReadyAt?: number;
+  /** A matching owned pane was directly observed live at this time before a newly detected crash. */
   liveProofAt?: number;
   /** Adapter revalidates ownership, identity, process state and empty composer immediately before acting. */
   safeToAct: boolean;
+}
+
+/** Fresh live-pane readiness confirms a restart; historical rollout content cannot. */
+export function hasFreshProcessReady(observation: RecoveryObservation, startedAt: number, now: number): boolean {
+  const at = observation.processReadyAt;
+  return (
+    observation.processReady === true &&
+    ['idle', 'working', 'completed'].includes(observation.activity) &&
+    Number.isFinite(startedAt) &&
+    startedAt >= 0 &&
+    typeof at === 'number' &&
+    Number.isFinite(at) &&
+    at >= startedAt &&
+    at <= now &&
+    now - at <= 30_000
+  );
 }
 
 export interface RecoveryEvent {
@@ -106,6 +124,8 @@ export interface RecoveryEvent {
 }
 
 export interface RecoveryFlight {
+  accepted?: boolean;
+  acceptedAt?: number;
   key: string;
   action: RecoveryAction;
   conversationId: string;

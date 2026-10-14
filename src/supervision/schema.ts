@@ -113,9 +113,12 @@ export const TaskStateSchema = z
     agentProgressVeto: z.boolean().optional(),
     inFlight: z
       .object({
-        key: z.string().max(250),
+        key: z.string().min(1).max(250),
         startedAt: z.number(),
         promptHash: z.string().max(64).optional(),
+        action: z.enum(['continue', 'restart']).optional(),
+        accepted: z.boolean().optional(),
+        acceptedAt: z.number().finite().nonnegative().optional(),
         previousSubmissionKey: z.string().max(100).optional(),
       })
       .strict()
@@ -123,7 +126,29 @@ export const TaskStateSchema = z
     handledEvidence: z.array(z.string().max(250)).max(32),
     history: z.array(z.object({ at: z.number(), reason: z.string().max(80) }).strict()).max(100),
   })
-  .strict();
+  .strict()
+  .refine(
+    (state) => {
+      const flight = state.inFlight;
+      if (!flight?.accepted) return true;
+      return (
+        !!state.conversationId &&
+        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(state.conversationId) &&
+        Number.isFinite(flight.startedAt) &&
+        flight.startedAt >= 0 &&
+        flight.acceptedAt !== undefined &&
+        flight.acceptedAt >= flight.startedAt &&
+        state.handledEvidence.includes(flight.key) &&
+        (flight.action === 'restart'
+          ? !flight.promptHash
+          : flight.action === 'continue' &&
+            /^[a-f0-9]{64}$/.test(flight.promptHash ?? '') &&
+            !!state.submissionKey &&
+            state.submissionKey !== flight.previousSubmissionKey)
+      );
+    },
+    { message: 'Accepted delivery evidence is incomplete', path: ['inFlight'] }
+  );
 export function initialTaskState(): SupervisionTaskState {
   return {
     version: 1,

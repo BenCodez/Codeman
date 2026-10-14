@@ -57,6 +57,10 @@ Object.assign(CodemanApp.prototype, {
     const self = this;
     const terminal = target.terminal || this.terminal;
     const sessionId = target.sessionId || this.activeSessionId;
+    const isCurrent = () => (!target.isCurrent || target.isCurrent()) &&
+      (target.sessionId || (this.activeSessionId === sessionId && this.terminal === terminal));
+    if (!terminal || !sessionId) return;
+    this._activePasteCleanup?.();
 
     // Create a hidden contenteditable div to receive the paste
     const trap = document.createElement('div');
@@ -64,6 +68,18 @@ Object.assign(CodemanApp.prototype, {
     trap.style.cssText = 'position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;overflow:hidden';
     document.body.appendChild(trap);
     trap.focus();
+
+    let timeout;
+    const cleanup = () => {
+      clearTimeout(timeout);
+      const restoreFocus = document.activeElement === trap && isCurrent();
+      if (trap.parentNode) trap.parentNode.removeChild(trap);
+      if (self._activePasteCleanup === cleanup) self._activePasteCleanup = null;
+      pasteConsumed = true;
+      if (restoreFocus) terminal.focus();
+    };
+    this._activePasteCleanup = cleanup;
+    timeout = setTimeout(cleanup, 2000);
 
     // One Ctrl+V can deliver TWO paste events to this trap. The
     // execCommand('paste') below fires one wherever the browser honours that
@@ -81,6 +97,11 @@ Object.assign(CodemanApp.prototype, {
       e.preventDefault();
       if (pasteConsumed) return;
       pasteConsumed = true;
+      if (!isCurrent()) {
+        cleanup();
+        self.showToast?.('Paste cancelled because the target terminal changed', 'warning');
+        return;
+      }
 
       // Check for images in clipboard items
       var imageFiles = [];
@@ -95,11 +116,7 @@ Object.assign(CodemanApp.prototype, {
       }
 
       // Clean up the trap
-      setTimeout(function() {
-        if (trap.parentNode) trap.parentNode.removeChild(trap);
-        // Refocus the terminal
-        if (terminal) terminal.focus();
-      }, 0);
+      setTimeout(cleanup, 0);
 
       if (imageFiles.length > 0) {
         self._uploadAndInsertImages(imageFiles, { sessionId: sessionId });
@@ -111,13 +128,22 @@ Object.assign(CodemanApp.prototype, {
         // indistinguishable from typed input, weakening the CLI's
         // prompt-injection defenses.
         var text = e.clipboardData ? e.clipboardData.getData('text/plain') : '';
-        if (text && terminal) terminal.paste(text);
+        if (text) {
+          // Replay can reset xterm's mode mirror while Codex still expects
+          // bracketed text. Keep multiline clipboard input inside the composer.
+          if (self.sessions?.get(sessionId)?.mode === 'codex' && typeof terminal.input === 'function') {
+            terminal.input(`\x1b[200~${text.replace(/\r?\n/g, '\r')}\x1b[201~`, true);
+          } else terminal.paste(text);
+        }
       }
     });
 
     // Trigger the browser's native paste via execCommand
     // (this fires the paste event on our focused trap element)
-    document.execCommand('paste');
+    try { document.execCommand('paste'); } catch {
+      // The key's native paste may still arrive. The bounded cleanup restores
+      // focus when clipboard permission prevents either browser path.
+    }
   },
 
   // Max images accepted in one batch (paste / drop / mobile picker). Each is

@@ -188,6 +188,96 @@ function fixture() {
   return Object.assign(state, { session, adapter, persist, deps });
 }
 
+describe('fresh process readiness provenance', () => {
+  it.each([
+    'ready',
+    'missing-id',
+    'missing-pid',
+    'dead',
+    'blank-screen',
+    'truncated',
+    'bounded-delay',
+    'expired-delay',
+    'backward',
+  ] as const)('keeps current live readiness separate from historical rollout time: %s', async (change) => {
+    const f = fixture();
+    f.identity.tail = completedTail();
+    f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 1234 };
+    if (change === 'missing-id') delete f.pane.paneId;
+    if (change === 'missing-pid') delete f.pane.panePid;
+    if (change === 'dead') f.pane = { dead: true, screen: null, status: 1, paneId: '%7', panePid: 1234 };
+    if (change === 'blank-screen') f.pane.screen = '';
+    if (change === 'truncated') f.identity.tailTruncated = true;
+    if (['bounded-delay', 'expired-delay', 'backward'].includes(change)) {
+      resolver.mockImplementation(async () => {
+        vi.setSystemTime(NOW + (change === 'bounded-delay' ? 30000 : change === 'expired-delay' ? 30001 : -1));
+        return structuredClone(f.identity);
+      });
+    }
+    const observation = await f.adapter.observe();
+    if (change === 'ready' || change === 'bounded-delay') {
+      expect(observation).toMatchObject({
+        activity: 'completed',
+        processReady: true,
+        processReadyAt: NOW,
+        at: NOW - 9000,
+      });
+    } else expect(observation.processReadyAt).toBeUndefined();
+  });
+});
+
+describe('bounded live-pane provenance', () => {
+  it.each([
+    'observed',
+    'first-dead',
+    'missing-id',
+    'changed-id',
+    'changed-pid',
+    'generation',
+    'configuration',
+    'expired',
+    'backward',
+    'unknown-between',
+  ] as const)('binds crash live proof to a recent matching native observation (%s)', async (change) => {
+    const f = fixture();
+    f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 1234 };
+    f.identity.tail = completedTail();
+    if (change === 'missing-id') delete f.pane.paneId;
+    if (change !== 'first-dead') await f.adapter.observe();
+    if (change === 'unknown-between') {
+      f.pane = null;
+      await f.adapter.observe();
+    }
+    const now = change === 'expired' ? NOW + 31_000 : change === 'backward' ? NOW - 1 : NOW + 1000;
+    vi.setSystemTime(now);
+    f.pane = {
+      dead: true,
+      status: 1,
+      screen: null,
+      paneId: change === 'changed-id' ? '%8' : '%7',
+      panePid: change === 'changed-pid' ? 1235 : 1234,
+    };
+    f.session.paneExit = { at: now, status: 1 };
+    f.identity.tail = failedTail();
+    if (change === 'generation') f.context.generation++;
+    if (change === 'configuration')
+      f.session.codexConfig = { ...f.session.codexConfig, model: 'different-fixture-model' };
+    const observation = await f.adapter.observe();
+    expect(observation.activity).toBe('crashed');
+    if (change === 'observed') {
+      expect(observation.liveProofAt).toBe(NOW);
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(true);
+      await f.adapter.observe();
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(true);
+      vi.setSystemTime(NOW + 31_001);
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(false);
+    } else {
+      expect(observation.liveProofAt).toBeUndefined();
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(false);
+    }
+  });
+});
+
 async function withRollout(
   body: string,
   check: (f: ReturnType<typeof fixture>, writeBody: (nextBody: string) => Promise<void>) => Promise<void>
@@ -750,6 +840,95 @@ describe('owned remote evidence and mutation', () => {
     return f;
   }
 
+  it.each([
+    'unchanged',
+    'owner',
+    'config',
+    'env',
+    'home',
+    'generation',
+    'pane',
+    'expired',
+    'transport',
+    'cancelled',
+  ] as const)('binds remote task crash dispatch to current private live provenance: %s', async (change) => {
+    const f = remoteFixture();
+    const task = new CodexTaskAdapter(f.session as unknown as Session, f.persist, f.deps);
+    await task.observe();
+    vi.setSystemTime(NOW + 1000);
+    const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+    evidence.clock = clockAt();
+    evidence.pane = { dead: true, status: 9, paneId: '%7', panePid: 700, screen: null };
+    const { observation } = await task.observe();
+    expect(observation).toMatchObject({ activity: 'crashed', liveProofAt: NOW });
+    if (change === 'owner') f.session.owner = 'other-owner';
+    if (change === 'config') f.session.codexConfig.model = 'other-model';
+    if (change === 'env') f.env = { FIXTURE_SETTING: 'changed' };
+    if (change === 'home') f.context.codexHome = '/fixture/other-home';
+    if (change === 'generation') f.context.generation++;
+    if (change === 'pane') evidence.pane.panePid = 701;
+    if (change === 'expired') vi.setSystemTime(NOW + 30_001);
+    if (change === 'transport') {
+      f.deps.inspectRemote = vi.fn(
+        async () =>
+          ({ transport: 'unreachable', session: 'unknown', identity: { reason: 'unverified' } }) as RemoteCodexEvidence
+      );
+      await task.observe();
+      f.deps.inspectRemote = vi.fn(async () => structuredClone(evidence));
+    }
+    expect(await task.recover(observation, () => change !== 'cancelled')).toBe(
+      change === 'unchanged' ? 'sent' : 'not-sent'
+    );
+    expect(f.deps.restartRemote).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it('dates remote live provenance at the read start when the task is enabled during the remote observation', async () => {
+    const f = remoteFixture();
+    const read = createDeferred<RemoteCodexEvidence>();
+    f.deps.inspectRemote = vi
+      .fn()
+      .mockReturnValueOnce(read.promise)
+      .mockImplementation(async () => structuredClone(f.remoteEvidence));
+    const task = new CodexTaskAdapter(f.session as unknown as Session, f.persist, f.deps);
+    const inspecting = task.observe();
+    await vi.waitFor(() => expect(f.deps.inspectRemote).toHaveBeenCalledOnce());
+    vi.setSystemTime(NOW + 1000);
+    read.resolve({
+      ...f.remoteEvidence,
+      clock: { localBefore: NOW, localAfter: NOW + 1000, remoteBefore: NOW, remoteAfter: NOW + 1000 },
+    } as RemoteCodexEvidence);
+    expect((await inspecting).observation.processReadyAt).toBe(NOW);
+    vi.setSystemTime(NOW + 2000);
+    const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+    evidence.clock = clockAt();
+    evidence.pane = { dead: true, status: 9, paneId: '%7', panePid: 700, screen: null };
+    const { observation } = await task.observe();
+    expect(observation.liveProofAt).toBe(NOW);
+    expect(observation.liveProofAt).toBeLessThan(NOW + 500); // The owner's mid-read enable boundary.
+  });
+
+  it.each(['current', 'stale', 'future', 'missing-id', 'invalid-pid', 'dead', 'blocked'] as const)(
+    'exports fresh remote restart readiness only from a bounded current live pane: %s',
+    async (proof) => {
+      const f = remoteFixture();
+      const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+      evidence.identity.tail = completedTail();
+      if (proof === 'stale') vi.setSystemTime(NOW + 30_001);
+      if (proof === 'future') evidence.clock = clockAt(NOW + 1);
+      if (proof === 'missing-id') evidence.pane!.paneId = '';
+      if (proof === 'invalid-pid') evidence.pane!.panePid = NaN;
+      if (proof === 'dead') evidence.pane = { dead: true, status: 9, paneId: '%7', panePid: 700, screen: null };
+      if (proof === 'blocked')
+        evidence.identity.tail +=
+          event({ type: 'error', message: 'Authentication required', codex_error_info: 'unauthorized' }, NOW - 1) +
+          '\n';
+      const observation = await f.adapter.observe();
+      expect(observation.processReadyAt).toBe(proof === 'current' ? NOW : undefined);
+      if (proof === 'current') expect(observation).toMatchObject({ activity: 'completed', processReady: true });
+    }
+  );
+
   it.each(['missing-clock', 'malformed-clock', 'legacy-submission', 'changed-clock'] as const)(
     'refuses identity and task command authority from %s even with a claimed verified tail',
     async (fault) => {
@@ -1224,9 +1403,11 @@ describe('owned remote evidence and mutation', () => {
       },
     };
     vi.setSystemTime(NOW - 10_000);
+    f.remoteEvidence.clock = clockAt();
     await f.adapter.observe();
     f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
     vi.setSystemTime(NOW - 5000);
+    f.remoteEvidence.clock = clockAt();
     expect(await f.adapter.observe()).toMatchObject({
       activity: 'crashed',
       at: NOW - 5000,

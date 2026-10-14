@@ -1,4 +1,4 @@
-/** Actual Session/TmuxManager effect boundaries, exclusively injected children and temporary owner data. */
+/** @fileoverview Actual Session/TmuxManager effect boundaries, exclusively injected children and temporary owner data. */
 import { mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -22,6 +22,15 @@ vi.mock('node:child_process', async (original) => {
       throw new Error('Unmocked process effect forbidden');
     },
     spawn: () => {
+      throw new Error('Unmocked process effect forbidden');
+    },
+    execFileSync: () => {
+      throw new Error('Unmocked process effect forbidden');
+    },
+    spawnSync: () => {
+      throw new Error('Unmocked process effect forbidden');
+    },
+    fork: () => {
       throw new Error('Unmocked process effect forbidden');
     },
   };
@@ -144,6 +153,80 @@ async function fixture(action: 'continue' | 'restart') {
 function commands() {
   return effects.exec.mock.calls.map(([command]) => String(command));
 }
+
+describe('native recovery pane frame validation', () => {
+  it.each([
+    '1|9|garbage|%7|700',
+    '1|9|KILL|%7|700',
+    '1|0|TERM|%7|700',
+    '0|0||%7|700',
+    '0||KILL|%7|700',
+    '1|garbage|9|%7|700',
+    '1|9||%7|700|extra',
+    '1|9||%7',
+    '1|9||%7|700\n1|9||%8|701',
+    '1|9||%7|700\n\n',
+    '1|9||%7|700\r\n',
+    '1|-1||%7|700',
+    '1|100000||%7|700',
+    '1|256||%7|700',
+    '1|9|99999|%7|700',
+    '1|9|-1|%7|700',
+    '1|9|100000|%7|700',
+    '1|9||%999999999999999999999|700',
+    '1|9||%7;touch|700',
+    '1|9||%07|700',
+    '1|9||%7|0',
+    '1|9||%7|-1',
+    '1|9||%7|700 ',
+    '1|9||%7|700x',
+    '1|9||%7|999999999999',
+    '1||NOTASIGNAL|%7|700',
+    '1||TERM;touch|%7|700',
+    '1||SIGKILL|%7|700',
+    '1||kill|%7|700',
+    '2|9||%7|700',
+    '1|9| |%7|700',
+    '0|garbage||%7|700',
+  ])('rejects the whole malformed native frame before screen capture: %j', async (frame) => {
+    const manager = Object.create(TmuxManager.prototype) as ManagerType;
+    Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
+    effects.exec.mockResolvedValue({ stdout: frame, stderr: '' });
+    expect(await manager.inspectPaneForRecovery('codeman-aaaaaaaa')).toBeNull();
+    expect(commands()).toHaveLength(1);
+    expect(commands()[0]).toContain('list-panes');
+    expect(commands().some((command) => command.includes('capture-pane'))).toBe(false);
+  });
+  it.each([
+    { frame: '1|9||%7|700\n', dead: true, status: 9, signal: undefined },
+    { frame: '1||9|%7|700', dead: true, status: undefined, signal: 9 },
+    { frame: '1||KILL|%7|700', dead: true, status: undefined, signal: 9 },
+    { frame: '1||TERM|%7|700', dead: true, status: undefined, signal: 15 },
+    { frame: '1|0|0|%0|700', dead: true, status: 0, signal: 0 },
+    { frame: '0|||%7|700\n', dead: false, status: undefined, signal: undefined },
+  ])(
+    'accepts a complete bounded native frame with normal empty exit fields: $frame',
+    async ({ frame, dead, status, signal }) => {
+      const manager = Object.create(TmuxManager.prototype) as ManagerType;
+      Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
+      effects.exec.mockImplementation(async (command: string) => {
+        if (command.includes('list-panes')) return { stdout: frame, stderr: '' };
+        if (command.includes('capture-pane')) return { stdout: 'Sanitized ready screen', stderr: '' };
+        throw new Error('Unmocked native command forbidden');
+      });
+      expect(await manager.inspectPaneForRecovery('codeman-aaaaaaaa')).toEqual({
+        dead,
+        status,
+        signal,
+        paneId: frame.includes('%0') ? '%0' : '%7',
+        panePid: 700,
+        paneSignalToken: frame.split('|')[2],
+        screen: dead ? null : 'Sanitized ready screen',
+      });
+      expect(commands()).toHaveLength(dead ? 1 : 2);
+    }
+  );
+});
 
 describe('native continuation after literal input', () => {
   it.each(['unchanged', 'cancel', 'grant', 'delay-cancel', 'delay-grant', 'evidence', 'config', 'stop', 'exception'])(

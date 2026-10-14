@@ -14,7 +14,7 @@ import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import { initialTaskState } from '../src/supervision/schema.js';
 import { TaskStore } from '../src/supervision/store.js';
 import { RecoveryStore } from '../src/recovery/store.js';
-import { SessionActionArbiter } from '../src/supervision/action-arbiter.js';
+import { SessionActionArbiter, sessionActionKey } from '../src/supervision/action-arbiter.js';
 import { createDeferred } from './mocks/index.js';
 import {
   CONTINUATION_PROMPT,
@@ -100,6 +100,50 @@ afterAll(async () => {
 });
 
 describe('task and recovery server action wiring', () => {
+  it.each([true, false])(
+    'binds uncertain remote restoration to its exact flight and fresh acceptance (%s)',
+    async (fresh) => {
+      let observation: RecoveryObservation = {
+        activity: 'unknown',
+        reason: 'remote-session-missing',
+        at: Date.now(),
+        conversationId: flight.conversationId,
+        safeToAct: false,
+      };
+      const observe = vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => observation);
+      const restore = vi.spyOn(CodexRecoveryAdapter.prototype, 'restoreMissingRemote').mockResolvedValue('unknown');
+      const act = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const id = `remote-restore-acceptance-${fresh}`;
+      const { recovery, recoveryDeps } = controllers(id);
+      try {
+        await recovery.restoreMissingRemote();
+        const pending = recovery.getStatus().inFlight!;
+        expect(pending.action).toBe('restart');
+        expect(internals.actionReservationStore.get(id).inFlight?.key).toBe(sessionActionKey('recovery', pending.key));
+        observation = {
+          activity: 'idle',
+          reason: 'observing',
+          at: 1,
+          conversationId: flight.conversationId,
+          processReady: true,
+          processReadyAt: fresh ? Date.now() : undefined,
+          safeToAct: false,
+        };
+        await recovery.inspect();
+        expect(restore).toHaveBeenCalledOnce();
+        expect(!!recovery.getStatus().inFlight).toBe(!fresh);
+        expect(!!internals.actionReservationStore.get(id).inFlight).toBe(!fresh);
+        expect(await recoveryDeps.act(flight, () => true)).toBe(fresh ? 'sent' : 'not-sent');
+        expect(act).toHaveBeenCalledTimes(fresh ? 1 : 0);
+      } finally {
+        await recovery.reset();
+        observe.mockRestore();
+        restore.mockRestore();
+        act.mockRestore();
+      }
+    }
+  );
+
   it('keeps a task-owned unknown delivery reserved when recovery is reset', async () => {
     vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValueOnce('unknown');
     const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
@@ -189,6 +233,7 @@ describe('task and recovery server action wiring', () => {
 
     const crash = {
       activity: 'crashed' as const,
+      liveProofAt: Date.now(),
       reason: 'process-crashed' as const,
       at: Date.now() + 1000,
       conversationId: flight.conversationId,
@@ -616,6 +661,13 @@ describe('task and recovery server action wiring', () => {
   });
 
   it('shares the recovery reservation and task phase guards for missing remote restoration', async () => {
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockResolvedValue({
+      activity: 'unknown',
+      reason: 'remote-session-missing',
+      at: Date.now(),
+      conversationId: flight.conversationId,
+      safeToAct: false,
+    });
     vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({
       observation: {
         activity: 'completed',
@@ -629,16 +681,19 @@ describe('task and recovery server action wiring', () => {
     });
     const restore = vi.spyOn(CodexRecoveryAdapter.prototype, 'restoreMissingRemote').mockResolvedValue('unknown');
     const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
-    const { task, taskDeps, recovery, recoveryDeps } = controllers('remote-restore-action-boundary');
+    const { task, taskDeps, recovery } = controllers('remote-restore-action-boundary');
     await task.update({
       objective: 'Verify remote work',
       criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
       config: { enabled: true },
     });
-    expect(await recoveryDeps.restoreMissingRemote!(() => true)).toBe('not-sent');
+    await recovery.restoreMissingRemote();
+    expect(recovery.getStatus().inFlight).toBeUndefined();
     expect(restore).not.toHaveBeenCalled();
     await task.pause();
-    expect(await recoveryDeps.restoreMissingRemote!(() => true)).toBe('unknown');
+    await recovery.restoreMissingRemote();
+    expect(recovery.getStatus().inFlight).toBeDefined();
+    expect(restore).toHaveBeenCalledOnce();
     await task.reset();
     expect(await taskDeps.act('task-key', flight.conversationId, 'continue', () => true)).toBe('not-sent');
     expect(taskAct).not.toHaveBeenCalled();

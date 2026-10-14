@@ -7,12 +7,14 @@ import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import type { RecoveryController, RecoveryDependencies } from '../src/recovery/controller.js';
 import type { TaskController } from '../src/supervision/controller.js';
 import { initialTaskState } from '../src/supervision/schema.js';
+import { sessionActionKey } from '../src/supervision/action-arbiter.js';
 import type { TaskStore } from '../src/supervision/store.js';
 import { createDeferred } from './mocks/index.js';
 
 interface Internals {
   sessions: Map<string, Session>;
   taskStore: TaskStore;
+  actionReservationStore: TaskStore;
   getTaskController(session: Session): TaskController | undefined;
   getRecoveryController(session: Session): RecoveryController | undefined;
   stopRecoveryController(id: string, drop: boolean): Promise<void>;
@@ -104,15 +106,20 @@ it.each(['unchanged', 'late-veto'] as const)(
       input();
       return 'sent';
     });
-    const restoring = deps.restoreMissingRemote!(() => true);
+    const restoring = recovery.restoreMissingRemote();
     await entered.promise;
+    const flight = recovery.getStatus().inFlight;
+    expect(flight).toBeDefined();
+    expect(internals.actionReservationStore.get(ID).inFlight?.key).toBe(sessionActionKey('recovery', flight!.key));
     try {
       if (change === 'late-veto')
         await internals.taskStore.save(ID, { ...initialTaskState(), agentProgressVeto: true });
     } finally {
       release.resolve();
     }
-    expect(await restoring).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+    const result = await restoring;
+    expect(result.lastReason).toBe(change === 'unchanged' ? 'process-resumed' : 'delivery-failed');
+    expect(!!result.inFlight).toBe(change === 'unchanged');
     expect(input).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
   }
 );

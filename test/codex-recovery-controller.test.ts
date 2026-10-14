@@ -96,6 +96,7 @@ function acceptedSubmission(patch: Partial<RecoveryObservation> = {}): RecoveryO
     activity: 'working',
     reason: 'turn-running',
     at: Date.now(),
+    processReadyAt: Date.now(),
     conversationId: THREAD,
     safeToAct: false,
     submissionKey: 'new-continuation-user-message',

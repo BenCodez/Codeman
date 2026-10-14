@@ -39,6 +39,7 @@ import { MAX_INPUT_LENGTH } from '../../config/terminal-limits.js';
 import { isAllowedRequestHost, isAllowedRequestOrigin, type HostPolicy } from '../network-auth-policy.js';
 import { WsConnectionRegistry } from '../ws-connection-registry.js';
 import { canAccessOwned, getAuthUser } from '../route-helpers.js';
+import { canQueueInputDispatch, queueInputDispatch } from '../input-dispatch-queue.js';
 
 /** Micro-batch interval for terminal output (ms). Short enough for low latency,
  *  long enough to group Ink's rapid cursor-up redraw sequences into single frames. */
@@ -63,9 +64,6 @@ const DEC_2026_END = '\x1b[?2026l';
 
 /** Max concurrent WS connections per session. Prevents listener/bandwidth multiplication. */
 const MAX_WS_PER_SESSION = 5;
-
-/** Bound queued owner input while an SSH clock read is pending. */
-const MAX_WS_PENDING_INPUT_FRAMES = 512;
 
 /**
  * Track live WS connections per session, keyed by clientId (COD-137).
@@ -172,15 +170,13 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
       const sizingToken = Symbol('ws-desktop-sizing');
       let holdsDesktopClaim = false;
 
-      // EventEmitter does not await message listeners. Keep this socket's input
-      // in arrival order through asynchronous clock admission; resize/pong/close
-      // remain immediate. Tagged identities enter the Session FIFO on arrival.
-      let inputTail = Promise.resolve();
-      let pendingInputFrames = 0;
-      let pendingInputBytes = 0;
+      // EventEmitter does not await message listeners. Keep all sockets for this
+      // exact Session in arrival order through async admission. Resize/pong/close
+      // remain immediate; tagged identities enter the Session FIFO on arrival.
       const handleMessage = async (msg: Record<string, unknown>) => {
         try {
-          if (socket.readyState !== 1 || ctx.sessions.get(id) !== session) return;
+          if (socket.readyState !== 1 || ctx.sessions.get(id) !== session || session.inputDispatchAllowed === false)
+            return;
           if (msg.t === 'i' && typeof msg.d === 'string') {
             if (msg.d.length > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame
@@ -313,10 +309,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
           }
           const cid = typeof msg.cid === 'string' ? msg.cid : null;
           const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
-          if (
-            pendingInputFrames >= MAX_WS_PENDING_INPUT_FRAMES ||
-            pendingInputBytes + msg.d.length > MAX_INPUT_LENGTH
-          ) {
+          if (!canQueueInputDispatch(session, msg.d.length)) {
             if (cid && seq !== null) {
               if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
             } else socket.close(4008, 'Input backlog full');
@@ -326,15 +319,11 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
             return;
           }
-          const bytes = msg.d.length;
-          pendingInputFrames++;
-          pendingInputBytes += bytes;
-          inputTail = inputTail
-            .then(() => handleMessage(msg))
-            .finally(() => {
-              pendingInputFrames--;
-              pendingInputBytes -= bytes;
-            });
+          const paneStartedAt = session.paneStartedAt;
+          void queueInputDispatch(session, msg.d.length, async () => {
+            if (session.paneStartedAt !== paneStartedAt) return;
+            await handleMessage(msg);
+          }).catch(() => {});
         } catch {
           // Ignore malformed messages without disturbing the input queue.
         }
