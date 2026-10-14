@@ -8,11 +8,11 @@ import {
   type TaskUpdate,
   type TaskProgress,
 } from './schema.js';
-import { commandHash } from './evidence.js';
+import { commandHash, type CommandSuccessEvidence } from './evidence.js';
 import { CONTINUATION_PROMPT, type RecoveryObservation } from '../recovery/types.js';
 export interface TaskObservation {
   observation: RecoveryObservation;
-  commands: Map<string, number>;
+  commands: Map<string, CommandSuccessEvidence>;
   marker?: { key: string; progress: unknown; at: number; submissionKey?: string };
 }
 export interface TaskDependencies {
@@ -106,6 +106,16 @@ export class TaskController {
   }
   private runtimeBudgetExpired(): boolean {
     return this.state.startedAt !== undefined && this.now() - this.state.startedAt >= this.state.config.maxRuntimeMs;
+  }
+  private commandEvidenceIsCurrent(evidence: CommandSuccessEvidence | undefined): evidence is CommandSuccessEvidence {
+    return (
+      !!evidence &&
+      Number.isFinite(evidence.startedAt) &&
+      Number.isFinite(evidence.completedAt) &&
+      evidence.startedAt >= (this.state.configuredAt ?? this.state.startedAt ?? this.now()) &&
+      evidence.completedAt >= evidence.startedAt &&
+      evidence.completedAt <= this.now() + 2000
+    );
   }
   private actionIsCurrent(revision: number): boolean {
     return !this.stopped && this.revision === revision && !this.runtimeBudgetExpired();
@@ -242,11 +252,27 @@ export class TaskController {
       if (candidate.inFlight && candidate.config.enabled)
         throw new TaskValidationError('Unresolved delivery requires reset');
       if (acceptanceCriteriaComplete(candidate)) candidate.outcome = 'completed';
+      // Configuration saves do not reacquire authority cancelled by owner input or restart.
+      const enabledChanged = candidate.config.enabled !== this.state.config.enabled;
       candidate.phase =
-        candidate.outcome === 'completed' ? 'completed' : candidate.config.enabled ? 'watching' : 'disabled';
+        candidate.outcome === 'completed'
+          ? 'completed'
+          : !candidate.config.enabled
+            ? 'disabled'
+            : enabledChanged
+              ? 'watching'
+              : this.state.phase === 'completed'
+                ? 'paused'
+                : this.state.phase;
+      const reason =
+        !enabledChanged && candidate.config.enabled && ['paused', 'blocked'].includes(this.state.phase)
+          ? this.state.reason
+          : !changed && !enabledChanged && candidate.phase !== 'watching'
+            ? candidate.reason
+            : 'configured';
       if (candidate.config.enabled) candidate.startedAt ??= this.now();
       this.state = candidate;
-      const result = await this.save('configured');
+      const result = await this.save(reason);
       this.arm();
       return result;
     });
@@ -267,9 +293,10 @@ export class TaskController {
         if (!c) throw new TaskValidationError('Unknown criterion');
         if (c.kind === 'manual' && !owner) throw new TaskValidationError('Manual criteria require owner verification');
         const hash = c.command ? commandHash(c.command) : undefined;
-        const at = hash ? commands.get(hash) : this.now();
-        if (c.kind === 'command' && (!at || at < (this.state.configuredAt ?? this.state.startedAt ?? this.now())))
+        const evidence = hash ? commands.get(hash) : undefined;
+        if (c.kind === 'command' && !this.commandEvidenceIsCurrent(evidence))
           throw new TaskValidationError('Command success evidence is not verified');
+        const at = c.kind === 'command' ? evidence!.completedAt : this.now();
         c.verified = true;
         c.evidence = {
           source: c.kind === 'command' ? 'command' : 'owner',
@@ -426,14 +453,8 @@ export class TaskController {
           for (const id of p.verifiedCriteria ?? []) {
             const c = this.state.criteria.find((c) => c.id === id);
             const hash = c?.command ? commandHash(c.command) : undefined;
-            const at = hash ? commands.get(hash) : undefined;
-            if (
-              !c ||
-              c.kind !== 'command' ||
-              !hash ||
-              !at ||
-              at < (this.state.configuredAt ?? this.state.startedAt ?? this.now())
-            ) {
+            const evidence = hash ? commands.get(hash) : undefined;
+            if (!c || c.kind !== 'command' || !hash || !this.commandEvidenceIsCurrent(evidence)) {
               valid = false;
               break;
             }
@@ -448,7 +469,7 @@ export class TaskController {
               const c = this.state.criteria.find((c) => c.id === id)!;
               const hash = commandHash(c.command!);
               c.verified = true;
-              c.evidence = { source: 'command', at: commands.get(hash)!, commandHash: hash };
+              c.evidence = { source: 'command', at: commands.get(hash)!.completedAt, commandHash: hash };
             }
             this.state.outcome = acceptanceCriteriaComplete(this.state)
               ? 'completed'
@@ -477,6 +498,9 @@ export class TaskController {
         ['crashed', 'interrupted'].includes(o.activity) &&
         o.safeToAct &&
         o.at >= (this.state.startedAt ?? 0) &&
+        (o.activity !== 'crashed' ||
+          o.liveProofAt === undefined ||
+          (Number.isFinite(o.liveProofAt) && o.liveProofAt >= (this.state.startedAt ?? 0) && o.liveProofAt <= o.at)) &&
         o.evidenceKey &&
         (this.state.outcome === 'unfinished' || (this.state.outcome === 'unknown' && o.activity === 'crashed'))
       ) {

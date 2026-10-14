@@ -289,7 +289,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             unspent.delete(entry);
             continue;
           }
-          await ctx.addSession(session);
+          await ctx.addSession(session, { tentative: true });
           // Before the listeners, because setupSessionListeners() reads the
           // image-watcher flag this phase restores; before the spawn, because the
           // custom-model environment and the nice priority shape the process.
@@ -329,9 +329,9 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // Both halves precede the route's OWN persist, which matters because a
           // constructed session carries none of this and `toState()` is written
           // wholesale, so persisting first would replace the fuller record with
-          // the reduced one and drop the pin that keeps it from being pruned. A
-          // listener-driven persist can still land inside the debounce window
-          // while the pane starts; the write below repairs the record.
+          // the reduced one and drop the pin that keeps it from being pruned.
+          // Tentative registration blocks both listener-driven and synchronous
+          // recovery persistence until all restore finalization has succeeded.
           // `rearmAutoResumeSchedule: false`: the saved stamp predates the reboot and
           // the pane is new, so honouring it would have every restored session type
           // `continue` into itself about a minute after one click. Auto-resume stays
@@ -396,6 +396,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               untrackedInput: identity.untrackedInput,
             });
           }
+          ctx.commitSessionRegistration(session);
           ctx.persistSessionState(session);
 
           getLifecycleLog().log({ event: 'recovered', sessionId: session.id, name: session.name });

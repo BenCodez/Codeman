@@ -88,6 +88,8 @@ export interface RecoveryObservation {
   progressAt?: number;
   submissionHash?: string;
   processReady?: boolean;
+  /** A matching remote pane was directly observed live at this time before a newly detected crash. */
+  liveProofAt?: number;
   /** Adapter revalidates ownership, identity, process state and empty composer immediately before acting. */
   safeToAct: boolean;
 }

@@ -148,7 +148,7 @@ describe('Task supervision UI', () => {
 
     expect(h.app._apiJson.mock.calls[2][1].body.criteria).toBeDefined();
     const afterEdit = controller.getStatus();
-    expect(afterEdit).toMatchObject({ outcome: 'unknown', phase: 'watching', continuations: 0 });
+    expect(afterEdit).toMatchObject({ outcome: 'unknown', phase: 'paused', continuations: 0 });
     expect(afterEdit.kickoffAt).toBeUndefined();
     expect(afterEdit.criteria.every((criterion) => !criterion.verified)).toBe(true);
     expect(afterEdit.criteria.find((criterion) => criterion.id === 'custom-command')).toMatchObject({
@@ -174,6 +174,70 @@ describe('Task supervision UI', () => {
     h.app._onSessionTask({ sessionId: 'a', state: { ...state(), continuations: 3 } });
     await h.app.taskAction('resume');
     expect(h.app._apiJson).toHaveBeenCalledTimes(2);
+  });
+  it.each(['owner-input', 'restart'] as const)('saving settings preserves a real %s pause', async (cause) => {
+    const restored = initialTaskState();
+    Object.assign(restored, {
+      objective: 'Review fixture',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual', verified: false }],
+      checkpoint: 'Review ready',
+      nextAction: 'Inspect result',
+      outcome: 'unfinished',
+      startedAt: 10000,
+      configuredAt: 10000,
+    });
+    restored.config.enabled = true;
+    const act = vi.fn(async () => 'sent' as const);
+    const controller = new TaskController(
+      {
+        now: () => 10000,
+        observe: async () => ({
+          observation: {
+            activity: 'completed',
+            reason: 'turn-completed',
+            at: 10001,
+            conversationId: 'task-conversation',
+            turnId: 'completed-turn',
+            processReady: true,
+            safeToAct: false,
+          },
+          commands: new Map(),
+        }),
+        act,
+        persist: async () => {},
+        changed: () => {},
+      },
+      restored
+    );
+    if (cause === 'owner-input') {
+      await controller.progress({ outcome: 'unfinished' });
+      controller.noteUserInput();
+      await controller.drain();
+    }
+    const h = harness(controller.getStatus());
+    h.app._apiJson = vi.fn(async (_url, options) =>
+      options?.method === 'PUT' ? controller.update(options.body) : controller.getStatus()
+    );
+    await h.open();
+    h.get('taskMaxContinuations').value = '5';
+    await h.app.saveTaskConfiguration();
+    expect(h.app._apiJson.mock.calls[1][1].body).toEqual({
+      config: { enabled: true, maxContinuations: 5, maxRuntimeMs: 900000 },
+    });
+    expect(controller.getStatus()).toMatchObject({
+      phase: 'paused',
+      reason: cause === 'owner-input' ? 'user-input' : 'restart-requires-resume',
+    });
+    expect(h.get('taskPhase').textContent).toBe('Paused');
+    h.get('taskObjective').value = 'Review the updated objective';
+    await h.app.saveTaskConfiguration();
+    expect(controller.getStatus().phase).toBe('paused');
+    h.get('taskManualCriteria').value += '\nSecurity review';
+    await h.app.saveTaskConfiguration();
+    expect(controller.getStatus().phase).toBe('paused');
+    await controller.refresh();
+    expect(act).not.toHaveBeenCalled();
+    controller.stop();
   });
   it('shows evidence, timestamped bounded history and safe text', async () => {
     const s: any = state();

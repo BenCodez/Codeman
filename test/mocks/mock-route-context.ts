@@ -36,6 +36,7 @@ export function createMockRouteContext(options?: {
     addSession: vi.fn(async (s: MockSession) => {
       sessions.set(s.id, s);
     }),
+    commitSessionRegistration: vi.fn(),
     tabLayouts: {
       get: vi.fn(),
       put: vi.fn(),

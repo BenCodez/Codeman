@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto';
 import { CONTINUATION_PROMPT } from '../src/recovery/types.js';
 import { TaskController, type TaskObservation } from '../src/supervision/controller.js';
 import { TaskStore } from '../src/supervision/store.js';
-import { initialTaskState } from '../src/supervision/schema.js';
+import { initialTaskState, type TaskUpdate } from '../src/supervision/schema.js';
 import { successfulCommands, commandHash, latestProgressMarker } from '../src/supervision/evidence.js';
 import { SessionActionArbiter } from '../src/supervision/action-arbiter.js';
 import { mkdtemp, readFile, stat, writeFile } from 'node:fs/promises';
@@ -133,13 +133,198 @@ describe('task supervision', () => {
     await configure(f.controller);
     await expect(f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] })).rejects.toThrow();
     expect(f.controller.getStatus().criteria[0].verified).toBe(false);
-    f.commands.set(commandHash('npm test'), 10001);
+    f.commands.set(commandHash('npm test'), { startedAt: 10000, completedAt: 10001 });
     await f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] });
     await f.controller.refresh();
     expect(f.controller.getStatus().phase).toBe('completed');
     expect(f.act).not.toHaveBeenCalled();
     f.controller.stop();
   });
+  it.each(['owner-progress', 'agent-marker'] as const)(
+    '%s verifies only commands that begin after task configuration',
+    async (entry) => {
+      const line = (at: number, payload: unknown) =>
+        JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+      const end = line(10002, { type: 'exec_command_end', call_id: 'test-command', exit_code: 0 });
+      for (const startedAt of [9999, undefined, 10000]) {
+        const f = fixture();
+        await configure(f.controller);
+        f.clock(10003);
+        const begin =
+          startedAt === undefined
+            ? ''
+            : line(startedAt, {
+                type: 'exec_command_begin',
+                call_id: 'test-command',
+                command: ['bash', '-lc', 'npm test'],
+              });
+        f.observe(async () => ({
+          observation: {
+            activity: 'completed',
+            reason: 'turn-completed',
+            at: 10003,
+            conversationId: id,
+            submissionKey: 'fixture-submission',
+            turnId: 'verification-turn',
+            processReady: true,
+            safeToAct: false,
+          },
+          commands: successfulCommands(begin + end, 0, 10003),
+          ...(entry === 'agent-marker'
+            ? {
+                marker: {
+                  key: 'verification-marker',
+                  at: 10003,
+                  submissionKey: 'fixture-submission',
+                  progress: { outcome: 'completed', verifiedCriteria: ['test'] },
+                },
+              }
+            : {}),
+        }));
+        const verify = () =>
+          entry === 'owner-progress'
+            ? f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] })
+            : f.controller.refresh();
+        if (startedAt === 10000) {
+          await verify();
+          expect(f.controller.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed' });
+          expect(f.controller.getStatus().criteria[0].evidence).toMatchObject({ source: 'command', at: 10002 });
+        } else {
+          if (entry === 'owner-progress') await expect(verify()).rejects.toThrow('success evidence');
+          else {
+            await verify();
+            expect(f.controller.getStatus()).toMatchObject({
+              phase: 'paused',
+              reason: 'criterion-evidence-unverified',
+            });
+          }
+          expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+        }
+        expect(f.act).not.toHaveBeenCalled();
+        f.controller.stop();
+      }
+    }
+  );
+  it.each([undefined, NaN, Infinity, 10002])(
+    'rejects missing, invalid or impossible command start %s',
+    async (startedAt) => {
+      const f = fixture();
+      await configure(f.controller);
+      f.commands.set(commandHash('npm test'), { startedAt, completedAt: 10001 } as any);
+      await expect(f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] })).rejects.toThrow(
+        'success evidence'
+      );
+      expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+      f.controller.stop();
+    }
+  );
+  it.each(['owner-progress', 'agent-marker'] as const)(
+    '%s retains fresh success when an overlapping pre-configuration command finishes later',
+    async (entry) => {
+      const line = (at: number, payload: unknown) =>
+        JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+      const submission = line(9000, { type: 'user_message', message: 'Run the authorized checks' });
+      const submissionKey = createHash('sha256').update(submission.trimEnd()).digest('hex');
+      const begin = (at: number, call_id: string) =>
+        line(at, {
+          type: 'exec_command_begin',
+          call_id,
+          command: ['bash', '-lc', 'npm test'],
+        });
+      const end = (at: number, call_id: string) => line(at, { type: 'exec_command_end', call_id, exit_code: 0 });
+      const tail =
+        submission +
+        begin(9000, 'old') +
+        begin(10001, 'fresh') +
+        end(10005, 'fresh') +
+        end(10010, 'old') +
+        line(10011, {
+          type: 'agent_message',
+          message: 'CODEMAN_TASK_PROGRESS {"outcome":"completed","verifiedCriteria":["test"]}',
+        });
+      const f = fixture();
+      f.set({ submissionKey });
+      await configure(f.controller);
+      f.clock(10011);
+      f.observe(async () => ({
+        observation: {
+          activity: 'completed',
+          reason: 'turn-completed',
+          at: 10011,
+          conversationId: id,
+          submissionKey,
+          turnId: 'overlapping-checks',
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: successfulCommands(tail, 0, 10011),
+        marker: latestProgressMarker(tail, 0, 10011),
+      }));
+
+      if (entry === 'owner-progress') await f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] });
+      else await f.controller.refresh();
+
+      expect(f.controller.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed' });
+      expect(f.controller.getStatus().criteria[0].evidence).toMatchObject({ source: 'command', at: 10005 });
+      expect(f.act).not.toHaveBeenCalled();
+      f.controller.stop();
+    }
+  );
+  it.each(['owner-progress', 'agent-marker'] as const)(
+    '%s verifies a fresh acceptance check after 100 completed command failures',
+    async (entry) => {
+      const line = (at: number, payload: unknown) =>
+        JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+      const submission = line(9000, { type: 'user_message', message: 'Run the authorized checks' });
+      const submissionKey = createHash('sha256').update(submission.trimEnd()).digest('hex');
+      const failures = Array.from({ length: 100 }, (_, index) => {
+        const call_id = `failed-search-${index}`;
+        return (
+          line(10001 + 2 * index, {
+            type: 'exec_command_begin',
+            call_id,
+            command: ['bash', '-lc', 'rg missing-pattern'],
+          }) + line(10002 + 2 * index, { type: 'exec_command_end', call_id, exit_code: index % 2 ? 1 : 2 })
+        );
+      }).join('');
+      const tail =
+        submission +
+        failures +
+        line(10201, { type: 'exec_command_begin', call_id: 'acceptance', command: ['bash', '-lc', 'npm test'] }) +
+        line(10202, { type: 'exec_command_end', call_id: 'acceptance', exit_code: 0 }) +
+        line(10203, {
+          type: 'agent_message',
+          message: 'CODEMAN_TASK_PROGRESS {"outcome":"completed","verifiedCriteria":["test"]}',
+        });
+      const commands = successfulCommands(tail, 0, 10203);
+      expect(commands.size).toBe(1);
+      expect(commands.get(commandHash('npm test'))).toEqual({ startedAt: 10201, completedAt: 10202 });
+      const f = fixture();
+      f.set({ submissionKey });
+      await configure(f.controller);
+      f.clock(10203);
+      f.observe(async () => ({
+        observation: {
+          activity: 'completed',
+          reason: 'turn-completed',
+          at: 10203,
+          conversationId: id,
+          submissionKey,
+          turnId: 'check-after-failures',
+          processReady: true,
+          safeToAct: false,
+        },
+        commands,
+        marker: latestProgressMarker(tail, 0, 10203),
+      }));
+      if (entry === 'owner-progress') await f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] });
+      else await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed' });
+      expect(f.controller.getStatus().criteria[0].evidence).toMatchObject({ source: 'command', at: 10202 });
+      expect(f.act).not.toHaveBeenCalled();
+      f.controller.stop();
+    }
+  );
   it('preserves evidence on equal settings and validates config atomically', async () => {
     const f = fixture();
     await configure(f.controller);
@@ -147,6 +332,84 @@ describe('task supervision', () => {
     expect(f.controller.getStatus().criteria).toHaveLength(1);
     expect(() => f.controller.update({ objective: '', config: { enabled: true } })).toThrow();
     expect(f.controller.getStatus().objective).toBe('Fix the bug');
+    f.controller.stop();
+  });
+  it.each(['owner-input', 'restart'] as const)(
+    'settings edits preserve the %s pause until explicit resume',
+    async (cause) => {
+      const f = fixture();
+      await configure(f.controller);
+      // Model a task whose kickoff was already accepted before the owner's pause or restart.
+      const started = await f.controller.resume();
+      f.set({ activity: 'working', submissionHash: started.inFlight!.promptHash, submissionKey: 'accepted-kickoff' });
+      await f.controller.refresh();
+      f.set({ activity: 'completed', turnId: 'new-turn', at: 10001 });
+      await f.controller.progress({ outcome: 'unfinished', checkpoint: 'Located bug', nextAction: 'Apply fix' });
+      let controller = f.controller;
+      if (cause === 'owner-input') {
+        controller.noteUserInput();
+        await controller.drain();
+      } else {
+        const restored = controller.getStatus();
+        controller.stop();
+        controller = new TaskController(
+          {
+            now: () => 10000,
+            observe: async () => ({
+              observation: {
+                activity: 'completed',
+                reason: 'turn-completed',
+                at: 10001,
+                conversationId: id,
+                turnId: 'new-turn',
+                processReady: true,
+                safeToAct: false,
+              },
+              commands: new Map(),
+            }),
+            act: f.act,
+            persist: f.persist,
+            changed: () => {},
+          },
+          restored
+        );
+      }
+      f.act.mockClear();
+      const reason = cause === 'owner-input' ? 'user-input' : 'restart-requires-resume';
+      const patches: TaskUpdate[] = [
+        { config: { maxContinuations: 5 } },
+        { config: { enabled: true, maxRuntimeMs: 120000 } },
+        {},
+        { objective: 'Fix the updated objective', config: { enabled: true } },
+        { criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }] },
+      ];
+      for (const patch of patches) {
+        await controller.update(patch);
+        await controller.refresh();
+        expect(controller.getStatus()).toMatchObject({ phase: 'paused', reason, config: { enabled: true } });
+        expect(f.act).not.toHaveBeenCalled();
+      }
+      await controller.resume();
+      await controller.refresh();
+      expect(f.act).toHaveBeenCalledOnce();
+      controller.stop();
+    }
+  );
+  it('settings edits preserve a blocked task while a real enabled-state change arms it', async () => {
+    const f = fixture();
+    await configure(f.controller);
+    await f.controller.progress({ outcome: 'blocked', checkpoint: 'Needs owner approval', nextAction: 'Review' });
+    await f.controller.update({ config: { enabled: true, maxContinuations: 5 } });
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'progress-recorded' });
+    await f.controller.update({ objective: 'Review the updated objective' });
+    await f.controller.update({ criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }] });
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'progress-recorded' });
+    await f.controller.refresh();
+    expect(f.act).not.toHaveBeenCalled();
+    await f.controller.update({ config: { enabled: false } });
+    expect(f.controller.getStatus().phase).toBe('disabled');
+    await f.controller.update({ config: { enabled: true } });
+    expect(f.controller.getStatus().phase).toBe('watching');
     f.controller.stop();
   });
   it.each(['objective', 'criteria'] as const)('preserves configured limits across a partial %s edit', async (field) => {
@@ -271,7 +534,7 @@ describe('task supervision', () => {
     await f.controller.refresh();
     expect(f.controller.getStatus().inFlight).toBeUndefined();
     expect(f.controller.getStatus().phase).toBe('watching');
-    f.commands.set(commandHash('npm test'), 10003);
+    f.commands.set(commandHash('npm test'), { startedAt: 10000, completedAt: 10003 });
     f.marker({
       key: 'final-completion',
       at: 10004,
@@ -468,12 +731,50 @@ describe('task supervision', () => {
       },
       state
     );
+    await c.update({ config: { enabled: false } });
     await c.update({ config: { enabled: true } });
     await c.refresh();
     expect(recover).toHaveBeenCalledOnce();
     expect(c.getStatus().continuations).toBe(1);
     c.stop();
   });
+  it.each([11000, NaN, Infinity, 20001, 15000])(
+    'requires crash live proof %s to fall within the armed task lifetime',
+    async (liveProofAt) => {
+      const f = fixture();
+      await f.controller.update({
+        objective: 'Review',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      });
+      f.clock(11000);
+      await f.controller.progress({
+        outcome: 'unfinished',
+        checkpoint: 'Verified while disabled',
+        nextAction: 'Review result',
+      });
+      f.clock(15000);
+      await f.controller.update({ config: { enabled: true } });
+      f.clock(20000);
+      f.set({
+        activity: 'crashed',
+        reason: 'process-crashed',
+        safeToAct: true,
+        evidenceKey: 'newly-observed-crash',
+        at: 20000,
+        liveProofAt,
+      });
+      await f.controller.refresh();
+      if (liveProofAt === 15000) {
+        expect(f.recover).toHaveBeenCalledOnce();
+        expect(f.controller.getStatus().reason).toBe('recovery-sent');
+      } else {
+        expect(f.recover).not.toHaveBeenCalled();
+        expect(f.controller.getStatus()).toMatchObject({ phase: 'paused', continuations: 0 });
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+      }
+      f.controller.stop();
+    }
+  );
   it('agent markers never verify manual criteria', async () => {
     const f = fixture();
     await f.controller.update({
@@ -497,7 +798,7 @@ describe('task supervision', () => {
   it('agent command acknowledgment completes only with actual correlated command evidence', async () => {
     const f = fixture();
     await configure(f.controller);
-    f.commands.set(commandHash('npm test'), 10001);
+    f.commands.set(commandHash('npm test'), { startedAt: 10000, completedAt: 10001 });
     f.marker({
       key: 'marker',
       submissionKey: 'fixture-submission',
@@ -513,7 +814,7 @@ describe('task supervision', () => {
   it('treats fully verified command criteria as terminal despite an unfinished marker', async () => {
     const f = fixture();
     await configure(f.controller);
-    f.commands.set(commandHash('npm test'), 10001);
+    f.commands.set(commandHash('npm test'), { startedAt: 10000, completedAt: 10001 });
     f.marker({
       key: 'contradictory-marker',
       submissionKey: 'fixture-submission',
@@ -538,8 +839,12 @@ describe('task supervision', () => {
     expect(f.act).not.toHaveBeenCalled();
 
     await f.controller.update({ objective: 'Fix a newly discovered bug' });
-    expect(f.controller.getStatus()).toMatchObject({ outcome: 'unknown', phase: 'watching' });
+    expect(f.controller.getStatus()).toMatchObject({ outcome: 'unknown', phase: 'paused' });
     expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+    await f.controller.refresh();
+    expect(f.act).not.toHaveBeenCalled();
+    await f.controller.resume();
+    expect(f.act).toHaveBeenCalledOnce();
     f.controller.stop();
   });
   it('completes when the owner verifies the final manual criterion', async () => {
@@ -698,6 +1003,7 @@ describe('task supervision', () => {
       },
       state
     );
+    await c.update({ config: { enabled: false } });
     await c.update({ config: { enabled: true } });
     await c.refresh();
     await c.drain();
@@ -827,6 +1133,7 @@ describe('task supervision', () => {
         },
         state
       );
+      await c.update({ config: { enabled: false } });
       await c.update({ config: { enabled: true } });
       await c.refresh();
       expect(c.getStatus().outcome).toBe('unknown');
@@ -885,6 +1192,7 @@ describe('task supervision', () => {
       },
       state
     );
+    await c.update({ config: { enabled: false } });
     await c.update({ config: { enabled: true } });
     await c.refresh();
     expect(c.getStatus()).toMatchObject({ outcome: 'unknown', checkpoint: '', nextAction: '' });
@@ -946,6 +1254,7 @@ describe('task supervision', () => {
       },
       state
     );
+    await c.update({ config: { enabled: false } });
     await c.update({ config: { enabled: true } });
     await c.refresh();
     expect(c.getStatus().submissionKey).toBe('fixture-submission');
@@ -981,12 +1290,52 @@ describe('task supervision', () => {
     expect((await stat(path)).mode & 0o777).toBe(0o600);
     expect(new TaskStore(path).get('session').outcome).toBe('unknown');
     await writeFile(path, '{}');
-    expect(new TaskStore(path).get('session').reason).toBe('persistence-failed');
+    const corrupt = new TaskStore(path);
+    expect(corrupt.get('session').reason).toBe('persistence-failed');
+    await expect(corrupt.save('session', initialTaskState())).rejects.toThrow('could not be loaded');
+    await expect(corrupt.drop('session')).rejects.toThrow('could not be loaded');
+    expect(await readFile(path, 'utf8')).toBe('{}');
   });
 });
 describe('structured command evidence', () => {
   const line = (at: number, payload: unknown) =>
     JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+  it('bounds truly pending commands and reclaims capacity only for matching completed calls', () => {
+    const begin = (at: number, call_id: string) =>
+      line(at, { type: 'exec_command_begin', call_id, command: ['bash', '-lc', 'npm test'] });
+    const end = (at: number, call_id: string, exit_code: number) =>
+      line(at, { type: 'exec_command_end', call_id, exit_code });
+    const pending = Array.from({ length: 100 }, (_, index) => begin(10000 + index, `pending-${index}`)).join('');
+    const unknown = end(10100, 'unknown-call', 1);
+    const overflow = begin(10101, 'over-capacity') + end(10102, 'over-capacity', 0);
+    expect(successfulCommands(pending + unknown + overflow, 0, 10105).size).toBe(0);
+    const reclaimed = end(10103, 'pending-0', 1) + begin(10104, 'admitted') + end(10105, 'admitted', 0);
+    expect(successfulCommands(pending + unknown + overflow + reclaimed, 0, 10105).get(commandHash('npm test'))).toEqual(
+      {
+        startedAt: 10104,
+        completedAt: 10105,
+      }
+    );
+  });
+  it('does not reuse a failed completion or malformed begin as success evidence', () => {
+    const begin = line(10000, { type: 'exec_command_begin', call_id: 'failed', command: ['bash', '-lc', 'npm test'] });
+    const failed = line(10001, { type: 'exec_command_end', call_id: 'failed', exit_code: 1 });
+    const later = line(10002, { type: 'exec_command_end', call_id: 'failed', exit_code: 0 });
+    expect(successfulCommands(begin + failed + later, 0, 10002).size).toBe(0);
+    const malformed = line(10000, { type: 'exec_command_begin', call_id: 'failed', command: ['bash', '-lc'] });
+    expect(successfulCommands(malformed + later, 0, 10002).size).toBe(0);
+  });
+  it.each([false, true])('keeps the latest completion for equal execution starts, reverse order %s', (reverse) => {
+    const begin = (call_id: string) =>
+      line(10001, { type: 'exec_command_begin', call_id, command: ['bash', '-lc', 'npm test'] });
+    const earlier = line(10004, { type: 'exec_command_end', call_id: 'earlier', exit_code: 0 });
+    const later = line(10005, { type: 'exec_command_end', call_id: 'later', exit_code: 0 });
+    const tail = begin('earlier') + begin('later') + (reverse ? later + earlier : earlier + later);
+    expect(successfulCommands(tail, 0, 10011).get(commandHash('npm test'))).toEqual({
+      startedAt: 10001,
+      completedAt: 10005,
+    });
+  });
   it('correlates supported Codex shells and rejects failed, partial, or arbitrary wrapper evidence', () => {
     for (const [index, shell] of ['bash', '/bin/zsh', '/usr/bin/bash', '/usr/bin/sh', '/usr/bin/zsh'].entries()) {
       const callId = `supported-${index}`;
@@ -996,7 +1345,10 @@ describe('structured command evidence', () => {
         command: [shell, '-lc', 'npm test'],
       });
       const end = line(10001, { type: 'exec_command_end', call_id: callId, exit_code: 0 });
-      expect(successfulCommands(begin + end, 9000, 11000).get(commandHash('npm test'))).toBe(10001);
+      expect(successfulCommands(begin + end, 9000, 11000).get(commandHash('npm test'))).toEqual({
+        startedAt: 10000,
+        completedAt: 10001,
+      });
     }
     const begin = line(10000, { type: 'exec_command_begin', call_id: 'c', command: ['bash', '-lc', 'npm test'] });
     const end = line(10001, { type: 'exec_command_end', call_id: 'c', exit_code: 0 });

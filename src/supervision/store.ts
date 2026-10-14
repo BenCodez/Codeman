@@ -45,6 +45,7 @@ export class TaskStore {
   }
 
   save(id: string, state: TaskState): Promise<void> {
+    if (this.loadFailed) return Promise.reject(new Error('Task journal could not be loaded'));
     if (!/^[\w-]{1,100}$/.test(id)) return Promise.reject(new Error('Invalid session identity'));
     TaskStateSchema.parse(state);
     const copy = structuredClone(state);
@@ -59,6 +60,7 @@ export class TaskStore {
   }
 
   drop(id: string): Promise<void> {
+    if (this.loadFailed) return Promise.reject(new Error('Task journal could not be loaded'));
     const result = this.writes.then(async () => {
       if (!this.records[id]) return;
       const next = { ...this.records };

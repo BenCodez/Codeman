@@ -70,6 +70,57 @@ describe('task routes ownership and bounded inputs', () => {
     expect(res.statusCode).toBe(400);
     expect(controller.update).not.toHaveBeenCalled();
   });
+  it.each(['owner-input', 'restart'] as const)('a settings-only PUT keeps a real %s pause', async (cause) => {
+    const act = vi.fn(async () => 'sent' as const);
+    const deps = {
+      now: () => 10000,
+      observe: async () => ({
+        observation: {
+          activity: 'completed' as const,
+          reason: 'turn-completed' as const,
+          at: 10001,
+          conversationId: 'task-conversation',
+          turnId: 'completed-turn',
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      }),
+      act,
+      persist: async () => {},
+      changed: () => {},
+    };
+    let actual = new TaskController(deps);
+    await actual.update({
+      objective: 'Review',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { enabled: true },
+    });
+    await actual.progress({ outcome: 'unfinished', checkpoint: 'Review ready', nextAction: 'Inspect result' });
+    if (cause === 'owner-input') {
+      actual.noteUserInput();
+      await actual.drain();
+    } else {
+      const restored = actual.getStatus();
+      actual.stop();
+      actual = new TaskController(deps, restored);
+    }
+    getController.mockReturnValue(actual);
+    const res = await h.app.inject({
+      method: 'PUT',
+      url: `/api/sessions/${h.ctx._sessionId}/task`,
+      payload: { config: { enabled: true, maxContinuations: 5 } },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().data).toMatchObject({
+      phase: 'paused',
+      reason: cause === 'owner-input' ? 'user-input' : 'restart-requires-resume',
+      config: { enabled: true, maxContinuations: 5 },
+    });
+    await actual.refresh();
+    expect(act).not.toHaveBeenCalled();
+    actual.stop();
+  });
   it('does not expose internal verification errors', async () => {
     controller.progress.mockRejectedValueOnce(new TaskValidationError('/private/transcript'));
     const res = await h.app.inject({

@@ -1,4 +1,4 @@
-/** @fileoverview Only bounded structured ExecCommandEnd evidence proves command success. */
+/** @fileoverview Only bounded paired structured execution evidence proves command success. */
 import { createHash } from 'node:crypto';
 const SUPPORTED_POSIX_SHELLS = new Set([
   'bash',
@@ -14,8 +14,13 @@ const SUPPORTED_POSIX_SHELLS = new Set([
 export function commandHash(command: string): string {
   return createHash('sha256').update(command).digest('hex');
 }
-export function successfulCommands(tail: string, since: number, now: number): Map<string, number> {
-  const result = new Map<string, number>();
+/** Paired execution timestamps; a fresh end alone cannot prove post-configuration state. */
+export interface CommandSuccessEvidence {
+  startedAt: number;
+  completedAt: number;
+}
+export function successfulCommands(tail: string, since: number, now: number): Map<string, CommandSuccessEvidence> {
+  const result = new Map<string, CommandSuccessEvidence>();
   if (Buffer.byteLength(tail) > 262144 || !tail.endsWith('\n')) return result;
   const pending = new Map<string, { command: string; at: number }>();
   for (const line of tail.split('\n')) {
@@ -50,9 +55,16 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
         c.length === 3 && SUPPORTED_POSIX_SHELLS.has(c[0]) && ['-lc', '-c'].includes(c[1]) ? c[2] : undefined;
       if (command && command.length <= 1000 && pending.size < 100) pending.set(p.call_id, { command, at });
     }
-    if (p.type === 'exec_command_end' && typeof p.call_id === 'string' && p.exit_code === 0) {
+    if (p.type === 'exec_command_end' && typeof p.call_id === 'string') {
       const begin = pending.get(p.call_id);
-      if (begin && at >= begin.at) result.set(commandHash(begin.command), at);
+      if (p.exit_code === 0 && begin && at >= begin.at) {
+        const hash = commandHash(begin.command);
+        const prior = result.get(hash);
+        // A late completion of older work must not erase a newer execution's freshness proof.
+        if (!prior || begin.at > prior.startedAt || (begin.at === prior.startedAt && at > prior.completedAt))
+          result.set(hash, { startedAt: begin.at, completedAt: at });
+      }
+      // Every completed call releases its pending execution slot.
       pending.delete(p.call_id);
     }
   }

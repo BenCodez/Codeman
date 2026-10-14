@@ -1,5 +1,8 @@
 /** @fileoverview Integration coverage for WebServer's shared task/recovery action boundary. */
 import { createHash } from 'node:crypto';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebServer } from '../src/web/server.js';
 import { Session } from '../src/session.js';
@@ -9,23 +12,21 @@ import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 import { RecoveryController, type RecoveryDependencies } from '../src/recovery/controller.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import { initialTaskState } from '../src/supervision/schema.js';
+import { TaskStore } from '../src/supervision/store.js';
+import { RecoveryStore } from '../src/recovery/store.js';
 import { SessionActionArbiter } from '../src/supervision/action-arbiter.js';
 import {
   CONTINUATION_PROMPT,
   initialRecoveryState,
   type RecoveryFlight,
   type RecoveryObservation,
-  type RecoveryState,
 } from '../src/recovery/types.js';
 
 interface ServerInternals {
   sessions: Map<string, Session>;
-  taskStore: {
-    save(id: string, state: ReturnType<typeof initialTaskState>): Promise<void>;
-    drop(id: string): Promise<void>;
-  };
-  recoveryStore: { save(id: string, state: RecoveryState): Promise<void> };
-  actionReservationStore: { save(id: string, state: ReturnType<typeof initialTaskState>): Promise<void> };
+  taskStore: TaskStore;
+  recoveryStore: RecoveryStore;
+  actionReservationStore: TaskStore;
   getActionArbiter(id: string): SessionActionArbiter;
   getTaskController(session: Session): TaskController | undefined;
   getRecoveryController(session: Session): RecoveryController | undefined;
@@ -56,7 +57,7 @@ async function persistLegacyReservation(id: string, owners: { task: boolean; rec
   if (owners.task) taskState.inFlight = { key: 'old-task-flight', startedAt: 1 };
   await internals.taskStore.save(id, taskState);
   const recoveryState = initialRecoveryState();
-  if (owners.recovery) recoveryState.inFlight = { ...flight, key: 'old-recovery-flight' };
+  if (owners.recovery) recoveryState.inFlight = { ...flight, key: 'old-recovery-flight', startedAt: Date.now() };
   await internals.recoveryStore.save(id, recoveryState);
   const reservation = initialTaskState();
   reservation.inFlight = { key: 'bare-uuid-from-pr3', startedAt: 1 };
@@ -222,7 +223,7 @@ describe('task and recovery server action wiring', () => {
       },
       commands: new Map(),
     });
-    vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
+    const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
     const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
     const { task, recoveryDeps } = controllers('owner-completes-accepted-kickoff');
     await task.update({
@@ -257,8 +258,33 @@ describe('task and recovery server action wiring', () => {
     await expect(task.update({ objective: 'Review the follow-up work' })).resolves.toMatchObject({
       objective: 'Review the follow-up work',
       outcome: 'unknown',
-      phase: 'watching',
+      phase: 'paused',
     });
+    expect(task.getStatus().kickoffAt).toBeUndefined();
+    await task.refresh();
+    expect(taskAct).toHaveBeenCalledOnce();
+
+    observe.mockResolvedValue({
+      observation: {
+        activity: 'idle',
+        reason: 'observing',
+        at: Date.now() + 2,
+        conversationId: flight.conversationId,
+        submissionKey: 'accepted-kickoff',
+        processReady: true,
+        safeToAct: false,
+      },
+      commands: new Map(),
+    });
+    await task.resume();
+    expect(taskAct).toHaveBeenCalledTimes(2);
+    expect(taskAct.mock.lastCall?.[2]).toContain('Review the follow-up work');
+    expect(task.getStatus()).toMatchObject({
+      phase: 'watching',
+      reason: 'kickoff-sent',
+      inFlight: { previousSubmissionKey: 'accepted-kickoff' },
+    });
+    expect(task.getStatus().inFlight?.promptHash).not.toBe(pending.promptHash);
   });
 
   it('blocks task delivery until a sent recovery action has verified acceptance', async () => {
@@ -324,6 +350,93 @@ describe('task and recovery server action wiring', () => {
     expect(await recoveryDeps.act(flight, () => true)).toBe('sent');
     expect(recoveryAct).toHaveBeenCalledOnce();
   });
+
+  it('attributes a restored bare reservation to its exclusive durable recovery flight', async () => {
+    const id = 'legacy-exclusive-recovery';
+    await persistLegacyReservation(id, { task: false, recovery: true });
+    const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
+    const { task, recovery, taskDeps } = controllers(id);
+
+    await task.reset();
+    expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('not-sent');
+    expect(taskAct).not.toHaveBeenCalled();
+    await recovery.reset();
+    expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('sent');
+    expect(taskAct).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['task', true],
+    ['task', false],
+    ['recovery', true],
+    ['recovery', false],
+  ] as const)(
+    'preserves a bare reservation with an unreadable %s journal and opposite flight %s',
+    async (failedOwner, oppositeFlight) => {
+      const id = `corrupt-${failedOwner}-${oppositeFlight}`;
+      const unreservedId = `${id}-unreserved`;
+      const root = await mkdtemp(join(homedir(), 'task-recovery-corrupt-'));
+      const taskPath = join(root, 'tasks.json');
+      const recoveryPath = join(root, 'recovery.json');
+      const failedPath = failedOwner === 'task' ? taskPath : recoveryPath;
+      const corruptBytes = '{"version":1,"sessions":';
+      await writeFile(failedPath, corruptBytes);
+      const original = {
+        taskStore: internals.taskStore,
+        recoveryStore: internals.recoveryStore,
+        actionReservationStore: internals.actionReservationStore,
+      };
+      internals.taskStore = new TaskStore(taskPath);
+      internals.recoveryStore = new RecoveryStore(recoveryPath);
+      internals.actionReservationStore = new TaskStore(join(root, 'action-reservations.json'));
+      expect(failedOwner === 'task' ? internals.taskStore.loadFailed : internals.recoveryStore.loadFailed).toBe(true);
+      try {
+        if (failedOwner === 'task') {
+          const state = initialRecoveryState();
+          if (oppositeFlight) state.inFlight = { ...flight, startedAt: Date.now() };
+          await internals.recoveryStore.save(id, state);
+        } else {
+          const state = initialTaskState();
+          if (oppositeFlight) state.inFlight = { key: 'old-task-flight', startedAt: 1 };
+          await internals.taskStore.save(id, state);
+        }
+        const reservation = initialTaskState();
+        reservation.inFlight = { key: 'bare-legacy-reservation', startedAt: 1 };
+        await internals.actionReservationStore.save(id, reservation);
+        const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
+        const recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+        const { task, recovery, taskDeps, recoveryDeps } = controllers(id);
+        internals.getActionArbiter(id);
+        const readable = failedOwner === 'task' ? recovery : task;
+        const unreadable = failedOwner === 'task' ? task : recovery;
+
+        await readable.reset();
+        expect(internals.actionReservationStore.get(id).inFlight?.key).toBe('bare-legacy-reservation');
+        await expect(unreadable.reset()).rejects.toThrow('could not be saved');
+        expect(internals.actionReservationStore.get(id).inFlight?.key).toBe('bare-legacy-reservation');
+        expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('not-sent');
+        expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+        // An unreadable opposite journal also vetoes dispatch when no shared key is retained.
+        const unreserved = controllers(unreservedId);
+        expect(
+          await (failedOwner === 'task'
+            ? unreserved.recoveryDeps.act(flight, () => true)
+            : unreserved.taskDeps.act('new-task', flight.conversationId, 'continue', () => true))
+        ).toBe('not-sent');
+        expect(taskAct).not.toHaveBeenCalled();
+        expect(recoveryAct).not.toHaveBeenCalled();
+        expect(await readFile(failedPath, 'utf8')).toBe(corruptBytes);
+      } finally {
+        await internals.stopRecoveryController(id, false);
+        await internals.stopRecoveryController(unreservedId, false);
+        internals.sessions.delete(id);
+        internals.sessions.delete(unreservedId);
+        ids.delete(id);
+        ids.delete(unreservedId);
+        Object.assign(internals, original);
+      }
+    }
+  );
 
   it('clears an ambiguous restored bare reservation only after both flights are explicitly reset', async () => {
     const id = 'legacy-ambiguous-flights';

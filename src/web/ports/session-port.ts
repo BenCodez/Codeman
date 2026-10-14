@@ -10,7 +10,9 @@ export interface SessionPort {
   readonly sessions: ReadonlyMap<string, Session>;
   /** Fence pre-reboot recovery evidence without resetting settings or retry budgets. */
   prepareRebootRestoreRecovery?(sessionId: string): Promise<void>;
-  addSession(session: Session): Promise<void>;
+  /** Tentative restores preserve the historical record through every state writer until committed. */
+  addSession(session: Session, options?: { tentative?: boolean }): Promise<void>;
+  commitSessionRegistration(session: Session): void;
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
   persistSessionState(session: Session): void;

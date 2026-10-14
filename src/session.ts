@@ -4534,7 +4534,13 @@ export class Session extends EventEmitter {
     try {
       const submittedPrompt = this._trackSubmit(data, options);
       if (!this.ptyProcess) return false;
-      this.ptyProcess.write(data);
+      try {
+        this.ptyProcess.write(data);
+      } finally {
+        // A PTY exception may follow a partial write. Keep the identity sealed
+        // before any submission listener can throw; only no-PTY is known unsent.
+        this._commitWriteInput(options);
+      }
       this._emitSubmittedPrompt(submittedPrompt);
       return true;
     } finally {
@@ -4685,26 +4691,14 @@ export class Session extends EventEmitter {
    * long-lived session can't grow it without limit (insertion order = MRU, so
    * eviction drops the least-recently-active client).
    */
-  private _appliedInputSeq = new Map<string, number>();
+  private _appliedInputSeq = new Map<string, { last?: number; pending: Set<number>; waiting: Set<number> }>();
   private static readonly MAX_INPUT_DEDUP_CLIENTS = 256;
+  private static readonly MAX_PENDING_INPUT_SEQS = 4096;
 
   /**
-   * Decide whether an input frame should be applied to the PTY or skipped as a
-   * duplicate redelivery. Returns true exactly once per (clientId, seq): the
-   * first time a seq strictly greater than the client's last-applied is seen.
-   * A redelivery of an already-applied seq (the client never got our ACK and
-   * resent) returns false. Callers should ACK regardless — a duplicate is, from
-   * the client's view, "delivered" — and only `write()` the PTY when this is
-   * true. Relies on the client delivering one client's frames in seq order over
-   * a single ordered stream, so `seq <= last` ⇒ already applied.
-   *
-   * Without this, the client's at-least-once redelivery (needed because a
-   * half-open socket silently drops frames with no error) would type a prompt
-   * twice whenever an ACK is lost after the write landed.
-   */
-  /**
-   * The highest input seq recorded for `clientId`, or 0 when this session has
-   * never seen it.
+   * The highest committed/sealed input seq, or 0 before any dispatch. Admission
+   * and lock rejection never advance it. hasAppliedInputSeq distinguishes an
+   * actual zero occurrence from the default watermark.
    *
    * Reported back on a REJECTED (duplicate) frame so the client can lift its own
    * counter above this watermark. Without that number a client whose persisted
@@ -4714,37 +4708,67 @@ export class Session extends EventEmitter {
    * delivered, and a reload restores the same stale counter from localStorage.
    */
   lastInputSeq(clientId: string): number {
-    return this._appliedInputSeq.get(clientId) ?? 0;
+    return this._appliedInputSeq.get(clientId)?.last ?? 0;
   }
 
-  shouldApplyInput(clientId: string, seq: number): boolean {
-    const last = this._appliedInputSeq.get(clientId);
-    if (last !== undefined && seq <= last) return false;
-    // Re-insert to move this client to the MRU end for fair eviction.
-    if (last !== undefined) this._appliedInputSeq.delete(clientId);
-    this._appliedInputSeq.set(clientId, seq);
-    if (this._appliedInputSeq.size > Session.MAX_INPUT_DEDUP_CLIENTS) {
-      const oldest = this._appliedInputSeq.keys().next().value;
-      if (oldest !== undefined) this._appliedInputSeq.delete(oldest);
+  /** Distinguish the valid zero sequence from a client with no delivery. */
+  hasAppliedInputSeq(clientId: string, seq: number): boolean {
+    const state = this._appliedInputSeq.get(clientId);
+    // An earlier identity can arrive while a higher sparse frame is already
+    // dispatching. Its known undelivered slot outranks the resulting watermark.
+    return state?.last !== undefined && seq <= state.last && !state.waiting.has(seq);
+  }
+
+  /** Remember received identities, including lock rejection, without accepting bytes. */
+  deferInputSeq(clientId: string, seq: number): boolean {
+    let state = this._appliedInputSeq.get(clientId);
+    if (state && (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq))) return true;
+    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) return false;
+    if (!state) {
+      if (this._appliedInputSeq.size >= Session.MAX_INPUT_DEDUP_CLIENTS) {
+        // Never evict an in-flight identity: its retry could apply twice.
+        const idle = [...this._appliedInputSeq].find(([, entry]) => entry.waiting.size === 0);
+        if (!idle) return false;
+        this._appliedInputSeq.delete(idle[0]);
+      }
+      state = { pending: new Set(), waiting: new Set() };
     }
+    // Re-insert to move this client to the MRU end for fair eviction.
+    this._appliedInputSeq.delete(clientId);
+    this._appliedInputSeq.set(clientId, state);
+    state.waiting.add(seq);
     return true;
   }
 
+  /** Admit only the earliest received identity; failed frames cannot be overtaken. */
+  shouldApplyInput(clientId: string, seq: number): boolean {
+    if (!this.deferInputSeq(clientId, seq)) return false;
+    const state = this._appliedInputSeq.get(clientId)!;
+    if (this.hasAppliedInputSeq(clientId, seq) || state.pending.size > 0 || seq !== Math.min(...state.waiting))
+      return false;
+    state.pending.add(seq);
+    return true;
+  }
+
+  /** Confirm completed delivery (or accepted remote-buffer ownership), then ACK. */
+  commitInputSeq(clientId: string, seq: number): void {
+    const state = this._appliedInputSeq.get(clientId);
+    if (!state?.pending.delete(seq)) return;
+    state.waiting.delete(seq);
+    state.last = Math.max(state.last ?? seq, seq);
+  }
+
+  private _commitWriteInput(options: SessionWriteOptions): void {
+    if (options.inputSeq) this.commitInputSeq(options.inputSeq.clientId, options.inputSeq.seq);
+  }
+
   /**
-   * Undo the bookkeeping of {@link shouldApplyInput} for a delivery that failed.
-   *
-   * Without this, the reliable-delivery layer guarantees exactly-once delivery of
-   * something that may never have been delivered: the seq is recorded as applied
-   * BEFORE the write is attempted, so a client retry — the very mechanism the seq
-   * exists for — is rejected as a duplicate and the input is lost for good.
-   *
-   * Only rolls back if `seq` is still the newest recorded one; a later input has
-   * already superseded it and must not be re-opened.
+   * Release failed admission while retaining its FIFO slot for a retry. A later
+   * frame cannot overtake known unsent input. Committed/sealed identities remain
+   * closed even when a later listener or dispatch cleanup throws.
    */
   forgetInputSeq(clientId: string, seq: number): void {
-    if (this._appliedInputSeq.get(clientId) === seq) {
-      this._appliedInputSeq.set(clientId, seq - 1);
-    }
+    this._appliedInputSeq.get(clientId)?.pending.delete(seq);
   }
 
   /**
@@ -4776,8 +4800,21 @@ export class Session extends EventEmitter {
   private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
     const submittedPrompt = this._trackSubmit(data, options, !!(this._mux && this._muxSession));
     if (this._mux && this._muxSession) {
-      const sent = await this._mux.sendInput(this.id, data);
+      let sent: boolean;
+      try {
+        sent = await this._mux.sendInput(this.id, data);
+      } catch (err) {
+        this._commitWriteInput(options); // unknown partial send, never reopen for replay
+        throw err;
+      }
+      if (!sent && options.inputSeq) {
+        // The mux can type text successfully and fail its separate Enter send.
+        // A false result after dispatch is not a certificate that nothing landed.
+        this._commitWriteInput(options);
+        throw new Error('Mux input delivery could not be confirmed');
+      }
       if (sent) {
+        this._commitWriteInput(options);
         this._emitSubmittedPrompt(submittedPrompt);
         this._verifySubmitted(data);
       }
@@ -4785,7 +4822,11 @@ export class Session extends EventEmitter {
     }
     // Fallback to PTY write
     if (this.ptyProcess) {
-      this.ptyProcess.write(data);
+      try {
+        this.ptyProcess.write(data);
+      } finally {
+        this._commitWriteInput(options);
+      }
       this._emitSubmittedPrompt(submittedPrompt);
       return true;
     }

@@ -21,7 +21,15 @@ const INTERRUPTED = { message: 'Conversation interrupted.', codex_error_info: nu
 type Payload = Record<string, unknown>;
 
 function context(patch: Partial<CodexClassificationContext> = {}): CodexClassificationContext {
-  return { conversationId: THREAD, now: NOW, screen: READY, busy: false, watching: false, ...patch };
+  return {
+    conversationId: THREAD,
+    now: NOW,
+    screen: READY,
+    busy: false,
+    watching: false,
+    tailTruncated: false,
+    ...patch,
+  };
 }
 
 function line(payload: Payload, at = NOW - 10_000): string {
@@ -384,6 +392,14 @@ describe('background subagents', () => {
     expect(classifyCodexTail(tail(start(), spawned, complete(INTERRUPTED)), context())).toMatchObject({
       activity: 'watching',
       reason: 'background-work',
+      safeToAct: false,
+    });
+  });
+
+  it.each([true, undefined])('does not infer no live children when tailTruncated is %s', (tailTruncated) => {
+    // This is also the retained suffix when an earlier spawn is outside the read window.
+    expect(classifyCodexTail(failed(), context({ tailTruncated }))).toMatchObject({
+      activity: 'interrupted',
       safeToAct: false,
     });
   });

@@ -15,10 +15,12 @@ import type { AddressInfo } from 'node:net';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import WebSocket from 'ws';
-import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js';
+import { createMockRouteContext, createDeferred, type MockRouteContext } from '../mocks/index.js';
 import { registerWsRoutes } from '../../src/web/routes/ws-routes.js';
 import { MAX_INPUT_LENGTH } from '../../src/config/terminal-limits.js';
 import { RebootIdentityFenceError } from '../../src/recovery/reboot-identity-fence.js';
+import { Session } from '../../src/session.js';
+import type { MuxSession, TerminalMultiplexer } from '../../src/mux-interface.js';
 
 /** Assigned by the OS on every listen (`port: 0`); see beforeEach. */
 let PORT = 0;
@@ -216,6 +218,168 @@ describe('ws-routes', () => {
         ws.close();
       }
     });
+    it('gates a higher frame when the key lock releases between earlier blocked frames and its arrival', async () => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const key = createDeferred<void>();
+      const held = session.sendNamedKey('\n', () => key.promise);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      const sync = async () => {
+        const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+        ws.ping();
+        await pong;
+      };
+      try {
+        for (const seq of [1, 2]) ws.send(JSON.stringify({ t: 'i', d: `${seq}`, cid: 'mid-burst', seq }));
+        await sync();
+        key.resolve();
+        await held;
+        ws.send(JSON.stringify({ t: 'i', d: '3', cid: 'mid-burst', seq: 3 }));
+        await sync();
+        expect(written).not.toHaveBeenCalled();
+        expect(session.lastInputSeq('mid-burst')).toBe(0);
+        const acked = collectMessages(ws, 3);
+        for (const seq of [1, 2, 3]) ws.send(JSON.stringify({ t: 'i', d: `${seq}`, cid: 'mid-burst', seq }));
+        expect(await acked).toEqual([
+          { t: 'ia', seq: 1 },
+          { t: 'ia', seq: 2 },
+          { t: 'ia', seq: 3 },
+        ]);
+        expect(written.mock.calls.map(([data]) => data)).toEqual(['1', '2', '3']);
+      } finally {
+        key.resolve();
+        await held;
+        ws.close();
+        await session.stop(false);
+      }
+    });
+
+    it('never replays bytes after an actual Session submission listener throws after the PTY write', async () => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      session.on('promptSubmitted', () => {
+        throw new Error('listener failed after write');
+      });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      try {
+        ws.send(JSON.stringify({ t: 'i', d: 'committed\r', cid: 'after-write', seq: 7 }));
+        const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+        ws.ping();
+        await pong;
+        expect(written).toHaveBeenCalledTimes(1);
+        expect(session.lastInputSeq('after-write')).toBe(7);
+        const duplicate = nextMessage(ws);
+        ws.send(JSON.stringify({ t: 'i', d: 'committed\r', cid: 'after-write', seq: 7 }));
+        expect(await duplicate).toEqual({ t: 'ia', seq: 7, dup: true, last: 7 });
+        expect(written).toHaveBeenCalledTimes(1);
+      } finally {
+        ws.close();
+        await session.stop(false);
+      }
+    });
+    it.each(['recovery', 'named-key'])(
+      'retains all three frames blocked by an actual Session %s reservation',
+      async (owner) => {
+        const thread = '11111111-2222-3333-4444-555555555555';
+        const probe = createDeferred<{ dead: false; screen: string }>();
+        const key = createDeferred<void>();
+        const mux = {
+          isAvailable: () => true,
+          inspectPaneForRecovery: () => probe.promise,
+          sendInput: vi.fn(async () => true),
+        };
+        const session = new Session({
+          id: 'ws-test-session',
+          workingDir: '/tmp',
+          mode: 'codex',
+          useMux: true,
+          mux: mux as unknown as TerminalMultiplexer,
+          muxSession: { muxName: 'codeman-ws-fixture', recoveryIsolated: true } as MuxSession,
+          codexConfig: { noDaemon: true, resumeSessionId: thread },
+        });
+        const written = vi.fn();
+        Object.assign(session, { ptyProcess: { write: written } });
+        (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        const held =
+          owner === 'named-key'
+            ? session.sendNamedKey('\n', () => key.promise)
+            : session.deliverRecovery(
+                {
+                  action: 'continue',
+                  key: 'fixture',
+                  conversationId: thread,
+                  startedAt: Date.now(),
+                },
+                0
+              );
+        const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+        const received: unknown[] = [];
+        ws.on('message', (raw) => received.push(JSON.parse(String(raw))));
+        try {
+          expect(session.recoveryInputReserved).toBe(true);
+          for (let seq = 1; seq <= 3; seq++) ws.send(JSON.stringify({ t: 'i', d: `${seq}`, cid: 'locked', seq }));
+          // Pong follows the preceding frames on this socket, proving they were handled.
+          const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+          ws.ping();
+          await pong;
+          expect(session.lastInputSeq('locked')).toBe(0);
+          expect(written).not.toHaveBeenCalled();
+          expect(received).toEqual([]);
+          key.resolve();
+          probe.resolve({ dead: false, screen: '›\n  example-model high · /tmp\n' });
+          await held;
+          const acks = collectMessages(ws, 3);
+          for (let seq = 1; seq <= 3; seq++) ws.send(JSON.stringify({ t: 'i', d: `${seq}`, cid: 'locked', seq }));
+          expect(await acks).toEqual([
+            { t: 'ia', seq: 1 },
+            { t: 'ia', seq: 2 },
+            { t: 'ia', seq: 3 },
+          ]);
+          expect(written.mock.calls.map(([data]) => data)).toEqual(['1', '2', '3']);
+          expect(session.lastInputSeq('locked')).toBe(3);
+          const dup = nextMessage(ws);
+          ws.send(JSON.stringify({ t: 'i', d: '3', cid: 'locked', seq: 3 }));
+          expect(await dup).toEqual({ t: 'ia', seq: 3, dup: true, last: 3 });
+          expect(written).toHaveBeenCalledTimes(3);
+        } finally {
+          key.resolve();
+          probe.resolve({ dead: false, screen: '›\n  example-model high · /tmp\n' });
+          await held;
+          ws.close();
+          await session.stop(false);
+        }
+      }
+    );
+
+    it('does not invent watermarks for sparse failed writes on the actual Session', async () => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'shell' });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      try {
+        for (const seq of [7, 100]) ws.send(JSON.stringify({ t: 'i', d: `${seq}`, cid: 'gap', seq }));
+        const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+        ws.ping();
+        await pong;
+        expect(session.lastInputSeq('gap')).toBe(0);
+        const written = vi.fn();
+        Object.assign(session, { ptyProcess: { write: written } });
+        const acks = collectMessages(ws, 2);
+        for (const seq of [7, 100]) ws.send(JSON.stringify({ t: 'i', d: `${seq}`, cid: 'gap', seq }));
+        expect(await acks).toEqual([
+          { t: 'ia', seq: 7 },
+          { t: 'ia', seq: 100 },
+        ]);
+        expect(written.mock.calls.map(([data]) => data)).toEqual(['7', '100']);
+        expect(session.lastInputSeq('gap')).toBe(100);
+      } finally {
+        ws.close();
+        await session.stop(false);
+      }
+    });
     it('forwards input messages to session.write()', async () => {
       const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
       try {
@@ -270,7 +434,8 @@ describe('ws-routes', () => {
       const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
       try {
         const session = ctx._session;
-        session.shouldApplyInput('c1', 7); // pretend seq 7 already landed
+        session.shouldApplyInput('c1', 7);
+        session.commitInputSeq('c1', 7); // pretend seq 7 already landed
 
         ws.send(JSON.stringify({ t: 'i', d: 'again\r', cid: 'c1', seq: 7 }));
 
