@@ -13,7 +13,7 @@
  */
 
 import { createHash } from 'node:crypto';
-import { constants, type Stats } from 'node:fs';
+import { constants, closeSync, fstatSync, lstatSync, openSync, readSync, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, isAbsolute, join, parse, resolve, sep } from 'node:path';
@@ -50,6 +50,56 @@ export interface CodexIdentityResult {
   /** Only false certifies that the tail contains the rollout's complete lifecycle history. */
   tailTruncated?: boolean;
   witness?: CodexIdentityWitness;
+}
+
+/** Final bounded synchronous check, after launch preparation and the last owner-grant await. */
+export function confirmCodexIdentityWitness(identity: CodexIdentityResult): boolean {
+  if (!identity.path || !identity.witness || identity.tailTruncated !== false || identity.tail === undefined)
+    return false;
+  const leaf = identity.witness.paths.find((input) => input.path === identity.path && input.kind === 'file');
+  if (!leaf || leaf.size === undefined || leaf.mtimeMs === undefined || leaf.ctimeMs === undefined) return false;
+  const matchesLeaf = (stat: Stats) =>
+    stat.isFile() &&
+    stat.dev === leaf.dev &&
+    stat.ino === leaf.ino &&
+    stat.size === leaf.size &&
+    stat.mtimeMs === leaf.mtimeMs &&
+    stat.ctimeMs === leaf.ctimeMs;
+  const witnessIsCurrent = () => {
+    for (const input of identity.witness!.paths) {
+      const stat = lstatSync(input.path);
+      if (
+        stat.isSymbolicLink() ||
+        (input.kind === 'file' ? !stat.isFile() : !stat.isDirectory()) ||
+        stat.dev !== input.dev ||
+        stat.ino !== input.ino ||
+        (input.size !== undefined && stat.size !== input.size) ||
+        (input.mtimeMs !== undefined && stat.mtimeMs !== input.mtimeMs) ||
+        (input.ctimeMs !== undefined && stat.ctimeMs !== input.ctimeMs)
+      )
+        return false;
+    }
+    return true;
+  };
+  let fd: number | undefined;
+  try {
+    if (!witnessIsCurrent()) return false;
+    fd = openSync(identity.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    const before = fstatSync(fd);
+    if (!matchesLeaf(before) || before.size > 262_144) return false;
+    const bytes = Buffer.alloc(before.size);
+    if (readSync(fd, bytes, 0, before.size, 0) !== before.size) return false;
+    const after = fstatSync(fd);
+    return (
+      matchesLeaf(after) &&
+      witnessIsCurrent() &&
+      createHash('sha256').update(bytes).digest('hex') === createHash('sha256').update(identity.tail).digest('hex')
+    );
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
 }
 
 const HEAD_BYTES = 128 * 1024;
@@ -159,7 +209,7 @@ async function readWindow(
   budget.check();
   // Acquire outside checked(): if open finishes after the deadline, the handle must
   // still reach this finally block instead of being lost in the deadline check.
-  const file = await fs.open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  const file = await fs.open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   try {
     budget.check();
     const stat = await checked(budget, () => file.stat());

@@ -31,7 +31,7 @@ import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { homedir } from 'node:os';
-import { parseNativePaneSignal } from './recovery/native-pane-signal.js';
+import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
 import {
   dataPath,
   DEFAULT_TMUX_SOCKET,
@@ -2499,6 +2499,24 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // Recovery cannot turn current server defaults into provenance for an old pane.
     if (options.onlyIfDead && localCodex && !recoveryCodexHome) return null;
     const guard = options.recoveryDispatchGuard;
+    const expected = options.expectedRecoveryPane;
+    if (
+      expected &&
+      (!options.onlyIfDead ||
+        !localCodex ||
+        !/^%(?:0|[1-9]\d{0,9})$/.test(expected.paneId) ||
+        !Number.isSafeInteger(Number(expected.paneId.slice(1))) ||
+        !Number.isSafeInteger(expected.panePid) ||
+        expected.panePid <= 0 ||
+        !/^[1-9]\d{0,9}$/.test(String(expected.panePid)) ||
+        (expected.status !== undefined && (expected.status > 255 || (expected.signal ?? 0) > 0)) ||
+        !matchesNativePaneSignal(expected.signal, expected.paneSignalToken) ||
+        ![expected.status, expected.signal].every(
+          (value) => value === undefined || (Number.isSafeInteger(value) && value >= 0)
+        ) ||
+        !((expected.status ?? 0) > 0 || (expected.signal ?? 0) > 0))
+    )
+      return null;
     const canDispatch = () =>
       !guard ||
       (options.onlyIfDead === true &&
@@ -2571,12 +2589,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       if (!canDispatch()) return null;
       guard?.noteDispatch();
-      await execAsync(
-        `${this.tmux()} respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+      const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${expected ? shellescape(expected.paneId) : `"${muxName}"`} bash -c ${expected ? shellescape(launchCmd) : JSON.stringify(launchCmd)}`;
+      const predicate = expected
+        ? [
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${expected.paneId}}`,
+            `#{==:#{pane_pid},${expected.panePid}}`,
+            '#{==:#{pane_dead},1}',
+            `#{==:#{pane_dead_status},${expected.status ?? ''}}`,
+            `#{==:#{pane_dead_signal},${expected.paneSignalToken ?? ''}}`,
+          ].reduce((all, term) => `#{&&:${all},${term}}`)
+        : undefined;
+      // The server evaluates this exact dead-process fence before queuing a no-k
+      // respawn. A refused or lost response remains uncertainty-sealed by Session.
+      const { stdout: spawnOutput } = await execAsync(
+        `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(expected!.paneId)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}`,
         {
           timeout: EXEC_TIMEOUT_MS,
         }
       );
+      if (expected && spawnOutput.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') return null;
       // Wait for the respawned process to start
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
       // The pane now runs a fresh command, so whatever the last read observed of

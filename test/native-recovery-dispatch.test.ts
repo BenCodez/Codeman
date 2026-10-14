@@ -85,6 +85,8 @@ async function fixture(action: 'continue' | 'restart') {
   const id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
   const thread = '11111111-2222-3333-4444-555555555555';
   const pane = {
+    paneId: '%7',
+    panePid: 700,
     dead: action === 'restart',
     status: action === 'restart' ? 1 : undefined,
     screen: action === 'restart' ? null : '›\n  fixture-model high · /tmp\n',
@@ -141,6 +143,10 @@ async function fixture(action: 'continue' | 'restart') {
   return {
     worker,
     manager,
+    home,
+    pane,
+    id,
+    thread,
     deliver,
     cancel: () => {
       current = false;
@@ -271,6 +277,88 @@ describe('native continuation after literal input', () => {
 });
 
 describe('native restart final preparation boundary', () => {
+  it.each(
+    (['recovery'] as const).flatMap((agent) =>
+      (['unchanged', 'Session-PID', 'preparation-PID'] as const).map((change) => ({ agent, change }))
+    )
+  )(
+    'passes the genuine $agent adapter private pane fence through Session and native dispatch ($change)',
+    async ({ agent, change }) => {
+      const f = await fixture('restart');
+      mkdirSync(join(f.home, 'sessions'));
+      const at = new Date(Date.now() - 60_000).toISOString();
+      writeFileSync(
+        join(f.home, 'sessions', `rollout-fixture-${f.thread}.jsonl`),
+        JSON.stringify({
+          timestamp: at,
+          type: 'session_meta',
+          payload: { id: f.thread, cwd: directory, originator: `codeman_${f.id}` },
+        }) +
+          '\n' +
+          JSON.stringify({
+            timestamp: at,
+            type: 'event_msg',
+            payload: { type: 'task_complete', turn_id: 'fixture-turn' },
+          }) +
+          '\n'
+      );
+      const { CodexRecoveryAdapter } = await import('../src/recovery/codex-adapter.js');
+      const adapter = new CodexRecoveryAdapter(f.worker, vi.fn());
+      f.pane.dead = false;
+      f.pane.status = undefined;
+      f.pane.screen = '›\n  fixture-model high · /tmp\n';
+      await adapter.observe();
+      f.pane.dead = true;
+      f.pane.status = 1;
+      f.pane.screen = null;
+      f.worker.setPaneExit({ at: Date.now(), status: 1 });
+      const observed = await adapter.observe();
+      const observation = observed;
+      expect(observation).toMatchObject({ activity: 'crashed', safeToAct: true });
+      if (change === 'Session-PID') {
+        const inspect = f.worker.inspectRecoveryPane.bind(f.worker);
+        let reads = 0;
+        vi.spyOn(f.worker, 'inspectRecoveryPane').mockImplementation(async () => {
+          const current = await inspect();
+          if (++reads === 2 && current) current.panePid = 701;
+          return current;
+        });
+      }
+      let workerEffects = 0;
+      const snapshot: Record<string, string> = {
+        session_name: 'codeman-aaaaaaaa',
+        pane_id: '%7',
+        pane_pid: '700',
+        pane_dead: '1',
+        pane_dead_status: '1',
+        pane_dead_signal: '',
+      };
+      effects.sync.mockImplementation((command: string) => {
+        if (change === 'preparation-PID' && command.includes('setenv') && command.includes(' CODEX_HOME '))
+          snapshot.pane_pid = '701';
+        return '99999\n';
+      });
+      effects.exec.mockImplementation(async (command: string) => {
+        const terms = [...command.matchAll(/#\{==:#\{([^}]+)\},([^}]*)\}/g)];
+        expect(terms).toHaveLength(6);
+        if (!terms.every((term) => snapshot[term[1]] === term[2]))
+          return { stdout: 'CODEMAN_RECOVERY_PANE_REFUSED\n', stderr: '' };
+        workerEffects++;
+        return { stdout: '', stderr: '' };
+      });
+      const result = await adapter.act({
+        key: observation.evidenceKey!,
+        action: 'restart',
+        conversationId: f.thread,
+        startedAt: Date.now(),
+      });
+      expect(result).toBe(change === 'unchanged' ? 'sent' : change === 'Session-PID' ? 'not-sent' : 'unknown');
+      expect(workerEffects).toBe(change === 'unchanged' ? 1 : 0);
+      if (change !== 'Session-PID') expect(commands().at(-1)).not.toContain('respawn-pane -k');
+      effects.exec.mockClear();
+    }
+  );
+
   it.each(['unchanged', 'cancel', 'grant', 'evidence', 'config'])(
     'rechecks %s after environment setup before a worker child',
     async (change) => {

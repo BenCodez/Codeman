@@ -13,3 +13,8 @@ export function parseNativePaneSignal(token: string): number | undefined | null 
   const key = `SIG${token}`;
   return Object.hasOwn(signals, key) && Number.isSafeInteger(signals[key]) && signals[key] > 0 ? signals[key] : null;
 }
+
+export function matchesNativePaneSignal(signal: number | undefined, token: string | undefined): boolean {
+  const decoded = parseNativePaneSignal(token ?? '');
+  return decoded !== null && decoded === signal;
+}

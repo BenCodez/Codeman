@@ -140,11 +140,21 @@ export interface RecoveryMuxDispatchGuard {
 }
 
 /** Options for respawning a dead pane. */
+export interface RecoveryPaneIdentity {
+  paneId: string;
+  panePid: number;
+  status?: number;
+  signal?: number;
+  paneSignalToken?: string;
+}
+
 export interface RespawnPaneOptions {
   /** Automatic local recovery checks authority again immediately before its worker effect. */
   recoveryDispatchGuard?: RecoveryMuxDispatchGuard;
   /** Recovery refuses a pane that became live by omitting tmux's kill-live-pane flag. Local only. */
   onlyIfDead?: boolean;
+  /** Ephemeral inspected native process identity; never restored from disk. */
+  expectedRecoveryPane?: RecoveryPaneIdentity;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;

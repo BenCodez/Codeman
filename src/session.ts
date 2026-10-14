@@ -2368,7 +2368,8 @@ export class Session extends EventEmitter {
     generation: number,
     isCurrent: () => boolean = () => true,
     prompt: string = CONTINUATION_PROMPT,
-    confirmEvidence?: () => boolean
+    confirmEvidence?: () => boolean,
+    expectedRecoveryPane?: import('./mux-interface.js').RecoveryPaneIdentity
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.getRecoveryContext();
     if (
@@ -2386,6 +2387,16 @@ export class Session extends EventEmitter {
     try {
       return await this._withPaneLifecycle(async () => {
         const pane = await this.inspectRecoveryPane();
+        if (
+          expectedRecoveryPane &&
+          (!pane ||
+            pane.paneId !== expectedRecoveryPane.paneId ||
+            pane.panePid !== expectedRecoveryPane.panePid ||
+            pane.status !== expectedRecoveryPane.status ||
+            pane.signal !== expectedRecoveryPane.signal ||
+            (pane.paneSignalToken ?? '') !== (expectedRecoveryPane.paneSignalToken ?? ''))
+        )
+          return 'not-sent';
         const envToAuthorize =
           context.codexHome !== currentLocalCodexHome()
             ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
@@ -2480,6 +2491,7 @@ export class Session extends EventEmitter {
           const pid = await this._mux!.respawnPane({
             ...this._buildRespawnPaneOptions(),
             onlyIfDead: true,
+            ...(expectedRecoveryPane ? { expectedRecoveryPane: { ...expectedRecoveryPane } } : {}),
             recoveryDispatchGuard: recoveryGuard,
           });
           if (!pid) return refusedBeforeDispatch && !dispatched ? 'not-sent' : 'unknown';
