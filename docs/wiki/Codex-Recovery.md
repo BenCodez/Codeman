@@ -49,16 +49,18 @@ The status shows observed Codex activity separately from recovery-controller sta
 
 The journal is `recovery.json` under the instance-aware data directory, mode `0600`, written by atomic rename. It contains sanitized reason codes and identifiers, never prompts, rollout text, SSH diagnostics or credentials. A corrupt/unwritable journal disables automation. History is capped at 100 events; handled evidence at 32 entries. Filesystem scans have explicit byte, entry and time budgets and pause when evidence is incomplete or inaccessible.
 
+Explicit owner deletion stops and drains recovery even if journal cleanup fails; unreadable or unwritable journal evidence is preserved for inspection. After verified startup restoration, orphan records with only unsent scheduling intentions can be reclaimed. Actual in-flight delivery reservations and records belonging to retained sessions or pending restores remain protected.
+
 ## API and events
 
 All routes use existing authentication and session ownership checks. `/api/v1` aliases are supported.
 
-| Method | Route | Behavior |
-| --- | --- | --- |
-| GET | `/api/sessions/:id/recovery` | Read fresh evidence without scheduling or dispatching recovery |
-| PUT | `/api/sessions/:id/recovery/config` | Update bounded settings; unknown fields are rejected |
-| POST | `/api/sessions/:id/recovery/retry` | Request one guarded attempt, with no caller-supplied prompt or thread |
-| POST | `/api/sessions/:id/recovery/reset` | Clear retry/circuit/uncertain-reservation state explicitly |
+| Method | Route                               | Behavior                                                              |
+| ------ | ----------------------------------- | --------------------------------------------------------------------- |
+| GET    | `/api/sessions/:id/recovery`        | Read fresh evidence without scheduling or dispatching recovery        |
+| PUT    | `/api/sessions/:id/recovery/config` | Update bounded settings; unknown fields are rejected                  |
+| POST   | `/api/sessions/:id/recovery/retry`  | Request one guarded attempt, with no caller-supplied prompt or thread |
+| POST   | `/api/sessions/:id/recovery/reset`  | Clear retry/circuit/uncertain-reservation state explicitly            |
 
 The API returns `{ "success": true, "data": ... }` or the existing error envelope. The owner-scoped SSE event `session:recovery` carries `{ sessionId, state }`. Attention events use the existing push/webhook integrations and sanitized reason codes; ordinary successful retries do not send notifications.
 

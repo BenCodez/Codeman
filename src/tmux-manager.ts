@@ -2178,8 +2178,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
+    const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
     const recoveryCodexHome = localCodex
-      ? normalizedCodexHome(options.recoveryCodexHome ?? envOverrides?.CODEX_HOME ?? currentLocalCodexHome())
+      ? normalizedCodexHome(options.recoveryCodexHome ?? launchEnvCodexHome ?? currentLocalCodexHome())
       : undefined;
     if (localCodex && !recoveryCodexHome) throw new Error('Local Codex launch home is unverified');
     if (options.codexRestoreGuard && (!localCodex || !codexConfig?.resumeSessionId || !codexConfig.noDaemon))
@@ -2562,14 +2563,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     if (!session) return null;
     const muxName = session.muxName;
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
+    const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
     const recoveryCodexHome = localCodex
       ? normalizedCodexHome(
           options.onlyIfDead
             ? (options.recoveryCodexHome ?? session.recoveryCodexHome)
-            : (envOverrides?.CODEX_HOME ??
-                options.recoveryCodexHome ??
-                session.recoveryCodexHome ??
-                currentLocalCodexHome())
+            : (launchEnvCodexHome ?? options.recoveryCodexHome ?? session.recoveryCodexHome ?? currentLocalCodexHome())
         )
       : undefined;
     // Recovery cannot turn current server defaults into provenance for an old pane.

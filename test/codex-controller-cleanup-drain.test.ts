@@ -291,36 +291,41 @@ it.each(['recovery', 'task'] as const)(
   }
 );
 
-it('stops both controllers and preserves an uncertain reservation when a journal drop fails', async () => {
-  await fixture('recovery', async ({ internals, recovery, task, finish, pending, paths }) => {
-    const session = internals.sessions.get(ID) as Session;
-    const stop = vi.spyOn(session, 'stop').mockResolvedValue();
-    const closing = vi.spyOn(session, 'markClosing');
-    const recoveryStop = vi.spyOn(recovery, 'stop');
-    const taskStop = vi.spyOn(task, 'stop');
-    const before = await fs.readFile(paths[1], 'utf8');
-    Reflect.set(internals.taskStore, 'path', join(paths[1], 'blocked'));
-    vi.spyOn(internals.tabLayouts, 'runSessionDeletion').mockImplementation(
-      async (_owners: unknown, action: () => Promise<void>) => action()
-    );
-    const cleanup = internals.cleanupSession(ID, true, 'fixture failed deletion');
-    // Attach the rejection handler before releasing the delayed receipt.
-    const rejected = expect(cleanup).rejects.toThrow();
-    finish.resolve('unknown');
-    await pending;
-    await rejected;
-    expect(recoveryStop).toHaveBeenCalledOnce();
-    expect(taskStop).toHaveBeenCalledOnce();
-    expect(stop).not.toHaveBeenCalled();
-    expect(internals.sessions.get(ID)).toBe(session);
-    expect(internals.cleaningUp.has(ID)).toBe(false);
-    expect(closing).toHaveBeenLastCalledWith(false);
-    expect(await fs.readFile(paths[1], 'utf8')).toBe(before);
-    expect(new TaskStore(paths[2]).get(ID).inFlight?.key).toMatch(/^recovery:/);
-    expect(new RecoveryStore(paths[0]).get(ID).inFlight).toBeDefined();
-    Reflect.set(internals.taskStore, 'path', paths[1]);
-  });
-});
+it.each(['task', 'actions', 'recovery'] as const)(
+  'stops both controllers and completes owner deletion when the %s journal cannot be removed',
+  async (failed) => {
+    await fixture('recovery', async ({ internals, recovery, task, finish, pending, paths }) => {
+      const session = internals.sessions.get(ID) as Session;
+      const stop = vi.spyOn(session, 'stop').mockResolvedValue();
+      const recoveryStop = vi.spyOn(recovery, 'stop');
+      const taskStop = vi.spyOn(task, 'stop');
+      const journals = [internals.recoveryStore, internals.taskStore, internals.actionReservationStore];
+      const index = failed === 'recovery' ? 0 : failed === 'task' ? 1 : 2;
+      const before = await fs.readFile(paths[index], 'utf8');
+      const drops = journals.map((journal) => vi.spyOn(journal, 'drop'));
+      Reflect.set(journals[index], 'path', join(paths[index], 'blocked'));
+      vi.spyOn(console, 'warn').mockImplementation(() => {});
+      vi.spyOn(internals.tabLayouts, 'runSessionDeletion').mockImplementation(
+        async (_owners: unknown, action: () => Promise<void>) => action()
+      );
+      const cleanup = internals.cleanupSession(ID, true, 'fixture owner deletion');
+      finish.resolve('unknown');
+      await pending.catch(() => {});
+      await cleanup;
+      expect(recoveryStop).toHaveBeenCalledOnce();
+      expect(taskStop).toHaveBeenCalledOnce();
+      expect(stop).toHaveBeenCalledWith(true);
+      expect(internals.sessions.has(ID)).toBe(false);
+      expect(internals.cleaningUp.has(ID)).toBe(false);
+      expect(await fs.readFile(paths[index], 'utf8')).toBe(before);
+      for (const drop of drops) expect(drop).toHaveBeenCalledWith(ID);
+      for (let i = 0; i < paths.length; i++) {
+        if (i !== index) expect(JSON.parse(await fs.readFile(paths[i], 'utf8')).sessions[ID]).toBeUndefined();
+      }
+      Reflect.set(journals[index], 'path', paths[index]);
+    });
+  }
+);
 
 it('synchronously stops and drains a task-only server shutdown before flushing its durable uncertainty', async () => {
   await fixture('task', async ({ internals, task, finish, pending, paths }) => {
