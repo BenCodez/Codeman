@@ -1,20 +1,24 @@
 /** @fileoverview Codex-specific recovery authority for verified local and owned SSH panes. */
 import { createHash } from 'node:crypto';
+import { openSync, closeSync, fstatSync, lstatSync, readSync, constants as fsConstants } from 'node:fs';
 import type { Session } from '../session.js';
 import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../session-env-clamp.js';
-import { resolveCodexIdentity } from './codex-identity.js';
+import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
+import { currentLocalCodexHome, normalizedCodexHome } from './codex-home.js';
 import { classifyCodexTail, hasEmptyCodexComposer } from './codex-classifier.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight, type RecoveryObservation } from './types.js';
 import {
   inspectRemoteCodex,
   deliverRemoteCodexInput,
   restartRemoteCodexPane,
+  restoreRemoteCodexWorker,
   type RemoteCodexEvidence,
   type RemoteCodexEvidenceRequest,
   type RemoteCodexIdentityGuard,
   type RemoteCodexInputRequest,
   type RemoteCodexInputResult,
   type RemoteCodexRestartRequest,
+  type RemoteCodexRestoreRequest,
 } from './remote-codex.js';
 
 export interface CodexRecoveryAdapterDeps {
@@ -30,12 +34,17 @@ export interface CodexRecoveryAdapterDeps {
     remote: NonNullable<Session['remote']>,
     request: RemoteCodexInputRequest
   ): Promise<RemoteCodexInputResult>;
+  restoreRemote?(
+    remote: NonNullable<Session['remote']>,
+    request: RemoteCodexRestoreRequest
+  ): Promise<'sent' | 'not-sent' | 'unknown'>;
 }
 
 const defaultDeps: CodexRecoveryAdapterDeps = {
   inspectRemote: inspectRemoteCodex,
   restartRemote: restartRemoteCodexPane,
   deliverRemote: deliverRemoteCodexInput,
+  restoreRemote: restoreRemoteCodexWorker,
 };
 
 const REMOTE_LIVE_PROOF_MAX_AGE_MS = 30_000;
@@ -74,8 +83,15 @@ export class CodexRecoveryAdapter {
     expected: RemoteCodexInputRequest['expected'];
     submission: NonNullable<RemoteCodexEvidenceRequest['submission']>;
   };
-  private missingProof?: { generation: number; conversationId: string };
-  private verifiedTail?: { conversationId: string; tail: string };
+  private missingProof?: { generation: number; conversationId: string; tailHash: string };
+  private verifiedTail?: {
+    conversationId: string;
+    tail: string;
+    path?: string;
+    witness?: CodexIdentityWitness;
+    config?: string;
+    env?: string;
+  };
   private remotePaneContinuity?: {
     generation: number;
     conversationId: string;
@@ -107,6 +123,9 @@ export class CodexRecoveryAdapter {
     if (session.docker) return unknown('unsupported-location');
     if (session.remote?.owned === false) return unknown('unowned-session');
     if (!context.managed) return unknown('unowned-session');
+    // A remote login environment can change between probes and restart. Only an
+    // explicitly persisted absolute home pins the worker's exact configuration.
+    if (session.remote && normalizedCodexHome(context.codexHome) === undefined) return unknown('identity-unverified');
     if (!context.noDaemon) return unknown('managed-daemon');
     if (context.switchPending || context.untrackedInput || session.paneLifecycleInFlight)
       return unknown('identity-unverified');
@@ -114,7 +133,10 @@ export class CodexRecoveryAdapter {
     const clamped = await clampExternalCliConfigsForOwner(session.owner, { codexConfig: session.codexConfig });
     // Include the active home explicitly; the path participates in the current grant check.
     const persistedEnv = session.getEnvOverridesForPersist();
-    const env = context.codexHome ? { ...persistedEnv, CODEX_HOME: context.codexHome } : persistedEnv;
+    const env =
+      context.codexHome && (session.remote || context.codexHome !== currentLocalCodexHome())
+        ? { ...persistedEnv, CODEX_HOME: context.codexHome }
+        : persistedEnv;
     const safeEnv = await clampEnvOverridesForOwner(session.owner, env);
     if (
       JSON.stringify(clamped.codexConfig) !== JSON.stringify(session.codexConfig) ||
@@ -185,7 +207,18 @@ export class CodexRecoveryAdapter {
         if (!((transportPane.status ?? 0) > 0 || (transportPane.signal ?? 0) > 0)) {
           return unknown('pane-unverified');
         }
-        this.missingProof = { generation: context.generation, conversationId };
+        const classified = classifyCodexTail(evidence.identity.tail, {
+          conversationId,
+          now: Date.now(),
+          screen: null,
+          busy: false,
+          watching: !!session.watching,
+          tailTruncated: evidence.identity.tailTruncated,
+          lastIntentionalStopAt: context.intentionalStopAt,
+        });
+        // Explicit restoration still cannot clear active child work or a structured veto.
+        if (['watching', 'unknown', 'paused', 'blocked'].includes(classified.activity)) return classified;
+        this.missingProof = { generation: context.generation, conversationId, tailHash };
         return {
           activity: 'unknown',
           reason: 'remote-session-missing',
@@ -253,17 +286,16 @@ export class CodexRecoveryAdapter {
             tailTruncated: evidence.identity.tailTruncated,
             lastIntentionalStopAt: context.intentionalStopAt,
           });
-          observation =
-            childWork.reason === 'background-work' || childWork.activity === 'unknown'
-              ? childWork
-              : {
-                  activity: 'crashed',
-                  reason: 'process-crashed',
-                  at: crashAt,
-                  ...(transitionedFromLive ? { liveProofAt: transitionedFromLive.liveObservedAt } : {}),
-                  evidenceKey,
-                  safeToAct: crashAt > 0 && context.intentionalStopAt < crashAt - 2000,
-                };
+          observation = ['watching', 'unknown', 'paused', 'blocked'].includes(childWork.activity)
+            ? childWork
+            : {
+                activity: 'crashed',
+                reason: 'process-crashed',
+                at: crashAt,
+                ...(transitionedFromLive ? { liveProofAt: transitionedFromLive.liveObservedAt } : {}),
+                evidenceKey,
+                safeToAct: crashAt > 0 && context.intentionalStopAt < crashAt - 2000,
+              };
         } else return unknown('pane-unverified');
       } else {
         const observedAt = Date.now();
@@ -353,7 +385,15 @@ export class CodexRecoveryAdapter {
       return unknown('user-input');
     if (!identity.conversationId || identity.reason !== 'verified' || identity.tail === undefined)
       return unknown('identity-unverified');
-    this.verifiedTail = { conversationId: identity.conversationId, tail: identity.tail };
+    if (identity.tailTruncated === false)
+      this.verifiedTail = {
+        conversationId: identity.conversationId,
+        tail: identity.tail,
+        path: identity.path,
+        witness: identity.witness,
+        config: JSON.stringify(this.session.codexConfig),
+        env: JSON.stringify(this.session.getEnvOverridesForPersist()),
+      };
     if (!pane) return unknown('pane-unverified');
     if (session.codexConfig?.resumeSessionId !== identity.conversationId) {
       session.pinRecoveryConversation(identity.conversationId);
@@ -370,7 +410,7 @@ export class CodexRecoveryAdapter {
         pane.signal === exit.signal &&
         ((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0)
       ) {
-        // A confirmed parent exit does not establish that its spawned children have finished.
+        // A confirmed parent exit cannot clear child work, owner intent or permission/authentication vetoes.
         const childWork = classifyCodexTail(identity.tail, {
           conversationId: identity.conversationId,
           now: Date.now(),
@@ -380,16 +420,15 @@ export class CodexRecoveryAdapter {
           tailTruncated: identity.tailTruncated,
           lastIntentionalStopAt: context.intentionalStopAt,
         });
-        observation =
-          childWork.reason === 'background-work' || childWork.activity === 'unknown'
-            ? childWork
-            : {
-                activity: 'crashed',
-                reason: 'process-crashed',
-                at: exit.at,
-                evidenceKey: `${identity.conversationId}:pane:${exit.at}:${pane.status ?? pane.signal}`,
-                safeToAct: context.intentionalStopAt < exit.at - 2000,
-              };
+        observation = ['watching', 'unknown', 'paused', 'blocked'].includes(childWork.activity)
+          ? childWork
+          : {
+              activity: 'crashed',
+              reason: 'process-crashed',
+              at: exit.at,
+              evidenceKey: `${identity.conversationId}:pane:${exit.at}:${pane.status ?? pane.signal}`,
+              safeToAct: context.intentionalStopAt < exit.at - 2000,
+            };
       } else observation = unknown('pane-unverified');
     } else {
       observation = classifyCodexTail(identity.tail, {
@@ -418,6 +457,61 @@ export class CodexRecoveryAdapter {
       };
     }
     return observation;
+  }
+
+  /** Tail from this adapter's latest exact identity observation; never API-bound. */
+  getVerifiedTail(conversationId: string): string | undefined {
+    return this.verifiedTail?.conversationId === conversationId ? this.verifiedTail.tail : undefined;
+  }
+
+  /** Last local evidence read after Session has awaited pane and current grants. */
+  confirmLocalEvidence(conversationId: string, generation: number): boolean {
+    const expected = this.verifiedTail;
+    const context = this.session.getRecoveryContext();
+    if (
+      this.session.remote ||
+      expected?.conversationId !== conversationId ||
+      !expected.path ||
+      !expected.witness ||
+      context.generation !== generation ||
+      expected.config !== JSON.stringify(this.session.codexConfig) ||
+      expected.env !== JSON.stringify(this.session.getEnvOverridesForPersist())
+    )
+      return false;
+    let fd: number | undefined;
+    try {
+      // Any changed history binding, conflicting rollout or ancestor invalidates this observation.
+      for (const input of expected.witness.paths) {
+        const stat = lstatSync(input.path);
+        if (
+          stat.isSymbolicLink() ||
+          (input.kind === 'file' ? !stat.isFile() : !stat.isDirectory()) ||
+          stat.dev !== input.dev ||
+          stat.ino !== input.ino ||
+          (input.size !== undefined && stat.size !== input.size) ||
+          (input.mtimeMs !== undefined && stat.mtimeMs !== input.mtimeMs) ||
+          (input.ctimeMs !== undefined && stat.ctimeMs !== input.ctimeMs)
+        )
+          return false;
+      }
+      // This bounded synchronous proof introduces no new await after Session's final owner-grant read.
+      fd = openSync(expected.path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW || 0));
+      const before = fstatSync(fd);
+      if (!before.isFile() || before.size > 262_144) return false;
+      const bytes = Buffer.alloc(before.size);
+      if (readSync(fd, bytes, 0, before.size, 0) !== before.size) return false;
+      const after = fstatSync(fd);
+      return (
+        after.size === before.size &&
+        after.mtimeMs === before.mtimeMs &&
+        this.session.getRecoveryContext().generation === generation &&
+        createHash('sha256').update(bytes).digest('hex') === createHash('sha256').update(expected.tail).digest('hex')
+      );
+    } catch {
+      return false;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
   }
 
   async act(flight: RecoveryFlight, isCurrent: () => boolean = () => true): Promise<'sent' | 'not-sent' | 'unknown'> {
@@ -468,7 +562,12 @@ export class CodexRecoveryAdapter {
           isCurrent
         );
       }
-    } else result = await this.session.deliverRecovery(flight, this.proof.generation, isCurrent);
+    } else {
+      const generation = this.proof.generation;
+      result = await this.session.deliverRecovery(flight, generation, isCurrent, CONTINUATION_PROMPT, () =>
+        this.confirmLocalEvidence(flight.conversationId, generation)
+      );
+    }
     if (result === 'sent') this.persistSession();
     return result;
   }
@@ -510,13 +609,9 @@ export class CodexRecoveryAdapter {
     );
   }
 
-  /** Tail from this adapter's latest exact identity observation; never API-bound. */
-  getVerifiedTail(conversationId: string): string | undefined {
-    return this.verifiedTail?.conversationId === conversationId ? this.verifiedTail.tail : undefined;
-  }
-
   /** Explicit owner-request path only; automatic evaluation never calls this. */
   async restoreMissingRemote(isCurrent: () => boolean = () => true): Promise<'sent' | 'not-sent' | 'unknown'> {
+    if (!this.deps.restoreRemote) return 'not-sent';
     const first = await this.observe();
     const proof = this.missingProof;
     if (
@@ -531,11 +626,27 @@ export class CodexRecoveryAdapter {
       !isCurrent() ||
       !this.missingProof ||
       this.missingProof.generation !== proof.generation ||
+      this.missingProof.tailHash !== proof.tailHash ||
       second.reason !== 'remote-session-missing' ||
       second.conversationId !== proof.conversationId
     )
       return 'not-sent';
-    const result = await this.session.restoreMissingRemoteWorker(proof.conversationId, proof.generation, isCurrent);
+    const context = this.session.getRecoveryContext();
+    if (!this.session.remote || !this.session.codexConfig || !context.submission) return 'not-sent';
+    const result = await this.session.restoreMissingRemoteWorker(
+      proof.conversationId,
+      proof.generation,
+      isCurrent,
+      () =>
+        this.deps.restoreRemote!(this.session.remote!, {
+          sessionId: this.session.id,
+          resumeId: proof.conversationId,
+          submission: context.submission,
+          expectedIdentity: { conversationId: proof.conversationId, tailHash: proof.tailHash },
+          codexConfig: { ...this.session.codexConfig!, resumeSessionId: proof.conversationId },
+          codexHome: context.codexHome,
+        })
+    );
     if (result === 'sent') this.persistSession();
     return result;
   }

@@ -346,6 +346,13 @@ export class RecoveryController {
     }
   }
 
+  private recoveryWindowExpired(): boolean {
+    const origin = this.state.windowStartedAt;
+    if (origin === undefined) return false;
+    const elapsed = this.now() - origin;
+    return !Number.isFinite(origin) || origin < 0 || elapsed < 0 || elapsed >= this.state.config.maxRecoveryDurationMs;
+  }
+
   private async evaluate(manual: boolean): Promise<void> {
     if (this.stopped) return;
     const revision = this.revision;
@@ -439,7 +446,7 @@ export class RecoveryController {
       await this.save();
       return;
     }
-    if (this.now() - this.state.windowStartedAt >= this.state.config.maxRecoveryDurationMs) {
+    if (this.recoveryWindowExpired()) {
       this.block('recovery-window-exhausted', true);
       await this.save();
       return;
@@ -473,7 +480,7 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const isCurrent = () => !this.stopped && revision === this.revision;
+    const isCurrent = () => !this.stopped && revision === this.revision && !this.recoveryWindowExpired();
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
       outcome = isCurrent() ? await this.deps.act(this.state.inFlight, isCurrent) : 'not-sent';
@@ -485,9 +492,14 @@ export class RecoveryController {
       // without consuming a retry or labelling an explicit disable/shutdown as a failure.
       this.state.inFlight = undefined;
       this.state.attempts--;
-      if (this.state.attempts === 0) this.state.windowStartedAt = undefined;
-      this.state.phase = 'idle';
-      this.state.needsAttention = false;
+      if (this.recoveryWindowExpired()) {
+        // A certified unsent deadline refusal refunds the attempt, never its elapsed window.
+        this.block('recovery-window-exhausted', true);
+      } else {
+        if (this.state.attempts === 0) this.state.windowStartedAt = undefined;
+        this.state.phase = 'idle';
+        this.state.needsAttention = false;
+      }
       await this.save();
       return;
     }

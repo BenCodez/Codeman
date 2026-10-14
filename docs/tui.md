@@ -206,6 +206,12 @@ managed session after a direct handoff. Direct `tmux attach` and custom automati
 that bypass Codeman's attach endpoint cannot create this mark; such automation must
 call the authenticated direct-attach fence endpoint before handing stdin to tmux.
 
+Explicit Codex reboot restoration rechecks the exact conversation, launch settings,
+current owner grants and input fences at the launch boundary. If a worker may have
+started before startup fails or restoration is dismissed, Codeman preserves its
+pane and conversation files, fences further restoration, and reports that the
+worker may be running. Inspect that pane before attempting another restoration.
+
 Detaching leaves the agent running; typing `exit` or pressing `Ctrl+D` would end it,
 which is the difference the bar exists to make obvious. If an agent does exit, its
 pane stays as a corpse: the TUI refuses to attach to a dead pane and offers `r` to

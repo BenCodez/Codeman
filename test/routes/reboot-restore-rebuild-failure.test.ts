@@ -20,7 +20,7 @@
 import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { dataPath, getDataDir } from '../../src/config/instance.js';
@@ -42,6 +42,14 @@ vi.mock('../../src/session.js', () => ({
     workingDir: string;
     owner?: string;
     claudeSessionId: string | null = null;
+    restoreGuard?: import('../../src/mux-interface.js').CodexRestoreLaunchGuard;
+    codexRestoreWorkerMayExist = false;
+    commitCodexRestoreLaunch() {
+      this.codexRestoreWorkerMayExist = false;
+    }
+    setCodexRestoreLaunchGuard(guard: import('../../src/mux-interface.js').CodexRestoreLaunchGuard | undefined) {
+      this.restoreGuard = guard;
+    }
     constructor(config: { id: string; mode?: string; name?: string; workingDir: string; owner?: string }) {
       launchConfigs.push(config as unknown as Record<string, unknown>);
       this.id = config.id;
@@ -53,7 +61,15 @@ vi.mock('../../src/session.js', () => ({
     async startInteractive() {
       callOrder.push('startInteractive');
       await startBarrier;
+      if (this.restoreGuard) {
+        await this.restoreGuard.prepare();
+        if (this.restoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+      }
       if (startShouldThrow) throw new Error('spawn claude ENOENT');
+      if (this.restoreGuard) {
+        this.codexRestoreWorkerMayExist = true;
+        this.restoreGuard.noteDispatch?.();
+      }
     }
     /** The mock route context projects a session through this on broadcast. */
     toState() {
@@ -526,6 +542,7 @@ describe('Codex reboot launch and cancellation', () => {
       reasoningEffort: 'high',
     };
     (entry.state as unknown as Record<string, unknown>).__envOverrides = { CODEX_HOME: home, CODEX_OTHER: 'keep' };
+    (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = home;
     return entry;
   }
   it('launches original UUID with supported settings and preserves the original journal key', async () => {
@@ -589,6 +606,7 @@ describe('Codex reboot launch and cancellation', () => {
     entry.state.owner = 'alice';
     entry.state.workingDir = workspace;
     const trustedHome = customModelConfigDir(entry.sessionId);
+    (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = trustedHome;
     mkdirSync(join(trustedHome, 'sessions'), { recursive: true });
     writeFileSync(
       join(trustedHome, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`),
@@ -673,6 +691,30 @@ describe('Codex reboot launch and cancellation', () => {
       else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
     }
   });
+  it.each([
+    { type: 'collab_agent_spawn_end', call_id: 'spawn', new_thread_id: 'child', status: 'running' },
+    { type: 'exec_approval_request' },
+    { type: 'error', message: 'Sanitized authentication fixture.', codex_error_info: 'unauthorized' },
+  ])('rechecks a newly appended $type veto after startup preparation', async (payload) => {
+    const entry = codexOffer();
+    rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    ctx.setupSessionListeners.mockImplementation(async () => {
+      const home = (entry.state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome;
+      appendFileSync(
+        join(home, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`),
+        JSON.stringify({ timestamp: new Date(Date.now() - 1000).toISOString(), type: 'event_msg', payload }) + '\n'
+      );
+    });
+    const app = await createHarness(ctx);
+    const res = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;
+    expect(res.skipped).toEqual([{ sessionId: 'codex-original', reason: 'identity-unverified' }]);
+    expect(callOrder).not.toContain('startInteractive');
+    expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith('codex-original', expect.anything());
+    expect(rebootRestoreRegistry.list(() => true)).toHaveLength(1);
+    await app.close();
+  });
+
   it('dismissal during pre-spawn preparation prevents launching and releases partial registration', async () => {
     const entry = codexOffer();
     rebootRestoreRegistry.set([entry]);

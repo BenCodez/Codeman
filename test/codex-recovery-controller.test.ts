@@ -741,3 +741,68 @@ describe('accepted evidence and persistent retry bounds', () => {
     expect(f.controller.getStatus().history).toHaveLength(100);
   });
 });
+
+describe('recovery runtime remains bounded at final dispatch', () => {
+  it('retains the first elapsed window when persistence consumes the complete budget', async () => {
+    const f = fixture(enabledState({}, { maxRecoveryDurationMs: 10_000 }));
+    f.persist.mockImplementation(async (state) => {
+      f.journal.push(structuredClone(state));
+      if (state.inFlight) advance(10_000);
+    });
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.controller.getStatus()).toMatchObject({
+      attempts: 0,
+      failedAttempts: 0,
+      circuitOpen: true,
+      windowStartedAt: NOW,
+      lastReason: 'recovery-window-exhausted',
+    });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    const restored = fixture(f.journal.at(-1)!);
+    await restored.controller.retry();
+    expect(restored.act).not.toHaveBeenCalled();
+  });
+
+  it.each(['not-sent', 'unknown'] as const)(
+    'carries expiration through final adapter reads with %s outcome',
+    async (outcome) => {
+      const f = fixture(enabledState({ attempts: 1, windowStartedAt: NOW - 9_000 }, { maxRecoveryDurationMs: 10_000 }));
+      let delivered = false;
+      f.act.mockImplementation(async (_flight, isCurrent) => {
+        advance(1_000);
+        if (isCurrent()) delivered = true;
+        return outcome;
+      });
+      await f.controller.retry();
+      expect(delivered).toBe(false);
+      expect(f.controller.getStatus().windowStartedAt).toBe(NOW - 9_000);
+      if (outcome === 'not-sent') {
+        expect(f.controller.getStatus()).toMatchObject({
+          attempts: 1,
+          circuitOpen: true,
+          lastReason: 'recovery-window-exhausted',
+        });
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+      } else {
+        expect(f.controller.getStatus().inFlight).toBeDefined();
+        await f.controller.retry();
+        expect(f.act).toHaveBeenCalledOnce();
+      }
+    }
+  );
+
+  it('still permits a verified action immediately before the deadline', async () => {
+    const f = fixture(enabledState({ windowStartedAt: NOW - 9_999 }, { maxRecoveryDurationMs: 10_000 }));
+    await f.controller.retry();
+    expect(f.act).toHaveBeenCalledOnce();
+    expect(f.controller.getStatus().lastReason).toBe('continuation-sent');
+  });
+
+  it.each([NOW + 1, -1])('refuses invalid restored recovery-window origin %s', async (windowStartedAt) => {
+    const f = fixture(enabledState({ windowStartedAt }));
+    await f.controller.retry();
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.controller.getStatus()).toMatchObject({ circuitOpen: true, lastReason: 'recovery-window-exhausted' });
+  });
+});

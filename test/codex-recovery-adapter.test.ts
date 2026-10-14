@@ -13,7 +13,7 @@ import { clampEnvOverridesForOwner, clampExternalCliConfigsForOwner } from '../s
 import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../src/recovery/codex-adapter.js';
 import type { RemoteCodexEvidence, RemoteCodexInputResult } from '../src/recovery/remote-codex.js';
 import { resolveCodexIdentity, type CodexIdentityResult } from '../src/recovery/codex-identity.js';
-import type { RecoveryFlight, RecoveryObservation } from '../src/recovery/types.js';
+import { CONTINUATION_PROMPT, type RecoveryFlight, type RecoveryObservation } from '../src/recovery/types.js';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import { createDeferred } from './mocks/index.js';
@@ -159,13 +159,21 @@ function fixture() {
         dispatch: () => Promise<DeliveryResult>
       ) => dispatch()
     ),
-    restoreMissingRemoteWorker: vi.fn(async () => state.delivery),
+    restoreMissingRemoteWorker: vi.fn(
+      async (
+        _conversationId: string,
+        _generation: number,
+        isCurrent: () => boolean,
+        dispatch: () => Promise<DeliveryResult>
+      ) => (isCurrent() ? dispatch() : 'not-sent')
+    ),
   };
   const persist = vi.fn();
   const deps: CodexRecoveryAdapterDeps = {
     inspectRemote: vi.fn(async () => structuredClone(state.remoteEvidence)),
     restartRemote: vi.fn(async () => state.remoteRestart),
     deliverRemote: vi.fn(async () => state.remoteDelivery),
+    restoreRemote: vi.fn(async () => state.remoteRestart),
   };
   const adapter = new CodexRecoveryAdapter(session as unknown as Session, persist, deps);
   resolver.mockImplementation(async () => structuredClone(state.identity));
@@ -258,6 +266,8 @@ describe('exact current identity and delivery proof', () => {
     expect(f.session.deliverRecovery).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: THREAD }),
       3,
+      expect.any(Function),
+      CONTINUATION_PROMPT,
       expect.any(Function)
     );
     expect(f.persist).toHaveBeenCalledTimes(2);
@@ -639,7 +649,11 @@ describe('human input invalidates the current epoch', () => {
     f.pane = { dead: true, status: 130, signal: undefined, screen: null };
     f.session.paneExit = { at: NOW - 1_000, status: 130 };
     f.context.intentionalStopAt = NOW - 1_500;
-    expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', safeToAct: false });
+    expect(await f.adapter.observe()).toMatchObject({
+      activity: 'paused',
+      reason: 'user-interrupted',
+      safeToAct: false,
+    });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
 });
@@ -659,6 +673,8 @@ describe('authoritative agent exits and process readiness', () => {
     expect(f.session.deliverRecovery).toHaveBeenCalledWith(
       expect.objectContaining({ action: 'restart', conversationId: THREAD }),
       3,
+      expect.any(Function),
+      CONTINUATION_PROMPT,
       expect.any(Function)
     );
   });
@@ -722,6 +738,22 @@ describe('owned remote evidence and mutation', () => {
     return f;
   }
 
+  it.each([undefined, '', 'relative/home'])(
+    'refuses remote authority without an explicit absolute worker home (%s)',
+    async (codexHome) => {
+      const f = remoteFixture();
+      f.context.codexHome = codexHome;
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'unknown',
+        reason: 'identity-unverified',
+        safeToAct: false,
+      });
+      expect(f.deps.inspectRemote).not.toHaveBeenCalled();
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+    }
+  );
+
   const invalidLifecycleRows = [
     { name: 'malformed JSON', row: '{broken-json}' },
     {
@@ -769,6 +801,56 @@ describe('owned remote evidence and mutation', () => {
     );
     expect(await f.adapter.act(flight(await f.adapter.observe(), 'restart'))).toBe('sent');
     expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+  });
+
+  const remoteVetoes = [
+    { type: 'error', message: 'Sanitized authentication fixture.', codex_error_info: 'Unauthorized' },
+    { type: 'error', message: 'Sanitized usage fixture.', codex_error_info: 'UsageLimitExceeded' },
+    { type: 'exec_approval_request', call_id: 'approval-fixture' },
+    { type: 'turn_aborted', turn_id: 'fixture-turn', reason: 'replaced' },
+    {
+      type: 'error',
+      message: 'Conversation interrupted.',
+      codex_error_info: { response_stream_disconnected: { http_status_code: null }, unauthorized: null },
+    },
+    CHILD_SPAWN,
+  ];
+  const remoteVetoTail = (payload: Record<string, unknown>) =>
+    event({ type: 'task_started', turn_id: 'fixture-turn' }, NOW - 20_000) + '\n' + event(payload, NOW - 11_000) + '\n';
+
+  it.each(remoteVetoes)(
+    'preserves structured remote crash veto %j at observation and final dispatch',
+    async (payload) => {
+      const f = remoteFixture();
+      f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
+      const reservation = flight(await f.adapter.observe(), 'restart');
+      f.remoteEvidence.identity.tail = remoteVetoTail(payload);
+      expect(await f.adapter.act(reservation)).toBe('not-sent');
+      expect(await f.adapter.observe()).toMatchObject({ safeToAct: false });
+      expect(f.session.restartRemoteRecoveryPane).not.toHaveBeenCalled();
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(remoteVetoes)('refuses missing-worker restore with structured veto %j', async (payload) => {
+    const f = remoteFixture();
+    f.remoteEvidence.session = 'missing';
+    f.remoteEvidence.identity.tail = remoteVetoTail(payload);
+    expect(await f.adapter.restoreMissingRemote()).toBe('not-sent');
+    expect(f.session.restoreMissingRemoteWorker).not.toHaveBeenCalled();
+  });
+
+  it('rechecks child work before committing missing-worker restoration', async () => {
+    const f = remoteFixture();
+    f.remoteEvidence.session = 'missing';
+    const inspect = f.deps.inspectRemote.getMockImplementation()!;
+    f.deps.inspectRemote.mockImplementation(async (...args) => {
+      const result = await inspect(...args);
+      f.remoteEvidence.identity.tail = remoteVetoTail(CHILD_SPAWN);
+      return result;
+    });
+    expect(await f.adapter.restoreMissingRemote()).toBe('not-sent');
+    expect(f.session.restoreMissingRemoteWorker).not.toHaveBeenCalled();
   });
 
   it('separates an unreachable SSH transport from a missing remote worker', async () => {
@@ -1146,7 +1228,21 @@ describe('owned remote evidence and mutation', () => {
     };
     expect(await f.adapter.restoreMissingRemote()).toBe('sent');
     expect(f.deps.inspectRemote).toHaveBeenCalledTimes(2);
-    expect(f.session.restoreMissingRemoteWorker).toHaveBeenCalledExactlyOnceWith(THREAD, 3, expect.any(Function));
+    expect(f.session.restoreMissingRemoteWorker).toHaveBeenCalledExactlyOnceWith(
+      THREAD,
+      3,
+      expect.any(Function),
+      expect.any(Function)
+    );
+    expect(f.deps.restoreRemote).toHaveBeenCalledWith(
+      f.session.remote,
+      expect.objectContaining({
+        resumeId: THREAD,
+        expectedIdentity: { conversationId: THREAD, tailHash: expect.any(String) },
+        codexHome: '/fixture/codex-home',
+        codexConfig: expect.objectContaining({ noDaemon: true, resumeSessionId: THREAD }),
+      })
+    );
   });
 
   it('refuses a missing-worker restore if another worker appears during revalidation', async () => {
@@ -1273,6 +1369,95 @@ describe('current owner grants', () => {
       reason: 'approval-required',
       safeToAct: false,
     });
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+});
+
+const DEAD_PANE_VETOES = [
+  {
+    payload: { type: 'error', message: 'Sanitized rollback fixture.', codex_error_info: 'thread_rollback_failed' },
+    activity: 'unknown',
+    reason: 'observing',
+  },
+  {
+    payload: {
+      type: 'error',
+      message: 'Sanitized steering fixture.',
+      codex_error_info: { active_turn_not_steerable: { turn_kind: 'review' } },
+    },
+    activity: 'unknown',
+    reason: 'observing',
+  },
+
+  {
+    payload: { type: 'error', message: 'Sanitized authentication fixture.', codex_error_info: 'Unauthorized' },
+    activity: 'blocked',
+    reason: 'authentication-required',
+  },
+  {
+    payload: { type: 'error', message: 'Sanitized limit fixture.', codex_error_info: 'UsageLimitExceeded' },
+    activity: 'blocked',
+    reason: 'usage-limit',
+  },
+  { payload: { type: 'error', message: 'Sanitized unknown error fixture.' }, activity: 'blocked', reason: 'observing' },
+  {
+    payload: { type: 'exec_approval_request', call_id: 'approval-fixture' },
+    activity: 'paused',
+    reason: 'approval-required',
+  },
+  {
+    payload: { type: 'turn_aborted', turn_id: 'fixture-turn', reason: 'interrupted' },
+    activity: 'paused',
+    reason: 'user-interrupted',
+  },
+];
+
+function deadPaneVetoTail(payload: Record<string, unknown>): string {
+  return (
+    event({ type: 'task_started', turn_id: 'fixture-turn' }, NOW - 20_000) + '\n' + event(payload, NOW - 11_000) + '\n'
+  );
+}
+
+describe('dead local panes preserve structured recovery vetoes', () => {
+  it.each(DEAD_PANE_VETOES)('preserves $reason before authorizing a crash', async ({ payload, activity, reason }) => {
+    const f = fixture();
+    f.pane = { dead: true, status: 1, screen: null };
+    f.identity.tail = deadPaneVetoTail(payload);
+    expect(await f.adapter.observe()).toMatchObject({ activity, reason, safeToAct: false });
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it.each(DEAD_PANE_VETOES)('rechecks $reason before delivering a reserved restart', async ({ payload }) => {
+    const f = fixture();
+    f.pane = { dead: true, status: 1, screen: null };
+    const reserved = flight(await f.adapter.observe(), 'restart');
+    f.identity.tail = deadPaneVetoTail(payload);
+    expect(await f.adapter.act(reserved)).toBe('not-sent');
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it('still resumes a verified abnormal exit without a structured veto', async () => {
+    const f = fixture();
+    f.pane = { dead: true, status: 1, screen: null };
+    expect(await f.adapter.act(flight(await f.adapter.observe(), 'restart'))).toBe('sent');
+    expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+  });
+});
+
+describe('malformed error variants cannot spend an existing recovery reservation', () => {
+  it.each([false, true])('denies final recovery with a contradictory error enum (dead=%s)', async (dead) => {
+    const f = fixture();
+    if (dead) f.pane = { dead: true, status: 1, screen: null };
+    const reserved = flight(await f.adapter.observe(), dead ? 'restart' : 'continue');
+    f.identity.tail = deadPaneVetoTail({
+      type: 'task_complete',
+      turn_id: 'fixture-turn',
+      error: {
+        message: 'Conversation interrupted.',
+        codex_error_info: { response_stream_disconnected: { http_status_code: null }, unauthorized: null },
+      },
+    });
+    expect(await f.adapter.act(reserved)).toBe('not-sent');
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
 });

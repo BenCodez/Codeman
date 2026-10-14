@@ -182,6 +182,12 @@ export class RecoveryStore {
         await handle.close();
       }
       await rename(temp, this.path);
+      const directory = await open(dirname(this.path), 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
     } finally {
       await unlink(temp).catch(() => {});
     }

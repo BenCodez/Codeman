@@ -298,7 +298,11 @@ describe('ws-routes', () => {
           mode: 'codex',
           useMux: true,
           mux: mux as unknown as TerminalMultiplexer,
-          muxSession: { muxName: 'codeman-ws-fixture', recoveryIsolated: true } as MuxSession,
+          muxSession: {
+            muxName: 'codeman-ws-fixture',
+            recoveryIsolated: true,
+            recoveryCodexHome: '/fixture/codex-home',
+          } as MuxSession,
           codexConfig: { noDaemon: true, resumeSessionId: thread },
         });
         const written = vi.fn();

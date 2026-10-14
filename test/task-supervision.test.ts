@@ -66,6 +66,193 @@ async function configure(c: TaskController) {
   await c.progress({ outcome: 'unfinished', checkpoint: 'Located bug', nextAction: 'Apply fix' });
 }
 describe('task supervision', () => {
+  it('refuses nonowner progress before observing, persisting or revoking an owner action', async () => {
+    const f = fixture();
+    await configure(f.controller);
+    const before = f.controller.getStatus();
+    f.persist.mockClear();
+    const observe = vi.fn(async () => ({
+      observation: { activity: 'completed' as const, reason: 'turn-completed' as const, at: 10001 },
+      commands: new Map(),
+    }));
+    f.observe(observe);
+    expect(() =>
+      f.controller.progress({ outcome: 'unfinished', checkpoint: 'Fabricated', nextAction: 'Run' }, false)
+    ).toThrow('owner authority');
+    expect(() => f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] }, false)).toThrow(
+      'owner authority'
+    );
+    expect(f.controller.getStatus()).toEqual(before);
+    expect(observe).not.toHaveBeenCalled();
+    expect(f.persist).not.toHaveBeenCalled();
+    // A refused report must not bump the revision and cancel authorized delivery.
+    f.observe(async () => {
+      expect(() => f.controller.progress({ outcome: 'unknown' }, false)).toThrow('owner authority');
+      return {
+        observation: {
+          activity: 'completed' as const,
+          reason: 'turn-completed' as const,
+          at: 10001,
+          conversationId: id,
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      };
+    });
+    await f.controller.resume();
+    expect(f.act).toHaveBeenCalledOnce();
+    f.controller.stop();
+  });
+  it('inherits a durable runtime origin even with less than a second left', async () => {
+    const f = fixture();
+    await f.controller.update({
+      objective: 'Review',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { maxRuntimeMs: 1000 },
+    });
+    await f.controller.resume(() => true, 9250);
+    expect(f.controller.getStatus().startedAt).toBe(9250);
+    const promptHash = f.controller.getStatus().inFlight!.promptHash;
+    f.set({ submissionKey: 'accepted', submissionHash: promptHash });
+    await f.controller.refresh();
+    await f.controller.progress({ outcome: 'unfinished', checkpoint: 'Verified step', nextAction: 'Next step' });
+    f.clock(10250);
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted', startedAt: 9250 });
+    expect(f.act).toHaveBeenCalledOnce();
+    await f.controller.resume(() => true, 10250);
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted', startedAt: 9250 });
+    expect(f.act).toHaveBeenCalledOnce();
+    f.controller.stop();
+  });
+  it('does not dispatch when inherited runtime expires during kickoff observation', async () => {
+    const f = fixture();
+    await f.controller.update({
+      objective: 'Review',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { maxRuntimeMs: 1000 },
+    });
+    f.observe(async () => {
+      f.clock(10251);
+      return {
+        observation: {
+          activity: 'completed' as const,
+          reason: 'turn-completed' as const,
+          at: 10251,
+          conversationId: id,
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      };
+    });
+    await f.controller.resume(() => true, 9250);
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted' });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.act).not.toHaveBeenCalled();
+    f.controller.stop();
+  });
+  it.each([NaN, Infinity, -1, 10001])('refuses invalid inherited runtime origin %s before mutation', (origin) => {
+    const f = fixture();
+    const before = f.controller.getStatus();
+    expect(() => f.controller.resume(() => true, origin)).toThrow('runtime origin');
+    expect(f.controller.getStatus()).toEqual(before);
+    expect(f.persist).not.toHaveBeenCalled();
+    f.controller.stop();
+  });
+  it('settles an externally cancelled resume before starting observation', async () => {
+    const f = fixture();
+    await f.controller.update({
+      objective: 'Review',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+    });
+    const observe = vi.fn();
+    f.observe(observe);
+    await f.controller.resume(() => false);
+    expect(observe).not.toHaveBeenCalled();
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'paused', reason: 'delivery-cancelled' });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    f.controller.stop();
+  });
+  it.each([NaN, Infinity, -1, 11000])('never dispatches from invalid restored runtime origin %s', async (startedAt) => {
+    const state = initialTaskState();
+    state.objective = 'Review';
+    state.criteria = [{ id: 'review', description: 'Owner review', kind: 'manual', verified: false }];
+    state.config.enabled = true;
+    state.startedAt = startedAt;
+    const observe = vi.fn();
+    const act = vi.fn();
+    const controller = new TaskController(
+      {
+        now: () => 10000,
+        observe,
+        act,
+        persist: async () => {},
+        changed: () => {},
+      },
+      state
+    );
+    await controller.resume();
+    expect(controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted' });
+    expect(observe).not.toHaveBeenCalled();
+    expect(act).not.toHaveBeenCalled();
+    controller.stop();
+  });
+  it('vetoes continuation after a backward clock jump following accepted kickoff', async () => {
+    const f = fixture();
+    await configure(f.controller);
+    await f.controller.resume();
+    f.set({ submissionKey: 'accepted-kickoff', submissionHash: f.controller.getStatus().inFlight!.promptHash });
+    await f.controller.refresh();
+    await f.controller.progress({ outcome: 'unfinished', checkpoint: 'Verified checkpoint', nextAction: 'Review' });
+    f.clock(9999);
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted' });
+    expect(f.act).toHaveBeenCalledOnce();
+    f.controller.stop();
+  });
+  it.each(['observation', 'reservation', 'delivery'] as const)(
+    'revokes externally cancelled kickoff at %s',
+    async (boundary) => {
+      const f = fixture();
+      await f.controller.update({
+        objective: 'Review',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      });
+      let current = true;
+      if (boundary === 'observation') {
+        f.observe(async () => {
+          current = false;
+          return {
+            observation: { activity: 'completed' as const, reason: 'turn-completed' as const, at: 10000 },
+            commands: new Map(),
+          };
+        });
+        await f.controller.resume(() => current);
+        expect(f.controller.getStatus()).toMatchObject({ phase: 'paused', reason: 'delivery-cancelled' });
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+      } else {
+        if (boundary === 'reservation')
+          f.persist.mockImplementationOnce(async () => {
+            current = false;
+          });
+        else
+          f.act.mockImplementationOnce(async (_key, _conversationId, _prompt, isCurrent) => {
+            expect(isCurrent()).toBe(true);
+            current = false;
+            expect(isCurrent()).toBe(false);
+            return 'sent';
+          });
+        await f.controller.resume(() => current);
+        expect(f.controller.getStatus()).toMatchObject({ phase: 'paused', reason: 'delivery-cancelled' });
+        expect(!!f.controller.getStatus().inFlight).toBe(boundary === 'delivery');
+      }
+      expect(f.act).toHaveBeenCalledTimes(boundary === 'delivery' ? 1 : 0);
+      f.controller.stop();
+    }
+  );
   it('defaults off and idle never continues', async () => {
     const f = fixture();
     expect(f.controller.getStatus().config.enabled).toBe(false);
@@ -977,12 +1164,11 @@ describe('task supervision', () => {
     await configure(f.controller);
     const state = f.controller.getStatus();
     f.controller.stop();
-    let c: TaskController;
     const recover = vi.fn(async () => {
       c.noteUserInput();
       return 'sent' as const;
     });
-    c = new TaskController(
+    const c = new TaskController(
       {
         now: () => 10002,
         observe: async () => ({
@@ -1300,6 +1486,45 @@ describe('task supervision', () => {
 describe('structured command evidence', () => {
   const line = (at: number, payload: unknown) =>
     JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+  it.each([
+    { command: ['bash', '-lc'] },
+    { command: ['/tmp/custom-wrapper', '-lc', 'different-command'] },
+    { command: ['bash', '-lc', 'different-command'] },
+    { command: ['bash', '-lc', 'npm test'] },
+    { command: null },
+  ])('refuses reused begin identity with later command $command', ({ command }) => {
+    const begin = line(10000, { type: 'exec_command_begin', call_id: 'reused', command: ['bash', '-lc', 'npm test'] });
+    const reused = line(10001, { type: 'exec_command_begin', call_id: 'reused', command });
+    const end = line(10002, { type: 'exec_command_end', call_id: 'reused', exit_code: 0 });
+    expect(successfulCommands(begin + reused + end, 0, 10002).size).toBe(0);
+  });
+  it('does not reuse a completed identity while keeping separate valid calls eligible', () => {
+    const begin = (call_id: string, at: number) =>
+      line(at, { type: 'exec_command_begin', call_id, command: ['bash', '-lc', 'npm test'] });
+    const end = (call_id: string, at: number) => line(at, { type: 'exec_command_end', call_id, exit_code: 0 });
+    expect(
+      successfulCommands(begin('one', 10000) + end('one', 10001) + begin('one', 10002) + end('one', 10003), 0, 10003)
+        .size
+    ).toBe(0);
+    expect(
+      successfulCommands(
+        begin('one', 10000) + end('one', 10001) + begin('two', 10002) + end('two', 10003),
+        0,
+        10003
+      ).get(commandHash('npm test'))
+    ).toEqual({ startedAt: 10002, completedAt: 10003 });
+  });
+  it.each(['invalid', new Date(13000).toISOString()])('refuses an invalid same-call timestamp %s', (timestamp) => {
+    const begin = line(10000, { type: 'exec_command_begin', call_id: 'reused', command: ['bash', '-lc', 'npm test'] });
+    const reused =
+      JSON.stringify({
+        timestamp,
+        type: 'event_msg',
+        payload: { type: 'exec_command_begin', call_id: 'reused', command: ['bash', '-lc', 'other'] },
+      }) + '\n';
+    const end = line(10002, { type: 'exec_command_end', call_id: 'reused', exit_code: 0 });
+    expect(successfulCommands(begin + reused + end, 0, 10002).size).toBe(0);
+  });
   it('bounds truly pending commands and reclaims capacity only for matching completed calls', () => {
     const begin = (at: number, call_id: string) =>
       line(at, { type: 'exec_command_begin', call_id, command: ['bash', '-lc', 'npm test'] });
@@ -1392,4 +1617,134 @@ describe('structured command evidence', () => {
       )
     ).toBeUndefined();
   });
+});
+
+describe('newest exact command execution owns success evidence', () => {
+  const line = (at: number, payload: unknown) =>
+    JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+  const begin = (call_id: string, at: number) =>
+    line(at, { type: 'exec_command_begin', call_id, command: ['bash', '-lc', 'npm test'] });
+  const end = (call_id: string, at: number, exit_code: number) =>
+    line(at, { type: 'exec_command_end', call_id, exit_code });
+  for (const entry of ['owner-progress', 'agent-marker'] as const) {
+    it.each([
+      'backwards-begin-pending',
+      'backwards-begin-failed',
+      'contradictory-end',
+      'missing-end-identity',
+      'empty-end-identity',
+      'missing-exit-code',
+      'string-exit-code',
+      'fractional-exit-code',
+      'backwards-end',
+      'end-before-begin',
+    ])(`${entry} refuses ambiguous command evidence after an earlier success: %s`, async (uncertainty) => {
+      const f = fixture();
+      try {
+        await configure(f.controller);
+        f.clock(10009);
+        let tail = begin('old', 10003) + end('old', 10004, 0);
+        if (uncertainty.startsWith('backwards-begin')) {
+          tail += begin('new', 10002);
+          if (uncertainty === 'backwards-begin-failed') tail += end('new', 10005, 1);
+        } else if (uncertainty === 'contradictory-end') tail += end('old', 10005, 1);
+        else if (uncertainty === 'backwards-end') tail += begin('new', 10006) + end('new', 10005, 0);
+        else if (uncertainty === 'end-before-begin') {
+          tail += end('new', 10005, 0) + begin('new', 10006) + end('new', 10007, 0);
+        } else {
+          const malformed = {
+            'missing-end-identity': { exit_code: 0 },
+            'empty-end-identity': { call_id: '', exit_code: 0 },
+            'missing-exit-code': { call_id: 'other' },
+            'string-exit-code': { call_id: 'other', exit_code: '0' },
+            'fractional-exit-code': { call_id: 'other', exit_code: 0.5 },
+          }[uncertainty];
+          tail += line(10005, { type: 'exec_command_end', ...malformed });
+        }
+        f.observe(async () => ({
+          observation: {
+            activity: 'completed',
+            reason: 'turn-completed',
+            at: 10008,
+            conversationId: id,
+            turnId: 'uncertain-command',
+            submissionKey: 'fixture-submission',
+            processReady: true,
+            safeToAct: false,
+          },
+          commands: successfulCommands(tail, 0, 10009),
+          ...(entry === 'agent-marker'
+            ? {
+                marker: {
+                  key: 'uncertain-command-proof',
+                  at: 10008,
+                  submissionKey: 'fixture-submission',
+                  progress: { outcome: 'completed', verifiedCriteria: ['test'] },
+                },
+              }
+            : {}),
+        }));
+        if (entry === 'owner-progress')
+          await expect(f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] })).rejects.toThrow(
+            'success evidence'
+          );
+        else await f.controller.refresh();
+        expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+        expect(f.act).not.toHaveBeenCalled();
+      } finally {
+        f.controller.stop();
+      }
+    });
+    it.each(['pending', 'failed', 'succeeded', 'old-late-success', 'old-late-failure'])(
+      `${entry} uses the latest command for %s`,
+      async (outcome) => {
+        const f = fixture();
+        try {
+          await configure(f.controller);
+          f.clock(10007);
+          let tail = begin('old', 10001);
+          if (!outcome.startsWith('old-late')) tail += end('old', 10002, 0);
+          tail += begin('new', 10003);
+          if (outcome !== 'pending')
+            tail += end('new', 10004, outcome === 'failed' || outcome === 'old-late-success' ? 1 : 0);
+          if (outcome.startsWith('old-late')) tail += end('old', 10005, outcome === 'old-late-success' ? 0 : 1);
+          f.observe(async () => ({
+            observation: {
+              activity: 'completed',
+              reason: 'turn-completed',
+              at: 10006,
+              conversationId: id,
+              turnId: 'latest-command',
+              submissionKey: 'fixture-submission',
+              processReady: true,
+              safeToAct: false,
+            },
+            commands: successfulCommands(tail, 0, 10007),
+            ...(entry === 'agent-marker'
+              ? {
+                  marker: {
+                    key: 'new-criterion-proof',
+                    at: 10006,
+                    submissionKey: 'fixture-submission',
+                    progress: { outcome: 'completed', verifiedCriteria: ['test'] },
+                  },
+                }
+              : {}),
+          }));
+          const verify = () =>
+            entry === 'owner-progress'
+              ? f.controller.progress({ outcome: 'completed', verifiedCriteria: ['test'] })
+              : f.controller.refresh();
+          const success = outcome === 'succeeded' || outcome === 'old-late-failure';
+          if (!success && entry === 'owner-progress') await expect(verify()).rejects.toThrow('success evidence');
+          else await verify();
+          expect(f.controller.getStatus().criteria[0].verified).toBe(success);
+          if (success) expect(f.controller.getStatus().criteria[0].evidence?.at).toBe(10004);
+          expect(f.act).not.toHaveBeenCalled();
+        } finally {
+          f.controller.stop();
+        }
+      }
+    );
+  }
 });
