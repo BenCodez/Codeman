@@ -2367,6 +2367,9 @@ export class WebServer extends EventEmitter {
   private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
     const controller = this.recoveryControllers.get(id);
     const listener = this.recoveryInputListeners.get(id);
+    const mode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
+    const ownsRecoveryState =
+      !!controller || !!listener || (mode !== undefined && getCli(mode)?.capabilities.recovery === 'codex-rollout');
     if (listener) this.sessions.get(id)?.off('recoveryUserInput', listener);
     this.recoveryInputListeners.delete(id);
     if (controller) {
@@ -2374,7 +2377,7 @@ export class WebServer extends EventEmitter {
       await controller.drain();
       this.recoveryControllers.delete(id);
     }
-    if (drop) await this.recoveryStore.drop(id);
+    if (drop && ownsRecoveryState) await this.recoveryStore.drop(id);
   }
 
   /**

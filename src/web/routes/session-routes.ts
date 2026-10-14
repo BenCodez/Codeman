@@ -1842,7 +1842,16 @@ export function registerSessionRoutes(
     // client's ACK, so a tagged duplicate redelivery must still return 200 but
     // skip the write. Untagged requests (curl/legacy) always apply.
     const tagged = typeof clientId === 'string' && typeof seq === 'number';
+    if (tagged && !session.deferInputSeq(clientId as string, seq as number)) {
+      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Input backlog is full; this frame was not sent');
+    }
+    if (session.recoveryInputReserved) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');
+    }
     const duplicate = tagged && !session.shouldApplyInput(clientId as string, seq as number);
+    if (duplicate && !session.hasAppliedInputSeq(clientId as string, seq as number)) {
+      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input delivery is still in progress; retry the input');
+    }
     if (duplicate && !wantsWait) {
       // Match the WS duplicate ACK without changing the existing 200 envelope.
       // The header lets the browser repair a stale first-attempt sequence without
@@ -1852,217 +1861,233 @@ export function registerSessionRoutes(
       reply.header('x-codeman-input-ack', JSON.stringify({ seq, dup: true, last }));
       return {};
     }
-    if (!duplicate && session.recoveryInputReserved) {
-      // Recovery owns the pane until its delivery attempt is resolved. Both Session
-      // write paths reject during that interval; a 2xx would make the browser treat
-      // the rejected frame as ACKed and delete it from its durable queue.
-      if (tagged) session.forgetInputSeq(clientId as string, seq as number);
-      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');
-    }
 
-    // Wake-on-LAN (remote-wake.ts): a wake-enabled remote host that suspended leaves
-    // the local ssh pane STALLED, and `send-keys` succeeds against it — the bytes
-    // would vanish with no error anywhere. Give the registry the chance to probe the
-    // host, wake it, reattach, and own delivery before we write into nothing.
-    //
-    // Costs nothing for non-wake hosts (the `wakeCommand` guard) or while the host is
-    // known reachable inside the probe throttle window; the probe itself is a bare
-    // TCP connect on wake-enabled hosts only, at most once per
-    // REMOTE_WAKE_PROBE_MIN_INTERVAL_MS.
-    if (!duplicate && (await remoteWake.hasWakeTarget(session))) {
-      if (wantsWait) {
-        // Send-and-wait keeps the response open anyway, so blocking on the wake is
-        // simpler and more correct than buffering (buffering would break the wait).
-        // A host that never comes back is an error here, as on the create/attach
-        // paths: writing into the stalled pane would answer `delivered:true` plus a
-        // timeout, which is the combination the API docs send callers to the wrong
-        // recovery for.
-        if (!(await remoteWake.ensureAwake(session))) {
-          return createErrorResponse(
-            ApiErrorCode.OPERATION_FAILED,
-            `${session.remote?.label ?? 'the remote host'} did not come back after a wake-on-LAN request — nothing was sent`
-          );
-        }
-      } else {
-        const outcome = await remoteWake.handleInput(session, inputStr);
-        // The registry holds the bytes and flushes them in order once the pane is
-        // reattached. The client's ACK is this 200 — a tagged retry is deduped
-        // (`shouldApplyInput` above already consumed the seq), so nothing is lost.
-        // `buffered` is additive to the historical bare `{}`; `dropped` says the chunk
-        // was over the wake buffer's cap and is GONE (a 200 with no field could not
-        // tell delivered from buffered from dropped).
-        if (outcome === 'buffered') return { buffered: true };
-        if (outcome === 'dropped') return { buffered: true, dropped: true };
-      }
-    }
-
-    // Only a waiting request pays for the tmux probe: the browser's plain input path
-    // (thousands of calls per session) must stay exec-free.
-    const workerDead = wantsWait && workerIsDead(ctx.mux, session);
-
-    const timeoutMs = clampWaitMs(waitTimeout ?? undefined);
-    // Same slot leak as the GET routes: a client that gives up mid-wait would
-    // otherwise hold a waiter for the full timeout. Response-side, always — see
-    // abortOnClientHangUp: on THIS route a request-side listener fires the moment the
-    // JSON body finishes streaming and aborts every send-and-wait before it starts.
-    const abort = abortOnClientHangUp(reply);
-    let waitPromise: Promise<SignalWaitResult> | null = null;
-    if (wantsWait) {
-      try {
-        waitPromise = sessionWaits.waitForSignal(id, {
-          until,
-          timeoutMs,
-          owner: ownerFor(req),
-          abortSignal: abort.signal,
-          // A FRESH delivery must not be satisfied by the state the session is already
-          // in: it is idle right now, which is precisely why we are typing at it.
-          // A DUPLICATE has no new turn coming, so it answers from the current state
-          // instead of blocking for a transition that already happened.
-          requireTransition: !duplicate,
-          currentSignal: duplicate ? currentSignalFor(session, workerDead) : undefined,
-        });
-      } catch (err) {
-        if (err instanceof WaitCapacityError) {
-          // Nothing has been written yet, but `shouldApplyInput` already consumed the
-          // seq. Give it back or the caller's retry is rejected as a duplicate and the
-          // input is lost by the very mechanism meant to make delivery reliable.
-          if (tagged && !duplicate) session.forgetInputSeq(clientId as string, seq as number);
-          return waitCapacityResponse(err);
-        }
-        throw err;
-      }
-    }
-    const stopDeathWatch = wantsWait ? watchForDeadWorker(ctx.mux, session, id) : () => {};
-
-    // Write input to PTY. Direct write is synchronous; tagged fallback and wait
-    // requests await writeViaMux because their response reports delivery. Only an
-    // untagged explicit mux request remains fire-and-forget for legacy behavior.
-    // Every write here is `fromUser`: this route carries a person's prompt, or an
-    // agent's on their behalf, so it may name the tab (Ralph, respawn, cron and
-    // approvals write through the session directly and never say so).
-    //
-    // A failed write must roll dedup bookkeeping back. Otherwise the seq stays
-    // recorded as applied and the retry that reliable delivery exists for is
-    // rejected as a duplicate. Tagged POST writes below are awaited so their
-    // response can also keep the browser's queue record unacknowledged.
-    const undoOnFailure = () => {
-      if (tagged) session.forgetInputSeq(clientId as string, seq as number);
-    };
-
-    // Whether the bytes actually reached a write path. The tagged POST fallback is
-    // also awaited: its HTTP response is the browser's delivery ACK, so it cannot
-    // truthfully return 2xx before knowing whether recovery rejected both writes.
-    let delivered = false;
-
-    // A plain prompt (`<text>\r`) goes through the mux even when the caller did not
-    // ask for it: written straight into the pane it arrives as one burst, and Claude
-    // Code takes a long burst as a paste whose `\r` becomes a newline, so the prompt
-    // sat unsent (see isPlainPromptInput). The mux path types the text, presses Enter
-    // separately and arms the SubmitVerifier. An explicit `useMux: false` keeps the
-    // raw write for a caller that really wants it.
-    const autoMux = useMux === undefined && isPlainPromptInput(inputStr);
-
-    if (duplicate) {
-      // Redelivery of an already-applied input: skip the write, but still honor the
-      // wait, since the caller's question ("tell me when this settles") is unanswered.
-    } else if ((useMux || autoMux) && waitPromise) {
-      // The response is already staying open for the wait, so the tmux write can be
-      // awaited here. This is the ONE path where a writeViaMux failure is observable.
-      const ok = await session.writeViaMux(inputStr, { fromUser: true }).catch(() => false);
-      if (ok) {
-        delivered = true;
-      } else {
-        console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-        delivered = session.write(inputStr, { fromUser: true });
-        if (!delivered) undoOnFailure();
-      }
-    } else if (autoMux || (useMux && tagged)) {
-      // Awaited, unlike the explicit useMux branch below. This shape also reaches here
-      // from the browser's POST fallback, which sends its frames one at a time and
-      // waits for each 2xx; answering only once Enter has gone out is what keeps the
-      // next keystroke from overtaking it.
-      const ok = await session.writeViaMux(inputStr, { fromUser: true }).catch(() => false);
-      if (ok) {
-        delivered = true;
-      } else {
-        console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-        delivered = session.write(inputStr, { fromUser: true });
-        if (!delivered) undoOnFailure();
-      }
-    } else if (useMux) {
-      // Fire-and-forget: don't block the HTTP response on a tmux child process.
-      // Fallback to a direct write on failure. Unchanged from before send-and-wait.
-      session
-        .writeViaMux(inputStr, { fromUser: true })
-        .then((ok) => {
-          if (ok) return;
-          console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-          if (!session.write(inputStr, { fromUser: true })) undoOnFailure();
-        })
-        .catch(() => {
-          if (!session.write(inputStr, { fromUser: true })) undoOnFailure();
-        });
-    } else {
-      // Same rollback. NOT an error response, deliberately: a session can
-      // legitimately have no PTY yet (created but not started), and callers have
-      // always been able to write to one without a 4xx.
-      delivered = session.write(inputStr, { fromUser: true });
-      if (!delivered && tagged) {
-        session.forgetInputSeq(clientId as string, seq as number);
-      }
-    }
-
-    if (!waitPromise) {
-      // Recovery may acquire the pane while an awaited mux write is in progress.
-      // In that race the initial reservation check passed, but both guarded writes
-      // still return false. Keep a tagged browser frame retryable and unacknowledged.
-      if (!duplicate && tagged && !delivered && session.recoveryInputReserved) {
-        return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');
-      }
-      return {};
-    }
-
+    // Admission is not delivery. Any exit before commit releases this exact
+    // reservation without changing a genuinely applied watermark.
+    let abortWait: AbortController | undefined;
+    let stopDeathWatch = () => {};
     try {
-      // `send-keys` SUCCEEDS against a dead pane — tmux is happy to write into a corpse
-      // — so a truthful `delivered` cannot come from the write's return value alone.
-      // This is the case the field exists for: "delivered, but it timed out" tells an
-      // agent to wait longer when the truth is "restart the worker".
-      if (delivered && workerDead) {
-        delivered = false;
-        // The bytes went nowhere, so the seq must not be recorded as applied or the
-        // caller's retry against a restarted worker is refused as a duplicate.
-        if (!duplicate) undoOnFailure();
+      // Wake-on-LAN (remote-wake.ts): a wake-enabled remote host that suspended leaves
+      // the local ssh pane STALLED, and `send-keys` succeeds against it — the bytes
+      // would vanish with no error anywhere. Give the registry the chance to probe the
+      // host, wake it, reattach, and own delivery before we write into nothing.
+      //
+      // Costs nothing for non-wake hosts (the `wakeCommand` guard) or while the host is
+      // known reachable inside the probe throttle window; the probe itself is a bare
+      // TCP connect on wake-enabled hosts only, at most once per
+      // REMOTE_WAKE_PROBE_MIN_INTERVAL_MS.
+      if (!duplicate && (await remoteWake.hasWakeTarget(session))) {
+        if (wantsWait) {
+          // Send-and-wait keeps the response open anyway, so blocking on the wake is
+          // simpler and more correct than buffering (buffering would break the wait).
+          // A host that never comes back is an error here, as on the create/attach
+          // paths: writing into the stalled pane would answer `delivered:true` plus a
+          // timeout, which is the combination the API docs send callers to the wrong
+          // recovery for.
+          if (!(await remoteWake.ensureAwake(session))) {
+            return createErrorResponse(
+              ApiErrorCode.OPERATION_FAILED,
+              `${session.remote?.label ?? 'the remote host'} did not come back after a wake-on-LAN request — nothing was sent`
+            );
+          }
+        } else {
+          const outcome = await remoteWake.handleInput(session, inputStr);
+          // The registry holds the bytes and flushes them in order once the pane is
+          // reattached. The client's ACK is this 200 — a tagged retry is deduped
+          // (its admitted identity is committed with buffer ownership), so nothing is lost.
+          // `buffered` is additive to the historical bare `{}`; `dropped` says the chunk
+          // was over the wake buffer's cap and is GONE (a 200 with no field could not
+          // tell delivered from buffered from dropped).
+          if (outcome === 'buffered' || outcome === 'dropped') {
+            if (tagged) session.commitInputSeq(clientId as string, seq as number);
+            return outcome === 'buffered' ? { buffered: true } : { buffered: true, dropped: true };
+          }
+        }
       }
 
-      // Nothing was written and nothing will be: no turn is coming, so blocking for the
-      // full timeout would only delay the caller's real recovery by up to ten minutes.
-      // Releasing the waiter also hands its slot back immediately.
-      const selfReleased = !delivered && !duplicate;
-      if (selfReleased) abort.abort();
+      // Only a waiting request pays for the tmux probe: the browser's plain input path
+      // (thousands of calls per session) must stay exec-free.
+      const workerDead = wantsWait && workerIsDead(ctx.mux, session);
 
-      const result = await waitPromise;
-      return {
-        success: true,
-        data: {
-          delivered,
-          duplicate,
-          status: session.status,
-          limitPaused: session.isLimitPaused,
-          // Identical `wait` object to the two GET endpoints, so one client helper
-          // reads all three, `timeoutMs` (post-clamp) included.
-          //
-          // `aborted` is the CLIENT-facing "you hung up, nobody is reading this", and
-          // by that definition it is unobservable — which is exactly what the API
-          // reference promises. The abort above is the server releasing its own waiter
-          // on a delivery that failed, and the client IS reading this response, so
-          // reporting `aborted: true` there would break that promise and hand an agent
-          // a second, contradictory reason for the same outcome. `delivered: false`
-          // already says what happened; `ended` says the wait was released early.
-          wait: { ...result, aborted: selfReleased ? false : result.aborted, until: [...until] },
-        },
+      const timeoutMs = clampWaitMs(waitTimeout ?? undefined);
+      // Same slot leak as the GET routes: a client that gives up mid-wait would
+      // otherwise hold a waiter for the full timeout. Response-side, always — see
+      // abortOnClientHangUp: on THIS route a request-side listener fires the moment the
+      // JSON body finishes streaming and aborts every send-and-wait before it starts.
+      const abort = abortOnClientHangUp(reply);
+      abortWait = abort;
+      let waitPromise: Promise<SignalWaitResult> | null = null;
+      if (wantsWait) {
+        try {
+          waitPromise = sessionWaits.waitForSignal(id, {
+            until,
+            timeoutMs,
+            owner: ownerFor(req),
+            abortSignal: abort.signal,
+            // A FRESH delivery must not be satisfied by the state the session is already
+            // in: it is idle right now, which is precisely why we are typing at it.
+            // A DUPLICATE has no new turn coming, so it answers from the current state
+            // instead of blocking for a transition that already happened.
+            requireTransition: !duplicate,
+            currentSignal: duplicate ? currentSignalFor(session, workerDead) : undefined,
+          });
+        } catch (err) {
+          if (err instanceof WaitCapacityError) {
+            // Nothing has been written yet. Release admission so the retry can
+            // acquire the same FIFO slot after waiter capacity is available.
+            if (tagged && !duplicate) session.forgetInputSeq(clientId as string, seq as number);
+            return waitCapacityResponse(err);
+          }
+          throw err;
+        }
+      }
+      stopDeathWatch = wantsWait ? watchForDeadWorker(ctx.mux, session, id) : () => {};
+
+      // Write input to PTY. Direct write is synchronous; tagged fallback and wait
+      // requests await writeViaMux because their response reports delivery. Only an
+      // untagged explicit mux request remains fire-and-forget for legacy behavior.
+      // Every write here is `fromUser`: this route carries a person's prompt, or an
+      // agent's on their behalf, so it may name the tab (Ralph, respawn, cron and
+      // approvals write through the session directly and never say so).
+      //
+      // Known unsent failures release admission; unknown partial writes stay
+      // sealed at the Session boundary. Tagged POST writes below are awaited so
+      // the response can keep known undelivered queue records unacknowledged.
+      const undoOnFailure = () => {
+        if (tagged) session.forgetInputSeq(clientId as string, seq as number);
       };
+      const writeOptions = {
+        fromUser: true,
+        ...(tagged && !workerDead ? { inputSeq: { clientId: clientId as string, seq: seq as number } } : {}),
+      };
+      const failedMuxWrite = (err: unknown): false => {
+        // Never fall back or reopen an identity after bytes may have committed.
+        if (tagged && session.hasAppliedInputSeq(clientId as string, seq as number)) throw err;
+        return false;
+      };
+
+      // Whether the bytes actually reached a write path. The tagged POST fallback is
+      // also awaited: its HTTP response is the browser's delivery ACK, so it cannot
+      // truthfully return 2xx before knowing whether recovery rejected both writes.
+      let delivered = false;
+
+      // A plain prompt (`<text>\r`) goes through the mux even when the caller did not
+      // ask for it: written straight into the pane it arrives as one burst, and Claude
+      // Code takes a long burst as a paste whose `\r` becomes a newline, so the prompt
+      // sat unsent (see isPlainPromptInput). The mux path types the text, presses Enter
+      // separately and arms the SubmitVerifier. An explicit `useMux: false` keeps the
+      // raw write for a caller that really wants it.
+      const autoMux = useMux === undefined && isPlainPromptInput(inputStr);
+
+      if (duplicate) {
+        // Redelivery of an already-applied input: skip the write, but still honor the
+        // wait, since the caller's question ("tell me when this settles") is unanswered.
+      } else if ((useMux || autoMux) && waitPromise) {
+        // The response is already staying open for the wait, so the tmux write can be
+        // awaited here. This is the ONE path where a writeViaMux failure is observable.
+        const ok = await session.writeViaMux(inputStr, writeOptions).catch(failedMuxWrite);
+        if (ok) {
+          delivered = true;
+        } else {
+          console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
+          delivered = session.write(inputStr, writeOptions);
+          if (!delivered) undoOnFailure();
+        }
+      } else if (autoMux || (useMux && tagged)) {
+        // Awaited, unlike the explicit useMux branch below. This shape also reaches here
+        // from the browser's POST fallback, which sends its frames one at a time and
+        // waits for each 2xx; answering only once Enter has gone out is what keeps the
+        // next keystroke from overtaking it.
+        const ok = await session.writeViaMux(inputStr, writeOptions).catch(failedMuxWrite);
+        if (ok) {
+          delivered = true;
+        } else {
+          console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
+          delivered = session.write(inputStr, writeOptions);
+          if (!delivered) undoOnFailure();
+        }
+      } else if (useMux) {
+        // Fire-and-forget: don't block the HTTP response on a tmux child process.
+        // Fallback to a direct write on failure. Unchanged from before send-and-wait.
+        session
+          .writeViaMux(inputStr, writeOptions)
+          .then((ok) => {
+            if (ok) return;
+            console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
+            if (!session.write(inputStr, writeOptions)) undoOnFailure();
+          })
+          .catch(() => {
+            if (!session.write(inputStr, writeOptions)) undoOnFailure();
+          });
+      } else {
+        // A tagged no-PTY write is retryable below. Legacy untagged callers keep
+        // their historical response when a session has not been started yet.
+        delivered = session.write(inputStr, writeOptions);
+        if (!delivered && tagged) {
+          session.forgetInputSeq(clientId as string, seq as number);
+        }
+      }
+
+      if (!duplicate && tagged && delivered && !workerDead) session.commitInputSeq(clientId as string, seq as number);
+
+      if (!waitPromise) {
+        // Recovery may acquire the pane while an awaited mux write is in progress.
+        // In that race the initial reservation check passed, but both guarded writes
+        // still return false. Keep a tagged browser frame retryable and unacknowledged.
+        if (!duplicate && tagged && !delivered) {
+          return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input was not delivered; retry the input');
+        }
+        return {};
+      }
+
+      try {
+        // `send-keys` SUCCEEDS against a dead pane — tmux is happy to write into a corpse
+        // — so a truthful `delivered` cannot come from the write's return value alone.
+        // This is the case the field exists for: "delivered, but it timed out" tells an
+        // agent to wait longer when the truth is "restart the worker".
+        if (delivered && workerDead) {
+          delivered = false;
+          // The bytes went nowhere, so the seq must not be recorded as applied or the
+          // caller's retry against a restarted worker is refused as a duplicate.
+          if (!duplicate) undoOnFailure();
+        }
+
+        // Nothing was written and nothing will be: no turn is coming, so blocking for the
+        // full timeout would only delay the caller's real recovery by up to ten minutes.
+        // Releasing the waiter also hands its slot back immediately.
+        const selfReleased = !delivered && !duplicate;
+        if (selfReleased) abort.abort();
+
+        const result = await waitPromise;
+        return {
+          success: true,
+          data: {
+            delivered,
+            duplicate,
+            status: session.status,
+            limitPaused: session.isLimitPaused,
+            // Identical `wait` object to the two GET endpoints, so one client helper
+            // reads all three, `timeoutMs` (post-clamp) included.
+            //
+            // `aborted` is the CLIENT-facing "you hung up, nobody is reading this", and
+            // by that definition it is unobservable — which is exactly what the API
+            // reference promises. The abort above is the server releasing its own waiter
+            // on a delivery that failed, and the client IS reading this response, so
+            // reporting `aborted: true` there would break that promise and hand an agent
+            // a second, contradictory reason for the same outcome. `delivered: false`
+            // already says what happened; `ended` says the wait was released early.
+            wait: { ...result, aborted: selfReleased ? false : result.aborted, until: [...until] },
+          },
+        };
+      } finally {
+        stopDeathWatch();
+      }
     } finally {
+      // Dispatch can fail before the normal wait path starts. Release both
+      // ownerships here as well so an uncertain send cannot leak wait capacity.
+      abortWait?.abort();
       stopDeathWatch();
+      if (tagged && !duplicate) session.forgetInputSeq(clientId as string, seq as number);
     }
   });
 

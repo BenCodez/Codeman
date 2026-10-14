@@ -86,7 +86,7 @@ describe('isolated fresh Codex identity', () => {
   it('verifies an exact per-pane originator, header UUID and cwd', async () => {
     const path = await rollout();
     const result = await resolveCodexIdentity(request());
-    expect(result).toMatchObject({ reason: 'verified', conversationId: A, path });
+    expect(result).toMatchObject({ reason: 'verified', conversationId: A, path, tailTruncated: false });
     expect(result.head).toContain('session_meta');
     expect(result.tail).toContain('task_complete');
   });
@@ -372,7 +372,12 @@ describe('corrupt and over-budget stores', () => {
       JSON.stringify({ payload: 'x'.repeat(300 * 1024) }) + '\n' + '{"last":true}\n'
     );
     const result = await resolveCodexIdentity(request());
-    expect(result).toMatchObject({ reason: 'verified', conversationId: A, tail: '{"last":true}\n' });
+    expect(result).toMatchObject({
+      reason: 'verified',
+      conversationId: A,
+      tail: '{"last":true}\n',
+      tailTruncated: true,
+    });
     expect(Buffer.byteLength(result.tail!)).toBeLessThanOrEqual(256 * 1024);
   });
 

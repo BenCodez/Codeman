@@ -74,6 +74,8 @@ export interface SessionWriteOptions {
    * name a tab; Ralph, respawn, cron and approval writes leave this unset.
    */
   fromUser?: boolean;
+  /** Internal reliable-delivery identity, committed at the byte-dispatch boundary. */
+  inputSeq?: { clientId: string; seq: number };
 }
 
 export type RemoteCommandMode = Extract<

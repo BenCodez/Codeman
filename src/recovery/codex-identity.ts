@@ -4,7 +4,8 @@
  * This is an INTERNAL recovery reader: path/head/tail may contain private prompts and
  * must never be returned in an API response. Shared-daemon launches have no per-pane
  * originator authority. Neither cwd, file mtime nor a timestamp-only history match
- * authorizes recovery. A truncated, unreadable or over-budget store supplies no id.
+ * authorizes recovery. Incomplete identity evidence supplies no id; a verified id
+ * with a truncated rollout tail remains non-actionable.
  *
  * All filesystem work is asynchronous and serial within one home. An outstanding
  * operation retains its single-flight slot even after the caller's deadline expires,
@@ -33,6 +34,8 @@ export interface CodexIdentityResult {
   reason: 'verified' | 'managed-daemon' | 'ambiguous' | 'unverified' | 'unreadable';
   head?: string;
   tail?: string;
+  /** Only false certifies that the tail contains the rollout's complete lifecycle history. */
+  tailTruncated?: boolean;
 }
 
 const HEAD_BYTES = 128 * 1024;
@@ -341,10 +344,17 @@ async function resolveInternal(
     ) {
       throw new Refusal('unverified');
     }
-    const tail = (await readWindow(selected.path, TAIL_BYTES, true, budget)).text;
-    if (!tail.endsWith('\n')) throw new Refusal('unverified');
+    const tail = await readWindow(selected.path, TAIL_BYTES, true, budget);
+    if (!tail.text.endsWith('\n')) throw new Refusal('unverified');
     budget.check();
-    return { reason: 'verified', conversationId: selected.id, path: selected.path, head, tail };
+    return {
+      reason: 'verified',
+      conversationId: selected.id,
+      path: selected.path,
+      head,
+      tail: tail.text,
+      tailTruncated: tail.truncated,
+    };
   } catch (error) {
     return { reason: error instanceof Refusal ? error.reason : isAbsent(error) ? 'unverified' : 'unreadable' };
   }
