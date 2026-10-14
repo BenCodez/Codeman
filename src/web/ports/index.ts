@@ -11,6 +11,7 @@ export type { EventPort } from './event-port.js';
 export type { RespawnPort } from './respawn-port.js';
 export type { RecoveryPort } from './recovery-port.js';
 export type { TaskPort } from './task-port.js';
+export type { SupervisorPort } from './supervisor-port.js';
 export type { ConfigPort } from './config-port.js';
 export type { InfraPort, ScheduledRun } from './infra-port.js';
 export type { AuthPort } from './auth-port.js';

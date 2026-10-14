@@ -419,7 +419,12 @@ const capabilitiesSchema = z
     launchDefaults: z
       .record(
         z.string(),
-        z.enum(['codexModel', 'codexReasoningEffort'] as const satisfies readonly LaunchDefaultSettingKey[])
+        z.enum([
+          'codexModel',
+          'codexReasoningEffort',
+          'codexNoDaemon',
+          'codexNoAltScreen',
+        ] as const satisfies readonly LaunchDefaultSettingKey[])
       )
       .refine((v) => Object.keys(v).length >= 1 && Object.keys(v).length <= 8, 'launchDefaults takes 1 to 8 params')
       .optional(),

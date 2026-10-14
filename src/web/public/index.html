@@ -1258,6 +1258,7 @@
                 <span>Recovery</span>
               </button>
               <button type="button" class="set-rail-item" data-tab="task" style="display: none;" onclick="app.switchOptionsTab('task')"><span>Task supervision</span></button>
+              <button type="button" class="set-rail-item" data-tab="supervisor" style="display: none;" onclick="app.switchOptionsTab('supervisor')"><span>Codex supervisor</span></button>
               <button type="button" class="set-rail-item" data-tab="ralph" data-claude-only onclick="app.switchOptionsTab('ralph')">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><polyline points="3 6 4 7 6 5"/><polyline points="3 12 4 13 6 11"/><polyline points="3 18 4 19 6 17"/></svg>
                 <span>Ralph / Todo</span>
@@ -1396,6 +1397,7 @@
 
               </div><!-- End sessionRespawnSection -->
             </section>
+
 
             <!-- ══ Context ══════════════════════════════════════════════════ -->
             <section class="set-section hidden" id="context-tab" data-label="Session">
@@ -1641,6 +1643,24 @@
                 <button class="btn-toolbar" type="button" onclick="app.saveTaskProgress()">Save checkpoint / verification</button>
               </fieldset>
               <div class="set-group"><h4>Recent task events</h4><p id="taskHistoryEmpty">No task events yet</p><ol id="taskHistory" class="task-history"></ol></div>
+            </section>
+
+            <section class="set-section hidden" id="supervisor-tab" data-label="Codex supervisor">
+              <div class="set-section-head"><h2>Codex supervisor</h2></div>
+              <p class="set-section-blurb">Assign this local isolated Codex session to manage selected owned Codex workers through guarded task and recovery controllers. The role is off by default. A worker needs an isolated <code>--no-daemon</code> conversation with a verified Codex identity; run one turn first if identity is not established.</p>
+              <p id="supervisorError" role="alert" hidden>Supervisor is unavailable for this session. Local managed Codex, isolation, owner access, and verified identity are required.</p>
+              <div class="set-group"><h4>Codex process isolation</h4><p class="set-group-hint">Set the <code>--no-daemon</code> and <code>--no-alt-screen</code> launch defaults under App Settings → Codex, then create a new local session and run one turn to establish its verified identity. Codeman does not rewrite or restart an existing conversation because it cannot safely prove an exact resume target from stale launch metadata.</p></div>
+              <div class="set-group"><h4>Supervisor status</h4><dl class="task-status-grid"><dt>Phase</dt><dd id="supervisorPhase">Loading</dd><dt>Reason</dt><dd id="supervisorReason">—</dd></dl>
+                <div class="task-actions"><button class="btn-toolbar" id="supervisorStartBtn" onclick="app.supervisorAction('start')">Start manager</button><button class="btn-toolbar" id="supervisorPauseBtn" onclick="app.supervisorAction('pause')">Pause</button><button class="btn-toolbar" id="supervisorResetBtn" onclick="app.supervisorAction('reset')">Reset</button><button class="btn-toolbar" onclick="app.loadSupervisorStatus()">Refresh</button></div>
+              </div>
+              <fieldset class="set-group task-form" id="supervisorSettings" disabled><legend>Owner configuration</legend>
+                <label for="supervisorObjective">Manager objective</label><textarea class="set-textarea" id="supervisorObjective" maxlength="3000" rows="3"></textarea>
+                <label><input type="checkbox" id="supervisorEnabled"> Enable supervisor role</label>
+                <label for="supervisorWorkers">Worker plans (JSON)</label><textarea class="set-textarea" id="supervisorWorkers" rows="12" spellcheck="false" placeholder='[{"sessionId":"...","task":"...","criteria":[{"id":"tests","description":"Tests pass","kind":"command","command":"npm test"}],"maxAssignments":3,"maxRuntimeMs":900000}]'></textarea>
+                <p class="set-group-hint">Each worker needs an explicit task, acceptance criteria, assignment budget, and runtime. Manual criteria remain owner-only. Unsupported or discovered remote transports, Docker, foreign-owner, self, cyclic, and already-leased workers are refused.</p>
+                <button class="btn-toolbar" onclick="app.saveSupervisorConfiguration()">Save supervisor configuration</button>
+              </fieldset>
+              <div class="set-group"><h4>Selected workers</h4><p class="set-group-hint">Health and task state come from bounded controller inspection. Stale or unknown evidence never enables crash retry.</p><div class="task-actions"><button class="btn-toolbar" onclick="app.loadSupervisorWorkers()">Refresh worker evidence</button></div><ol id="supervisorWorkerStatus" class="task-history"></ol></div>
             </section>
 
             <!-- ══ Ralph / Todo ═════════════════════════════════════════════ -->
@@ -2849,6 +2869,20 @@
                       <span class="set-row-desc">Decorative Codex TUI motion. Leave off to reduce remote and mobile redraws.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexAnimations"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="codex no daemon isolated supervision recovery">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Isolated process for recovery</span>
+                      <span class="set-row-desc">Start new local Codex sessions with <code>--no-daemon</code>. Required for task recovery and the optional supervisor role.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexNoDaemon"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="codex no alternate screen terminal">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Disable alternate screen</span>
+                      <span class="set-row-desc">Start new local Codex sessions with <code>--no-alt-screen</code> so transcript output remains in terminal scrollback.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexNoAltScreen"><span class="slider"></span></label>
                   </div>
                 </div>
               </div>
@@ -4251,6 +4285,7 @@
   <script defer src="respawn-ui.js"></script>
   <script defer src="recovery-ui.js"></script>
   <script defer src="supervision-ui.js"></script>
+  <script defer src="supervisor-ui.js"></script>
   <script defer src="ralph-panel.js"></script>
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>

@@ -170,10 +170,11 @@ export class TaskController {
   private preserveCancelledDelivery(
     revision: number,
     result: 'sent' | 'not-sent' | 'unknown',
-    kickoff = false
+    kickoff = false,
+    externallyCurrent: () => boolean = () => true
   ): Promise<TaskState> | undefined {
     const deadlineExpired = !this.stopped && this.revision === revision && this.runtimeBudgetExpired();
-    if (!this.stopped && this.revision === revision && !deadlineExpired) return undefined;
+    if (!this.stopped && this.revision === revision && !deadlineExpired && externallyCurrent()) return undefined;
     if (result === 'not-sent') {
       delete this.state.inFlight;
       if (kickoff) delete this.state.kickoffAt;
@@ -333,10 +334,14 @@ export class TaskController {
       return this.save('owner-paused');
     });
   }
-  resume(): Promise<TaskState> {
+  resume(externallyCurrent: () => boolean = () => true): Promise<TaskState> {
     const revision = ++this.revision;
     return this.enqueue(async () => {
       this.requireCurrent(revision);
+      if (!externallyCurrent()) {
+        this.state.phase = 'paused';
+        return this.save('delivery-cancelled');
+      }
       if (this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
       if (!this.state.objective || !this.state.criteria.length || this.state.outcome === 'completed')
         throw new TaskValidationError('No unfinished task to supervise');
@@ -345,11 +350,19 @@ export class TaskController {
       if (this.state.kickoffAt !== undefined) {
         this.state.phase = 'watching';
         const result = await this.save('owner-resumed');
+        if (!externallyCurrent()) {
+          this.state.phase = 'paused';
+          return this.save('delivery-cancelled');
+        }
         this.arm();
         return result;
       }
       const { observation: o, marker } = await this.deps.observe();
       this.requireCurrent(revision);
+      if (!externallyCurrent()) {
+        this.state.phase = 'paused';
+        return this.save('delivery-cancelled');
+      }
       if (!o.conversationId || !o.processReady || !['idle', 'completed'].includes(o.activity)) {
         this.state.phase = 'paused';
         return this.save('kickoff-not-ready');
@@ -374,10 +387,11 @@ export class TaskController {
       this.state.kickoffAt = this.now();
       this.reserveProgressBoundary(o, marker, true);
       await this.save('kickoff-reserved');
-      const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent', true);
+      const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent', true, externallyCurrent);
       if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-      const delivered = await this.deps.act(key, o.conversationId, this.prompt(), () => this.actionIsCurrent(revision));
-      const cancelled = this.preserveCancelledDelivery(revision, delivered, true);
+      const isCurrent = () => this.actionIsCurrent(revision) && externallyCurrent();
+      const delivered = await this.deps.act(key, o.conversationId, this.prompt(), isCurrent);
+      const cancelled = this.preserveCancelledDelivery(revision, delivered, true, externallyCurrent);
       if (cancelled) return cancelled;
       if (delivered === 'not-sent') {
         delete this.state.inFlight;

@@ -28,6 +28,7 @@
  * | plan         | PlanItem, PlanTaskStatus, TddPhase                                    | In-memory → `GET /api/sessions/:id/plan/tasks` |
  * | orchestrator | OrchestratorState, OrchestratorPlan, OrchestratorConfig, OrchestratorPersistState | `~/.codeman/state.json` → `GET /api/orchestrator/status` |
  * | mcp-sync     | McpSyncResult, McpSyncTargetResult                                    | Other CLIs' own config files → `GET`/`POST /api/mcp-sync` |
+ * | supervisor   | SupervisorConfig, SupervisorState, SupervisorWorkerInspection         | `~/.codeman/supervisors.json` → `/api/sessions/:id/supervisor` |
  *
  * ## Cross-domain relationship map
  *
@@ -74,3 +75,4 @@ export * from './user.js';
 export * from './webview.js';
 export * from './intent.js';
 export * from './mcp-sync.js';
+export * from './supervisor.js';

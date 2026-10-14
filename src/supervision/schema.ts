@@ -24,7 +24,7 @@ export const CriterionSchema = z.discriminatedUnion('kind', [
     })
     .strict(),
 ]);
-const Criteria = z
+export const CriteriaSchema = z
   .array(CriterionSchema)
   .min(1)
   .max(30)
@@ -32,7 +32,7 @@ const Criteria = z
 export const TaskUpdateSchema = z
   .object({
     objective: z.string().min(1).max(4000).optional(),
-    criteria: Criteria.optional(),
+    criteria: CriteriaSchema.optional(),
     config: TaskConfigSchema.partial().optional(),
   })
   .strict();

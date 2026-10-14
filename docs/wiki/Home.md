@@ -79,6 +79,7 @@ codeman web    # then open http://localhost:3000
 | [Notifications And Approvals](Notifications-And-Approvals)    | How do I know an agent needs me, and answer from my phone? |
 | [Cron Jobs](Cron-Jobs)                                        | How do I run an agent on a schedule?                |
 | [Autonomous Loops](Autonomous-Loops)                          | What are the Ralph and Orchestrator loops for?      |
+| [Codex Supervisor](Codex-Supervisor)                          | How can one Codex session coordinate bounded worker tasks? |
 | [Watching Agents Work](Watching-Agents-Work)                  | How do I see what the subagents are doing?          |
 
 ### Where it runs

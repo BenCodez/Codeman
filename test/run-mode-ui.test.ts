@@ -760,6 +760,8 @@ describe('Codex quick start settings', () => {
     app.loadAppSettingsFromStorage = () => ({
       codexDangerouslyBypassApprovals: true,
       codexAnimationsEnabled: false,
+      codexNoDaemon: true,
+      codexNoAltScreen: true,
     });
     app.getCaseSettings = () => ({});
     app.buildEnvOverrides = () => ({});
@@ -778,7 +780,13 @@ describe('Codex quick start settings', () => {
       mode: 'codex',
       // tabs follow the w<n>-<case> naming convention (quick-start would otherwise auto-name codeman-<id>)
       sessionName: 'w1-codex-case',
-      codexConfig: { dangerouslyBypassApprovals: true, animations: false, renderMode: 'hybrid' },
+      codexConfig: {
+        dangerouslyBypassApprovals: true,
+        animations: false,
+        noDaemon: true,
+        noAltScreen: true,
+        renderMode: 'hybrid',
+      },
     });
     expect(selected).toEqual(['sess-1']);
   });

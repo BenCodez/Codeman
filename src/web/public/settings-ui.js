@@ -535,6 +535,10 @@ Object.assign(CodemanApp.prototype, {
       settings.codexDangerouslyBypassApprovals ?? false;
     document.getElementById('appSettingsCodexAnimations').checked =
       settings.codexAnimationsEnabled ?? false;
+    const codexNoDaemon = document.getElementById('appSettingsCodexNoDaemon');
+    const codexNoAltScreen = document.getElementById('appSettingsCodexNoAltScreen');
+    if (codexNoDaemon) codexNoDaemon.checked = settings.codexNoDaemon ?? false;
+    if (codexNoAltScreen) codexNoAltScreen.checked = settings.codexNoAltScreen ?? false;
     document.getElementById('appSettingsCodexModel').value = settings.codexModel ?? '';
     document.getElementById('appSettingsCodexReasoningEffort').value = settings.codexReasoningEffort ?? '';
     this._applyCodexSettingsVisibility();
@@ -2629,6 +2633,8 @@ Object.assign(CodemanApp.prototype, {
       codexReasoningEffort: document.getElementById('appSettingsCodexReasoningEffort').value,
       codexDangerouslyBypassApprovals: document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked,
       codexAnimationsEnabled: document.getElementById('appSettingsCodexAnimations').checked,
+      codexNoDaemon: document.getElementById('appSettingsCodexNoDaemon')?.checked ?? false,
+      codexNoAltScreen: document.getElementById('appSettingsCodexNoAltScreen')?.checked ?? false,
       // Claude Permissions settings
       agentTeamsEnabled: document.getElementById('appSettingsAgentTeams').checked,
       agentSkillEnabled: document.getElementById('appSettingsAgentSkill').checked,

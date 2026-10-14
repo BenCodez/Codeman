@@ -1504,6 +1504,8 @@ export const SettingsUpdateSchema = z
     codexReasoningEffort: z.enum(['', ...CODEX_REASONING_EFFORTS]).optional(),
     codexDangerouslyBypassApprovals: z.boolean().optional(),
     codexAnimationsEnabled: z.boolean().optional(),
+    codexNoDaemon: z.boolean().optional(),
+    codexNoAltScreen: z.boolean().optional(),
     // Terminal history and retention
     terminalScrollbackLines: z
       .number()

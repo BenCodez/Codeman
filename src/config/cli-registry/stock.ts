@@ -700,10 +700,15 @@ const CODEX: CliEntry = {
       screenLine: String.raw`(?:^|\n) {2}([A-Za-z0-9][\w.:/@+-]{0,79}) (?:${[...CODEX_REASONING_EFFORTS, 'default'].join('|')}) · [^\n]*(?:\n {2}[^\n]*)?$`,
       screenLines: 2,
     },
-    // App Settings → Codex model / reasoning effort (synced), filled into a LOCAL launch's
+    // App Settings → Codex launch defaults (synced), filled into a LOCAL launch's
     // codexConfig wherever the caller left the field unset. Launch-only: nothing writes
     // codex's own config.toml. Read by applyLaunchDefaults() in src/web/launch-defaults.ts.
-    launchDefaults: { model: 'codexModel', reasoningEffort: 'codexReasoningEffort' },
+    launchDefaults: {
+      model: 'codexModel',
+      reasoningEffort: 'codexReasoningEffort',
+      noDaemon: 'codexNoDaemon',
+      noAltScreen: 'codexNoAltScreen',
+    },
     // Two columns, like claude's, measured on a live 0.154.0 answer: the `•`/`›`/`⚠`
     // markers sit in the gutter, prose continuations sit at 2, and a nested YAML block
     // the model wrote rendered at 2/4/6/8 for its own 0/2/4/6. Replayed at 100, 120,

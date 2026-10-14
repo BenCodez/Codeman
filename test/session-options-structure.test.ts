@@ -34,7 +34,7 @@ function methodBody(signature: string): string {
   return sessionUi.slice(start, sessionUi.indexOf('\n  },', start));
 }
 
-const TABS = ['respawn', 'context', 'recovery', 'ralph', 'summary'];
+const TABS = ['respawn', 'context', 'recovery', 'task', 'supervisor', 'ralph', 'summary'];
 
 describe('Session Options modal structure', () => {
   it('keeps every element openSessionOptions and switchOptionsTab touch by id', () => {

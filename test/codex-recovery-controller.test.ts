@@ -773,6 +773,29 @@ describe('recovery action authority', () => {
 });
 
 describe('durable reservation and serialization', () => {
+  it('clears a supervisor retry intention cancelled while its schedule is saving', async () => {
+    const f = fixture(enabledState());
+    const entered = createDeferred();
+    const release = createDeferred();
+    f.persist.mockImplementation(async (state) => {
+      if (state.pending && !state.inFlight) {
+        entered.resolve();
+        await release.promise;
+      }
+      f.journal.push(structuredClone(state));
+    });
+    let authorized = true;
+    const work = f.controller.retry(() => authorized);
+    await entered.promise;
+    authorized = false;
+    release.resolve();
+    await work;
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.controller.getStatus()).toMatchObject({ attempts: 0, phase: 'watching' });
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.controller.getStatus().nextRetryAt).toBeUndefined();
+  });
+
   it('persists the in-flight reservation before any side effect', async () => {
     const f = fixture(enabledState());
     const entered = createDeferred();

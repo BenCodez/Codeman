@@ -37,7 +37,15 @@ describe('Codex launch defaults', () => {
     }
     await mkdir(workingDir, { recursive: true });
     await mkdir(dirname(SETTINGS_PATH), { recursive: true });
-    await writeFile(SETTINGS_PATH, JSON.stringify({ codexModel: 'gpt-6.1', codexReasoningEffort: 'high' }));
+    await writeFile(
+      SETTINGS_PATH,
+      JSON.stringify({
+        codexModel: 'gpt-6.1',
+        codexReasoningEffort: 'high',
+        codexNoDaemon: true,
+        codexNoAltScreen: true,
+      })
+    );
     harness = await createRouteTestHarness(registerSessionRoutes);
     vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
   });
@@ -65,15 +73,28 @@ describe('Codex launch defaults', () => {
   for (const url of ['/api/sessions', '/api/quick-start']) {
     it(`applies persisted defaults at ${url} and emits the CLI options`, async () => {
       const config = await createdConfig(url);
-      expect(config).toMatchObject({ model: 'gpt-6.1', reasoningEffort: 'high' });
+      expect(config).toMatchObject({
+        model: 'gpt-6.1',
+        reasoningEffort: 'high',
+        noDaemon: true,
+        noAltScreen: true,
+      });
       expect(buildCodexCommand(config)).toContain('--model gpt-6.1');
       expect(buildCodexCommand(config)).toContain('--config model_reasoning_effort=high');
+      expect(buildCodexCommand(config)).toContain('--no-daemon');
+      expect(buildCodexCommand(config)).toContain('--no-alt-screen');
     });
 
     it(`preserves explicit model and effort at ${url}`, async () => {
-      expect(await createdConfig(url, { codexConfig: { model: 'gpt-other', reasoningEffort: 'low' } })).toMatchObject({
+      expect(
+        await createdConfig(url, {
+          codexConfig: { model: 'gpt-other', reasoningEffort: 'low', noDaemon: false, noAltScreen: false },
+        })
+      ).toMatchObject({
         model: 'gpt-other',
         reasoningEffort: 'low',
+        noDaemon: false,
+        noAltScreen: false,
       });
     });
   }
@@ -89,9 +110,14 @@ describe('Codex launch defaults', () => {
     }
   });
 
-  it('keeps defaults out of custom endpoint launches', async () => {
+  it('keeps model defaults out of custom endpoints while applying local process isolation', async () => {
     const config = { model: 'local-model', animations: false };
-    expect(await resolveCodexDefaults(config, true)).toBe(config);
+    expect(await resolveCodexDefaults(config, true)).toEqual({
+      model: 'local-model',
+      animations: false,
+      noDaemon: true,
+      noAltScreen: true,
+    });
   });
 
   it('is driven by the registry: codex declares the defaults, and a CLI without them is untouched', async () => {
@@ -100,6 +126,8 @@ describe('Codex launch defaults', () => {
     expect(getCli('codex')!.capabilities.launchDefaults).toEqual({
       model: 'codexModel',
       reasoningEffort: 'codexReasoningEffort',
+      noDaemon: 'codexNoDaemon',
+      noAltScreen: 'codexNoAltScreen',
     });
     for (const entry of STOCK_CLIS) {
       if ((entry.id as string) === 'codex') continue;
@@ -111,17 +139,30 @@ describe('Codex launch defaults', () => {
     const bag = { codexConfig: { animations: false }, geminiConfig: { model: 'g' }, name: 'n' };
     const filled = await applyLaunchDefaults('codex', bag);
     expect(filled).toEqual({
-      codexConfig: { animations: false, model: 'gpt-6.1', reasoningEffort: 'high' },
+      codexConfig: {
+        animations: false,
+        model: 'gpt-6.1',
+        reasoningEffort: 'high',
+        noDaemon: true,
+        noAltScreen: true,
+      },
       geminiConfig: { model: 'g' },
       name: 'n',
     });
     expect(filled.geminiConfig).toBe(bag.geminiConfig);
     expect(bag.codexConfig).toEqual({ animations: false });
     // A field the caller sent is never overwritten, one at a time.
-    expect(await resolveCodexDefaults({ model: 'mine' })).toEqual({ model: 'mine', reasoningEffort: 'high' });
+    expect(await resolveCodexDefaults({ model: 'mine' })).toEqual({
+      model: 'mine',
+      reasoningEffort: 'high',
+      noDaemon: true,
+      noAltScreen: true,
+    });
     expect(await resolveCodexDefaults({ reasoningEffort: 'low' })).toEqual({
       model: 'gpt-6.1',
       reasoningEffort: 'low',
+      noDaemon: true,
+      noAltScreen: true,
     });
   });
 
@@ -183,12 +224,32 @@ describe('Codex launch defaults', () => {
     const system = await createRouteTestHarness(registerSystemRoutes);
     try {
       const put = (payload: unknown) => system.app.inject({ method: 'PUT', url: '/api/settings', payload });
-      expect((await put({ codexModel: 'gpt-6.1', codexReasoningEffort: 'xhigh' })).statusCode).toBe(200);
+      expect(
+        (
+          await put({
+            codexModel: 'gpt-6.1',
+            codexReasoningEffort: 'xhigh',
+            codexNoDaemon: true,
+            codexNoAltScreen: true,
+          })
+        ).statusCode
+      ).toBe(200);
       const read = await system.app.inject({ method: 'GET', url: '/api/settings' });
-      expect(read.json()).toMatchObject({ codexModel: 'gpt-6.1', codexReasoningEffort: 'xhigh' });
+      expect(read.json()).toMatchObject({
+        codexModel: 'gpt-6.1',
+        codexReasoningEffort: 'xhigh',
+        codexNoDaemon: true,
+        codexNoAltScreen: true,
+      });
+      const launched = await createdConfig('/api/sessions');
+      expect(launched).toMatchObject({ noDaemon: true, noAltScreen: true });
+      expect(buildCodexCommand(launched)).toContain('--no-daemon');
+      expect(buildCodexCommand(launched)).toContain('--no-alt-screen');
       expect((await put({ codexReasoningEffort: 'bogus' })).statusCode).toBe(400);
       expect((await put({ codexModel: 'bad;command' })).statusCode).toBe(400);
       expect((await put({ codexModel: '', codexReasoningEffort: '' })).statusCode).toBe(200);
+      expect(await resolveCodexDefaults(undefined)).toEqual({ noDaemon: true, noAltScreen: true });
+      expect((await put({ codexNoDaemon: false, codexNoAltScreen: false })).statusCode).toBe(200);
       expect(await resolveCodexDefaults(undefined)).toBeUndefined();
     } finally {
       await system.app.close();

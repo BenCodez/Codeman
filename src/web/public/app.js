@@ -2296,6 +2296,7 @@ class CodemanApp {
     // Recovery events missed during a disconnect are reconciled by an authoritative read.
     if (this._recoveryView) void this.loadRecoveryStatus?.();
     if (this._taskView) void this.loadTaskStatus?.();
+    if (this._supervisorView) void this.loadSupervisorStatus?.();
     // Start the remote-host reachability poller even if no session switch follows
     // (a page loaded with the remote tab already active) — see host-wake-ui.js.
     this._ensureHostWakePoller?.();

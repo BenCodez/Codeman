@@ -5,6 +5,7 @@
 import { EventEmitter } from 'node:events';
 import { vi } from 'vitest';
 import type {
+  CodexConfig,
   SessionAttachmentHistoryItem,
   SessionStatus,
   SessionRemote,
@@ -325,6 +326,7 @@ export class MockSession extends EventEmitter {
 
   /** CLI mode */
   mode: string = 'claude';
+  codexConfig: CodexConfig | undefined;
 
   /** Text output buffer (stripped of ANSI) */
   textOutput: string = '';
@@ -366,6 +368,7 @@ export class MockSession extends EventEmitter {
       name: this.name,
       color: this.color,
       mode: this.mode,
+      codexConfig: this.codexConfig,
       muxName: this._muxName,
       pinned: this.pinned || undefined,
       pinnedAt: this.pinned ? (this.pinnedAt ?? undefined) : undefined,

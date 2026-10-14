@@ -131,6 +131,17 @@ describe('task routes ownership and bounded inputs', () => {
     expect(res.statusCode).toBe(400);
     expect(res.body).not.toContain('/private');
   });
+  it('never grants owner-only manual verification to an agent-attributed request', async () => {
+    const payload = { outcome: 'unfinished' as const, verifiedCriteria: ['manual-a'] };
+    const res = await h.app.inject({
+      method: 'POST',
+      url: `/api/sessions/${h.ctx._sessionId}/task/progress`,
+      headers: { 'x-codeman-parent-session': '12345678-worker' },
+      payload,
+    });
+    expect(res.statusCode).toBe(200);
+    expect(controller.progress).toHaveBeenCalledWith(payload, false);
+  });
   it('returns a sanitized operational failure when valid task persistence fails', async () => {
     const actual = new TaskController({
       observe: async () => {

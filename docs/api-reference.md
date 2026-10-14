@@ -969,6 +969,24 @@ same speech-to-text service the CLI's own `/voice` mode uses. Gated on the synce
   unavailable (reason in the close reason), `4008` too many concurrent streams.
   Streams are capped in count and length (`src/config/voice.ts`).
 
+## Codex supervisor
+
+All routes are owner-scoped and available through `/api/v1` aliases. Configuration routes are owner actions. Manager-scoped routes additionally require `X-Codeman-Supervisor-Session` equal to `:id`; this header is attribution, while global authentication, Origin checks, and the session owner check provide authorization.
+
+| Method | Path | Body | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/sessions/:id/supervisor` | none | Read durable manager configuration and phase. |
+| `PUT` | `/api/sessions/:id/supervisor` | `{ objective, enabled, workers[] }` | Configure explicit worker tasks, criteria, `maxAssignments`, and `maxRuntimeMs`. |
+| `POST` | `/api/sessions/:id/supervisor/start\|pause\|reset` | none | Owner lifecycle actions. Start delivers the manager objective through task supervision. |
+| `GET` | `/api/sessions/:id/supervisor/workers` | none | Manager view of selected workers' task checkpoints, verified criteria, recovery state, normalized health, observation time, and freshness. |
+| `POST` | `/api/sessions/:id/supervisor/workers/:workerId/assign` | `{ requestId }` | Start the exact owner-configured task through the worker task controller. |
+| `POST` | `/api/sessions/:id/supervisor/workers/:workerId/retry` | `{ requestId }` | Ask the recovery controller to retry a currently validated crash. |
+| `POST` | `/api/sessions/:id/supervisor/workers/:workerId/progress` | task progress | Record evidence without owner authority; manual criteria cannot be verified here. |
+
+`GET .../workers` inspects at most four workers concurrently within a ten-second request deadline. Each item includes `observedAt` and `stale`; a timed-out or unavailable worker is returned with `health: "unknown"` and `stale: true` so verified results from other workers remain usable. Concurrent reads share one inspection, and unfinished per-worker inspections are not duplicated.
+
+`requestId` is a durable 8–120 character identifier. Each accepted ID is durably bound to its worker and action; reusing it for that operation is idempotent, while reusing it for a different operation is refused. The accepted-ID journal has a fixed capacity of 128 and refuses new operations when full until the owner resets the supervisor; accepted IDs are never evicted for replay. An operation reserved before a lost or failed dispatch remains uncertain and pauses the supervisor; it is not replayed after restart. See [Codex Supervisor](wiki/Codex-Supervisor.md) for eligibility and limitations.
+
 ## Authentication
 
 Optional HTTP Basic (`CODEMAN_USERNAME`/`CODEMAN_PASSWORD`) → opaque

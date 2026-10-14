@@ -33,6 +33,7 @@ export function createMockRouteContext(options?: {
   return {
     // -- SessionPort --
     sessions,
+    prepareRebootRestoreRecovery: vi.fn(async () => {}),
     addSession: vi.fn(async (s: MockSession) => {
       sessions.set(s.id, s);
     }),
@@ -69,6 +70,8 @@ export function createMockRouteContext(options?: {
       }
     ),
     getSessionStateWithRespawn: vi.fn((s: MockSession) => s.toState()),
+    getTaskController: vi.fn(() => undefined),
+    getSupervisorController: vi.fn(() => undefined),
 
     // -- EventPort --
     broadcast: vi.fn(),

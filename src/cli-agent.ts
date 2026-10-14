@@ -30,6 +30,7 @@
  */
 import http from 'node:http';
 import https from 'node:https';
+import { randomUUID } from 'node:crypto';
 import type { Command } from 'commander';
 import {
   basicAuthHeader,
@@ -783,6 +784,41 @@ export async function agentRm(deps: AgentDeps, options: { id: string }): Promise
   return EXIT.ok;
 }
 
+export type SupervisorAgentAction = 'status' | 'workers' | 'assign' | 'retry';
+/** Scoped supervisor API. The header attributes the manager; server auth and owner checks remain authoritative. */
+export async function agentSupervisor(
+  deps: AgentDeps,
+  options: { action: SupervisorAgentAction; workerId?: string; requestId?: string }
+): Promise<number> {
+  if ((options.action === 'assign' || options.action === 'retry') && !options.workerId)
+    return fail(deps, 'worker id is required', EXIT.refused);
+  let workerId = options.workerId;
+  if (workerId) {
+    const target = await resolveSessionId(deps, workerId);
+    if ('error' in target) return fail(deps, target.error, target.code);
+    if (isSelfSession(deps.ctx.selfId, target.id)) return fail(deps, 'a supervisor cannot manage itself', EXIT.refused);
+    workerId = target.id;
+  }
+  const base = `/api/v1/sessions/${encodeURIComponent(deps.ctx.selfId)}/supervisor`;
+  const path =
+    options.action === 'status'
+      ? base
+      : options.action === 'workers'
+        ? `${base}/workers`
+        : `${base}/workers/${encodeURIComponent(workerId!)}/${options.action}`;
+  const res = await deps.request(deps.ctx, {
+    method: options.action === 'status' || options.action === 'workers' ? 'GET' : 'POST',
+    path,
+    headers: { 'X-Codeman-Supervisor-Session': deps.ctx.selfId },
+    ...(options.action === 'assign' || options.action === 'retry'
+      ? { body: { requestId: options.requestId ?? randomUUID() } }
+      : {}),
+  });
+  if (!res.json?.success) return fail(deps, describeFailure(res));
+  emitJson(deps, res.json.data ?? {});
+  return EXIT.ok;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Commander wiring
 // ─────────────────────────────────────────────────────────────────────────────
@@ -975,6 +1011,31 @@ export function registerAgentCommands(program: Command): Command {
     .description('Delete any session except this one (refuses your own id)')
     .option('--json', 'Machine-readable output')
     .action((id: string, options: { json?: boolean }) => run(Boolean(options.json), (deps) => agentRm(deps, { id })));
+
+  const supervisor = agent
+    .command('supervisor')
+    .description('Inspect and operate only the owner-configured Codex supervisor worker set');
+  supervisor
+    .command('status')
+    .description('Show this manager session supervisor state as JSON')
+    .action(() => run(true, (deps) => agentSupervisor(deps, { action: 'status' })));
+  supervisor
+    .command('workers')
+    .description('Show evidence-backed task and recovery status for selected workers')
+    .action(() => run(true, (deps) => agentSupervisor(deps, { action: 'workers' })));
+  for (const action of ['assign', 'retry'] as const) {
+    supervisor
+      .command(`${action} <workerId>`)
+      .description(
+        action === 'assign'
+          ? 'Start the worker task configured by the owner'
+          : 'Retry a validated crash through recovery'
+      )
+      .requiredOption('--request-id <id>', 'Durable unique operation id; reuse the same id after a lost response')
+      .action((workerId: string, options: { requestId: string }) =>
+        run(true, (deps) => agentSupervisor(deps, { action, workerId, requestId: options.requestId }))
+      );
+  }
 
   return agent;
 }

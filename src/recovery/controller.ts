@@ -240,10 +240,10 @@ export class RecoveryController {
     });
   }
 
-  async retry(): Promise<RecoveryState> {
+  async retry(externallyCurrent: () => boolean = () => true): Promise<RecoveryState> {
     return this.enqueue(async () => {
       try {
-        await this.evaluate(true);
+        await this.evaluate(true, externallyCurrent);
         return this.getStatus();
       } finally {
         this.arm();
@@ -444,9 +444,10 @@ export class RecoveryController {
     }
   }
 
-  private async evaluate(manual: boolean): Promise<void> {
-    if (this.stopped) return;
+  private async evaluate(manual: boolean, externallyCurrent: () => boolean = () => true): Promise<void> {
+    if (this.stopped || !externallyCurrent()) return;
     const revision = this.revision;
+    const isCurrent = () => !this.stopped && revision === this.revision && externallyCurrent();
     const before = JSON.stringify(this.state);
     let observation: RecoveryObservation;
     try {
@@ -454,7 +455,7 @@ export class RecoveryController {
     } catch {
       observation = { activity: 'unknown', reason: 'identity-unverified', at: this.now(), safeToAct: false };
     }
-    if (this.stopped || revision !== this.revision) return;
+    if (!isCurrent()) return;
     this.invalidateConfirmation(observation);
     const unchangedStallAlert = this.retainStallAlert(observation);
     this.state.activity = observation.activity;
@@ -612,7 +613,17 @@ export class RecoveryController {
       await this.save();
     }
     if (!manual && this.now() < (this.state.nextRetryAt ?? Infinity)) return;
-    if (this.stopped || revision !== this.revision) return;
+    if (!isCurrent()) {
+      // An external supervisor pause can race the durable scheduling write without
+      // changing this controller's own revision. Remove that manual intention so a
+      // later timer cannot dispatch it after the supervisor has lost authority.
+      this.state.pending = undefined;
+      this.state.nextRetryAt = undefined;
+      this.state.phase = this.state.config.enabled ? 'watching' : 'idle';
+      this.state.needsAttention = false;
+      await this.save();
+      return;
+    }
     const pending = this.state.pending;
     if (!pending) return;
     this.state.inFlight = { ...pending, startedAt: this.now(), previousSubmissionKey: observation.submissionKey };
@@ -624,7 +635,6 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const isCurrent = () => !this.stopped && revision === this.revision;
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
       outcome = isCurrent() ? await this.deps.act(this.state.inFlight, isCurrent) : 'not-sent';

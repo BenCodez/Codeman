@@ -122,6 +122,7 @@ run('minify app.js', 'npx esbuild dist/web/public/app.js --minify --outfile=dist
 run('minify tab-rail-resize.js', 'npx esbuild dist/web/public/tab-rail-resize.js --minify --outfile=dist/web/public/tab-rail-resize.js --allow-overwrite');
 run('minify terminal-ui.js', 'npx esbuild dist/web/public/terminal-ui.js --minify --outfile=dist/web/public/terminal-ui.js --allow-overwrite');
 run('minify respawn-ui.js', 'npx esbuild dist/web/public/respawn-ui.js --minify --outfile=dist/web/public/respawn-ui.js --allow-overwrite');
+run('minify supervisor-ui.js', 'npx esbuild dist/web/public/supervisor-ui.js --minify --outfile=dist/web/public/supervisor-ui.js --allow-overwrite');
 run('minify ralph-panel.js', 'npx esbuild dist/web/public/ralph-panel.js --minify --outfile=dist/web/public/ralph-panel.js --allow-overwrite');
 run('minify settings-ui.js', 'npx esbuild dist/web/public/settings-ui.js --minify --outfile=dist/web/public/settings-ui.js --allow-overwrite');
 run('minify panels-ui.js', 'npx esbuild dist/web/public/panels-ui.js --minify --outfile=dist/web/public/panels-ui.js --allow-overwrite');
@@ -151,6 +152,7 @@ console.log('\n[build] content-hash cache busting');
     'tab-rail-resize.js',
     'terminal-ui.js',
     'respawn-ui.js',
+    'supervisor-ui.js',
     'ralph-panel.js',
     'settings-ui.js',
     'panels-ui.js',

@@ -164,6 +164,9 @@ import { TaskStore } from '../supervision/store.js';
 import { initialTaskState } from '../supervision/schema.js';
 import { CodexTaskAdapter } from '../supervision/adapter.js';
 import { SessionActionArbiter } from '../supervision/action-arbiter.js';
+import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
+import { buildSupervisorManagerTask } from '../supervisor/manager-task.js';
+import { SupervisorStore } from '../supervisor/store.js';
 import { RecoveryController } from '../recovery/controller.js';
 import { RecoveryStore } from '../recovery/store.js';
 import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
@@ -200,6 +203,7 @@ import {
   registerRespawnRoutes,
   registerRecoveryRoutes,
   registerTaskRoutes,
+  registerSupervisorRoutes,
   registerRalphRoutes,
   registerPlanRoutes,
   registerClipboardRoutes,
@@ -317,6 +321,9 @@ export class WebServer extends EventEmitter {
   private actionArbiters = new Map<string, SessionActionArbiter>();
   private taskStore = new TaskStore();
   private actionReservationStore = new TaskStore(dataPath('action-reservations.json'));
+  private supervisorControllers = new Map<string, SupervisorController>();
+  private supervisorStore = new SupervisorStore();
+  private supervisorLeaseQueue: Promise<unknown> = Promise.resolve();
   private recoveryControllers = new Map<string, RecoveryController>();
   private recoveryInputListeners = new Map<string, () => void>();
   private rebootIdentityListeners = new Map<string, () => void>();
@@ -773,6 +780,7 @@ export class WebServer extends EventEmitter {
       getSessionStateWithRespawn: this.getSessionStateWithRespawn.bind(this),
       getRecoveryController: this.getRecoveryController.bind(this),
       getTaskController: this.getTaskController.bind(this),
+      getSupervisorController: this.getSupervisorController.bind(this),
       // EventPort
       broadcast: this.broadcast.bind(this),
       sendPushNotifications: this.sendPushNotifications.bind(this),
@@ -1177,6 +1185,7 @@ export class WebServer extends EventEmitter {
     registerRespawnRoutes(this.app, ctx);
     registerRecoveryRoutes(this.app, ctx);
     registerTaskRoutes(this.app, ctx);
+    registerSupervisorRoutes(this.app, ctx);
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
     registerClipboardRoutes(this.app, ctx);
@@ -2391,6 +2400,112 @@ export class WebServer extends EventEmitter {
     return arbiter;
   }
 
+  private withSupervisorLeases<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.supervisorLeaseQueue.then(fn, fn);
+    this.supervisorLeaseQueue = result.catch(() => {});
+    return result;
+  }
+
+  private supervisorLeaseHolder(workerId: string, excludingSupervisor: string): string | undefined {
+    // A failed save may disable the live controller while disk still owns the
+    // lease. Release requires both durable and live states to relinquish it.
+    const states = [
+      ...this.supervisorStore.all(),
+      ...[...this.supervisorControllers.values()].map((controller) => controller.getStatus()),
+    ];
+    for (const state of states) {
+      if (
+        state.supervisorSessionId !== excludingSupervisor &&
+        state.enabled &&
+        // Keep the operation journal, including uncertain delivery, but an
+        // absent, pruned manager cannot hold an unreachable lease forever.
+        // Pinned/detached records and outstanding reboot restores retain it.
+        (this.sessions.has(state.supervisorSessionId) ||
+          this.store.getSession(state.supervisorSessionId) !== null ||
+          rebootRestoreRegistry.hasOutstanding(state.supervisorSessionId)) &&
+        state.workers.some((worker) => worker.sessionId === workerId)
+      )
+        return state.supervisorSessionId;
+    }
+    return undefined;
+  }
+
+  private getSupervisorController(session: Session): SupervisorController | undefined {
+    if (
+      this.recoveryStopping ||
+      this.sessions.get(session.id) !== session ||
+      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout' ||
+      session.remote ||
+      session.docker ||
+      !session.getRecoveryContext().managed ||
+      !session.getRecoveryContext().noDaemon
+    )
+      return undefined;
+    const existing = this.supervisorControllers.get(session.id);
+    if (existing) return existing;
+    const controller = new SupervisorController(
+      {
+        validateWorkers: (ids) => {
+          for (const id of ids) {
+            const worker = this.sessions.get(id);
+            if (
+              !worker ||
+              worker === session ||
+              worker.owner !== session.owner ||
+              getCli(worker.mode)?.capabilities.recovery !== 'codex-rollout' ||
+              worker.remote?.owned === false ||
+              worker.docker ||
+              !worker.getRecoveryContext().managed ||
+              !worker.getRecoveryContext().noDaemon ||
+              !this.getTaskController(worker) ||
+              !this.getRecoveryController(worker)
+            )
+              throw new SupervisorValidationError('Worker is not an eligible owned isolated Codex session');
+            // A failed reset disables the live controller before the durable
+            // manager role is released. Neither state can hide the other's role.
+            if (this.supervisorControllers.get(id)?.getStatus().enabled || this.supervisorStore.get(id).enabled)
+              throw new SupervisorValidationError('Supervisor cycles are not allowed');
+          }
+        },
+        worker: (id) => {
+          const worker = this.sessions.get(id);
+          if (!worker || worker.owner !== session.owner) return undefined;
+          const task = this.getTaskController(worker);
+          const recovery = this.getRecoveryController(worker);
+          return task && recovery ? { task, recovery } : undefined;
+        },
+        persist: (state) => this.supervisorStore.save(session.id, state),
+        withLeases: (fn) => this.withSupervisorLeases(fn),
+        leaseHolder: (workerId, excluding) => this.supervisorLeaseHolder(workerId, excluding),
+        startManager: async (objective, _workers, isCurrent) => {
+          const task = this.getTaskController(session);
+          if (!task) throw new Error('Supervisor task controller is unavailable');
+          await task.update(buildSupervisorManagerTask(objective));
+          if (!isCurrent()) return false;
+          const started = await task.resume(isCurrent);
+          if (!isCurrent()) {
+            if (started.inFlight) throw new Error('Manager task delivery may have started before cancellation');
+            return false;
+          }
+          const outcome = classifyTaskKickoff(started);
+          if (outcome === 'uncertain') throw new Error('Manager task delivery acceptance is uncertain');
+          return outcome === 'accepted';
+        },
+        pauseManager: async () => {
+          await this.getTaskController(session)?.pause();
+        },
+        resetManager: async () => {
+          await this.getTaskController(session)?.reset();
+        },
+        changed: () => this.persistSessionState(session),
+      },
+      session.id,
+      this.supervisorStore.get(session.id)
+    );
+    this.supervisorControllers.set(session.id, controller);
+    return controller;
+  }
+
   private controllerHasTaskFlight(id: string): boolean {
     return (
       this.taskStore.loadFailed ||
@@ -2527,6 +2642,17 @@ export class WebServer extends EventEmitter {
   }
 
   private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
+    const supervisor = this.supervisorControllers.get(id);
+    const supervisorMode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
+    const ownsSupervisorState =
+      !!supervisor ||
+      (supervisorMode !== undefined && getCli(supervisorMode)?.capabilities.recovery === 'codex-rollout');
+    if (supervisor) {
+      supervisor.stop();
+      await supervisor.drain();
+      this.supervisorControllers.delete(id);
+    }
+    if (drop && ownsSupervisorState) await this.supervisorStore.drop(id);
     const task = this.taskControllers.get(id);
     const taskInput = this.taskInputListeners.get(id);
     const taskMode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
@@ -2721,7 +2847,7 @@ export class WebServer extends EventEmitter {
     return result;
   }
 
-  // ========== SSE Delegates (SseStreamManager) ==========
+  // ========== SSE Delegates (SseStreamManager) ===  }
 
   private broadcast(event: string, data: unknown): void {
     // Invalidate caches on structural changes (creation/deletion)
@@ -2915,7 +3041,7 @@ export class WebServer extends EventEmitter {
     }
   }
 
-  // ========== Web Push ==========
+  // ========== Web Push ===  }
 
   /** Map SSE event names to push notification payloads */
   private static readonly PUSH_EVENT_MAP: Record<
@@ -4237,11 +4363,15 @@ export class WebServer extends EventEmitter {
 
   async stop(): Promise<void> {
     this.recoveryStopping = true;
+    for (const controller of this.supervisorControllers.values()) controller.stop();
+    await Promise.all([...this.supervisorControllers.values()].map((controller) => controller.drain()));
+    this.supervisorControllers.clear();
     for (const controller of this.recoveryControllers.values()) controller.stop();
     await Promise.all([...this.recoveryControllers.keys()].map((id) => this.stopRecoveryController(id, false)));
     await this.recoveryStore.flush();
     await this.taskStore.flush();
     await this.actionReservationStore.flush();
+    await this.supervisorStore.flush();
     getLifecycleLog().log({ event: 'server_stopped', sessionId: '*' });
     // Set stopping flag to prevent new timer creation during shutdown
     this.sse.setStopping();

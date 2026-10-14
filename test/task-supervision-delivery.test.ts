@@ -25,6 +25,81 @@ afterEach(async () => {
 const line = (at: number, payload: unknown) =>
   JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
 describe('transport canonical task prompts', () => {
+  it('rechecks an external supervisor cancellation inside the real Session lifecycle guard', async () => {
+    const commands: string[] = [];
+    const mux = new TmuxManager(async (command) => {
+      commands.push(command);
+    });
+    const muxSession = {
+      sessionId: SESSION,
+      muxName: 'codeman-aaaaaaaa',
+      pid: 99999,
+      createdAt: 10000,
+      workingDir: '/tmp',
+      mode: 'codex',
+      attached: true,
+      recoveryIsolated: true,
+    } as MuxSession;
+    mux.registerSession(muxSession);
+    let releasePane!: (value: { dead: false; screen: string; status: undefined; signal: undefined }) => void;
+    let paneEntered!: () => void;
+    const inspectingPane = new Promise<void>((resolve) => (paneEntered = resolve));
+    vi.spyOn(mux, 'inspectPaneForRecovery').mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          releasePane = resolve;
+          paneEntered();
+        })
+    );
+    session = new Session({
+      id: SESSION,
+      workingDir: '/tmp',
+      mode: 'codex',
+      useMux: true,
+      mux,
+      muxSession,
+      codexConfig: { noDaemon: true, sandbox: 'workspace-write', approvalPolicy: 'on-request' },
+    });
+    session.pinRecoveryConversation(THREAD);
+    controller = new TaskController({
+      now: () => 10_000,
+      persist: async () => {},
+      changed: () => {},
+      observe: async () => ({
+        observation: {
+          activity: 'idle',
+          reason: 'observing',
+          at: 10_000,
+          conversationId: THREAD,
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      }),
+      act: (key, conversationId, prompt, isCurrent) =>
+        session!.deliverRecovery(
+          { action: 'continue', key, conversationId, startedAt: 10_000 },
+          session!.getRecoveryContext().generation,
+          isCurrent,
+          prompt
+        ),
+    });
+    await controller.update({
+      objective: 'Repair the parser',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { enabled: false },
+    });
+    let authorized = true;
+    const resuming = controller.resume(() => authorized);
+    await inspectingPane;
+    authorized = false;
+    releasePane({ dead: false, screen: '›\n', status: undefined, signal: undefined });
+    const state = await resuming;
+    expect(commands).toEqual([]);
+    expect(state).toMatchObject({ phase: 'paused', reason: 'delivery-cancelled' });
+    expect(state.inFlight).toBeUndefined();
+  });
+
   it('accepts both real kickoff and continuation bytes and processes subsequent structured progress', async () => {
     const delivered: string[] = [];
     let enters = 0;
