@@ -16,7 +16,7 @@
  * See `docs/multi-user-plan.md` sections 4.1, 5, 6.3.
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, statSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import { isAbsolute, join, relative } from 'node:path';
 import { randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
@@ -164,7 +164,7 @@ export function canRunPrivilegedCommands(grant: { role: UserRole; canBypassPermi
 
 // ─────────────────────────────── IO layer ───────────────────────────────
 
-let cache: { users: UserRecord[]; ts: number } | null = null;
+let cache: { users: UserRecord[]; ts: number; recoveryRecognized: boolean } | null = null;
 
 /** Drop the in-process cache (called after every write; exported for tests). */
 export function invalidateUsersCache(): void {
@@ -183,7 +183,7 @@ export async function readUsers(force = false): Promise<UserRecord[]> {
     // empty store — do NOT cache [] and do NOT let it look empty, or a following
     // createUser/bootstrap would overwrite users.json and destroy every account.
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-      cache = { users: [], ts: now };
+      cache = { users: [], ts: now, recoveryRecognized: false };
       return [];
     }
     throw err;
@@ -192,7 +192,17 @@ export async function readUsers(force = false): Promise<UserRecord[]> {
   // read as empty, so mutators/bootstrap abort instead of clobbering it.
   const parsed = JSON.parse(raw) as Partial<UsersFile>;
   const users = Array.isArray(parsed.users) ? parsed.users : [];
-  cache = { users, ts: now };
+  cache = {
+    users,
+    ts: now,
+    recoveryRecognized:
+      !!parsed &&
+      typeof parsed === 'object' &&
+      !Array.isArray(parsed) &&
+      Object.keys(parsed).length === 2 &&
+      parsed.version === 1 &&
+      Array.isArray(parsed.users),
+  };
   return users;
 }
 
@@ -214,7 +224,7 @@ async function writeUsers(users: UserRecord[]): Promise<void> {
     await fs.unlink(tmpPath).catch(() => {});
     throw err;
   }
-  cache = { users, ts: Date.now() };
+  cache = { users, ts: Date.now(), recoveryRecognized: true };
 }
 
 /**
@@ -468,6 +478,66 @@ export async function canUsernameRunPrivilegedCommands(username: string | undefi
   if (!isMultiUserMode() || !username) return true;
   const user = await findUser(username);
   return canRunPrivilegedCommands(user ?? { role: 'user' });
+}
+
+/** A recovery grant must remain current after its last asynchronous lookup. */
+export async function prepareRecoveryPrivilegeGrant(username: string | undefined): Promise<{
+  privileged: boolean;
+  isCurrent(): boolean;
+}> {
+  if (!isMultiUserMode()) return { privileged: true, isCurrent: () => !isMultiUserMode() };
+  if (!username) return { privileged: false, isCurrent: () => false };
+  const norm = normalizeUsername(username);
+  if (!isValidUsername(norm)) return { privileged: false, isCurrent: () => false };
+  const version = () => {
+    try {
+      const value = statSync(dataPath(USERS_FILE));
+      if (
+        !value.isFile() ||
+        !Number.isSafeInteger(value.size) ||
+        value.size < 0 ||
+        value.size > 2 * 1024 * 1024 ||
+        ![value.dev, value.ino, value.mtimeMs, value.ctimeMs].every(Number.isFinite)
+      )
+        return undefined;
+      return [value.dev, value.ino, value.size, value.mtimeMs, value.ctimeMs].join(':');
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : undefined;
+    }
+  };
+  const key = (users: UserRecord[]) => {
+    const matches = users.filter(
+      (user) => typeof user?.username === 'string' && normalizeUsername(user.username) === norm
+    );
+    const user = matches.length === 1 ? matches[0] : undefined;
+    if (
+      !user ||
+      user.username !== norm ||
+      !['admin', 'user'].includes(user.role) ||
+      (user.disabled !== undefined && typeof user.disabled !== 'boolean') ||
+      (user.canBypassPermissions !== undefined && typeof user.canBypassPermissions !== 'boolean')
+    )
+      return undefined;
+    return JSON.stringify([user.role, !!user.disabled, !!user.canBypassPermissions]);
+  };
+  const before = version();
+  if (before === undefined) return { privileged: false, isCurrent: () => false };
+  // Recovery uses a fresh lookup even when ordinary authentication's short cache is warm.
+  const users = await readUsers(true);
+  const after = version();
+  const permission = key(users);
+  const user = users.find((record) => record?.username === norm);
+  const authorized = before === after && !!cache?.recoveryRecognized && permission !== undefined && !user?.disabled;
+  return {
+    privileged: authorized && canRunPrivilegedCommands(user!),
+    isCurrent: () =>
+      authorized &&
+      isMultiUserMode() &&
+      after === version() &&
+      cache !== null &&
+      cache.recoveryRecognized &&
+      key(cache.users) === permission,
+  };
 }
 
 /**

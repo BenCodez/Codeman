@@ -24,7 +24,18 @@
  * @module state-store
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, copyFileSync } from 'node:fs';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  unlinkSync,
+  copyFileSync,
+  openSync,
+  closeSync,
+  fsyncSync,
+} from 'node:fs';
 import { writeFile, rename, unlink, copyFile, access } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -194,17 +205,83 @@ export class StateStore {
    * waits for it to complete then re-checks dirty flag before starting another.
    */
   async saveNowAsync(): Promise<void> {
-    if (this._saveInFlight) {
+    while (this._saveInFlight) {
       await this._saveInFlight;
       // After waiting, re-check if still dirty (the previous save may have handled it)
       if (!this.dirty) return;
     }
-    this._saveInFlight = this._doSaveAsync();
+    const writing = this._doSaveAsync();
+    this._saveInFlight = writing;
     try {
-      await this._saveInFlight;
+      await writing;
     } finally {
-      this._saveInFlight = null;
+      if (this._saveInFlight === writing) this._saveInFlight = null;
     }
+  }
+
+  /** Strict reboot commit: older writes settle first; memory/history changes only after durable replacement. */
+  async persistSessionDurably(
+    id: string,
+    session: AppState['sessions'][string] | (() => AppState['sessions'][string]),
+    isCurrent: () => boolean = () => true
+  ): Promise<void> {
+    while (this._saveInFlight) await this._saveInFlight;
+    if (!isCurrent()) throw new Error('Reboot restoration was cancelled before durable commit');
+    if (this.circuitBreakerOpen) throw new Error('State persistence circuit breaker is open');
+    this.ensureDir();
+    const previous = existsSync(this.filePath) ? readFileSync(this.filePath, 'utf8') : undefined;
+    if (previous !== undefined) {
+      const parsed = JSON.parse(previous);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('State file is malformed');
+    } // Preserve malformed/unreadable files.
+    const record = typeof session === 'function' ? session() : session;
+    const json = JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } });
+    const temporary = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.reboot.tmp`;
+    const write = (text: string) => {
+      const fd = openSync(temporary, 'wx', 0o600);
+      try {
+        writeFileSync(fd, text);
+        fsyncSync(fd);
+      } finally {
+        closeSync(fd);
+      }
+      renameSync(temporary, this.filePath);
+      const directory = openSync(dirname(this.filePath), 'r');
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+    };
+    this.saveDeb.cancel();
+    try {
+      if (!isCurrent()) throw new Error('Reboot restoration was cancelled before durable commit');
+      write(json);
+    } catch (error) {
+      // A failed directory acknowledgement may follow a successful rename.
+      // Restore the exact old bytes without publishing the tentative record in memory.
+      if (existsSync(this.filePath) && readFileSync(this.filePath, 'utf8') !== previous) {
+        try {
+          if (previous === undefined) unlinkSync(this.filePath);
+          else write(previous);
+        } catch {
+          // The durable offer still owns the original complete historical record.
+        }
+      }
+      this.dirty = true;
+      throw error;
+    } finally {
+      try {
+        unlinkSync(temporary);
+      } catch {
+        /* Already renamed or never created. */
+      }
+    }
+    this.state.sessions[id] = record;
+    this.cachedSessionJsons.clear();
+    this.dirtySessions.clear();
+    this.dirty = false;
+    this._resetCircuitBreaker();
   }
 
   /**

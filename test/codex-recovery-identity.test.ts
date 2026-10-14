@@ -224,6 +224,26 @@ describe('exact submitted-prompt history attribution', () => {
     expect(await resolveCodexIdentity(submitted())).toEqual({ reason: 'unverified' });
   });
 
+  it.each([1e308, 0, -1, Number.MAX_SAFE_INTEGER])(
+    'refuses unrelated history seconds %s whose converted timestamp is invalid',
+    async (ts) => {
+      await rollout();
+      const matching = { session_id: A, ts: SUBMITTED / 1000, text: PROMPT };
+      const unrelated = { session_id: A, ts, text: 'Unrelated sanitized history row' };
+      // Keep valid chronological order so timestamp conversion is the actual veto.
+      await history(ts > 0 ? [matching, unrelated] : [unrelated, matching]);
+      expect(await resolveCodexIdentity(submitted())).toEqual({ reason: 'unverified' });
+    }
+  );
+
+  it('keeps ordinary fractional-positive Unix seconds eligible without rounding the proof', async () => {
+    await rollout();
+    const seconds = (SUBMITTED + 0.125) / 1000;
+    expect(Number.isInteger(seconds * 1000)).toBe(false);
+    await history([{ session_id: A, ts: seconds, text: PROMPT }]);
+    expect(await resolveCodexIdentity(submitted())).toMatchObject({ reason: 'verified', conversationId: A });
+  });
+
   it('refuses missing, malformed or incomplete history after a known submission', async () => {
     await rollout();
     expect(await resolveCodexIdentity(submitted())).toEqual({ reason: 'unverified' });

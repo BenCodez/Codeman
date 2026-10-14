@@ -26,6 +26,7 @@ import { join } from 'node:path';
 import { dataPath, getDataDir } from '../../src/config/instance.js';
 import { writeCustomModelHosts, type CustomModelHost } from '../../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
+import { createUser, deleteUser, invalidateUsersCache } from '../../src/user-store.js';
 
 /** Set per test: whether the mocked `startInteractive()` rejects. */
 let startShouldThrow = false;
@@ -243,7 +244,7 @@ describe('a rebuild that succeeds', () => {
     // record with the reduced one.
     expect(ctx.reapplyPersistedSessionState).toHaveBeenCalled();
     const reapplyOrder = (ctx.reapplyPersistedSessionState as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
-    const persistOrder = (ctx.persistSessionState as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
+    const persistOrder = (ctx.persistRebootRestoreDurably as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0];
     expect(reapplyOrder).toBeLessThan(persistOrder);
     await app.close();
   });
@@ -583,74 +584,103 @@ describe('Codex reboot launch and cancellation', () => {
     expect(rebootRestoreRegistry.list(() => true)).toHaveLength(1);
     await app.close();
   });
-  it('re-derives a regular owner custom-model home from the current admin endpoint', async () => {
-    const previousMultiuser = process.env.CODEMAN_MULTIUSER;
-    const previousSpaces = process.env.CODEMAN_USER_SPACES_DIR;
-    const spaces = join(homedir(), 'regular-custom-model-spaces');
-    process.env.CODEMAN_MULTIUSER = '1';
-    process.env.CODEMAN_USER_SPACES_DIR = spaces;
-    const workspace = join(spaces, 'alice', 'cases', 'project');
-    mkdirSync(workspace, { recursive: true });
-    const endpoint: CustomModelHost = {
-      id: 'admin-endpoint',
-      label: 'admin endpoint',
-      baseUrl: 'http://127.0.0.1:8080',
-      apiKey: 'server-owned-secret',
-      models: ['custom-model'],
-    };
-    await writeCustomModelHosts(getDataDir(), [endpoint]);
+  it.each(['enabled', 'missing', 'deleted'] as const)(
+    'requires a current %s regular owner when re-deriving a custom-model home',
+    async (ownerStatus) => {
+      const previousMultiuser = process.env.CODEMAN_MULTIUSER;
+      const previousSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+      const spaces = join(homedir(), 'regular-custom-model-spaces');
+      process.env.CODEMAN_MULTIUSER = '1';
+      process.env.CODEMAN_USER_SPACES_DIR = spaces;
+      const workspace = join(spaces, 'alice', 'cases', 'project');
+      mkdirSync(workspace, { recursive: true });
+      const endpoint: CustomModelHost = {
+        id: 'admin-endpoint',
+        label: 'admin endpoint',
+        baseUrl: 'http://127.0.0.1:8080',
+        apiKey: 'server-owned-secret',
+        models: ['custom-model'],
+      };
+      await writeCustomModelHosts(getDataDir(), [endpoint]);
+      writeFileSync(dataPath('users.json'), JSON.stringify({ version: 1, users: [] }));
+      invalidateUsersCache();
+      if (ownerStatus !== 'missing') {
+        const owner = await createUser({ username: 'alice', role: 'user', password: 'fixture-password' });
+        expect(owner).toMatchObject({ role: 'user', disabled: false, canBypassPermissions: false });
+        if (ownerStatus === 'deleted') await deleteUser('alice');
+      }
 
-    const entry = codexOffer();
-    entry.owner = 'alice';
-    entry.workingDir = workspace;
-    entry.state.owner = 'alice';
-    entry.state.workingDir = workspace;
-    const trustedHome = customModelConfigDir(entry.sessionId);
-    (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = trustedHome;
-    mkdirSync(join(trustedHome, 'sessions'), { recursive: true });
-    writeFileSync(
-      join(trustedHome, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`),
-      JSON.stringify({
-        type: 'session_meta',
-        timestamp: '2026-10-13T15:00:00Z',
-        payload: { id: uuid, cwd: workspace, originator: 'codeman_codex-original' },
-      }) + '\n'
-    );
-    (entry.state as unknown as Record<string, unknown>).__customModel = {
-      endpointId: endpoint.id,
-      modelId: 'custom-model',
-      envKeys: ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'],
-      configDir: trustedHome,
-    };
-    (entry.state as unknown as Record<string, unknown>).__envOverrides = {
-      CODEX_HOME: join(homedir(), 'attacker-controlled-home'),
-      CODEMAN_CUSTOM_MODEL_API_KEY: 'attacker-secret',
-      CODEX_OTHER: 'keep',
-    };
-    rebootRestoreRegistry.set([entry]);
-    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
-    const app = await createHarness(ctx);
-    try {
-      const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json()
-        .data;
-      expect(result.restored.map((item: { id: string }) => item.id)).toEqual(['codex-original']);
-      expect(launchConfigs[0].envOverrides).toEqual({
+      const entry = codexOffer();
+      entry.owner = 'alice';
+      entry.workingDir = workspace;
+      entry.state.owner = 'alice';
+      entry.state.workingDir = workspace;
+      const trustedHome = customModelConfigDir(entry.sessionId);
+      (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = trustedHome;
+      mkdirSync(join(trustedHome, 'sessions'), { recursive: true });
+      writeFileSync(
+        join(trustedHome, 'sessions', `rollout-2026-10-13T15-00-00-${uuid}.jsonl`),
+        JSON.stringify({
+          type: 'session_meta',
+          timestamp: '2026-10-13T15:00:00Z',
+          payload: { id: uuid, cwd: workspace, originator: 'codeman_codex-original' },
+        }) + '\n'
+      );
+      (entry.state as unknown as Record<string, unknown>).__customModel = {
+        endpointId: endpoint.id,
+        modelId: 'custom-model',
+        envKeys: ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'],
+        configDir: trustedHome,
+      };
+      (entry.state as unknown as Record<string, unknown>).__envOverrides = {
+        CODEX_HOME: join(homedir(), 'attacker-controlled-home'),
+        CODEMAN_CUSTOM_MODEL_API_KEY: 'attacker-secret',
         CODEX_OTHER: 'keep',
-        CODEX_HOME: trustedHome,
-        CODEMAN_CUSTOM_MODEL_API_KEY: 'server-owned-secret',
-      });
-    } finally {
-      await app.close();
-      if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
-      else process.env.CODEMAN_MULTIUSER = previousMultiuser;
-      if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
-      else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
+      };
+      rebootRestoreRegistry.set([entry]);
+      const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+      const app = await createHarness(ctx);
+      try {
+        const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json()
+          .data;
+        if (ownerStatus === 'enabled') {
+          expect(result.restored.map((item: { id: string }) => item.id)).toEqual(['codex-original']);
+          expect(launchConfigs[0].envOverrides).toEqual({
+            CODEX_OTHER: 'keep',
+            CODEX_HOME: trustedHome,
+            CODEMAN_CUSTOM_MODEL_API_KEY: 'server-owned-secret',
+          });
+        } else {
+          expect(result.restored).toEqual([]);
+          expect(result.skipped).toEqual([{ sessionId: 'codex-original', reason: 'rebuild-failed' }]);
+          // Construction is tentative; the final launch guard refuses before dispatch.
+          expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith(
+            'codex-original',
+            expect.objectContaining({ codexRestoreWorkerMayExist: false }),
+            { preserveCustomModelConfigDir: true }
+          );
+          expect(ctx.sessions.has('codex-original')).toBe(false);
+          expect(rebootRestoreRegistry.list(() => true)).toEqual([entry]);
+          expect(ctx.persistRebootRestoreDurably).not.toHaveBeenCalled();
+        }
+      } finally {
+        await app.close();
+        rmSync(dataPath('users.json'), { force: true });
+        invalidateUsersCache();
+        if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+        if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+        else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
+      }
     }
-  });
+  );
   it('rejects a regular owner persisted CODEX_HOME when no current admin endpoint authorizes it', async () => {
     const previousMultiuser = process.env.CODEMAN_MULTIUSER;
     const previousSpaces = process.env.CODEMAN_USER_SPACES_DIR;
     const spaces = join(homedir(), 'untrusted-custom-model-spaces');
+    invalidateUsersCache();
+    const owner = await createUser({ username: 'alice', role: 'user', password: 'fixture-password' });
+    expect(owner).toMatchObject({ role: 'user', disabled: false, canBypassPermissions: false });
     process.env.CODEMAN_MULTIUSER = '1';
     process.env.CODEMAN_USER_SPACES_DIR = spaces;
     const workspace = join(spaces, 'alice', 'cases', 'project');
@@ -685,6 +715,8 @@ describe('Codex reboot launch and cancellation', () => {
       expect(launchConfigs).toEqual([]);
     } finally {
       await app.close();
+      rmSync(dataPath('users.json'), { force: true });
+      invalidateUsersCache();
       if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
       else process.env.CODEMAN_MULTIUSER = previousMultiuser;
       if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;

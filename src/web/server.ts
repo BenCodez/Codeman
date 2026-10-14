@@ -751,6 +751,7 @@ export class WebServer extends EventEmitter {
       sessions: this.sessions as ReadonlyMap<string, Session>,
       addSession: this.registerSessionWithLayout.bind(this),
       commitSessionRegistration: this.commitSessionRegistration.bind(this),
+      persistRebootRestoreDurably: this.persistRebootRestoreDurably.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
@@ -1321,6 +1322,22 @@ export class WebServer extends EventEmitter {
     // not-yet-created PTY. Its separate identity fence remains durable, while
     // the tentative constructor snapshot must never replace historical state.
     if (this.tentativeSessionRegistrations.has(session) || this.sessions.get(session.id) !== session) return;
+    this.store.setSession(session.id, this.buildPersistedSessionState(session));
+  }
+
+  private async persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void> {
+    const current = () =>
+      isCurrent() && this.sessions.get(session.id) === session && this.tentativeSessionRegistrations.has(session);
+    if (!current()) throw new Error('Reboot restoration was cancelled before durable commit');
+    await this.mux.flushSessionsDurably(current);
+    await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
+    if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
+    this.persistDeb.cancelKey(session.id);
+    this.commitSessionRegistration(session);
+  }
+
+  /** Private complete snapshot; tentative restorations can serialize without overwriting historical memory. */
+  private buildPersistedSessionState(session: Session): SessionState {
     // See session-manager.updateSessionState: __envOverrides is an internal disk-only
     // field kept off SessionState to avoid leaking via API broadcasts.
     const base = session.toState();
@@ -1370,7 +1387,7 @@ export class WebServer extends EventEmitter {
         state.respawnEnabled = false;
       }
     }
-    this.store.setSession(session.id, state);
+    return state;
   }
 
   private saveRespawnConfig(sessionId: string, config: RespawnConfig, durationMinutes?: number): void {
