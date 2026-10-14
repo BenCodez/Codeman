@@ -1,8 +1,11 @@
 /**
  * @fileoverview Behavioral authority tests for the Codex recovery adapter.
- * Sessions, rollout resolution, pane reads and owner clamps are fakes; no live IO.
+ * Sessions, pane reads and owner clamps are fakes; rollout reads use isolated fixture files or fakes.
  */
 import { createHash } from 'node:crypto';
+import fs from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Session } from '../src/session.js';
 import type { CodexConfig } from '../src/types/session.js';
@@ -23,6 +26,16 @@ const SESSION = '019a5aa0-aaaa-7aaa-8aaa-aaaaaaaaaaaa';
 const THREAD = '019a5aa0-1111-7111-8111-111111111111';
 const OTHER = '019a5aa0-2222-7222-8222-222222222222';
 const READY = '  Sanitized fixture result\n› \n  fixture-model default · /fixture/workspace\n';
+const CHILD_SPAWN = {
+  type: 'collab_agent_spawn_end',
+  call_id: 'fixture-spawn',
+  sender_thread_id: THREAD,
+  new_thread_id: OTHER,
+  prompt: 'Sanitized child fixture request.',
+  model: 'fixture-model',
+  reasoning_effort: 'low',
+  status: 'running',
+};
 const resolver = vi.mocked(resolveCodexIdentity);
 const configClamp = vi.mocked(clampExternalCliConfigsForOwner);
 const envClamp = vi.mocked(clampEnvOverridesForOwner);
@@ -33,10 +46,11 @@ function event(payload: Record<string, unknown>, at: number): string {
   return JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload });
 }
 
-function failedTail(): string {
+function failedTail(...during: string[]): string {
   return (
     [
       event({ type: 'task_started', turn_id: 'fixture-turn', model_context_window: null }, NOW - 10_000),
+      ...during,
       event(
         {
           type: 'task_complete',
@@ -85,6 +99,7 @@ function fixture() {
       reason: 'verified',
       conversationId: THREAD,
       tail: failedTail(),
+      tailTruncated: false,
       path: '/fixture/private-rollout.jsonl',
     } as CodexIdentityResult,
     env: undefined as Record<string, string> | undefined,
@@ -114,6 +129,47 @@ function fixture() {
   const adapter = new CodexRecoveryAdapter(session as unknown as Session, persist);
   resolver.mockImplementation(async () => structuredClone(state.identity));
   return Object.assign(state, { session, adapter, persist });
+}
+
+async function withRollout(
+  body: string,
+  check: (f: ReturnType<typeof fixture>, writeBody: (nextBody: string) => Promise<void>) => Promise<void>
+): Promise<void> {
+  const f = fixture();
+  const home = await fs.mkdtemp(join(homedir(), 'codex-adapter-rollout-'));
+  try {
+    f.context.codexHome = home;
+    f.session.workingDir = join(home, 'workspace');
+    const directory = join(home, 'sessions');
+    await fs.mkdir(directory);
+    const path = join(directory, `rollout-2026-10-13T12-00-00-${THREAD}.jsonl`);
+    const header = JSON.stringify({
+      timestamp: new Date(NOW - 60_000).toISOString(),
+      type: 'session_meta',
+      payload: { id: THREAD, cwd: f.session.workingDir, originator: `codeman_${SESSION}` },
+    });
+    const writeBody = async (nextBody: string): Promise<void> => {
+      await fs.writeFile(path, `${header}\n${nextBody}`);
+    };
+    await writeBody(body);
+    const actual = await vi.importActual<typeof import('../src/recovery/codex-identity.js')>(
+      '../src/recovery/codex-identity.js'
+    );
+    resolver.mockImplementation(actual.resolveCodexIdentity);
+    await check(f, writeBody);
+  } finally {
+    await fs.rm(home, { recursive: true, force: true });
+  }
+}
+
+function hiddenLiveChildTail(): string {
+  return (
+    event(CHILD_SPAWN, NOW - 20_000) +
+    '\n' +
+    JSON.stringify({ type: 'response_item', payload: { message: 'x'.repeat(300 * 1024) } }) +
+    '\n' +
+    failedTail()
+  );
 }
 
 function flight(observation: RecoveryObservation, action: RecoveryFlight['action'] = 'continue'): RecoveryFlight {
@@ -312,6 +368,19 @@ describe('ownership, location and isolated-launch gates', () => {
     expect(await noPane.adapter.observe()).toMatchObject({ reason: 'pane-unverified', safeToAct: false });
   });
 
+  it.each([true, undefined])('does not act or certify readiness with tailTruncated:%s', async (tailTruncated) => {
+    const f = fixture();
+    f.identity.tailTruncated = tailTruncated;
+    expect(await f.adapter.observe()).toMatchObject({
+      activity: 'interrupted',
+      safeToAct: false,
+      processReady: false,
+    });
+    f.pane = { dead: true, status: 1, screen: null };
+    expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', safeToAct: false });
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
   it('rechecks loss of ownership/isolation before spending an existing reservation', async () => {
     const f = fixture();
     const reservation = flight(await f.adapter.observe());
@@ -319,6 +388,175 @@ describe('ownership, location and isolated-launch gates', () => {
     expect(await f.adapter.act(reservation)).toBe('not-sent');
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
+});
+
+describe('bounded real rollout lifecycle evidence', () => {
+  const invalidLifecycleRows = [
+    { name: 'malformed JSON', row: '{broken-json}' },
+    {
+      name: 'unsupported lifecycle schema',
+      row: event({ type: 'task_complete', turn_id: { unsupported: 'fixture-turn' } }, NOW - 9_250),
+    },
+    {
+      name: 'unreadable control payload',
+      row: JSON.stringify({ timestamp: new Date(NOW - 9_250).toISOString(), type: 'event_msg', payload: null }),
+    },
+  ];
+
+  it.each(invalidLifecycleRows)('vetoes dead-pane restart with complete $name after a live child', async ({ row }) => {
+    await withRollout(failedTail(event(CHILD_SPAWN, NOW - 9_500), row), async (f) => {
+      const identity = await resolveCodexIdentity({
+        sessionId: SESSION,
+        workingDir: f.session.workingDir,
+        codexHome: f.context.codexHome,
+        noDaemon: true,
+      });
+      expect(identity).toMatchObject({ reason: 'verified', conversationId: THREAD, tailTruncated: false });
+      f.pane = { dead: true, status: 1, screen: null };
+      expect(await f.adapter.observe()).toMatchObject({ activity: 'unknown', safeToAct: false });
+      const unproved: RecoveryFlight = {
+        key: `${THREAD}:pane:${f.session.paneExit!.at}:1`,
+        action: 'restart',
+        conversationId: THREAD,
+        startedAt: NOW,
+      };
+      expect(await f.adapter.act(unproved)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(invalidLifecycleRows)('vetoes a restart reservation when final evidence has $name', async ({ row }) => {
+    await withRollout(failedTail(), async (f, writeBody) => {
+      f.pane = { dead: true, status: 1, screen: null };
+      const reservation = flight(await f.adapter.observe(), 'restart');
+      await writeBody(failedTail(event(CHILD_SPAWN, NOW - 9_500), row));
+      expect(await f.adapter.act(reservation)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    });
+  });
+
+  it('vetoes abnormal dead-pane restart while a complete rollout still has a pending child', async () => {
+    const body = failedTail(event(CHILD_SPAWN, NOW - 9_500));
+    expect(Buffer.byteLength(body)).toBeLessThan(256 * 1024);
+    await withRollout(body, async (f) => {
+      const identity = await resolveCodexIdentity({
+        sessionId: SESSION,
+        workingDir: f.session.workingDir,
+        codexHome: f.context.codexHome,
+        noDaemon: true,
+      });
+      expect(identity).toMatchObject({ reason: 'verified', conversationId: THREAD, tailTruncated: false });
+      expect(identity.tail).toContain('collab_agent_spawn_end');
+      f.pane = { dead: true, status: 1, screen: null };
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'watching',
+        reason: 'background-work',
+        safeToAct: false,
+      });
+      const unproved: RecoveryFlight = {
+        key: `${THREAD}:pane:${f.session.paneExit!.at}:1`,
+        action: 'restart',
+        conversationId: THREAD,
+        startedAt: NOW,
+      };
+      expect(await f.adapter.act(unproved)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    });
+  });
+
+  it('vetoes a dead-pane restart reservation when the final complete rollout reveals pending child work', async () => {
+    await withRollout(failedTail(), async (f, writeBody) => {
+      f.pane = { dead: true, status: 1, screen: null };
+      const reservation = flight(await f.adapter.observe(), 'restart');
+      await writeBody(failedTail() + event(CHILD_SPAWN, NOW - 8_500) + '\n');
+      expect(await f.adapter.act(reservation)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    });
+  });
+
+  it('keeps a verified dead pane without pending children eligible for restart', async () => {
+    await withRollout(failedTail(), async (f) => {
+      f.pane = { dead: true, status: 1, screen: null };
+      const observation = await f.adapter.observe();
+      expect(observation).toMatchObject({ activity: 'crashed', reason: 'process-crashed', safeToAct: true });
+      expect(await f.adapter.act(flight(observation, 'restart'))).toBe('sent');
+      expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+    });
+  });
+
+  it('keeps a hidden live child non-actionable after the 256KiB tail window loses its spawn', async () => {
+    const body = hiddenLiveChildTail();
+    expect(Buffer.byteLength(body)).toBeGreaterThan(256 * 1024);
+    await withRollout(body, async (f) => {
+      const identity = await resolveCodexIdentity({
+        sessionId: SESSION,
+        workingDir: f.session.workingDir,
+        codexHome: f.context.codexHome,
+        noDaemon: true,
+      });
+      expect(identity).toMatchObject({
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: failedTail(),
+        tailTruncated: true,
+      });
+      expect(identity.tail).not.toContain('collab_agent_spawn_end');
+      const observation = await f.adapter.observe();
+      expect(observation).toMatchObject({ activity: 'interrupted', safeToAct: false, processReady: false });
+      const unproved: RecoveryFlight = {
+        key: observation.evidenceKey!,
+        action: 'continue',
+        conversationId: THREAD,
+        startedAt: NOW,
+      };
+      expect(await f.adapter.act(unproved)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    });
+  });
+
+  it.each(['continue', 'restart'] as const)(
+    'reprobes the actual tail and vetoes %s if earlier child evidence has fallen outside the window',
+    async (action) => {
+      await withRollout(failedTail(), async (f, writeBody) => {
+        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null };
+        const reservation = flight(await f.adapter.observe(), action);
+        await writeBody(hiddenLiveChildTail());
+        expect(await f.adapter.act(reservation)).toBe('not-sent');
+        expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+      });
+    }
+  );
+
+  it.each(['continue', 'restart'] as const)(
+    'keeps a complete attributed child lifecycle eligible for %s once the child has completed',
+    async (action) => {
+      const body =
+        event(CHILD_SPAWN, NOW - 20_000) +
+        '\n' +
+        event(
+          {
+            type: 'collab_wait_end',
+            call_id: 'fixture-wait',
+            sender_thread_id: THREAD,
+            statuses: { [OTHER]: { completed: null } },
+          },
+          NOW - 19_000
+        ) +
+        '\n' +
+        failedTail();
+      await withRollout(body, async (f) => {
+        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null };
+        const observation = await f.adapter.observe();
+        expect(observation).toMatchObject({
+          activity: action === 'restart' ? 'crashed' : 'interrupted',
+          safeToAct: true,
+          ...(action === 'continue' ? { processReady: true } : {}),
+        });
+        expect(await f.adapter.act(flight(observation, action))).toBe('sent');
+        expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+      });
+    }
+  );
 });
 
 describe('human input invalidates the current epoch', () => {

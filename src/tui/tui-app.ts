@@ -57,6 +57,7 @@ import { composerScroll, composerStep, composerText, createComposer, type TuiCom
 import { formatAwayDigest } from './tui-digest.js';
 import {
   ATTACH_BANNER_MARKER,
+  isAttachSwitchBinding,
   TuiClient,
   type TuiSessionOptions,
   type TuiWindowSizing,
@@ -550,6 +551,9 @@ export async function beginAttachHandoff(
   cols?: number,
   rows?: number
 ): Promise<TuiAttachHandoff> {
+  // A killed older TUI may have left Alt jumps outside this tab set. Remove
+  // those before fencing: omitting an unsafe target must make it unreachable.
+  await client.clearLeakedAttachSwitchKeys();
   // Alt+1..9 can enter any of these panes after tmux owns stdin. Fence every
   // reachable Codex target before installing a single switch binding, including
   // the active target when the dashboard began on a non-Codex row.
@@ -611,7 +615,7 @@ export async function beginAttachHandoff(
     if (!tab.muxName) continue;
     const key = `M-${tab.index}`;
     const bound = await client.readPrefixBinding(key, 'root');
-    if (bound !== null && !bound.startsWith('switch-client')) continue;
+    if (bound !== null && !isAttachSwitchBinding(bound)) continue;
     if (await client.bindSwitchKey(key, tab.muxName)) switchKeys.push(key);
   }
   const bannerFor = (activeMux: string, ownLabel: string): Record<string, string> =>

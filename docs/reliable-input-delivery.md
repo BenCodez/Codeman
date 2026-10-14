@@ -45,12 +45,18 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
 
 ### Server
 
-- **`Session.shouldApplyInput(clientId, seq)`** — returns `true` exactly once per
-  `(clientId, seq)`: the first time a seq strictly greater than that client's
-  last-applied is seen. A replayed/lower seq returns `false`. Bounded MRU map
-  (`MAX_INPUT_DEDUP_CLIENTS = 256`).
+- **Session admission and commit** — `deferInputSeq` remembers received identities,
+  including frames rejected during recovery or named-key delivery, without moving
+  the applied watermark. `shouldApplyInput` admits only the earliest received
+  uncommitted identity for that client. A lock that clears halfway through a burst
+  therefore cannot let later frames overtake earlier retries. `commitInputSeq`
+  seals completed byte dispatch before submission listeners run; known unsent
+  failure releases admission while retaining its FIFO slot. Unknown partial sends
+  remain sealed so a retry cannot duplicate their effects. The owner bounds state
+  to 256 clients and 4096 received identities per client, refuses overflow with
+  feedback, and never evicts an undelivered identity.
 - **WS route** (`ws-routes.ts`) — parses optional `cid`/`seq` on `{t:'i'}`; applies
-  via `shouldApplyInput`. An applied frame is ACKed with `{t:'ia',seq}`; a duplicate is
+  via `shouldApplyInput`. Pending/blocked frames are not ACKed. An applied frame is ACKed with `{t:'ia',seq}`; a duplicate is
   ACKed as `{t:'ia',seq,dup:true,last:<watermark>}`, where `last` is the server's
   highest applied seq for that `clientId` (`Session.lastInputSeq`). The client drops
   an applied record; on `dup` it lifts its own counter to `last` first and
@@ -69,7 +75,11 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
   (the 200 is the client's ACK), with an `x-codeman-input-ack` header carrying
   `{seq,dup:true,last}` through the same client ACK handler. Headers avoid adding
   a body-read dependency to ordinary input delivery. `curl`/legacy callers omit
-  the fields and always apply.
+  the fields and always apply. Tagged known-unsent or still-pending deliveries
+  return 422; a 2xx never acknowledges those reservations. Both transports pass
+  the optional internal `SessionWriteOptions.inputSeq` identity to the write
+  boundary, so an exception after bytes land cannot reopen the identity or trigger
+  a fallback write.
 
 ## Oversized input (issue #484)
 

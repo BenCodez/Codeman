@@ -37,6 +37,50 @@ async function journal(data: unknown): Promise<void> {
 }
 
 describe('recovery journal durability', () => {
+  it('round-trips near byte capacity and preserves the last readable snapshot after an oversized save', async () => {
+    const maxBytes = 2 * 1024 * 1024;
+    const large = savedState({
+      handledEvidence: Array.from({ length: 32 }, (_, i) => `${i}:` + 'x'.repeat(246)),
+      history: Array.from({ length: 100 }, () => ({
+        at: NOW,
+        kind: 'state' as const,
+        reason: 'observing' as const,
+        attempt: 0,
+      })),
+      inFlight: {
+        key: 'flight',
+        action: 'continue',
+        conversationId: THREAD,
+        startedAt: NOW,
+        previousSubmissionKey: '😀'.repeat(50),
+      },
+    });
+    const records: Record<string, RecoveryState> = {};
+    const bytes = (sessions: Record<string, RecoveryState>) =>
+      Buffer.byteLength(JSON.stringify({ version: 1, sessions }), 'utf8');
+    let count = 0;
+    while (bytes({ ...records, [`session-${count}`]: large }) <= maxBytes) records[`session-${count++}`] = large;
+    expect(count).toBeLessThan(200);
+    expect(bytes(records)).toBeGreaterThan(maxBytes * 0.98);
+    await journal({ version: 1, sessions: records });
+    const store = new RecoveryStore(path);
+    expect(store.loadFailed).toBe(false);
+    const updated = { ...large, attempts: 1 };
+    await store.save('session-0', updated);
+    const previous = await fs.readFile(path, 'utf8');
+    expect(new RecoveryStore(path).get('session-0')).toEqual(updated);
+    expect(bytes({ ...records, extra: large })).toBeGreaterThan(maxBytes);
+    await expect(store.save('extra', large)).rejects.toThrow(/byte capacity/);
+    expect(await fs.readFile(path, 'utf8')).toBe(previous);
+    expect(store.get('extra')).toEqual(initialRecoveryState());
+    const reloaded = new RecoveryStore(path);
+    expect(reloaded.loadFailed).toBe(false);
+    expect(reloaded.get('session-0')).toEqual(updated);
+    expect(Object.keys(JSON.parse(previous).sessions)).toHaveLength(count);
+    await store.drop(`session-${count - 1}`);
+    await store.save('extra', large);
+    expect(new RecoveryStore(path).get('extra')).toEqual(large);
+  });
   it('starts disabled without a journal and does not create files during reads', async () => {
     const store = new RecoveryStore(path);
     expect(store.loadFailed).toBe(false);
@@ -231,6 +275,17 @@ describe('recovery journal durability', () => {
 });
 
 describe('corrupt journals fail closed', () => {
+  it.each(['{"version":1,"sessions":', ' '.repeat(2 * 1024 * 1024 + 1)])(
+    'refuses save and drop after a failed load without replacing unknown journal bytes',
+    async (bytes) => {
+      await journal(bytes);
+      const store = new RecoveryStore(path);
+      expect(store.loadFailed).toBe(true);
+      await expect(store.save('work', savedState())).rejects.toThrow(/could not be loaded/);
+      await expect(store.drop('work')).rejects.toThrow(/could not be loaded/);
+      expect(await fs.readFile(path, 'utf8')).toBe(bytes);
+    }
+  );
   it.each([
     ['truncated JSON', '{"version":1,"sessions":'],
     ['unknown document version', { version: 2, sessions: {} }],

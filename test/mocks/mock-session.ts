@@ -4,7 +4,12 @@
  */
 import { EventEmitter } from 'node:events';
 import { vi } from 'vitest';
-import type { SessionAttachmentHistoryItem, SessionStatus, SessionRemote } from '../../src/types.js';
+import type {
+  SessionAttachmentHistoryItem,
+  SessionStatus,
+  SessionRemote,
+  SessionWriteOptions,
+} from '../../src/types.js';
 
 /**
  * Enhanced mock session for testing RespawnController.
@@ -106,16 +111,18 @@ export class MockSession extends EventEmitter {
   recoveryInputReserved = false;
 
   /** Direct PTY write (used by session.write()). Mirrors the real boolean return. */
-  write(data: string): boolean {
+  write(data: string, options: SessionWriteOptions = {}): boolean {
     if (this.failWrites || this.recoveryInputReserved) return false;
     this.writeBuffer.push(data);
+    if (options.inputSeq) this.commitInputSeq(options.inputSeq.clientId, options.inputSeq.seq);
     return true;
   }
 
   /** Write via mux (used by respawn controller) */
-  async writeViaMux(data: string): Promise<boolean> {
+  async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
     if (this.failWrites || this.recoveryInputReserved) return false;
     this.writeBuffer.push(data);
+    if (options.inputSeq) this.commitInputSeq(options.inputSeq.clientId, options.inputSeq.seq);
     return true;
   }
 
@@ -129,15 +136,44 @@ export class MockSession extends EventEmitter {
 
   /** Exactly-once input dedup — mirrors Session.shouldApplyInput so route tests
    *  exercising the reliable-delivery path behave like production. */
-  private _appliedInputSeq = new Map<string, number>();
-  forgetInputSeq(clientId: string, seq: number): void {
-    if (this._appliedInputSeq.get(clientId) === seq) this._appliedInputSeq.set(clientId, seq - 1);
+  private _appliedInputSeq = new Map<string, { last?: number; pending: Set<number>; waiting: Set<number> }>();
+  lastInputSeq(clientId: string): number {
+    return this._appliedInputSeq.get(clientId)?.last ?? 0;
+  }
+  /** Distinguish the valid zero sequence from a client with no delivery. */
+  hasAppliedInputSeq(clientId: string, seq: number): boolean {
+    const state = this._appliedInputSeq.get(clientId);
+    return state?.last !== undefined && seq <= state.last && !state.waiting.has(seq);
   }
 
+  forgetInputSeq(clientId: string, seq: number): void {
+    this._appliedInputSeq.get(clientId)?.pending.delete(seq);
+  }
+  commitInputSeq(clientId: string, seq: number): void {
+    const state = this._appliedInputSeq.get(clientId);
+    if (state?.pending.delete(seq)) {
+      state.last = Math.max(state.last ?? seq, seq);
+      state.waiting.delete(seq);
+    }
+  }
+  deferInputSeq(clientId: string, seq: number): boolean {
+    const state = this._appliedInputSeq.get(clientId) ?? {
+      last: undefined,
+      pending: new Set<number>(),
+      waiting: new Set<number>(),
+    };
+    if (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq)) return true;
+    if (state.waiting.size >= 4096) return false;
+    state.waiting.add(seq);
+    this._appliedInputSeq.set(clientId, state);
+    return true;
+  }
   shouldApplyInput(clientId: string, seq: number): boolean {
-    const last = this._appliedInputSeq.get(clientId);
-    if (last !== undefined && seq <= last) return false;
-    this._appliedInputSeq.set(clientId, seq);
+    if (!this.deferInputSeq(clientId, seq)) return false;
+    const state = this._appliedInputSeq.get(clientId)!;
+    if (this.hasAppliedInputSeq(clientId, seq) || state.pending.size || seq !== Math.min(...state.waiting))
+      return false;
+    state.pending.add(seq);
     return true;
   }
 

@@ -8,6 +8,8 @@ import { dataPath } from '../config/instance.js';
 import { RecoveryConfigSchema } from './schema.js';
 import { initialRecoveryState, type RecoveryState } from './types.js';
 
+const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
+
 const ReasonSchema = z.enum([
   'disabled',
   'observing',
@@ -105,7 +107,8 @@ export class RecoveryStore {
     try {
       if (existsSync(path)) {
         const info = lstatSync(path);
-        if (!info.isFile() || info.isSymbolicLink() || info.size > 2 * 1024 * 1024) throw new Error('Invalid journal');
+        if (!info.isFile() || info.isSymbolicLink() || info.size > MAX_JOURNAL_BYTES)
+          throw new Error('Invalid journal');
         const data = JSON.parse(readFileSync(path, 'utf8'));
         const parsed = z
           .object({ version: z.literal(1), sessions: z.record(z.string().regex(/^[\w-]{1,100}$/), StateSchema) })
@@ -133,6 +136,7 @@ export class RecoveryStore {
   }
 
   save(id: string, state: RecoveryState): Promise<void> {
+    if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
     if (!/^[\w-]{1,100}$/.test(id)) return Promise.reject(new Error('Invalid session identity'));
     StateSchema.parse(state);
     const copy = structuredClone(state);
@@ -147,6 +151,7 @@ export class RecoveryStore {
   }
 
   drop(id: string): Promise<void> {
+    if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
     const result = this.writes.then(async () => {
       if (!this.records[id]) return;
       const next = { ...this.records };
@@ -159,12 +164,15 @@ export class RecoveryStore {
   }
 
   private async write(records: Record<string, RecoveryState>): Promise<void> {
+    const payload = JSON.stringify({ version: 1, sessions: records });
+    if (Buffer.byteLength(payload, 'utf8') > MAX_JOURNAL_BYTES)
+      throw new Error('Recovery journal is over byte capacity');
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${randomUUID()}.tmp`;
     try {
       const handle = await open(temp, 'wx', 0o600);
       try {
-        await handle.writeFile(JSON.stringify({ version: 1, sessions: records }));
+        await handle.writeFile(payload);
         await handle.sync();
       } finally {
         await handle.close();

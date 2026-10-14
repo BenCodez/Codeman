@@ -12,6 +12,7 @@ import { planVerifiedRebootRestore, verifyCodexRebootIdentity } from '../../src/
 import { hashCodexPrompt, resolveCodexIdentity } from '../../src/recovery/codex-identity.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../src/recovery/reboot-identity-fence.js';
 import { Session } from '../../src/session.js';
+import { TmuxManager } from '../../src/tmux-manager.js';
 import type { StateStore } from '../../src/state-store.js';
 import type { SessionState } from '../../src/types.js';
 import { createUser, invalidateUsersCache } from '../../src/user-store.js';
@@ -39,6 +40,7 @@ async function closeServer(server: WebServer): Promise<void> {
 async function harness() {
   // Do not listen or run boot/background services. The route context is the
   // real server's, including listener setup, reapply, discard and persistence.
+  vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
   const server = new WebServer(0, false, true);
   servers.push(server);
   const ctx = Reflect.get(server, 'createRouteContext').call(server) as Parameters<
@@ -101,6 +103,128 @@ afterEach(async () => {
 });
 
 describe('durable Codex reboot completion', () => {
+  it.each(
+    (['failed', 'cancelled'] as const).flatMap((outcome) =>
+      (['programmatic', 'user', 'direct-attach'] as const).map((input) => ({ outcome, input }))
+    )
+  )('preserves the historical record through $input input during a $outcome launch', async ({ outcome, input }) => {
+    const inputIndex = ['programmatic', 'user', 'direct-attach'].indexOf(input) + 1;
+    const { state } = fixture(
+      `${outcome === 'failed' ? '11111111' : '22222222'}-0000-0000-0000-00000000000${inputIndex}`
+    );
+    Object.assign(state, {
+      pinned: true,
+      pinnedAt: 456,
+      inputTokens: 234,
+      outputTokens: 123,
+      totalCost: 12,
+    });
+    state.codexConfig!.resumeSessionId = UUID;
+    writeRebootIdentityFence(state.id, { switchPending: false, resumeSessionId: UUID });
+    await offer(state);
+    const { server, app, store } = await harness();
+    store.setSession(state.id, state);
+    store.flush();
+    const persisted = () => JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[state.id];
+    const originalSnapshot = persisted();
+
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let launching: Session | undefined;
+    vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(async function () {
+      launching = this;
+      await barrier;
+      if (outcome === 'failed') throw new Error('fixture launch failed');
+    });
+    const restore = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+    try {
+      await vi.waitFor(() => expect(launching).toBeDefined());
+      expect(sessionMap(server).get(state.id)).toBe(launching);
+      if (input === 'direct-attach') launching!.fenceUntrackedInput();
+      else expect(launching!.write('queued launch input\r', { fromUser: input === 'user' })).toBe(false);
+      // Exercise the debounced writer too, beyond its ordinary 100ms window.
+      Reflect.get(server, 'persistSessionState').call(server, launching);
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      store.flush();
+      expect(store.getSession(state.id)).toEqual(state);
+      expect(persisted()).toEqual(originalSnapshot);
+      expect(readRebootIdentityFence(state.id)).toMatchObject({
+        switchPending: true,
+        ...(input === 'direct-attach' ? { untrackedInput: true } : {}),
+      });
+      if (outcome === 'cancelled') {
+        const dismiss = await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });
+        expect(dismiss.statusCode).toBe(200);
+      }
+    } finally {
+      release();
+    }
+    const result = (await restore).json();
+    expect(result.restored).toEqual([]);
+    expect(result.skipped).toEqual([
+      { sessionId: state.id, reason: outcome === 'failed' ? 'rebuild-failed' : 'restore-cancelled' },
+    ]);
+    expect(sessionMap(server).has(state.id)).toBe(false);
+    store.flush();
+    expect(store.getSession(state.id)).toEqual(state);
+    expect(persisted()).toEqual(originalSnapshot);
+    expect(rebootRestoreRegistry.list(() => true)).toHaveLength(outcome === 'failed' ? 1 : 0);
+    // Retaining the offer does not authorize a retry through newly tainted identity.
+    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+  });
+
+  it('commits restored totals on success and persists later current-session input', async () => {
+    const { state } = fixture('33333333-0000-0000-0000-000000000000');
+    Object.assign(state, { pinned: true, pinnedAt: 456, inputTokens: 234, outputTokens: 123, totalCost: 12 });
+    state.codexConfig!.resumeSessionId = UUID;
+    await offer(state);
+    const { server, app, store } = await harness();
+    store.setSession(state.id, state);
+    store.flush();
+    const originalStart = Session.prototype.startInteractive;
+    let release!: () => void;
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let launching: Session | undefined;
+    vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(async function (...args) {
+      launching = this;
+      await barrier;
+      await originalStart.apply(this, args);
+    });
+    const restore = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+    try {
+      await vi.waitFor(() => expect(launching).toBeDefined());
+      expect(launching!.write('unsent startup prompt\r', { fromUser: true })).toBe(false);
+      expect(store.getSession(state.id)).toEqual(state);
+    } finally {
+      release();
+    }
+    expect((await restore).json().restored).toHaveLength(1);
+    await vi.waitFor(() => expect(store.getSession(state.id)?.pid).not.toBe(1234));
+    expect(store.getSession(state.id)).toMatchObject({
+      pinned: true,
+      pinnedAt: 456,
+      inputTokens: 234,
+      outputTokens: 123,
+      totalCost: 12,
+    });
+    expect(readRebootIdentityFence(state.id)).toMatchObject({ switchPending: true });
+    const session = sessionMap(server).get(state.id)!;
+    session.restoreTokens(235, 124, 13);
+    expect(session.write('Current exact prompt\r', { fromUser: true })).toBe(true);
+    expect(store.getSession(state.id)).toMatchObject({ inputTokens: 235, outputTokens: 124, totalCost: 13 });
+    expect(store.getSession(state.id)?.lastSubmitAt).toBeGreaterThan(0);
+    expect(readRebootIdentityFence(state.id)).toMatchObject({
+      switchPending: false,
+      submission: { hash: hashCodexPrompt('Current exact prompt') },
+    });
+    store.flush();
+    expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[state.id].inputTokens).toBe(235);
+  });
+
   it('restores twice after the consumed submission ages out of bounded history', async () => {
     const { state, home } = fixture('aaaaaaaa-1111-2222-3333-444444444444');
     const prompt = 'Original exact task before the first reboot';

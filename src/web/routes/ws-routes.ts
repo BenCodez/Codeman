@@ -36,7 +36,6 @@ import { FastifyInstance } from 'fastify';
 import type { WebSocket } from 'ws';
 import type { SessionPort } from '../ports/session-port.js';
 import { MAX_INPUT_LENGTH } from '../../config/terminal-limits.js';
-import { RebootIdentityFenceError } from '../../recovery/reboot-identity-fence.js';
 import { isAllowedRequestHost, isAllowedRequestOrigin, type HostPolicy } from '../network-auth-policy.js';
 import { WsConnectionRegistry } from '../ws-connection-registry.js';
 import { canAccessOwned, getAuthUser } from '../route-helpers.js';
@@ -192,6 +191,13 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             // (legacy/other tools) are applied as-is — no behavior change.
             const cid = typeof msg.cid === 'string' ? msg.cid : null;
             const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
+            if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
+              if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
+              return;
+            }
+            // A rejected frame must not claim a delivery identity. Otherwise a
+            // burst during recovery can manufacture a watermark for lost bytes.
+            if (session.recoveryInputReserved) return;
             const apply = cid && seq !== null ? session.shouldApplyInput(cid, seq) : true;
             let delivered = true;
             if (apply) {
@@ -200,16 +206,20 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               if (holdsDesktopClaim) session.noteDesktopActivity();
               // Browser keystrokes are the user's own, so they may name the tab.
               try {
-                delivered = session.write(msg.d, { fromUser: true });
-              } catch (error) {
-                if (error instanceof RebootIdentityFenceError && cid && seq !== null) session.forgetInputSeq(cid, seq);
-                throw error;
+                delivered = session.write(msg.d, {
+                  fromUser: true,
+                  ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
+                });
+              } catch (err) {
+                if (cid && seq !== null) session.forgetInputSeq(cid, seq);
+                throw err;
               }
               // A session whose PTY is gone swallows the write. ACKing anyway told
               // the client to drop the frame from its durable queue and left the seq
               // burnt, so the retry that reliable delivery exists for was rejected as
               // a duplicate: the input was lost for good.
               if (!delivered && cid && seq !== null) session.forgetInputSeq(cid, seq);
+              if (delivered && cid && seq !== null) session.commitInputSeq(cid, seq);
             }
             if (seq !== null && socket.readyState === 1) {
               if (apply) {
@@ -234,6 +244,9 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
                   typeof (session as { lastInputSeq?: (c: string) => number }).lastInputSeq === 'function'
                     ? (session as { lastInputSeq: (c: string) => number }).lastInputSeq(cid as string)
                     : seq;
+                // A matching request is still in flight (or admission is full),
+                // so neither a success nor duplicate ACK can certify delivery.
+                if (cid && !session.hasAppliedInputSeq(cid, seq)) return;
                 socket.send(`{"t":"ia","seq":${seq},"dup":true,"last":${watermark}}`);
               }
             }

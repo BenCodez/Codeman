@@ -365,6 +365,9 @@ export class WebServer extends EventEmitter {
   // Active plan orchestrators (for cancellation via API)
   private activePlanOrchestrators: Map<string, PlanOrchestrator> = new Map();
   private persistDeb = new KeyedDebouncer(100);
+  // Historical state belongs to disk until a rebuilt session commits. Weak
+  // instance ownership also fences late callbacks after discard/replacement.
+  private tentativeSessionRegistrations = new WeakSet<Session>();
   // Stored listener handlers for cleanup
   private subagentWatcherHandlers: {
     discovered: (info: SubagentInfo) => void;
@@ -718,15 +721,22 @@ export class WebServer extends EventEmitter {
     }
   }
 
-  /** Add a tentative session only after its owner layout accepts the creation. */
-  private async registerSessionWithLayout(session: Session): Promise<void> {
+  /** Register with the owner layout, deferring historical writes for tentative rebuilds. */
+  private async registerSessionWithLayout(session: Session, options?: { tentative?: boolean }): Promise<void> {
+    if (options?.tentative) this.tentativeSessionRegistrations.add(session);
     this.sessions.set(session.id, session);
     try {
       await this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner));
     } catch (error) {
-      this.sessions.delete(session.id);
+      if (this.sessions.get(session.id) === session) this.sessions.delete(session.id);
       throw error;
     }
+  }
+
+  /** End restore preparation only once every awaited finalization has succeeded. */
+  private commitSessionRegistration(session: Session): void {
+    if (this.sessions.get(session.id) !== session) throw new Error('Tentative session was replaced before commit');
+    this.tentativeSessionRegistrations.delete(session);
   }
 
   /**
@@ -740,6 +750,7 @@ export class WebServer extends EventEmitter {
       // SessionPort
       sessions: this.sessions as ReadonlyMap<string, Session>,
       addSession: this.registerSessionWithLayout.bind(this),
+      commitSessionRegistration: this.commitSessionRegistration.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
@@ -1274,9 +1285,10 @@ export class WebServer extends EventEmitter {
 
   /** Debounced wrapper — coalesces rapid persistSessionState calls per session */
   private persistSessionState(session: Session): void {
+    if (this.tentativeSessionRegistrations.has(session)) return;
     this.persistDeb.schedule(session.id, () => {
       // Session may have been removed during debounce
-      if (this.sessions.has(session.id)) {
+      if (this.sessions.get(session.id) === session) {
         this._persistSessionStateNow(session);
       }
     });
@@ -1305,6 +1317,10 @@ export class WebServer extends EventEmitter {
 
   /** Persists full session state including respawn config to state.json */
   private _persistSessionStateNow(session: Session): void {
+    // Recovery input persists synchronously, before dispatch can fail for a
+    // not-yet-created PTY. Its separate identity fence remains durable, while
+    // the tentative constructor snapshot must never replace historical state.
+    if (this.tentativeSessionRegistrations.has(session) || this.sessions.get(session.id) !== session) return;
     // See session-manager.updateSessionState: __envOverrides is an internal disk-only
     // field kept off SessionState to avoid leaking via API broadcasts.
     const base = session.toState();
@@ -2391,10 +2407,14 @@ export class WebServer extends EventEmitter {
   private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
     const controller = this.recoveryControllers.get(id);
     const listener = this.recoveryInputListeners.get(id);
-    if (listener) {
-      this.sessions.get(id)?.off('recoveryUserInput', listener);
-    }
     const identityListener = this.rebootIdentityListeners.get(id);
+    const mode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
+    const ownsRecoveryState =
+      !!controller ||
+      !!listener ||
+      !!identityListener ||
+      (mode !== undefined && getCli(mode)?.capabilities.recovery === 'codex-rollout');
+    if (listener) this.sessions.get(id)?.off('recoveryUserInput', listener);
     if (identityListener) this.sessions.get(id)?.off('recoveryIdentityChanged', identityListener);
     this.rebootIdentityListeners.delete(id);
     this.recoveryInputListeners.delete(id);
@@ -2403,7 +2423,7 @@ export class WebServer extends EventEmitter {
       await controller.drain();
       this.recoveryControllers.delete(id);
     }
-    if (drop) await this.recoveryStore.drop(id);
+    if (drop && ownsRecoveryState) await this.recoveryStore.drop(id);
   }
 
   /**

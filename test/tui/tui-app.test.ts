@@ -130,6 +130,7 @@ describe('direct attach recovery fence', () => {
     const fenceDirectAttach = vi.fn(async () => {});
     const bindSwitchKey = vi.fn(async () => true);
     const client = {
+      clearLeakedAttachSwitchKeys: vi.fn(async () => {}),
       fenceDirectAttach,
       readPrefixKey: vi.fn(async () => null),
       readDetachKey: vi.fn(async () => null),
@@ -169,6 +170,7 @@ describe('direct attach recovery fence', () => {
   it('omits unfenced or unidentified Codex jumps without blocking an initial Claude attach', async () => {
     const bindSwitchKey = vi.fn(async () => true);
     const client = {
+      clearLeakedAttachSwitchKeys: vi.fn(async () => {}),
       fenceDirectAttach: vi.fn(async () => {
         throw new Error('server unavailable');
       }),

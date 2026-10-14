@@ -77,13 +77,26 @@ export class CodexRecoveryAdapter {
         pane.signal === exit.signal &&
         ((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0)
       ) {
-        observation = {
-          activity: 'crashed',
-          reason: 'process-crashed',
-          at: exit.at,
-          evidenceKey: `${identity.conversationId}:pane:${exit.at}:${pane.status ?? pane.signal}`,
-          safeToAct: context.intentionalStopAt < exit.at - 2000,
-        };
+        // A confirmed parent exit does not establish that its spawned children have finished.
+        const childWork = classifyCodexTail(identity.tail, {
+          conversationId: identity.conversationId,
+          now: Date.now(),
+          screen: '',
+          busy: false,
+          watching: !!session.watching,
+          tailTruncated: identity.tailTruncated,
+          lastIntentionalStopAt: context.intentionalStopAt,
+        });
+        observation =
+          childWork.reason === 'background-work' || childWork.activity === 'unknown'
+            ? childWork
+            : {
+                activity: 'crashed',
+                reason: 'process-crashed',
+                at: exit.at,
+                evidenceKey: `${identity.conversationId}:pane:${exit.at}:${pane.status ?? pane.signal}`,
+                safeToAct: context.intentionalStopAt < exit.at - 2000,
+              };
       } else observation = unknown('pane-unverified');
     } else {
       observation = classifyCodexTail(identity.tail, {
@@ -92,14 +105,18 @@ export class CodexRecoveryAdapter {
         screen: pane.screen,
         busy: session.isBusy(),
         watching: !!session.watching,
+        tailTruncated: identity.tailTruncated,
         lastIntentionalStopAt: context.intentionalStopAt,
       });
       observation.processReady =
+        identity.tailTruncated === false &&
         pane.screen !== null &&
         hasEmptyCodexComposer(pane.screen) &&
         !['blocked', 'paused', 'unknown'].includes(observation.activity);
     }
     observation.conversationId = identity.conversationId;
+    // A bounded suffix can hide an earlier still-live child, including after the parent process exits.
+    observation.safeToAct = observation.safeToAct && identity.tailTruncated === false;
     if (observation.safeToAct && observation.evidenceKey) {
       this.proof = {
         key: observation.evidenceKey,
