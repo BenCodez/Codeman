@@ -103,7 +103,10 @@ function fixture() {
       intentionalStopAt: 0,
       switchPending: false,
       codexHome: '/fixture/codex-home' as string | undefined,
-      submission: undefined as RecoverySubmission | undefined,
+      submission: {
+        at: NOW - 10_000,
+        hash: createHash('sha256').update('Sanitized fixture request.').digest('hex'),
+      } as RecoverySubmission | undefined,
     },
     pane: { paneId: '%7', panePid: 700, dead: false, screen: READY } as Pane | null,
     transportPane: { dead: true, status: 255, screen: null } as Pane | null,
@@ -302,6 +305,14 @@ async function withRollout(
     const writeBody = async (nextBody: string): Promise<void> => {
       await fs.writeFile(path, `${header}\n${nextBody}`);
     };
+    await fs.writeFile(
+      join(home, 'history.jsonl'),
+      JSON.stringify({
+        session_id: THREAD,
+        ts: f.context.submission!.at / 1000,
+        text: 'Sanitized fixture request.',
+      }) + '\n'
+    );
     await writeBody(body);
     const actual = await vi.importActual<typeof import('../src/recovery/codex-identity.js')>(
       '../src/recovery/codex-identity.js'
@@ -336,6 +347,33 @@ function flight(observation: RecoveryObservation, action: RecoveryFlight['action
 }
 
 describe('exact current identity and delivery proof', () => {
+  it.each([false, true])(
+    'refuses seed-only automatic authority and clears previous evidence (%s)',
+    async (previous) => {
+      const f = fixture();
+      let reserved: RecoveryFlight = {
+        key: `${THREAD}:seed`,
+        action: 'continue',
+        conversationId: THREAD,
+        startedAt: NOW,
+      };
+      if (previous) {
+        reserved = flight(await f.adapter.observe());
+        expect(f.adapter.getVerifiedTail(THREAD)).toBe(f.identity.tail);
+      }
+      f.context.submission = undefined;
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'unknown',
+        reason: 'identity-unverified',
+        safeToAct: false,
+      });
+      expect(f.adapter.getVerifiedTail(THREAD)).toBeUndefined();
+      expect(await f.adapter.act(reserved)).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+      expect(f.session.pinRecoveryConversation).not.toHaveBeenCalled();
+    }
+  );
+
   it('passes the session-specific home, exact resume seed and exact prompt hash to the resolver', async () => {
     const f = fixture();
     f.context.submission = {
@@ -1118,6 +1156,7 @@ describe('authoritative agent exits and process readiness', () => {
     { label: 'unchanged progress', progressAge: undefined },
   ])('revalidates $label after a stall restart is durably reserved', async ({ progressAge }) => {
     const f = fixture();
+    f.context.submission!.at = NOW - 60_000;
     const root = await fs.mkdtemp(join(homedir(), 'codex-stall-delivery-'));
     const directory = join(root, 'sessions', '2026', '10', '13');
     const rollout = join(directory, `rollout-2026-10-13T11-59-00-${THREAD}.jsonl`);
@@ -1135,7 +1174,14 @@ describe('authoritative agent exits and process readiness', () => {
         payload: { id: THREAD, cwd: f.session.workingDir, originator: `codeman_${SESSION}` },
       }) +
         '\n' +
+        event({ type: 'user_message', message: 'Sanitized fixture request.' }, f.context.submission!.at) +
+        '\n' +
         activeTail()
+    );
+    await fs.writeFile(
+      join(root, 'history.jsonl'),
+      JSON.stringify({ session_id: THREAD, ts: f.context.submission!.at / 1000, text: 'Sanitized fixture request.' }) +
+        '\n'
     );
     const actualIdentity = await vi.importActual<typeof import('../src/recovery/codex-identity.js')>(
       '../src/recovery/codex-identity.js'
@@ -1278,6 +1324,52 @@ describe('owned remote evidence and mutation', () => {
     } as Session['remote'];
     return f;
   }
+
+  it.each(['authorized', 'issuer-refused', 'issuer-refused-after-clock', 'owner-changed', 'grant-changed'] as const)(
+    'revalidates the local issuer at queued SSH dispatch boundaries: %s',
+    async (kind) => {
+      const f = remoteFixture();
+      const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+      evidence.pane = { dead: false, paneId: '%7', panePid: 700, screen: READY };
+      evidence.identity = {
+        reason: 'verified',
+        conversationId: THREAD,
+        tail: completedTail(),
+        tailTruncated: false,
+        changedAt: NOW - 1000,
+      };
+      expect((await f.adapter.observe()).processReady).toBe(true);
+      let ownerCurrent = true;
+      let prepareCount = 0;
+      f.session.isRemoteRecoveryAuthorityCurrent.mockImplementation((...args: unknown[]) =>
+        (args[2] as () => boolean)()
+      );
+      const prepare = vi.fn(async () => {
+        await Promise.resolve();
+        prepareCount++;
+        if (kind === 'owner-changed') ownerCurrent = false;
+        if (kind === 'grant-changed') f.session.isRemoteRecoveryAuthorityCurrent.mockReturnValue(false);
+        return kind !== 'issuer-refused' && !(kind === 'issuer-refused-after-clock' && prepareCount === 2);
+      });
+      const authority = Object.assign(() => ownerCurrent, { prepareEvidence: prepare });
+      const remoteEffect = vi.fn();
+      vi.mocked(f.deps.deliverRemote).mockImplementation(async (_remote, _request, token) => {
+        if (!token || typeof token === 'function')
+          throw new Error('Expected split asynchronous and synchronous authority');
+        // The real remote mutation runner checks after queue admission, then samples the clock and checks again.
+        if (!(await token.check()) || !token.isCurrent()) return { status: 'not-sent' };
+        await Promise.resolve();
+        if (!(await token.check()) || !token.isCurrent()) return { status: 'not-sent' };
+        remoteEffect();
+        return { status: 'sent', submittedAt: NOW };
+      });
+      const result = await f.adapter.deliverRemotePrompt(THREAD, f.context.generation, 'Authorized task', authority);
+      expect(result).toBe(kind === 'authorized' ? 'sent' : 'not-sent');
+      expect(prepare).toHaveBeenCalledTimes(['authorized', 'issuer-refused-after-clock'].includes(kind) ? 2 : 1);
+      for (const call of prepare.mock.calls) expect(call).toEqual([]);
+      expect(remoteEffect).toHaveBeenCalledTimes(kind === 'authorized' ? 1 : 0);
+    }
+  );
 
   it.each([
     'unchanged',
@@ -1659,10 +1751,7 @@ describe('owned remote evidence and mutation', () => {
     const f = remoteFixture();
     f.context.submission = undefined;
     expect(await f.adapter.observe()).toMatchObject({ reason: 'identity-unverified', safeToAct: false });
-    expect(f.deps.inspectRemote).toHaveBeenCalledExactlyOnceWith(
-      f.session.remote,
-      expect.objectContaining({ submission: undefined, resumeId: THREAD })
-    );
+    expect(f.deps.inspectRemote).not.toHaveBeenCalled();
   });
 
   it('reattaches a healthy remote worker before delivering without restarting its pane', async () => {

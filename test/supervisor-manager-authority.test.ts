@@ -1,6 +1,7 @@
 /** Real WebServer, manager Task and worker controllers; only native observations/effects are fixtures. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFile, writeFile, mkdtemp, rm, rename } from 'node:fs/promises';
+import fs from 'node:fs/promises';
 import { lstatSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -12,7 +13,7 @@ import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 import { WebServer } from '../src/web/server.js';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
-import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
+import type { MuxSession, RecoveryMuxDispatchGuard, TerminalMultiplexer } from '../src/mux-interface.js';
 import { TaskController, type TaskDependencies } from '../src/supervision/controller.js';
 import type { TaskState } from '../src/supervision/schema.js';
 import { TaskStore } from '../src/supervision/store.js';
@@ -20,7 +21,7 @@ import { latestProgressMarker } from '../src/supervision/evidence.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import { classifyCodexTail, hasEmptyCodexComposer } from '../src/recovery/codex-classifier.js';
-import type { RecoveryObservation } from '../src/recovery/types.js';
+import type { RecoveryActionAuthority, RecoveryEvidenceSource, RecoveryObservation } from '../src/recovery/types.js';
 import { RecoveryController, type RecoveryDependencies } from '../src/recovery/controller.js';
 import { SupervisorController, type SupervisorDependencies } from '../src/supervisor/controller.js';
 import type { SupervisorStore } from '../src/supervisor/store.js';
@@ -70,14 +71,14 @@ function fakeSession(id: string, conversationId: string): Session {
     sessionId: id,
     muxName: `fixture-${id}`,
     recoveryIsolated: true,
-    recoveryCodexHome: currentLocalCodexHome(),
+    recoveryCodexHome: id === MANAGER ? currentLocalCodexHome() : join(currentLocalCodexHome(), `fixture-${id}`),
     workingDir: process.cwd(),
     mode: 'codex',
     attached: true,
     pid: 99999,
     createdAt: Date.now(),
   } as MuxSession;
-  return new Session({
+  const session = new Session({
     id,
     owner: 'alice',
     mode: 'codex',
@@ -87,6 +88,48 @@ function fakeSession(id: string, conversationId: string): Session {
     muxSession,
     codexConfig: { noDaemon: true, resumeSessionId: conversationId },
   });
+  session.trackUserInput('Exact initial owner fixture prompt\r');
+  return session;
+}
+
+function privateEvidenceSource(session: Session, path: string, conversationId: string): RecoveryEvidenceSource {
+  const stat = lstatSync(path);
+  const scope = () =>
+    JSON.stringify([
+      session.owner,
+      session.workingDir,
+      session.codexConfig,
+      session.getEnvOverridesForPersist(),
+      session.getRecoveryContext(),
+    ]);
+  const snapshot = scope();
+  return {
+    sessionId: session.id,
+    identity: {
+      reason: 'verified',
+      conversationId,
+      path,
+      tail: readFileSync(path, 'utf8'),
+      tailTruncated: false,
+      witness: {
+        paths: [
+          {
+            path,
+            kind: 'file',
+            dev: stat.dev,
+            ino: stat.ino,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
+            ctimeMs: stat.ctimeMs,
+          },
+        ],
+      },
+    },
+    isCurrent: () => scope() === snapshot,
+  };
+}
+async function prepared(current: RecoveryActionAuthority, source: RecoveryEvidenceSource): Promise<boolean> {
+  return current() && (!current.prepareEvidence || (await current.prepareEvidence(source)) === true) && current();
 }
 
 describe('manager authority at the real server boundary', () => {
@@ -102,6 +145,7 @@ describe('manager authority at the real server boundary', () => {
   let taskAct: ReturnType<typeof vi.spyOn>;
   let recoveryAct: ReturnType<typeof vi.spyOn>;
   let rolloutPath: string;
+  let workerRolloutPath: string;
   let effects: ReturnType<typeof vi.fn>;
   let grantDirectory: string | undefined;
   let previousData: string | undefined;
@@ -138,8 +182,21 @@ describe('manager authority at the real server boundary', () => {
       safeToAct: true,
     };
     rolloutPath = dataPath('manager-authority-rollout.jsonl');
+    workerRolloutPath = dataPath('worker-authority-rollout.jsonl');
+    await writeFile(
+      workerRolloutPath,
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }) + '\n'
+    );
     vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async function () {
       const session = Reflect.get(this, 'session') as Session;
+      if (session.id === WORKER) {
+        const source = privateEvidenceSource(session, workerRolloutPath, WORKER_THREAD);
+        Reflect.set(Reflect.get(this, 'recovery'), 'verifiedTail', {
+          ...source.identity,
+          config: JSON.stringify(session.codexConfig),
+          env: JSON.stringify(session.getEnvOverridesForPersist()),
+        });
+      }
       return {
         observation:
           session.id === MANAGER
@@ -185,12 +242,24 @@ describe('manager authority at the real server boundary', () => {
     taskAct = vi
       .spyOn(CodexTaskAdapter.prototype, 'act')
       .mockImplementation(async (_key, _thread, _prompt, current) => {
-        if (!current()) return 'not-sent';
+        if (
+          !(await prepared(
+            current,
+            privateEvidenceSource(internals.sessions.get(WORKER)!, workerRolloutPath, WORKER_THREAD)
+          ))
+        )
+          return 'not-sent';
         effects();
         return 'sent';
       });
     recoveryAct = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockImplementation(async (_flight, current) => {
-      if (!current()) return 'not-sent';
+      if (
+        !(await prepared(
+          current,
+          privateEvidenceSource(internals.sessions.get(WORKER)!, workerRolloutPath, WORKER_THREAD)
+        ))
+      )
+        return 'not-sent';
       effects();
       return 'sent';
     });
@@ -638,11 +707,17 @@ describe('manager authority at the real server boundary', () => {
           await persist(state);
         };
       } else if (boundary === 'adapter-await') {
-        const finalDispatch = async (current: () => boolean) => {
+        const finalDispatch = async (current: RecoveryActionAuthority) => {
           expect(current()).toBe(true);
           reached.resolve();
           await release.promise;
-          if (!current()) return 'not-sent' as const;
+          if (
+            !(await prepared(
+              current,
+              privateEvidenceSource(internals.sessions.get(WORKER)!, workerRolloutPath, WORKER_THREAD)
+            ))
+          )
+            return 'not-sent' as const;
           effects();
           return 'sent' as const;
         };
@@ -686,9 +761,10 @@ describe('manager authority at the real server boundary', () => {
         vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementationOnce(function (
           this: CodexRecoveryAdapter,
           conversationId: string,
-          generation: number
+          generation: number,
+          source?: RecoveryEvidenceSource
         ) {
-          const verified = confirm.call(this, conversationId, generation);
+          const verified = confirm.call(this, conversationId, generation, source);
           vi.spyOn(Date, 'now').mockReturnValue(
             Date.now() + (kind === 'manager-native-expired-during-proof' ? 30_001 : 29_999)
           );
@@ -723,8 +799,18 @@ describe('manager authority at the real server boundary', () => {
         return;
       }
       await expect(operating).rejects.toThrow(/owner Start|cancelled|refused/);
-      expect(taskAct).toHaveBeenCalledTimes(boundary === 'adapter-await' && action === 'assign' ? 1 : 0);
-      expect(recoveryAct).toHaveBeenCalledTimes(boundary === 'adapter-await' && action === 'retry' ? 1 : 0);
+      const enteredFinalPreparation =
+        boundary === 'adapter-await' ||
+        (boundary === 'worker-await' &&
+          [
+            'native-auth',
+            'native-child',
+            'progress-blocked',
+            'progress-malformed',
+            'manager-native-expired-during-proof',
+          ].includes(kind));
+      expect(taskAct).toHaveBeenCalledTimes(enteredFinalPreparation && action === 'assign' ? 1 : 0);
+      expect(recoveryAct).toHaveBeenCalledTimes(enteredFinalPreparation && action === 'retry' ? 1 : 0);
       expect(effects).not.toHaveBeenCalled();
       expect(manager.getStatus().inFlight).toBeUndefined();
       expect(manager.getStatus().workers[0].assignments).toBe(0);
@@ -789,11 +875,17 @@ describe('manager authority at the real server boundary', () => {
     const reached = createDeferred();
     const release = createDeferred();
     if (boundary === 'adapter-await') {
-      const finalDispatch = async (current: () => boolean) => {
+      const finalDispatch = async (current: RecoveryActionAuthority) => {
         expect(current()).toBe(true);
         reached.resolve();
         await release.promise;
-        if (!current()) return 'not-sent' as const;
+        if (
+          !(await prepared(
+            current,
+            privateEvidenceSource(internals.sessions.get(WORKER)!, workerRolloutPath, WORKER_THREAD)
+          ))
+        )
+          return 'not-sent' as const;
         effects();
         return 'sent' as const;
       };
@@ -853,9 +945,10 @@ describe('manager authority at the real server boundary', () => {
       vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementationOnce(function (
         this: CodexRecoveryAdapter,
         conversationId: string,
-        generation: number
+        generation: number,
+        source?: RecoveryEvidenceSource
       ) {
-        const verified = confirm.call(this, conversationId, generation);
+        const verified = confirm.call(this, conversationId, generation, source);
         // No asynchronous gap: the durable grant version changes during the final proof.
         const path = dataPath('users.json');
         writeFileSync(
@@ -888,5 +981,276 @@ describe('manager authority at the real server boundary', () => {
     expect(manager.getStatus().workers[0].assignments).toBe(1);
     expect(taskAct).toHaveBeenCalledOnce();
     expect(internals.getTaskController(internals.sessions.get(WORKER)!)!.getStatus().criteria[0].verified).toBe(false);
+  });
+
+  it.each(
+    (['pane', 'worker-proof', 'combined-read'] as const).flatMap((boundary) =>
+      (
+        [
+          'healthy',
+          'private-file',
+          'owner-input',
+          'owner-changed',
+          'manager-replaced',
+          'worker-replaced',
+          'grant-revoked',
+        ] as const
+      ).map((change) => ({ boundary, change }))
+    )
+  )(
+    'rechecks the actual manager authority after the worker Session final $boundary await: $change',
+    async ({ boundary, change }) => {
+      const worker = internals.sessions.get(WORKER)!;
+      const originalWorkerTask = internals.getTaskController(worker)!;
+      if (change === 'grant-revoked') {
+        grantDirectory = await mkdtemp(join(homedir(), 'supervisor-final-grant-'));
+        process.env.CODEMAN_DATA_DIR = grantDirectory;
+        process.env.CODEMAN_MULTIUSER = '1';
+        invalidateUsersCache();
+        await writeFile(
+          dataPath('users.json'),
+          JSON.stringify({ version: 1, users: [{ username: 'alice', role: 'user', canBypassPermissions: true }] })
+        );
+      }
+      const reached = createDeferred();
+      const release = createDeferred();
+      let proofHeld = false;
+      const confirm = CodexRecoveryAdapter.prototype.confirmLocalEvidence;
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementation(async function (
+        this: CodexRecoveryAdapter,
+        conversationId: string,
+        generation: number,
+        source?: RecoveryEvidenceSource
+      ) {
+        if (Reflect.get(this, 'session').id !== WORKER) {
+          return confirm.call(this, conversationId, generation, source);
+        }
+        if (!proofHeld && boundary === 'worker-proof') {
+          proofHeld = true;
+          reached.resolve();
+          await release.promise;
+        }
+        return true;
+      });
+      if (boundary === 'combined-read') {
+        const open = fs.open.bind(fs);
+        vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+          const file = await open(...args);
+          if (args[0] === workerRolloutPath) {
+            const read = file.read.bind(file);
+            vi.spyOn(file, 'read').mockImplementation(async (...readArgs) => {
+              if (!proofHeld) {
+                proofHeld = true;
+                reached.resolve();
+                await release.promise;
+              }
+              return Reflect.apply(read, file, readArgs);
+            });
+          }
+          return file;
+        });
+      }
+      taskAct.mockRestore();
+      Reflect.set(worker, '_mux', {
+        isAvailable: () => true,
+        inspectPaneForRecovery: async () => {
+          if (boundary === 'pane') {
+            reached.resolve();
+            await release.promise;
+          }
+          return { paneId: '%7', panePid: 700, dead: false, screen: '›\n  fixture-model high · /tmp\n' };
+        },
+        sendInput: async (_id: string, _input: string, guard: RecoveryMuxDispatchGuard) => {
+          if (!guard.prepareEvidence || !(await guard.prepareEvidence())) return false;
+          const prepared = await guard.prepareEvidence();
+          if (!prepared || !guard.confirm()) {
+            guard.noteRefusal?.();
+            return false;
+          }
+          guard.noteDispatch();
+          effects();
+          return true;
+        },
+      });
+      const operation = manager.assign(WORKER, `session-final-proof-${change}`);
+      try {
+        await Promise.race([
+          reached.promise,
+          operation.then(() => {
+            throw new Error('Worker operation completed before its held Session boundary');
+          }),
+        ]);
+        if (change === 'private-file') await appendProgress({ outcome: 'blocked' });
+        if (change === 'owner-input') managerSession.trackUserInput('New owner draft');
+        if (change === 'owner-changed') Reflect.set(managerSession, '_owner', 'bob');
+        if (change === 'manager-replaced') internals.sessions.set(MANAGER, fakeSession(MANAGER, MANAGER_THREAD));
+        if (change === 'worker-replaced') internals.sessions.set(WORKER, fakeSession(WORKER, WORKER_THREAD));
+        if (change === 'grant-revoked') {
+          const path = dataPath('users.json');
+          await writeFile(
+            path + '.fixture',
+            JSON.stringify({ version: 1, users: [{ username: 'alice', role: 'user', disabled: true }] })
+          );
+          await rename(path + '.fixture', path);
+        }
+        release.resolve();
+        if (change === 'healthy') {
+          await expect(operation).resolves.toMatchObject({ workers: [expect.objectContaining({ assignments: 1 })] });
+          expect(effects).toHaveBeenCalledOnce();
+        } else {
+          await expect(operation).rejects.toThrow(/refused|cancelled|owner Start/);
+          expect(effects).not.toHaveBeenCalled();
+          expect(manager.getStatus().workers[0].assignments).toBe(0);
+          expect(originalWorkerTask.getStatus().inFlight).toBeUndefined();
+        }
+        expect(manager.getStatus().inFlight).toBeUndefined();
+      } finally {
+        release.resolve();
+        await operation.catch(() => {});
+      }
+    }
+  );
+
+  it('never borrows a newer manager evidence object while its previous private proof is held', async () => {
+    expect(await managerDeps.validateManagerAuthority()).toBe(true);
+    const confirm = CodexRecoveryAdapter.prototype.confirmLocalEvidence;
+    const reached = createDeferred();
+    const release = createDeferred();
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementationOnce(async function (
+      this: CodexRecoveryAdapter,
+      conversationId: string,
+      generation: number,
+      source?: RecoveryEvidenceSource
+    ) {
+      reached.resolve();
+      await release.promise;
+      return confirm.call(this, conversationId, generation, source);
+    });
+    const source = privateEvidenceSource(internals.sessions.get(WORKER)!, workerRolloutPath, WORKER_THREAD);
+    const preparing = managerDeps.prepareManagerAuthority(WORKER, source);
+    try {
+      await reached.promise;
+      expect(await managerDeps.validateManagerAuthority()).toBe(true);
+      release.resolve();
+      expect(await preparing).toBe(false);
+      expect(managerDeps.hasManagerAuthority()).toBe(true);
+      expect(await managerDeps.prepareManagerAuthority(WORKER, source)).toBe(true);
+      expect(effects).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await preparing;
+    }
+  });
+
+  it('refuses a fulfilled false private-proof Promise before worker dispatch', async () => {
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementationOnce(async () => false);
+    await expect(manager.assign(WORKER, 'false-manager-proof')).rejects.toThrow(/owner Start/);
+    expect(taskAct).not.toHaveBeenCalled();
+    expect(effects).not.toHaveBeenCalled();
+    expect(manager.getStatus()).toMatchObject({
+      phase: 'paused',
+      workers: [expect.objectContaining({ assignments: 0 })],
+    });
+    expect(manager.getStatus().inFlight).toBeUndefined();
+  });
+
+  it.each([
+    'healthy',
+    'missing',
+    'wrong-session',
+    'wrong-uuid',
+    'stale',
+    'throws',
+    'async-true',
+    'async-reject',
+  ] as const)('binds local private evidence to the exact selected worker (%s)', async (kind) => {
+    expect(await managerDeps.validateManagerAuthority()).toBe(true);
+    const worker = internals.sessions.get(WORKER)!;
+    const source = privateEvidenceSource(worker, workerRolloutPath, WORKER_THREAD);
+    if (kind === 'wrong-session') source.sessionId = MANAGER;
+    if (kind === 'wrong-uuid') source.identity.conversationId = OTHER_THREAD;
+    if (kind === 'stale') worker.trackUserInput('Later owner draft');
+    if (kind === 'throws')
+      source.isCurrent = () => {
+        throw new Error('Fixture source check failed');
+      };
+    if (kind === 'async-true') source.isCurrent = (() => Promise.resolve(true)) as unknown as () => boolean;
+    if (kind === 'async-reject')
+      source.isCurrent = (() =>
+        Promise.reject(new Error('Fixture async source check failed'))) as unknown as () => boolean;
+    expect(await managerDeps.prepareManagerAuthority(WORKER, kind === 'missing' ? undefined : source)).toBe(
+      kind === 'healthy'
+    );
+    expect(effects).not.toHaveBeenCalled();
+  });
+
+  it('rejects a local worker sharing the manager history home before configuration', async () => {
+    const worker = internals.sessions.get(WORKER)!;
+    Reflect.get(worker, '_muxSession').recoveryCodexHome = managerSession.getRecoveryContext().codexHome;
+    const before = manager.getStatus();
+    await expect(manager.configure(config)).rejects.toThrow(/distinct Codex homes/);
+    expect(manager.getStatus()).toEqual(before);
+    expect(effects).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    'keeps an owned SSH history domain separate from the same local home string (%s)',
+    async (owned) => {
+      expect(await managerDeps.validateManagerAuthority()).toBe(true);
+      const worker = internals.sessions.get(WORKER)!;
+      Reflect.set(worker, '_remote', {
+        hostId: 'fixture-host',
+        label: 'Fixture',
+        host: 'worker.invalid',
+        username: 'runner',
+        port: 22,
+        remotePath: '/fixture/work',
+        owned,
+      });
+      Reflect.set(worker, '_envOverrides', { CODEX_HOME: managerSession.getRecoveryContext().codexHome });
+      if (owned) expect(() => managerDeps.validateWorkers([WORKER])).not.toThrow();
+      else expect(() => managerDeps.validateWorkers([WORKER])).toThrow(/eligible/);
+      expect(await managerDeps.prepareManagerAuthority(WORKER)).toBe(owned);
+      expect(effects).not.toHaveBeenCalled();
+    }
+  );
+
+  it('seals a partial worker send when manager evidence changes before Enter and never replays it', async () => {
+    const worker = internals.sessions.get(WORKER)!;
+    const confirm = CodexRecoveryAdapter.prototype.confirmLocalEvidence;
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementation(async function (
+      this: CodexRecoveryAdapter,
+      conversationId: string,
+      generation: number,
+      source?: RecoveryEvidenceSource
+    ) {
+      return Reflect.get(this, 'session').id === WORKER ? true : confirm.call(this, conversationId, generation, source);
+    });
+    taskAct.mockRestore();
+    Reflect.set(worker, '_mux', {
+      isAvailable: () => true,
+      inspectPaneForRecovery: async () => ({
+        paneId: '%7',
+        panePid: 700,
+        dead: false,
+        screen: '›\n  fixture-model high · /tmp\n',
+      }),
+      sendInput: async (_id: string, _input: string, guard: RecoveryMuxDispatchGuard) => {
+        if (!guard.prepareEvidence || !(await guard.prepareEvidence()) || !guard.confirm()) return false;
+        guard.noteDispatch();
+        effects('literal');
+        await appendProgress({ outcome: 'blocked' });
+        if (!(await guard.prepareEvidence()) || !guard.confirm()) return false;
+        effects('Enter');
+        return true;
+      },
+    });
+    await expect(manager.assign(WORKER, 'partial-manager-veto')).rejects.toThrow(/uncertain|may have started/);
+    expect(effects.mock.calls).toEqual([['literal']]);
+    expect(manager.getStatus()).toMatchObject({ phase: 'paused', inFlight: { requestId: 'partial-manager-veto' } });
+    expect(manager.getStatus().workers[0].assignments).toBe(0);
+    expect(internals.getTaskController(worker)!.getStatus().inFlight).toBeDefined();
+    await expect(manager.assign(WORKER, 'partial-manager-veto')).rejects.toThrow(/not active|reset/);
+    expect(effects.mock.calls).toEqual([['literal']]);
   });
 });

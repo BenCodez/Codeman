@@ -141,6 +141,7 @@ async function fixture(
       },
       startManager: vi.fn(async () => true),
       hasManagerAuthority: () => true,
+      prepareManagerAuthority: async () => true,
       validateManagerAuthority: async () => true,
       pauseManager: async () => {},
       resetManager: async () => {},

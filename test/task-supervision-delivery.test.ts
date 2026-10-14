@@ -49,6 +49,42 @@ afterEach(async () => {
 });
 const line = (at: number, payload: unknown) =>
   JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+// Decode POSIX shell quoting independently of the command builder. No process is executed.
+function shellWords(command: string): string[] {
+  const words: string[] = [];
+  let word = '',
+    quote = '',
+    active = false;
+  for (let i = 0; i < command.length; i++) {
+    const char = command[i];
+    if (quote === "'") {
+      if (char === "'") quote = '';
+      else word += char;
+    } else if (quote === '"') {
+      if (char === '"') quote = '';
+      else if (char === '\\') word += command[++i];
+      else word += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      active = true;
+    } else if (char === '\\') {
+      word += command[++i];
+      active = true;
+    } else if (/\s/.test(char)) {
+      if (active) {
+        words.push(word);
+        word = '';
+        active = false;
+      }
+    } else {
+      word += char;
+      active = true;
+    }
+  }
+  expect(quote).toBe('');
+  if (active) words.push(word);
+  return words;
+}
 describe('transport canonical task prompts', () => {
   it('rechecks an external supervisor cancellation inside the real Session lifecycle guard', async () => {
     const commands: string[] = [];
@@ -326,13 +362,61 @@ describe('transport canonical task prompts', () => {
       recoveryIsolated: true,
       recoveryCodexHome: currentLocalCodexHome(),
     } as MuxSession);
-    const guard = { confirm: () => true, noteDispatch: vi.fn(), noteRefusal: vi.fn() };
+    const guard = {
+      expectedLivePane: { paneId: '%7', panePid: 700 },
+      confirm: () => true,
+      noteDispatch: vi.fn(),
+      noteRefusal: vi.fn(),
+    };
     expect(await mux.sendInput(SESSION, 'Authorized task\r', guard)).toBe(false);
     expect(guard.noteRefusal).toHaveBeenCalledOnce();
     expect(guard.noteDispatch).not.toHaveBeenCalled();
     expect(commands).not.toHaveBeenCalled();
     expect(nativeRead).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ['missing-reader', undefined],
+    ['different-session', 'codeman-bbbbbbbb|%7|700|0||\n'],
+    ['different-pane', 'codeman-aaaaaaaa|%8|700|0||\n'],
+    ['different-process', 'codeman-aaaaaaaa|%7|701|0||\n'],
+    ['dead-pane', 'codeman-aaaaaaaa|%7|700|1|1|\n'],
+    ['live-exit-status', 'codeman-aaaaaaaa|%7|700|0|0|\n'],
+    ['live-signal', 'codeman-aaaaaaaa|%7|700|0||KILL\n'],
+    ['trailing-cr', 'codeman-aaaaaaaa|%7|700|0||\r\n'],
+    ['unterminated', 'codeman-aaaaaaaa|%7|700|0||'],
+    ['empty-reader', null],
+  ] as const)(
+    'refuses injected guarded input with %s native scope before any real read or input',
+    async (_kind, frame) => {
+      const commands = vi.fn(async () => ({ stdout: '' }));
+      const composer = vi.fn(() => '›\n  example-model high · /tmp\n');
+      const mux = new TmuxManager(commands, composer, frame === undefined ? undefined : () => frame);
+      mux.registerSession({
+        sessionId: SESSION,
+        muxName: 'codeman-aaaaaaaa',
+        pid: 99999,
+        createdAt: 10_000,
+        workingDir: '/tmp',
+        mode: 'codex',
+        attached: true,
+        recoveryIsolated: true,
+        recoveryCodexHome: currentLocalCodexHome(),
+      } as MuxSession);
+      const guard = {
+        expectedLivePane: { paneId: '%7', panePid: 700 },
+        confirm: () => true,
+        noteDispatch: vi.fn(),
+        noteRefusal: vi.fn(),
+      };
+      expect(await mux.sendInput(SESSION, 'Authorized fixture task\r', guard)).toBe(false);
+      expect(guard.noteDispatch).not.toHaveBeenCalled();
+      expect(guard.noteRefusal).toHaveBeenCalled();
+      expect(commands).not.toHaveBeenCalled();
+      expect(composer).not.toHaveBeenCalled();
+      expect(nativeRead).not.toHaveBeenCalled();
+    }
+  );
 
   it('accepts both real kickoff and continuation bytes and processes subsequent structured progress', async () => {
     const delivered: string[] = [];
@@ -342,19 +426,42 @@ describe('transport canonical task prompts', () => {
     const captured: string[] = [];
     const mux = new TmuxManager(
       async (command) => {
-        const literal = command.match(/ -l ('[\s\S]*')$/)?.[1];
-        if (literal) {
-          delivered.push(literal.slice(1, -1).split("'\\''").join("'"));
+        const tokens = shellWords(command);
+        const conditional = tokens.indexOf('if-shell');
+        expect(conditional).toBeGreaterThan(0);
+        expect(tokens.slice(conditional + 1, conditional + 4)).toEqual(['-F', '-t', '%7']);
+        const expected = {
+          session_name: 'codeman-aaaaaaaa',
+          pane_id: '%7',
+          pane_pid: '700',
+          pane_dead: '0',
+          pane_dead_status: '',
+          pane_dead_signal: '',
+        };
+        const terms = [...tokens[conditional + 4].matchAll(/#\{==:#\{([^}]+)\},([^}]*)\}/g)];
+        expect(terms).toHaveLength(6);
+        expect(terms.every((term) => expected[term[1] as keyof typeof expected] === term[2])).toBe(true);
+        const send = shellWords(tokens[conditional + 5]);
+        expect(send.slice(0, 3)).toEqual(['send-keys', '-t', '%7']);
+        if (send[3] === '-l') {
+          expect(send).toHaveLength(5);
+          delivered.push(send[4]);
           joinedScreen = `› ${delivered.at(-1)}\n  example-model high · /tmp\n`;
-        } else if (command.endsWith(' Enter')) {
+        } else if (send[3] === 'Enter') {
+          expect(send).toHaveLength(4);
           enters++;
           joinedScreen = screen;
         } else throw new Error('Unexpected fixture command');
+        return { stdout: '' };
       },
       (muxName) => {
         expect(muxName).toBe('codeman-aaaaaaaa');
         captured.push(joinedScreen);
         return joinedScreen;
+      },
+      (muxName) => {
+        expect(muxName).toBe('codeman-aaaaaaaa');
+        return 'codeman-aaaaaaaa|%7|700|0||\n';
       }
     );
     const muxSession = {
@@ -370,6 +477,8 @@ describe('transport canonical task prompts', () => {
     } as MuxSession;
     mux.registerSession(muxSession);
     vi.spyOn(mux, 'inspectPaneForRecovery').mockResolvedValue({
+      paneId: '%7',
+      panePid: 700,
       dead: false,
       screen,
       status: undefined,
@@ -499,8 +608,12 @@ describe('transport canonical task prompts', () => {
     expect(enters).toBe(2);
     expect(captured).toEqual([
       screen,
+      screen,
+      `› ${delivered[0]}\n  example-model high · /tmp\n`,
       `› ${delivered[0]}\n  example-model high · /tmp\n`,
       screen,
+      screen,
+      `› ${delivered[1]}\n  example-model high · /tmp\n`,
       `› ${delivered[1]}\n  example-model high · /tmp\n`,
     ]);
     expect(kickoffFlight.promptHash).toBeDefined();

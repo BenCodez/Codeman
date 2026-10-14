@@ -168,7 +168,7 @@ import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } 
 import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
 import { SupervisorStore } from '../supervisor/store.js';
 import { RecoveryController } from '../recovery/controller.js';
-import { hasFreshProcessReady, type RecoveryObservation } from '../recovery/types.js';
+import { hasFreshProcessReady, isRecoveryEvidenceSourceCurrent, type RecoveryObservation } from '../recovery/types.js';
 import { RecoveryStore } from '../recovery/store.js';
 import { rebootStateBinding } from '../recovery/reboot-state-binding.js';
 import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
@@ -2520,6 +2520,7 @@ export class WebServer extends EventEmitter {
         this.taskStore.loadFailed ||
         !context.managed ||
         !context.noDaemon ||
+        !context.submission ||
         context.switchPending ||
         context.untrackedInput ||
         session.paneLifecycleInFlight ||
@@ -2569,10 +2570,61 @@ export class WebServer extends EventEmitter {
       !!managerEvidence &&
       !!managerGrant &&
       managerEvidence.grantIsCurrent() &&
-      managerAdapter.confirmLocalEvidence(managerEvidence.conversationId, managerEvidence.generation) &&
-      managerEvidence.grantIsCurrent() &&
       hasManagerTaskAuthority() &&
       hasFreshProcessReady(managerEvidence.observation, managerGrant.state.startedAt ?? NaN, Date.now());
+    const confirmManagerEvidence = async (
+      source?: import('../recovery/types.js').RecoveryEvidenceSource
+    ): Promise<boolean> => {
+      const expected = managerEvidence;
+      if (!expected || !hasManagerAuthority()) return false;
+      let verified = false;
+      try {
+        verified =
+          (await managerAdapter.confirmLocalEvidence(expected.conversationId, expected.generation, source)) === true;
+      } catch {
+        // A failed private read cannot authorize a worker effect.
+      }
+      const accepted = verified && managerEvidence === expected && hasManagerAuthority();
+      if (!accepted && managerEvidence === expected) managerEvidence = undefined;
+      return accepted;
+    };
+    const prepareManagerAuthority = async (
+      workerId: string,
+      source?: import('../recovery/types.js').RecoveryEvidenceSource
+    ): Promise<boolean> => {
+      const worker = this.sessions.get(workerId);
+      if (!worker || worker === session || worker.owner !== session.owner || worker.docker) return false;
+      const workerScope = () =>
+        JSON.stringify([
+          worker.owner,
+          worker.workingDir,
+          worker.codexConfig,
+          worker.getEnvOverridesForPersist(),
+          worker.getRecoveryContext(),
+          worker.remote,
+        ]);
+      const snapshot = workerScope();
+      const currentWorker = () => {
+        const context = worker.getRecoveryContext();
+        return (
+          this.sessions.get(workerId) === worker &&
+          worker.owner === session.owner &&
+          !worker.docker &&
+          context.managed &&
+          context.noDaemon &&
+          !context.switchPending &&
+          !context.untrackedInput &&
+          workerScope() === snapshot &&
+          (worker.remote
+            ? worker.remote.owned !== false && source === undefined
+            : !!source &&
+              source.sessionId === worker.id &&
+              source.identity.conversationId === worker.codexConfig?.resumeSessionId &&
+              isRecoveryEvidenceSourceCurrent(source))
+        );
+      };
+      return currentWorker() && (await confirmManagerEvidence(source)) && currentWorker();
+    };
     const controller = new SupervisorController(
       {
         validateWorkers: (ids) => {
@@ -2595,6 +2647,10 @@ export class WebServer extends EventEmitter {
             // manager role is released. Neither state can hide the other's role.
             if (this.supervisorControllers.get(id)?.getStatus().enabled || this.supervisorStore.get(id).enabled)
               throw new SupervisorValidationError('Supervisor cycles are not allowed');
+            if (!worker.remote && worker.getRecoveryContext().codexHome === session.getRecoveryContext().codexHome)
+              throw new SupervisorValidationError(
+                'Local manager and worker require distinct Codex homes for independent history'
+              );
           }
         },
         worker: (id) => {
@@ -2602,7 +2658,19 @@ export class WebServer extends EventEmitter {
           if (!worker || worker.owner !== session.owner) return undefined;
           const task = this.getTaskController(worker);
           const recovery = this.getRecoveryController(worker);
-          return task && recovery ? { task, recovery } : undefined;
+          return task && recovery
+            ? {
+                task,
+                recovery,
+                isCurrent: () =>
+                  !this.recoveryStopping &&
+                  !this.cleaningUp.has(id) &&
+                  this.sessions.get(id) === worker &&
+                  worker.owner === session.owner &&
+                  this.taskControllers.get(id) === task &&
+                  this.recoveryControllers.get(id) === recovery,
+              }
+            : undefined;
         },
         persist: (state) => this.supervisorStore.save(session.id, state),
         withLeases: (fn) => this.withSupervisorLeases(fn),
@@ -2611,6 +2679,7 @@ export class WebServer extends EventEmitter {
           this.taskControllers.get(id)?.getStatus().agentProgressVeto === true ||
           this.taskStore.get(id).agentProgressVeto === true,
         hasManagerAuthority,
+        prepareManagerAuthority,
         validateManagerAuthority: async () => {
           managerEvidence = undefined;
           if (!hasManagerTaskAuthority()) return false;
@@ -2649,7 +2718,7 @@ export class WebServer extends EventEmitter {
               observation: { ...observation },
               grantIsCurrent: grant.isCurrent,
             };
-            return hasManagerAuthority();
+            return confirmManagerEvidence();
           }
           return false;
         },

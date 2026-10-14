@@ -1,5 +1,6 @@
 /** @fileoverview Same-owner attributed task observations and guarded delivery. */
 import type { Session } from '../session.js';
+import type { RecoveryActionAuthority, RecoveryEvidenceGuard } from '../recovery/types.js';
 import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../recovery/codex-adapter.js';
 import { successfulCommands, latestProgressMarker } from './evidence.js';
 import type { TaskObservation } from './controller.js';
@@ -24,14 +25,43 @@ export class CodexTaskAdapter {
     this.continuationProof = undefined;
     const context = this.session.getRecoveryContext();
     const observation = await this.recovery.observe();
+    if (context.generation !== this.session.getRecoveryContext().generation)
+      return {
+        observation: {
+          ...observation,
+          conversationId: undefined,
+          reason: 'identity-unverified',
+          activity: 'unknown',
+          safeToAct: false,
+        },
+        commands: new Map(),
+      };
     if (!observation.conversationId || ['unknown', 'blocked', 'paused'].includes(observation.activity))
       return { observation, commands: new Map() };
     const tail = this.recovery.getVerifiedTail(observation.conversationId);
-    if (tail === undefined || context.generation !== this.session.getRecoveryContext().generation)
-      return { observation: { ...observation, activity: 'unknown', safeToAct: false }, commands: new Map() };
+    if (tail === undefined)
+      return {
+        observation: {
+          ...observation,
+          conversationId: undefined,
+          reason: 'identity-unverified',
+          activity: 'unknown',
+          safeToAct: false,
+        },
+        commands: new Map(),
+      };
     const clock = this.recovery.getVerifiedRemoteClock(observation.conversationId);
     if (this.session.remote && !validRemoteClock(clock))
-      return { observation: { ...observation, activity: 'unknown', safeToAct: false }, commands: new Map() };
+      return {
+        observation: {
+          ...observation,
+          conversationId: undefined,
+          reason: 'identity-unverified',
+          activity: 'unknown',
+          safeToAct: false,
+        },
+        commands: new Map(),
+      };
     const now = clock?.remoteAfter ?? Date.now();
     const commands = successfulCommands(tail, 0, now);
     const marker = latestProgressMarker(tail, 0, now);
@@ -69,7 +99,7 @@ export class CodexTaskAdapter {
   }
   async recover(
     observation: import('../recovery/types.js').RecoveryObservation,
-    isCurrent: () => boolean
+    isCurrent: RecoveryActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     if (!observation.conversationId || !observation.evidenceKey) return 'not-sent';
     // Establish the recovery adapter's current generation-bound proof then let it revalidate again at dispatch.
@@ -83,6 +113,9 @@ export class CodexTaskAdapter {
           !this.recovery.hasLivePaneProof(observation.liveProofAt!)))
     )
       return 'not-sent';
+    const canDispatch: RecoveryActionAuthority = () =>
+      isCurrent() && (observation.activity !== 'crashed' || this.recovery.hasLivePaneProof(observation.liveProofAt!));
+    if (isCurrent.prepareEvidence) canDispatch.prepareEvidence = (source) => isCurrent.prepareEvidence!(source);
     return this.recovery.act(
       {
         key: observation.evidenceKey,
@@ -90,15 +123,14 @@ export class CodexTaskAdapter {
         action: observation.activity === 'crashed' ? 'restart' : 'continue',
         startedAt: Date.now(),
       },
-      () =>
-        isCurrent() && (observation.activity !== 'crashed' || this.recovery.hasLivePaneProof(observation.liveProofAt!))
+      canDispatch
     );
   }
   async act(
     key: string,
     conversationId: string,
     prompt: string,
-    isCurrent: () => boolean
+    isCurrent: RecoveryActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'> {
     const context = this.session.getRecoveryContext();
     const proof = this.continuationProof;
@@ -123,12 +155,15 @@ export class CodexTaskAdapter {
     if (this.session.remote) {
       return this.recovery.deliverRemotePrompt(conversationId, context.generation, prompt, isCurrent);
     }
+    const confirmEvidence: RecoveryEvidenceGuard = () =>
+      this.recovery.confirmLocalEvidence(conversationId, context.generation);
+    confirmEvidence.getEvidenceSource = () => this.recovery.getLocalEvidenceSource(conversationId, context.generation);
     return this.session.deliverRecovery(
       { key, conversationId, action: 'continue', startedAt: Date.now() },
       context.generation,
       isCurrent,
       prompt,
-      () => this.recovery.confirmLocalEvidence(conversationId, context.generation)
+      confirmEvidence
     );
   }
 }

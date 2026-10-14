@@ -37,6 +37,7 @@ describe('supervisor routes', () => {
         leaseHolder: () => undefined,
         startManager: async () => true,
         hasManagerAuthority: () => true,
+        prepareManagerAuthority: async () => true,
         validateManagerAuthority: async () => true,
         pauseManager: async () => {},
         resetManager: async () => {},

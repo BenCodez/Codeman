@@ -118,6 +118,7 @@ function harness() {
     pauseManager: vi.fn(() => task.pause().then(() => {})),
     resetManager: () => task.reset().then(() => {}),
     hasManagerAuthority: () => grant(),
+    prepareManagerAuthority: async () => grant(),
     validateManagerAuthority: vi.fn(async () => grant()),
     changed: vi.fn(),
     now: () => Date.now(),

@@ -196,7 +196,7 @@ describe('Task supervision UI', () => {
             activity: 'completed',
             reason: 'turn-completed',
             at: 10001,
-            conversationId: 'task-conversation',
+            conversationId: '11111111-2222-3333-4444-555555555555',
             turnId: 'completed-turn',
             processReady: true,
             safeToAct: false,
@@ -239,6 +239,64 @@ describe('Task supervision UI', () => {
     expect(act).not.toHaveBeenCalled();
     controller.stop();
   });
+  it.each([undefined, 'task-conversation'])(
+    'shows failed owner verification instead of completing under unverified identity %s',
+    async (conversationId) => {
+      const persist = vi.fn(async () => {});
+      const act = vi.fn(async () => 'not-sent' as const);
+      const controller = new TaskController({
+        observe: async () => ({
+          observation: {
+            activity: 'completed',
+            reason: 'turn-completed',
+            at: 10_000,
+            safeToAct: false,
+            conversationId,
+          },
+          commands: new Map(),
+        }),
+        now: () => 10_000,
+        act,
+        persist,
+        changed: () => {},
+      });
+      try {
+        await controller.update({
+          objective: 'Review fixture',
+          criteria: [{ id: 'review', kind: 'manual', description: 'Owner review' }],
+        });
+        const before = controller.getStatus();
+        persist.mockClear();
+        const h = harness(before);
+        h.app._apiJson = vi.fn(async (_url, options) => {
+          if (options?.method !== 'POST') return controller.getStatus();
+          try {
+            return await controller.progress(options.body);
+          } catch {
+            return null;
+          }
+        });
+        await h.open();
+        h.get('taskCriteriaEvidence').querySelector('input').checked = true;
+        h.get('taskProgressOutcome').value = 'completed';
+        await h.app.saveTaskProgress();
+        expect(controller.getStatus()).toEqual(before);
+        expect(controller.getStatus().criteria[0].verified).toBe(false);
+        expect(h.get('taskPhase').textContent).toBe('Unavailable');
+        expect(h.get('taskError').hidden).toBe(false);
+        expect(h.app.showToast).toHaveBeenCalledWith(
+          'Task action failed. Refresh status before trying again.',
+          'error'
+        );
+        expect(persist).not.toHaveBeenCalled();
+        expect(act).not.toHaveBeenCalled();
+      } finally {
+        controller.stop();
+        await controller.drain();
+      }
+    }
+  );
+
   it('shows evidence, timestamped bounded history and safe text', async () => {
     const s: any = state();
     s.criteria[0].verified = true;

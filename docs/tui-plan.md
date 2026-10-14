@@ -130,7 +130,7 @@ While the TUI is open and a session flips to NEEDS YOU: flash the row, ring BEL,
 
 ### Degraded mode (server down)
 
-When no server answers, enumerate `tmux -L codeman list-sessions` + read `state.json` (read-only), show a "server not running" header line, and offer attach only for sessions that do not require a Codex input fence (no states, no approvals). Codex attachment requires the authenticated direct-attach fence endpoint to acknowledge its durable write before stdin reaches tmux. If that endpoint is unreachable, authentication fails, or the write fails, refuse attachment, including a non-Codex target whose attach strip could switch to a Codex pane. This preserves degraded attachment for eligible sessions while keeping Codex recovery identity safe.
+When no server answers, enumerate `tmux -L codeman list-sessions` + read `state.json` (read-only), show a "server not running" header line, and offer attach only for sessions that do not require a Codex input fence (no states, no approvals). Codex attachment requires the authenticated direct-attach fence endpoint to acknowledge its durable write before stdin reaches tmux. If that endpoint is unreachable, authentication fails, or the write fails, refuse attachment for Codex or unknown-mode targets. Native attaches do not install global Alt switch bindings; inherited recognizable controls require owner cleanup, because command syntax cannot prove stale ownership. This preserves degraded attachment for eligible sessions while keeping Codex recovery identity safe.
 
 ## 4. Architecture
 

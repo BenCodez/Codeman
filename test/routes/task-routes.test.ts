@@ -52,7 +52,12 @@ describe('task routes ownership and bounded inputs', () => {
     'refuses agent-attributed progress via %s while preserving direct owner verification',
     async (header) => {
       const observe = vi.fn(async () => ({
-        observation: { activity: 'completed' as const, reason: 'turn-completed' as const, at: 10000 },
+        observation: {
+          activity: 'completed' as const,
+          reason: 'turn-completed' as const,
+          at: 10000,
+          conversationId: '11111111-2222-3333-4444-555555555555',
+        },
         commands: new Map(),
       }));
       const persist = vi.fn(async () => {});
@@ -128,7 +133,7 @@ describe('task routes ownership and bounded inputs', () => {
           activity: 'completed' as const,
           reason: 'turn-completed' as const,
           at: 10001,
-          conversationId: 'task-conversation',
+          conversationId: '11111111-2222-3333-4444-555555555555',
           turnId: 'completed-turn',
           processReady: true,
           safeToAct: false,

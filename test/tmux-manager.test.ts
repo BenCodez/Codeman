@@ -844,6 +844,8 @@ describe('TmuxManager (unit)', () => {
       'grant-revoked-during-shell-prep',
       'dispatch-uncertain',
       'async-confirm',
+      'async-refused',
+      'async-rejected',
     ])('scopes guarded reboot launch effects and cleanup for %s', async (outcome) => {
       const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
       const nonTestManager = new NonTestTmuxManager();
@@ -897,20 +899,22 @@ describe('TmuxManager (unit)', () => {
           },
           confirm: () => {
             confirmations++;
-            if (outcome === 'async-confirm') return Promise.resolve(true) as never;
+            if (outcome === 'async-confirm') return Promise.resolve(authorized);
+            if (outcome === 'async-refused') return Promise.resolve(false);
+            if (outcome === 'async-rejected') return Promise.reject(new Error('Fixture private proof rejected'));
             return authorized && (outcome !== 'before-worker' || confirmations === 1);
           },
         },
       });
       try {
-        if (outcome === 'unchanged') expect((await launch).pid).toBe(4242);
+        if (['unchanged', 'async-confirm'].includes(outcome)) expect((await launch).pid).toBe(4242);
         else await expect(launch).rejects.toThrow();
         const commands = mockedExecSync.mock.calls.map(([cmd]) => String(cmd));
         expect(commands.some((cmd) => cmd.includes('new-session'))).toBe(
-          !['before-create', 'async-confirm'].includes(outcome)
+          !['before-create', 'async-refused', 'async-rejected'].includes(outcome)
         );
         expect(commands.some((cmd) => cmd.includes('respawn-pane'))).toBe(
-          ['unchanged', 'dispatch-uncertain'].includes(outcome)
+          ['unchanged', 'async-confirm', 'dispatch-uncertain'].includes(outcome)
         );
         expect(commands.filter((cmd) => cmd.includes('kill-session'))).toHaveLength(
           ['before-worker', 'grant-revoked-during-shell-prep'].includes(outcome) ? 1 : 0

@@ -1,5 +1,5 @@
 /** @fileoverview Codex manager authority, expressed only through guarded worker controllers. */
-import type { RecoveryState } from '../recovery/types.js';
+import type { RecoveryActionAuthority, RecoveryEvidenceSource, RecoveryState } from '../recovery/types.js';
 import type { TaskState, TaskUpdate } from '../supervision/schema.js';
 import type { SupervisorWorkerInspection } from '../types/supervisor.js';
 import { SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from './manager-task.js';
@@ -34,16 +34,18 @@ export function classifyRecoveryRetry(state: RecoveryState): GuardedDispatchOutc
 }
 
 export interface SupervisorWorkerHandle {
+  /** Exact selected Session/controller incarnation throughout one operation. */
+  isCurrent?(): boolean;
   task: {
     getStatus(): TaskState;
     update(patch: TaskUpdate): Promise<TaskState>;
-    resume(isCurrent?: () => boolean, runtimeStartedAt?: number): Promise<TaskState>;
+    resume(isCurrent?: RecoveryActionAuthority, runtimeStartedAt?: number): Promise<TaskState>;
   };
   recovery: {
     getStatus(): RecoveryState;
     inspect(): Promise<RecoveryState>;
     inspectEvidence(): Promise<{ state: RecoveryState; observedAt: number; stale: boolean; isCurrent(): boolean }>;
-    retry(isCurrent?: () => boolean): Promise<RecoveryState>;
+    retry(isCurrent?: RecoveryActionAuthority): Promise<RecoveryState>;
   };
 }
 export interface SupervisorDependencies {
@@ -57,6 +59,8 @@ export interface SupervisorDependencies {
   agentProgressVeto?(workerId: string): boolean;
   /** Current manager Task grant, including durable attention vetoes and exact controller binding. */
   hasManagerAuthority(): boolean;
+  /** Fresh bounded private proof immediately before each worker native effect. */
+  prepareManagerAuthority(workerId: string, source?: RecoveryEvidenceSource): Promise<boolean>;
   /** Read-only native manager revalidation; never refresh/dispatch its Task controller here. */
   validateManagerAuthority(): Promise<boolean>;
   startManager(
@@ -577,7 +581,7 @@ export class SupervisorController {
     dispatch: (
       worker: SupervisorWorkerHandle,
       configured: SupervisorState['workers'][number],
-      isCurrent: () => boolean,
+      isCurrent: RecoveryActionAuthority,
       runtimeStartedAt: number
     ) => Promise<void>
   ): Promise<SupervisorState> {
@@ -598,6 +602,7 @@ export class SupervisorController {
       const configured = this.state.workers.find((w) => w.sessionId === workerId);
       let worker = configured && this.deps.worker(workerId);
       if (!configured || !worker) throw new SupervisorValidationError('Worker is outside this supervisor');
+      const selectedWorkerCurrent = worker.isCurrent?.bind(worker);
       // The first operation spends runtime during preflight too. Persist its origin
       // only once dispatch is accepted; a certified unsent refusal starts no budget.
       const runtimeStartedAt = configured.startedAt ?? this.now();
@@ -605,14 +610,17 @@ export class SupervisorController {
         configured.assignments < configured.maxAssignments &&
         this.hasRuntimeBudget(runtimeStartedAt, configured.maxRuntimeMs) &&
         this.hasRuntimeBudget(this.state.startedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS);
-      const isCurrent = () =>
+      const isCurrent: RecoveryActionAuthority = () =>
         !this.stopped &&
         this.revision === revision &&
         this.state.phase === 'active' &&
         this.deps.hasManagerAuthority?.() === true &&
+        (selectedWorkerCurrent ? selectedWorkerCurrent() === true : true) &&
         hasBudget() &&
         !!worker &&
         this.workerAllowsAction(worker, configured, action, false);
+      isCurrent.prepareEvidence = async (source) =>
+        isCurrent() && (await this.deps.prepareManagerAuthority(workerId, source)) === true && isCurrent();
       const requireCurrent = () => {
         if (!hasBudget()) throw new SupervisorOperationRefused('Worker assignment budget exhausted');
         if (!isCurrent()) throw new SupervisorOperationRefused('Supervisor operation was cancelled');

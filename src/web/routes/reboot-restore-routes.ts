@@ -59,7 +59,7 @@ import type { CodexConfig, CustomModelBookkeeping, SessionAttachmentHistoryItem 
 import { rebuildPersistedCustomModelEnv, captureCustomModelRecoveryWitness } from '../../custom-model-recovery.js';
 import { customModelConfigDir, removeConfigDir } from '../../custom-model-injection-apply.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
-import { confirmCodexIdentityWitness } from '../../recovery/codex-identity.js';
+import { checkCodexIdentityWitness } from '../../recovery/codex-witness-check.js';
 import { currentLocalCodexHome, normalizedCodexHome } from '../../recovery/codex-home.js';
 import { isCodexRestoreConfig } from '../../recovery/reboot-state-binding.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
@@ -442,23 +442,25 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                   sameCodexLaunchConfig(current.configs.codexConfig as CodexConfig | undefined, codexConfig!) &&
                   JSON.stringify(current.env) === JSON.stringify(envToAuthorize);
               },
-              confirm: () => {
-                const peers = [...ctx.sessions.values()].filter((other) => other !== session);
+              confirm: async () => {
+                const authorityIsCurrent = () => {
+                  const peers = [...ctx.sessions.values()].filter((other) => other !== session);
+                  return (
+                    granted &&
+                    customModelIsCurrent() === true &&
+                    grantIsCurrent() === true &&
+                    rebootRestoreRegistry.isHeld(entry, owner) &&
+                    ctx.sessions.get(session.id) === session &&
+                    JSON.stringify(readRebootIdentityFence(session.id)) === fence &&
+                    rejectAlreadyLive(
+                      [entry],
+                      new Set(peers.map((other) => other.id)),
+                      new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
+                    ).skipped.length === 0
+                  );
+                };
                 return (
-                  granted &&
-                  customModelIsCurrent() === true &&
-                  grantIsCurrent() === true &&
-                  rebootRestoreRegistry.isHeld(entry, owner) &&
-                  ctx.sessions.get(session.id) === session &&
-                  JSON.stringify(readRebootIdentityFence(session.id)) === fence &&
-                  rejectAlreadyLive(
-                    [entry],
-                    new Set(peers.map((other) => other.id)),
-                    new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
-                  ).skipped.length === 0 &&
-                  confirmCodexIdentityWitness(finalEvidence!) &&
-                  customModelIsCurrent() === true &&
-                  grantIsCurrent() === true
+                  authorityIsCurrent() && (await checkCodexIdentityWitness(finalEvidence!)) && authorityIsCurrent()
                 );
               },
             });

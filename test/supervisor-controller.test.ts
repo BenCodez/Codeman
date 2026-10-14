@@ -71,6 +71,7 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
     leaseHolder: vi.fn(() => undefined),
     startManager: vi.fn(async () => true),
     hasManagerAuthority: vi.fn(() => true),
+    prepareManagerAuthority: vi.fn(async () => true),
     validateManagerAuthority: vi.fn(async () => true),
     pauseManager: vi.fn(async () => {}),
     resetManager: vi.fn(async () => {}),

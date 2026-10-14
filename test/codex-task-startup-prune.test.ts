@@ -167,7 +167,13 @@ describe('task and shared-action startup journal cleanup', () => {
         const act = vi.fn(async () => 'not-sent' as const);
         const task = new TaskController({
           observe: async () => ({
-            observation: { activity: 'idle', reason: 'observing', at: Date.now(), safeToAct: false },
+            observation: {
+              activity: 'idle',
+              reason: 'observing',
+              at: Date.now(),
+              safeToAct: false,
+              conversationId: THREAD,
+            },
             commands: new Map(),
           }),
           act,

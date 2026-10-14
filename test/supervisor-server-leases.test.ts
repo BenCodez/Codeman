@@ -1,4 +1,5 @@
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
+import { join } from 'node:path';
 /** @fileoverview Supervisor leases follow surviving/restorable manager identities after boot. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebServer } from '../src/web/server.js';
@@ -53,7 +54,7 @@ function session(id: string): Session {
     sessionId: id,
     muxName: `fixture-${id}`,
     recoveryIsolated: true,
-    recoveryCodexHome: currentLocalCodexHome(),
+    recoveryCodexHome: join(currentLocalCodexHome(), `fixture-${id}`),
     workingDir: process.cwd(),
     mode: 'codex',
     attached: true,
@@ -139,6 +140,22 @@ describe('server supervisor lease reconciliation', () => {
     expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
   });
 
+  it('refuses shared-home configuration after a lease release without committing a new role', async () => {
+    await internals.cleanupStaleSessions();
+    expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBeUndefined();
+    const managerSession = internals.sessions.get(NEXT)!;
+    const worker = internals.sessions.get(WORKER)!;
+    Reflect.set(worker, '_envOverrides', { CODEX_HOME: managerSession.getRecoveryContext().codexHome });
+    Reflect.get(worker, '_muxSession').recoveryCodexHome = managerSession.getRecoveryContext().codexHome;
+    const manager = internals.getSupervisorController(managerSession)!;
+    const before = manager.getStatus();
+    await expect(manager.configure(config)).rejects.toThrow(/distinct Codex homes/);
+    expect(manager.getStatus()).toEqual(before);
+    expect(internals.supervisorStore.get(NEXT).enabled).toBe(false);
+    expect(internals.supervisorStore.get(OLD)).toEqual(journal);
+    expect(internals.supervisorLeaseHolder(WORKER, OLD)).toBeUndefined();
+  });
+
   it('retains durable ownership after a failed reset until the release commits', async () => {
     internals.sessions.set(OLD, old);
     const manager = internals.getSupervisorController(old)!;
@@ -201,21 +218,27 @@ describe('server supervisor lease reconciliation', () => {
     const manager = internals.getSupervisorController(internals.sessions.get(NEXT)!)!;
     await manager.configure(config);
     const act = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
-    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
-      observation: {
-        activity: 'idle',
-        reason: 'observing',
-        at: Date.now(),
-        conversationId: '44444444-4444-4444-8444-444444444444',
-        processReady: true,
-        safeToAct: false,
-      },
-      commands: new Map(),
-    }));
+    const accepted: { submissionHash?: string } = {};
+    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async function (this: CodexTaskAdapter) {
+      const submissionHash = Reflect.get(this, 'session').id === NEXT ? accepted.submissionHash : undefined;
+      return {
+        observation: {
+          activity: submissionHash ? 'working' : 'idle',
+          reason: submissionHash ? 'turn-running' : 'observing',
+          at: Date.now(),
+          conversationId: '44444444-4444-4444-8444-444444444444',
+          processReady: true,
+          safeToAct: false,
+          submissionKey: submissionHash ? 'accepted-manager-submission' : undefined,
+          submissionHash,
+        },
+        commands: new Map(),
+      };
+    });
     internals.sessions.get(NEXT)!.pinRecoveryConversation('44444444-4444-4444-8444-444444444444');
-    vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockReturnValue(true);
+    internals.sessions.get(NEXT)!.trackUserInput('Initial owner prompt in the selected manager thread\r');
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockResolvedValue(true);
     vi.spyOn(CodexRecoveryAdapter.prototype, 'getVerifiedTail').mockReturnValue('');
-    let submissionHash: string | undefined;
     vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => ({
       activity: 'working',
       reason: 'turn-running',
@@ -225,10 +248,13 @@ describe('server supervisor lease reconciliation', () => {
       processReadyAt: Date.now(),
       safeToAct: false,
       submissionKey: 'accepted-manager-submission',
-      submissionHash,
+      submissionHash: accepted.submissionHash,
     }));
     await manager.start();
-    submissionHash = internals.getTaskController(internals.sessions.get(NEXT)!)!.getStatus().inFlight?.promptHash;
+    const managerTask = internals.getTaskController(internals.sessions.get(NEXT)!)!;
+    accepted.submissionHash = managerTask.getStatus().inFlight?.promptHash;
+    await managerTask.refresh();
+    expect(managerTask.getStatus().inFlight).toBeUndefined();
     act.mockClear();
     await internals.taskStore.save(WORKER, { ...initialTaskState(), agentProgressVeto: true });
     await expect(manager.assign(WORKER, 'durable-stop')).rejects.toThrow('cancelled');

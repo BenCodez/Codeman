@@ -11,6 +11,7 @@ import {
   type RecoveryReason,
   type RecoveryState,
   type RecoveryFlight,
+  type RecoveryActionAuthority,
 } from './types.js';
 
 export interface RecoveryDependencies {
@@ -20,9 +21,9 @@ export interface RecoveryDependencies {
   hasActionAuthority?(): boolean;
   observe(): Promise<RecoveryObservation>;
   /** 'unknown' includes any possibly-partially-delivered operation; it must never be replayed. */
-  act(flight: RecoveryFlight, isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
+  act(flight: RecoveryFlight, isCurrent: RecoveryActionAuthority): Promise<'sent' | 'not-sent' | 'unknown'>;
   /** Explicit owner action for a verified missing owned remote worker. */
-  restoreMissingRemote?(isCurrent: () => boolean): Promise<'sent' | 'not-sent' | 'unknown'>;
+  restoreMissingRemote?(isCurrent: RecoveryActionAuthority): Promise<'sent' | 'not-sent' | 'unknown'>;
   persist(state: RecoveryState): Promise<void>;
   changed(state: RecoveryState): void;
   now?: () => number;
@@ -293,7 +294,7 @@ export class RecoveryController {
     });
   }
 
-  async retry(externallyCurrent: () => boolean = () => true): Promise<RecoveryState> {
+  async retry(externallyCurrent: RecoveryActionAuthority = () => true): Promise<RecoveryState> {
     return this.enqueue(async () => {
       try {
         await this.evaluate(true, externallyCurrent);
@@ -660,7 +661,7 @@ export class RecoveryController {
     return !Number.isFinite(origin) || origin < 0 || elapsed < 0 || elapsed >= this.state.config.maxRecoveryDurationMs;
   }
 
-  private async evaluate(manual: boolean, externallyCurrent: () => boolean = () => true): Promise<void> {
+  private async evaluate(manual: boolean, externallyCurrent: RecoveryActionAuthority = () => true): Promise<void> {
     if (this.stopped || !externallyCurrent()) return;
     const revision = this.revision;
     const isCurrent = () => !this.stopped && revision === this.revision && externallyCurrent();
@@ -911,10 +912,14 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const canDispatch = () =>
+    const canDispatch: RecoveryActionAuthority = () =>
       isCurrent() &&
       !this.recoveryWindowExpired() &&
       (this.deps.hasActionAuthority ? this.deps.hasActionAuthority() === true : true);
+    if (externallyCurrent.prepareEvidence) {
+      canDispatch.prepareEvidence = async (source) =>
+        canDispatch() && (await externallyCurrent.prepareEvidence!(source)) === true && canDispatch();
+    }
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
       outcome = canDispatch() ? await this.deps.act(this.state.inFlight, canDispatch) : 'not-sent';

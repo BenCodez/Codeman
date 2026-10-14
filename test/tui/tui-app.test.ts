@@ -123,10 +123,12 @@ describe('direct attach recovery fence', () => {
     expect(needsDirectAttachFence({ mode: 'codex' })).toBe(true);
     expect(needsDirectAttachFence({ mode: 'claude' })).toBe(false);
     expect(needsDirectAttachFence({ mode: 'shell' })).toBe(false);
-    expect(needsDirectAttachFence({ mode: undefined })).toBe(false);
+    expect(needsDirectAttachFence({ mode: undefined })).toBe(true);
+    expect(needsDirectAttachFence({ mode: '' })).toBe(true);
+    expect(needsDirectAttachFence({ mode: 'unknown-cli' })).toBe(true);
   });
 
-  it('fences an Alt-switchable Codex target before attaching to an initial Claude row', async () => {
+  it('leaves secondary workers untouched when attaching to a Claude row', async () => {
     const fenceDirectAttach = vi.fn(async () => {});
     const bindSwitchKey = vi.fn(async () => true);
     const client = {
@@ -161,10 +163,8 @@ describe('direct attach recovery fence', () => {
       },
     ]);
 
-    expect(fenceDirectAttach).toHaveBeenCalledOnce();
-    expect(fenceDirectAttach).toHaveBeenCalledWith('codex-session-id');
-    expect(fenceDirectAttach.mock.invocationCallOrder[0]).toBeLessThan(bindSwitchKey.mock.invocationCallOrder[0]);
-    expect(bindSwitchKey).toHaveBeenCalledWith('M-2', 'codeman-codex222');
+    expect(fenceDirectAttach).not.toHaveBeenCalled();
+    expect(bindSwitchKey).not.toHaveBeenCalled();
     await handoff.restore();
   });
 
@@ -211,7 +211,7 @@ describe('direct attach recovery fence', () => {
       },
     ]);
 
-    expect(bindSwitchKey).toHaveBeenCalledWith('M-1', 'codeman-claude1');
+    expect(bindSwitchKey).not.toHaveBeenCalled();
     expect(bindSwitchKey).not.toHaveBeenCalledWith('M-2', expect.anything());
     expect(bindSwitchKey).not.toHaveBeenCalledWith('M-3', expect.anything());
     await handoff.restore();
@@ -570,20 +570,16 @@ describe('the one-key way out', () => {
     expect(ONE_KEY_DETACH).not.toContain('+');
   });
 
-  it('advertises alt+1-9 only once those keys were really claimed', () => {
-    // Same rule as the way-out key: never name a key that does nothing. That
-    // is the bug this whole series started with.
-    const withSwitch = buildAttachBanner({ oneKey: 'F1', switchKeys: true, cols: 150 })['status-format[0]'];
-    expect(withSwitch).toContain('alt+1-9 switch');
-    expect(withSwitch).toContain('back to the codeman dashboard');
-    expect(buildAttachBanner({ oneKey: 'F1', cols: 150 })['status-format[0]']).not.toContain('alt+1-9');
+  it('does not advertise global Alt switch shortcuts during an attach', () => {
+    const bar = buildAttachBanner({ oneKey: 'F1', cols: 150 })['status-format[0]'];
+    expect(bar).not.toContain('alt+1-9');
+    expect(bar).toContain('back to the codeman dashboard');
   });
 
-  it('still fits the strip once the switch hint has taken its space', () => {
+  it('fits the session strip while reserving space for the detach hint', () => {
     for (const cols of [80, 100, 120, 190]) {
       const bar = buildAttachBanner({
         oneKey: 'F1',
-        switchKeys: true,
         cols,
         tabs: Array.from({ length: 12 }, (_, i) => ({
           index: i + 1,
@@ -593,7 +589,7 @@ describe('the one-key way out', () => {
       })['status-format[0]'];
       const visible = bar.replace(/#\[[^\]]*\]/g, '');
       expect({ cols, fits: visible.length <= cols }).toEqual({ cols, fits: true });
-      expect(visible).toContain('alt+1-9 switch');
+      expect(visible).not.toContain('alt+1-9 switch');
       expect(visible).toContain('back to the codeman dashboard');
     }
   });
