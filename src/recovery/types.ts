@@ -99,6 +99,10 @@ export interface RecoveryObservation {
   submissionKey?: string;
   turnId?: string;
   progressAt?: number;
+  /** Stable complete native remote event identity; local clock bounds cannot identify progress. */
+  progressEvidenceKey?: string;
+  /** Earliest plausible local progress time, for conservative owner/recovery ordering. */
+  progressLowerBound?: number;
   submissionHash?: string;
   processReady?: boolean;
   /** Conservative start of the current bounded live-pane read, independent of historical rollout time. */
@@ -143,6 +147,9 @@ export interface RecoveryFlight {
   previousSubmissionKey?: string;
   /** Exact structured silence baseline reserved for this stall recovery cycle. */
   stallProgressAt?: number;
+  stallProgressEvidenceKey?: string;
+  /** Final remote read must still satisfy the owner's full quiet interval. */
+  stallQuietPeriodMs?: number;
 }
 
 export interface RecoveryState {
@@ -161,7 +168,7 @@ export interface RecoveryState {
   circuitOpen: boolean;
   needsAttention: boolean;
   /** Durable warning identity only. Fresh private dead-pane confirmations are still required to restart. */
-  stallAlert?: { key: string; conversationId: string; progressAt: number };
+  stallAlert?: { key: string; conversationId: string; progressAt: number; progressEvidenceKey?: string };
   inFlight?: RecoveryFlight;
   pending?: { key: string; action: RecoveryAction; conversationId: string; reason?: RecoveryReason };
   handledEvidence: string[];

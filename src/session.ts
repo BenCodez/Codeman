@@ -2240,7 +2240,7 @@ export class Session extends EventEmitter {
    * watcher detects a dead remote pane, the session owner reassembles the SAME
    * `RespawnPaneOptions` used for Claude-idle respawns and calls
    * `respawnPane()` directly. For a remote session that re-runs
-   * `buildRemoteSessionCommand` (owned → `new-session -A`, non-owned →
+   * `buildRemoteSessionCommand` (owned Codex → attach-only; other owned → `new-session -A`, non-owned →
    * `attach`), which idempotently REATTACHES the still-running durable remote
    * tmux session — scrollback + agent intact (proven COD-104/105).
    *
@@ -2848,17 +2848,6 @@ export class Session extends EventEmitter {
     this._recoveryDelivering = true;
     try {
       return await this._withPaneLifecycle(async () => {
-        const pane = await this.inspectRecoveryPane();
-        if (
-          expectedRecoveryPane &&
-          (!pane ||
-            pane.paneId !== expectedRecoveryPane.paneId ||
-            pane.panePid !== expectedRecoveryPane.panePid ||
-            pane.status !== expectedRecoveryPane.status ||
-            pane.signal !== expectedRecoveryPane.signal ||
-            (pane.paneSignalToken ?? '') !== (expectedRecoveryPane.paneSignalToken ?? ''))
-        )
-          return 'not-sent';
         const envToAuthorize =
           context.codexHome !== currentLocalCodexHome()
             ? { ...this._envOverrides, CODEX_HOME: context.codexHome! }
@@ -2889,6 +2878,19 @@ export class Session extends EventEmitter {
             return 'not-sent';
           }
         }
+        // Owner edits made directly in the TUI do not change our generation.
+        // Read the live pane after asynchronous authorization, then recheck every fence.
+        const pane = await this.inspectRecoveryPane();
+        if (
+          expectedRecoveryPane &&
+          (!pane ||
+            pane.paneId !== expectedRecoveryPane.paneId ||
+            pane.panePid !== expectedRecoveryPane.panePid ||
+            pane.status !== expectedRecoveryPane.status ||
+            pane.signal !== expectedRecoveryPane.signal ||
+            (pane.paneSignalToken ?? '') !== (expectedRecoveryPane.paneSignalToken ?? ''))
+        )
+          return 'not-sent';
         const currentContext = this.getRecoveryContext();
         if (
           granted.isCurrent() !== true ||
@@ -2944,7 +2946,13 @@ export class Session extends EventEmitter {
           noteDispatch: () => {
             dispatched = true;
           },
+          noteRefusal: () => {
+            if (!dispatched) refusedBeforeDispatch = true;
+          },
         };
+        // The pane read awaited after the earlier evidence check. Preserve this
+        // boundary's own final admission proof as well as the native mux guard.
+        if (!recoveryGuard.confirm()) return 'not-sent';
         this._submitVerifier?.cancel();
         this._submitVerifier = null;
         if (flight.action === 'restart') {
@@ -3052,6 +3060,9 @@ export class Session extends EventEmitter {
       advisorModel: this._advisorModel,
       historyLimit: this._tmuxHistoryLimit,
       remote: this._remote,
+      // Reconnect and wake may only attach an existing owned Codex worker.
+      // Missing workers require the explicit, journaled recovery restore path.
+      ...(this.mode === 'codex' && this._remote && this._remote.owned !== false ? { remoteAttachOnly: true } : {}),
       docker: this._docker,
       owner: this._owner,
     };

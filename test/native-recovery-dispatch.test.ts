@@ -80,7 +80,13 @@ function setGrant(granted: boolean) {
   );
   renameSync(`${path}.fixture`, path);
 }
-async function fixture(action: 'continue' | 'restart', stalled = false, paneSignalToken?: string) {
+async function fixture(
+  action: 'continue' | 'restart',
+  stalledOrPrompt: boolean | string = false,
+  paneSignalToken?: string
+) {
+  const stalled = stalledOrPrompt === true;
+  const prompt = typeof stalledOrPrompt === 'string' ? stalledOrPrompt : 'Authorized fixture continuation';
   const home = join(directory, 'codex');
   mkdirSync(home);
   const id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
@@ -112,7 +118,16 @@ async function fixture(action: 'continue' | 'restart', stalled = false, paneSign
   Reflect.set(manager, 'paneExits', new Map());
   Reflect.set(manager, 'paneExitGeneration', 0);
   vi.spyOn(manager, 'isAvailable').mockReturnValue(true);
-  vi.spyOn(manager, 'inspectPaneForRecovery').mockResolvedValue(pane);
+  vi.spyOn(manager, 'inspectPaneForRecovery').mockImplementation(async () => ({ ...pane }));
+  effects.sync.mockImplementation((command: string) => {
+    if (command.includes('capture-pane')) return pane.screen;
+    return '99999\n';
+  });
+  effects.exec.mockImplementation(async (command: string) => {
+    if (command.includes('send-keys') && command.includes(' -l '))
+      pane.screen = `› ${prompt.replace(/\r/g, '').replace(/\n/g, '').trimEnd()}\n  fixture-model high · /tmp\n`;
+    return { stdout: '', stderr: '' };
+  });
   // These would read server credential env/bin locations; the effect boundary under test needs neither.
   vi.spyOn(manager as unknown as { _configureCliEnv(): void }, '_configureCliEnv').mockImplementation(() => {});
   vi.spyOn(
@@ -146,7 +161,7 @@ async function fixture(action: 'continue' | 'restart', stalled = false, paneSign
       },
       worker.getRecoveryContext().generation,
       () => current,
-      'Authorized fixture continuation',
+      prompt,
       () => evidence,
       stalled ? { paneId: '%7', panePid: 700, status: pane.status, signal: pane.signal, paneSignalToken } : undefined
     );
@@ -251,6 +266,7 @@ describe('native continuation after literal input', () => {
       const f = await fixture('continue');
       effects.exec.mockImplementation(async (command: string) => {
         if (command.includes('send-keys') && command.includes(' -l ')) {
+          f.pane.screen = '› Authorized fixture continuation\n  fixture-model high · /tmp\n';
           if (change === 'cancel') f.cancel();
           if (change === 'grant') setGrant(false);
           if (change === 'delay-cancel') setTimeout(f.cancel, 10);
@@ -284,6 +300,225 @@ describe('native continuation after literal input', () => {
     expect(await f.manager.sendInput(f.worker.id, 'ordinary fixture\r')).toBe(true);
     expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(1);
   });
+
+  it('keeps post-paste composer uncertainty sealed through refresh, retry and durable reload', async () => {
+    const f = await fixture('continue');
+    const { RecoveryController } = await import('../src/recovery/controller.js');
+    const { RecoveryStore } = await import('../src/recovery/store.js');
+    const { initialRecoveryState } = await import('../src/recovery/types.js');
+    const store = new RecoveryStore(join(directory, 'composer-recovery.json'));
+    const send = effects.exec.getMockImplementation()!;
+    effects.exec.mockImplementation(async (command: string) => {
+      const result = await send(command);
+      if (command.includes('send-keys') && command.includes(' -l '))
+        f.pane.screen = '› Authorized fixture continuation edited by owner\n  fixture-model high · /tmp\n';
+      return result;
+    });
+    const deps = {
+      observe: async () => ({
+        activity: 'interrupted' as const,
+        reason: 'turn-failed' as const,
+        at: Date.now(),
+        conversationId: f.thread,
+        evidenceKey: 'composer-fixture',
+        safeToAct: true,
+      }),
+      act: () => f.deliver(),
+      persist: (state: ReturnType<typeof initialRecoveryState>) => store.save(f.id, state),
+      changed: vi.fn(),
+    };
+    const controller = new RecoveryController(deps);
+    let restored: InstanceType<typeof RecoveryController> | undefined;
+    try {
+      await controller.retry();
+      expect(store.get(f.id)).toMatchObject({ lastReason: 'acceptance-unverified', inFlight: { action: 'continue' } });
+      await controller.refresh();
+      await controller.retry();
+      restored = new RecoveryController(deps, new RecoveryStore(join(directory, 'composer-recovery.json')).get(f.id));
+      await restored.refresh();
+      await restored.retry();
+      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
+      expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(0);
+      expect(restored.getStatus().inFlight).toBeDefined();
+    } finally {
+      controller.stop();
+      restored?.stop();
+      await controller.drain();
+      await restored?.drain();
+    }
+  });
+});
+
+describe('direct TUI composer edits at automatic input boundaries', () => {
+  it.each(['unchanged', 'draft'] as const)(
+    'rechecks the joined composer after a held literal child completes (%s)',
+    async (change) => {
+      const f = await fixture('continue');
+      let entered!: () => void;
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const send = effects.exec.getMockImplementation()!;
+      effects.exec.mockImplementation(async (command: string) => {
+        const result = await send(command);
+        if (command.includes('send-keys') && command.includes(' -l ')) {
+          entered();
+          await held;
+        }
+        return result;
+      });
+      const delivery = f.deliver();
+      await waiting;
+      if (change === 'draft')
+        f.pane.screen = '› Direct owner edit during pending literal child\n  fixture-model high · /tmp\n';
+      release();
+      expect(await delivery).toBe(change === 'unchanged' ? 'sent' : 'unknown');
+      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
+      expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(change === 'unchanged' ? 1 : 0);
+    }
+  );
+
+  it.each([1, 2].flatMap((capture) => (['grant', 'evidence'] as const).map((change) => ({ capture, change }))))(
+    'rechecks $change after composer capture $capture, immediately before native effect',
+    async ({ capture, change }) => {
+      const f = await fixture('continue');
+      const read = effects.sync.getMockImplementation()!;
+      let captures = 0;
+      effects.sync.mockImplementation((command: string) => {
+        const screen = read(command);
+        if (command.includes('capture-pane') && ++captures === capture) {
+          if (change === 'grant') setGrant(false);
+          else f.invalidate();
+        }
+        return screen;
+      });
+      expect(await f.deliver()).toBe(capture === 1 ? 'not-sent' : 'unknown');
+      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(capture - 1);
+      expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(0);
+    }
+  );
+
+  it.each(['unchanged', 'draft', 'multiline-draft', 'busy', 'unreadable'] as const)(
+    'reads the actual Session composer after a held asynchronous grant (%s)',
+    async (change) => {
+      const f = await fixture('continue');
+      const clamps = await import('../src/session-env-clamp.js');
+      const clamp = clamps.clampRecoveryLaunchForOwner;
+      let entered!: () => void;
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      vi.spyOn(clamps, 'clampRecoveryLaunchForOwner').mockImplementation(async (...args) => {
+        const granted = await clamp(...args);
+        entered();
+        await held;
+        return granted;
+      });
+      const generation = f.worker.getRecoveryContext().generation;
+      const delivery = f.deliver();
+      await waiting;
+      if (change === 'draft') f.pane.screen = '› Unsent owner draft\n  fixture-model high · /tmp\n';
+      if (change === 'multiline-draft') f.pane.screen = '›\n  Unsent owner continuation\n  fixture-model high · /tmp\n';
+      if (change === 'busy') f.pane.screen = 'Working (esc to interrupt)\n›\n  fixture-model high · /tmp\n';
+      if (change === 'unreadable') f.pane.screen = null;
+      expect(f.worker.getRecoveryContext().generation).toBe(generation);
+      release();
+      expect(await delivery).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+      expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(
+        change === 'unchanged' ? 2 : 0
+      );
+    }
+  );
+
+  it.each(['unchanged', 'draft', 'busy', 'unreadable', 'grant'] as const)(
+    'fences a direct composer edit after Session admission but before native input (%s)',
+    async (change) => {
+      const f = await fixture('continue');
+      const nativeSend = f.manager.sendInput.bind(f.manager);
+      vi.spyOn(f.manager, 'sendInput').mockImplementation(async (...args) => {
+        if (change === 'draft') f.pane.screen = '› Direct owner draft\n  fixture-model high · /tmp\n';
+        if (change === 'busy') f.pane.screen = 'Working (esc to interrupt)\n›\n  fixture-model high · /tmp\n';
+        if (change === 'unreadable') f.pane.screen = null;
+        if (change === 'grant') setGrant(false);
+        return nativeSend(...args);
+      });
+      expect(await f.deliver()).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
+      expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(
+        change === 'unchanged' ? 2 : 0
+      );
+    }
+  );
+
+  it.each(['unchanged', 'draft', 'busy', 'approval', 'authentication', 'unreadable'] as const)(
+    'requires the exact delivered composer at Enter and seals partial bytes (%s)',
+    async (change) => {
+      const f = await fixture('continue');
+      const send = effects.exec.getMockImplementation()!;
+      effects.exec.mockImplementation(async (command: string) => {
+        const result = await send(command);
+        if (command.includes('send-keys') && command.includes(' -l ')) {
+          if (change === 'draft')
+            f.pane.screen = '› Authorized fixture continuation owner edit\n  fixture-model high · /tmp\n';
+          if (change === 'busy') f.pane.screen = 'Working (esc to interrupt)\n' + f.pane.screen;
+          if (change === 'approval') f.pane.screen = 'Would you like to approve this?\n' + f.pane.screen;
+          if (change === 'authentication') f.pane.screen = 'Authentication failed\n' + f.pane.screen;
+          if (change === 'unreadable') f.pane.screen = null;
+        }
+        return result;
+      });
+      expect(await f.deliver()).toBe(change === 'unchanged' ? 'sent' : 'unknown');
+      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
+      expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(change === 'unchanged' ? 1 : 0);
+      // The generic delayed submit verifier must never press Enter after this refusal.
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(change === 'unchanged' ? 1 : 0);
+    }
+  );
+
+  it.each([
+    'Healthy Unicode task: café 🧭 漢字',
+    'Repair authentication failed and usage limit handling; explain would you like and approve this UI.',
+    JSON.stringify({ objective: 'First line\nSecond line 🧭', checkpoint: 'Evidence\nNext step' }),
+    'x'.repeat(6000) + '🧭',
+  ])('delivers the exact bounded joined composer without normalizing it: %s', async (prompt) => {
+    const f = await fixture('continue', prompt);
+    expect(await f.deliver()).toBe('sent');
+    const captures = effects.sync.mock.calls
+      .map(([command]) => String(command))
+      .filter((command) => command.includes('capture-pane'));
+    expect(captures).toHaveLength(2);
+    expect(captures.every((command) => command.includes(' -J '))).toBe(true);
+    expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(1);
+  });
+
+  it.each(
+    ['Authentication failed', 'Would you like to approve this?'].flatMap((prompt) =>
+      [false, true].map((surroundingVeto) => ({ prompt, surroundingVeto }))
+    )
+  )(
+    'only excludes actual exact composer text from veto chrome ($prompt, veto=$surroundingVeto)',
+    async ({ prompt, surroundingVeto }) => {
+      const f = await fixture('continue', prompt);
+      const send = effects.exec.getMockImplementation()!;
+      effects.exec.mockImplementation(async (command: string) => {
+        const result = await send(command);
+        if (surroundingVeto && command.includes('send-keys') && command.includes(' -l '))
+          f.pane.screen = `${prompt}\n${f.pane.screen}`;
+        return result;
+      });
+      expect(await f.deliver()).toBe(surroundingVeto ? 'unknown' : 'sent');
+      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
+      expect(commands().filter((command) => command.endsWith(' Enter'))).toHaveLength(surroundingVeto ? 0 : 1);
+    }
+  );
 });
 
 describe('native restart final preparation boundary', () => {

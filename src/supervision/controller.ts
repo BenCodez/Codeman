@@ -64,6 +64,7 @@ export class TaskController {
       this.state.reason = 'restart-requires-resume';
     }
     this.lastPersisted = structuredClone(this.state);
+    this.arm();
   }
   getStatus(): TaskState {
     return structuredClone(this.state);
@@ -112,7 +113,10 @@ export class TaskController {
   private arm(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    if (!this.stopped && this.state.config.enabled && this.state.phase === 'watching') {
+    if (
+      !this.stopped &&
+      (this.state.inFlight?.accepted || (this.state.config.enabled && this.state.phase === 'watching'))
+    ) {
       this.timer = setTimeout(() => {
         this.timer = undefined;
         void this.refresh()
@@ -573,6 +577,13 @@ export class TaskController {
 
   refresh(): Promise<TaskState> {
     return this.enqueue(async () => {
+      if (this.stopped) return this.getStatus();
+      // A durable receipt authorizes only exact reservation cleanup, even after
+      // reload or owner pause. Do not observe progress or dispatch from this path.
+      if (this.state.inFlight?.accepted) {
+        await this.settleAcceptedFlight();
+        return this.getStatus();
+      }
       if (this.stopped || !this.state.config.enabled || this.state.phase !== 'watching') return this.getStatus();
       const revision = this.revision;
       const { observation: o, commands, marker } = await this.deps.observe();

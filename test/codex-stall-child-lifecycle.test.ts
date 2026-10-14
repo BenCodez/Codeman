@@ -5,6 +5,7 @@ import type { RemoteCodexEvidence } from '../src/recovery/remote-codex.js';
 import type { Session } from '../src/session.js';
 import { RecoveryController } from '../src/recovery/controller.js';
 import { initialRecoveryState } from '../src/recovery/types.js';
+import { RecoveryStore } from '../src/recovery/store.js';
 import { sampleRemoteCodexClock } from '../src/recovery/remote-clock.js';
 import { clampExternalCliConfigsForOwner } from '../src/session-env-clamp.js';
 import {
@@ -307,6 +308,280 @@ async function remoteFixture(
 }
 
 describe('actual remote adapter uses the same child lifecycle veto', () => {
+  it('confirms and dispatches unchanged native progress across varying bounded SSH latency', async () => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+    let probes = 0;
+    vi.mocked(f.deps.inspectRemote).mockImplementation(async () => {
+      const latency = [40, 90, 20, 70][probes++] ?? 50;
+      const now = Date.now();
+      return {
+        ...f.evidence,
+        clock: {
+          localBefore: now - latency,
+          localAfter: now,
+          remoteBefore: now - latency / 2,
+          remoteAfter: now - latency / 2,
+        },
+      };
+    });
+    try {
+      for (const delta of [15_100, 17_100, 18_100]) {
+        vi.setSystemTime(CHILD_NOW + delta);
+        await f.controller.refresh();
+      }
+      expect(probes).toBe(4);
+      expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+      expect(f.delivered).not.toHaveBeenCalled();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it.each(['same-time-progress', 'new-progress', 'changed-pane', 'expired-clock', 'invalid-clock'] as const)(
+    'refuses %s at the final native remote read despite clock jitter',
+    async (change) => {
+      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+      let probes = 0;
+      vi.mocked(f.deps.inspectRemote).mockImplementation(async () => {
+        const latency = [40, 90, 20, 70][probes++] ?? 50;
+        const now = Date.now();
+        if (probes === 4) {
+          if (change === 'same-time-progress' || change === 'new-progress')
+            f.evidence.identity.tail +=
+              childEvent(
+                { type: 'agent_message', message: 'Fresh structured work' },
+                change === 'same-time-progress' ? 25_000 : -17_000
+              ) + '\n';
+          if (change === 'changed-pane') f.evidence.pane!.panePid++;
+        }
+        return {
+          ...f.evidence,
+          clock:
+            probes === 4 && change === 'expired-clock'
+              ? clockAt(CHILD_NOW)
+              : {
+                  localBefore: now - latency,
+                  localAfter: now,
+                  remoteBefore: now - latency / 2,
+                  remoteAfter: now - latency / 2 + (probes === 4 && change === 'invalid-clock' ? 20_000 : 0),
+                },
+        };
+      });
+      try {
+        for (const delta of [15_100, 17_100, 18_100]) {
+          vi.setSystemTime(CHILD_NOW + delta);
+          await f.controller.refresh();
+        }
+        expect(probes).toBe(4);
+        expect(f.deps.restartRemote).not.toHaveBeenCalled();
+        expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
+  it('uses the latest plausible local time at the final quiet-interval boundary', async () => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+    let latency = 40;
+    vi.mocked(f.deps.inspectRemote).mockImplementation(async () => {
+      const now = Date.now();
+      return {
+        ...f.evidence,
+        clock: {
+          localBefore: now - latency,
+          localAfter: now,
+          remoteBefore: now - latency / 2,
+          remoteAfter: now - latency / 2,
+        },
+      };
+    });
+    try {
+      vi.setSystemTime(CHILD_NOW + 15_100);
+      const observed = await f.adapter.observe();
+      latency = 1000;
+      expect(
+        await f.adapter.act({
+          key: observed.stallEvidenceKey!,
+          conversationId: CHILD_THREAD,
+          action: 'restart',
+          reason: 'stalled',
+          startedAt: Date.now(),
+          stallProgressAt: observed.progressAt,
+          stallProgressEvidenceKey: observed.progressEvidenceKey,
+          stallQuietPeriodMs: 40_000,
+        })
+      ).toBe('not-sent');
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it('retains one durable live-silence warning across changing clock uncertainty and reload', async () => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, false, true, true);
+    let probes = 0;
+    vi.mocked(f.deps.inspectRemote).mockImplementation(async () => {
+      const latency = [40, 90, 20, 70][probes++ % 4];
+      const now = Date.now();
+      return {
+        ...f.evidence,
+        clock: {
+          localBefore: now - latency,
+          localAfter: now,
+          remoteBefore: now - latency / 2,
+          remoteAfter: now - latency / 2,
+        },
+      };
+    });
+    let restored: RecoveryController | undefined;
+    try {
+      for (const delta of [15_100, 17_100]) {
+        vi.setSystemTime(CHILD_NOW + delta);
+        await f.controller.refresh();
+      }
+      const saved = f.store.get(f.session.id);
+      expect(saved.stallAlert?.progressEvidenceKey).toMatch(/^remote:[a-f0-9]{64}$/);
+      expect(
+        saved.history.filter((event) => event.kind === 'attention' && event.reason === 'stall-unverified')
+      ).toHaveLength(1);
+      f.controller.stop();
+      restored = new RecoveryController(
+        {
+          observe: () => f.adapter.observe(),
+          act: (flight, current) => f.adapter.act(flight, current),
+          persist: (state) => f.store.save(f.session.id, state),
+          changed: vi.fn(),
+        },
+        new RecoveryStore(Reflect.get(f.store, 'path')).get(f.session.id)
+      );
+      vi.setSystemTime(CHILD_NOW + 18_100);
+      await restored.inspect();
+      await restored.refresh();
+      expect(restored.getStatus()).toMatchObject({
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+        stallAlert: saved.stallAlert,
+      });
+      expect(
+        restored
+          .getStatus()
+          .history.filter((event) => event.kind === 'attention' && event.reason === 'stall-unverified')
+      ).toHaveLength(1);
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+    } finally {
+      restored?.stop();
+      await restored?.drain();
+      await f.cleanup();
+    }
+  });
+
+  it.each([false, true])(
+    'never replays accepted native progress after clock jitter and a durable reload, but permits a new proved cycle (legacy numeric history=%s)',
+    async (legacyNumeric) => {
+      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+      let probes = 0;
+      vi.mocked(f.deps.inspectRemote).mockImplementation(async () => {
+        const latency = [40, 90, 20, 70][probes++ % 4];
+        const now = Date.now();
+        return {
+          ...f.evidence,
+          clock: {
+            localBefore: now - latency,
+            localAfter: now,
+            remoteBefore: now - latency / 2,
+            remoteAfter: now - latency / 2,
+          },
+        };
+      });
+      let restored: RecoveryController | undefined;
+      try {
+        for (const delta of [15_100, 17_100, 18_100]) {
+          vi.setSystemTime(CHILD_NOW + delta);
+          await f.controller.refresh();
+        }
+        expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+        f.evidence.pane = { dead: false, paneId: '%7', panePid: 701, screen: CHILD_READY };
+        vi.setSystemTime(CHILD_NOW + 19_100);
+        await f.controller.refresh();
+        expect(f.store.get(f.session.id).inFlight).toBeUndefined();
+        expect(f.store.get(f.session.id).handledEvidence[0]).toMatch(/^stall:[a-f0-9]{64}:remote:[a-f0-9]{64}$/);
+        if (legacyNumeric) {
+          const state = f.store.get(f.session.id);
+          state.handledEvidence = state.handledEvidence.map((key) =>
+            key.replace(/remote:[a-f0-9]{64}$/, String(CHILD_NOW - 25_000 + 20))
+          );
+          await f.store.save(f.session.id, state);
+        }
+        f.controller.stop();
+        restored = new RecoveryController(
+          {
+            observe: () => f.adapter.observe(),
+            act: (flight, current) => f.adapter.act(flight, current),
+            persist: (state) => f.store.save(f.session.id, state),
+            changed: vi.fn(),
+          },
+          new RecoveryStore(Reflect.get(f.store, 'path')).get(f.session.id)
+        );
+        await restored.updateConfig({ enabled: false });
+        await restored.updateConfig({ enabled: true });
+        f.evidence.pane = { dead: true, paneId: '%7', panePid: 701, status: 9, screen: null };
+        for (const delta of [60_000, 62_000, 63_000]) {
+          vi.setSystemTime(CHILD_NOW + delta);
+          await restored.refresh();
+        }
+        expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+        f.evidence.identity.tail +=
+          childEvent({ type: 'agent_message', message: 'New native progress after accepted recovery' }, -20_000) + '\n';
+        for (const delta of [64_000, 66_000, 68_000]) {
+          vi.setSystemTime(CHILD_NOW + delta);
+          await restored.refresh();
+        }
+        expect(f.deps.restartRemote).toHaveBeenCalledTimes(2);
+        expect(restored.getStatus().attempts).toBe(2);
+        expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+      } finally {
+        restored?.stop();
+        await restored?.drain();
+        await f.cleanup();
+      }
+    }
+  );
+
+  it.each([
+    'missing-key',
+    'missing-lower-bound',
+    'malformed-key',
+    'fractional-bound',
+    'future-bound',
+    'zero-bound',
+  ] as const)('keeps incomplete remote progress metadata %s non-actionable', async (change) => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+    const observe = f.adapter.observe.bind(f.adapter);
+    vi.spyOn(f.adapter, 'observe').mockImplementation(async () => {
+      const result = await observe();
+      if (change === 'missing-key') result.progressEvidenceKey = undefined;
+      if (change === 'missing-lower-bound') result.progressLowerBound = undefined;
+      if (change === 'malformed-key') result.progressEvidenceKey = 'remote:unknown';
+      if (change === 'fractional-bound') result.progressLowerBound! -= 0.5;
+      if (change === 'future-bound') result.progressLowerBound = Date.now() + 1;
+      if (change === 'zero-bound') result.progressLowerBound = 0;
+      return result;
+    });
+    try {
+      for (const delta of [15_100, 17_100, 18_100]) {
+        vi.setSystemTime(CHILD_NOW + delta);
+        await f.controller.refresh();
+      }
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().inFlight).toBeUndefined();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it.each([
     { detectStalls: true, recoverCrashes: false },
     { detectStalls: true, recoverCrashes: true },

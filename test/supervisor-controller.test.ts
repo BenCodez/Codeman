@@ -859,7 +859,7 @@ describe('SupervisorController', () => {
       },
       commands: new Map(),
     });
-    await expect(starting).rejects.toThrow(/not ready/);
+    await expect(starting).rejects.toThrow(/superseded by session input/);
     await pausing;
     expect(act).not.toHaveBeenCalled();
     expect(managerTask.getStatus()).toMatchObject({ phase: 'paused' });

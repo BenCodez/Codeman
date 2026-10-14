@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import { isAbsolute } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import type { CodexConfig, SessionRemote } from '../types.js';
+import { CODEX_REASONING_EFFORTS } from '../types/session.js';
 import { buildSshConnectionArgs, remoteLoginShellCommand, remoteSshTarget, shellescape } from '../remote-hosts.js';
 import { runWithRemoteSshLimit } from '../remote-ssh-limiter.js';
 import { buildRemoteCodexPaneCommand, remoteTmuxSessionName } from '../tmux-manager.js';
@@ -110,6 +111,9 @@ const out=x=>process.stdout.write('${MARKER}'+Buffer.from(JSON.stringify(x)).toS
 // tmux quoted strings cannot contain raw newlines: emit control bytes as octal outside quotes.
 const tq=x=>"'"+String(x).replace(/['\x01-\x1f\x7f]/g,c=>c==="'"?"'\\''":"'\\"+c.charCodeAt(0).toString(8).padStart(3,"0")+"'")+"'";
 const nativeEffect=(target,fields,args)=>{check();const terms=Object.entries(fields).map(([key,value])=>"#{==:#{"+key+"},"+value+"}"),predicate=terms.reduce((all,term)=>"#{&&:"+all+","+term+"}");const result=cp.execFileSync("tmux",["-L","codeman-remote","if-shell","-F","-t",target,predicate,args.map(tq).join(" "),"display-message -p CODEMAN_REMOTE_PANE_REFUSED"],{encoding:"utf8",timeout:1500,maxBuffer:16384}).trim();if(result==="CODEMAN_REMOTE_PANE_REFUSED")return false;if(result)refusal("unreadable");return true};
+// Joined captures retain literal multiline input while removing native wrapping.
+// Compare exactly the bytes already pasted, never infer continuation-row indentation.
+const composerCurrent=(target,expected)=>{try{check();const screen=cp.execFileSync("tmux",["-L","codeman-remote","capture-pane","-p","-J","-t",target],{encoding:"utf8",timeout:1500,maxBuffer:81920});check();const rows=screen.split("\n");while(rows.length&&!rows[rows.length-1].trim())rows.pop();let shortcut="";if(rows.length&&/^\s*(?:← for agents · )?\? for shortcuts\s*$/u.test(rows[rows.length-1]))shortcut=rows.pop();const footer=rows.pop();if(!footer||!/^\s{2,}\S+\s+(?:${['default', ...CODEX_REASONING_EFFORTS].join('|')})\s+·\s+\S.*$/u.test(footer))return false;const body=rows.join("\n"),candidates=expected===undefined?["","Ask Codex to do anything"]:[expected];for(const text of candidates){if(!body.endsWith(text))continue;const prefix=body.slice(0,body.length-text.length),match=/(?:^|\n)[ \t]*› ?$/u.exec(prefix);if(!match)continue;const chrome=prefix.slice(0,match.index)+"\n"+footer+"\n"+shortcut;if(!/esc to interrupt|reconnecting|would you like|approve this|sign in|log in|authentication failed|usage limit|limit reached/i.test(chrome))return true}return false}catch{return false}};
 
 const req=JSON.parse(Buffer.from(process.argv[1]||'','base64').toString('utf8'));
 const uuid=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
@@ -135,7 +139,7 @@ let identity={reason:'unverified'},identityTailHash,identityProof;try{visit(path
 const name=req.remoteSessionName;let session='present',pane,screenText,nativeFields;try{cp.execFileSync('tmux',['-L','codeman-remote','has-session','-t',name],{stdio:'ignore',timeout:1500})}catch(e){if(e&&e.status===1)session='missing';else refusal('unreadable')}
 if(session==='present'){const row=cp.execFileSync('tmux',['-L','codeman-remote','list-panes','-t',name,'-F','#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}|#{pane_pid}'],{encoding:'utf8',timeout:1500,maxBuffer:16384}).replace(/\n$/,'').split('\n');if(row.length!==1||row[0].includes('\r'))refusal('unverified');const f=row[0].split('|');if(f.length!==5||!/^[01]$/.test(f[0])||!/^%(?:0|[1-9]\d*)$/.test(f[3])||!Number.isSafeInteger(+f[3].slice(1))||!/^[1-9]\d*$/.test(f[4])||!Number.isSafeInteger(+f[4]))refusal('unverified');const number=x=>{if(x==="")return undefined;if(!/^(?:0|[1-9]\d{0,4})$/.test(x)||+x>255)refusal("unverified");return +x},signal=x=>{if(x===""||/^(?:0|[1-9]\d{0,4})$/.test(x)){const n=number(x);if(n!==undefined&&n!==0&&!Object.values(signals).includes(n))refusal("unverified");return n;}const n=/^[A-Z][A-Z0-9]{0,15}$/.test(x)?signals["SIG"+x]:undefined;if(!Number.isSafeInteger(n)||n<=0||n>65535)refusal("unverified");return n};pane={dead:f[0]==='1',status:number(f[1]),signal:signal(f[2]),paneId:f[3],panePid:+f[4]};if((pane.status!==undefined&&(pane.signal||0)>0)||(!pane.dead&&(pane.status!==undefined||pane.signal!==undefined)))refusal("unverified");nativeFields={session_name:name,pane_id:f[3],pane_pid:f[4],pane_dead:f[0],pane_dead_status:f[1],pane_dead_signal:f[2]};if(!pane.dead){screenText=cp.execFileSync('tmux',['-L','codeman-remote','capture-pane','-p','-t',pane.paneId],{encoding:'utf8',timeout:1500,maxBuffer:65536});pane.screen=Buffer.from(screenText).toString('base64')}}
 if(!req.action&&identity.reason==='verified'){try{confirmWitness()}catch(e){identity={reason:e&&e.reason||'unreadable'}}}
-let action,actionAt;if(req.action){action='not-sent';const a=req.action,e=a.expected;let identityMatch=identity.reason==='verified'&&identity.tailTruncated===false&&identity.conversationId===e.conversationId&&identityTailHash===e.tailHash;const paneMatch=session==='present'&&pane&&pane.paneId===e.paneId&&pane.panePid===e.panePid;if(identityMatch){try{const h=header(identityProof.p),t=read(identityProof.p,262144,true),matched=history();confirmWitness();identityMatch=!!matched&&matched.id===identityProof.id&&h.id===identityProof.id&&h.cwd===identityProof.cwd&&h.origin===identityProof.origin&&h.createdAt===identityProof.createdAt&&!h.sub&&!t.truncated&&t.text.endsWith('\n')&&crypto.createHash('sha256').update(t.text,'utf8').digest('hex')===e.tailHash}catch{identityMatch=false}}if(a.kind==='input'&&identityMatch&&paneMatch&&!pane.dead&&crypto.createHash('sha256').update(screenText,'utf8').digest('hex')===e.screenHash){let pasted=false,chunk="",bytes=0;const paste=()=>{if(!nativeEffect(pane.paneId,nativeFields,["send-keys","-l","-t",pane.paneId,chunk])){if(pasted)refusal("unverified");return false}pasted=true;return true};let current=true;for(const point of actionPrompt){const n=Buffer.byteLength(point,"utf8");if(bytes+n>8192){if(!paste()){current=false;break}chunk="";bytes=0}chunk+=point;bytes+=n}if(current&&(chunk||!pasted))current=paste();if(current){confirmWitness();check();actionAt=Date.now();if(!nativeEffect(pane.paneId,nativeFields,["send-keys","-t",pane.paneId,"Enter"]))refusal("unverified");action="sent"}}else if(a.kind==='restart'&&identityMatch&&paneMatch&&pane.dead&&pane.status===e.status&&pane.signal===e.signal){if(nativeEffect(pane.paneId,nativeFields,['respawn-pane','-c',req.workingDir,'-t',pane.paneId,a.command]))action='sent'}else if(a.kind==='restore'&&identityMatch&&session==='missing'){
+let action,actionAt;if(req.action){action='not-sent';const a=req.action,e=a.expected;let identityMatch=identity.reason==='verified'&&identity.tailTruncated===false&&identity.conversationId===e.conversationId&&identityTailHash===e.tailHash;const paneMatch=session==='present'&&pane&&pane.paneId===e.paneId&&pane.panePid===e.panePid;if(identityMatch){try{const h=header(identityProof.p),t=read(identityProof.p,262144,true),matched=history();confirmWitness();identityMatch=!!matched&&matched.id===identityProof.id&&h.id===identityProof.id&&h.cwd===identityProof.cwd&&h.origin===identityProof.origin&&h.createdAt===identityProof.createdAt&&!h.sub&&!t.truncated&&t.text.endsWith('\n')&&crypto.createHash('sha256').update(t.text,'utf8').digest('hex')===e.tailHash}catch{identityMatch=false}}if(a.kind==='input'&&identityMatch&&paneMatch&&!pane.dead&&crypto.createHash('sha256').update(screenText,'utf8').digest('hex')===e.screenHash){let pasted=false,pastedText="",chunk="",bytes=0;const paste=()=>{confirmWitness();if(!composerCurrent(pane.paneId,pasted?pastedText:undefined)){if(pasted)refusal("unverified");return false}confirmWitness();if(!nativeEffect(pane.paneId,nativeFields,["send-keys","-l","-t",pane.paneId,chunk])){if(pasted)refusal("unverified");return false}pasted=true;pastedText+=chunk;return true};let current=true;for(const point of actionPrompt){const n=Buffer.byteLength(point,"utf8");if(bytes+n>8192){if(!paste()){current=false;break}chunk="";bytes=0}chunk+=point;bytes+=n}if(current&&(chunk||!pasted))current=paste();if(current){confirmWitness();if(!composerCurrent(pane.paneId,pastedText))refusal("unverified");confirmWitness();check();actionAt=Date.now();if(!nativeEffect(pane.paneId,nativeFields,["send-keys","-t",pane.paneId,"Enter"]))refusal("unverified");action="sent"}}else if(a.kind==='restart'&&identityMatch&&paneMatch&&pane.dead&&pane.status===e.status&&pane.signal===e.signal){if(nativeEffect(pane.paneId,nativeFields,['respawn-pane','-c',req.workingDir,'-t',pane.paneId,a.command]))action='sent'}else if(a.kind==='restore'&&identityMatch&&session==='missing'){
 // Start only an inert private wait. Even an immediately failing Codex must see
 // remain-on-exit and the ordinary owned-SSH TUI configuration before it starts.
 check();const channel='codeman-restore-'+crypto.randomBytes(16).toString('hex');
@@ -151,6 +155,12 @@ if(!inertDead)refusal('unverified');confirmWitness();check();
 if(!nativeEffect(createdPane,{session_name:name,session_id:createdSession,pane_id:createdPane,pane_pid:createdPid,pane_dead:1,pane_dead_status:1,pane_dead_signal:'',pid:createdServerPid},['respawn-pane','-c',req.workingDir,'-t',createdPane,a.command]))refusal('unverified');action='sent'}}
 out({v:1,session,pane,identity,action,actionAt,clock:{remoteBefore:started,remoteAfter:Date.now()}});
 `;
+
+// Encoding only the static reader avoids expanding its quotes at every nested
+// shell layer, retaining the bounded 64 KiB prompt inside the 120 KiB command cap.
+const REMOTE_CODEX_READER_SOURCE = `eval(Buffer.from(${JSON.stringify(
+  Buffer.from(REMOTE_CODEX_INSPECT_SCRIPT.replace(/^\/\/[^\n]*\n/gm, '')).toString('base64')
+)},"base64").toString("utf8"))`;
 
 function remoteCommand(remote: SessionRemote, command: string): string {
   return [...buildSshConnectionArgs(remote), remoteSshTarget(remote), shellescape(command)].join(' ');
@@ -248,9 +258,7 @@ export function buildRemoteCodexEvidenceCommand(remote: SessionRemote, request: 
   ).toString('base64');
   return remoteCommand(
     remote,
-    remoteLoginShellCommand(
-      `node -e ${shellescape(REMOTE_CODEX_INSPECT_SCRIPT.replace(/^\/\/[^\n]*\n/gm, ''))} ${payload}`
-    )
+    remoteLoginShellCommand(`node -e ${shellescape(REMOTE_CODEX_READER_SOURCE)} ${payload}`)
   );
 }
 
@@ -430,9 +438,7 @@ function buildRemoteCodexActionCommand(
   ).toString('base64');
   return remoteCommand(
     remote,
-    remoteLoginShellCommand(
-      `node -e ${shellescape(REMOTE_CODEX_INSPECT_SCRIPT.replace(/^\/\/[^\n]*\n/gm, ''))} ${payload}`
-    )
+    remoteLoginShellCommand(`node -e ${shellescape(REMOTE_CODEX_READER_SOURCE)} ${payload}`)
   );
 }
 

@@ -14,6 +14,7 @@ import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import { TaskController, type TaskDependencies } from '../src/supervision/controller.js';
+import type { TaskState } from '../src/supervision/schema.js';
 import { TaskStore } from '../src/supervision/store.js';
 import { latestProgressMarker } from '../src/supervision/evidence.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
@@ -52,6 +53,17 @@ interface Internals {
   getTaskController(session: Session): TaskController | undefined;
   getRecoveryController(session: Session): RecoveryController | undefined;
   stopRecoveryController(id: string, drop: boolean): Promise<void>;
+}
+function expectManagerEvidenceUnchanged(actual: TaskState, before: TaskState, paused: boolean): void {
+  const expected = paused
+    ? {
+        ...before,
+        phase: 'paused',
+        reason: 'owner-paused',
+        history: [...before.history, { at: Date.now(), reason: 'owner-paused' }].slice(-100),
+      }
+    : before;
+  expect(actual).toEqual(expected);
 }
 function fakeSession(id: string, conversationId: string): Session {
   const muxSession = {
@@ -312,8 +324,8 @@ describe('manager authority at the real server boundary', () => {
         expect(manager.getStatus().inFlight).toBeUndefined();
         expect(manager.getStatus().workers[0].assignments).toBe(0);
       }
-      expect(managerTask.getStatus()).toEqual(before);
-      expect(internals.taskStore.get(MANAGER)).toEqual(before);
+      expectManagerEvidenceUnchanged(managerTask.getStatus(), before, !allowed);
+      expectManagerEvidenceUnchanged(internals.taskStore.get(MANAGER), before, !allowed);
     }
   );
   it.each(
@@ -352,7 +364,8 @@ describe('manager authority at the real server boundary', () => {
         );
       } else await appendProgress(progress);
       await expect(manager[action](WORKER, 'fresh-manager-progress-veto')).rejects.toThrow(/owner Start/);
-      expect(managerTask.getStatus()).toEqual(before);
+      expectManagerEvidenceUnchanged(managerTask.getStatus(), before, true);
+      expectManagerEvidenceUnchanged(internals.taskStore.get(MANAGER), before, true);
       expect(internals.taskStore.get(MANAGER).criteria[0].verified).toBe(false);
       expect(manager.getStatus()).toMatchObject({
         phase: 'paused',
@@ -414,9 +427,9 @@ describe('manager authority at the real server boundary', () => {
         await expect(operating).rejects.toThrow(/owner Start/);
         expect(effects).not.toHaveBeenCalled();
       }
-      // Read-only report validation cannot advance the manager's progress or certify acceptance.
-      expect(managerTask.getStatus()).toEqual(cached);
-      expect(internals.taskStore.get(MANAGER)).toEqual(cached);
+      // Attention pauses polling without advancing progress or certifying acceptance.
+      expectManagerEvidenceUnchanged(managerTask.getStatus(), cached, !allowed);
+      expectManagerEvidenceUnchanged(internals.taskStore.get(MANAGER), cached, !allowed);
       expect(cached.criteria[0].verified).toBe(false);
     }
   );
@@ -567,7 +580,11 @@ describe('manager authority at the real server boundary', () => {
     )
   )('refuses $action with manager $kind before touching the worker', async ({ action, kind }) => {
     await veto(kind);
-    await expect(manager[action](WORKER, 'vetoed-operation')).rejects.toThrow(/owner Start|cancelled/);
+    await expect(manager[action](WORKER, 'vetoed-operation')).rejects.toThrow(
+      kind === 'live-malformed' || kind === 'unreadable-journal'
+        ? /Task state could not be saved/
+        : /owner Start|cancelled/
+    );
     expect(taskAct).not.toHaveBeenCalled();
     expect(recoveryAct).not.toHaveBeenCalled();
     expect(manager.getStatus()).toMatchObject({

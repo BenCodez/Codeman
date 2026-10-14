@@ -140,6 +140,7 @@ export class CodexRecoveryAdapter {
     generation: number;
     conversationId: string;
     stallProgressAt?: number;
+    stallProgressEvidenceKey?: string;
     stallEvidenceKey?: string;
     processProofKey?: string;
     nativePane?: RecoveryPaneIdentity;
@@ -281,7 +282,21 @@ export class CodexRecoveryAdapter {
               : context.intentionalStopAt,
         });
         result.at = remoteToLocal(result.at, clock);
-        if (result.progressAt !== undefined) result.progressAt = remoteCompletionToLocal(result.progressAt, clock);
+        if (result.progressAt !== undefined) {
+          const nativeProgressAt = result.progressAt;
+          result.progressAt = remoteCompletionToLocal(nativeProgressAt, clock);
+          result.progressLowerBound = remoteToLocal(nativeProgressAt, clock);
+          // Only validated native events define progress. Probe latency and rollout
+          // metadata changes must not mint another silence/recovery cycle.
+          result.progressEvidenceKey = `remote:${createHash('sha256')
+            .update(
+              remoteTail
+                .split('\n')
+                .filter((line) => line.trim() && JSON.parse(line)?.type === 'event_msg')
+                .join('\n')
+            )
+            .digest('hex')}`;
+        }
         return result;
       };
       if (session.codexConfig?.resumeSessionId !== conversationId) {
@@ -395,10 +410,13 @@ export class CodexRecoveryAdapter {
                   ? {
                       stallEvidenceKey: childWork.stallEvidenceKey,
                       progressAt: childWork.progressAt ?? childWork.at,
+                      progressEvidenceKey: childWork.progressEvidenceKey,
+                      progressLowerBound: childWork.progressLowerBound,
                       stallObservedAt: remoteClock.localBefore,
                       stallRestartable:
                         crashAt > 0 &&
-                        context.intentionalStopAt < (childWork.progressAt ?? childWork.at) - 2000 &&
+                        context.intentionalStopAt <
+                          (childWork.progressLowerBound ?? childWork.progressAt ?? childWork.at) - 2000 &&
                         detectedAt >= remoteClock.localAfter &&
                         detectedAt - remoteClock.localBefore <= 15_000,
                     }
@@ -457,6 +475,7 @@ export class CodexRecoveryAdapter {
             ? {
                 stallEvidenceKey: observation.stallEvidenceKey,
                 stallProgressAt: observation.progressAt ?? observation.at,
+                stallProgressEvidenceKey: observation.progressEvidenceKey,
               }
             : {}),
           ...(pane.dead
@@ -744,8 +763,20 @@ export class CodexRecoveryAdapter {
         ? current.stallRestartable === true &&
           current.stallEvidenceKey === flight.key &&
           previous.stallProgressAt !== undefined &&
-          (flight.stallProgressAt === undefined || flight.stallProgressAt === previous.stallProgressAt) &&
-          (current.progressAt ?? current.at) === previous.stallProgressAt
+          (previous.stallProgressEvidenceKey !== undefined
+            ? flight.stallProgressEvidenceKey === previous.stallProgressEvidenceKey &&
+              current.progressEvidenceKey === previous.stallProgressEvidenceKey &&
+              flight.stallQuietPeriodMs !== undefined &&
+              Number.isInteger(flight.stallQuietPeriodMs) &&
+              flight.stallQuietPeriodMs >= 10_000 &&
+              flight.stallQuietPeriodMs <= 3_600_000 &&
+              current.progressAt !== undefined &&
+              Number.isFinite(current.progressAt) &&
+              Date.now() - current.progressAt >= flight.stallQuietPeriodMs
+            : flight.stallProgressEvidenceKey === undefined &&
+              current.progressEvidenceKey === undefined &&
+              (flight.stallProgressAt === undefined || flight.stallProgressAt === previous.stallProgressAt) &&
+              (current.progressAt ?? current.at) === previous.stallProgressAt)
         : current.safeToAct && current.evidenceKey === flight.key;
     if (
       flight.reason === 'stalled' &&

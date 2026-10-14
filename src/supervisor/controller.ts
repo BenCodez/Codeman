@@ -99,6 +99,7 @@ export class SupervisorController {
       this.state.reason = this.state.inFlight ? 'restart-in-flight' : 'restart-requires-resume';
     }
     this.lastPersisted = structuredClone(this.state);
+    if (this.state.enabled) void this.suspendManager();
   }
 
   getStatus(): SupervisorState {
@@ -108,6 +109,7 @@ export class SupervisorController {
   stop(): void {
     this.stopped = true;
     this.revision++;
+    void this.suspendManager();
   }
 
   async drain(): Promise<void> {
@@ -131,7 +133,21 @@ export class SupervisorController {
     this.queue = result.catch(() => {});
     return result;
   }
+  /** Task.pause invalidates delivery authority synchronously, before its queued durable save. */
+  private suspendManager(): Promise<unknown[]> {
+    try {
+      return this.deps.pauseManager().then(
+        () => [],
+        (error: unknown) => [error]
+      );
+    } catch (error) {
+      return Promise.resolve([error]);
+    }
+  }
   private async save(reason: string, workerId?: string): Promise<SupervisorState> {
+    // Start the Task veto before either journal await. A failed pause must not
+    // prevent saving the supervisor's uncertainty or restore manager authority.
+    let managerPause = this.state.phase !== 'active' ? this.suspendManager() : undefined;
     this.state.reason = reason;
     this.state.history = [...this.state.history, { at: this.now(), reason, ...(workerId ? { workerId } : {}) }].slice(
       -100
@@ -145,10 +161,14 @@ export class SupervisorController {
       this.state.enabled = false;
       this.state.phase = 'blocked';
       this.state.reason = 'persistence-failed';
+      managerPause ??= this.suspendManager();
       this.deps.changed(this.getStatus());
+      await managerPause;
       throw new Error('Supervisor state could not be saved');
     }
     this.deps.changed(this.getStatus());
+    const pauseErrors = await managerPause;
+    if (pauseErrors?.length) throw pauseErrors[0];
     return this.getStatus();
   }
 
@@ -174,9 +194,7 @@ export class SupervisorController {
         this.state.workers = config.workers.map((worker) => ({ ...worker, assignments: 0 }));
         this.state.startedAt = undefined;
         this.state.phase = config.enabled ? 'ready' : 'disabled';
-        const saved = await this.save('configured');
-        await this.deps.pauseManager();
-        return saved;
+        return this.save('configured');
       })
     );
   }
@@ -224,16 +242,16 @@ export class SupervisorController {
 
   pause(): Promise<SupervisorState> {
     this.revision++;
+    void this.suspendManager();
     return this.enqueue(async () => {
       this.state.phase = 'paused';
-      const saved = await this.save('owner-paused');
-      await this.deps.pauseManager();
-      return saved;
+      return this.save('owner-paused');
     });
   }
 
   reset(): Promise<SupervisorState> {
     this.revision++;
+    void this.suspendManager();
     return this.enqueue(async () => {
       const id = this.state.supervisorSessionId;
       this.state = initialSupervisorState(id);

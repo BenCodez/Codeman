@@ -94,10 +94,17 @@ export interface CodexClassificationContext {
 
 /** Only an empty, visible Codex composer certifies that a prompt can be delivered. */
 export function hasEmptyCodexComposer(screen: string): boolean {
-  const rows = screen
-    .slice(-16_384)
-    .split('\n')
-    .filter((r) => r.trim());
+  return hasCodexComposerText(screen);
+}
+
+/** Exact native input acknowledgement; wrapped rows must be joined by the capture producer. */
+export function hasCodexComposerText(screen: string, expected?: string): boolean {
+  const capturedRows = screen.slice(-16_384).split('\n');
+  // Exact pending input must retain blank draft rows; only unused capture rows
+  // after the footer may disappear. The empty-composer classifier keeps its
+  // historical whitespace handling.
+  const rows = expected === undefined ? capturedRows.filter((row) => row.trim()) : capturedRows;
+  if (expected !== undefined) while (rows.length && !rows[rows.length - 1].trim()) rows.pop();
   const tail = rows.slice(-5);
   let index = -1;
   for (let i = tail.length - 1; i >= 0; i--) {
@@ -108,12 +115,13 @@ export function hasEmptyCodexComposer(screen: string): boolean {
   }
   if (index < 0) return false;
   const composer = tail[index];
-  const text = composer.replace(/^\s*›\s*/u, '').trim();
-  if (text !== '' && text !== 'Ask Codex to do anything') return false;
+  const text = composer.replace(/^\s*› ?/u, '');
+  if (expected !== undefined ? text !== expected : text.trim() !== '' && text.trim() !== 'Ask Codex to do anything')
+    return false;
   // A blank first row can still contain a multiline draft. Every subsequent row must be
   // known footer chrome; unknown rows (including a changed TUI layout) veto delivery.
   const after = tail.slice(index + 1);
-  if (!after.length) return true;
+  if (!after.length) return expected === undefined;
   const effort = ['default', ...CODEX_REASONING_EFFORTS].join('|');
   const footer = new RegExp(`^\\s{2,}\\S+\\s+(?:${effort})\\s+·\\s+\\S.*$`, 'u');
   return (
