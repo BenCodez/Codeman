@@ -2498,6 +2498,20 @@ export class WebServer extends EventEmitter {
     const result = await this.tabLayouts.runStaleSessionCleanup(activeSessionIds, (ids) =>
       this.store.cleanupSessionsByIds(ids)
     );
+    // Prior boots may already have removed state.json rows. Prune the whole
+    // readable journal, retaining live/history/restore owners and reservations.
+    // This optional domain must not block unrelated state/layout cleanup.
+    try {
+      await this.recoveryStore.pruneOrphans(
+        (id) =>
+          this.sessions.has(id) ||
+          this.store.getSession(id) !== null ||
+          this.recoveryControllers.has(id) ||
+          rebootRestoreRegistry.hasOutstanding(id)
+      );
+    } catch (err) {
+      console.warn(`[Server] Recovery journal cleanup failed: ${getErrorMessage(err)}`);
+    }
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
