@@ -2,6 +2,8 @@
 import { createHash } from 'node:crypto';
 import { openSync, closeSync, fstatSync, lstatSync, readSync, constants as fsConstants } from 'node:fs';
 import type { Session } from '../session.js';
+import type { RecoveryPaneIdentity } from '../mux-interface.js';
+import { matchesNativePaneSignal } from './native-pane-signal.js';
 import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../session-env-clamp.js';
 import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './codex-home.js';
@@ -83,11 +85,65 @@ function remotePaneEvidenceKey(
 }
 
 export class CodexRecoveryAdapter {
+  private livePaneProof?: { paneId: string; panePid: number; at: number; conversationId: string; scope: string };
+  private latestLiveProofAt?: number;
+
+  private liveProofScope(): string {
+    const context = this.session.getRecoveryContext();
+    return JSON.stringify([
+      context.generation,
+      this.session.owner,
+      this.session.workingDir,
+      this.session.codexConfig,
+      this.session.getEnvOverridesForPersist(),
+      context.codexHome,
+      this.session.remote,
+    ]);
+  }
+
+  /** Live evidence is private, process-specific, short-lived and never restored from disk. */
+  hasLivePaneProof(at: number): boolean {
+    const elapsed = Date.now() - at;
+    if (this.session.remote) {
+      const live = this.remotePaneContinuity;
+      const pane = this.proof?.remotePane;
+      return (
+        Number.isFinite(at) &&
+        this.latestLiveProofAt === at &&
+        !!live &&
+        live.liveObservedAt === at &&
+        live.deadObservedAt !== undefined &&
+        live.scope === this.liveProofScope() &&
+        !!pane &&
+        this.proof?.generation === live.generation &&
+        pane.conversationId === live.conversationId &&
+        pane.tailHash === live.tailHash &&
+        pane.paneId === live.paneId &&
+        pane.panePid === live.panePid &&
+        Number.isFinite(elapsed) &&
+        elapsed >= 0 &&
+        elapsed <= REMOTE_LIVE_PROOF_MAX_AGE_MS
+      );
+    }
+    return (
+      Number.isFinite(at) &&
+      !!this.livePaneProof &&
+      this.latestLiveProofAt === at &&
+      this.livePaneProof?.at === at &&
+      this.livePaneProof.scope === this.liveProofScope() &&
+      Number.isFinite(elapsed) &&
+      elapsed >= 0 &&
+      elapsed <= 30_000
+    );
+  }
   private proof?: {
     key: string;
     generation: number;
     conversationId: string;
     stallProgressAt?: number;
+    stallEvidenceKey?: string;
+    processProofKey?: string;
+    nativePane?: RecoveryPaneIdentity;
     remotePane?: RemoteCodexRestartRequest['expectedPane'] & RemoteCodexIdentityGuard;
   };
   private remotePromptProof?: {
@@ -113,6 +169,7 @@ export class CodexRecoveryAdapter {
     paneId: string;
     panePid: number;
     liveObservedAt: number;
+    scope: string;
     deadObservedAt?: number;
   };
   constructor(
@@ -122,14 +179,14 @@ export class CodexRecoveryAdapter {
   ) {}
 
   async observe(): Promise<RecoveryObservation> {
+    this.latestLiveProofAt = undefined;
     const session = this.session;
     const context = session.getRecoveryContext();
-    const unknown = (reason: RecoveryObservation['reason']): RecoveryObservation => ({
-      activity: 'unknown',
-      reason,
-      at: Date.now(),
-      safeToAct: false,
-    });
+    const unknown = (reason: RecoveryObservation['reason']): RecoveryObservation => {
+      this.livePaneProof = undefined;
+      this.remotePaneContinuity = undefined;
+      return { activity: 'unknown', reason, at: Date.now(), safeToAct: false };
+    };
     this.proof = undefined;
     this.missingProof = undefined;
     this.verifiedTail = undefined;
@@ -259,7 +316,15 @@ export class CodexRecoveryAdapter {
       }
       if (evidence.session !== 'present') return unknown('pane-unverified');
       const pane = evidence.pane;
-      if (!pane) return unknown('pane-unverified');
+      if (
+        !pane ||
+        !/^%\d+$/.test(pane.paneId) ||
+        !Number.isSafeInteger(Number(pane.paneId.slice(1))) ||
+        !Number.isSafeInteger(pane.panePid) ||
+        pane.panePid <= 0
+      )
+        return unknown('pane-unverified');
+      if (!pane.dead && (pane.status !== undefined || pane.signal !== undefined)) return unknown('pane-unverified');
       let observation: RecoveryObservation;
       if (pane.dead) {
         if (pane.status === 0 && !pane.signal) {
@@ -285,6 +350,7 @@ export class CodexRecoveryAdapter {
           const continuity = this.remotePaneContinuity;
           const transitionedFromLive =
             continuity?.generation === context.generation &&
+            continuity.scope === this.liveProofScope() &&
             continuity.conversationId === conversationId &&
             continuity.tailHash === tailHash &&
             continuity.paneId === pane.paneId &&
@@ -295,6 +361,7 @@ export class CodexRecoveryAdapter {
               : undefined;
           if (transitionedFromLive && transitionedFromLive.deadObservedAt === undefined)
             transitionedFromLive.deadObservedAt = detectedAt;
+          if (transitionedFromLive) this.latestLiveProofAt = transitionedFromLive.liveObservedAt;
           // A rollout mtime cannot date a crash that wrote no final event. Only
           // an exact live→dead pane transition may mint a current timestamp;
           // missing historical time otherwise stays ancient and fail-closed.
@@ -317,25 +384,44 @@ export class CodexRecoveryAdapter {
                 ...(transitionedFromLive ? { liveProofAt: transitionedFromLive.liveObservedAt } : {}),
                 evidenceKey,
                 safeToAct: crashAt > 0 && context.intentionalStopAt < crashAt - 2000,
+                ...(childWork.activity === 'working' &&
+                childWork.reason === 'turn-running' &&
+                childWork.stallEvidenceKey
+                  ? {
+                      stallEvidenceKey: childWork.stallEvidenceKey,
+                      progressAt: childWork.progressAt ?? childWork.at,
+                      stallObservedAt: remoteClock.localBefore,
+                      stallRestartable:
+                        crashAt > 0 &&
+                        context.intentionalStopAt < (childWork.progressAt ?? childWork.at) - 2000 &&
+                        detectedAt >= remoteClock.localAfter &&
+                        detectedAt - remoteClock.localBefore <= 15_000,
+                    }
+                  : {}),
               };
         } else return unknown('pane-unverified');
       } else {
-        const observedAt = Date.now();
+        const observedAt = remoteClock.localBefore;
         remoteDeadPaneFirstSeenBySession.delete(session);
-        this.remotePaneContinuity = {
-          generation: context.generation,
-          conversationId,
-          tailHash,
-          paneId: pane.paneId,
-          panePid: pane.panePid,
-          liveObservedAt: observedAt,
-        };
+        this.remotePaneContinuity =
+          Date.now() >= remoteClock.localAfter && Date.now() - observedAt <= REMOTE_LIVE_PROOF_MAX_AGE_MS
+            ? {
+                generation: context.generation,
+                conversationId,
+                tailHash,
+                paneId: pane.paneId,
+                panePid: pane.panePid,
+                liveObservedAt: observedAt,
+                scope: this.liveProofScope(),
+              }
+            : undefined;
         observation = classifyRemoteTail(pane.screen, session.isBusy());
         observation.processReady =
           evidence.identity.tailTruncated === false &&
           pane.screen !== null &&
           hasEmptyCodexComposer(pane.screen) &&
           !['blocked', 'paused', 'unknown'].includes(observation.activity);
+        if (observation.processReady === true && this.remotePaneContinuity) observation.processReadyAt = observedAt;
         if (observation.processReady && pane.screen !== null) {
           this.remotePromptProof = {
             generation: context.generation,
@@ -352,11 +438,22 @@ export class CodexRecoveryAdapter {
         }
       }
       observation.conversationId = conversationId;
-      if (observation.safeToAct && observation.evidenceKey) {
+      const proofKey = observation.safeToAct
+        ? observation.evidenceKey
+        : observation.stallRestartable
+          ? observation.stallEvidenceKey
+          : undefined;
+      if (proofKey) {
         this.proof = {
-          key: observation.evidenceKey,
+          key: proofKey,
           generation: context.generation,
           conversationId,
+          ...(observation.stallRestartable
+            ? {
+                stallEvidenceKey: observation.stallEvidenceKey,
+                stallProgressAt: observation.progressAt ?? observation.at,
+              }
+            : {}),
           ...(pane.dead
             ? {
                 remotePane: {
@@ -373,6 +470,7 @@ export class CodexRecoveryAdapter {
       }
       return observation;
     }
+    const paneReadStartedAt = Date.now();
     const [identity, pane] = await Promise.all([
       resolveCodexIdentity({
         sessionId: session.id,
@@ -409,6 +507,8 @@ export class CodexRecoveryAdapter {
         env: JSON.stringify(this.session.getEnvOverridesForPersist()),
       };
     if (!pane) return unknown('pane-unverified');
+    if (!pane.dead && (pane.status !== undefined || pane.signal !== undefined || !!pane.paneSignalToken))
+      return unknown('pane-unverified');
     if (session.codexConfig?.resumeSessionId !== identity.conversationId) {
       session.pinRecoveryConversation(identity.conversationId);
       this.persistSession();
@@ -435,6 +535,8 @@ export class CodexRecoveryAdapter {
         pane.signal === exit.signal &&
         ((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0)
       ) {
+        if (!Number.isFinite(exit.at) || exit.at <= 0 || exit.at > Number.MAX_SAFE_INTEGER || exit.at > Date.now())
+          return unknown('pane-unverified');
         // A confirmed parent exit cannot clear child work, owner intent or permission/authentication vetoes.
         const childWork = classifyCodexTail(identity.tail, {
           conversationId: identity.conversationId,
@@ -453,6 +555,15 @@ export class CodexRecoveryAdapter {
               at: exit.at,
               evidenceKey: `${identity.conversationId}:pane:${exit.at}:${pane.status ?? pane.signal}`,
               safeToAct: context.intentionalStopAt < exit.at - 2000,
+              // Keep the structured unfinished-turn proof alongside the watcher
+              // crash proof. The controller's explicit stall policy chooses it.
+              ...(childWork.activity === 'working' && childWork.reason === 'turn-running' && childWork.stallEvidenceKey
+                ? {
+                    stallEvidenceKey: childWork.stallEvidenceKey,
+                    progressAt: childWork.progressAt ?? childWork.at,
+                    stallRestartable: context.intentionalStopAt < (childWork.progressAt ?? childWork.at) - 2000,
+                  }
+                : {}),
             };
       } else if (
         classified.activity === 'working' &&
@@ -482,6 +593,65 @@ export class CodexRecoveryAdapter {
         !['blocked', 'paused', 'unknown'].includes(observation.activity);
     }
     observation.conversationId = identity.conversationId;
+    const nativePane =
+      pane.dead &&
+      /^%(?:0|[1-9]\d{0,9})$/.test(pane.paneId ?? '') &&
+      Number.isSafeInteger(Number(pane.paneId?.slice(1))) &&
+      Number.isSafeInteger(pane.panePid) &&
+      /^[1-9]\d{0,9}$/.test(String(pane.panePid)) &&
+      pane.panePid! > 0 &&
+      (pane.status === undefined ||
+        (Number.isSafeInteger(pane.status) && pane.status >= 0 && pane.status <= 255 && !(pane.signal! > 0))) &&
+      matchesNativePaneSignal(pane.signal, pane.paneSignalToken) &&
+      ((pane.status ?? 0) > 0 || (pane.signal ?? 0) > 0) &&
+      Date.now() >= paneReadStartedAt &&
+      Date.now() - paneReadStartedAt <= 15_000
+        ? {
+            paneId: pane.paneId!,
+            panePid: pane.panePid!,
+            status: pane.status,
+            signal: pane.signal,
+            paneSignalToken: pane.paneSignalToken,
+          }
+        : undefined;
+    if (nativePane) observation.processProofKey = createHash('sha256').update(JSON.stringify(nativePane)).digest('hex');
+    if (observation.activity === 'crashed' && !nativePane) observation.safeToAct = false;
+    if (observation.stallRestartable === true) {
+      if (!nativePane) delete observation.stallRestartable;
+      else observation.stallObservedAt = paneReadStartedAt;
+    }
+    const now = Date.now();
+    const scope = this.liveProofScope();
+    if (
+      !pane.dead &&
+      /^%\d+$/.test(pane.paneId ?? '') &&
+      Number.isSafeInteger(pane.panePid) &&
+      pane.panePid! > 0 &&
+      now >= paneReadStartedAt &&
+      now - paneReadStartedAt <= 30_000
+    ) {
+      if (observation.processReady === true) observation.processReadyAt = paneReadStartedAt;
+      this.livePaneProof = {
+        paneId: pane.paneId!,
+        panePid: pane.panePid!,
+        at: paneReadStartedAt,
+        conversationId: identity.conversationId,
+        scope,
+      };
+    } else if (
+      pane.dead &&
+      this.livePaneProof &&
+      this.livePaneProof.paneId === pane.paneId &&
+      this.livePaneProof.panePid === pane.panePid &&
+      this.livePaneProof.conversationId === identity.conversationId &&
+      this.livePaneProof.scope === scope &&
+      this.livePaneProof.at <= observation.at &&
+      now >= this.livePaneProof.at &&
+      now - this.livePaneProof.at <= 30_000
+    ) {
+      observation.liveProofAt = this.livePaneProof.at;
+      this.latestLiveProofAt = this.livePaneProof.at;
+    } else this.livePaneProof = undefined;
     // A bounded suffix can hide an earlier still-live child, including after the parent process exits.
     observation.safeToAct = observation.safeToAct && identity.tailTruncated === false;
     if (identity.tailTruncated !== false) delete observation.stallRestartable;
@@ -495,7 +665,13 @@ export class CodexRecoveryAdapter {
         key: proofKey,
         generation: context.generation,
         conversationId: identity.conversationId,
-        ...(observation.stallRestartable ? { stallProgressAt: observation.progressAt ?? observation.at } : {}),
+        ...(nativePane ? { nativePane, processProofKey: observation.processProofKey } : {}),
+        ...(observation.stallRestartable
+          ? {
+              stallEvidenceKey: observation.stallEvidenceKey,
+              stallProgressAt: observation.progressAt ?? observation.at,
+            }
+          : {}),
       };
     }
     return observation;
@@ -570,7 +746,12 @@ export class CodexRecoveryAdapter {
 
   async act(flight: RecoveryFlight, isCurrent: () => boolean = () => true): Promise<'sent' | 'not-sent' | 'unknown'> {
     const previous = this.proof;
-    if (!isCurrent() || !previous || previous.key !== flight.key || previous.conversationId !== flight.conversationId)
+    if (
+      !isCurrent() ||
+      !previous ||
+      previous.conversationId !== flight.conversationId ||
+      (flight.reason === 'stalled' ? previous.stallEvidenceKey !== flight.key : previous.key !== flight.key)
+    )
       return 'not-sent';
     // Reads are repeated immediately before execution; a completed turn or new user input vetoes an old reservation.
     const current = await this.observe();
@@ -584,6 +765,18 @@ export class CodexRecoveryAdapter {
           (flight.stallProgressAt === undefined || flight.stallProgressAt === previous.stallProgressAt) &&
           (current.progressAt ?? current.at) === previous.stallProgressAt
         : current.safeToAct && current.evidenceKey === flight.key;
+    if (
+      flight.reason === 'stalled' &&
+      previous.remotePane &&
+      JSON.stringify(this.proof?.remotePane) !== JSON.stringify(previous.remotePane)
+    )
+      return 'not-sent';
+    if (
+      flight.action === 'restart' &&
+      previous.nativePane &&
+      JSON.stringify(previous.nativePane) !== JSON.stringify(this.proof?.nativePane)
+    )
+      return 'not-sent';
     if (!isCurrent() || !currentProvesAction || !this.proof || this.proof.generation !== previous.generation)
       return 'not-sent';
     let result: 'sent' | 'not-sent' | 'unknown';
@@ -627,8 +820,15 @@ export class CodexRecoveryAdapter {
       }
     } else {
       const generation = this.proof.generation;
-      result = await this.session.deliverRecovery(flight, generation, isCurrent, CONTINUATION_PROMPT, () =>
-        this.confirmLocalEvidence(flight.conversationId, generation)
+      const paneFence: [] | [RecoveryPaneIdentity | undefined] =
+        flight.action === 'restart' && this.proof.nativePane ? [this.proof.nativePane] : [];
+      result = await this.session.deliverRecovery(
+        flight,
+        generation,
+        isCurrent,
+        CONTINUATION_PROMPT,
+        () => this.confirmLocalEvidence(flight.conversationId, generation),
+        ...paneFence
       );
     }
     if (result === 'sent') this.persistSession();

@@ -2,7 +2,7 @@
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { dataPath } from '../config/instance.js';
 import { RecoveryConfigSchema } from './schema.js';
@@ -96,6 +96,8 @@ const StateSchema = z
       startedAt: Stamp,
       previousSubmissionKey: z.string().max(100).optional(),
       stallProgressAt: Stamp.positive().max(Number.MAX_SAFE_INTEGER).optional(),
+      accepted: z.boolean().optional(),
+      acceptedAt: Stamp.optional(),
     }).optional(),
     pending: Pending.optional(),
     handledEvidence: z.array(Evidence).max(32),
@@ -112,7 +114,29 @@ const StateSchema = z
       )
       .max(100),
   })
-  .strict();
+  .strict()
+  .refine(
+    (state) => {
+      const flight = state.inFlight;
+      if (!flight?.accepted) return true;
+      const handledKey =
+        flight.reason === 'stalled' && flight.stallProgressAt !== undefined
+          ? `stall:${createHash('sha256').update(flight.key).digest('hex')}:${flight.stallProgressAt}`
+          : flight.key;
+      return (
+        (flight.reason !== 'stalled' || flight.stallProgressAt !== undefined) &&
+        state.conversationId === flight.conversationId &&
+        flight.acceptedAt !== undefined &&
+        flight.acceptedAt >= flight.startedAt &&
+        state.lastSuccessfulRecovery === flight.acceptedAt &&
+        state.handledEvidence.includes(handledKey) &&
+        state.history.some(
+          (event) => event.kind === 'accepted' && event.reason === 'recovery-accepted' && event.at >= flight.startedAt
+        )
+      );
+    },
+    { message: 'Accepted delivery evidence is incomplete', path: ['inFlight'] }
+  );
 
 export class RecoveryStore {
   private records: Record<string, RecoveryState> = {};

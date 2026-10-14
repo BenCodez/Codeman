@@ -40,6 +40,7 @@ import {
 } from '../../session.js';
 import type { PaneCaptureOptions } from '../../mux-interface.js';
 import { SseEvent } from '../sse-events.js';
+import { InputDispatchQueueFullError, queueInputDispatch } from '../input-dispatch-queue.js';
 import { webviewCapabilities } from '../../webview-capabilities.js';
 import {
   CreateSessionSchema,
@@ -1813,6 +1814,7 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const { input, useMux, seq, clientId, wait, waitTimeout } = parseBody(SessionInputWithLimitSchema, req.body);
     const session = findSessionOrFail(ctx, id, req);
+    const inputPaneStartedAt = session.paneStartedAt;
 
     const inputStr = String(input);
     if (inputStr.length > MAX_INPUT_LENGTH) {
@@ -1868,6 +1870,8 @@ export function registerSessionRoutes(
     let abortWait: AbortController | undefined;
     let stopDeathWatch = () => {};
     try {
+      const abort = abortOnClientHangUp(reply);
+      abortWait = abort;
       // Wake-on-LAN (remote-wake.ts): a wake-enabled remote host that suspended leaves
       // the local ssh pane STALLED, and `send-keys` succeeds against it — the bytes
       // would vanish with no error anywhere. Give the registry the chance to probe the
@@ -1906,43 +1910,26 @@ export function registerSessionRoutes(
         }
       }
 
-      // Only a waiting request pays for the tmux probe: the browser's plain input path
-      // (thousands of calls per session) must stay exec-free.
-      const workerDead = wantsWait && workerIsDead(ctx.mux, session);
-
       const timeoutMs = clampWaitMs(waitTimeout ?? undefined);
-      // Same slot leak as the GET routes: a client that gives up mid-wait would
-      // otherwise hold a waiter for the full timeout. Response-side, always — see
-      // abortOnClientHangUp: on THIS route a request-side listener fires the moment the
-      // JSON body finishes streaming and aborts every send-and-wait before it starts.
-      const abort = abortOnClientHangUp(reply);
-      abortWait = abort;
-      let waitPromise: Promise<SignalWaitResult> | null = null;
-      if (wantsWait) {
-        try {
-          waitPromise = sessionWaits.waitForSignal(id, {
+      let workerDead = false;
+      const inputWait: { promise: Promise<SignalWaitResult> | null } = { promise: null };
+      // Register immediately before this frame's own delivery, rather than
+      // letting an earlier queued owner's turn satisfy a fresh send-and-wait.
+      const registerInputWait = () => {
+        workerDead = wantsWait && workerIsDead(ctx.mux, session);
+        if (wantsWait) {
+          inputWait.promise = sessionWaits.waitForSignal(id, {
             until,
             timeoutMs,
             owner: ownerFor(req),
             abortSignal: abort.signal,
-            // A FRESH delivery must not be satisfied by the state the session is already
-            // in: it is idle right now, which is precisely why we are typing at it.
-            // A DUPLICATE has no new turn coming, so it answers from the current state
-            // instead of blocking for a transition that already happened.
             requireTransition: !duplicate,
             currentSignal: duplicate ? currentSignalFor(session, workerDead) : undefined,
           });
-        } catch (err) {
-          if (err instanceof WaitCapacityError) {
-            // Nothing has been written yet. Release admission so the retry can
-            // acquire the same FIFO slot after waiter capacity is available.
-            if (tagged && !duplicate) session.forgetInputSeq(clientId as string, seq as number);
-            return waitCapacityResponse(err);
-          }
-          throw err;
         }
-      }
-      stopDeathWatch = wantsWait ? watchForDeadWorker(ctx.mux, session, id) : () => {};
+        stopDeathWatch = wantsWait ? watchForDeadWorker(ctx.mux, session, id) : () => {};
+      };
+      if (duplicate) registerInputWait();
 
       // Write input to PTY. Direct write is synchronous; tagged fallback and wait
       // requests await writeViaMux because their response reports delivery. Only an
@@ -1961,13 +1948,21 @@ export function registerSessionRoutes(
         fromUser: true,
         ...(tagged && !workerDead ? { inputSeq: { clientId: clientId as string, seq: seq as number } } : {}),
       };
+      let legacyBackground = false;
+      const inputCurrent = () =>
+        ctx.sessions.get(id) === session &&
+        session.paneStartedAt === inputPaneStartedAt &&
+        session.inputDispatchAllowed !== false &&
+        (legacyBackground || !abort.signal.aborted) &&
+        canAccessOwned(getAuthUser(req), session.owner);
       const directWrite = async () => {
         try {
+          if (!inputCurrent()) return false;
           if (session.requiresRemoteInputClock?.(inputStr, writeOptions)) {
             const admission = await session.prepareUserInputClock(inputStr, writeOptions);
             if (!admission || admission() !== true) return false;
           }
-          return session.write(inputStr, writeOptions);
+          return inputCurrent() && session.write(inputStr, writeOptions);
         } catch (error) {
           if (error instanceof RebootIdentityFenceError) undoOnFailure();
           throw error; // the outer finally releases waiter/death-watch ownership
@@ -1992,58 +1987,72 @@ export function registerSessionRoutes(
       // raw write for a caller that really wants it.
       const autoMux = useMux === undefined && isPlainPromptInput(inputStr);
 
-      if (duplicate) {
-        // Redelivery of an already-applied input: skip the write, but still honor the
-        // wait, since the caller's question ("tell me when this settles") is unanswered.
-      } else if ((useMux || autoMux) && waitPromise) {
-        // The response is already staying open for the wait, so the tmux write can be
-        // awaited here. This is the ONE path where a writeViaMux failure is observable.
-        const ok = await session.writeViaMux(inputStr, writeOptions).catch(failedMuxWrite);
-        if (ok) {
-          delivered = true;
-        } else {
-          console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-          delivered = await directWrite();
-          if (!delivered) undoOnFailure();
-        }
-      } else if (autoMux || (useMux && (tagged || getCli(session.mode)?.capabilities.recovery === 'codex-rollout'))) {
-        // Awaited, unlike the explicit useMux branch below. This shape also reaches here
-        // from the browser's POST fallback, which sends its frames one at a time and
-        // waits for each 2xx; answering only once Enter has gone out is what keeps the
-        // next keystroke from overtaking it.
-        const ok = await session.writeViaMux(inputStr, writeOptions).catch(failedMuxWrite);
-        if (ok) {
-          delivered = true;
-        } else {
-          console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-          delivered = await directWrite();
-          if (!delivered) undoOnFailure();
-        }
-      } else if (useMux) {
-        // Fire-and-forget: don't block the HTTP response on a tmux child process.
-        // Fallback to a direct write on failure. Unchanged from before send-and-wait.
-        session
-          .writeViaMux(inputStr, writeOptions)
-          .then((ok) => {
-            if (ok) return;
-            console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
-            if (!session.write(inputStr, writeOptions)) undoOnFailure();
-          })
-          .catch(() => {
-            console.warn(`[Server] Mux input delivery could not be confirmed for session ${id}`);
-          });
-      } else {
-        // A tagged no-PTY write is retryable below. Legacy untagged callers keep
-        // their historical response when a session has not been started yet.
-        delivered = await directWrite();
-        if (!delivered && tagged) {
-          session.forgetInputSeq(clientId as string, seq as number);
-        }
+      if (!duplicate) {
+        legacyBackground =
+          !!useMux &&
+          !autoMux &&
+          !wantsWait &&
+          !tagged &&
+          getCli(session.mode)?.capabilities.recovery !== 'codex-rollout';
+        const delivery = queueInputDispatch(session, inputStr.length, async () => {
+          if (!inputCurrent()) return;
+          registerInputWait();
+          if (workerDead) delete writeOptions.inputSeq;
+          if ((useMux || autoMux) && inputWait.promise) {
+            // The response is already staying open for the wait, so the tmux write can be
+            // awaited here. This is the ONE path where a writeViaMux failure is observable.
+            const ok = await session.writeViaMux(inputStr, writeOptions).catch(failedMuxWrite);
+            if (ok) {
+              delivered = true;
+            } else {
+              console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
+              delivered = await directWrite();
+              if (!delivered) undoOnFailure();
+            }
+          } else if (
+            autoMux ||
+            (useMux && (tagged || getCli(session.mode)?.capabilities.recovery === 'codex-rollout'))
+          ) {
+            // Awaited, unlike the explicit useMux branch below. This shape also reaches here
+            // from the browser's POST fallback, which sends its frames one at a time and
+            // waits for each 2xx; answering only once Enter has gone out is what keeps the
+            // next keystroke from overtaking it.
+            const ok = await session.writeViaMux(inputStr, writeOptions).catch(failedMuxWrite);
+            if (ok) {
+              delivered = true;
+            } else {
+              console.warn(`[Server] writeViaMux failed for session ${id}, falling back to direct write`);
+              delivered = await directWrite();
+              if (!delivered) undoOnFailure();
+            }
+          } else if (useMux) {
+            // Fire-and-forget: don't block the HTTP response on a tmux child process.
+            // Fallback to a direct write on failure. Unchanged from before send-and-wait.
+            const ok = await session.writeViaMux(inputStr, writeOptions).catch(failedMuxWrite);
+            if (ok) delivered = true;
+            else {
+              delivered = await directWrite();
+              if (!delivered) undoOnFailure();
+            }
+          } else {
+            // A tagged no-PTY write is retryable below. Legacy untagged callers keep
+            // their historical response when a session has not been started yet.
+            delivered = await directWrite();
+            if (!delivered && tagged) {
+              session.forgetInputSeq(clientId as string, seq as number);
+            }
+          }
+        });
+        if (legacyBackground)
+          void delivery.catch(() =>
+            console.warn(`[Server] Mux input delivery could not be confirmed for session ${id}`)
+          );
+        else await delivery;
       }
 
       if (!duplicate && tagged && delivered && !workerDead) session.commitInputSeq(clientId as string, seq as number);
 
-      if (!waitPromise) {
+      if (!inputWait.promise) {
         // Recovery may acquire the pane while an awaited mux write is in progress.
         // In that race the initial reservation check passed, but both guarded writes
         // still return false. Keep a tagged browser frame retryable and unacknowledged.
@@ -2071,7 +2080,7 @@ export function registerSessionRoutes(
         const selfReleased = !delivered && !duplicate;
         if (selfReleased) abort.abort();
 
-        const result = await waitPromise;
+        const result = await inputWait.promise;
         return {
           success: true,
           data: {
@@ -2095,6 +2104,16 @@ export function registerSessionRoutes(
       } finally {
         stopDeathWatch();
       }
+    } catch (error) {
+      if (error instanceof WaitCapacityError) return waitCapacityResponse(error);
+      if (error instanceof InputDispatchQueueFullError) {
+        return {
+          ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input backlog is full; retry the input'),
+          retryable: true,
+          notSent: true,
+        };
+      }
+      throw error;
     } finally {
       // Dispatch can fail before the normal wait path starts. Release both
       // ownerships here as well so an uncertain send cannot leak wait capacity.
@@ -2276,7 +2295,7 @@ export function registerSessionRoutes(
   // own `capabilities.newline`. Claude Code's Ink input recognizes 0x0a as "insert newline" vs
   // 0x0d (carriage return = submit).
 
-  app.post('/api/sessions/:id/send-key', async (req) => {
+  app.post('/api/sessions/:id/send-key', async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = req.body as Record<string, unknown>;
     const key = typeof body?.key === 'string' ? body.key : '';
@@ -2316,21 +2335,37 @@ export function registerSessionRoutes(
     try {
       // Route through the dedicated Codeman socket — bare `tmux` would target the
       // user's default server and never find this session (same #80 regression class).
-      const sent = await session.sendNamedKey(
-        hex.map((byte) => String.fromCharCode(parseInt(byte, 16))).join(''),
-        (signal) =>
-          new Promise<void>((resolve, reject) => {
-            execFile(
-              'tmux',
-              ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
-              { timeout: 5000, signal },
-              (err) => {
-                if (err) reject(err);
-                else resolve();
+      const abort = abortOnClientHangUp(reply);
+      const keyPaneStartedAt = session.paneStartedAt;
+      const keyCurrent = () =>
+        ctx.sessions.get(id) === session &&
+        session.paneStartedAt === keyPaneStartedAt &&
+        session.inputDispatchAllowed !== false &&
+        !abort.signal.aborted &&
+        canAccessOwned(getAuthUser(req), session.owner);
+      const rawKey = hex.map((byte) => String.fromCharCode(parseInt(byte, 16))).join('');
+      const sent = await queueInputDispatch(session, rawKey.length, async () => {
+        if (!keyCurrent()) return false;
+        return session.sendNamedKey(
+          rawKey,
+          (signal) =>
+            new Promise<void>((resolve, reject) => {
+              if (!keyCurrent() || signal.aborted) {
+                reject(new Error('Key admission changed'));
+                return;
               }
-            );
-          })
-      );
+              execFile(
+                'tmux',
+                ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
+                { timeout: 5000, signal },
+                (err) => {
+                  if (err) reject(err);
+                  else resolve();
+                }
+              );
+            })
+        );
+      });
       if (!sent) {
         return {
           ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input delivery is in progress; retry the key'),
@@ -2339,6 +2374,13 @@ export function registerSessionRoutes(
         };
       }
     } catch (err) {
+      if (err instanceof InputDispatchQueueFullError) {
+        return {
+          ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input backlog is full; retry the key'),
+          retryable: true,
+          notSent: true,
+        };
+      }
       console.error('[Server] send-key failed:', err);
       return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'tmux send-keys failed');
     }

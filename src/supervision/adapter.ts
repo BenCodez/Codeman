@@ -74,7 +74,15 @@ export class CodexTaskAdapter {
     if (!observation.conversationId || !observation.evidenceKey) return 'not-sent';
     // Establish the recovery adapter's current generation-bound proof then let it revalidate again at dispatch.
     const current = await this.recovery.observe();
-    if (!current.safeToAct || current.evidenceKey !== observation.evidenceKey) return 'not-sent';
+    if (
+      !current.safeToAct ||
+      current.evidenceKey !== observation.evidenceKey ||
+      (observation.activity === 'crashed' &&
+        (!Number.isFinite(observation.liveProofAt) ||
+          current.liveProofAt !== observation.liveProofAt ||
+          !this.recovery.hasLivePaneProof(observation.liveProofAt!)))
+    )
+      return 'not-sent';
     return this.recovery.act(
       {
         key: observation.evidenceKey,
@@ -82,7 +90,8 @@ export class CodexTaskAdapter {
         action: observation.activity === 'crashed' ? 'restart' : 'continue',
         startedAt: Date.now(),
       },
-      isCurrent
+      () =>
+        isCurrent() && (observation.activity !== 'crashed' || this.recovery.hasLivePaneProof(observation.liveProofAt!))
     );
   }
   async act(

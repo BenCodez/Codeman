@@ -3,8 +3,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../src/recovery/codex-adapter.js';
 import type { RemoteCodexEvidence } from '../src/recovery/remote-codex.js';
 import type { Session } from '../src/session.js';
+import { RecoveryController } from '../src/recovery/controller.js';
+import { initialRecoveryState } from '../src/recovery/types.js';
+import { sampleRemoteCodexClock } from '../src/recovery/remote-clock.js';
+import { clampExternalCliConfigsForOwner } from '../src/session-env-clamp.js';
 import {
   CHILD_NOW,
+  childEvent,
   CHILD_READY,
   CHILD_THREAD,
   createChildLifecycleFixture,
@@ -31,31 +36,173 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('actual local stall controller with an abnormally dead owned pane', () => {
-  it.each(REACTIVATIONS)('never restarts a resumed child after two quiet-time probes (%s)', async (type) => {
-    const f = await createChildLifecycleFixture(returnedChildTail(type), true, false);
+  it('requires two fresh observations of one exact native process rather than mixing different dead pane PIDs', async () => {
+    const f = await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, true);
     try {
-      expect(f.session.paneExit).toBeUndefined();
-      expect(f.controller.getStatus().config).toMatchObject({ detectStalls: true, stalledAfterMs: 10_000 });
-      expect(await f.adapter.observe()).toMatchObject({
-        activity: 'watching',
-        reason: 'background-work',
-        safeToAct: false,
-      });
       await f.controller.refresh();
       vi.setSystemTime(CHILD_NOW + 2000);
+      vi.spyOn(f.session, 'inspectRecoveryPane').mockResolvedValue({
+        dead: true,
+        status: 9,
+        screen: null,
+        paneId: '%7',
+        panePid: 701,
+      });
       await f.controller.refresh();
-      expect(f.delivered).not.toHaveBeenCalled();
-      expect(f.controller.getStatus().pending).toBeUndefined();
       vi.setSystemTime(CHILD_NOW + 3000);
       await f.controller.refresh();
-      await f.controller.retry(); // Even explicit Retry cannot overtake certified child work.
       expect(f.delivered).not.toHaveBeenCalled();
-      expect(f.controller.getStatus()).toMatchObject({ attempts: 0, lastReason: 'background-work' });
-      expect(f.controller.getStatus().inFlight).toBeUndefined();
+      expect(f.controller.getStatus().attempts).toBe(0);
+      vi.setSystemTime(CHILD_NOW + 4000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 5000);
+      await f.controller.refresh();
+      expect(f.delivered).toHaveBeenCalledOnce();
     } finally {
       await f.cleanup();
     }
   });
+  it.each(REACTIVATIONS.flatMap((type) => [false, true].map((storedExit) => ({ type, storedExit }))))(
+    'never restarts a resumed child after two quiet-time probes ($type, watcher exit=$storedExit)',
+    async ({ type, storedExit }) => {
+      const f = await createChildLifecycleFixture(returnedChildTail(type), true, storedExit);
+      try {
+        expect(!!f.session.paneExit).toBe(storedExit);
+        expect(f.controller.getStatus().config).toMatchObject({ detectStalls: true, stalledAfterMs: 10_000 });
+        expect(await f.adapter.observe()).toMatchObject({
+          activity: 'watching',
+          reason: 'background-work',
+          safeToAct: false,
+        });
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 2000);
+        await f.controller.refresh();
+        expect(f.delivered).not.toHaveBeenCalled();
+        expect(f.controller.getStatus().pending).toBeUndefined();
+        vi.setSystemTime(CHILD_NOW + 3000);
+        await f.controller.refresh();
+        await f.controller.retry(); // Even explicit Retry cannot overtake certified child work.
+        expect(f.delivered).not.toHaveBeenCalled();
+        expect(f.controller.getStatus()).toMatchObject({ attempts: 0, lastReason: 'background-work' });
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
+  it.each([
+    { detectStalls: true, recoverCrashes: false },
+    { detectStalls: true, recoverCrashes: true },
+    { detectStalls: false, recoverCrashes: true },
+    { detectStalls: false, recoverCrashes: false },
+  ])('honors independent stall/crash policies after the actual pane watcher records an exit: %j', async (policy) => {
+    const f = await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, false);
+    try {
+      expect(f.session.setPaneExit({ at: CHILD_NOW - 1000, status: 9 })).toBe(true);
+      await f.controller.updateConfig({ ...policy, stalledAfterMs: 40_000 });
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'crashed',
+        safeToAct: true,
+        stallRestartable: true,
+        progressAt: CHILD_NOW - 25_000,
+      });
+      await f.controller.inspect();
+      expect(f.controller.getStatus().activity).toBe(policy.detectStalls ? 'working' : 'crashed');
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 2000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 3000);
+      await f.controller.refresh();
+      if (!policy.detectStalls) {
+        expect(f.delivered).toHaveBeenCalledTimes(policy.recoverCrashes ? 1 : 0);
+        if (policy.recoverCrashes)
+          expect(f.delivered.mock.calls[0][0]).toMatchObject({ action: 'restart', reason: 'process-crashed' });
+        return;
+      }
+      // Recorded death cannot bypass the owner's 40-second silence threshold.
+      expect(f.delivered).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().attempts).toBe(0);
+      vi.setSystemTime(CHILD_NOW + 15_000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 16_999);
+      await f.controller.refresh();
+      expect(f.delivered).not.toHaveBeenCalled();
+      vi.setSystemTime(CHILD_NOW + 17_000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 18_000);
+      await f.controller.refresh();
+      expect(f.delivered).toHaveBeenCalledOnce();
+      expect(f.delivered.mock.calls[0][0]).toMatchObject({
+        action: 'restart',
+        reason: 'stalled',
+        stallProgressAt: CHILD_NOW - 25_000,
+      });
+      expect(f.store.get(f.session.id).inFlight?.key).toContain(':stalled');
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it.each(['live', 'clean', 'owner-stop', 'authentication', 'usage-limit'] as const)(
+    'keeps $0 authoritative over a recorded watcher death and explicit stall recovery',
+    async (veto) => {
+      let body = returnedChildTail('collab_resume_end', 'completed');
+      if (veto === 'authentication')
+        body +=
+          childEvent(
+            {
+              type: 'task_complete',
+              turn_id: 'current',
+              error: { message: 'Authentication required', codex_error_info: 'unauthorized' },
+            },
+            24_000
+          ) + '\n';
+      if (veto === 'usage-limit')
+        body += childEvent({ type: 'turn_aborted', turn_id: 'current', reason: 'budget_limited' }, 24_000) + '\n';
+      const f = await createChildLifecycleFixture(body, veto !== 'live', false);
+      try {
+        if (veto === 'clean') {
+          vi.spyOn(f.session, 'inspectRecoveryPane').mockResolvedValue({ dead: true, status: 0, screen: null });
+          f.session.setPaneExit({ at: CHILD_NOW - 1000, status: 0 });
+        } else f.session.setPaneExit({ at: CHILD_NOW - 1000, status: 9 });
+        if (veto === 'owner-stop') Object.assign(f.session, { _recoveryIntentionalStopAt: CHILD_NOW - 25_000 });
+        await f.controller.updateConfig({ recoverCrashes: true });
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 2000);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 3000);
+        await f.controller.refresh();
+        await f.controller.retry();
+        expect(f.delivered).not.toHaveBeenCalled();
+        expect(f.controller.getStatus().attempts).toBe(0);
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
+  it.each([NaN, Infinity, -1, 0, Number.MAX_SAFE_INTEGER + 1, CHILD_NOW + 60_000])(
+    'refuses malformed or future watcher timestamps %s despite otherwise valid stall evidence',
+    async (at) => {
+      const f = await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, false);
+      try {
+        f.session.setPaneExit({ at, status: 9 });
+        expect(await f.adapter.observe()).toMatchObject({
+          activity: 'unknown',
+          reason: 'pane-unverified',
+          safeToAct: false,
+        });
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 2000);
+        await f.controller.refresh();
+        expect(f.delivered).not.toHaveBeenCalled();
+        expect(f.controller.getStatus().attempts).toBe(0);
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
 
   it.each(['completed', 'shutdown'])(
     'permits an otherwise proven stall after the named child is %s',
@@ -81,7 +228,14 @@ describe('actual local stall controller with an abnormally dead owned pane', () 
   );
 });
 
-async function remoteFixture(type: string, status: unknown, dead: boolean, preparedClock = true) {
+async function remoteFixture(
+  type: string,
+  status: unknown,
+  dead: boolean,
+  preparedClock = true,
+  unfinished = false,
+  offset = 0
+) {
   const f = await createChildLifecycleFixture(returnedChildTail(type, status, true), false);
   const remote = {
     hostId: 'fixture-host',
@@ -104,7 +258,10 @@ async function remoteFixture(type: string, status: unknown, dead: boolean, prepa
   expect(f.session.getRecoveryContext()).toMatchObject({ managed: true, noDaemon: true, remoteOwned: true });
   expect(f.session.getRecoveryContext().submission).toBeDefined();
   if (preparedClock)
-    expect(f.session.getRecoveryContext().submission).toMatchObject({ clockDomain: 'local', clock: clockAt() });
+    expect(f.session.getRecoveryContext().submission).toMatchObject({
+      clockDomain: 'local',
+      clock: { ...clockAt(), remoteBefore: Date.now() + offset, remoteAfter: Date.now() + offset },
+    });
   const evidence: RemoteCodexEvidence = {
     transport: 'reachable',
     session: 'present',
@@ -112,7 +269,7 @@ async function remoteFixture(type: string, status: unknown, dead: boolean, prepa
     identity: {
       reason: 'verified',
       conversationId: CHILD_THREAD,
-      tail: returnedChildTail(type, status, true),
+      tail: returnedChildTail(type, status, !unfinished),
       tailTruncated: false,
       changedAt: CHILD_NOW - 1000,
     },
@@ -123,10 +280,263 @@ async function remoteFixture(type: string, status: unknown, dead: boolean, prepa
     deliverRemote: vi.fn(async () => ({ status: 'sent', submittedAt: Date.now(), clock: clockAt() })),
   };
   const adapter = new CodexRecoveryAdapter(f.session, vi.fn(), deps);
-  return { ...f, adapter, deps };
+  const state = initialRecoveryState();
+  state.config = { ...state.config, enabled: true, detectStalls: true, stalledAfterMs: 40_000, retryDelayMs: 1000 };
+  state.armedAt = CHILD_NOW - 60_000;
+  const controller = new RecoveryController(
+    {
+      observe: () => adapter.observe(),
+      act: (flight, current) => adapter.act(flight, current),
+      persist: (next) => f.store.save(f.session.id, next),
+      changed: vi.fn(),
+    },
+    state
+  );
+  return {
+    ...f,
+    adapter,
+    deps,
+    evidence,
+    controller,
+    async cleanup() {
+      controller.stop();
+      await controller.drain();
+      await f.cleanup();
+    },
+  };
 }
 
 describe('actual remote adapter uses the same child lifecycle veto', () => {
+  it.each([
+    { detectStalls: true, recoverCrashes: false },
+    { detectStalls: true, recoverCrashes: true },
+    { detectStalls: false, recoverCrashes: true },
+    { detectStalls: false, recoverCrashes: false },
+  ])('honors independent remote stall/crash policies: %j', async (policy) => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+    try {
+      await f.controller.updateConfig(policy);
+      expect(await f.adapter.observe()).toMatchObject({
+        activity: 'crashed',
+        stallRestartable: true,
+        progressAt: CHILD_NOW - 25_000,
+      });
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 2000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 3000);
+      await f.controller.refresh();
+      if (!policy.detectStalls) {
+        expect(f.deps.restartRemote).toHaveBeenCalledTimes(policy.recoverCrashes ? 1 : 0);
+        if (policy.recoverCrashes) expect(f.store.get(f.session.id).inFlight?.reason).toBe('process-crashed');
+        expect(f.delivered).not.toHaveBeenCalled();
+        return;
+      }
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      vi.setSystemTime(CHILD_NOW + 15_000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 17_000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 18_000);
+      await f.controller.refresh();
+      expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+      expect(f.store.get(f.session.id).inFlight).toMatchObject({
+        action: 'restart',
+        reason: 'stalled',
+        stallProgressAt: CHILD_NOW - 25_000,
+      });
+      expect(f.delivered).not.toHaveBeenCalled();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it.each([-60_000, 60_000])(
+    'preserves native remote progress clock with %i ms skew during stalled dispatch',
+    async (offset) => {
+      vi.mocked(sampleRemoteCodexClock).mockResolvedValueOnce({
+        ...clockAt(),
+        remoteBefore: CHILD_NOW + offset,
+        remoteAfter: CHILD_NOW + offset,
+      });
+      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true, offset);
+      try {
+        f.evidence.identity.tail =
+          f.evidence.identity
+            .tail!.trim()
+            .split('\n')
+            .map((line) => {
+              const row = JSON.parse(line);
+              row.timestamp = new Date(Date.parse(row.timestamp) + offset).toISOString();
+              return JSON.stringify(row);
+            })
+            .join('\n') + '\n';
+        vi.mocked(f.deps.inspectRemote).mockImplementation(async () => ({
+          ...f.evidence,
+          clock: { ...clockAt(), remoteBefore: Date.now() + offset, remoteAfter: Date.now() + offset },
+        }));
+        vi.setSystemTime(CHILD_NOW + 15_000);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 17_000);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 18_000);
+        await f.controller.refresh();
+        expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+        expect(f.store.get(f.session.id).inFlight?.stallProgressAt).toBe(CHILD_NOW - 25_000);
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
+  it.each([
+    'same-clock',
+    'stale-clock',
+    'future-clock',
+    'changed-pane',
+    'new-progress',
+    'transport',
+    'clean-exit',
+    'child-running',
+    'authentication',
+    'usage-limit',
+    'truncated',
+    'malformed',
+    'owner-stop',
+    'unowned',
+    'invalid-clock',
+  ] as const)('keeps %s from authorizing a remote unfinished-turn stall restart', async (veto) => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+    try {
+      vi.setSystemTime(CHILD_NOW + 15_000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 17_000);
+      if (veto === 'same-clock' || veto === 'stale-clock' || veto === 'future-clock') {
+        const at = veto === 'same-clock' ? CHILD_NOW + 15_000 : veto === 'stale-clock' ? CHILD_NOW : CHILD_NOW + 20_000;
+        vi.mocked(f.deps.inspectRemote).mockImplementation(async () => ({ ...f.evidence, clock: clockAt(at) }));
+      }
+      if (veto === 'changed-pane') f.evidence.pane!.panePid = 701;
+      if (veto === 'new-progress')
+        f.evidence.identity.tail += childEvent({ type: 'exec_command_end', call_id: 'later' }, -16_000) + '\n';
+      if (veto === 'transport')
+        vi.mocked(f.deps.inspectRemote).mockResolvedValue({
+          transport: 'unreachable',
+          session: 'unknown',
+          identity: { reason: 'unverified' },
+        } as RemoteCodexEvidence);
+      if (veto === 'clean-exit') f.evidence.pane!.status = 0;
+      if (veto === 'child-running')
+        f.evidence.identity.tail +=
+          childEvent({ type: 'collab_resume_end', receiver_thread_id: CHILD_THREAD, status: 'running' }, -16_000) +
+          '\n';
+      if (veto === 'authentication')
+        f.evidence.identity.tail +=
+          childEvent(
+            {
+              type: 'task_complete',
+              turn_id: 'current',
+              error: { message: 'Authentication required', codex_error_info: 'unauthorized' },
+            },
+            -16_000
+          ) + '\n';
+      if (veto === 'usage-limit')
+        f.evidence.identity.tail +=
+          childEvent({ type: 'turn_aborted', turn_id: 'current', reason: 'budget_limited' }, -16_000) + '\n';
+      if (veto === 'truncated') f.evidence.identity.tailTruncated = true;
+      if (veto === 'malformed') f.evidence.identity.tail += '{"type":"event_msg","payload":';
+      if (veto === 'owner-stop') Object.assign(f.session, { _recoveryIntentionalStopAt: CHILD_NOW + 16_000 });
+      if (veto === 'unowned') Object.assign(f.session.remote!, { owned: false });
+      if (veto === 'invalid-clock')
+        vi.mocked(f.deps.inspectRemote).mockImplementation(async () => ({
+          ...f.evidence,
+          clock: { ...clockAt(), localAfter: Date.now() - 1 },
+        }));
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 18_000);
+      await f.controller.refresh();
+      expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+      expect(f.delivered).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().attempts).toBe(0);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  it.each(['pane', 'progress', 'owner-input', 'grants', 'cancellation'] as const)(
+    'rechecks %s immediately before remote stalled dispatch',
+    async (veto) => {
+      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+      try {
+        const observation = await f.adapter.observe();
+        if (veto === 'pane') f.evidence.pane!.panePid = 701;
+        if (veto === 'progress')
+          f.evidence.identity.tail += childEvent({ type: 'exec_command_end', call_id: 'later' }, 500) + '\n';
+        if (veto === 'owner-input') f.session.write('Owner changed intent\r', { fromUser: true });
+        if (veto === 'grants')
+          vi.mocked(clampExternalCliConfigsForOwner).mockResolvedValueOnce({
+            codexConfig: { ...f.session.codexConfig, noDaemon: false },
+          });
+        expect(
+          await f.adapter.act(
+            {
+              key: observation.stallEvidenceKey!,
+              action: 'restart',
+              reason: 'stalled',
+              conversationId: CHILD_THREAD,
+              startedAt: Date.now(),
+              stallProgressAt: observation.progressAt,
+            },
+            () => veto !== 'cancellation'
+          )
+        ).toBe('not-sent');
+        expect(f.deps.restartRemote).not.toHaveBeenCalled();
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
+  it('seals an uncertain remote stall dispatch against further recovery and journal reload', async () => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+    try {
+      vi.mocked(f.deps.restartRemote).mockResolvedValue('unknown');
+      vi.setSystemTime(CHILD_NOW + 15_000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 17_000);
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 18_000);
+      await f.controller.refresh();
+      expect(f.store.get(f.session.id)).toMatchObject({
+        attempts: 1,
+        lastReason: 'acceptance-unverified',
+        inFlight: { reason: 'stalled' },
+      });
+      const restored = new RecoveryController(
+        {
+          observe: () => f.adapter.observe(),
+          act: (flight, current) => f.adapter.act(flight, current),
+          persist: (next) => f.store.save(f.session.id, next),
+          changed: vi.fn(),
+        },
+        f.store.get(f.session.id)
+      );
+      try {
+        vi.setSystemTime(CHILD_NOW + 60_000);
+        await restored.refresh();
+        await restored.retry();
+        expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+        expect(restored.getStatus().inFlight).toBeDefined();
+      } finally {
+        restored.stop();
+        await restored.drain();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   it.each([false, true])('refuses legacy remote submission without clock provenance (dead=%s)', async (dead) => {
     const f = await remoteFixture('collab_resume_end', { completed: null }, dead, false);
     try {

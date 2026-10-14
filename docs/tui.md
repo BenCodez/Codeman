@@ -7,7 +7,7 @@ tmux pane with one keystroke.
 
 It is **additional, not a replacement**: the web UI stays the primary surface and
 gets every feature first. The TUI exists for the terminal workflow (SSH, Termius,
-a tmux window you keep open all day), and it is a *client* of the running server,
+a tmux window you keep open all day), and it is a _client_ of the running server,
 so the two surfaces can never disagree about what a session is doing. It is also
 not a multiplexer: tmux still owns every pane, and attaching hands the terminal to
 tmux rather than proxying bytes.
@@ -26,11 +26,11 @@ Neither sets up a screen, so both are as quick as the one API call they make, an
 
 What it needs:
 
-| Needs | What you get |
-| --- | --- |
+| Needs             | What you get                                                                                                                                                                                                                                                                                                                 |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Full features** | A running Codeman server (states, approvals, preview, prompts, search, digest). The TUI finds it the way `codeman attach` does: `CODEMAN_API_URL`, else loopback on `CODEMAN_PORT` for this `CODEMAN_INSTANCE`. The self-signed certificate an `--https` install generates is accepted, as it is everywhere else in the CLI. |
-| **Server down** | It still starts, in **degraded mode**: sessions are enumerated straight from `tmux -L codeman` plus a read-only peek at `state.json`, and attach is the only verb. See [Troubleshooting](#troubleshooting). |
-| **A terminal** | `codeman tui` refuses to run when stdin/stdout are not a TTY, and says to use `--list` instead. A cron job or a pipe therefore fails loudly rather than emitting escape codes into a log. |
+| **Server down**   | It still starts in **degraded mode** and enumerates sessions from `tmux -L codeman` plus read-only `state.json`. Attachment remains available when its attach strip has no Codex pane. Codex attachment requires a reachable authenticated server to commit the input fence. See [Troubleshooting](#troubleshooting).        |
+| **A terminal**    | `codeman tui` refuses to run when stdin/stdout are not a TTY, and says to use `--list` instead. A cron job or a pipe therefore fails loudly rather than emitting escape codes into a log.                                                                                                                                    |
 
 ## What it looks like
 
@@ -88,13 +88,13 @@ The numbers are the same on both surfaces, so `codeman tui --list` then
 
 Groups are always in this order, and a session is in exactly one of them:
 
-| Group | Glyph | Means | Comes from |
-| --- | --- | --- | --- |
-| **NEEDS YOU** | `⚠` | A permission or question dialog is blocking the agent | The approvals inbox (`permission_prompt` hooks, with the on-screen options parsed) |
-| | `✋` | Waiting for your next instruction, or errored | `idle_prompt`, or an errored session (equally something only a human clears) |
-| **WORKING** | `✻` animating | A turn is running | The same working classification the web dashboard uses |
-| **IDLE** | `○` | Live, but sitting there | |
-| **RECENT** | `✔` | A past session from the unified list | History rows, no live pane |
+| Group         | Glyph         | Means                                                 | Comes from                                                                         |
+| ------------- | ------------- | ----------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| **NEEDS YOU** | `⚠`           | A permission or question dialog is blocking the agent | The approvals inbox (`permission_prompt` hooks, with the on-screen options parsed) |
+|               | `✋`          | Waiting for your next instruction, or errored         | `idle_prompt`, or an errored session (equally something only a human clears)       |
+| **WORKING**   | `✻` animating | A turn is running                                     | The same working classification the web dashboard uses                             |
+| **IDLE**      | `○`           | Live, but sitting there                               |                                                                                    |
+| **RECENT**    | `✔`           | A past session from the unified list                  | History rows, no live pane                                                         |
 
 Ordering inside a group is "the one that has waited longest, first": blocked
 sessions sort by how long the dialog has been up, working sessions by when their
@@ -111,20 +111,20 @@ same item announced twice does not ring twice.
 
 ## Keymap
 
-| Key | Does |
-| --- | --- |
-| `↑` `↓` or `j` `k` | Move the cursor. PageUp/PageDown jump five rows. |
-| `Enter` | Attach to the selected session (see [Attaching](#attaching)) |
-| `1`-`9` | Jump to that row and attach. When a dialog is on screen, a digit answers it instead (see below). |
-| `y` | Approve the selected session's dialog |
-| `n` | Deny it, or **start a new session** when there is no dialog |
-| `p` | Send one line to the selected session without attaching |
-| `x` | Kill the selected session; `y` confirms, any other key cancels |
-| `/` | Search sessions, events and files |
-| `g` | Away digest: what happened while you were gone |
-| `?` | Help overlay |
-| `Esc` | Close whatever overlay is open |
-| `q` or `Ctrl+C` | Quit, restoring the screen you started with |
+| Key                | Does                                                                                             |
+| ------------------ | ------------------------------------------------------------------------------------------------ |
+| `↑` `↓` or `j` `k` | Move the cursor. PageUp/PageDown jump five rows.                                                 |
+| `Enter`            | Attach to the selected session (see [Attaching](#attaching))                                     |
+| `1`-`9`            | Jump to that row and attach. When a dialog is on screen, a digit answers it instead (see below). |
+| `y`                | Approve the selected session's dialog                                                            |
+| `n`                | Deny it, or **start a new session** when there is no dialog                                      |
+| `p`                | Send one line to the selected session without attaching                                          |
+| `x`                | Kill the selected session; `y` confirms, any other key cancels                                   |
+| `/`                | Search sessions, events and files                                                                |
+| `g`                | Away digest: what happened while you were gone                                                   |
+| `?`                | Help overlay                                                                                     |
+| `Esc`              | Close whatever overlay is open                                                                   |
+| `q` or `Ctrl+C`    | Quit, restoring the screen you started with                                                      |
 
 Inside the `p` composer and the `/` query: `←` `→` `Home` `End` `Delete`
 `Backspace` plus `Ctrl+A` / `Ctrl+E` / `Ctrl+U` / `Ctrl+W`, `Enter` to send or open,
@@ -206,6 +206,10 @@ managed session after a direct handoff. Direct `tmux attach` and custom automati
 that bypass Codeman's attach endpoint cannot create this mark; such automation must
 call the authenticated direct-attach fence endpoint before handing stdin to tmux.
 
+If the server or authenticated fence endpoint is unavailable, or the durable fence
+write fails, supported attachment is refused. This applies to a Codex target and
+to any attach strip that can switch to Codex, even in server-down degraded mode.
+
 Explicit Codex reboot restoration rechecks the exact conversation, launch settings,
 current owner grants and input fences at the launch boundary. If a worker may have
 started before startup fails or restoration is dismissed, Codeman preserves its
@@ -219,11 +223,11 @@ resume the conversation in a fresh one instead.
 
 Three cases:
 
-| Where you are | What happens |
-| --- | --- |
-| Not in tmux | `tmux -L codeman attach-session` |
-| Already in tmux on Codeman's socket | `switch-client`, so you do not nest |
-| In tmux on a **different** socket | Refused, with an explanation: detach from that tmux first, then run `codeman tui` again |
+| Where you are                       | What happens                                                                            |
+| ----------------------------------- | --------------------------------------------------------------------------------------- |
+| Not in tmux                         | `tmux -L codeman attach-session`                                                        |
+| Already in tmux on Codeman's socket | `switch-client`, so you do not nest                                                     |
+| In tmux on a **different** socket   | Refused, with an explanation: detach from that tmux first, then run `codeman tui` again |
 
 A direct-PTY session has no pane to attach to, and says so.
 
@@ -257,13 +261,14 @@ not `admin`), or put them in the data dir's `.env` (`~/.codeman/.env`), which is
 where `codeman attach` already reads them from.
 
 **`server not running: attach only`** in a yellow banner. Nothing answered on the
-expected port, so the TUI fell back to enumerating tmux. You get names and attach;
-you do not get states, approvals or previews, because those only exist on the
-server. Start the server (`codeman web -d`, or `systemctl --user start codeman-web`)
+expected port, so the TUI fell back to enumerating tmux. You get names and eligible
+non-Codex attachment; a target or attach strip containing Codex is refused until
+the authenticated server can acknowledge its durable input fence. States,
+approvals and previews also require the server. Start the server (`codeman web -d`, or `systemctl --user start codeman-web`)
 and the banner clears on its own: the TUI keeps re-probing.
 
 **It found the wrong server, or none.** Discovery is instance-scoped. A beta
-instance (`CODEMAN_INSTANCE=beta`) has its own data dir *and* its own tmux socket,
+instance (`CODEMAN_INSTANCE=beta`) has its own data dir _and_ its own tmux socket,
 so its TUI sees only its own sessions. Set `CODEMAN_PORT` or `CODEMAN_API_URL`
 explicitly when you run more than one.
 

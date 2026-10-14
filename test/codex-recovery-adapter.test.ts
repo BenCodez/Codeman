@@ -192,6 +192,96 @@ function fixture() {
   return Object.assign(state, { session, adapter, persist, deps });
 }
 
+describe('fresh process readiness provenance', () => {
+  it.each([
+    'ready',
+    'missing-id',
+    'missing-pid',
+    'dead',
+    'blank-screen',
+    'truncated',
+    'bounded-delay',
+    'expired-delay',
+    'backward',
+  ] as const)('keeps current live readiness separate from historical rollout time: %s', async (change) => {
+    const f = fixture();
+    f.identity.tail = completedTail();
+    f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 1234 };
+    if (change === 'missing-id') delete f.pane.paneId;
+    if (change === 'missing-pid') delete f.pane.panePid;
+    if (change === 'dead') f.pane = { dead: true, screen: null, status: 1, paneId: '%7', panePid: 1234 };
+    if (change === 'blank-screen') f.pane.screen = '';
+    if (change === 'truncated') f.identity.tailTruncated = true;
+    if (['bounded-delay', 'expired-delay', 'backward'].includes(change)) {
+      resolver.mockImplementation(async () => {
+        vi.setSystemTime(NOW + (change === 'bounded-delay' ? 30000 : change === 'expired-delay' ? 30001 : -1));
+        return structuredClone(f.identity);
+      });
+    }
+    const observation = await f.adapter.observe();
+    if (change === 'ready' || change === 'bounded-delay') {
+      expect(observation).toMatchObject({
+        activity: 'completed',
+        processReady: true,
+        processReadyAt: NOW,
+        at: NOW - 9000,
+      });
+    } else expect(observation.processReadyAt).toBeUndefined();
+  });
+});
+
+describe('bounded live-pane provenance', () => {
+  it.each([
+    'observed',
+    'first-dead',
+    'missing-id',
+    'changed-id',
+    'changed-pid',
+    'generation',
+    'configuration',
+    'expired',
+    'backward',
+    'unknown-between',
+  ] as const)('binds crash live proof to a recent matching native observation (%s)', async (change) => {
+    const f = fixture();
+    f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 1234 };
+    f.identity.tail = completedTail();
+    if (change === 'missing-id') delete f.pane.paneId;
+    if (change !== 'first-dead') await f.adapter.observe();
+    if (change === 'unknown-between') {
+      f.pane = null;
+      await f.adapter.observe();
+    }
+    const now = change === 'expired' ? NOW + 31_000 : change === 'backward' ? NOW - 1 : NOW + 1000;
+    vi.setSystemTime(now);
+    f.pane = {
+      dead: true,
+      status: 1,
+      screen: null,
+      paneId: change === 'changed-id' ? '%8' : '%7',
+      panePid: change === 'changed-pid' ? 1235 : 1234,
+    };
+    f.session.paneExit = { at: now, status: 1 };
+    f.identity.tail = failedTail();
+    if (change === 'generation') f.context.generation++;
+    if (change === 'configuration')
+      f.session.codexConfig = { ...f.session.codexConfig, model: 'different-fixture-model' };
+    const observation = await f.adapter.observe();
+    expect(observation.activity).toBe('crashed');
+    if (change === 'observed') {
+      expect(observation.liveProofAt).toBe(NOW);
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(true);
+      await f.adapter.observe();
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(true);
+      vi.setSystemTime(NOW + 31_001);
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(false);
+    } else {
+      expect(observation.liveProofAt).toBeUndefined();
+      expect(f.adapter.hasLivePaneProof(NOW)).toBe(false);
+    }
+  });
+});
+
 async function withRollout(
   body: string,
   check: (f: ReturnType<typeof fixture>, writeBody: (nextBody: string) => Promise<void>) => Promise<void>
@@ -441,7 +531,7 @@ describe('ownership, location and isolated-launch gates', () => {
       safeToAct: false,
       processReady: false,
     });
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', safeToAct: false });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
@@ -477,7 +567,7 @@ describe('bounded real rollout lifecycle evidence', () => {
         noDaemon: true,
       });
       expect(identity).toMatchObject({ reason: 'verified', conversationId: THREAD, tailTruncated: false });
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
       expect(await f.adapter.observe()).toMatchObject({ activity: 'unknown', safeToAct: false });
       const unproved: RecoveryFlight = {
         key: `${THREAD}:pane:${f.session.paneExit!.at}:1`,
@@ -492,7 +582,7 @@ describe('bounded real rollout lifecycle evidence', () => {
 
   it.each(invalidLifecycleRows)('vetoes a restart reservation when final evidence has $name', async ({ row }) => {
     await withRollout(failedTail(), async (f, writeBody) => {
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
       const reservation = flight(await f.adapter.observe(), 'restart');
       await writeBody(failedTail(event(CHILD_SPAWN, NOW - 9_500), row));
       expect(await f.adapter.act(reservation)).toBe('not-sent');
@@ -512,7 +602,7 @@ describe('bounded real rollout lifecycle evidence', () => {
       });
       expect(identity).toMatchObject({ reason: 'verified', conversationId: THREAD, tailTruncated: false });
       expect(identity.tail).toContain('collab_agent_spawn_end');
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
       expect(await f.adapter.observe()).toMatchObject({
         activity: 'watching',
         reason: 'background-work',
@@ -531,7 +621,7 @@ describe('bounded real rollout lifecycle evidence', () => {
 
   it('vetoes a dead-pane restart reservation when the final complete rollout reveals pending child work', async () => {
     await withRollout(failedTail(), async (f, writeBody) => {
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
       const reservation = flight(await f.adapter.observe(), 'restart');
       await writeBody(failedTail() + event(CHILD_SPAWN, NOW - 8_500) + '\n');
       expect(await f.adapter.act(reservation)).toBe('not-sent');
@@ -541,7 +631,7 @@ describe('bounded real rollout lifecycle evidence', () => {
 
   it('keeps a verified dead pane without pending children eligible for restart', async () => {
     await withRollout(failedTail(), async (f) => {
-      f.pane = { dead: true, status: 1, screen: null };
+      f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
       const observation = await f.adapter.observe();
       expect(observation).toMatchObject({ activity: 'crashed', reason: 'process-crashed', safeToAct: true });
       expect(await f.adapter.act(flight(observation, 'restart'))).toBe('sent');
@@ -583,7 +673,7 @@ describe('bounded real rollout lifecycle evidence', () => {
     'reprobes the actual tail and vetoes %s if earlier child evidence has fallen outside the window',
     async (action) => {
       await withRollout(failedTail(), async (f, writeBody) => {
-        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null };
+        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
         const reservation = flight(await f.adapter.observe(), action);
         await writeBody(hiddenLiveChildTail());
         expect(await f.adapter.act(reservation)).toBe('not-sent');
@@ -610,7 +700,7 @@ describe('bounded real rollout lifecycle evidence', () => {
         '\n' +
         failedTail();
       await withRollout(body, async (f) => {
-        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null };
+        if (action === 'restart') f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
         const observation = await f.adapter.observe();
         expect(observation).toMatchObject({
           activity: action === 'restart' ? 'crashed' : 'interrupted',
@@ -660,7 +750,7 @@ describe('human input invalidates the current epoch', () => {
 
   it('does not revive a process after the user deliberately interrupted it', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 130, signal: undefined, screen: null };
+    f.pane = { dead: true, status: 130, signal: undefined, screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = { at: NOW - 1_000, status: 130 };
     f.context.intentionalStopAt = NOW - 1_500;
     expect(await f.adapter.observe()).toMatchObject({
@@ -673,6 +763,89 @@ describe('human input invalidates the current epoch', () => {
 });
 
 describe('authoritative agent exits and process readiness', () => {
+  it.each([
+    {},
+    { paneId: '%7' },
+    { paneId: '%x', panePid: 700 },
+    { paneId: '%7', panePid: 0 },
+    { paneId: '%7', panePid: 700, status: undefined, signal: 9 },
+    { paneId: '%7', panePid: 700, status: undefined, signal: 9, paneSignalToken: 'UNKNOWN' },
+    { paneId: '%7', panePid: 700, status: undefined, signal: 15, paneSignalToken: 'KILL' },
+  ])('does not grant generic abnormal-death restart authority from incomplete native metadata %j', async (identity) => {
+    const f = fixture();
+    f.pane = { dead: true, status: 9, screen: null, ...identity };
+    f.session.paneExit = { at: NOW - 1000, status: f.pane.status, signal: f.pane.signal };
+    const observation = await f.adapter.observe();
+    expect(observation.safeToAct).toBe(false);
+    expect(
+      await f.adapter.act({
+        key: observation.evidenceKey ?? 'unverified',
+        action: 'restart',
+        conversationId: THREAD,
+        startedAt: NOW,
+      })
+    ).toBe('not-sent');
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+  it.each([
+    {},
+    { paneId: '%7' },
+    { paneId: '%x', panePid: 700 },
+    { paneId: '%9007199254740992', panePid: 700 },
+    { paneId: '%7', panePid: 0 },
+    { paneId: '%7', panePid: -1 },
+    { paneId: '%7', panePid: NaN },
+    { paneId: '%7', panePid: Infinity },
+    { paneId: '%7', panePid: Number.MAX_SAFE_INTEGER + 1 },
+    { paneId: '%7', panePid: 700, status: undefined, signal: 9 },
+    { paneId: '%7', panePid: 700, status: undefined, signal: 9, paneSignalToken: 'UNKNOWN' },
+    { paneId: '%7', panePid: 700, status: undefined, signal: 15, paneSignalToken: 'KILL' },
+    { paneId: '%7', panePid: 700, status: undefined, signal: 65535, paneSignalToken: '65535' },
+    { paneId: '%7', panePid: 700, status: 256 },
+    { paneId: '%7', panePid: 700, status: 1, signal: 9, paneSignalToken: 'KILL' },
+  ])('does not qualify incomplete native process metadata %j for an automatic stall action', async (identity) => {
+    const f = fixture();
+    f.identity.tail = activeTail();
+    f.session.paneExit = undefined;
+    f.pane = { dead: true, status: 9, screen: null, ...identity };
+    const observation = await f.adapter.observe();
+    expect(observation.stallRestartable).not.toBe(true);
+    expect(
+      await f.adapter.act({
+        key: observation.stallEvidenceKey!,
+        action: 'restart',
+        reason: 'stalled',
+        conversationId: THREAD,
+        startedAt: NOW,
+      })
+    ).toBe('not-sent');
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it.each(['paneId', 'panePid'] as const)(
+    'vetoes a different native %s immediately before stalled dispatch',
+    async (field) => {
+      const f = fixture();
+      f.identity.tail = activeTail();
+      f.session.paneExit = undefined;
+      f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
+      const observation = await f.adapter.observe();
+      expect(observation.stallRestartable).toBe(true);
+      if (field === 'paneId') f.pane.paneId = '%8';
+      else f.pane.panePid = 701;
+      expect(
+        await f.adapter.act({
+          key: observation.stallEvidenceKey!,
+          action: 'restart',
+          reason: 'stalled',
+          conversationId: THREAD,
+          startedAt: NOW,
+          stallProgressAt: observation.progressAt,
+        })
+      ).toBe('not-sent');
+      expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    }
+  );
   it.each([true, false])(
     'keeps unknown dead-pane lifecycle non-restartable with stored exit:%s',
     async (storedExit) => {
@@ -682,7 +855,7 @@ describe('authoritative agent exits and process readiness', () => {
       ]) {
         const body = activeTail() + event(CHILD_SPAWN, NOW - 10_000) + '\n' + row + '\n';
         await withRollout(body, async (f) => {
-          f.pane = { dead: true, status: 9, screen: null };
+          f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
           f.session.paneExit = storedExit ? { at: NOW - 10_000, status: 9 } : undefined;
           expect(await f.adapter.observe()).toMatchObject({ activity: 'unknown', safeToAct: false });
           expect((await f.adapter.observe()).stallRestartable).toBeUndefined();
@@ -694,7 +867,7 @@ describe('authoritative agent exits and process readiness', () => {
 
   it('recovers two same-turn deaths using fresh progress and raw adapter keys across durable reload', async () => {
     await withRollout(activeTail(), async (f, writeBody) => {
-      f.pane = { dead: true, status: 9, screen: null };
+      f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
       f.session.paneExit = undefined;
       const store = new RecoveryStore(join(f.context.codexHome!, 'recovery-journal.json'));
       const dependencies = {
@@ -712,7 +885,7 @@ describe('authoritative agent exits and process readiness', () => {
         await controller.retry();
         expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
         const firstKey = controller.getStatus().inFlight!.key;
-        f.pane = { dead: false, screen: READY };
+        f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 701 };
         await controller.inspect();
         const accepted = new RecoveryStore(join(f.context.codexHome!, 'recovery-journal.json')).get(SESSION);
         expect(accepted.attempts).toBe(1);
@@ -721,7 +894,7 @@ describe('authoritative agent exits and process readiness', () => {
         controller = new RecoveryController(dependencies, accepted);
         // The old turn/progress remains deduplicated even after a fresh pane probe.
         vi.setSystemTime(NOW + 20_000);
-        f.pane = { dead: true, status: 9, screen: null };
+        f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
         await controller.retry();
         vi.setSystemTime(NOW + 22_000);
         await controller.retry();
@@ -729,11 +902,11 @@ describe('authoritative agent exits and process readiness', () => {
         const progress = NOW + 22_001;
         vi.setSystemTime(progress);
         await writeBody(activeTail() + event({ type: 'exec_command_end', call_id: 'next-progress' }, progress) + '\n');
-        f.pane = { dead: false, screen: READY };
+        f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 701 };
         await controller.inspect();
         // Structured progress legitimately exceeds the last activity transition.
         expect(await f.adapter.observe()).toMatchObject({ at: NOW - 20_000, progressAt: progress });
-        f.pane = { dead: true, status: 9, screen: null };
+        f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
         vi.setSystemTime(progress + 10_000);
         await controller.retry();
         expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
@@ -752,7 +925,7 @@ describe('authoritative agent exits and process readiness', () => {
 
   it('vetoes a stall reservation when its final complete lifecycle becomes unknown', async () => {
     await withRollout(activeTail(), async (f, writeBody) => {
-      f.pane = { dead: true, status: 9, screen: null };
+      f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
       f.session.paneExit = undefined;
       const initial = await f.adapter.observe();
       expect(initial.stallRestartable).toBe(true);
@@ -771,7 +944,7 @@ describe('authoritative agent exits and process readiness', () => {
 
   it('authorizes restart only for a confirmed matching abnormal local exit', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
     const observation = await f.adapter.observe();
     expect(observation).toMatchObject({
       activity: 'crashed',
@@ -785,22 +958,47 @@ describe('authoritative agent exits and process readiness', () => {
       3,
       expect.any(Function),
       CONTINUATION_PROMPT,
-      expect.any(Function)
+      expect.any(Function),
+      expect.objectContaining({ paneId: '%7', panePid: 700, status: 1 })
     );
   });
 
   it('an explicit status 0 is a clean intentional exit and cannot revive', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 0, screen: null };
+    f.pane = { dead: true, status: 0, screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = { at: NOW - 10_000, status: 0 };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'exited', reason: 'clean-exit', safeToAct: false });
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it('rechecks current grants and structured progress for a recorded watcher stall reservation', async () => {
+    const f = fixture();
+    f.identity.tail = activeTail();
+    f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
+    f.session.paneExit = { at: NOW - 1000, status: 9 };
+    const observation = await f.adapter.observe();
+    expect(observation).toMatchObject({ activity: 'crashed', stallRestartable: true });
+    const reserved: RecoveryFlight = {
+      key: observation.stallEvidenceKey!,
+      action: 'restart',
+      reason: 'stalled',
+      conversationId: THREAD,
+      startedAt: NOW,
+      stallProgressAt: observation.progressAt,
+    };
+    configClamp.mockResolvedValueOnce({ codexConfig: { ...f.session.codexConfig, noDaemon: false } });
+    expect(await f.adapter.act(reserved)).toBe('not-sent');
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+    await f.adapter.observe();
+    f.identity.tail += event({ type: 'exec_command_end', call_id: 'new-progress' }, NOW - 500) + '\n';
+    expect(await f.adapter.act(reserved)).toBe('not-sent');
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
 
   it('marks an unfinished current turn restartable only with a fresh abnormal dead-pane probe', async () => {
     const f = fixture();
     f.identity.tail = activeTail();
-    f.pane = { dead: true, status: 9, screen: null };
+    f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = undefined;
     const observation = await f.adapter.observe();
     expect(observation).toMatchObject({
@@ -826,7 +1024,7 @@ describe('authoritative agent exits and process readiness', () => {
       const f = fixture();
       f.identity.tail = activeTail();
       f.identity.tailTruncated = tailTruncated;
-      f.pane = { dead: true, status: 9, screen: null };
+      f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
       f.session.paneExit = undefined;
       const observation = await f.adapter.observe();
       expect(observation.safeToAct).toBe(false);
@@ -855,7 +1053,7 @@ describe('authoritative agent exits and process readiness', () => {
           payload: { type: 'collab_agent_spawn_end', new_thread_id: 'child-fixture' },
         }) +
         '\n';
-      f.pane = { dead: true, status: 9, screen: null };
+      f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
       f.session.paneExit = storedExit ? { at: NOW - 10_000, status: 9 } : undefined;
       const observation = await f.adapter.observe();
       expect(observation).toMatchObject({ activity: 'watching', reason: 'background-work', safeToAct: false });
@@ -867,7 +1065,7 @@ describe('authoritative agent exits and process readiness', () => {
   it('cancels a stall restart when the final pane probe is live', async () => {
     const f = fixture();
     f.identity.tail = activeTail();
-    f.pane = { dead: true, status: 9, screen: null };
+    f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = undefined;
     const observation = await f.adapter.observe();
     const reservation: RecoveryFlight = {
@@ -893,7 +1091,7 @@ describe('authoritative agent exits and process readiness', () => {
     const rollout = join(directory, `rollout-2026-10-13T11-59-00-${THREAD}.jsonl`);
     f.session.workingDir = join(root, 'workspace');
     f.context.codexHome = root;
-    f.pane = { dead: true, status: 9, screen: null };
+    f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = undefined;
     await fs.mkdir(directory, { recursive: true });
     await fs.mkdir(f.session.workingDir);
@@ -995,13 +1193,13 @@ describe('authoritative agent exits and process readiness', () => {
 
   it('requires a positive signal or numeric abnormal status and agreement with stored exit evidence', async () => {
     const f = fixture();
-    f.pane = { dead: true, signal: 9, screen: null };
+    f.pane = { dead: true, signal: 9, paneSignalToken: 'KILL', screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = { at: NOW - 10_000, signal: 9 };
     expect(await f.adapter.observe()).toMatchObject({ activity: 'crashed', safeToAct: true });
-    f.pane = { dead: true, screen: null };
+    f.pane = { dead: true, screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = { at: NOW - 10_000 };
     expect(await f.adapter.observe()).toMatchObject({ reason: 'pane-unverified', safeToAct: false });
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
     f.session.paneExit = { at: NOW - 10_000, status: 2 };
     expect(await f.adapter.observe()).toMatchObject({ reason: 'pane-unverified', safeToAct: false });
     f.session.paneExit = undefined;
@@ -1045,6 +1243,95 @@ describe('owned remote evidence and mutation', () => {
     } as Session['remote'];
     return f;
   }
+
+  it.each([
+    'unchanged',
+    'owner',
+    'config',
+    'env',
+    'home',
+    'generation',
+    'pane',
+    'expired',
+    'transport',
+    'cancelled',
+  ] as const)('binds remote task crash dispatch to current private live provenance: %s', async (change) => {
+    const f = remoteFixture();
+    const task = new CodexTaskAdapter(f.session as unknown as Session, f.persist, f.deps);
+    await task.observe();
+    vi.setSystemTime(NOW + 1000);
+    const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+    evidence.clock = clockAt();
+    evidence.pane = { dead: true, status: 9, paneId: '%7', panePid: 700, screen: null };
+    const { observation } = await task.observe();
+    expect(observation).toMatchObject({ activity: 'crashed', liveProofAt: NOW });
+    if (change === 'owner') f.session.owner = 'other-owner';
+    if (change === 'config') f.session.codexConfig.model = 'other-model';
+    if (change === 'env') f.env = { FIXTURE_SETTING: 'changed' };
+    if (change === 'home') f.context.codexHome = '/fixture/other-home';
+    if (change === 'generation') f.context.generation++;
+    if (change === 'pane') evidence.pane.panePid = 701;
+    if (change === 'expired') vi.setSystemTime(NOW + 30_001);
+    if (change === 'transport') {
+      f.deps.inspectRemote = vi.fn(
+        async () =>
+          ({ transport: 'unreachable', session: 'unknown', identity: { reason: 'unverified' } }) as RemoteCodexEvidence
+      );
+      await task.observe();
+      f.deps.inspectRemote = vi.fn(async () => structuredClone(evidence));
+    }
+    expect(await task.recover(observation, () => change !== 'cancelled')).toBe(
+      change === 'unchanged' ? 'sent' : 'not-sent'
+    );
+    expect(f.deps.restartRemote).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
+    expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+  });
+
+  it('dates remote live provenance at the read start when the task is enabled during the remote observation', async () => {
+    const f = remoteFixture();
+    const read = createDeferred<RemoteCodexEvidence>();
+    f.deps.inspectRemote = vi
+      .fn()
+      .mockReturnValueOnce(read.promise)
+      .mockImplementation(async () => structuredClone(f.remoteEvidence));
+    const task = new CodexTaskAdapter(f.session as unknown as Session, f.persist, f.deps);
+    const inspecting = task.observe();
+    await vi.waitFor(() => expect(f.deps.inspectRemote).toHaveBeenCalledOnce());
+    vi.setSystemTime(NOW + 1000);
+    read.resolve({
+      ...f.remoteEvidence,
+      clock: { localBefore: NOW, localAfter: NOW + 1000, remoteBefore: NOW, remoteAfter: NOW + 1000 },
+    } as RemoteCodexEvidence);
+    expect((await inspecting).observation.processReadyAt).toBe(NOW);
+    vi.setSystemTime(NOW + 2000);
+    const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+    evidence.clock = clockAt();
+    evidence.pane = { dead: true, status: 9, paneId: '%7', panePid: 700, screen: null };
+    const { observation } = await task.observe();
+    expect(observation.liveProofAt).toBe(NOW);
+    expect(observation.liveProofAt).toBeLessThan(NOW + 500); // The owner's mid-read enable boundary.
+  });
+
+  it.each(['current', 'stale', 'future', 'missing-id', 'invalid-pid', 'dead', 'blocked'] as const)(
+    'exports fresh remote restart readiness only from a bounded current live pane: %s',
+    async (proof) => {
+      const f = remoteFixture();
+      const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+      evidence.identity.tail = completedTail();
+      if (proof === 'stale') vi.setSystemTime(NOW + 30_001);
+      if (proof === 'future') evidence.clock = clockAt(NOW + 1);
+      if (proof === 'missing-id') evidence.pane!.paneId = '';
+      if (proof === 'invalid-pid') evidence.pane!.panePid = NaN;
+      if (proof === 'dead') evidence.pane = { dead: true, status: 9, paneId: '%7', panePid: 700, screen: null };
+      if (proof === 'blocked')
+        evidence.identity.tail +=
+          event({ type: 'error', message: 'Authentication required', codex_error_info: 'unauthorized' }, NOW - 1) +
+          '\n';
+      const observation = await f.adapter.observe();
+      expect(observation.processReadyAt).toBe(proof === 'current' ? NOW : undefined);
+      if (proof === 'current') expect(observation).toMatchObject({ activity: 'completed', processReady: true });
+    }
+  );
 
   it.each(['missing-clock', 'malformed-clock', 'legacy-submission', 'changed-clock'] as const)(
     'refuses identity and task command authority from %s even with a claimed verified tail',
@@ -1520,9 +1807,11 @@ describe('owned remote evidence and mutation', () => {
       },
     };
     vi.setSystemTime(NOW - 10_000);
+    f.remoteEvidence.clock = clockAt();
     await f.adapter.observe();
     f.remoteEvidence.pane = { dead: true, status: 17, paneId: '%9', panePid: 901, screen: null };
     vi.setSystemTime(NOW - 5000);
+    f.remoteEvidence.clock = clockAt();
     expect(await f.adapter.observe()).toMatchObject({
       activity: 'crashed',
       at: NOW - 5000,
@@ -1819,7 +2108,7 @@ function deadPaneVetoTail(payload: Record<string, unknown>): string {
 describe('dead local panes preserve structured recovery vetoes', () => {
   it.each(DEAD_PANE_VETOES)('preserves $reason before authorizing a crash', async ({ payload, activity, reason }) => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
     f.identity.tail = deadPaneVetoTail(payload);
     expect(await f.adapter.observe()).toMatchObject({ activity, reason, safeToAct: false });
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
@@ -1827,7 +2116,7 @@ describe('dead local panes preserve structured recovery vetoes', () => {
 
   it.each(DEAD_PANE_VETOES)('rechecks $reason before delivering a reserved restart', async ({ payload }) => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
     const reserved = flight(await f.adapter.observe(), 'restart');
     f.identity.tail = deadPaneVetoTail(payload);
     expect(await f.adapter.act(reserved)).toBe('not-sent');
@@ -1836,7 +2125,7 @@ describe('dead local panes preserve structured recovery vetoes', () => {
 
   it('still resumes a verified abnormal exit without a structured veto', async () => {
     const f = fixture();
-    f.pane = { dead: true, status: 1, screen: null };
+    f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
     expect(await f.adapter.act(flight(await f.adapter.observe(), 'restart'))).toBe('sent');
     expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
   });
@@ -1845,7 +2134,7 @@ describe('dead local panes preserve structured recovery vetoes', () => {
 describe('malformed error variants cannot spend an existing recovery reservation', () => {
   it.each([false, true])('denies final recovery with a contradictory error enum (dead=%s)', async (dead) => {
     const f = fixture();
-    if (dead) f.pane = { dead: true, status: 1, screen: null };
+    if (dead) f.pane = { dead: true, status: 1, screen: null, paneId: '%7', panePid: 700 };
     const reserved = flight(await f.adapter.observe(), dead ? 'restart' : 'continue');
     f.identity.tail = deadPaneVetoTail({
       type: 'task_complete',
