@@ -216,6 +216,12 @@ export class RebootRestoreRegistry {
     return [...this.entries.values()].filter((entry) => canAccess(entry.owner));
   }
 
+  /** Include a restore already in flight when retaining an absent session's role. */
+  hasOutstanding(sessionId: string): boolean {
+    this.dropIfExpired();
+    return this.entries.has(sessionId) || this.parked.has(sessionId);
+  }
+
   /**
    * Remove and return the entries a click is about to spend.
    *
