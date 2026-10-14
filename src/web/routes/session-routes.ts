@@ -1845,6 +1845,12 @@ export function registerSessionRoutes(
     const tagged = typeof clientId === 'string' && typeof seq === 'number';
     const duplicate = tagged && !session.shouldApplyInput(clientId as string, seq as number);
     if (duplicate && !wantsWait) {
+      // Match the WS duplicate ACK without changing the existing 200 envelope.
+      // The header lets the browser repair a stale first-attempt sequence without
+      // waiting for a response body, which ordinary input never needed to read.
+      const port = session as { lastInputSeq?: (cid: string) => number };
+      const last = typeof port.lastInputSeq === 'function' ? port.lastInputSeq(clientId as string) : seq;
+      reply.header('x-codeman-input-ack', JSON.stringify({ seq, dup: true, last }));
       return {};
     }
     if (!duplicate && session.recoveryInputReserved) {
@@ -2255,7 +2261,14 @@ export function registerSessionRoutes(
     const session = findSessionOrFail(ctx, id, req);
     const muxName = session.muxName;
     if (session.recoveryInputReserved) {
-      return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the key');
+      // This is the only send-key failure that certifies no bytes were sent.
+      // Unlike ordinary input this endpoint has no seq deduplication, so the
+      // browser must not replay a key after an ambiguous tmux/network failure.
+      return {
+        ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the key'),
+        retryable: true,
+        notSent: true,
+      };
     }
     if (!muxName) {
       return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'No tmux session');
@@ -2276,24 +2289,32 @@ export function registerSessionRoutes(
     try {
       // Route through the dedicated Codeman socket — bare `tmux` would target the
       // user's default server and never find this session (same #80 regression class).
-      await new Promise<void>((resolve, reject) => {
-        execFile(
-          'tmux',
-          ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
-          { timeout: 5000 },
-          (err) => {
-            if (err) reject(err);
-            else resolve();
-          }
-        );
-      });
+      const sent = await session.sendNamedKey(
+        hex.map((byte) => String.fromCharCode(parseInt(byte, 16))).join(''),
+        (signal) =>
+          new Promise<void>((resolve, reject) => {
+            execFile(
+              'tmux',
+              ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
+              { timeout: 5000, signal },
+              (err) => {
+                if (err) reject(err);
+                else resolve();
+              }
+            );
+          })
+      );
+      if (!sent) {
+        return {
+          ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input delivery is in progress; retry the key'),
+          retryable: true,
+          notSent: true,
+        };
+      }
     } catch (err) {
       console.error('[Server] send-key failed:', err);
       return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'tmux send-keys failed');
     }
-    // The bytes bypassed the session's write path, so tell the auto-name
-    // tracker about them or the two lines of a prompt join with no separator.
-    session.trackUserInput(hex.map((byte) => String.fromCharCode(parseInt(byte, 16))).join(''));
     return {};
   });
 

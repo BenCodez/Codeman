@@ -3870,6 +3870,48 @@ class CodemanApp {
   }
 
   /**
+   * Named newline keys share the input queue's ordering, but only travel over
+   * HTTP: the server chooses the CLI's exact hex sequence. They have no server
+   * dedup contract, so only a certified not-sent response may be retried, and
+   * they are never persisted/replayed across a reload with an unknown outcome.
+   * `owner` is the terminal/tile lifetime, also used to cancel pending keys.
+   */
+  _sendNamedKey(sessionId, key, owner, delayMs = 0) {
+    if (!sessionId || (key !== 'S-Enter' && key !== 'C-Enter')) return;
+    let list = this._pendingDeliveries.get(sessionId);
+    if (!list) {
+      list = [];
+      this._pendingDeliveries.set(sessionId, list);
+    }
+    if (list.filter((r) => r.key).length >= 32) {
+      this.showToast?.('Too many newline keys queued; key not sent', 'error');
+      return;
+    }
+    list.push({
+      seq: this._nextSeq(sessionId),
+      data: '', key, owner, delayMs,
+      ts: Date.now(), tries: 0, sentAt: 0, retryAt: 0,
+    });
+    this._persistReliableNow();
+    this._updateConnectionIndicator();
+    this._drainSession(sessionId);
+  }
+
+  /** Terminal teardown cancels its newline retries; ordinary input stays durable. */
+  _cancelPendingKeys(owner) {
+    for (const [sessionId, list] of this._pendingDeliveries) {
+      for (const rec of [...list]) {
+        if (!rec.key || rec.owner !== owner) continue;
+        rec.cancelled = true;
+        rec.abort?.abort();
+        this._ackDelivery(sessionId, rec.seq);
+        this.showToast?.('Terminal closed; pending newline key cancelled', 'warning');
+      }
+      this._drainSession(sessionId);
+    }
+  }
+
+  /**
    * The OPEN terminal socket bound to `sessionId`, or null: the primary socket
    * first, then one registered by a second terminal (the split pane). The
    * delivery layer below asks this instead of reading `this._ws` directly, so a
@@ -3975,14 +4017,18 @@ class CodemanApp {
   _drainSession(sessionId) {
     const list = this._pendingDeliveries.get(sessionId);
     if (!list || list.length === 0) return;
+    // An HTTP key (or input POST already in flight) owns the ordering barrier.
+    // A newly opened socket must not let later text overtake it.
+    if (this._postDraining.has(sessionId)) return;
 
     // Fast path: WebSocket open for this session — fire each not-yet-sent record
     // over the single ordered stream. They stay pending until the server ACKs
     // them ({t:'ia'}); a frame swallowed by a half-open socket is re-sent after
     // the sweep force-reconnects (which resets sentAt=0 in _onWsReady).
     const sock = this._inputSocketFor(sessionId);
-    if (sock) {
+    if (sock && !list[0].key) {
       for (const rec of list) {
+        if (rec.key) break;
         if (rec.sentAt !== 0) continue;
         try {
           sock.ws.send(JSON.stringify({ t: 'i', d: rec.data, seq: rec.seq, cid: this._clientId }));
@@ -3995,9 +4041,9 @@ class CodemanApp {
       return;
     }
 
-    // Slow path: no WS — POST records in order, awaiting each (the HTTP 2xx is
-    // the ACK). Serialized per session so seq order survives async fetches.
-    if (this._postDraining.has(sessionId)) return;
+    // HTTP path: no WS, or a named key at the head. Await each POST (the HTTP
+    // 2xx is the ACK), serialized per session so async fetches keep seq order.
+    if (list[0].key && list[0].retryAt > Date.now()) return;
     this._postDraining.add(sessionId);
     (async () => {
       try {
@@ -4006,27 +4052,75 @@ class CodemanApp {
           if (!cur || cur.length === 0) break;
           // If the WebSocket came back mid-drain, yield to it (the acked stream)
           // so we don't redundantly re-POST what onopen is already re-sending.
-          if (this._inputSocketFor(sessionId)) {
+          if (this._inputSocketFor(sessionId) && !cur[0].key) {
             break;
           }
           const rec = cur[0];
+          if (rec.key) {
+            if (rec.retryAt > Date.now()) break;
+            if (Date.now() - rec.ts >= 30000 || rec.tries >= 16) {
+              this._dropNamedKey(sessionId, rec, 'Recovery did not finish; newline key not sent');
+              continue;
+            }
+            // Local echo flushes text first, then gives the CLI a short gap so
+            // it does not classify the newline chord as part of a paste burst.
+            if (!rec.tries && rec.delayMs) await new Promise((resolve) => setTimeout(resolve, rec.delayMs));
+            if (rec.cancelled) continue;
+          }
           rec.tries++;
           rec.sentAt = Date.now();
+          // ACK the occurrence sent by THIS request, even if a late socket ACK
+          // repairs the record's sequence while the POST is still in flight.
+          const sentSeq = rec.seq;
           let resp = null;
           try {
-            const body = { input: rec.data, seq: rec.seq, clientId: this._clientId };
+            const body = rec.key ? { key: rec.key } : { input: rec.data, seq: rec.seq, clientId: this._clientId };
             if (rec.useMux) body.useMux = true;
-            resp = await fetch(`/api/sessions/${sessionId}/input`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-              keepalive: rec.data.length < 65536,
-            });
+            // The server bounds tmux at 5s; bound the browser request too so a
+            // stalled proxy cannot hold all later keystrokes indefinitely.
+            if (rec.key) rec.abort = new AbortController();
+            const deadline = rec.key ? setTimeout(() => rec.abort.abort(), 10000) : null;
+            try {
+              resp = await fetch(`/api/sessions/${sessionId}/${rec.key ? 'send-key' : 'input'}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body),
+                keepalive: !rec.key && rec.data.length < 65536,
+                ...(rec.key ? { signal: rec.abort.signal } : {}),
+              });
+              if (rec.key && resp.status === 422) {
+                const failure = await resp.json();
+                if (failure.success === false && failure.retryable === true && failure.notSent === true) {
+                  rec.retryAt = Date.now() + 1000;
+                }
+              }
+            } finally {
+              if (deadline) clearTimeout(deadline);
+              rec.abort = null;
+            }
           } catch {
             resp = null;
           }
+          if (rec.key && !resp?.ok) {
+            if (rec.cancelled) continue;
+            if (rec.retryAt > Date.now()) break;
+            const refused = resp && [400, 404, 410, 413].includes(resp.status);
+            this._dropNamedKey(sessionId, rec,
+              refused ? 'Newline key refused by the server; not sent'
+                : 'Newline key delivery could not be confirmed; check the prompt before retrying');
+            continue;
+          }
           if (resp && resp.ok) {
-            this._ackDelivery(sessionId, rec.seq);
+            let ack = {};
+            if (!rec.key) {
+              // Duplicate metadata travels in a header so ordinary successful
+              // POSTs retain their body-independent ACK/backpressure behavior.
+              try {
+                const taggedAck = JSON.parse(resp.headers?.get?.('x-codeman-input-ack') || 'null');
+                if (taggedAck?.seq === sentSeq && taggedAck.dup === true) ack = taggedAck;
+              } catch { /* A legacy/malformed ACK remains an ordinary 2xx ACK. */ }
+            }
+            this._onWsInputAck(sentSeq, ack, sessionId);
           } else if (resp && (resp.status === 404 || resp.status === 410)) {
             // Session no longer exists — the input can never land. Drop it
             // rather than retry forever (not a "lost" prompt: the target is gone).
@@ -4043,8 +4137,15 @@ class CodemanApp {
         }
       } finally {
         this._postDraining.delete(sessionId);
+        // A socket may have opened while the HTTP barrier was in flight.
+        if (this._inputSocketFor(sessionId)) this._drainSession(sessionId);
       }
     })();
+  }
+
+  _dropNamedKey(sessionId, rec, message) {
+    this._ackDelivery(sessionId, rec.seq);
+    this.showToast?.(message, 'error');
   }
 
   /** Drop a frame the server refused for good, and say so once. */
@@ -4080,7 +4181,7 @@ class CodemanApp {
   }
 
   /**
-   * Server input-ACK frame ({t:'ia',seq}) over the WebSocket.
+   * Server input ACK: a WS {t:'ia',seq} or an HTTP duplicate ACK header.
    *
    * `dup:true` means the server REJECTED the frame as already-seen rather than
    * applying it, and `last` is its watermark for this clientId. That combination
@@ -4090,7 +4191,7 @@ class CodemanApp {
    * is dropped-but-ACKed — a silently dead terminal that a reload cannot fix,
    * because the stale counter is restored from localStorage too.
    *
-   * ⚠️ Only a FIRST-attempt record is re-queued. A retry (`tries > 1`) being
+   * ⚠️ Only a FIRST-attempt record is repaired. A retry (`tries > 1`) being
    * called a duplicate is the mechanism working as designed — the original did
    * land — and re-sending it would type the same thing twice.
    */
@@ -4104,24 +4205,41 @@ class CodemanApp {
       const rec = (this._pendingDeliveries.get(sessionId) || []).find((r) => r.seq === seq);
       if (rec) this._dropRejectedInput(sessionId, rec);
       else this._ackDelivery(sessionId, seq);
+      this._drainSession(sessionId);
       return;
     }
     if (msg && msg.dup) {
       const list = this._pendingDeliveries.get(sessionId);
       const rec = list && list.find((r) => r.seq === seq);
       const watermark = Number.isInteger(msg.last) ? msg.last : seq;
-      // Lift the counter clear of the server's watermark before anything else, so
-      // the re-queue below (and every later keystroke) gets an acceptable seq.
+      // Lift the counter before repairing any sequence. Do not move the record:
+      // appending it to the tail lets a named key and subsequent text overtake it.
       if ((this._seqCounters.get(sessionId) || 0) <= watermark) {
         this._seqCounters.set(sessionId, watermark);
         this._persistReliableNow();
       }
-      const lost = rec && rec.tries <= 1 ? rec.data : null;
+      if (rec && !rec.key && rec.tries <= 1) {
+        rec.seq = this._nextSeq(sessionId);
+        rec.sentAt = 0;
+        rec.tries = 0;
+        // Never-attempted frames behind it need increasing sequences too. Keep
+        // every record (including chunk boundaries/key owners) in its FIFO slot.
+        // Attempted frames retain their identities until their own ACK certifies
+        // rejection; renumbering an ambiguous send would risk applying it twice.
+        for (const pending of list.slice(list.indexOf(rec) + 1)) {
+          if (pending.tries === 0) pending.seq = this._nextSeq(sessionId);
+        }
+        this._persistReliableNow();
+        this._drainSession(sessionId);
+        return;
+      }
       this._ackDelivery(sessionId, seq);
-      if (lost !== null) this._reliableSend(sessionId, lost, rec.useMux);
+      this._drainSession(sessionId);
       return;
     }
     this._ackDelivery(sessionId, seq);
+    // The ACK of the text ahead of a named key releases its HTTP barrier.
+    if (this._pendingDeliveries.get(sessionId)?.[0]?.key) this._drainSession(sessionId);
   }
 
   /** Called from ws.onopen — flush everything pending over the fresh socket. */
@@ -4151,7 +4269,7 @@ class CodemanApp {
         // cause needless WS↔HTTP flapping. A truly half-open socket goes quiet.
         // Silence is measured on THIS socket: the primary's last frame says
         // nothing about a second terminal's connection, and the reverse.
-        const stale = oldest && oldest.sentAt && Date.now() - oldest.sentAt > this._reliableAckTimeoutMs;
+        const stale = oldest && !oldest.key && oldest.sentAt && Date.now() - oldest.sentAt > this._reliableAckTimeoutMs;
         const silent = Date.now() - (sock.lastRecvAt || 0) > this._reliableAckTimeoutMs;
         if (stale && silent) {
           try {
@@ -4265,7 +4383,7 @@ class CodemanApp {
       let bytes = 0;
       for (const [s, list] of this._pendingDeliveries) {
         if (!list.length) continue;
-        pending[s] = list.map((r) => ({
+        pending[s] = list.filter((r) => !r.key).map((r) => ({
           seq: r.seq,
           data: r.data,
           useMux: r.useMux,

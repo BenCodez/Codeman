@@ -4,7 +4,7 @@
 
 With local echo on, pressing Enter cleared the overlay and then sent the prompt
 over the WebSocket **fire-and-forget** (`ws.send({t:'i',d})`). On a flaky link
-(e.g. a moving train) the socket is frequently *half-open*: `readyState === OPEN`
+(e.g. a moving train) the socket is frequently _half-open_: `readyState === OPEN`
 so `ws.send()` does **not** throw, but the underlying TCP is dead, so the frame is
 silently discarded. Nothing was enqueued (the send "succeeded"), the on-screen
 prompt was already wiped, and `navigator.onLine` stays `true` — so a long typed
@@ -34,7 +34,7 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
     record (`sentAt === 0`) in seq order over the single ordered stream. Records
     stay pending until the server's `{t:'ia',seq}` ACK removes them.
   - **POST path** — when no WS, POST records in order, awaiting each (the HTTP 2xx
-    *is* the ACK). A 404/410 (session gone) drops the record rather than retry
+    _is_ the ACK). A 404/410 (session gone) drops the record rather than retry
     forever.
 - **Half-open recovery** (`_redeliverSweep`, every 2s): if the active WS session's
   oldest record is unacked past `_reliableAckTimeoutMs` (4s), the socket is assumed
@@ -53,9 +53,12 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
   via `shouldApplyInput`. An applied frame is ACKed with `{t:'ia',seq}`; a duplicate is
   ACKed as `{t:'ia',seq,dup:true,last:<watermark>}`, where `last` is the server's
   highest applied seq for that `clientId` (`Session.lastInputSeq`). The client drops
-  the record either way, and on `dup` it lifts its own counter to `last` first and
-  re-sends a FIRST-attempt record (a retry being called a duplicate is the mechanism
-  working: the original landed). Without `last`, a tab killed between a send and the
+  an applied record; on `dup` it lifts its own counter to `last` first and
+  repairs a FIRST-attempt record's sequence **in its existing FIFO position**,
+  also renumbering later never-attempted records in place. Attempted records keep
+  their identities until their own ACK certifies rejection. A newline barrier
+  therefore cannot overtake the rejected text. A retry being called a duplicate
+  confirms that the original landed. Without `last`, a tab killed between a send and the
   persisted counter write came back counting BELOW the server's watermark, and every
   later keystroke was dropped-but-ACKed: a silently dead terminal a reload could not
   fix, since the stale counter was restored from localStorage too. The client now
@@ -63,8 +66,10 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
   frames apply unconditionally (no behavior change).
 - **POST route** (`/api/sessions/:id/input`) — optional `seq`/`clientId` in
   `SessionInputWithLimitSchema`; a deduped duplicate returns 200 without writing
-  (the 200 is the client's ACK). `curl`/legacy callers omit the fields and always
-  apply.
+  (the 200 is the client's ACK), with an `x-codeman-input-ack` header carrying
+  `{seq,dup:true,last}` through the same client ACK handler. Headers avoid adding
+  a body-read dependency to ordinary input delivery. `curl`/legacy callers omit
+  the fields and always apply.
 
 ## Oversized input (issue #484)
 
@@ -93,9 +98,20 @@ input for the session, and came back from localStorage on each reload.
 
 ## Known limitation
 
+Shift/Ctrl+Enter use `/send-key`, whose CLI-specific hex chord has no server
+deduplication contract. Both terminal implementations put these keys in the same
+input queue as an HTTP ordering barrier: earlier text must be acknowledged and
+later text waits. Only a recovery reservation's `422` response with
+`retryable:true` and `notSent:true` permits a retry (at most 16 attempts within
+30 seconds, with a 1-second minimum retry delay). Key requests have a 10-second
+deadline. Terminal teardown cancels its pending keys, and unsupported or unknown
+delivery outcomes produce feedback rather than replaying a potentially delivered
+newline. Named keys are not persisted across reloads; ordinary input retains its
+durable seq/ACK behavior.
+
 Dedup state is in-memory on the server. A **server restart** between a write and
 the client's redelivery of that same seq could re-apply it (a rare duplicate).
-This is a deliberate trade-off: favor *never losing input* over a rare duplicate
+This is a deliberate trade-off: favor _never losing input_ over a rare duplicate
 across the narrow restart window.
 
 ## Tests

@@ -26,6 +26,7 @@ import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { ApiErrorCode, httpStatusForErrorCode } from '../../src/types.js';
 import { Session } from '../../src/session.js';
+import type { MuxSession, TerminalMultiplexer } from '../../src/mux-interface.js';
 
 // Mock execFile so the send-key route's `tmux` invocation is observable (not run for real).
 const { execFile } = vi.hoisted(() => ({ execFile: vi.fn() }));
@@ -144,6 +145,120 @@ describe('session-routes', () => {
   // ========== POST /api/sessions/:id/send-key ==========
 
   describe('POST /api/sessions/:id/send-key', () => {
+    it('reserves the actual Session before a held child callback, excluding concurrent key/input/recovery', async () => {
+      const thread = '11111111-2222-3333-4444-555555555555';
+      const mux = {
+        isAvailable: () => true,
+        inspectPaneForRecovery: vi.fn(async () => ({ dead: false, screen: '›\n  example-model high · /tmp\n' })),
+        sendInput: vi.fn(async () => true),
+      };
+      const session = new Session({
+        id: 'test-session-1',
+        workingDir: '/tmp',
+        mode: 'codex',
+        useMux: true,
+        mux: mux as unknown as TerminalMultiplexer,
+        muxSession: { muxName: 'codeman-test-key', recoveryIsolated: true } as MuxSession,
+        codexConfig: { noDaemon: true, resumeSessionId: thread },
+      });
+      (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      let complete: (err: Error | null) => void = () => {};
+      execFile.mockReset();
+      execFile.mockImplementation((_bin: string, _argv: string[], _opts: unknown, cb: typeof complete) => {
+        complete = cb;
+      });
+      const sending = harness.app
+        .inject({
+          method: 'POST',
+          url: `/api/sessions/${session.id}/send-key`,
+          payload: { key: 'S-Enter' },
+        })
+        .then((response) => response);
+      try {
+        await vi.waitFor(() => expect(execFile).toHaveBeenCalledTimes(1));
+        expect(session.recoveryInputReserved).toBe(true);
+        expect(session.paneLifecycleInFlight).toBe(true);
+        expect(session.getRecoveryContext().generation).toBe(1);
+        expect(
+          await session.deliverRecovery(
+            { action: 'continue', key: 'fixture', conversationId: thread, startedAt: Date.now() },
+            1
+          )
+        ).toBe('not-sent');
+        expect(mux.sendInput).not.toHaveBeenCalled();
+        const blockedKey = await harness.app.inject({
+          method: 'POST',
+          url: `/api/sessions/${session.id}/send-key`,
+          payload: { key: 'C-Enter' },
+        });
+        expect(blockedKey.statusCode).toBe(422);
+        expect(blockedKey.json()).toMatchObject({ retryable: true, notSent: true });
+        const blockedInput = await harness.app.inject({
+          method: 'POST',
+          url: `/api/sessions/${session.id}/input`,
+          payload: { input: 'later', clientId: 'fixture', seq: 1 },
+        });
+        expect(blockedInput.statusCode).toBe(422);
+        expect(execFile).toHaveBeenCalledTimes(1);
+        complete(null);
+        expect((await sending).statusCode).toBe(200);
+        expect(session.recoveryInputReserved).toBe(false);
+        expect(session.paneLifecycleInFlight).toBe(false);
+        expect(session.getRecoveryContext().generation).toBe(1); // no post-callback double tracking
+      } finally {
+        complete(null);
+        await sending;
+        await session.stop(false);
+      }
+    });
+
+    it('certifies recovery-reserved keys as not sent, then sends the exact chord once after recovery', async () => {
+      execFile.mockReset();
+      execFile.mockImplementation((_bin: string, _argv: string[], _opts: unknown, cb: (e: Error | null) => void) =>
+        cb(null)
+      );
+      const session = harness.ctx._session;
+      session.recoveryInputReserved = true;
+      const blocked = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/send-key',
+        payload: { key: 'S-Enter' },
+      });
+      expect(blocked.statusCode).toBe(422);
+      expect(blocked.json()).toMatchObject({
+        success: false,
+        errorCode: 'OPERATION_FAILED',
+        retryable: true,
+        notSent: true,
+      });
+      expect(execFile).not.toHaveBeenCalled();
+
+      session.recoveryInputReserved = false;
+      const retried = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/send-key',
+        payload: { key: 'S-Enter' },
+      });
+      expect(retried.statusCode).toBe(200);
+      expect(execFile).toHaveBeenCalledTimes(1);
+      expect(execFile.mock.calls[0][1].slice(-1)).toEqual(['0a']);
+    });
+
+    it('does not label an uncertain tmux failure as safe to retry', async () => {
+      execFile.mockReset();
+      execFile.mockImplementation((_bin: string, _argv: string[], _opts: unknown, cb: (e: Error | null) => void) =>
+        cb(new Error('tmux timeout'))
+      );
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/send-key',
+        payload: { key: 'C-Enter' },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(res.json()).not.toHaveProperty('retryable');
+      expect(res.json()).not.toHaveProperty('notSent');
+    });
+
     it('routes tmux send-keys through the dedicated Codeman socket (-L)', async () => {
       // Regression guard: bare `tmux` would hit the user's default server and never
       // find a session that lives only on the Codeman socket (#80 regression class).

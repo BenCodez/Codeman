@@ -18,6 +18,8 @@ import { dataPath } from '../config/instance.js';
 export interface RebootIdentityFence {
   switchPending: boolean;
   submission?: { at: number; hash: string };
+  /** Exact UUID validated and launched by a completed new-pane reboot restore. */
+  resumeSessionId?: string;
   /** Direct tmux owned stdin, so tracked writes can no longer prove the pane's thread. */
   untrackedInput?: boolean;
 }
@@ -99,9 +101,16 @@ export function readRebootIdentityFence(id: string): RebootIdentityFence | undef
       throw new Error('Invalid proof');
     if (value.untrackedInput !== undefined && typeof value.untrackedInput !== 'boolean')
       throw new Error('Invalid handoff taint');
+    if (
+      value.resumeSessionId !== undefined &&
+      (typeof value.resumeSessionId !== 'string' ||
+        !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.resumeSessionId))
+    )
+      throw new Error('Invalid resumed identity');
     return {
       switchPending: value.switchPending,
       submission: value.submission,
+      ...(value.resumeSessionId !== undefined ? { resumeSessionId: value.resumeSessionId } : {}),
       ...(value.untrackedInput === true ? { untrackedInput: true } : {}),
     };
   } catch {

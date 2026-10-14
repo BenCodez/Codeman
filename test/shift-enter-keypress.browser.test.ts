@@ -21,9 +21,10 @@
  * Port: ephemeral
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { chromium, type Browser, type Page } from 'playwright';
 import { WebServer } from '../src/web/server.js';
+import { TmuxManager } from '../src/tmux-manager.js';
 
 let baseUrl: string;
 const MAIN_ID = 'shift-enter-probe-main';
@@ -44,10 +45,13 @@ describe('Shift/Ctrl+Enter through the shipped key handlers (keypress must be sw
   let page: Page;
 
   beforeAll(async () => {
+    // This suite serves assets and intercepts all input for nonexistent ids.
+    // Test-mode mux IO is already disabled; no installed tmux is needed.
+    vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
     server = new WebServer(0, false, true);
     await server.start();
     baseUrl = `http://localhost:${server.boundPort}`;
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, executablePath: process.env.CHROMIUM_PATH });
     page = await browser.newPage();
     await page.goto(baseUrl, { waitUntil: 'domcontentloaded' });
     await page.waitForFunction(() => (window as any).app?.terminal, null, { timeout: 30000 });
@@ -59,6 +63,27 @@ describe('Shift/Ctrl+Enter through the shipped key handlers (keypress must be sw
         const realFetch = window.fetch.bind(window);
         window.fetch = (input: RequestInfo | URL, init?: RequestInit) => {
           const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+          const probe = w.__queueProbe;
+          if (probe && url.match(new RegExp(`/api/sessions/${probe.id}/(input|send-key)$`))) {
+            const body = JSON.parse(String(init?.body ?? '{}'));
+            const value = body.key ? `<${body.key}>` : body.input;
+            probe.requests.push(value);
+            if (body.key && probe.reserved) {
+              return Promise.resolve(
+                new Response(
+                  JSON.stringify({
+                    success: false,
+                    errorCode: 'OPERATION_FAILED',
+                    retryable: true,
+                    notSent: true,
+                  }),
+                  { status: 422, headers: { 'Content-Type': 'application/json' } }
+                )
+              );
+            }
+            probe.delivered.push(value);
+            return Promise.resolve(new Response('{}', { status: 200 }));
+          }
           const m = /\/api\/sessions\/([^/]+)\/send-key$/.exec(url);
           if (m) {
             w.__sendKeys.push(`${m[1]} ${JSON.parse(String(init?.body ?? '{}')).key}`);
@@ -101,6 +126,7 @@ describe('Shift/Ctrl+Enter through the shipped key handlers (keypress must be sw
   afterAll(async () => {
     if (browser) await browser.close();
     if (server) await server.stop();
+    vi.restoreAllMocks();
   }, 60000);
 
   /**
@@ -213,5 +239,55 @@ describe('Shift/Ctrl+Enter through the shipped key handlers (keypress must be sw
     const enter = await pressIn('paneB', 'Enter');
     expect(enter.data).toEqual(['\r']);
     expect(enter.sendKeys).toEqual([]);
+  });
+
+  it.each([
+    ['main', 'Shift+Enter', 'S-Enter'],
+    ['paneB', 'Control+Enter', 'C-Enter'],
+  ])('%s queues a recovery-blocked %s ahead of subsequent typing, delivering it once', async (pane, chord, key) => {
+    const id = pane === 'main' ? MAIN_ID : PANE_B_ID;
+    await page.evaluate(
+      ({ id, pane }) => {
+        const w = window as any;
+        const app = w.app;
+        w.__queueSaved = { id: app.activeSessionId, echo: app._localEchoEnabled, socketFor: app._inputSocketFor };
+        // Stand in for the transport only. Both handlers and the app's input
+        // queue, ACK handling and redelivery sweep are the shipped code.
+        app._inputSocketFor = () => null;
+        app.activeSessionId = id;
+        app._localEchoEnabled = false;
+        app._pendingInput = '';
+        w.__queueProbe = { id, reserved: true, requests: [], delivered: [] };
+        (pane === 'main' ? app.terminal : w.__paneB.terminal).focus();
+      },
+      { id, pane }
+    );
+    try {
+      await page.keyboard.type('before');
+      await page.keyboard.press(chord);
+      await page.waitForFunction((key) => (window as any).__queueProbe.requests.includes(`<${key}>`), key);
+      await page.keyboard.type('after');
+      await page.waitForTimeout(100);
+      expect(await page.evaluate(() => (window as any).__queueProbe.delivered.join(''))).toBe('before');
+      await page.evaluate(() => {
+        (window as any).__queueProbe.reserved = false;
+      });
+      await page.waitForFunction(() => (window as any).__queueProbe.delivered.join('').endsWith('after'), null, {
+        timeout: 10000,
+      });
+      const probe = await page.evaluate(() => (window as any).__queueProbe);
+      expect(probe.delivered.join('')).toBe(`before<${key}>after`);
+      expect(probe.delivered.filter((value: string) => value === `<${key}>`)).toHaveLength(1);
+      expect(probe.requests.filter((value: string) => value === `<${key}>`).length).toBeGreaterThan(1);
+    } finally {
+      await page.evaluate(() => {
+        const w = window as any;
+        const app = w.app;
+        app.activeSessionId = w.__queueSaved.id;
+        app._localEchoEnabled = w.__queueSaved.echo;
+        app._inputSocketFor = w.__queueSaved.socketFor;
+        w.__queueProbe = null;
+      });
+    }
   });
 });

@@ -20,10 +20,10 @@
 import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { getDataDir } from '../../src/config/instance.js';
+import { dataPath, getDataDir } from '../../src/config/instance.js';
 import { writeCustomModelHosts, type CustomModelHost } from '../../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
 
@@ -58,6 +58,9 @@ vi.mock('../../src/session.js', () => ({
     /** The mock route context projects a session through this on broadcast. */
     toState() {
       return { id: this.id, mode: this.mode, name: this.name, workingDir: this.workingDir, owner: this.owner };
+    }
+    getRecoveryContext() {
+      return { switchPending: false, submission: undefined, untrackedInput: false };
     }
   },
 }));
@@ -126,6 +129,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   rebootRestoreRegistry.reset();
+  rmSync(dataPath('reboot-identities', 'codex-original.json'), { force: true });
   await writeCustomModelHosts(getDataDir(), []);
   vi.clearAllMocks();
 });
@@ -659,7 +663,7 @@ describe('Codex reboot launch and cancellation', () => {
     try {
       const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json()
         .data;
-      expect(result.skipped).toEqual([{ sessionId: 'codex-original', reason: 'identity-unverified' }]);
+      expect(result.skipped).toEqual([{ sessionId: 'codex-original', reason: 'rebuild-failed' }]);
       expect(launchConfigs).toEqual([]);
     } finally {
       await app.close();

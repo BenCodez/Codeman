@@ -53,6 +53,7 @@ import { SseEvent } from '../sse-events.js';
 import type { CodexConfig, CustomModelBookkeeping, SessionAttachmentHistoryItem } from '../../types.js';
 import { rebuildPersistedCustomModelEnv } from '../../custom-model-recovery.js';
 import { customModelConfigDir, removeConfigDir } from '../../custom-model-injection-apply.js';
+import { writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
 
 type RebootRestoreCtx = SessionPort & EventPort & ConfigPort & InfraPort;
@@ -200,16 +201,24 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             const trustedConfigDir = customModelConfigDir(saved.id);
             preserveCustomModelConfigDir = existsSync(trustedConfigDir);
             if (!preserveCustomModelConfigDir) newlyCreatedCustomModelConfigDir = trustedConfigDir;
-            // CODEX_HOME and API credentials for a custom endpoint are stripped by
-            // the owner clamp above. Re-add only values derived from the CURRENT
+            // Re-add only values derived from the CURRENT
             // admin-owned endpoint store and the deterministic per-session config
-            // directory. Persisted/user-provided values never cross this boundary.
+            // directory. A privileged owner's clamp retains saved values, so a
+            // failed rebuild must refuse the launch even when the old home verifies.
             const trustedCustomModelEnv = await rebuildPersistedCustomModelEnv(
               saved.mode ?? 'claude',
               saved.id,
               savedCustomModel
             );
-            if (trustedCustomModelEnv) envOverrides = { ...envOverrides, ...trustedCustomModelEnv };
+            if (!trustedCustomModelEnv) {
+              failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
+              continue;
+            }
+            const customModelKeys = new Set(savedCustomModel.envKeys);
+            envOverrides = {
+              ...Object.fromEntries(Object.entries(envOverrides ?? {}).filter(([key]) => !customModelKeys.has(key))),
+              ...trustedCustomModelEnv,
+            };
           }
           let codexConfig: CodexConfig | undefined;
           if (usesCodexRecovery) {
@@ -376,6 +385,17 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // lands during state restoration, hook installation or preamble setup
           // is therefore observed and cleaned up before the rebuilt record can
           // replace the pre-reboot snapshot.
+          if (usesCodexRecovery) {
+            const identity = session.getRecoveryContext();
+            writeRebootIdentityFence(session.id, {
+              resumeSessionId: codexConfig!.resumeSessionId,
+              switchPending: identity.switchPending,
+              // The new Session has no consumed pre-reboot submission. Retain
+              // any NEW tracked input or direct-attach veto from the startup awaits.
+              submission: identity.submission,
+              untrackedInput: identity.untrackedInput,
+            });
+          }
           ctx.persistSessionState(session);
 
           getLifecycleLog().log({ event: 'recovered', sessionId: session.id, name: session.name });

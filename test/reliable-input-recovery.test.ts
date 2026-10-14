@@ -50,15 +50,16 @@ describe('the client lifts itself over the watermark', () => {
     expect(handler).toMatch(/_seqCounters\.set\(sessionId, watermark\)/);
   });
 
-  it('re-queues a FIRST-attempt frame, whose input was genuinely lost', () => {
+  it('repairs a FIRST-attempt frame in place, whose input was genuinely lost', () => {
     expect(handler).toMatch(/rec\.tries <= 1/);
-    expect(handler).toMatch(/this\._reliableSend\(sessionId, lost/);
+    expect(handler).toMatch(/rec\.seq = this\._nextSeq\(sessionId\)/);
+    expect(handler).not.toMatch(/this\._reliableSend\(/);
   });
 
   it('does NOT re-queue a retry, which the dedup correctly suppressed', () => {
     // A retry called a duplicate means the original DID land; re-sending it would
     // type the same thing twice — the exact thing exactly-once delivery prevents.
-    expect(handler).toMatch(/const lost = rec && rec\.tries <= 1 \? rec\.data : null;/);
+    expect(handler).toMatch(/if \(rec && !rec\.key && rec\.tries <= 1\)/);
   });
 
   it('persists the raised counter immediately, not on the debounce', () => {

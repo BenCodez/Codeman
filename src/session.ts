@@ -1313,13 +1313,13 @@ export class Session extends EventEmitter {
   }
 
   /**
-   * True while a start, attach or relaunch is running for this session's pane.
+   * True while a start, attach, relaunch or input dispatch owns this session's pane.
    * The exited-agent sweep reads it (see `pane-exit-sweep.ts`): the dead-pane
    * branch of {@link _setupOrAttachMuxSession} respawns an exited pane, and
    * until it finishes and clears the exit, the pane still reads as dead.
    */
   get paneLifecycleInFlight(): boolean {
-    return this._paneLifecycleOps > 0;
+    return this._paneLifecycleOps > 0 || this._inputDeliveryInFlight;
   }
 
   /**
@@ -1342,6 +1342,7 @@ export class Session extends EventEmitter {
    */
   markClosing(closing: boolean): void {
     this._closing = closing;
+    if (closing) this._namedKeyAbort?.abort();
   }
 
   /** Run one pane start, attach or relaunch with {@link paneLifecycleInFlight} raised. */
@@ -2069,6 +2070,7 @@ export class Session extends EventEmitter {
     createSessionOptions: import('./mux-interface.js').CreateSessionOptions;
     spawnErrLabel: string;
   }): Promise<{ isRestored: boolean; respawnedResumeId?: string; respawnedDeadPane: boolean }> {
+    if (this._inputDeliveryInFlight) throw new Error('Session input delivery is in progress');
     return this._withPaneLifecycle(() => this._doSetupOrAttachMuxSession(options));
   }
 
@@ -2215,6 +2217,7 @@ export class Session extends EventEmitter {
    * @returns true if the pane was respawned (reattach issued), false otherwise.
    */
   async reattachRemote(): Promise<boolean> {
+    if (this._inputDeliveryInFlight) return false;
     if (!this._remote) return false; // not a remote session
     if (!this._useMux || !this._mux || !this._muxSession) return false;
     const mux = this._mux;
@@ -2262,19 +2265,56 @@ export class Session extends EventEmitter {
    *   the mux session is gone — see {@link reattachRemote} for that reasoning).
    */
   async restartCli(): Promise<boolean> {
-    if (this._recoveryDelivering) return false;
+    if (this._inputDeliveryInFlight) return false;
     return this._withPaneLifecycle(() => this._doRestartCli());
   }
 
   private _recoveryGeneration = 0;
   private _recoveryDelivering = false;
+  private _namedKeyAbort: AbortController | null = null;
+  private _ordinaryInputWrites = 0;
   private _recoverySubmission?: { at: number; hash: string };
   private _recoveryIntentionalStopAt = 0;
   private _recoverySwitchPending = false;
   private _recoveryUntrackedInput = false;
 
   get recoveryInputReserved(): boolean {
-    return this._recoveryDelivering;
+    return this._recoveryDelivering || this._namedKeyAbort !== null;
+  }
+
+  /** Lifecycle/recovery admission also excludes ordinary sends already in flight. */
+  private get _inputDeliveryInFlight(): boolean {
+    return this.recoveryInputReserved || this._ordinaryInputWrites > 0;
+  }
+
+  /**
+   * Own a raw named-key dispatch from admission through its child completion.
+   * User intent cancels recovery/verifier work before any asynchronous send;
+   * false certifies rejection before dispatch, while a dispatched failure throws
+   * because bytes may have reached the pane. Raw input is tracked exactly once.
+   */
+  async sendNamedKey(data: string, dispatch: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
+    if (this._inputDeliveryInFlight || this._paneLifecycleOps > 0 || this._closing || this._isStopped) return false;
+    const abort = new AbortController();
+    this._namedKeyAbort = abort;
+    try {
+      this._submitVerifier?.cancel();
+      this._submitVerifier = null;
+      const submitted = this._trackSubmit(data, { fromUser: true });
+      if (abort.signal.aborted) return false;
+      await dispatch(abort.signal);
+      if (abort.signal.aborted) throw new Error('Named key dispatch cancelled');
+      this._emitSubmittedPrompt(submitted);
+      return true;
+    } catch (err) {
+      if (getCli(this.mode)?.capabilities.recovery === 'codex-rollout') {
+        this._recoveryInputProofTracker.invalidate();
+        this._invalidateRecoverySubmission();
+      }
+      throw err;
+    } finally {
+      if (this._namedKeyAbort === abort) this._namedKeyAbort = null;
+    }
   }
 
   /** Private recovery evidence; raw prompts and environment values never enter the public session state. */
@@ -2331,7 +2371,7 @@ export class Session extends EventEmitter {
       !context.noDaemon ||
       context.switchPending ||
       this._paneLifecycleOps > 0 ||
-      this._recoveryDelivering ||
+      this._inputDeliveryInFlight ||
       generation !== context.generation ||
       this._codexConfig?.resumeSessionId !== flight.conversationId
     )
@@ -2792,7 +2832,7 @@ export class Session extends EventEmitter {
   }
 
   async startInteractive(): Promise<void> {
-    if (this._recoveryDelivering) throw new Error('Session recovery is in progress');
+    if (this._inputDeliveryInFlight) throw new Error('Session recovery is in progress');
     if (this.ptyProcess) {
       throw new Error('Session already has a running process');
     }
@@ -3815,7 +3855,7 @@ export class Session extends EventEmitter {
    * ```
    */
   async startShell(): Promise<void> {
-    if (this._recoveryDelivering) throw new Error('Session recovery is in progress');
+    if (this._inputDeliveryInFlight) throw new Error('Session recovery is in progress');
     if (this.ptyProcess) {
       throw new Error('Session already has a running process');
     }
@@ -4488,12 +4528,17 @@ export class Session extends EventEmitter {
    * input could disappear while the caller believed it had been delivered.
    */
   write(data: string, options: SessionWriteOptions = {}): boolean {
-    if (this._recoveryDelivering) return false;
-    const submittedPrompt = this._trackSubmit(data, options);
-    if (!this.ptyProcess) return false;
-    this.ptyProcess.write(data);
-    this._emitSubmittedPrompt(submittedPrompt);
-    return true;
+    if (this.recoveryInputReserved) return false;
+    this._ordinaryInputWrites++;
+    try {
+      const submittedPrompt = this._trackSubmit(data, options);
+      if (!this.ptyProcess) return false;
+      this.ptyProcess.write(data);
+      this._emitSubmittedPrompt(submittedPrompt);
+      return true;
+    } finally {
+      this._ordinaryInputWrites--;
+    }
   }
 
   // ── Conversation tracking ─────────────────────────────────────────────
@@ -4718,7 +4763,16 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    if (this._recoveryDelivering) return false;
+    if (this.recoveryInputReserved) return false;
+    this._ordinaryInputWrites++;
+    try {
+      return await this._doWriteViaMux(data, options);
+    } finally {
+      this._ordinaryInputWrites--;
+    }
+  }
+
+  private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
     const submittedPrompt = this._trackSubmit(data, options, !!(this._mux && this._muxSession));
     if (this._mux && this._muxSession) {
       const sent = await this._mux.sendInput(this.id, data);
@@ -5006,6 +5060,7 @@ export class Session extends EventEmitter {
   async stop(killMux: boolean = true): Promise<void> {
     // Set stopped flag first to prevent new timers from being created
     this._isStopped = true;
+    this._namedKeyAbort?.abort();
     // A pane that is gone is watching nothing. Nothing probes a stopped session, so
     // without this the last chip it drew would ride along on its row forever.
     this._watching = null;
