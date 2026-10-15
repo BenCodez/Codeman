@@ -445,3 +445,136 @@ it('actual dismiss waits for durable ACK while GET and competing restore stay re
     await h.app.close();
   }
 });
+
+async function failAndEndRestore() {
+  expect(registry.beginSpending('alice')).toBe(true);
+  const [held] = registry.take(alice, undefined, 'alice');
+  io.failPrimaryAck = true;
+  await expect(registry.releaseFlight('alice', [])).rejects.toThrow('ACK lost');
+  registry.endSpending('alice');
+  expect(registry.beginSpending('alice')).toBe(false);
+  expect(registry.isHeld(held, 'alice')).toBe(false);
+  return held;
+}
+it('an explicit Restore durably repairs a transient failed release and uses a fresh held reference', async () => {
+  const held = await failAndEndRestore();
+  const entered = hold('primary-file-sync');
+  const repairing = registry.beginSpendingAfterRepair('alice');
+  await reached(entered, repairing);
+  expect(registry.take(alice, undefined, 'alice')).toEqual([]);
+  expect(await registry.beginSpendingAfterRepair('alice')).toBe(false);
+  expect(await registry.beginSpendingAfterRepair('bob')).toBe(false);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  release!();
+  expect(await repairing).toBe(true);
+  const [fresh] = registry.take(alice, undefined, 'alice');
+  expect(fresh).not.toBe(held);
+  expect(registry.isHeld(fresh, 'alice')).toBe(true);
+  expect(registry.isHeld(held, 'alice')).toBe(false);
+  await registry.releaseFlight('alice', [fresh]);
+  registry.endSpending('alice');
+  expect(await restoredIds()).toEqual(['bob', 'alice']);
+});
+it('a repeated repair ACK failure keeps every spending and cleanup veto until another explicit click', async () => {
+  await failAndEndRestore();
+  io.failPrimaryAck = true;
+  expect(await registry.beginSpendingAfterRepair('alice')).toBe(false);
+  expect(registry.beginSpending('alice')).toBe(false);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  expect(await registry.beginSpendingAfterRepair('alice')).toBe(true);
+  registry.endSpending('alice');
+});
+it.each(['malformed', 'foreign', 'missing'])(
+  'preserves a %s journal in place instead of repairing unknown evidence',
+  async (kind) => {
+    await failAndEndRestore();
+    await fs.unlink(path + '.previous');
+    const bytes =
+      kind === 'malformed'
+        ? '{private broken journal'
+        : JSON.stringify({ version: 1, builtAt: Date.now(), entries: [entry('foreign')] });
+    if (kind === 'missing') await fs.unlink(path);
+    else await fs.writeFile(path, bytes);
+    expect(await registry.beginSpendingAfterRepair('alice')).toBe(false);
+    expect(registry.getBrokerCleanupState()).toBeUndefined();
+    if (kind === 'missing') await expect(fs.stat(path)).rejects.toMatchObject({ code: 'ENOENT' });
+    else expect(await fs.readFile(path, 'utf8')).toBe(bytes);
+  }
+);
+it('Dismiss during a held repair wins before any offer can be taken', async () => {
+  const old = await failAndEndRestore();
+  const entered = hold('primary-file-sync');
+  const repairing = registry.beginSpendingAfterRepair('alice');
+  await reached(entered, repairing);
+  const clearing = registry.clear(alice);
+  release!();
+  expect(await repairing).toBe(false);
+  expect(await clearing).toBe(1);
+  expect(registry.take(alice, undefined, 'alice')).toEqual([]);
+  expect(registry.isHeld(old, 'alice')).toBe(false);
+  expect(await restoredIds()).toEqual(['bob']);
+});
+it('expiry while repairing cannot authorize a retained offer', async () => {
+  await failAndEndRestore();
+  const entered = hold('primary-file-sync');
+  const repairing = registry.beginSpendingAfterRepair('alice');
+  await reached(entered, repairing);
+  vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 25 * 60 * 60 * 1000);
+  release!();
+  expect(await repairing).toBe(false);
+  expect(registry.take(alice, undefined, 'alice')).toEqual([]);
+  await registry.flush();
+  expect(await restoredIds()).toEqual([]);
+});
+it('a still-live failed restore flight cannot be repaired by another owner', async () => {
+  expect(registry.beginSpending('alice')).toBe(true);
+  registry.take(alice, undefined, 'alice');
+  io.failPrimaryAck = true;
+  await expect(registry.releaseFlight('alice', [])).rejects.toThrow('ACK lost');
+  expect(await registry.beginSpendingAfterRepair('bob')).toBe(false);
+  registry.endSpending('alice');
+  expect(await registry.beginSpendingAfterRepair('bob')).toBe(true);
+  registry.endSpending('bob');
+});
+it.each(['workspace-missing', 'already-live'])(
+  'actual owner Restore retries the journal and preserves the %s launch veto',
+  async (reason) => {
+    rebootRestoreRegistry.reset();
+    await rebootRestoreRegistry.configurePersistence(path);
+    const candidate = entry('repair-route');
+    candidate.workingDir = join(root, 'absent-workspace');
+    candidate.state.workingDir = candidate.workingDir;
+    await rebootRestoreRegistry.set([candidate]);
+    expect(rebootRestoreRegistry.beginSpending()).toBe(true);
+    const [held] = rebootRestoreRegistry.take(() => true, undefined, undefined);
+    io.failPrimaryAck = true;
+    await expect(rebootRestoreRegistry.releaseFlight(undefined, [])).rejects.toThrow('ACK lost');
+    rebootRestoreRegistry.endSpending();
+    const h = await createRouteTestHarness(
+      registerRebootRestoreRoutes,
+      reason === 'already-live' ? { sessionId: candidate.sessionId } : undefined
+    );
+    try {
+      const entered = hold('primary-file-sync');
+      const restoring = Promise.resolve(
+        h.app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })
+      );
+      await reached(entered, restoring);
+      expect((await h.app.inject({ method: 'GET', url: '/api/reboot-restore' })).statusCode).toBe(200);
+      expect((await h.app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).statusCode).toBe(
+        409
+      );
+      expect(h.ctx.addSession).not.toHaveBeenCalled();
+      expect(rebootRestoreRegistry.isHeld(held, undefined)).toBe(false);
+      release!();
+      const response = await restoring;
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toEqual({ restored: [], skipped: [{ sessionId: candidate.sessionId, reason }] });
+      expect(h.ctx.addSession).not.toHaveBeenCalled();
+      expect(rebootRestoreRegistry.list(() => true)).toHaveLength(reason === 'already-live' ? 0 : 1);
+    } finally {
+      release?.();
+      await h.app.close();
+    }
+  }
+);
