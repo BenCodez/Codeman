@@ -150,7 +150,7 @@ it('withholds while a later mutation remains queued or active after its predeces
 });
 
 it.each(['save', 'drop', 'prune'] as const)(
-  'withholds cleanup after a lost %s rename acknowledgment until a complete rewrite succeeds',
+  'seals cleanup and mutations after a lost %s rename acknowledgment until restart',
   async (kind) => {
     const f = await fixture();
     const native = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
@@ -161,15 +161,20 @@ it.each(['save', 'drop', 'prune'] as const)(
     });
     try {
       await expect(mutation(f.store, kind)).rejects.toBe(ioError);
-      // Cached records can disagree with the private pathname after an actual rename.
-      expect(f.store.get(ID)).toEqual(state());
+      // The pathname may contain the new state while cached ownership is stale.
+      const published = await readFile(f.path, 'utf8');
+      expect(f.store.get(ID)).toEqual({ ...state(), phase: 'blocked', reason: 'persistence-failed' });
       expect(new SupervisorStore(f.path).getBrokerCleanupState()).toEqual(
         kind === 'save' ? { [ID]: { ...state(), objective: 'Newly committed plan' } } : {}
       );
       expect(f.store.getBrokerCleanupState()).toBeUndefined();
-      await f.store.save(ID, { ...state(), objective: 'Later healthy write' });
-      expect(f.store.get(ID).objective).toBe('Later healthy write');
-      expect(f.store.getBrokerCleanupState()).toEqual(new SupervisorStore(f.path).getBrokerCleanupState());
+      await expect(f.store.save(ID, { ...state(), objective: 'Stale rewrite' })).rejects.toThrow(/uncertain/);
+      await expect(f.store.drop(ID)).rejects.toThrow(/uncertain/);
+      await expect(f.store.pruneOrphans(() => false)).rejects.toThrow(/uncertain/);
+      expect(await readFile(f.path, 'utf8')).toBe(published);
+      const restarted = new SupervisorStore(f.path);
+      await restarted.save(ID, { ...state(), objective: 'Later healthy write' });
+      expect(restarted.getBrokerCleanupState()).toEqual(new SupervisorStore(f.path).getBrokerCleanupState());
       expect(new SupervisorStore(f.path).getBrokerCleanupState()?.[ID].objective).toBe('Later healthy write');
     } finally {
       await f.cleanup();

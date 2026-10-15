@@ -4,6 +4,7 @@ import { TaskController, type TaskDependencies } from '../src/supervision/contro
 import { initialTaskState, type TaskState } from '../src/supervision/schema.js';
 import {
   SupervisorController,
+  SupervisorValidationError,
   type SupervisorDependencies,
   type SupervisorWorkerHandle,
 } from '../src/supervisor/controller.js';
@@ -165,6 +166,68 @@ async function noMoreManagerWork(h: ReturnType<typeof harness>) {
 }
 
 describe('Supervisor manager Task pause invariant', () => {
+  it.each(['missing-worker', 'shared-home', 'lease-collision'] as const)(
+    'durably exposes the paused manager after rejected %s reconfiguration and allows owner Start',
+    async (failure) => {
+      const h = await active();
+      const before = h.controller.getStatus();
+      const error = new SupervisorValidationError(failure);
+      if (failure === 'lease-collision') h.deps.leaseHolder = () => 'another-supervisor';
+      else
+        vi.mocked(h.deps.validateWorkers).mockImplementation(() => {
+          throw error;
+        });
+      await expect(h.controller.configure({ ...config, objective: 'Rejected replacement' })).rejects.toThrow();
+      expect(h.controller.getStatus()).toMatchObject({
+        objective: before.objective,
+        workers: before.workers,
+        startedAt: before.startedAt,
+        enabled: true,
+        phase: 'paused',
+        reason: 'configuration-refused',
+      });
+      expect(h.saved.at(-1)?.phase).toBe('paused');
+      expect(h.deps.hasManagerAuthority()).toBe(false);
+      await noMoreManagerWork(h);
+      vi.mocked(h.deps.validateWorkers).mockReset();
+      h.deps.leaseHolder = () => undefined;
+      await h.controller.start();
+      expect(h.controller.getStatus().phase).toBe('active');
+      expect(h.deps.hasManagerAuthority()).toBe(true);
+      expect(h.controller.getStatus().startedAt).toBe(before.startedAt);
+    }
+  );
+
+  it('keeps the manager blocked when persisting the rejected-configuration pause fails', async () => {
+    const h = await active();
+    vi.mocked(h.deps.validateWorkers).mockImplementation(() => {
+      throw new SupervisorValidationError('Missing worker');
+    });
+    vi.mocked(h.deps.persist).mockRejectedValueOnce(new Error('Fixture pause journal refused'));
+    await expect(h.controller.configure(config)).rejects.toThrow(/saved/);
+    expect(h.controller.getStatus()).toMatchObject({ enabled: false, phase: 'blocked', reason: 'persistence-failed' });
+    expect(h.deps.hasManagerAuthority()).toBe(false);
+    await noMoreManagerWork(h);
+  });
+
+  it('does not overwrite a newer owner reset after an earlier replacement is superseded', async () => {
+    const h = await active();
+    const replacing = h.controller
+      .configure({ ...config, objective: 'Superseded replacement' })
+      .catch((error: unknown) => error);
+    const resetting = h.controller.reset();
+    expect(await replacing).toBeInstanceOf(SupervisorValidationError);
+    await resetting;
+    expect(h.controller.getStatus()).toMatchObject({
+      enabled: false,
+      phase: 'disabled',
+      reason: 'owner-reset',
+      objective: '',
+    });
+    expect(h.controller.getStatus().history.some((entry) => entry.reason === 'configuration-refused')).toBe(false);
+    expect(h.deps.hasManagerAuthority()).toBe(false);
+  });
+
   it.each([false, true])(
     'vetoes manager polling immediately while queued reconfiguration waits (enabled=%s)',
     async (enabled) => {

@@ -149,6 +149,21 @@ describe('task and recovery server action wiring', () => {
       }
     }
   );
+  it.each([
+    ['local', {}, true],
+    ['docker', { docker: { containerId: 'fixture' } }, false],
+    ['owned SSH', { remote: { owned: true, host: 'fixture.invalid', remotePath: '/fixture' } }, true],
+    ['implicit owned SSH', { remote: { host: 'fixture.invalid', remotePath: '/fixture' } }, true],
+    ['unowned SSH', { remote: { owned: false, host: 'fixture.invalid', remotePath: '/fixture' } }, false],
+  ] as const)('creates layer4 task workflows only for local or owned SSH %s', (_kind, location, supported) => {
+    const id = `task-location-${_kind.replaceAll(' ', '-')}`;
+    ids.add(id);
+    const session = new Session({ id, mode: 'codex', workingDir: process.cwd(), useMux: false, ...location });
+    internals.sessions.set(id, session);
+    const controller = internals.getTaskController(session);
+    expect(controller !== undefined).toBe(supported);
+    if (!supported) expect(internals.taskStore.get(id)).toEqual(initialTaskState());
+  });
 
   it.each([false, true])(
     'forwards delegated configuration authority to the real journal (current=%s)',

@@ -194,7 +194,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
           !notedOwnerIntent.has(msg) &&
           msg.t === 'i' &&
           typeof msg.d === 'string' &&
-          msg.d.length <= MAX_INPUT_LENGTH &&
+          Buffer.byteLength(msg.d, 'utf8') <= MAX_INPUT_LENGTH &&
           socket.readyState === 1 &&
           ctx.sessions.get(id) === session &&
           canAccessOwned(getAuthUser(req), session.owner) &&
@@ -221,7 +221,15 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             return;
           }
           if (msg.t === 'i' && typeof msg.d === 'string') {
-            if (msg.d.length > MAX_INPUT_LENGTH) {
+            // Reject supplied malformed delivery tags before retaining a FIFO identity
+            // or ACKing an oversized frame. Never reinterpret them as legacy raw input.
+            if (
+              (msg.cid !== undefined &&
+                (typeof msg.cid !== 'string' || msg.cid.length === 0 || msg.cid.length > 128)) ||
+              (msg.seq !== undefined && (typeof msg.seq !== 'number' || !Number.isSafeInteger(msg.seq) || msg.seq < 0))
+            )
+              return;
+            if (Buffer.byteLength(msg.d, 'utf8') > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame
               // unACKed and the client redelivered it every few seconds forever
               // (issue #484). A client that predates `err` reads this as a plain
@@ -367,7 +375,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               (msg.seq !== undefined && (typeof msg.seq !== 'number' || !Number.isSafeInteger(msg.seq) || msg.seq < 0)))
           )
             return;
-          if (msg.t !== 'i' || typeof msg.d !== 'string' || msg.d.length > MAX_INPUT_LENGTH) {
+          if (msg.t !== 'i' || typeof msg.d !== 'string' || Buffer.byteLength(msg.d, 'utf8') > MAX_INPUT_LENGTH) {
             void handleMessage(msg);
             return;
           }

@@ -188,28 +188,38 @@ export class SupervisorController {
     // Owner reconfiguration revokes manager Task input before the supervisor
     // queue or lease journal can delay applying the replacement configuration.
     void this.suspendManager();
-    return this.enqueue(() =>
-      this.deps.withLeases(async () => {
-        if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
-        if (this.state.inFlight)
-          throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
-        this.deps.validateWorkers(config.workers.map((w) => w.sessionId));
-        if (config.enabled) {
-          if (this.deps.leaseHolder(this.state.supervisorSessionId, this.state.supervisorSessionId))
-            throw new SupervisorValidationError('A worker cannot become a supervisor');
-          for (const worker of config.workers) {
-            const holder = this.deps.leaseHolder(worker.sessionId, this.state.supervisorSessionId);
-            if (holder) throw new SupervisorValidationError('Worker already has an active supervisor');
+    return this.enqueue(async () => {
+      try {
+        return await this.deps.withLeases(async () => {
+          if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
+          if (this.state.inFlight)
+            throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
+          this.deps.validateWorkers(config.workers.map((w) => w.sessionId));
+          if (config.enabled) {
+            if (this.deps.leaseHolder(this.state.supervisorSessionId, this.state.supervisorSessionId))
+              throw new SupervisorValidationError('A worker cannot become a supervisor');
+            for (const worker of config.workers) {
+              const holder = this.deps.leaseHolder(worker.sessionId, this.state.supervisorSessionId);
+              if (holder) throw new SupervisorValidationError('Worker already has an active supervisor');
+            }
           }
+          this.state.objective = config.objective;
+          this.state.enabled = config.enabled;
+          this.state.workers = config.workers.map((worker) => ({ ...worker, assignments: 0 }));
+          this.state.startedAt = undefined;
+          this.state.phase = config.enabled ? 'ready' : 'disabled';
+          return this.save('configured');
+        });
+      } catch (error) {
+        // This request already revoked manager input. A rejected replacement
+        // must expose that pause without overwriting a newer owner operation.
+        if (this.revision === revision && this.state.phase === 'active') {
+          this.state.phase = 'paused';
+          await this.save('configuration-refused');
         }
-        this.state.objective = config.objective;
-        this.state.enabled = config.enabled;
-        this.state.workers = config.workers.map((worker) => ({ ...worker, assignments: 0 }));
-        this.state.startedAt = undefined;
-        this.state.phase = config.enabled ? 'ready' : 'disabled';
-        return this.save('configured');
-      })
-    );
+        throw error;
+      }
+    });
   }
 
   start(): Promise<SupervisorState> {
@@ -592,6 +602,11 @@ export class SupervisorController {
     const ownRecoveryRefusal =
       dispatchReserved && action === 'retry' && !recovery.inFlight && recovery.lastReason === 'delivery-failed';
     if (
+      (action === 'assign' &&
+        task.config.enabled &&
+        task.phase === 'watching' &&
+        task.kickoffAt !== undefined &&
+        !dispatchReserved) ||
       task.agentProgressVeto === true ||
       this.deps.agentProgressVeto?.(configured.sessionId) === true ||
       (task.phase === 'paused' && !ownTaskUncertainty) ||

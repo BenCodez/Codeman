@@ -84,6 +84,73 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
 }
 
 describe('SupervisorController', () => {
+  describe('existing worker task admission', () => {
+    function matching(h: ReturnType<typeof harness>, kickoffAt: number | undefined) {
+      h.taskState.objective = config.workers[0].task;
+      h.taskState.criteria = config.workers[0].criteria.map((criterion) => ({ ...criterion, verified: false }));
+      h.taskState.config.enabled = true;
+      h.taskState.phase = 'watching';
+      h.taskState.outcome = 'unfinished';
+      h.taskState.kickoffAt = kickoffAt;
+    }
+
+    it.each([0, 10_000])('does not spend an assignment re-resuming a watching kickoff at %s', async (kickoffAt) => {
+      const h = harness();
+      matching(h, kickoffAt);
+      await h.controller.configure(config);
+      await h.controller.start();
+      const before = h.controller.getStatus();
+      vi.mocked(h.deps.persist).mockClear();
+      for (const request of ['already-watching-one', 'already-watching-two']) {
+        await expect(h.controller.assign(WORKER, request)).rejects.toThrow();
+      }
+      expect(h.controller.getStatus()).toEqual(before);
+      expect(h.deps.persist).not.toHaveBeenCalled();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+    });
+
+    it('rechecks a task that begins watching during the final manager authority await', async () => {
+      const h = harness();
+      await h.controller.configure(config);
+      await h.controller.start();
+      let checks = 0;
+      vi.mocked(h.deps.validateManagerAuthority).mockImplementation(async () => {
+        if (++checks === 2) matching(h, 10_000);
+        return true;
+      });
+      await expect(h.controller.assign(WORKER, 'became-watching')).rejects.toThrow();
+      expect(h.controller.getStatus().workers[0].assignments).toBe(0);
+      expect(h.controller.getStatus().inFlight).toBeUndefined();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+    });
+
+    it('retains the explicit owner pause veto for a matching task', async () => {
+      const h = harness();
+      matching(h, 10_000);
+      h.taskState.phase = 'paused';
+      h.taskState.reason = 'owner-paused';
+      await h.controller.configure(config);
+      await h.controller.start();
+      await expect(h.controller.assign(WORKER, 'owner-paused-task')).rejects.toThrow();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      expect(h.controller.getStatus().workers[0].assignments).toBe(0);
+    });
+
+    it('allows a matching configured task with no kickoff to receive its first assignment', async () => {
+      const h = harness();
+      matching(h, undefined);
+      await h.controller.configure(config);
+      await h.controller.start();
+      await h.controller.assign(WORKER, 'first-matching-kickoff');
+      expect(h.worker.task.update).toHaveBeenCalledOnce();
+      expect(h.worker.task.resume).toHaveBeenCalledOnce();
+      expect(h.controller.getStatus().workers[0].assignments).toBe(1);
+    });
+  });
+
   describe('worker prompt admission', () => {
     function largeWorker(text = 'x'.repeat(1000)) {
       return {
