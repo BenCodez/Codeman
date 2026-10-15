@@ -52,6 +52,14 @@ function taskUiReason(reason) {
 function taskUiDate(at) {
   return Number.isFinite(at) && at > 0 ? new Date(at).toLocaleString() : '\u2014';
 }
+function taskUiCriterionInput(criterion) {
+  return {
+    id: criterion.id,
+    kind: criterion.kind,
+    description: criterion.description,
+    ...(criterion.kind === 'command' ? { command: criterion.command } : {}),
+  };
+}
 Object.assign(CodemanApp.prototype, {
   openTaskOptions(sessionId) {
     this.closeTaskOptions();
@@ -80,16 +88,11 @@ Object.assign(CodemanApp.prototype, {
     const verified = document.getElementById('taskLastVerified');
     if (verified) verified.textContent = '\u2014';
     // Remove user-authored content as soon as the owner-bound view closes.
-    for (const id of [
-      'taskObjective',
-      'taskManualCriteria',
-      'taskCommandCriteria',
-      'taskCheckpoint',
-      'taskNextAction',
-    ]) {
+    for (const id of ['taskObjective', 'taskCheckpoint', 'taskNextAction']) {
       const input = document.getElementById(id);
       if (input) input.value = '';
     }
+    document.getElementById('taskCriteriaRows')?.replaceChildren();
     document.getElementById('taskCriteriaEvidence')?.replaceChildren();
     document.getElementById('taskHistory')?.replaceChildren();
   },
@@ -129,6 +132,88 @@ Object.assign(CodemanApp.prototype, {
   },
   markTaskDraft() {
     if (this._taskView) this._taskView.dirty = true;
+  },
+  _appendTaskCriterion(view, criterion, added = false) {
+    const element = document.createElement('div');
+    element.className = 'task-criterion-editor';
+    element.dataset.taskCriterionRow = '';
+    element.dataset.criterionId = criterion.id;
+    const row = { id: criterion.id, kind: criterion.kind, element, added, fields: {} };
+    const title = document.createElement('strong');
+    title.textContent = taskUiTranslate(
+      criterion.kind === 'command' ? 'Command acceptance check' : 'Owner acceptance criterion'
+    );
+    element.appendChild(title);
+    const field = (key, title) => {
+      const label = document.createElement('label');
+      const text = document.createElement('span');
+      text.textContent = taskUiTranslate(title);
+      const input = document.createElement('textarea');
+      input.className = 'set-textarea';
+      input.rows = 2;
+      input.maxLength = 1000;
+      input.dataset.i18nSkip = '';
+      input.dataset.taskField = key;
+      const original = criterion[key] ?? '';
+      input.value = original;
+      // Browsers normalize CR/CRLF in textareas. An untouched visible value
+      // must retain the API's exact original bytes, including line endings.
+      row.fields[key] = { input, baseline: input.value, original };
+      input.addEventListener('input', () => {
+        if (this._taskView === view) this.markTaskDraft();
+      });
+      label.append(text, input);
+      element.appendChild(label);
+    };
+    field('description', 'Description');
+    if (criterion.kind === 'command') {
+      field('command', 'Exact command');
+      if (added) row.fields.description.input.placeholder = taskUiTranslate('Defaults to the command');
+    }
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'btn-toolbar';
+    remove.textContent = taskUiTranslate('Remove criterion');
+    remove.addEventListener('click', () => {
+      if (this._taskView !== view || view.busy || view.loading || this.editingSessionId !== view.sessionId) return;
+      view.criterionRows = view.criterionRows.filter((candidate) => candidate !== row);
+      element.remove();
+      this.markTaskDraft();
+      this._updateTaskCriterionButtons();
+    });
+    element.appendChild(remove);
+    view.criterionRows.push(row);
+    document.getElementById('taskCriteriaRows').appendChild(element);
+  },
+  _updateTaskCriterionButtons() {
+    const full = (this._taskView?.criterionRows?.length ?? 0) >= 30;
+    document.getElementById('taskAddManualCriterion').disabled = full;
+    document.getElementById('taskAddCommandCriterion').disabled = full;
+  },
+  addTaskCriterion(kind) {
+    const view = this._taskView;
+    if (
+      !view?.state ||
+      view.busy ||
+      view.loading ||
+      this.editingSessionId !== view.sessionId ||
+      !['manual', 'command'].includes(kind) ||
+      view.criterionRows.length >= 30
+    )
+      return;
+    let id;
+    do {
+      id = `criterion-${Date.now()}-${++view.criterionSequence}`;
+    } while (view.usedCriterionIds.has(id));
+    view.usedCriterionIds.add(id);
+    this._appendTaskCriterion(
+      view,
+      { id, kind, description: '', ...(kind === 'command' ? { command: '' } : {}) },
+      true
+    );
+    this.markTaskDraft();
+    this._updateTaskCriterionButtons();
+    view.criterionRows.at(-1).fields[kind === 'command' ? 'command' : 'description'].input.focus();
   },
   _renderTaskStatus(force = false) {
     const view = this._taskView;
@@ -185,14 +270,20 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('taskResetBtn').disabled = !available;
     if (force || !view.dirty) {
       document.getElementById('taskObjective').value = state?.objective ?? '';
-      const manualCriteria = state?.criteria.filter((c) => c.kind === 'manual').map((c) => c.description) ?? [];
-      const commandCriteria = state?.criteria.filter((c) => c.kind === 'command').map((c) => c.command) ?? [];
-      document.getElementById('taskManualCriteria').value = manualCriteria.join('\n');
-      document.getElementById('taskCommandCriteria').value = commandCriteria.join('\n');
+      const criteria = (state?.criteria ?? []).map(taskUiCriterionInput);
+      const criteriaSignature = JSON.stringify(criteria);
+      // Status-only updates must not interrupt a focused field before its first input.
+      if (force || view.configurationBaseline?.criteria !== criteriaSignature) {
+        view.criterionRows = [];
+        view.criterionSequence = 0;
+        view.usedCriterionIds = new Set(criteria.map((criterion) => criterion.id));
+        document.getElementById('taskCriteriaRows').replaceChildren();
+        for (const criterion of criteria) this._appendTaskCriterion(view, criterion);
+        this._updateTaskCriterionButtons();
+      }
       view.configurationBaseline = {
         objective: (state?.objective ?? '').trim(),
-        manualText: manualCriteria.join('\n'),
-        commandText: commandCriteria.join('\n'),
+        criteria: criteriaSignature,
       };
       document.getElementById('taskEnabled').checked = state?.config.enabled ?? false;
       document.getElementById('taskMaxContinuations').value = state?.config.maxContinuations ?? '';
@@ -245,34 +336,30 @@ Object.assign(CodemanApp.prototype, {
     const view = this._taskView;
     if (!view?.state || view.busy || view.loading) return;
     const objective = document.getElementById('taskObjective').value.trim();
-    const manualText = document.getElementById('taskManualCriteria').value;
-    const commandText = document.getElementById('taskCommandCriteria').value;
-    const currentManual = view.state.criteria.filter((criterion) => criterion.kind === 'manual');
-    const currentCommands = view.state.criteria.filter((criterion) => criterion.kind === 'command');
-    const baseline = view.configurationBaseline ?? {
-      objective: view.state.objective.trim(),
-      manualText: currentManual.map((criterion) => criterion.description).join('\n'),
-      commandText: currentCommands.map((criterion) => criterion.command).join('\n'),
-    };
-    const manualChanged = manualText !== baseline.manualText;
-    const commandChanged = commandText !== baseline.commandText;
-    const parseCriteria = (text) =>
-      text
-        .split('\n')
-        .map((value) => value.trim())
-        .filter(Boolean);
-    const manual = manualChanged ? parseCriteria(manualText) : null;
-    const commands = commandChanged ? parseCriteria(commandText) : null;
-    const manualCount = manual?.length ?? currentManual.length;
-    const commandCount = commands?.length ?? currentCommands.length;
+    const baseline = view.configurationBaseline;
+    const read = (field) => (field.input.value === field.baseline ? field.original : field.input.value);
+    const criteria = view.criterionRows.map((row) => {
+      const command = row.kind === 'command' ? read(row.fields.command) : undefined;
+      const description = read(row.fields.description);
+      return {
+        id: row.id,
+        kind: row.kind,
+        description: row.added && row.kind === 'command' && description === '' ? command : description,
+        ...(row.kind === 'command' ? { command } : {}),
+      };
+    });
     const max = document.getElementById('taskMaxContinuations');
     const runtime = document.getElementById('taskMaxRuntime');
     if (
       !objective ||
-      (!manualCount && !commandCount) ||
-      manualCount + commandCount > 30 ||
-      manual?.some((text) => text.length > 1000) ||
-      commands?.some((text) => text.length > 1000) ||
+      !criteria.length ||
+      criteria.length > 30 ||
+      criteria.some(
+        (criterion) =>
+          !criterion.description.trim() ||
+          criterion.description.length > 1000 ||
+          (criterion.kind === 'command' && (!criterion.command.trim() || criterion.command.length > 1000))
+      ) ||
       !max.value ||
       !runtime.value ||
       !max.checkValidity() ||
@@ -281,55 +368,10 @@ Object.assign(CodemanApp.prototype, {
       this.showToast('Provide an objective, acceptance criteria, and valid task limits', 'warning');
       return;
     }
-    const criteriaChanged = manualChanged || commandChanged;
-    let criteria;
-    if (criteriaChanged) {
-      const unchangedKinds = new Set([...(manualChanged ? [] : ['manual']), ...(commandChanged ? [] : ['command'])]);
-      const usedIds = new Set(
-        view.state.criteria.filter((criterion) => unchangedKinds.has(criterion.kind)).map((criterion) => criterion.id)
-      );
-      let generated = 0;
-      const inputCriterion = (criterion) =>
-        criterion.kind === 'command'
-          ? {
-              id: criterion.id,
-              description: criterion.description,
-              kind: criterion.kind,
-              command: criterion.command,
-            }
-          : { id: criterion.id, description: criterion.description, kind: criterion.kind };
-      const rebuild = (kind, values) =>
-        values.map((value) => {
-          const old = view.state.criteria.find(
-            (candidate) =>
-              !usedIds.has(candidate.id) &&
-              candidate.kind === kind &&
-              (kind === 'command' ? candidate.command === value : candidate.description === value)
-          );
-          const id = old?.id ?? `criterion-${Date.now()}-${++generated}`;
-          usedIds.add(id);
-          return kind === 'command'
-            ? { id, description: old?.description ?? value, kind, command: value }
-            : { id, description: value, kind };
-        });
-      const nextManual = manualChanged ? rebuild('manual', manual) : currentManual.map(inputCriterion);
-      const nextCommands = commandChanged ? rebuild('command', commands) : currentCommands.map(inputCriterion);
-      if (manualChanged !== commandChanged) {
-        const changedKind = manualChanged ? 'manual' : 'command';
-        const changed = manualChanged ? nextManual : nextCommands;
-        let changedIndex = 0;
-        criteria = view.state.criteria.flatMap((criterion) => {
-          if (criterion.kind !== changedKind) return [inputCriterion(criterion)];
-          return changedIndex < changed.length ? [changed[changedIndex++]] : [];
-        });
-        criteria.push(...changed.slice(changedIndex));
-      } else {
-        criteria = [...nextManual, ...nextCommands];
-      }
-    }
+    const criteriaChanged = JSON.stringify(criteria) !== baseline.criteria;
     await this._performTaskRequest('', 'PUT', {
       ...(objective !== baseline.objective ? { objective } : {}),
-      ...(criteria ? { criteria } : {}),
+      ...(criteriaChanged ? { criteria } : {}),
       config: {
         enabled: document.getElementById('taskEnabled').checked,
         maxContinuations: Number(max.value),

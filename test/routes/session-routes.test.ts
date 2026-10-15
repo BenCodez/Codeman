@@ -142,6 +142,54 @@ describe('session-routes', () => {
     await harness.app.close();
   });
 
+  it.each(['clients', 'tail'] as const)(
+    'keeps HTTP fallback retryable when the actual %s sequence backlog is full',
+    async (capacity) => {
+      const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      let now = 0;
+      const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+      const clientId = 'fallback-client';
+      const seq = capacity === 'clients' ? 17 : 4098;
+      if (capacity === 'clients') {
+        for (let index = 0; index < 256; index++) expect(session.shouldApplyInput(`pending-${index}`, 1)).toBe(true);
+      } else {
+        expect(session.shouldApplyInput(clientId, 1)).toBe(true);
+        session.commitInputSeq(clientId, 1);
+        for (let pending = 2; pending <= 4097; pending++) expect(session.deferInputSeq(clientId, pending)).toBe(true);
+      }
+      const payload = { input: 'retained HTTP paste', clientId, seq, useMux: false };
+      const post = () => harness.app.inject({ method: 'POST', url: `/api/sessions/${session.id}/input`, payload });
+      try {
+        const refused = await post();
+        expect(refused.statusCode).toBe(422);
+        expect(refused.json()).toMatchObject({
+          success: false,
+          errorCode: 'OPERATION_FAILED',
+          retryable: true,
+          notSent: true,
+        });
+        expect(refused.headers['x-codeman-input-ack']).toBeUndefined();
+        expect(written).not.toHaveBeenCalled();
+        expect(session.hasAppliedInputSeq(clientId, seq)).toBe(false);
+        if (capacity === 'clients') session.commitInputSeq('pending-0', 1);
+        else now = 60_000;
+        const delivered = await post();
+        expect(delivered.statusCode).toBe(200);
+        expect(written).toHaveBeenCalledExactlyOnceWith(payload.input);
+        const duplicate = await post();
+        expect(duplicate.statusCode).toBe(200);
+        expect(JSON.parse(String(duplicate.headers['x-codeman-input-ack']))).toEqual({ seq, dup: true, last: seq });
+        expect(written).toHaveBeenCalledTimes(1);
+      } finally {
+        clock.mockRestore();
+        await session.stop(false);
+      }
+    }
+  );
+
   // ========== POST /api/sessions/:id/send-key ==========
 
   describe('POST /api/sessions/:id/send-key', () => {

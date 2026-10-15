@@ -63,6 +63,13 @@ function harness(initial?: object) {
   });
   vm.runInContext(`${constants}\n${source}\nglobalThis.__CodemanApp = CodemanApp;`, context);
   const prototype = (context as { __CodemanApp: { prototype: object } }).__CodemanApp.prototype;
+  // Execute the production close callback, including its actual reconnect policy.
+  const closeStart = source.indexOf('    ws.onclose = (event) => {');
+  const closeEnd = source.indexOf('\n    ws.onerror =', closeStart);
+  const makeClose = vm.runInContext(
+    `(function(ws, sessionId) { ${source.slice(closeStart, closeEnd)} return ws.onclose; })`,
+    context
+  );
   const load = () => {
     const app = Object.create(prototype) as App & Record<string, unknown>;
     app._seqCounters = new Map();
@@ -71,6 +78,7 @@ function harness(initial?: object) {
     app._persistReliableTimer = null;
     app._reliableMaxBytes = 256 * 1024;
     app._updateConnectionIndicator = vi.fn();
+    app._stopMobileResizeRetry = vi.fn();
     // Ack debouncing is irrelevant to this crash proof; keep immediate writes real.
     app._persistReliableState = vi.fn();
     app.pendingHooks = new Map();
@@ -92,6 +100,14 @@ function harness(initial?: object) {
     removeIdentity: () => {
       storage.delete('codeman:clientId');
     },
+    close: (app: App, sessionId: string) => {
+      Object.assign(app, { activeSessionId: sessionId });
+      const callback = makeClose.call(app, app._ws, sessionId);
+      callback({ code: 4008, reason: 'Input backlog full' });
+      // Exercise the real policy without opening a replacement socket on a timer.
+      clearTimeout((app as unknown as { _wsReconnectTimer: ReturnType<typeof setTimeout> })._wsReconnectTimer);
+      return (app as unknown as { _wsState: string })._wsState;
+    },
   };
 }
 async function settle(app: App) {
@@ -106,6 +122,47 @@ function duplicate(seq: number, last = seq) {
 }
 
 const session = 'test-session';
+it('retains durable FIFO on a real 4008 close, HTTP saturation and reload without replaying committed input', async () => {
+  const h = harness();
+  const app = h.load();
+  const sent: Array<{ seq: number; d: string; cid: string }> = [];
+  app._ws = { readyState: 1, send: (frame) => sent.push(JSON.parse(frame)) };
+  app._wsSessionId = session;
+  app._sendInputAsync(session, 'already committed but ACK lost');
+  app._sendInputAsync(session, 'unattempted saturated paste');
+  const identities = sent.map(({ seq, d, cid }) => ({ seq, d, cid }));
+  expect(identities.map(({ d }) => d)).toEqual(['already committed but ACK lost', 'unattempted saturated paste']);
+  expect(h.close(app, session)).toBe('fallback');
+  expect(app._ws).toBeNull();
+  expect(app._pendingDeliveries.get(session)?.map(({ seq, data }) => ({ seq, data }))).toEqual(
+    identities.map(({ seq, d }) => ({ seq, data: d }))
+  );
+  const http = vi.fn(
+    async () => new Response(JSON.stringify({ success: false, retryable: true, notSent: true }), { status: 422 })
+  );
+  h.transport(http);
+  app._drainSession(session);
+  await settle(app);
+  expect(http).toHaveBeenCalledOnce();
+  expect(app._pendingDeliveries.get(session)).toHaveLength(2);
+  expect(app.showToast).not.toHaveBeenCalled();
+  const restored = h.load();
+  const retried: Array<{ seq: number; d: string; cid: string }> = [];
+  restored._ws = { readyState: 1, send: (frame) => retried.push(JSON.parse(frame)) };
+  restored._wsSessionId = session;
+  restored._onWsReady(session);
+  expect(retried.map(({ seq, d, cid }) => ({ seq, d, cid }))).toEqual(identities);
+  // The older occurrence may have landed before overload. Its original identity
+  // is sealed; a duplicate ACK after reload must not manufacture a fresh send.
+  restored._onWsInputAck(identities[0].seq, { dup: true, last: identities[0].seq }, session);
+  expect(restored._pendingDeliveries.get(session)?.map(({ seq }) => seq)).toEqual([identities[1].seq]);
+  expect(retried).toHaveLength(2);
+  restored._onWsInputAck(identities[1].seq, {}, session);
+  expect(restored._pendingDeliveries.has(session)).toBe(false);
+  expect(h.snapshot().pending).toEqual({});
+  expect(restored.showToast).not.toHaveBeenCalled();
+});
+
 describe('reload never converts an uncertain occurrence into fresh input', () => {
   it.each([false, true])(
     'keeps the exact HTTP identity after response loss (attempt write fails: %s)',
