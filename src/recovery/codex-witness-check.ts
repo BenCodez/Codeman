@@ -16,8 +16,11 @@ export function checkCodexIdentityWitness(identity: CodexIdentityResult): Promis
 /** Read all participating domains before a common final path scan, under one deadline. */
 export async function checkCodexIdentityWitnesses(
   inputs: readonly CodexIdentityResult[],
-  additionalFiles: readonly PrivateFileWitness[] = []
+  additionalFiles: readonly PrivateFileWitness[] = [],
+  originalDeadline = Infinity
 ): Promise<boolean> {
+  const deadline = Math.min(performance.now() + TIMEOUT_MS, originalDeadline);
+  if (!Number.isFinite(deadline) || performance.now() >= deadline) return false;
   if (!inputs.length || inputs.length > 2 || !Array.isArray(additionalFiles) || additionalFiles.length > 8)
     return false;
   const files = additionalFiles.map((input) => ({ ...input }));
@@ -65,7 +68,6 @@ export async function checkCodexIdentityWitnesses(
       [...pending.values()].some((other) => paths.some((path) => other.paths.includes(path)))
     )
       return false;
-    const deadline = performance.now() + TIMEOUT_MS;
     const work = verify(identities, deadline, hashes, files);
     job = { key, paths, deadline, work };
     pending.set(group, job);
@@ -73,7 +75,7 @@ export async function checkCodexIdentityWitnesses(
       if (pending.get(group)?.work === work) pending.delete(group);
     });
   }
-  const remaining = job.deadline - performance.now();
+  const remaining = Math.min(job.deadline, deadline) - performance.now();
   if (remaining <= 0) return false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -83,7 +85,7 @@ export async function checkCodexIdentityWitnesses(
         timer = setTimeout(() => resolve(false), remaining);
       }),
     ]);
-    return confirmed === true && performance.now() < job.deadline;
+    return confirmed === true && performance.now() < Math.min(job.deadline, deadline);
   } finally {
     if (timer) clearTimeout(timer);
   }
