@@ -1861,11 +1861,11 @@ export function registerSessionRoutes(
     // skip the write. Untagged requests (curl/legacy) always apply.
     const tagged = typeof clientId === 'string' && typeof seq === 'number';
     if (tagged && !session.deferInputSeq(clientId as string, seq as number)) {
-      return {
+      return reply.code(429).send({
         ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input backlog is full; retry the input'),
         retryable: true,
         notSent: true,
-      };
+      });
     }
     let unlockInput: (() => void) | undefined;
     let backgroundOwnsQueue = false;
@@ -1885,11 +1885,11 @@ export function registerSessionRoutes(
     });
     await acquired;
     if (!unlockInput)
-      return {
+      return reply.code(429).send({
         ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input backlog is full; retry the input'),
         retryable: true,
         notSent: true,
-      };
+      });
     const releaseInputDispatch = () => {
       unlockInput?.();
       unlockInput = undefined;
