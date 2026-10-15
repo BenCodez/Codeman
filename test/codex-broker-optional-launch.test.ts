@@ -1,9 +1,27 @@
 /** Optional guard setup may fail before a fake native launch; every process API is sealed. */
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
+import * as fsPromises from 'node:fs/promises';
+import { dataPath } from '../src/config/instance.js';
 import type { TmuxManager as Manager } from '../src/tmux-manager.js';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 
-const effects = vi.hoisted(() => ({ sync: vi.fn(), exec: vi.fn(), file: vi.fn(), pty: vi.fn() }));
+const effects = vi.hoisted(() => ({
+  sync: vi.fn(),
+  exec: vi.fn(),
+  file: vi.fn(),
+  pty: vi.fn(),
+  saved: undefined as ((path: string) => void) | undefined,
+}));
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      await actual.rename(...args);
+      effects.saved?.(String(args[1]));
+    },
+  };
+});
 vi.mock('node-pty', () => ({ spawn: effects.pty }));
 vi.mock('node:child_process', async (original) => {
   const actual = await original<typeof import('node:child_process')>();
@@ -51,6 +69,7 @@ beforeAll(async () => {
   }
 });
 beforeEach(() => {
+  effects.saved = undefined;
   effects.pty.mockReset().mockReturnValue({
     pid: 0,
     write: vi.fn(),
@@ -667,8 +686,12 @@ for (const kind of ['create', 'ordinary-respawn'] as const) {
     effects.exec.mockImplementation(async (command: string) =>
       command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED') ? { stdout: response(), stderr: '' } : exec(command)
     );
-    if (kind === 'create') await expect(manager.createSession(options)).rejects.toThrow();
-    else {
+    if (kind === 'create') {
+      await expect(manager.createSession(options)).rejects.toThrow();
+      expect(manager.getSession(SID)).toMatchObject({ pid: 0, recoveryInputBroker: broker.incarnation });
+      await expect(manager.createSession(options)).rejects.toThrow('uncertain Codex launch');
+      expect(await manager.respawnPane(options)).toBeNull();
+    } else {
       expect(await manager.respawnPane(options)).toBeNull();
       expect(manager.getSession(SID)).toMatchObject({ pid: 0, recoveryInputBroker: broker.incarnation });
     }
@@ -690,3 +713,144 @@ for (const kind of ['create', 'ordinary-respawn'] as const) {
     expect(broker.startupReceipt).toHaveBeenCalledExactlyOnceWith(700);
   });
 }
+
+it.each(['lost-native-reply', 'malformed-native-reply', 'lost-startup-reply', 'owner-cancelled'] as const)(
+  'saves an uncertain initial broker registration and keeps reload/retries sealed: %s',
+  async (failure) => {
+    const broker = successfulBroker();
+    Object.assign(broker, { canFrame: true });
+    const create = vi.spyOn(CodexInputBroker, 'create').mockResolvedValue(broker);
+    const file = dataPath('mux-sessions.json');
+    let acknowledge!: () => void;
+    const saved = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    effects.saved = (path) => {
+      if (path === file) acknowledge();
+    };
+    vi.mocked(Reflect.get(manager, 'saveSessions')).mockRestore();
+    const original = effects.sync.getMockImplementation()!;
+    let current = true,
+      workerStarts = 0;
+    effects.sync.mockImplementation((command: string) => {
+      if (command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED')) {
+        workerStarts++;
+        expect(manager.getSession(SID)).toMatchObject({ pid: 0, recoveryInputBroker: broker.incarnation });
+        if (failure === 'lost-native-reply') throw Error('Native reply lost after possible dispatch');
+        if (failure === 'malformed-native-reply') return 'truncated native reply';
+        if (failure === 'owner-cancelled') current = false;
+      }
+      return original(command);
+    });
+    if (failure === 'lost-startup-reply')
+      vi.mocked(broker.startupReceipt).mockRejectedValue(Error('lost startup reply'));
+    let reloaded: Manager | undefined;
+    try {
+      await expect(
+        manager.createSession({
+          ...options,
+          owner: 'alice',
+          name: 'Owner history',
+          ownerLaunchIsCurrent: () => current,
+        })
+      ).rejects.toThrow();
+      expect(workerStarts).toBe(1);
+      const retained = manager.getSession(SID);
+      expect(retained).toMatchObject({
+        sessionId: SID,
+        pid: 0,
+        recoveryInputBroker: broker.incarnation,
+        recoveryCodexHome: '/fixture/codex',
+        owner: 'alice',
+        name: 'Owner history',
+        mode: 'codex',
+      });
+      await saved;
+      expect(JSON.parse(await fsPromises.readFile(file, 'utf8'))).toContainEqual(retained);
+      reloaded = new TmuxManager();
+      expect(reloaded.getSession(SID)).toEqual(retained);
+      expect(reloaded.canDeliverCodexOwnerInput(SID)).toBe(false);
+      expect(reloaded.wrapCodexOwnerInput(SID, 'never raw')).toEqual({ status: 'refused' });
+      expect(await reloaded.sendInput(SID, 'no replay\r')).toBe(false);
+      await expect(reloaded.createSession(options)).rejects.toThrow('uncertain Codex launch');
+      expect(await reloaded.respawnPane(options)).toBeNull();
+      // A missing listing is not a no-launch certificate and cannot erase history.
+      effects.sync.mockImplementation((command: string) =>
+        command.includes('list-panes -a') ? '' : original(command)
+      );
+      await reloaded.reconcileSessions();
+      expect(reloaded.getSession(SID)).toEqual(retained);
+      // Nor can an arbitrary later numeric PID replace the original missing ACK.
+      effects.sync.mockImplementation((command: string) =>
+        command.includes('list-panes -a') ? 'codeman-aaaaaaaa|999|0||\n' : original(command)
+      );
+      await reloaded.reconcileSessions();
+      expect(reloaded.getSession(SID)).toEqual(retained);
+      expect(create).toHaveBeenCalledOnce();
+      expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(1);
+      expect(commands().some((command) => command.includes('kill-session'))).toBe(false);
+      expect(effects.pty).not.toHaveBeenCalled();
+    } finally {
+      reloaded?.destroy();
+      await fsPromises.unlink(file).catch(() => {});
+    }
+  }
+);
+
+it('does not dispatch or overwrite historical ownership when owner intent was already cancelled', async () => {
+  registerOrdinary();
+  const historical = manager.getSession(SID)!;
+  historical.name = 'Historical owner tab';
+  const before = structuredClone(historical);
+  vi.spyOn(CodexInputBroker, 'create').mockResolvedValue(successfulBroker());
+  await expect(manager.createSession({ ...options, ownerLaunchIsCurrent: () => false })).rejects.toThrow(
+    'Owner launch authority changed'
+  );
+  expect(manager.getSession(SID)).toBe(historical);
+  expect(historical).toEqual(before);
+  expect(commands().filter((command) => command.includes(' new-session ') || command.includes('respawn-pane'))).toEqual(
+    []
+  );
+  expect(effects.pty).not.toHaveBeenCalled();
+});
+
+it('allows inspection-only attachment of a retained uncertain pane without another native launch', async () => {
+  const { Session } = await import('../src/session.js');
+  manager.registerSession({
+    sessionId: SID,
+    muxName: 'codeman-aaaaaaaa',
+    pid: 0,
+    mode: 'codex',
+    workingDir: options.workingDir,
+    createdAt: 123,
+    attached: false,
+    recoveryCodexHome: '/fixture/codex',
+    recoveryIsolated: true,
+    recoveryInputBroker: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+    name: 'Owner history',
+  });
+  vi.spyOn(manager, 'isAvailable').mockReturnValue(true);
+  vi.spyOn(manager, 'muxSessionExists').mockReturnValue(true);
+  vi.spyOn(manager, 'isPaneDead').mockReturnValue(true);
+  const respawn = vi.spyOn(manager, 'respawnPane');
+  const create = vi.spyOn(manager, 'createSession');
+  const session = new Session({
+    id: SID,
+    mode: 'codex',
+    workingDir: options.workingDir,
+    useMux: true,
+    mux: manager,
+    muxSession: manager.getSession(SID),
+    codexConfig: options.codexConfig,
+    envOverrides: options.envOverrides,
+  });
+  try {
+    await session.startInteractive();
+    expect(session.getRecoveryContext().managed).toBe(false);
+    expect(respawn).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    expect(commands().filter((command) => command.includes('respawn-pane'))).toEqual([]);
+  } finally {
+    await session.stop(false);
+  }
+});

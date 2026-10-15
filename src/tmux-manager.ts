@@ -1716,8 +1716,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private readonly inputBrokerLoads = new Map<string, Promise<CodexInputBroker | undefined>>();
   private readonly inputQueues = new Map<string, Promise<unknown>>();
 
+  /** PID 0 with an incarnation records a possible dispatch whose native receipt was lost. */
+  private uncertainBrokerRegistration(session: MuxSession | undefined): boolean {
+    return !!session?.recoveryInputBroker && session.pid === 0;
+  }
+
   canDeliverCodexOwnerInput(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
+    if (this.uncertainBrokerRegistration(session)) return false;
     if (!session?.recoveryInputBroker) return true;
     const broker = this.inputBrokers.get(sessionId);
     return broker?.incarnation === session.recoveryInputBroker && broker.canFrame;
@@ -1925,6 +1931,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     channel: 'owner-pty' | 'owner-key' = 'owner-pty'
   ): CodexOwnerInputFrame {
     const session = this.sessions.get(sessionId);
+    if (this.uncertainBrokerRegistration(session)) return { status: 'refused' };
     if (!session?.recoveryInputBroker) return { status: 'passthrough', data: input };
     const broker = this.inputBrokers.get(sessionId);
     if (!broker || broker.incarnation !== session.recoveryInputBroker) return { status: 'refused' };
@@ -2535,6 +2542,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
     const priorRegistration = this.sessions.get(sessionId);
+    if (this.uncertainBrokerRegistration(priorRegistration))
+      throw new Error('An uncertain Codex launch cannot create another worker');
+    const launchSnapshot = JSON.stringify(options);
+    const ownerCurrent = () => {
+      try {
+        const verdict: unknown = options.ownerLaunchIsCurrent === undefined ? true : options.ownerLaunchIsCurrent();
+        if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+          void Promise.resolve(verdict).catch(() => {});
+        return verdict === true && JSON.stringify(options) === launchSnapshot;
+      } catch {
+        return false;
+      }
+    };
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
     const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
     const recoveryCodexHome = localCodex
@@ -2649,6 +2669,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!)
           : undefined;
 
+      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+        throw new Error('Owner launch authority changed before native creation');
+
       // Create tmux session in three steps to handle cold-start (no server running)
       // and avoid the race where the command exits before remain-on-exit is set:
       // 2. Set remain-on-exit (server now exists, session won't vanish on exit)
@@ -2706,6 +2729,38 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
       const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
+      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+        throw new Error('Owner launch authority changed before native dispatch');
+      let reservedRegistration: MuxSession | undefined;
+      if (inputBroker) {
+        // Save exact ownership before the effect: the process can start even if
+        // the trailing native display-message reply never reaches this caller.
+        reservedRegistration = {
+          ...priorRegistration,
+          sessionId,
+          muxName,
+          pid: 0,
+          recoveryCodexHome,
+          recoveryInputBroker: inputBroker.incarnation,
+          recoveryIsolated: true,
+          createdAt: priorRegistration?.createdAt ?? Date.now(),
+          workingDir,
+          remote,
+          docker,
+          owner,
+          mode,
+          attached: false,
+          name: name ?? priorRegistration?.name,
+        };
+        this.sessions.set(sessionId, reservedRegistration);
+        this.inputBrokers.set(sessionId, inputBroker);
+        this.saveSessions();
+      }
+      const reservationBinding = reservedRegistration && JSON.stringify(reservedRegistration);
+      const registrationCurrent = () =>
+        this.sessions.get(sessionId) === (reservedRegistration ?? priorRegistration) &&
+        (!reservedRegistration || JSON.stringify(reservedRegistration) === reservationBinding) &&
+        ownerCurrent();
       const dispatchOutput = execSync(
         `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}${inputBroker ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
         {
@@ -2773,16 +2828,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           muxName,
           pid,
           originalLaunch,
-          () =>
-            this.sessions.get(sessionId) === priorRegistration &&
-            (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true),
+          registrationCurrent,
           dispatchReceipt
         );
         if (!fallbackPid) throw new Error('Optional input guard refusal could not safely fall back');
         pid = fallbackPid;
         activeBroker = undefined;
       }
+      if (inputBroker && !registrationCurrent())
+        throw new Error('Owner launch authority changed after native dispatch');
       const session: MuxSession = {
+        ...reservedRegistration,
         sessionId,
         muxName,
         pid,
@@ -2793,22 +2849,25 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           !docker &&
           getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
           /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd),
-        createdAt: Date.now(),
+        createdAt: reservedRegistration?.createdAt ?? Date.now(),
         workingDir,
         remote,
         docker,
         owner,
         mode,
         attached: false,
-        name,
+        name: name ?? reservedRegistration?.name,
       };
       if (activeBroker) this.inputBrokers.set(sessionId, activeBroker);
+      else if (inputBroker) this.inputBrokers.delete(sessionId);
+      if (reservedRegistration) Object.assign(reservedRegistration, session);
+      const registered = reservedRegistration ?? session;
 
-      this.sessions.set(sessionId, session);
+      this.sessions.set(sessionId, registered);
       this.saveSessions();
-      this.emit('sessionCreated', session);
+      this.emit('sessionCreated', registered);
 
-      return session;
+      return registered;
     } catch (err) {
       throw new Error(`Failed to create tmux session: ${getErrorMessage(err)}`);
     }
@@ -2916,7 +2975,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       cliName,
     } = options;
     const session = this.sessions.get(sessionId);
-    if (!session) return null;
+    if (!session || this.uncertainBrokerRegistration(session)) return null;
     const muxName = session.muxName;
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
     const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
@@ -3532,6 +3591,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     // Check tracked sessions against the live pane list.
     for (const [sessionId, session] of this.sessions) {
+      // A numeric pane listing cannot acknowledge the original command queue.
+      // Preserve unknown registrations even when the listing is unavailable.
+      if (this.uncertainBrokerRegistration(session)) continue;
       const pid = active.get(session.muxName);
       if (pid !== undefined) {
         alive.push(sessionId);
@@ -4262,6 +4324,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       return false;
     }
 
+    if (this.uncertainBrokerRegistration(session)) return false;
     const muxName = session.muxName;
     const inputBroker = await this.getInputBroker(session);
     if (

@@ -164,7 +164,7 @@ describe('session-routes', () => {
       const post = () => harness.app.inject({ method: 'POST', url: `/api/sessions/${session.id}/input`, payload });
       try {
         const refused = await post();
-        expect(refused.statusCode).toBe(422);
+        expect(refused.statusCode).toBe(429);
         expect(refused.json()).toMatchObject({
           success: false,
           errorCode: 'OPERATION_FAILED',
