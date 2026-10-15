@@ -4100,6 +4100,10 @@ class CodemanApp {
           try {
             const body = rec.key ? { key: rec.key } : { input: rec.data, seq: rec.seq, clientId: sentCid };
             if (rec.useMux) body.useMux = true;
+            const serializedBody = JSON.stringify(body);
+            // Fetch's keepalive quota counts the entire UTF-8 body, including
+            // delivery tags and JSON escaping, rather than plaintext characters.
+            const bodyBytes = window.CodemanInputLimit?.bytes?.(serializedBody) ?? Infinity;
             // The server bounds tmux at 5s; bound the browser request too so a
             // stalled proxy cannot hold all later keystrokes indefinitely.
             if (rec.key) rec.abort = new AbortController();
@@ -4108,8 +4112,8 @@ class CodemanApp {
               resp = await fetch(`/api/sessions/${sessionId}/${rec.key ? 'send-key' : 'input'}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-                keepalive: !rec.key && rec.data.length < 65536,
+                body: serializedBody,
+                keepalive: !rec.key && bodyBytes < 65536,
                 ...(rec.key ? { signal: rec.abort.signal } : {}),
               });
               if (rec.key && resp.status === 422) {

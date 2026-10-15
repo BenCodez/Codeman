@@ -220,6 +220,80 @@ it('retains durable FIFO on a real 4008 close, HTTP saturation and reload withou
 });
 
 describe('reload never converts an uncertain occurrence into fresh input', () => {
+  it.each([
+    'envelope-overflow',
+    'unicode-overflow',
+    'escaped-overflow',
+    'exact-body-limit',
+    'under-body-limit',
+    'small-unicode',
+  ] as const)('sizes HTTP keepalive from the serialized body and drains the durable FIFO: %s', async (kind) => {
+    const h = harness();
+    const app = h.load();
+    const overhead = Buffer.byteLength(JSON.stringify({ input: '', seq: 1, clientId: app._clientId }));
+    const text =
+      kind === 'unicode-overflow'
+        ? '🧭'.repeat(16_384)
+        : kind === 'escaped-overflow'
+          ? '\0'.repeat(11_000)
+          : kind === 'exact-body-limit'
+            ? 'a'.repeat(65_536 - overhead)
+            : kind === 'under-body-limit'
+              ? 'a'.repeat(65_535 - overhead)
+              : kind === 'small-unicode'
+                ? '🧭 owner input'
+                : 'a'.repeat(65_535);
+    let acknowledge!: () => void;
+    const firstAck = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    const requests: { body: { input: string; seq: number; clientId: string }; keepalive: unknown; bytes: number }[] =
+      [];
+    const effects: string[] = [];
+    h.transport(
+      vi.fn(async (_url, init) => {
+        const serialized = init!.body as string;
+        const bytes = Buffer.byteLength(serialized);
+        // Model the browser's Fetch body budget; the old plaintext check makes
+        // these valid records fail before any network request can begin.
+        if (init!.keepalive && bytes > 65_536) throw new TypeError('keepalive body budget exceeded');
+        const body = JSON.parse(serialized);
+        requests.push({ body, keepalive: init!.keepalive, bytes });
+        if (requests.length === 1) await firstAck;
+        effects.push(body.input);
+        return new Response('{}', { status: 200 });
+      })
+    );
+    try {
+      app._sendInputAsync(session, text);
+      app._sendInputAsync(session, 'next');
+      expect(requests).toHaveLength(1);
+      const first = requests[0];
+      expect(first.body).toEqual({ input: text, seq: 1, clientId: app._clientId });
+      if (kind === 'exact-body-limit') expect(first.bytes).toBe(65_536);
+      if (kind === 'under-body-limit') expect(first.bytes).toBe(65_535);
+      expect(first.keepalive).toBe(first.bytes < 65_536);
+      expect(effects).toEqual([]);
+      expect(h.snapshot().pending[session].map((record) => [record.cid, record.seq, record.data])).toEqual([
+        [app._clientId, 1, text],
+        [app._clientId, 2, 'next'],
+      ]);
+      acknowledge();
+      await settle(app);
+      expect(requests.map((request) => request.body)).toEqual([
+        { input: text, seq: 1, clientId: app._clientId },
+        { input: 'next', seq: 2, clientId: app._clientId },
+      ]);
+      expect(requests[1].keepalive).toBe(true);
+      expect(effects).toEqual([text, 'next']);
+      expect(app._pendingDeliveries.has(session)).toBe(false);
+      expect(h.snapshot().pending[session]).toBeUndefined();
+    } finally {
+      acknowledge();
+      await settle(app);
+    }
+  });
+
   it.each([false, true])(
     'keeps the exact HTTP identity after response loss (attempt write fails: %s)',
     async (quota) => {

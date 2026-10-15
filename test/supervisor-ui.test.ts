@@ -60,6 +60,42 @@ afterEach(() => {
 });
 
 describe('Codex supervisor UI', () => {
+  it.each([
+    { label: 'local manager', session: { mode: 'codex' }, capability: true, supported: true },
+    {
+      label: 'owned SSH worker',
+      session: { mode: 'codex', remote: { owned: true } },
+      capability: true,
+      supported: false,
+    },
+    {
+      label: 'unowned SSH worker',
+      session: { mode: 'codex', remote: { owned: false } },
+      capability: true,
+      supported: false,
+    },
+    {
+      label: 'Docker worker',
+      session: { mode: 'codex', docker: { containerId: 'fixture' } },
+      capability: true,
+      supported: false,
+    },
+    { label: 'unsupported CLI', session: { mode: 'claude' }, capability: false, supported: false },
+    { label: 'missing session', session: undefined, capability: true, supported: false },
+  ])('offers manager controls only for a supported $label', ({ session, capability, supported }) => {
+    const h = harness();
+    if (session) h.app.sessions.set(SID, session);
+    else h.app.sessions.delete(SID);
+    h.app.supportsSessionRecovery = () => capability;
+    const load = vi.spyOn(h.app, 'loadSupervisorStatus').mockResolvedValue(undefined);
+    expect(h.app.openSupervisorOptions(SID)).toBe(supported);
+    const rail = h.dom.window.document.querySelector<HTMLElement>('#sessionOptionsModal [data-tab="supervisor"]')!;
+    expect(rail.style.display).toBe(supported ? '' : 'none');
+    expect(!!h.app._supervisorView).toBe(supported);
+    expect(load).toHaveBeenCalledTimes(supported ? 1 : 0);
+    expect(h.app._apiJson).not.toHaveBeenCalled();
+  });
+
   it.each(
     [false, true].flatMap((mobile) =>
       [

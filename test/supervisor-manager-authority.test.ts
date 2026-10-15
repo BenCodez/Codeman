@@ -1440,7 +1440,15 @@ describe('manager authority at the real server boundary', () => {
     Reflect.get(worker, '_muxSession').recoveryCodexHome = managerSession.getRecoveryContext().codexHome;
     const before = manager.getStatus();
     await expect(manager.configure(config)).rejects.toThrow(/distinct Codex homes/);
-    expect(manager.getStatus()).toEqual(before);
+    const paused = manager.getStatus();
+    expect(paused).toEqual({
+      ...before,
+      phase: 'paused',
+      reason: 'configuration-refused',
+      history: [...before.history, { at: expect.any(Number), reason: 'configuration-refused' }].slice(-100),
+    });
+    expect(internals.supervisorStore.get(MANAGER)).toEqual(paused);
+    expect(managerTask.getStatus()).toMatchObject({ phase: 'paused', reason: 'owner-paused' });
     expect(effects).not.toHaveBeenCalled();
   });
 

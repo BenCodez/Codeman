@@ -220,7 +220,8 @@ Object.assign(CodemanApp.prototype, {
   openSupervisorOptions(sessionId) {
     this.closeSupervisorOptions();
     const session = this.sessions.get(sessionId);
-    const supported = this.supportsSessionRecovery?.(session) === true;
+    const supported =
+      !!session && this.supportsSessionRecovery?.(session) === true && !session.remote && !session.docker;
     const rail = document.querySelector('#sessionOptionsModal [data-tab="supervisor"]');
     if (rail) rail.style.display = supported ? '' : 'none';
     if (!supported) return false;

@@ -124,6 +124,42 @@ describe('Codex supervisor UI in Chromium', () => {
   }
 
   for (const width of [1440, 390]) {
+    it(`hides manager controls for SSH and Docker workers at ${width}px`, async () => {
+      const page = await render(width);
+      try {
+        const results = await page.evaluate(
+          ({ sid }) => {
+            const app = (window as any).app;
+            const calls = (window as any).supervisorCalls;
+            return [
+              { mode: 'codex', remote: { owned: true } },
+              { mode: 'codex', remote: { owned: false } },
+              { mode: 'codex', docker: { containerId: 'fixture' } },
+              { mode: 'codex' },
+            ].map((session) => {
+              app.sessions.set(sid, session);
+              const before = calls.length;
+              const supported = app.openSupervisorOptions(sid);
+              return {
+                supported,
+                display: (document.querySelector('#sessionOptionsModal [data-tab="supervisor"]') as HTMLElement).style
+                  .display,
+                calls: calls.length - before,
+              };
+            });
+          },
+          { sid: SID }
+        );
+        expect(results.slice(0, 3)).toEqual(
+          Array.from({ length: 3 }, () => ({ supported: false, display: 'none', calls: 0 }))
+        );
+        expect(results[3]).toMatchObject({ supported: true, display: '' });
+        expect(results[3].calls).toBeGreaterThan(0);
+      } finally {
+        await page.close();
+      }
+    });
+
     it.each([
       {
         label: 'fresh recovery dead pane',
