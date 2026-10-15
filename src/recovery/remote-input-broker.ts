@@ -30,6 +30,7 @@ export interface RemoteBrokerDeadPane {
 }
 export type RemoteBrokerProvisionResult =
   | { status: 'existing' | 'unsupported' | 'not-sent' | 'unknown' }
+  | { status: 'planned'; directory: string; incarnation: string }
   | { status: 'provisioned'; directory: string; incarnation: string; pane: RemoteBrokerPane };
 export interface RemoteBrokerTransport {
   run(command: string, input: string): Promise<{ stdout: string }>;
@@ -406,6 +407,7 @@ try{
  try{cp.execFileSync('python3',['-c','import pty,fcntl,select,sys,os; assert sys.platform.startswith("linux"); fd=os.open("/proc/self/stat",os.O_RDONLY|os.O_NONBLOCK); raw=os.read(fd,8192); os.close(fd); fields=raw[raw.rfind(b")")+2:].split(); assert len(fields)>=20 and fields[19].isdigit() and 0<int(fields[19])<=9007199254740991'],{stdio:'ignore',timeout:1500});check()}catch{emit({status:'unsupported'});process.exit(0)}
  const base=req.root===undefined?path.join(os.homedir(),'.codeman-input-brokers'):req.root;
  if(!text(base,4096)||!path.isAbsolute(base))throw Error('invalid root');
+ if(req.planOnly===true){emit({status:'planned',directory:path.join(base,m.sessionId,m.incarnation),incarnation:m.incarnation});process.exit(0)}
  const channel='codeman-broker-'+crypto.randomBytes(16).toString('hex');
  let row,status='1',signal='';
  if(present){const e=req.expectedPane,f=run(['list-panes','-t',name,'-F','#{session_name}|#{session_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pid}']).replace(/\n$/,'').split('|');const number=x=>x===''?undefined:/^(?:0|[1-9]\d{0,4})$/.test(x)&&+x<=255?+x:NaN,signum=x=>x===''?undefined:/^(?:0|[1-9]\d{0,4})$/.test(x)&&(+x===0||Object.values(os.constants.signals).includes(+x))?+x:/^[A-Z][A-Z0-9]{0,15}$/.test(x)&&os.constants.signals['SIG'+x]||NaN;if(!e||f.length!==8||f[0]!==name||f[2]!==e.paneId||+f[3]!==e.panePid||f[4]!=='1'||number(f[5])!==e.status||signum(f[6])!==e.signal||(!e.status&&!e.signal))throw Error('replacement');row=[f[1],f[2],f[3],f[7]];status=f[5];signal=f[6]}
@@ -500,13 +502,19 @@ export async function provisionRemoteInputBroker(
   remote: SessionRemote,
   material: RemoteBrokerMaterial,
   authority: RemoteBrokerAuthority,
-  options: { root?: string; transport?: RemoteBrokerTransport; expectedPane?: RemoteBrokerDeadPane } = {}
+  options: {
+    root?: string;
+    transport?: RemoteBrokerTransport;
+    expectedPane?: RemoteBrokerDeadPane;
+    planOnly?: boolean;
+  } = {}
 ): Promise<RemoteBrokerProvisionResult> {
   let input: string;
   let remoteSnapshot: SessionRemote;
   let remoteScope: string;
   let planned: RemoteBrokerMaterial;
   const expectedRoot = options.root;
+  const planOnly = options.planOnly === true;
   const selectedTransport = options.transport ?? transport;
   const positiveInteger = (value: unknown): value is number =>
     typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
@@ -557,6 +565,7 @@ export async function provisionRemoteInputBroker(
       workingDir: remoteSnapshot.remotePath,
       root: expectedRoot,
       expectedPane: options.expectedPane,
+      planOnly,
     });
     if (Buffer.byteLength(input) > MAX_INPUT) return { status: 'not-sent' };
   } catch {
@@ -579,6 +588,18 @@ export async function provisionRemoteInputBroker(
       if (bytes.toString('base64') !== encoded || !Buffer.from(bytes.toString('utf8')).equals(bytes) || !scopeCurrent())
         return { status: 'unknown' };
       const value = JSON.parse(bytes.toString('utf8'));
+      if (planOnly && value.status === 'planned') {
+        if (
+          !exact(value, ['status', 'directory', 'incarnation']) ||
+          value.incarnation !== planned.incarnation ||
+          !canonicalPrivateDirectory(value.directory) ||
+          !value.directory.endsWith(`/${planned.sessionId}/${planned.incarnation}`) ||
+          (expectedRoot !== undefined &&
+            value.directory !== posix.join(expectedRoot, planned.sessionId, planned.incarnation))
+        )
+          return { status: 'not-sent' };
+        return { status: 'planned', directory: value.directory, incarnation: value.incarnation };
+      }
       if (
         value.status === 'existing' ||
         value.status === 'unsupported' ||
@@ -586,6 +607,7 @@ export async function provisionRemoteInputBroker(
         value.status === 'unknown'
       )
         return exact(value, ['status']) && scopeCurrent() ? { status: value.status } : { status: 'unknown' };
+      if (planOnly) return { status: 'not-sent' };
       if (
         !exact(value, ['status', 'directory', 'incarnation', 'pane']) ||
         value.status !== 'provisioned' ||

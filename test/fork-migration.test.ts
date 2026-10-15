@@ -102,6 +102,26 @@ const { spawnSync } = await import('node:child_process');
 ${record}
 const args = process.argv.slice(2);
 record({ command: 'git', args });
+const operation = args[0] === '-c' ? args[2] : args[0];
+const failure = process.env.CODEMAN_TEST_SWITCH_FAIL;
+if ((failure === 'checkout' && operation === 'checkout') ||
+    (failure === 'origin' && args[0] === 'remote' && args[1] === 'set-url' && args[2] === 'origin' && args[3] === ${JSON.stringify(FORK)})) process.exit(1);
+if (operation === 'merge' && failure) {
+  const git = (...command) => {
+    const result = spawnSync(${JSON.stringify(REAL_GIT)}, command, { stdio: 'inherit', env: process.env });
+    if (result.status !== 0) process.exit(result.status ?? 1);
+  };
+  if (failure === 'dirty') fs.writeFileSync(process.env.CODEMAN_TEST_REPO + '/package.json', 'concurrent tracked work\\n');
+  if (failure === 'head') {
+    fs.writeFileSync(process.env.CODEMAN_TEST_REPO + '/concurrent-commit.txt', 'concurrent committed work\\n');
+    git('add', 'concurrent-commit.txt');
+    git('commit', '-m', 'concurrent owner commit');
+  }
+  if (failure === 'origin-changed') git('remote', 'set-url', 'origin', 'https://git.example.invalid/concurrent.git');
+  if (failure === 'backup-changed') git('config', 'remote.codeman-before-fork.pushurl', 'https://git.example.invalid/concurrent-push.git');
+  if (failure === 'lost-ack') git(...args);
+  process.exit(1);
+}
 if (args[0] === 'fetch') {
   if (process.env.CODEMAN_TEST_FETCH_FAIL === '1') process.exit(1);
   const i = args.indexOf(${JSON.stringify(FORK)});
@@ -175,18 +195,21 @@ afterEach(() => {
 });
 
 describe('switch-to-fork preview and apply', () => {
-  it.each([{ args: [] }, { args: ['--apply'] }])('rejects separate origin push routing before any mutation: %j', ({ args }) => {
-    const h = fixture();
-    h.git(h.repo, 'config', 'remote.origin.pushurl', 'https://git.example.invalid/old-push.git');
-    const config = readFileSync(join(h.repo, '.git/config'), 'utf8');
-    const result = h.run(args);
-    expect(result.status).toBe(1);
-    expect(result.stderr).toContain('separate push URL');
-    expect(readFileSync(join(h.repo, '.git/config'), 'utf8')).toBe(config);
-    expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.base);
-    expect(h.calls().some((call) => call.command === 'npm' || call.args[0] === 'fetch')).toBe(false);
-    h.assertPreserved();
-  });
+  it.each([{ args: [] }, { args: ['--apply'] }])(
+    'rejects separate origin push routing before any mutation: %j',
+    ({ args }) => {
+      const h = fixture();
+      h.git(h.repo, 'config', 'remote.origin.pushurl', 'https://git.example.invalid/old-push.git');
+      const config = readFileSync(join(h.repo, '.git/config'), 'utf8');
+      const result = h.run(args);
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('separate push URL');
+      expect(readFileSync(join(h.repo, '.git/config'), 'utf8')).toBe(config);
+      expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.base);
+      expect(h.calls().some((call) => call.command === 'npm' || call.args[0] === 'fetch')).toBe(false);
+      h.assertPreserved();
+    }
+  );
 
   it('rechecks separate push routing added while fetching before changing origin or HEAD', () => {
     const h = fixture();
@@ -295,6 +318,101 @@ describe('switch-to-fork preview and apply', () => {
   it('safely reattaches a detached release when both it and local master fast-forward', () => {
     const h = fixture();
     h.git(h.repo, 'checkout', '--detach', h.base);
+    const result = h.run();
+    expect(result.status, result.stderr).toBe(0);
+    expect(h.git(h.repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('master');
+    expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.target);
+    h.assertPreserved();
+  });
+
+  it.each(['existing', 'absent'] as const)(
+    'restores the exact detached release, refs, and remotes after a failed merge with %s master',
+    (master) => {
+      const h = fixture();
+      h.git(h.repo, 'fetch', '--no-tags', h.remote, h.target);
+      h.git(h.repo, 'checkout', '--detach', h.target);
+      if (master === 'absent') h.git(h.repo, 'branch', '-D', 'master');
+      const refs = h.git(h.repo, 'for-each-ref', '--format=%(refname) %(objectname)');
+      const config = readFileSync(join(h.repo, '.git/config'), 'utf8');
+      const result = h.run(['--apply'], { CODEMAN_TEST_SWITCH_FAIL: 'merge' });
+      expect(result.status).toBe(1);
+      expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.target);
+      expect(h.git(h.repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('HEAD');
+      expect(h.git(h.repo, 'for-each-ref', '--format=%(refname) %(objectname)')).toBe(refs);
+      expect(readFileSync(join(h.repo, '.git/config'), 'utf8')).toBe(config);
+      expect(h.calls().filter((call) => call.command === 'npm')).toEqual([]);
+      expect(readdirSync(h.temporary)).toEqual([]);
+      expect(existsSync(join(h.repo, '.git/codeman-fork-switch.lock'))).toBe(false);
+      h.assertPreserved();
+    }
+  );
+
+  it.each(['checkout', 'origin'] as const)('rolls back its owned changes when %s fails before the merge', (failure) => {
+    const h = fixture();
+    h.git(h.repo, 'checkout', '--detach', h.base);
+    h.git(h.repo, 'branch', '-D', 'master');
+    const refs = h.git(h.repo, 'for-each-ref', '--format=%(refname) %(objectname)');
+    const config = readFileSync(join(h.repo, '.git/config'), 'utf8');
+    const result = h.run(['--apply'], { CODEMAN_TEST_SWITCH_FAIL: failure });
+    expect(result.status).toBe(1);
+    expect(h.git(h.repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('HEAD');
+    expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.base);
+    expect(h.git(h.repo, 'for-each-ref', '--format=%(refname) %(objectname)')).toBe(refs);
+    expect(readFileSync(join(h.repo, '.git/config'), 'utf8')).toBe(config);
+    expect(h.calls().filter((call) => call.command === 'npm')).toEqual([]);
+    h.assertPreserved();
+  });
+
+  it.each(['dirty', 'head', 'lost-ack'] as const)(
+    'retains concurrent or possibly committed %s state instead of forcing detached rollback',
+    (failure) => {
+      const h = fixture();
+      h.git(h.repo, 'checkout', '--detach', h.base);
+      const result = h.run(['--apply'], { CODEMAN_TEST_SWITCH_FAIL: failure });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Rollback incomplete');
+      expect(h.git(h.repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('master');
+      if (failure === 'dirty')
+        expect(readFileSync(join(h.repo, 'package.json'), 'utf8')).toBe('concurrent tracked work\n');
+      if (failure === 'head') {
+        expect(h.git(h.repo, 'log', '-1', '--format=%s')).toBe('concurrent owner commit');
+        expect(readFileSync(join(h.repo, 'concurrent-commit.txt'), 'utf8')).toBe('concurrent committed work\n');
+      }
+      if (failure === 'lost-ack') expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.target);
+      expect(h.git(h.repo, 'remote', 'get-url', 'origin')).toBe(FORK);
+      expect(h.git(h.repo, 'remote', 'get-url', 'codeman-before-fork')).toBe(UPSTREAM);
+      expect(h.calls().filter((call) => call.command === 'npm')).toEqual([]);
+      h.assertPreserved();
+    }
+  );
+
+  it.each(['origin-changed', 'backup-changed'] as const)(
+    'does not overwrite concurrent %s routing during rollback',
+    (failure) => {
+      const h = fixture();
+      h.git(h.repo, 'checkout', '--detach', h.base);
+      const result = h.run(['--apply'], { CODEMAN_TEST_SWITCH_FAIL: failure });
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain('Rollback incomplete');
+      expect(h.git(h.repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('HEAD');
+      expect(h.git(h.repo, 'rev-parse', 'HEAD')).toBe(h.base);
+      if (failure === 'origin-changed')
+        expect(h.git(h.repo, 'remote', 'get-url', 'origin')).toBe('https://git.example.invalid/concurrent.git');
+      else {
+        expect(h.git(h.repo, 'remote', 'get-url', 'origin')).toBe(UPSTREAM);
+        expect(h.git(h.repo, 'config', '--get', 'remote.codeman-before-fork.pushurl')).toBe(
+          'https://git.example.invalid/concurrent-push.git'
+        );
+      }
+      expect(h.calls().filter((call) => call.command === 'npm')).toEqual([]);
+      h.assertPreserved();
+    }
+  );
+
+  it('fast-forwards a detached release with no pre-existing master', () => {
+    const h = fixture();
+    h.git(h.repo, 'checkout', '--detach', h.base);
+    h.git(h.repo, 'branch', '-D', 'master');
     const result = h.run();
     expect(result.status, result.stderr).toBe(0);
     expect(h.git(h.repo, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('master');
