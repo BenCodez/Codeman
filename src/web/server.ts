@@ -1363,6 +1363,7 @@ export class WebServer extends EventEmitter {
     if (!current()) throw new Error('Reboot restoration was cancelled before durable commit');
     await this.mux.flushSessionsDurably(current);
     const nativeRestorePending = session.codexRestoreWorkerMayExist;
+    const genericRestorePending = session.restoreLaunchMayExist;
     try {
       if (nativeRestorePending) {
         // A successful offer must not reopen as uncertain on the next boot.
@@ -1373,10 +1374,15 @@ export class WebServer extends EventEmitter {
         await this.mux.flushSessionsDurably(current);
       }
       await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
+      if (genericRestorePending) await session.completeRestoreLaunchCommit(current);
       if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
       this.persistDeb.cancelKey(session.id);
       this.commitSessionRegistration(session);
     } catch (error) {
+      if (genericRestorePending) {
+        session.retainRestoreLaunchUncertainty();
+        await this.mux.flushSessionsDurably().catch(() => {});
+      }
       if (nativeRestorePending) {
         session.retainCodexRestoreLaunchUncertainty();
         // Even cancellation retains our own possibly running worker. Never delete
@@ -4232,16 +4238,20 @@ export class WebServer extends EventEmitter {
     const ownsCleanupFence = !this.cleaningUp.has(sessionId);
     this.cleaningUp.add(sessionId);
     session.markClosing(true);
-    if (session.codexRestoreWorkerMayExist) {
+    if (session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist) {
       this.tentativeSessionRegistrations.add(session);
       this.persistDeb.cancelKey(sessionId);
     }
     try {
       await this.stopRecoveryController(sessionId, false);
       if (this.sessions.get(sessionId) !== session) return;
-      if (session.codexRestoreWorkerMayExist) {
+      if (session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist) {
         this.tentativeSessionRegistrations.add(session);
-        session.adoptUncertainCodexRestore();
+        if (session.codexRestoreWorkerMayExist) session.adoptUncertainCodexRestore();
+        else {
+          session.retainRestoreLaunchUncertainty();
+          session.adoptUncertainRestore();
+        }
         this.persistDeb.cancelKey(sessionId);
         // Keep tentative protection: the historical state record must remain intact.
         await this.mux.flushSessionsDurably();
@@ -4316,7 +4326,7 @@ export class WebServer extends EventEmitter {
       console.warn(`[Server] stopping a partially built session failed: ${getErrorMessage(err)}`);
       // `stop()` kills the mux session in its last block, after destroying its
       // trackers, so a throw on the way there leaves the pane running.
-      if (!options?.preserveMuxPane && !session.codexRestoreWorkerMayExist)
+      if (!options?.preserveMuxPane && !session.codexRestoreWorkerMayExist && !session.restoreLaunchMayExist)
         await this.mux.killSession(sessionId).catch(() => {});
     }
     try {
@@ -4386,7 +4396,13 @@ export class WebServer extends EventEmitter {
       if (
         alive.length > 0 ||
         discovered.length > 0 ||
-        this.mux.getSessions().some((session) => session.codexRestoreUncertain === true)
+        this.mux
+          .getSessions()
+          .some(
+            (session) =>
+              session.codexRestoreUncertain === true ||
+              (Object.hasOwn(session, 'restoreUncertain') && session.restoreUncertain !== false)
+          )
       ) {
         console.log(`[Server] Found ${alive.length + discovered.length} alive mux session(s) from previous run`);
 
@@ -4397,6 +4413,10 @@ export class WebServer extends EventEmitter {
         const remoteHostsById = new Map((await readRemoteHosts(getDataDir())).map((host) => [host.id, host]));
         for (const muxSession of muxSessions) {
           if (!this.sessions.has(muxSession.sessionId)) {
+            const inspectionOnly =
+              muxSession.discovered === true ||
+              muxSession.codexRestoreUncertain === true ||
+              (Object.hasOwn(muxSession, 'restoreUncertain') && muxSession.restoreUncertain !== false);
             // Restore session settings from state.json (single source of truth)
             const savedState = this.store.getSession(muxSession.sessionId);
             // Determine the correct session name (priority: savedState > muxSession > muxName)
@@ -4509,6 +4529,8 @@ export class WebServer extends EventEmitter {
               parentSessionId: savedState?.parentSessionId,
             });
 
+            if (inspectionOnly) session.ralphTracker.disableAutoEnable();
+
             // Custom-model selection survives the restart. The tmux session still carries
             // the injected `setenv`s (that is what kept the pane on the endpoint across the
             // restart), but `_envOverrides` is rebuilt from a persist that deliberately
@@ -4516,7 +4538,10 @@ export class WebServer extends EventEmitter {
             // the isolated config dir; an endpoint that has since been deleted still gets
             // the bookkeeping restored, which is what a later clear needs to unset.
             if (savedCustomModel) {
-              session.setCustomModel(savedCustomModel, await this._rebuildCustomModelEnv(session, savedCustomModel));
+              session.setCustomModel(
+                savedCustomModel,
+                inspectionOnly ? undefined : await this._rebuildCustomModelEnv(session, savedCustomModel)
+              );
             }
 
             // Update session name if it was a "Restored:" placeholder or doesn't match saved name
@@ -4527,19 +4552,22 @@ export class WebServer extends EventEmitter {
               // Auto-compact
               if (savedState.autoCompactEnabled !== undefined || savedState.autoCompactThreshold !== undefined) {
                 session.setAutoCompact(
-                  savedState.autoCompactEnabled ?? false,
+                  !inspectionOnly && (savedState.autoCompactEnabled ?? false),
                   savedState.autoCompactThreshold,
                   savedState.autoCompactPrompt
                 );
               }
               // Auto-clear
               if (savedState.autoClearEnabled !== undefined || savedState.autoClearThreshold !== undefined) {
-                session.setAutoClear(savedState.autoClearEnabled ?? false, savedState.autoClearThreshold);
+                session.setAutoClear(
+                  !inspectionOnly && (savedState.autoClearEnabled ?? false),
+                  savedState.autoClearThreshold
+                );
               }
               // Auto-resume on usage limit (re-arms a pending schedule; an
               // overdue one fires shortly after boot — the limit footer won't
               // reprint on its own, so the pause would otherwise stall)
-              if (savedState.autoResumeEnabled) {
+              if (!inspectionOnly && savedState.autoResumeEnabled) {
                 session.restoreAutoResume(true, savedState.autoResumeAt);
               }
               // Token tracking
@@ -4566,7 +4594,7 @@ export class WebServer extends EventEmitter {
                 }
               }
               // Ralph / Todo tracker (not supported for external-CLI sessions)
-              if (!isExternalCliMode(session.mode)) {
+              if (!inspectionOnly && !isExternalCliMode(session.mode)) {
                 if (savedState.ralphAutoEnableDisabled) {
                   session.ralphTracker.disableAutoEnable();
                   console.log(`[Server] Restored Ralph auto-enable disabled for session ${session.id}`);
@@ -4596,7 +4624,12 @@ export class WebServer extends EventEmitter {
                 session.flickerFilterEnabled = savedState.flickerFilterEnabled;
               }
               // Respawn controller (not supported for external-CLI sessions)
-              if (!isExternalCliMode(session.mode) && savedState.respawnEnabled && savedState.respawnConfig) {
+              if (
+                !inspectionOnly &&
+                !isExternalCliMode(session.mode) &&
+                savedState.respawnEnabled &&
+                savedState.respawnConfig
+              ) {
                 try {
                   this.restoreRespawnController(session, savedState.respawnConfig, 'state.json');
                 } catch (err) {
@@ -4607,6 +4640,7 @@ export class WebServer extends EventEmitter {
 
             // Fallback: restore respawn from mux-sessions.json if state.json didn't have it (not supported for external CLIs)
             if (
+              !inspectionOnly &&
               !isExternalCliMode(session.mode) &&
               !this.respawnControllers.has(session.id) &&
               muxSession.respawnConfig?.enabled
@@ -4624,6 +4658,7 @@ export class WebServer extends EventEmitter {
             // Fallback: restore Ralph state from state-inner.json if not already set and not explicitly disabled
             // Ralph tracker is not supported for external-CLI sessions
             if (
+              !inspectionOnly &&
               !isExternalCliMode(session.mode) &&
               !session.ralphTracker.enabled &&
               !session.ralphTracker.autoEnableDisabled
@@ -4637,6 +4672,7 @@ export class WebServer extends EventEmitter {
 
             // Fallback: auto-detect completion phrase from CLAUDE.md (not supported for external CLIs)
             if (
+              !inspectionOnly &&
               !isExternalCliMode(session.mode) &&
               session.ralphTracker.enabled &&
               !session.ralphTracker.loopState.completionPhrase
@@ -4649,7 +4685,7 @@ export class WebServer extends EventEmitter {
               }
             }
 
-            if (session.codexRestoreWorkerMayExist) this.tentativeSessionRegistrations.add(session);
+            if (inspectionOnly) this.tentativeSessionRegistrations.add(session);
             this.sessions.set(session.id, session);
             await this.setupSessionListeners(session);
 

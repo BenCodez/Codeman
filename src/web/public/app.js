@@ -3906,7 +3906,7 @@ class CodemanApp {
     this._drainSession(sessionId);
   }
 
-  /** Terminal teardown cancels its newline retries; ordinary input stays durable. */
+  /** Terminal teardown cancels newline retries and the unsent input that depended on them. */
   _cancelPendingKeys(owner) {
     for (const [sessionId, list] of this._pendingDeliveries) {
       for (const rec of [...list]) {
@@ -3916,8 +3916,7 @@ class CodemanApp {
         if (rec.tries > 0 && !rec.retryAt) {
           this._discardKeySuffix(sessionId, rec, 'Terminal closed during newline delivery; following input not sent', 'warning');
         } else {
-          this._ackDelivery(sessionId, rec.seq);
-          this.showToast?.('Terminal closed; pending newline key cancelled', 'warning');
+          this._discardKeySuffix(sessionId, rec, 'Terminal closed; pending newline key cancelled; following input not sent', 'warning');
         }
       }
       this._drainSession(sessionId);

@@ -289,7 +289,7 @@ Object.assign(CodemanApp.prototype, {
         state.phase !== 'active' ||
         !!view.workersBusy ||
         (inspection?.recoveryStale ?? inspection?.stale) !== false ||
-        !['dead-pane', 'interrupted'].includes(inspection?.health ?? '');
+        inspection?.health !== 'dead-pane';
       retry.addEventListener('click', () => void this.supervisorWorkerAction(worker.sessionId, 'retry'));
       row.appendChild(retry);
       list.appendChild(row);

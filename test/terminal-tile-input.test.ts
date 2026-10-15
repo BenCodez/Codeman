@@ -286,32 +286,36 @@ describe('named newline key lifetime', () => {
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
   });
 
-  it('destroying a tile cancels the retry from its shipped key handler without losing ordinary queued text', async () => {
-    const app = makeApp();
-    const { tile, term } = await connectTile(app);
-    const keys: string[] = [];
-    const input: string[] = [];
-    fetchMock.mockImplementation(async (url: string, init?: { body?: string }) => {
-      const body = JSON.parse(init?.body || '{}');
-      if (url.endsWith('/send-key')) {
-        keys.push(body.key);
-        return { ok: false, status: 422, json: async () => ({ success: false, retryable: true, notSent: true }) };
-      }
-      input.push(body.input);
-      return { ok: true, status: 200 };
-    });
-    expect(term.keyHandler?.({ type: 'keydown', key: 'Enter', ctrlKey: true })).toBe(false);
-    term.type('after');
-    await new Promise((r) => setTimeout(r, 0));
-    expect(keys).toEqual(['C-Enter']);
-    expect(input).toEqual([]);
-    tile.destroy();
-    await new Promise((r) => setTimeout(r, 0));
-    expect(keys).toEqual(['C-Enter']);
-    expect(input).toEqual(['after']);
-    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('cancelled'), 'warning');
-    expect(app._pendingDeliveries.get('s-tile')).toBeUndefined();
-  });
+  it.each(['shift', 'ctrl'] as const)(
+    'destroying a tile cancels a refused %s newline and its dependent text',
+    async (modifier) => {
+      const app = makeApp();
+      const { tile, term } = await connectTile(app);
+      const keys: string[] = [];
+      const input: string[] = [];
+      fetchMock.mockImplementation(async (url: string, init?: { body?: string }) => {
+        const body = JSON.parse(init?.body || '{}');
+        if (url.endsWith('/send-key')) {
+          keys.push(body.key);
+          return { ok: false, status: 422, json: async () => ({ success: false, retryable: true, notSent: true }) };
+        }
+        input.push(body.input);
+        return { ok: true, status: 200 };
+      });
+      expect(term.keyHandler?.({ type: 'keydown', key: 'Enter', [`${modifier}Key`]: true })).toBe(false);
+      term.type('after');
+      await new Promise((r) => setTimeout(r, 0));
+      expect(keys).toEqual([modifier === 'shift' ? 'S-Enter' : 'C-Enter']);
+      expect(input).toEqual([]);
+      tile.destroy();
+      await new Promise((r) => setTimeout(r, 0));
+      expect(keys).toEqual([modifier === 'shift' ? 'S-Enter' : 'C-Enter']);
+      expect(input).toEqual([]);
+      expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('cancelled'), 'warning');
+      expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
+      expect(app._pendingDeliveries.get('s-tile')).toBeUndefined();
+    }
+  );
 });
 
 describe('what xterm generates never enters the durable queue', () => {

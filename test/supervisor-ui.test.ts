@@ -42,6 +42,85 @@ afterEach(() => {
 });
 
 describe('Codex supervisor UI', () => {
+  it.each(
+    [false, true].flatMap((mobile) =>
+      [
+        {
+          label: 'fresh recovery dead pane',
+          inspection: { health: 'dead-pane', recoveryStale: false, stale: true },
+          allowed: true,
+        },
+        { label: 'fresh legacy dead pane', inspection: { health: 'dead-pane', stale: false }, allowed: true },
+        {
+          label: 'fresh interrupted recovery',
+          inspection: { health: 'interrupted', recoveryStale: false, stale: false },
+          allowed: false,
+        },
+        { label: 'fresh legacy interruption', inspection: { health: 'interrupted', stale: false }, allowed: false },
+        {
+          label: 'stale recovery dead pane',
+          inspection: { health: 'dead-pane', recoveryStale: true, stale: false },
+          allowed: false,
+        },
+        { label: 'stale legacy dead pane', inspection: { health: 'dead-pane', stale: true }, allowed: false },
+        { label: 'missing freshness', inspection: { health: 'dead-pane' }, allowed: false },
+        { label: 'absent inspection', inspection: undefined, allowed: false },
+        { label: 'malformed health', inspection: { health: ['dead-pane'], stale: false }, allowed: false },
+        { label: 'healthy worker', inspection: { health: 'working', stale: false }, allowed: false },
+        { label: 'unknown worker', inspection: { health: 'unknown', stale: false }, allowed: false },
+      ].map((entry) => ({ mobile, ...entry }))
+    )
+  )('offers crash retry only for $label (mobile=$mobile)', async ({ mobile, inspection, allowed }) => {
+    const h = harness();
+    h.dom.window.document.body.classList.toggle('mobile', mobile);
+    const active = {
+      ...state(),
+      enabled: true,
+      phase: 'active',
+      workers: [
+        {
+          sessionId: WID,
+          task: 'Finish the fixture',
+          criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+          assignments: 0,
+          maxAssignments: 2,
+          maxRuntimeMs: 60000,
+        },
+      ],
+    };
+    const rows = inspection ? [{ sessionId: WID, ...inspection }] : [];
+    h.app._supervisorView = { sessionId: SID, state: active, workerStatus: rows, workersBusy: false };
+    h.app._apiJson.mockImplementation(
+      async (url: string, options?: { method?: string; body?: { requestId: string } }) => {
+        if (url.endsWith('/workers')) return rows;
+        const requestId = options!.body!.requestId;
+        return {
+          ...active,
+          handledRequestIds: [requestId],
+          handledRequestBindings: [{ requestId, workerId: WID, action: 'retry' }],
+        };
+      }
+    );
+    h.app._renderSupervisorStatus();
+    const retry = h.get('supervisorWorkerStatus').querySelectorAll('button')[1];
+    expect(retry.textContent).toBe('Retry crash');
+    expect(retry.disabled).toBe(!allowed);
+    retry.click();
+    if (allowed) {
+      await vi.waitFor(() => expect(h.app._supervisorView.workersBusy).toBe(false));
+      const posts = h.app._apiJson.mock.calls.filter((call: any[]) => call[1]?.method === 'POST');
+      expect(posts).toHaveLength(1);
+      expect(posts[0]).toMatchObject([
+        `/api/sessions/${SID}/supervisor/workers/${WID}/retry`,
+        { method: 'POST', headers: { 'X-Codeman-Supervisor-Session': SID } },
+      ]);
+      expect(h.dom.window.sessionStorage.getItem('codeman:supervisorWorkerRequests:v1')).toBe('[]');
+    } else {
+      expect(h.app._apiJson).not.toHaveBeenCalled();
+      expect(h.dom.window.sessionStorage.getItem('codeman:supervisorWorkerRequests:v1')).toBeNull();
+    }
+  });
+
   it.each([false, true])(
     'distinguishes cached task status from recovery freshness (recovery stale=%s)',
     (recoveryStale) => {

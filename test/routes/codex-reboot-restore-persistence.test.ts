@@ -389,74 +389,70 @@ describe('durable Codex reboot completion', () => {
     }
   );
 
-  it.each([
-    'create-response-lost',
-    'attachment-failure',
-    'finalization-failure',
-    'cancelled-after-create',
-    'cleanup-failure',
-  ])('preserves a possibly started worker and historical evidence after %s', async (uncertainty) => {
-    const id = `${hashCodexPrompt(uncertainty).slice(0, 8)}-5555-2222-3333-444444444444`;
-    const { state, home, rollout } = fixture(id, join(homedir(), 'uncertain-restore-homes', uncertainty));
-    state.codexConfig!.resumeSessionId = UUID;
-    await offer(state);
-    const { server, app, ctx, store } = await harness();
-    store.setSession(id, state);
-    store.flush();
-    const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
-    const priorRollout = readFileSync(rollout, 'utf8');
-    const kill = vi.spyOn(ctx.mux, 'killSession');
-    const originalCreate = ctx.mux.createSession.bind(ctx.mux);
-    vi.spyOn(ctx.mux, 'createSession').mockImplementation(async (options) => {
-      const result = await originalCreate(options);
-      if (uncertainty === 'create-response-lost' || uncertainty === 'cleanup-failure')
-        throw new Error('Fixture response lost after worker creation');
-      if (uncertainty === 'cancelled-after-create') rebootRestoreRegistry.clear(() => true);
-      return result;
-    });
-    if (uncertainty === 'attachment-failure') {
-      const setup = Reflect.get(Session.prototype, '_setupOrAttachMuxSession');
-      vi.spyOn(
-        Session.prototype as unknown as { _setupOrAttachMuxSession(options: unknown): Promise<unknown> },
-        '_setupOrAttachMuxSession'
-      ).mockImplementation(async function (options) {
-        await setup.call(this, options);
-        throw new Error('Fixture attachment response lost');
+  it.each(['create-response-lost', 'attachment-failure', 'finalization-failure', 'cleanup-failure'])(
+    'preserves a possibly started worker and historical evidence after %s',
+    async (uncertainty) => {
+      const id = `${hashCodexPrompt(uncertainty).slice(0, 8)}-5555-2222-3333-444444444444`;
+      const { state, home, rollout } = fixture(id, join(homedir(), 'uncertain-restore-homes', uncertainty));
+      state.codexConfig!.resumeSessionId = UUID;
+      await offer(state);
+      const { server, app, ctx, store } = await harness();
+      store.setSession(id, state);
+      store.flush();
+      const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
+      const priorRollout = readFileSync(rollout, 'utf8');
+      const kill = vi.spyOn(ctx.mux, 'killSession');
+      const originalCreate = ctx.mux.createSession.bind(ctx.mux);
+      vi.spyOn(ctx.mux, 'createSession').mockImplementation(async (options) => {
+        const result = await originalCreate(options);
+        if (uncertainty === 'create-response-lost' || uncertainty === 'cleanup-failure')
+          throw new Error('Fixture response lost after worker creation');
+        return result;
       });
-    }
-    if (uncertainty === 'finalization-failure') {
-      const apply = ctx.reapplyPersistedSessionState.bind(ctx);
-      ctx.reapplyPersistedSessionState = async (...args) => {
-        if (args[2] === 'after-spawn') throw new Error('Fixture finalization unavailable');
-        await apply(...args);
-      };
-    }
-    if (uncertainty === 'cleanup-failure') {
-      const stop = Session.prototype.stop;
-      vi.spyOn(Session.prototype, 'stop').mockImplementation(async function (...args) {
-        await stop.apply(this, args);
-        throw new Error('Fixture cleanup response lost');
+      if (uncertainty === 'attachment-failure') {
+        const setup = Reflect.get(Session.prototype, '_setupOrAttachMuxSession');
+        vi.spyOn(
+          Session.prototype as unknown as { _setupOrAttachMuxSession(options: unknown): Promise<unknown> },
+          '_setupOrAttachMuxSession'
+        ).mockImplementation(async function (options) {
+          await setup.call(this, options);
+          throw new Error('Fixture attachment response lost');
+        });
+      }
+      if (uncertainty === 'finalization-failure') {
+        const apply = ctx.reapplyPersistedSessionState.bind(ctx);
+        ctx.reapplyPersistedSessionState = async (...args) => {
+          if (args[2] === 'after-spawn') throw new Error('Fixture finalization unavailable');
+          await apply(...args);
+        };
+      }
+      if (uncertainty === 'cleanup-failure') {
+        const stop = Session.prototype.stop;
+        vi.spyOn(Session.prototype, 'stop').mockImplementation(async function (...args) {
+          await stop.apply(this, args);
+          throw new Error('Fixture cleanup response lost');
+        });
+      }
+      const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
+      expect(result.restored).toEqual([]);
+      expect(result.skipped).toEqual([{ sessionId: id, reason: 'restore-uncertain' }]);
+      expect(kill).not.toHaveBeenCalled();
+      expect(ctx.mux.getSession(id)).toBeDefined();
+      expect(sessionMap(server).has(id)).toBe(true);
+      expect(sessionMap(server).get(id)?.codexRestoreWorkerMayExist).toBe(true);
+      expect(sessionMap(server).get(id)?.getRecoveryContext()).toMatchObject({ managed: false, untrackedInput: true });
+      expect(ctx.mux.getSession(id)).toMatchObject({
+        codexRestoreUncertain: true,
+        codexRestoreConfig: { resumeSessionId: UUID },
       });
+      expect(readFileSync(rollout, 'utf8')).toBe(priorRollout);
+      store.flush();
+      expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
+      expect(readRebootIdentityFence(id)).toMatchObject({ switchPending: true });
+      expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
+      expect(rebootRestoreRegistry.list(() => true)).toHaveLength(1);
     }
-    const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
-    expect(result.restored).toEqual([]);
-    expect(result.skipped).toEqual([{ sessionId: id, reason: 'restore-uncertain' }]);
-    expect(kill).not.toHaveBeenCalled();
-    expect(ctx.mux.getSession(id)).toBeDefined();
-    expect(sessionMap(server).has(id)).toBe(true);
-    expect(sessionMap(server).get(id)?.codexRestoreWorkerMayExist).toBe(true);
-    expect(sessionMap(server).get(id)?.getRecoveryContext()).toMatchObject({ managed: false, untrackedInput: true });
-    expect(ctx.mux.getSession(id)).toMatchObject({
-      codexRestoreUncertain: true,
-      codexRestoreConfig: { resumeSessionId: UUID },
-    });
-    expect(readFileSync(rollout, 'utf8')).toBe(priorRollout);
-    store.flush();
-    expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
-    expect(readRebootIdentityFence(id)).toMatchObject({ switchPending: true });
-    expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
-    expect(rebootRestoreRegistry.list(() => true)).toHaveLength(uncertainty === 'cancelled-after-create' ? 0 : 1);
-  });
+  );
 
   it.each(['final-grant', 'mux-preparation', 'snapshot-microtask', 'final-witness'] as const)(
     'refuses a saved privileged launch when its current grant is revoked during %s',
@@ -911,7 +907,105 @@ describe('durable Codex reboot completion', () => {
     expect(await verifyCodexRebootIdentity(sessionMap(server).get(state.id)!.toState())).toBeUndefined();
   });
 
-  it('preserves the old submission and fences an uncertain worker when a launched restore is dismissed', async () => {
+  it.each([
+    'healthy',
+    'cancelled-success',
+    'cancelled-lost-ack',
+    'changed-owner',
+    'changed-generation',
+    'changed-configuration',
+    'changed-registration',
+    'changed-grant',
+    'lost-removal-ack',
+  ] as const)('handles an actually acknowledged launch held at the route await: %s', async (outcome) => {
+    const { state, rollout } = fixture(
+      hashCodexPrompt(outcome).slice(0, 8) + '-1111-2222-3333-444444444444',
+      undefined,
+      outcome === 'changed-grant' ? join(userCasesDir('cancel-grant-fixture'), 'project') : undefined
+    );
+    state.codexConfig!.resumeSessionId = UUID;
+    if (outcome === 'changed-grant') {
+      process.env.CODEMAN_MULTIUSER = '1';
+      invalidateUsersCache();
+      state.owner = 'cancel-grant-fixture';
+      await createUser({
+        username: state.owner,
+        role: 'user',
+        password: 'fixture-password',
+        canBypassPermissions: true,
+      });
+      state.codexConfig!.sandbox = 'danger-full-access';
+      state.codexConfig!.approvalPolicy = 'never';
+    }
+    await offer(state);
+    const { server, app, ctx, store } = await harness();
+    store.setSession(state.id, state);
+    store.flush();
+    const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[state.id];
+    const originalRollout = readFileSync(rollout, 'utf8');
+    let reached!: () => void, release!: () => void, launching: Session | undefined;
+    const entered = new Promise<void>((resolve) => {
+      reached = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const start = Session.prototype.startInteractive;
+    vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(async function () {
+      await start.call(this);
+      launching = sessionMap(server).get(state.id)!;
+      expect(launching).toBe(this);
+      reached();
+      await held;
+      if (outcome === 'cancelled-lost-ack') throw Error('Fixture lost startup response after owned launch');
+    });
+    const kill = vi.spyOn(ctx.mux, 'killSession');
+    const cancel = vi.spyOn(ctx.mux, 'cancelAcknowledgedRebootLaunch');
+    const pending = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+    await Promise.race([
+      entered,
+      pending.then((response) => {
+        throw Error('Restore refused before the held launch: ' + response.body);
+      }),
+    ]);
+    expect(launching!.codexRestoreWorkerMayExist).toBe(true);
+    if (outcome !== 'healthy') {
+      await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });
+      if (outcome === 'changed-owner') launching!.owner = 'replacement-owner';
+      if (outcome === 'changed-generation') launching!.fenceUntrackedInput();
+      if (outcome === 'changed-configuration')
+        Reflect.set(launching!, '_envOverrides', { CODEX_HOME: 'different-home' });
+      if (outcome === 'changed-registration')
+        sessionMap(server).set(state.id, new Session({ id: state.id, workingDir: state.workingDir, mode: 'claude' }));
+      if (outcome === 'changed-grant') await updateUser(state.owner!, { canBypassPermissions: false });
+      if (outcome === 'lost-removal-ack')
+        vi.spyOn(ctx.mux, 'flushSessionsDurably').mockRejectedValue(Error('Lost removal metadata ACK'));
+    }
+    release();
+    const response = (await pending).json();
+    if (outcome === 'healthy') {
+      expect(response.restored).toHaveLength(1);
+      expect(sessionMap(server).get(state.id)).toBe(launching);
+      expect(kill).not.toHaveBeenCalled();
+    } else {
+      const certain = outcome === 'cancelled-success';
+      expect(response.restored).toEqual([]);
+      expect(response.skipped).toEqual([
+        { sessionId: state.id, reason: certain ? 'restore-cancelled' : 'restore-uncertain' },
+      ]);
+      expect(kill).not.toHaveBeenCalled();
+      expect(cancel).toHaveBeenCalledTimes(certain || outcome === 'lost-removal-ack' ? 1 : 0);
+      expect(ctx.mux.getSession(state.id) === undefined).toBe(certain);
+      expect(sessionMap(server).has(state.id)).toBe(!certain);
+      store.flush();
+      expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[state.id]).toEqual(historical);
+      expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
+    }
+    expect(readFileSync(rollout, 'utf8')).toBe(originalRollout);
+    if (outcome === 'changed-registration') await launching!.stop(false);
+  });
+
+  it('preserves the old submission and stops an acknowledged worker when its restore is dismissed', async () => {
     const { state, home } = fixture('dddddddd-1111-2222-3333-444444444444');
     const submission = { at: Date.now(), hash: hashCodexPrompt('pre-reboot task') };
     writeFileSync(
@@ -928,10 +1022,10 @@ describe('durable Codex reboot completion', () => {
     const { server, app, ctx } = await harness();
     const kill = vi.spyOn(ctx.mux, 'killSession');
     const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
-    expect(result.json().skipped).toEqual([{ sessionId: state.id, reason: 'restore-uncertain' }]);
-    expect(sessionMap(server).has(state.id)).toBe(true);
-    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: true, untrackedInput: true, submission });
-    expect(ctx.mux.getSession(state.id)).toBeDefined();
+    expect(result.json().skipped).toEqual([{ sessionId: state.id, reason: 'restore-cancelled' }]);
+    expect(sessionMap(server).has(state.id)).toBe(false);
+    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: false, submission });
+    expect(ctx.mux.getSession(state.id)).toBeUndefined();
     expect(kill).not.toHaveBeenCalled();
   });
 });

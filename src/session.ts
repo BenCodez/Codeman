@@ -74,6 +74,7 @@ import type {
   TerminalMultiplexer,
   MuxSession,
   CodexRestoreLaunchGuard,
+  RestoreLaunchGuard,
   RecoveryPaneIdentity,
 } from './mux-interface.js';
 import { TaskTracker, type BackgroundTask } from './task-tracker.js';
@@ -686,7 +687,12 @@ export class Session extends EventEmitter {
   private _preserveExitedPane = false;
   private _recoveryCodexHome?: string;
   private _codexRestoreGuard?: CodexRestoreLaunchGuard;
+  private _restoreLaunchGuard?: RestoreLaunchGuard;
+  private _restoreLaunchMayExist = false;
+  private _restoreLaunchDispatchSerial = 0;
+  private _restoreLaunchCancellationCurrent?: () => boolean;
   private _codexRestoreWorkerMayExist = false;
+  private _codexRestoreCancellationCurrent?: () => boolean;
   private _codexRestoreDispatchSerial = 0;
   private _useMux: boolean = false;
   /**
@@ -992,6 +998,10 @@ export class Session extends EventEmitter {
       (!!config.remote &&
         getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
         this._muxSession?.recoveryInputBrokerPending !== undefined);
+    this._restoreLaunchMayExist =
+      !!this._muxSession &&
+      Object.hasOwn(this._muxSession, 'restoreUncertain') &&
+      this._muxSession.restoreUncertain !== false;
     this._preserveExitedPane = (config.preserveExitedPane ?? false) || this._codexRestoreWorkerMayExist;
     this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
     this._recoveryUntrackedInput =
@@ -1082,7 +1092,7 @@ export class Session extends EventEmitter {
     this._remote = config.remote;
     this._docker = config.docker;
     this._owner = config.owner;
-    this._discoveredMuxSession = config.discoveredMuxSession === true;
+    this._discoveredMuxSession = config.discoveredMuxSession === true || this._muxSession?.discovered === true;
     // Restored so a record that says the agent exited survives a server restart
     // rather than being blanked by the first persist after boot. It runs here
     // because the scoping reads `_remote`, `_docker` and the mux fields, all of
@@ -2114,10 +2124,18 @@ export class Session extends EventEmitter {
     spawnErrLabel: string;
   }): Promise<{ isRestored: boolean; respawnedResumeId?: string; respawnedDeadPane: boolean }> {
     const mux = this._mux!;
-    if (this._codexRestoreGuard && this._muxSession) throw new Error('Reboot restoration cannot attach to a pane');
+    if ((this._codexRestoreGuard || this._restoreLaunchGuard) && this._muxSession)
+      throw new Error('Reboot restoration cannot attach to a pane');
+    if (this._restoreLaunchMayExist && !this._muxSession)
+      throw new Error('An uncertain custom-profile worker requires owner inspection');
+    if (this._discoveredMuxSession && !this._muxSession) throw new Error('Unknown native pane cannot be recreated');
     if (this._codexRestoreWorkerMayExist && !this._muxSession)
       throw new Error('An uncertain reboot worker requires owner inspection of its existing pane');
-    const preserveExitedPane = this._preserveExitedPane || this._codexRestoreWorkerMayExist;
+    const preserveExitedPane =
+      this._preserveExitedPane ||
+      this._codexRestoreWorkerMayExist ||
+      this._restoreLaunchMayExist ||
+      this._discoveredMuxSession;
     this._preserveExitedPane = false;
 
     // Verify stale mux session — tmux may have been destroyed (e.g., killed externally).
@@ -2145,8 +2163,14 @@ export class Session extends EventEmitter {
       // check ran, so it still carries the pre-pin ompConfig; rebuild it.
       this._pinOmpRespawnId();
       const respawnOptions = await this._buildRespawnPaneOptionsWithResumePin();
+      // A successful mux result can legitimately pin native launch metadata.
+      // Keep owner intent separate from that result while preserving the stricter dispatch fence.
+      const ownerIsCurrentAfterRespawn = this._captureOwnerLaunchAuthority('ignore');
       const newPid = await mux.respawnPane(respawnOptions);
+      if (!ownerIsCurrentAfterRespawn()) throw new Error('Owner launch authority changed during pane respawn');
       if (!newPid) {
+        if (getCli(this.mode)?.capabilities.recovery === 'codex-rollout')
+          throw new Error('An uncertain Codex respawn cannot create another worker');
         console.error('[Session] Failed to respawn pane, will create new session');
         needsNewSession = true;
       } else {
@@ -2199,6 +2223,14 @@ export class Session extends EventEmitter {
         if ((await this._codexRestoreGuard.confirm()) !== true) throw new Error('Reboot restoration authority changed');
         options.createSessionOptions.codexRestoreGuard = this._codexRestoreGuard;
       }
+      if (this._restoreLaunchGuard) {
+        const guard = this._restoreLaunchGuard;
+        await guard.prepare();
+        if ((await guard.confirm()) !== true || !guard.isCurrent())
+          throw new Error('Reboot restoration authority changed');
+        options.createSessionOptions.restoreGuard = guard;
+      }
+      options.createSessionOptions.ownerLaunchIsCurrent = this._captureOwnerLaunchAuthority();
       this._muxSession = await mux.createSession(options.createSessionOptions);
       console.log('[Session] Created mux session:', this._muxSession.muxName);
       // No extra sleep — createSession() already waits for tmux readiness
@@ -2640,6 +2672,7 @@ export class Session extends EventEmitter {
       untrackedInput: this._recoveryUntrackedInput,
       managed:
         lifecycleManaged &&
+        !this._restoreLaunchMayExist &&
         !this._codexRestoreWorkerMayExist &&
         (this.paneExitApplies || (!!this._remote && this._remote.owned !== false && !this._docker)),
       remoteOwned: !!this._remote && this._remote.owned !== false,
@@ -3490,6 +3523,46 @@ export class Session extends EventEmitter {
     return true;
   }
 
+  /** A refused optional guard cannot revive an owner launch canceled while it was awaited. */
+  private _captureOwnerLaunchAuthority(nativeHome: 'create' | 'respawn' | 'ignore' = 'create'): () => boolean {
+    const generation = this._recoveryGeneration;
+    const initialNativeHome = this._muxSession?.recoveryCodexHome;
+    const envHome = this._envOverrides?.CODEX_HOME || undefined;
+    const expectedHome =
+      !this._remote && !this._docker && getCli(this.mode)?.capabilities.recovery === 'codex-rollout'
+        ? normalizedCodexHome(
+            nativeHome === 'respawn'
+              ? (envHome ?? this._recoveryCodexHome ?? currentLocalCodexHome())
+              : (this._recoveryCodexHome ?? envHome ?? currentLocalCodexHome())
+          )
+        : undefined;
+    const currentNativeHome = () => {
+      const value = this._muxSession?.recoveryCodexHome;
+      if (nativeHome === 'ignore' || (initialNativeHome === undefined && value === expectedHome)) return undefined;
+      return value;
+    };
+    const scope = () =>
+      JSON.stringify([
+        this.mode,
+        this.workingDir,
+        this.owner,
+        this._codexConfig,
+        this._envOverrides,
+        this._niceConfig,
+        this._model,
+        this._effort,
+        this._advisorModel,
+        this._resumeSessionId,
+        this._customModel,
+        this._recoveryCodexHome,
+        currentNativeHome(),
+        this._remote,
+        this._docker,
+      ]);
+    const captured = scope();
+    return () => !this._isStopped && !this._closing && generation === this._recoveryGeneration && scope() === captured;
+  }
+
   /**
    * Assemble the {@link RespawnPaneOptions} for this session. Single source of
    * truth shared by interactive start, shell start (via their inline copies),
@@ -3498,6 +3571,7 @@ export class Session extends EventEmitter {
    */
   private _buildRespawnPaneOptions(): import('./mux-interface.js').RespawnPaneOptions {
     const options: import('./mux-interface.js').RespawnPaneOptions = {
+      ownerLaunchIsCurrent: this._captureOwnerLaunchAuthority('respawn'),
       sessionId: this.id,
       workingDir: this.workingDir,
       mode: this.mode,
@@ -3867,6 +3941,77 @@ export class Session extends EventEmitter {
     this.emit('output', data);
   }
 
+  /** Keep a custom profile bound through internal asynchronous native-launch preparation. */
+  setRestoreLaunchGuard(guard: RestoreLaunchGuard | undefined): void {
+    if (!guard) {
+      this._restoreLaunchGuard = undefined;
+      this._restoreLaunchCancellationCurrent = undefined;
+      return;
+    }
+    if (
+      this._remote ||
+      this._docker ||
+      this._muxSession ||
+      !this._useMux ||
+      !this._mux ||
+      getCli(this.mode)?.capabilities.recovery === 'codex-rollout'
+    )
+      throw new Error('Custom profile restoration requires a new local managed launch');
+    const generation = this._recoveryGeneration;
+    const mux = this._mux;
+    const binding = JSON.stringify(this._buildRespawnPaneOptions());
+    let dispatches = 0;
+    let uncertain = this._restoreLaunchMayExist;
+    let dispatchedSerial = 0;
+    let owned: RestoreLaunchGuard;
+    const scopeCurrent = () =>
+      this._restoreLaunchGuard === owned &&
+      !this._closing &&
+      !this._isStopped &&
+      generation === this._recoveryGeneration &&
+      this._mux === mux &&
+      binding === JSON.stringify(this._buildRespawnPaneOptions());
+    const current = () => scopeCurrent() && guard.isCurrent() === true;
+    this._restoreLaunchCancellationCurrent = scopeCurrent;
+    this._restoreLaunchGuard = owned = {
+      isCurrent: current,
+      noteDispatch: () => {
+        dispatches++;
+        if (dispatches === 1) uncertain ||= this._restoreLaunchMayExist;
+        dispatchedSerial = ++this._restoreLaunchDispatchSerial;
+        this._restoreLaunchMayExist = true;
+        guard.noteDispatch?.();
+      },
+      noteCleanupUncertain: () => {
+        uncertain = true;
+        ++this._restoreLaunchDispatchSerial;
+        this._restoreLaunchMayExist = true;
+        if (this._restoreLaunchGuard === owned) guard.noteCleanupUncertain?.();
+      },
+      noteBrokerRefusal: () => {
+        if (
+          this._restoreLaunchGuard === owned &&
+          dispatches === 1 &&
+          !uncertain &&
+          dispatchedSerial === this._restoreLaunchDispatchSerial
+        ) {
+          this._restoreLaunchMayExist = false;
+          guard.noteBrokerRefusal?.();
+        }
+      },
+      prepare: async () => {
+        if (!current()) throw new Error('Reboot restoration authority changed');
+        await guard.prepare();
+        if (!current()) throw new Error('Reboot restoration authority changed');
+      },
+      confirm: async () => current() && (await guard.confirm()) === true && current(),
+    };
+  }
+
+  get restoreLaunchMayExist(): boolean {
+    return this._restoreLaunchMayExist;
+  }
+
   /** Private route-to-launch authority for one tentative local Codex reboot restoration. */
   setCodexRestoreLaunchGuard(guard: CodexRestoreLaunchGuard | undefined): void {
     if (
@@ -3880,7 +4025,10 @@ export class Session extends EventEmitter {
         getCli(this.mode)?.capabilities.recovery !== 'codex-rollout')
     )
       throw new Error('Reboot restoration guard requires local Codex');
+    const owner = this.owner,
+      mux = this._mux;
     const generation = this._recoveryGeneration;
+    const scope = JSON.stringify([this.mode, this.owner, this.workingDir, this._recoveryCodexHome]);
     const config = JSON.stringify(this._codexConfig);
     const env = JSON.stringify(this._envOverrides);
     let dispatches = 0;
@@ -3894,6 +4042,7 @@ export class Session extends EventEmitter {
       !this._recoverySwitchPending &&
       !this._recoveryUntrackedInput &&
       generation === this._recoveryGeneration &&
+      scope === JSON.stringify([this.mode, this.owner, this.workingDir, this._recoveryCodexHome]) &&
       config === JSON.stringify(this._codexConfig) &&
       env === JSON.stringify(this._envOverrides);
     this._codexRestoreGuard = ownedGuard = guard
@@ -3937,10 +4086,46 @@ export class Session extends EventEmitter {
           },
         }
       : undefined;
+    this._codexRestoreCancellationCurrent = guard
+      ? () =>
+          current() &&
+          this._mux === mux &&
+          this.owner === owner &&
+          config === JSON.stringify(this._codexConfig) &&
+          env === JSON.stringify(this._envOverrides)
+      : undefined;
   }
 
   get codexRestoreWorkerMayExist(): boolean {
     return this._codexRestoreWorkerMayExist;
+  }
+
+  /** Called only after startInteractive resolved and its owner cancelled this tentative instance. */
+  async cancelAcknowledgedRestoreLaunch(
+    expectedOwner: string | undefined,
+    isRegistered: () => boolean
+  ): Promise<boolean> {
+    const mux = this._mux,
+      record = this._muxSession;
+    const current = () =>
+      (this._codexRestoreWorkerMayExist || this._restoreLaunchMayExist) &&
+      this._mux === mux &&
+      this._muxSession === record &&
+      this.owner === expectedOwner &&
+      record?.owner === expectedOwner &&
+      isRegistered() === true &&
+      (this._codexRestoreWorkerMayExist
+        ? this._codexRestoreCancellationCurrent?.()
+        : this._restoreLaunchCancellationCurrent?.()) === true;
+    if (!record || !mux?.cancelAcknowledgedRebootLaunch || !current()) return false;
+    if (!(await mux.cancelAcknowledgedRebootLaunch(record, current)) || !current()) return false;
+    this._codexRestoreWorkerMayExist = false;
+    this._restoreLaunchMayExist = false;
+    this._codexRestoreGuard = undefined;
+    this._restoreLaunchGuard = undefined;
+    this._muxSession = null;
+    this._preserveExitedPane = false;
+    return true;
   }
 
   /** Adopt only our guarded launch's existing metadata; this does not attach or launch a worker. */
@@ -3996,8 +4181,55 @@ export class Session extends EventEmitter {
     this._mux.registerSession(this._muxSession);
   }
 
+  /** Retain only this tentative launch's recorded native pane for inspection. */
+  adoptUncertainRestore(): boolean {
+    if (!this._restoreLaunchMayExist || this._remote || this._docker || !this._mux) return false;
+    const record = this._mux.getSession(this.id);
+    if (
+      !record ||
+      record.sessionId !== this.id ||
+      record.mode !== this.mode ||
+      record.owner !== this.owner ||
+      record.workingDir !== this.workingDir ||
+      !Object.hasOwn(record, 'restoreUncertain') ||
+      record.restoreUncertain === false
+    )
+      return false;
+    this._muxSession = record;
+    this._preserveExitedPane = true;
+    return true;
+  }
+
+  /** Only a freshly acknowledged launch can retire its marker after durable main state. */
+  async completeRestoreLaunchCommit(isCurrent: () => boolean): Promise<void> {
+    if (!this._restoreLaunchMayExist) return;
+    const mux = this._mux,
+      record = this._muxSession;
+    const current = () =>
+      this._mux === mux &&
+      this._muxSession === record &&
+      this._restoreLaunchCancellationCurrent?.() === true &&
+      isCurrent() === true;
+    if (
+      !record ||
+      !mux?.completeAcknowledgedRebootLaunch ||
+      !current() ||
+      !(await mux.completeAcknowledgedRebootLaunch(record, current)) ||
+      !current()
+    )
+      throw new Error('Custom profile launch commit is uncertain');
+  }
+
+  retainRestoreLaunchUncertainty(): void {
+    if (!this._restoreLaunchMayExist || !this._mux || !this._muxSession) return;
+    if (this._mux.getSession(this.id) !== this._muxSession) return;
+    this._muxSession.restoreUncertain = true;
+    this._mux.registerSession(this._muxSession);
+  }
+
   /** Release tentative protection only after a complete successful restoration commit. */
   commitCodexRestoreLaunch(): void {
+    this._restoreLaunchMayExist = false;
     this._codexRestoreWorkerMayExist = false;
     if (this._muxSession?.codexRestoreUncertain) {
       this._muxSession.codexRestoreUncertain = false;
@@ -4305,7 +4537,14 @@ export class Session extends EventEmitter {
           this._codexRestoreWorkerMayExist = true;
           this.adoptUncertainCodexRestore();
         }
-        if (this._codexRestoreGuard || this._codexRestoreWorkerMayExist) throw err;
+        if (
+          this._restoreLaunchGuard ||
+          this._restoreLaunchMayExist ||
+          this._discoveredMuxSession ||
+          this._codexRestoreGuard ||
+          this._codexRestoreWorkerMayExist
+        )
+          throw err;
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;
         this._muxSession = null;
@@ -5163,6 +5402,14 @@ export class Session extends EventEmitter {
           }, 100);
         }
       } catch (err) {
+        if (
+          this._restoreLaunchGuard ||
+          this._restoreLaunchMayExist ||
+          this._discoveredMuxSession ||
+          this._codexRestoreGuard ||
+          this._codexRestoreWorkerMayExist
+        )
+          throw err;
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;
         this._muxSession = null;

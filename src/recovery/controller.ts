@@ -278,6 +278,8 @@ export class RecoveryController {
       }
       if (
         !config.restartStalls &&
+        this.state.needsAttention &&
+        (this.state.lastReason === 'stalled' || this.state.lastReason === 'stall-unverified') &&
         (this.state.stallAlert || this.legacyStallAlert) &&
         !this.state.inFlight &&
         !this.state.circuitOpen
@@ -286,7 +288,9 @@ export class RecoveryController {
         this.state.needsAttention = true;
         this.state.phase = 'paused';
       }
-      this.event('state', config.enabled ? 'observing' : 'disabled');
+      // Settings neither observe new evidence nor acknowledge an existing warning.
+      // Keep its exact owner/reason, including a newer veto beside a retained stall marker.
+      if (!this.state.needsAttention) this.event('state', config.enabled ? 'observing' : 'disabled');
       await this.save();
       this.arm();
       return this.getStatus();
@@ -945,6 +949,7 @@ export class RecoveryController {
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
     // Once sampled, a withdrawn task or supervisor authority cannot revive this attempt.
+    const retainedStallAlert = restartableStall ? (this.state.stallAlert ?? this.legacyStallAlert) : undefined;
     let authorityWithdrawn = false;
     const canDispatch: RecoveryActionAuthority = () => {
       if (
@@ -996,6 +1001,17 @@ export class RecoveryController {
         if (this.state.attempts === 0) this.state.windowStartedAt = undefined;
         this.state.phase = 'idle';
         this.state.needsAttention = false;
+        if (
+          retainedStallAlert &&
+          retainedStallAlert === (this.state.stallAlert ?? this.legacyStallAlert) &&
+          this.state.lastReason === 'scheduled'
+        ) {
+          // A certified canceled stall attempt relinquishes its reservation to the
+          // same unresolved warning. Owner input and newer attention revoke that marker.
+          this.state.phase = 'paused';
+          this.state.needsAttention = true;
+          this.state.lastReason = 'stall-unverified';
+        }
       }
       await this.save();
       return;

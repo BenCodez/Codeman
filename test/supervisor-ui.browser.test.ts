@@ -124,6 +124,101 @@ describe('Codex supervisor UI in Chromium', () => {
   }
 
   for (const width of [1440, 390]) {
+    it.each([
+      {
+        label: 'fresh recovery dead pane',
+        inspection: { health: 'dead-pane', recoveryStale: false, stale: true },
+        allowed: true,
+      },
+      { label: 'fresh legacy dead pane', inspection: { health: 'dead-pane', stale: false }, allowed: true },
+      {
+        label: 'fresh interrupted recovery',
+        inspection: { health: 'interrupted', recoveryStale: false, stale: false },
+        allowed: false,
+      },
+      { label: 'fresh legacy interruption', inspection: { health: 'interrupted', stale: false }, allowed: false },
+      {
+        label: 'stale dead pane',
+        inspection: { health: 'dead-pane', recoveryStale: true, stale: false },
+        allowed: false,
+      },
+      { label: 'absent inspection', inspection: undefined, allowed: false },
+      { label: 'malformed health', inspection: { health: ['dead-pane'], stale: false }, allowed: false },
+    ])(`offers crash retry only for $label at ${width}px`, async ({ inspection, allowed }) => {
+      const page = await render(width);
+      try {
+        await page.evaluate(
+          ({ sid, wid, inspection }) => {
+            const app = (window as any).app;
+            const active = {
+              version: 1,
+              supervisorSessionId: sid,
+              objective: 'Coordinate fixture work',
+              enabled: true,
+              phase: 'active',
+              reason: 'owner-started',
+              workers: [
+                {
+                  sessionId: wid,
+                  task: 'Finish the fixture',
+                  criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+                  assignments: 0,
+                  maxAssignments: 2,
+                  maxRuntimeMs: 60000,
+                },
+              ],
+              handledRequestIds: [],
+              handledRequestBindings: [],
+              history: [],
+            };
+            const rows = inspection ? [{ sessionId: wid, ...inspection }] : [];
+            const posts: unknown[] = [];
+            (window as any).crashRetryPosts = posts;
+            app._apiJson = async (url: string, options?: any) => {
+              if (options?.method !== 'POST') return rows;
+              posts.push({ url, options });
+              return {
+                ...active,
+                handledRequestIds: [options.body.requestId],
+                handledRequestBindings: [{ requestId: options.body.requestId, workerId: wid, action: 'retry' }],
+              };
+            };
+            app._supervisorView = {
+              sessionId: sid,
+              state: active,
+              workerStatus: rows,
+              busy: false,
+              workersBusy: false,
+            };
+            app.switchOptionsTab('supervisor');
+            app._renderSupervisorStatus();
+          },
+          { sid: SID, wid: WID, inspection }
+        );
+        const retry = page.getByRole('button', { name: 'Retry crash', exact: true });
+        expect(await retry.isVisible()).toBe(true);
+        expect(await retry.isDisabled()).toBe(!allowed);
+        if (allowed) {
+          await retry.click();
+          await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);
+          const posts = await page.evaluate(() => (window as any).crashRetryPosts);
+          expect(posts).toHaveLength(1);
+          expect(posts[0]).toMatchObject({
+            url: `/api/sessions/${SID}/supervisor/workers/${WID}/retry`,
+            options: { method: 'POST', headers: { 'X-Codeman-Supervisor-Session': SID } },
+          });
+          expect(await page.evaluate(() => sessionStorage.getItem('codeman:supervisorWorkerRequests:v1'))).toBe('[]');
+        } else {
+          // Actual DOM activation respects the disabled control and creates no request identity.
+          await retry.evaluate((button: HTMLButtonElement) => button.click());
+          expect(await page.evaluate(() => (window as any).crashRetryPosts)).toEqual([]);
+          expect(await page.evaluate(() => sessionStorage.getItem('codeman:supervisorWorkerRequests:v1'))).toBeNull();
+        }
+      } finally {
+        await page.close();
+      }
+    });
+
     for (const responseFailure of ['lost', 'malformed-json'] as const) {
       it(`reuses an accepted request after ${responseFailure} and HTTP-origin reload at ${width}px`, async () => {
         const page = await render(width);
