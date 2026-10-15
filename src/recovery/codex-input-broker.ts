@@ -4,6 +4,7 @@ import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { dirname, join, isAbsolute, normalize } from 'node:path';
 import { CODEX_INPUT_BROKER_SOURCE } from './codex-input-broker-source.js';
+import { rollbackCodexBrokerProvisioning, type BrokerProvisioningRollback } from './codex-broker-cleanup.js';
 import { parseNativePaneSignal } from './native-pane-signal.js';
 import type { CodexIdentityWitness } from './codex-identity.js';
 import type { PrivateFileWitness } from './private-file-witness.js';
@@ -415,32 +416,76 @@ export class CodexInputBroker {
       if (parents.length >= 32) throw new Error('Broker parent durability boundary is too deep');
     }
     await fs.mkdir(root, { mode: 0o700, recursive: true });
+    const parentProof: BrokerProvisioningRollback['parents'] = [];
     for (const path of parents) {
       const stat = await fs.lstat(path);
       if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Broker parent is not a private directory');
+      parentProof.push({ path, dev: stat.dev, ino: stat.ino });
     }
     const directory = join(root, config.incarnation);
     await fs.mkdir(directory, { mode: 0o700 });
-    await fs.writeFile(join(directory, 'broker.py'), CODEX_INPUT_BROKER_SOURCE, { mode: 0o600, flag: 'wx' });
-    await fs.writeFile(join(directory, 'config.json'), serialized, { mode: 0o600, flag: 'wx' });
-    await fs.writeFile(join(directory, 'lock'), '', { mode: 0o600, flag: 'wx' });
-    const syncPaths = [
-      join(directory, 'broker.py'),
-      join(directory, 'config.json'),
-      join(directory, 'lock'),
-      directory,
+    const created = await fs.lstat(directory);
+    const rollback: BrokerProvisioningRollback = {
       root,
-    ];
-    // Always acknowledge the bounded chain, including after a previous attempt
-    // created directories but failed before their parent entries were durable.
-    syncPaths.push(...parents.slice(1));
-    for (const path of syncPaths) {
-      const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
-      try {
-        await handle.sync();
-      } finally {
-        await handle.close();
+      sessionId,
+      incarnation: config.incarnation,
+      directory: { dev: created.dev, ino: created.ino },
+      parents: parentProof,
+      files: [],
+    };
+    try {
+      for (const [name, content] of [
+        ['broker.py', CODEX_INPUT_BROKER_SOURCE],
+        ['config.json', serialized],
+        ['lock', ''],
+      ]) {
+        const handle = await fs.open(join(directory, name), 'wx', 0o600);
+        try {
+          const before = await handle.stat();
+          await handle.writeFile(content);
+          const after = await handle.stat();
+          if (
+            !privateFile(before) ||
+            !privateFile(after) ||
+            before.dev !== after.dev ||
+            before.ino !== after.ino ||
+            after.size !== Buffer.byteLength(content)
+          )
+            throw new Error('Broker private creation changed');
+          rollback.files.push({
+            name,
+            dev: after.dev,
+            ino: after.ino,
+            size: after.size,
+            hash: createHash('sha256').update(content).digest('hex'),
+          });
+        } finally {
+          await handle.close();
+        }
       }
+      const syncPaths = [
+        join(directory, 'broker.py'),
+        join(directory, 'config.json'),
+        join(directory, 'lock'),
+        directory,
+        root,
+      ];
+      // Always acknowledge the bounded chain, including after a previous attempt
+      // created directories but failed before their parent entries were durable.
+      syncPaths.push(...parents.slice(1));
+      for (const path of syncPaths) {
+        const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+        try {
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      }
+    } catch (error) {
+      // No caller has received this broker or its launch command. Unknown files,
+      // changed ownership, a runtime journal or a held lease prevent rollback.
+      await rollbackCodexBrokerProvisioning(rollback).catch(() => {});
+      throw error;
     }
     return new CodexInputBroker(directory, config);
   }
