@@ -528,8 +528,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               },
             });
           }
-          if (!usesCodexRecovery && savedCustomModel) {
-            if (!(await customModelIsCurrent())) throw new Error('Custom model profile changed before restore');
+          if (!usesCodexRecovery) {
+            // Every reboot launch needs the same native dispatch receipt and
+            // uncertainty seal, including ordinary Claude without a profile.
+            if (savedCustomModel && !(await customModelIsCurrent()))
+              throw new Error('Custom model profile changed before restore');
             if (!rebootRestoreRegistry.isHeld(entry, owner)) {
               await discardCancelledRestore();
               continue;
@@ -552,7 +555,9 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               prepare: async () => {},
               isCurrent: authorityIsCurrent,
               confirm: async () =>
-                authorityIsCurrent() && (await customModelIsCurrent()) === true && authorityIsCurrent(),
+                authorityIsCurrent() &&
+                (!savedCustomModel || (await customModelIsCurrent()) === true) &&
+                authorityIsCurrent(),
             });
           }
           await session.startInteractive();
