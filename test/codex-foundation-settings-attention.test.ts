@@ -117,18 +117,21 @@ it.each(['approval-required', 'authentication-required'] as const)(
   }
 );
 
-it.each(warnings)('explicit owner reset releases %s without another warning from a settings save', async (reason) => {
-  const f = await fixture(reason);
-  await f.controller.reset();
-  await f.controller.updateConfig({ maxRetries: 4 });
-  expect(f.controller.getStatus()).toMatchObject({
-    needsAttention: false,
-    lastReason: 'observing',
-    circuitOpen: false,
-  });
-  expect(f.controller.getStatus().inFlight).toBeUndefined();
-  expect(f.pushes).toEqual([reason]);
-});
+it.each(['approval-required', 'authentication-required', 'persistence-failed'] as const)(
+  'explicit owner reset releases %s without another warning from a settings save',
+  async (reason) => {
+    const f = await fixture(reason);
+    await f.controller.reset();
+    await f.controller.updateConfig({ maxRetries: 4 });
+    expect(f.controller.getStatus()).toMatchObject({
+      needsAttention: false,
+      lastReason: 'observing',
+      circuitOpen: false,
+    });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.pushes).toEqual([reason]);
+  }
+);
 
 it('notifies exactly once when genuinely newer authentication evidence replaces approval attention', async () => {
   const f = await fixture('approval-required');
@@ -139,4 +142,15 @@ it('notifies exactly once when genuinely newer authentication evidence replaces 
   await f.controller.updateConfig({});
   await f.controller.inspect();
   expect(f.pushes).toEqual(['approval-required', 'authentication-required']);
+});
+
+it('cannot release acceptance uncertainty through owner reset or an unrelated settings save', async () => {
+  const f = await fixture('acceptance-unverified');
+  const before = f.controller.getStatus();
+  await expect(f.controller.reset()).rejects.toThrow('Recovery delivery is still unverified');
+  await f.controller.updateConfig({ maxRetries: 4 });
+  expect(f.controller.getStatus()).toMatchObject({ needsAttention: true, lastReason: 'acceptance-unverified' });
+  expect(f.controller.getStatus().inFlight).toEqual(before.inFlight);
+  expect(f.pushes).toEqual(['acceptance-unverified']);
+  expect(f.act).not.toHaveBeenCalled();
 });
