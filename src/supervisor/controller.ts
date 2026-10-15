@@ -185,6 +185,9 @@ export class SupervisorController {
   configure(config: SupervisorConfig): Promise<SupervisorState> {
     SupervisorConfigSchema.parse(config);
     const revision = ++this.revision;
+    // Owner reconfiguration revokes manager Task input before the supervisor
+    // queue or lease journal can delay applying the replacement configuration.
+    void this.suspendManager();
     return this.enqueue(() =>
       this.deps.withLeases(async () => {
         if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');

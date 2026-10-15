@@ -165,6 +165,80 @@ async function noMoreManagerWork(h: ReturnType<typeof harness>) {
 }
 
 describe('Supervisor manager Task pause invariant', () => {
+  it.each([false, true])(
+    'vetoes manager polling immediately while queued reconfiguration waits (enabled=%s)',
+    async (enabled) => {
+      const h = await active();
+      const entered = deferred<void>();
+      const release = deferred<void>();
+      const persist = vi.mocked(h.deps.persist).getMockImplementation()!;
+      vi.mocked(h.deps.persist).mockImplementation(async (snapshot) => {
+        if (snapshot.reason === 'assign-reserved') {
+          entered.resolve();
+          await release.promise;
+        }
+        await persist(snapshot);
+      });
+      const assignment = h.controller.assign(WORKER, 'configuration-queue-request');
+      void assignment.catch(() => {});
+      await entered.promise;
+      const configuring = h.controller.configure({ ...config, enabled, objective: 'Replacement owner objective' });
+      void configuring.catch(() => {});
+      try {
+        expect(h.controller.getStatus().phase).toBe('active');
+        expect(h.deps.hasManagerAuthority()).toBe(false);
+        await h.task.drain();
+        expect(h.task.getStatus().phase).toBe('paused');
+        await noMoreManagerWork(h);
+        expect(
+          h.saved.some(
+            (snapshot) => snapshot.reason === 'configured' && snapshot.objective === 'Replacement owner objective'
+          )
+        ).toBe(false);
+      } finally {
+        release.resolve();
+      }
+      await expect(assignment).rejects.toThrow(/cancelled|owner Start/);
+      await expect(configuring).resolves.toMatchObject({
+        enabled,
+        phase: enabled ? 'ready' : 'disabled',
+        objective: 'Replacement owner objective',
+      });
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      await noMoreManagerWork(h);
+    }
+  );
+  it.each([false, true])(
+    'revokes an awaiting manager delivery on reconfiguration without replaying uncertain input (enabled=%s)',
+    async (enabled) => {
+      const h = await active();
+      const entered = deferred<() => boolean>();
+      const release = deferred<'unknown'>();
+      vi.mocked(h.taskDeps.act).mockImplementation(async (_key, _id, _prompt, isCurrent) => {
+        entered.resolve(isCurrent);
+        return release.promise;
+      });
+      h.complete();
+      const refresh = h.task.refresh();
+      const managerIsCurrent = await entered.promise;
+      const flight = h.task.getStatus().inFlight!;
+      const configuring = h.controller.configure({ ...config, enabled });
+      void configuring.catch(() => {});
+      try {
+        expect(managerIsCurrent()).toBe(false);
+      } finally {
+        release.resolve('unknown');
+      }
+      await refresh;
+      await configuring;
+      await h.task.drain();
+      expect(h.task.getStatus()).toMatchObject({ phase: 'paused', inFlight: flight, continuations: 1 });
+      expect(h.task.getStatus().handledEvidence).toContain(flight.key);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(h.taskDeps.act).toHaveBeenCalledOnce();
+      expect(h.task.getStatus().criteria[0].verified).toBe(false);
+    }
+  );
   it.each(['assign', 'retry'] as const)(
     'stops automatic manager continuation after uncertain %s and preserves the lease journal',
     async (action) => {

@@ -44,8 +44,7 @@ const RUN_MODE_LAUNCH = {
       codexConfig: {
         dangerouslyBypassApprovals: globalSettings.codexDangerouslyBypassApprovals ?? false,
         animations: globalSettings.codexAnimationsEnabled ?? false,
-        noDaemon: globalSettings.codexNoDaemon ?? false,
-        noAltScreen: globalSettings.codexNoAltScreen ?? false,
+        // Unchosen isolation defaults come from the server's current synced settings.
         renderMode: 'hybrid',
       },
     }),
