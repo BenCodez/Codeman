@@ -99,6 +99,7 @@ export class TaskStore {
         certifiedCancellation = undefined;
       });
       this.records = next;
+      this.cleanupWriteFailed = false;
     });
     const tracked = result
       .catch((error: unknown) => {
@@ -123,6 +124,7 @@ export class TaskStore {
       delete next[id];
       await this.write(next);
       this.records = next;
+      this.cleanupWriteFailed = false;
     });
     const tracked = result
       .catch((error: unknown) => {
@@ -154,6 +156,7 @@ export class TaskStore {
       if (removed > 0) {
         await this.write(next);
         this.records = next;
+        this.cleanupWriteFailed = false;
       }
       return removed;
     });

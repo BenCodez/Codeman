@@ -24,6 +24,8 @@ export interface TaskObservation {
   marker?: { key: string; progress: unknown; at: number; submissionKey?: string };
 }
 export interface TaskDependencies {
+  /** Current read-only complete wire-envelope admission; production always supplies it. */
+  admitPrompt?(prompt: string, authority: RecoveryActionAuthority, expected?: TaskObservation): Promise<boolean>;
   acceptReservation?(key: string): Promise<boolean>;
   resetReservation?(): Promise<void>;
   observe(): Promise<TaskObservation>;
@@ -415,6 +417,13 @@ export class TaskController {
           : !changed && !enabledChanged && candidate.phase !== 'watching'
             ? candidate.reason
             : 'configured';
+      if (candidate.config.enabled && candidate.phase === 'watching') {
+        await this.requirePromptAdmission(
+          candidate,
+          () => !this.stopped && this.revision === revision && (!externallyCurrent || externallyCurrent() === true)
+        );
+        this.requireCurrent(revision);
+      }
       if (candidate.config.enabled) candidate.startedAt ??= this.now();
       let result: TaskState;
       if (externallyCurrent) result = await this.saveGuardedUpdate(candidate, reason, isCurrent, changed);
@@ -504,6 +513,15 @@ export class TaskController {
             : patch.outcome === 'blocked'
               ? 'blocked'
               : 'paused';
+      if (candidate.phase === 'watching') {
+        if (!this.runtimeBudgetExpired())
+          await this.requirePromptAdmission(candidate, this.actionAuthority(revision), {
+            observation,
+            commands,
+            marker,
+          });
+        this.requireCurrent(revision);
+      }
       this.state = candidate;
       await this.save('progress-recorded');
       if (this.state.inFlight?.accepted) {
@@ -545,6 +563,17 @@ export class TaskController {
       this.requirePromptSize(this.state);
       const beforeObserveCancelled = this.preserveCancelledDelivery(revision, 'not-sent', false, externallyCurrent);
       if (beforeObserveCancelled) return beforeObserveCancelled;
+      const runtimeOrigin = Math.min(this.state.startedAt ?? this.now(), runtimeStartedAt ?? this.now());
+      // Re-watching an accepted kickoff sends no prompt. Its later input action
+      // has a fresh admission check; a dead worker may first need task recovery.
+      if (
+        this.state.kickoffAt === undefined &&
+        !this.runtimeBudgetExpired() &&
+        this.now() - runtimeOrigin < this.state.config.maxRuntimeMs
+      ) {
+        await this.requirePromptAdmission(this.state, this.actionAuthority(revision, externallyCurrent));
+        this.requireCurrent(revision);
+      }
       delete this.state.agentProgressVeto;
       this.state.config.enabled = true;
       if (this.runtimeBudgetExpired()) {
@@ -637,6 +666,25 @@ export class TaskController {
   }
   private requirePromptSize(state: TaskState): void {
     if (!taskPromptFits(state)) throw new TaskValidationError('Task prompt must be valid UTF8 and fit 65536 bytes');
+  }
+  private async requirePromptAdmission(
+    state: TaskState | string,
+    authority: RecoveryActionAuthority,
+    expected?: TaskObservation
+  ): Promise<void> {
+    if (!this.deps.admitPrompt) return;
+    let admitted = false;
+    try {
+      admitted =
+        (await this.deps.admitPrompt(
+          typeof state === 'string' ? state : formatTaskPrompt(state),
+          authority,
+          expected
+        )) === true && authority() === true;
+    } catch {
+      /* Unknown evidence is not permission to reserve input. */
+    }
+    if (!admitted) throw new TaskValidationError('Task prompt cannot fit the current verified input envelope');
   }
   private prompt(): string {
     return formatTaskPrompt(this.state);
@@ -736,6 +784,19 @@ export class TaskController {
             candidate.checkpoint = p.outcome === 'unfinished' ? p.checkpoint! : (p.checkpoint ?? candidate.checkpoint);
             candidate.nextAction = p.outcome === 'unfinished' ? p.nextAction! : (p.nextAction ?? candidate.nextAction);
             if (!taskPromptFits(candidate)) return this.recordAgentAttention(marker, 'task-evidence-unknown');
+            if (candidate.outcome !== 'completed') {
+              try {
+                await this.requirePromptAdmission(candidate, this.actionAuthority(revision), {
+                  observation: o,
+                  commands,
+                  marker,
+                });
+              } catch {
+                if (this.stopped || revision !== this.revision) return this.getStatus();
+                return this.recordAgentAttention(marker, 'task-evidence-unknown');
+              }
+              if (this.stopped || revision !== this.revision) return this.getStatus();
+            }
             this.state = candidate;
             this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
             await this.save('progress-recorded');
@@ -763,13 +824,28 @@ export class TaskController {
             o.at - o.liveProofAt <= 30_000 &&
             this.now() - o.liveProofAt <= 30_000)) &&
         o.evidenceKey &&
-        (this.state.outcome === 'unfinished' || (this.state.outcome === 'unknown' && o.activity === 'crashed'))
+        (this.state.outcome === 'unfinished' || this.state.outcome === 'unknown')
       ) {
         if (this.state.continuations >= this.state.config.maxContinuations || this.runtimeBudgetExpired()) {
           this.state.phase = 'blocked';
           return this.save('budget-exhausted');
         }
         if (!this.state.handledEvidence.includes(o.evidenceKey)) {
+          if (o.activity === 'interrupted') {
+            try {
+              await this.requirePromptAdmission(CONTINUATION_PROMPT, this.actionAuthority(revision), {
+                observation: o,
+                commands,
+                marker,
+              });
+            } catch {
+              if (this.stopped || revision !== this.revision) return this.getStatus();
+              this.retainFinalEvidenceRefusal();
+              this.state.phase = 'paused';
+              return this.save('task-evidence-unknown');
+            }
+            if (this.stopped || revision !== this.revision) return this.getStatus();
+          }
           const reservationAt = this.now();
           this.state.inFlight = {
             key: o.evidenceKey,
@@ -836,6 +912,19 @@ export class TaskController {
         return this.save('task-evidence-unknown');
       }
       const prompt = this.prompt();
+      try {
+        await this.requirePromptAdmission(this.state, this.actionAuthority(revision), {
+          observation: o,
+          commands,
+          marker,
+        });
+      } catch {
+        if (this.stopped || revision !== this.revision) return this.getStatus();
+        this.retainFinalEvidenceRefusal();
+        this.state.phase = 'paused';
+        return this.save('task-evidence-unknown');
+      }
+      if (this.stopped || revision !== this.revision) return this.getStatus();
       this.state.inFlight = {
         key,
         startedAt: this.now(),
