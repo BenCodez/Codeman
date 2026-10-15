@@ -194,8 +194,8 @@ export class SupervisorController {
           if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
           if (this.state.inFlight)
             throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
-          this.deps.validateWorkers(config.workers.map((w) => w.sessionId));
           if (config.enabled) {
+            this.deps.validateWorkers(config.workers.map((w) => w.sessionId));
             if (this.deps.leaseHolder(this.state.supervisorSessionId, this.state.supervisorSessionId))
               throw new SupervisorValidationError('A worker cannot become a supervisor');
             for (const worker of config.workers) {

@@ -84,6 +84,40 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
 }
 
 describe('SupervisorController', () => {
+  it.each(['deleted', 'ineligible'] as const)(
+    'disables a manager with an %s worker while retaining configuration and rejecting re-enable',
+    async (cause) => {
+      const h = harness();
+      await h.controller.configure(config);
+      await h.controller.start();
+      const before = h.controller.getStatus();
+      vi.mocked(h.deps.validateWorkers)
+        .mockClear()
+        .mockImplementation(() => {
+          throw new SupervisorValidationError(`Worker is ${cause}`);
+        });
+      vi.mocked(h.deps.leaseHolder).mockClear();
+      const disabled = await h.controller.configure({ ...config, enabled: false });
+      expect(disabled).toMatchObject({
+        enabled: false,
+        phase: 'disabled',
+        reason: 'configured',
+        objective: before.objective,
+        workers: before.workers,
+      });
+      expect(h.saved.at(-1)).toEqual(disabled);
+      expect(h.deps.validateWorkers).not.toHaveBeenCalled();
+      expect(h.deps.leaseHolder).not.toHaveBeenCalled();
+      expect(h.deps.pauseManager).toHaveBeenCalled();
+      await expect(h.controller.assign(WORKER, `disabled-${cause}`)).rejects.toThrow();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+      await expect(h.controller.configure(config)).rejects.toThrow(`Worker is ${cause}`);
+      expect(h.deps.validateWorkers).toHaveBeenCalledOnce();
+      expect(h.controller.getStatus()).toEqual(disabled);
+    }
+  );
+
   describe('existing worker task admission', () => {
     function matching(h: ReturnType<typeof harness>, kickoffAt: number | undefined) {
       h.taskState.objective = config.workers[0].task;
@@ -769,6 +803,10 @@ describe('SupervisorController', () => {
       inFlight: { requestId: 'request-0002' },
     });
     await expect(h.controller.assign(WORKER, 'request-0003')).rejects.toThrow(/not active/);
+    const sealed = h.controller.getStatus();
+    await expect(h.controller.configure({ ...config, enabled: false })).rejects.toThrow(/Unresolved supervisor/);
+    expect(h.controller.getStatus()).toEqual(sealed);
+    expect(h.worker.task.resume).toHaveBeenCalledOnce();
   });
 
   it('exposes no manager-authored worker progress operation', async () => {

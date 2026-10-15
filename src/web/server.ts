@@ -192,6 +192,7 @@ import {
   sendLostWebviewFramePage,
 } from './middleware/auth.js';
 import { isMultiUserMode } from '../config/multiuser.js';
+import { registerSupervisorAgentBoundary } from './middleware/supervisor-agent-boundary.js';
 import { bootstrapInitialAdmin, hasUsers, resolveClaudeModeForUsername } from '../user-store.js';
 import { installRouteErrorHandler } from './route-error-handler.js';
 import { isExplicitlyEnabled, isLoopbackBindHost, buildHostPolicy, type HostPolicy } from './network-auth-policy.js';
@@ -925,6 +926,7 @@ export class WebServer extends EventEmitter {
       this.hookSecretFailures = authState.hookSecretFailures;
       this.userFailures = authState.userFailures;
     }
+    registerSupervisorAgentBoundary(this.app, (candidate) => this.resolveSupervisorManagerAttribution(candidate));
 
     // WebSocket support (terminal I/O — low-latency bidirectional channel)
     await this.app.register(fastifyWebsocket);
@@ -3149,6 +3151,28 @@ export class WebServer extends EventEmitter {
       taskJournalHasOwnership(this.actionReservationStore.get(id)) ||
       this.supervisorJournalHasOwner(id)
     );
+  }
+
+  private resolveSupervisorManagerAttribution(candidate: string): string | undefined {
+    if (candidate.length < 8 || candidate.length > 100) return undefined;
+    const matches = (id: string) => id === candidate || id.startsWith(candidate);
+    // A failed optional journal does not block unrelated non-Codex callers.
+    // A known Codex caller cannot establish that its manager role is absent.
+    if (this.supervisorStore.loadFailed) {
+      const uncertain = [...this.sessions.values()].find(
+        (session) => matches(session.id) && getCli(session.mode)?.capabilities.recovery === 'codex-rollout'
+      );
+      if (uncertain) return uncertain.id;
+    }
+    const states = [
+      ...this.supervisorStore.all(),
+      ...[...this.supervisorControllers.values()].map((controller) => controller.getStatus()),
+    ];
+    return states.find(
+      (state) =>
+        matches(state.supervisorSessionId) &&
+        (state.enabled || !!state.inFlight || !!state.objective.trim() || state.workers.length > 0)
+    )?.supervisorSessionId;
   }
 
   private supervisorJournalHasOwner(id: string): boolean {

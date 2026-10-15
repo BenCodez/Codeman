@@ -27,15 +27,9 @@ import { FastifyInstance } from 'fastify';
 import type { PrivateFileWitness } from '../../recovery/private-file-witness.js';
 import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
 import { RebootRestoreRequestSchema } from '../schemas.js';
-import {
-  parseBody,
-  getAuthUser,
-  canAccessOwned,
-  ownerFor,
-  isWorkingDirAllowedForUsername,
-  sessionCapacityMessage,
-} from '../route-helpers.js';
+import { parseBody, getAuthUser, canAccessOwned, ownerFor, sessionCapacityMessage } from '../route-helpers.js';
 import { rebootRestoreRegistry } from '../reboot-restore-registry.js';
+import { isRebootWorkingDirAllowed } from '../../recovery/reboot-workspace.js';
 import {
   rejectAlreadyLive,
   verifyCodexRebootIdentity,
@@ -231,7 +225,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         // user's confinement, and `isWorkingDirAllowed` would wave an admin
         // through. The same reason the two grant re-checks below read
         // `saved.owner`.
-        if (!(await isWorkingDirAllowedForUsername(entry.owner, entry.workingDir))) {
+        if (
+          !(await isRebootWorkingDirAllowed(entry.owner, entry.workingDir, () =>
+            rebootRestoreRegistry.isHeld(entry, owner)
+          ))
+        ) {
           // Left on offer: a withdrawn grant can be restored, unlike an already-open
           // conversation, so this is not the permanent kind of refusal.
           failures.push({ sessionId: entry.sessionId, reason: 'workspace-forbidden' });
@@ -485,6 +483,13 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             unspent.delete(entry);
             continue;
           }
+          const launchWorkingDir = saved.workingDir;
+          const workspaceScopeIsCurrent = () =>
+            ctx.sessions.get(session.id) === session &&
+            session.owner === saved.owner &&
+            session.workingDir === launchWorkingDir &&
+            saved.workingDir === launchWorkingDir;
+          let workspaceDeadline = Infinity;
           if (usesCodexRecovery) {
             // Startup preparation awaits owner settings/listeners. Re-read complete
             // lifecycle evidence and current launch grants at the final boundary.
@@ -530,6 +535,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               const peers = [...ctx.sessions.values()].filter((other) => other !== session);
               return (
                 granted &&
+                workspaceScopeIsCurrent() &&
                 grantIsCurrent() === true &&
                 ctx.sessions.get(session.id) === session &&
                 session.owner === saved.owner &&
@@ -544,9 +550,13 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               );
             };
             cancellationIsCurrent = launchScopeIsCurrent;
-            const authorityIsCurrent = () => rebootRestoreRegistry.isHeld(entry, owner) && launchScopeIsCurrent();
+            const authorityIsCurrent = () =>
+              rebootRestoreRegistry.isHeld(entry, owner) &&
+              performance.now() < workspaceDeadline &&
+              launchScopeIsCurrent();
             session.setCodexRestoreLaunchGuard({
               prepare: async () => {
+                workspaceDeadline = Math.min(workspaceDeadline, performance.now() + 2000);
                 granted = false;
                 grantIsCurrent = () => false;
                 verifyGrantCurrent = async () => false;
@@ -558,7 +568,12 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 grantFiles = grantFile ? [grantFile] : [];
                 granted =
                   grantIsCurrent() === true &&
-                  (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
+                  (await isRebootWorkingDirAllowed(
+                    saved.owner,
+                    session.workingDir,
+                    () => rebootRestoreRegistry.isHeld(entry, owner) && workspaceScopeIsCurrent() && grantIsCurrent(),
+                    workspaceDeadline
+                  )) &&
                   (await customModelIsCurrent(undefined, undefined, grantFiles)) === true &&
                   sameCodexLaunchConfig(current.configs.codexConfig as CodexConfig | undefined, codexConfig!) &&
                   JSON.stringify(current.env) === JSON.stringify(envToAuthorize);
@@ -568,10 +583,14 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               confirm: async () => {
                 return (
                   authorityIsCurrent() &&
-                  (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
-                  authorityIsCurrent() &&
                   (await customModelIsCurrent(finalEvidence!, fence, grantFiles)) === true &&
                   (await verifyGrantCurrent()) &&
+                  (await isRebootWorkingDirAllowed(
+                    saved.owner,
+                    session.workingDir,
+                    authorityIsCurrent,
+                    workspaceDeadline
+                  )) &&
                   authorityIsCurrent()
                 );
               },
@@ -597,6 +616,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 // Session checks the scope before calling prepare. Only that
                 // first check may precede the prepared grant; once attempted,
                 // failed or pending preparation must remain unauthorized.
+                workspaceScopeIsCurrent() &&
                 (!grantPreparationAttempted || (workspaceGranted && grantIsCurrent())) &&
                 (!initialGenericGrant || initialGenericGrant.isCurrent()) &&
                 ctx.sessions.get(session.id) === session &&
@@ -609,9 +629,13 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               );
             };
             cancellationIsCurrent = launchScopeIsCurrent;
-            const authorityIsCurrent = () => rebootRestoreRegistry.isHeld(entry, owner) && launchScopeIsCurrent();
+            const authorityIsCurrent = () =>
+              rebootRestoreRegistry.isHeld(entry, owner) &&
+              performance.now() < workspaceDeadline &&
+              launchScopeIsCurrent();
             session.setRestoreLaunchGuard({
               prepare: async () => {
+                workspaceDeadline = Math.min(workspaceDeadline, performance.now() + 2000);
                 grantPreparationAttempted = true;
                 workspaceGranted = false;
                 grantIsCurrent = () => false;
@@ -628,14 +652,17 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 workspaceGranted =
                   (!initialGenericGrant || initialGenericGrant.isCurrent()) &&
                   grantIsCurrent() &&
-                  (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
+                  (await isRebootWorkingDirAllowed(
+                    saved.owner,
+                    session.workingDir,
+                    () => rebootRestoreRegistry.isHeld(entry, owner) && workspaceScopeIsCurrent() && grantIsCurrent(),
+                    workspaceDeadline
+                  )) &&
                   grantIsCurrent();
               },
               isCurrent: authorityIsCurrent,
               confirm: async () =>
                 grantPreparationAttempted &&
-                authorityIsCurrent() &&
-                (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
                 authorityIsCurrent() &&
                 (!initialGenericGrant || (await initialGenericGrant.verifyCurrent())) &&
                 (await verifyGrantCurrent()) &&
@@ -643,6 +670,12 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 // The final profile proof jointly rechecks its own files and the
                 // grants after every awaited grant read, immediately before dispatch.
                 (!savedCustomModel || (await customModelIsCurrent(undefined, undefined, grantFiles)) === true) &&
+                (await isRebootWorkingDirAllowed(
+                  saved.owner,
+                  session.workingDir,
+                  authorityIsCurrent,
+                  workspaceDeadline
+                )) &&
                 authorityIsCurrent(),
             });
           }

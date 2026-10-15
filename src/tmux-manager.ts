@@ -2001,9 +2001,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
   }
 
+  /** PID 0 with an incarnation records a possible dispatch whose native receipt was lost. */
+  private uncertainBrokerRegistration(session: MuxSession | undefined): boolean {
+    return !!session?.recoveryInputBroker && session.pid === 0;
+  }
+
   canDeliverCodexOwnerInput(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
     if (session?.recoveryInputBrokerPending !== undefined) return false;
+    if (this.uncertainBrokerRegistration(session)) return false;
     if (!session?.recoveryInputBroker) return true;
     const broker = this.knownInputBroker(session);
     return broker?.incarnation === session.recoveryInputBroker && broker.canFrame;
@@ -2228,6 +2234,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   ): CodexOwnerInputFrame {
     const session = this.sessions.get(sessionId);
     if (session?.recoveryInputBrokerPending !== undefined) return { status: 'refused' };
+    if (this.uncertainBrokerRegistration(session)) return { status: 'refused' };
     if (!session?.recoveryInputBroker) return { status: 'passthrough', data: input };
     const broker = this.knownInputBroker(session);
     if (!broker || broker.incarnation !== session.recoveryInputBroker) return { status: 'refused' };
@@ -3261,6 +3268,20 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       owner,
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
+    const priorRegistration = this.sessions.get(sessionId);
+    if (this.uncertainBrokerRegistration(priorRegistration))
+      throw new Error('An uncertain Codex launch cannot create another worker');
+    const launchSnapshot = JSON.stringify(options);
+    const ownerCurrent = () => {
+      try {
+        const verdict: unknown = options.ownerLaunchIsCurrent === undefined ? true : options.ownerLaunchIsCurrent();
+        if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+          void Promise.resolve(verdict).catch(() => {});
+        return verdict === true && JSON.stringify(options) === launchSnapshot;
+      } catch {
+        return false;
+      }
+    };
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
     const controlledRemoteCodex =
       !!remote &&
@@ -3441,6 +3462,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!options.codexRestoreGuard)
           : undefined;
       if (options.codexRestoreGuard && !inputBroker) throw new Error('Reboot restoration requires input provenance');
+      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+        throw new Error('Owner launch authority changed before native creation');
 
       // Create tmux session in three steps to handle cold-start (no server running)
       // and avoid the race where the command exits before remain-on-exit is set:
@@ -3534,6 +3557,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
+      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+        throw new Error('Owner launch authority changed before native dispatch');
       if (inputBroker || options.codexRestoreGuard || options.restoreGuard) {
         // Record exact ownership before a dispatch whose receipt may be lost.
         // PID 0 is explicitly unknown; it never supplies live/dead action proof.
@@ -3602,6 +3627,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
           throw new Error('Reboot restoration authority changed');
       }
+      if (inputBroker && !ownerCurrent()) throw new Error('Owner launch authority changed before native dispatch');
       // Dispatch can start a worker before a timeout/exception is returned. Seal before sending bytes.
       const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
       const optionalDispatch = !!inputBroker && !options.codexRestoreGuard && !options.restoreGuard;
@@ -3742,9 +3768,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             muxName,
             pid,
             originalLaunch,
-            () =>
-              this.sessions.get(sessionId) === session &&
-              (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true),
+            () => this.sessions.get(sessionId) === session && ownerCurrent(),
             dispatchReceipt,
             () => {
               launchedRestoreWorker = true;
@@ -3757,6 +3781,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           this.inputBrokers.delete(sessionId);
         } else if (receipt !== 'started') throw new Error('Codex startup receipt unavailable');
         if (this.sessions.get(sessionId) !== session) throw new Error('Codex launch ownership changed');
+        if (!ownerCurrent()) throw new Error('Owner launch authority changed after native dispatch');
         delete session.recoveryInputBrokerPending;
         if (!options.codexRestoreGuard) delete session.codexRestoreUncertain;
         try {
@@ -3952,7 +3977,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       remoteAttachOnly,
     } = options;
     const session = this.sessions.get(sessionId);
-    if (!session || session.recoveryInputBrokerPending !== undefined) return null;
+    if (!session || this.uncertainBrokerRegistration(session) || session.recoveryInputBrokerPending !== undefined)
+      return null;
     const muxName = session.muxName;
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
     const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
@@ -4807,6 +4833,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     let uncertaintyChanged = false;
     // Check tracked sessions against the live pane list.
     for (const [sessionId, session] of this.sessions) {
+      // A numeric pane listing cannot acknowledge the original command queue.
+      // Preserve unknown registrations even when the listing is unavailable.
+      if (this.uncertainBrokerRegistration(session)) continue;
       if (
         (session.codexRestoreUncertain === true || session.codexRestoreStateBinding !== undefined) &&
         !completeListing
@@ -5553,6 +5582,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     if (session.recoveryInputBrokerPending !== undefined) return false;
+    if (this.uncertainBrokerRegistration(session)) return false;
     const muxName = session.muxName;
     const inputBroker = await this.getInputBroker(session);
     if (
