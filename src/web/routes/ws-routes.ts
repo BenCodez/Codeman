@@ -194,11 +194,11 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               }
               return;
             }
-            if (!canQueueInputDispatch(session, msg.d.length)) {
+            if (!canQueueInputDispatch(session, Buffer.byteLength(msg.d, 'utf8'))) {
               if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
               return;
             }
-            void queueInputDispatch(session, msg.d.length, async () => {
+            void queueInputDispatch(session, Buffer.byteLength(msg.d, 'utf8'), async () => {
               if (ctx.sessions.get(id) !== session || !canAccessOwned(getAuthUser(req), session.owner)) return;
               // Reliable delivery: when the frame carries a clientId + seq, apply it
               // exactly once (skip a duplicate redelivery) but ACK it regardless so
