@@ -148,12 +148,15 @@ it.each([150, 650])(
     });
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     let settled = false;
-    const planning = planVerifiedRebootRestore(Object.keys(f.states), f.states, () => true, f.bindings).then(
-      (result) => {
-        settled = true;
-        return result;
-      }
-    );
+    const planning = planVerifiedRebootRestore(
+      Object.keys(f.states),
+      f.states,
+      async () => ({ status: 'present' as const, dev: 1, ino: 1 }),
+      f.bindings
+    ).then((result) => {
+      settled = true;
+      return result;
+    });
     jobs.push(planning);
     const completed = delay === 150 ? 6 : 3;
     for (let index = 0; index < completed; index++) {
@@ -216,7 +219,12 @@ it('the final common witness read cannot start a new per-entry 2s budget', async
     return inspect(...args);
   });
   let settled = false;
-  const planning = planVerifiedRebootRestore(Object.keys(f.states), f.states, () => true, f.bindings).then((result) => {
+  const planning = planVerifiedRebootRestore(
+    Object.keys(f.states),
+    f.states,
+    async () => ({ status: 'present' as const, dev: 1, ino: 1 }),
+    f.bindings
+  ).then((result) => {
     settled = true;
     return result;
   });

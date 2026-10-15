@@ -263,7 +263,11 @@ describe('native uncertain Codex reboot ownership', () => {
       store.setSession(ID, state);
       store.flush();
       const historical = structuredClone(store.getSession(ID));
-      const plan = await planVerifiedRebootRestore([ID], { [ID]: state }, () => true);
+      const plan = await planVerifiedRebootRestore([ID], { [ID]: state }, async () => ({
+        status: 'present' as const,
+        dev: 1,
+        ino: 1,
+      }));
       expect(plan.skipped).toEqual([]);
       await rebootRestoreRegistry.set(plan.restore);
       const ctx = Reflect.get(server, 'createRouteContext').call(server) as Parameters<

@@ -369,7 +369,12 @@ it('bounds all reboot candidate fence collection by one shared original deadline
   io.readPaths = [];
   const entered = hold('read-open');
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
-  const planning = planVerifiedRebootRestore(Object.keys(states), states, () => true, bindings);
+  const planning = planVerifiedRebootRestore(
+    Object.keys(states),
+    states,
+    async () => ({ status: 'present' as const, dev: 1, ino: 1 }),
+    bindings
+  );
   await reached(entered, planning);
   await vi.advanceTimersByTimeAsync(2000);
   const plan = await planning;
