@@ -156,7 +156,11 @@ it.each(['healthy', 'raw-resume', 'missing', 'malformed', 'reserved', 'unknown-c
     const { state, journal, broker } = await fixture(kind === 'raw-resume');
     if (!['healthy', 'raw-resume'].includes(kind)) await damage(journal, kind);
     expect(await verifyCodexRebootIdentity(state)).toBe(kind === 'healthy' ? CID : undefined);
-    const plan = await planVerifiedRebootRestore([SID], { [SID]: state }, () => true);
+    const plan = await planVerifiedRebootRestore([SID], { [SID]: state }, async () => ({
+      status: 'present' as const,
+      dev: 1,
+      ino: 1,
+    }));
     if (kind === 'healthy') {
       expect(plan.skipped).toEqual([]);
       expect(plan.restore[0].state).toMatchObject({
@@ -262,7 +266,15 @@ it.each([false, true])(
     if (newer) expect(fenceModified).toBeLessThan(rows[0].createdAt);
     else expect(fenceModified).toBeGreaterThan(rows[0].createdAt);
     expect(await verifyCodexRebootIdentity(state)).toBe(newer ? undefined : CID);
-    expect((await planVerifiedRebootRestore([SID], { [SID]: state }, () => true)).restore).toHaveLength(newer ? 0 : 1);
+    expect(
+      (
+        await planVerifiedRebootRestore([SID], { [SID]: state }, async () => ({
+          status: 'present' as const,
+          dev: 1,
+          ino: 1,
+        }))
+      ).restore
+    ).toHaveLength(newer ? 0 : 1);
   }
 );
 
@@ -285,7 +297,11 @@ it.each([
     await fs.rename(sidDirectory, join(root, 'parked-broker'));
     await fs.writeFile(join(root, 'mux-sessions.json'), '[]');
   }
-  const plan = await planVerifiedRebootRestore([SID], { [SID]: state }, () => true);
+  const plan = await planVerifiedRebootRestore([SID], { [SID]: state }, async () => ({
+    status: 'present' as const,
+    dev: 1,
+    ino: 1,
+  }));
   if (legacy) {
     expect(plan.restore[0].state).toMatchObject({ __codexPriorInputBroker: null });
     await fs.rename(join(root, 'parked-broker'), sidDirectory);
@@ -342,7 +358,11 @@ it.each(['healthy', 'tainted', 'missing', 'replaced'])(
   'the actual new broker rechecks prior journal bytes before child startup: %s',
   async (kind) => {
     const { state, broker, root, home, journal } = await fixture();
-    const plan = await planVerifiedRebootRestore([SID], { [SID]: state }, () => true);
+    const plan = await planVerifiedRebootRestore([SID], { [SID]: state }, async () => ({
+      status: 'present' as const,
+      dev: 1,
+      ino: 1,
+    }));
     const evidence = await verifyCodexRebootEvidence(plan.restore[0].state);
     expect(evidence).toBeDefined();
     const fence = await captureRebootIdentityFenceWitness(SID);
@@ -381,7 +401,15 @@ it.each(['healthy', 'tainted', 'missing', 'replaced'])(
 it('retains a known clean child exit veto even if ordinary session state missed the exit', async () => {
   const { state } = await fixture(false, 0);
   expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
-  expect((await planVerifiedRebootRestore([SID], { [SID]: state }, () => true)).restore).toEqual([]);
+  expect(
+    (
+      await planVerifiedRebootRestore([SID], { [SID]: state }, async () => ({
+        status: 'present' as const,
+        dev: 1,
+        ino: 1,
+      }))
+    ).restore
+  ).toEqual([]);
 });
 
 it.each([false, true])('boot captures the old broker before reconciliation prunes MUX (%s raw)', async (raw) => {

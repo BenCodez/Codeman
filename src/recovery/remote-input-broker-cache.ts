@@ -306,13 +306,43 @@ export class OwnedRemoteBrokerCache {
                     dirs[2],
                     constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
                   );
+                  let emptied: Stats;
                   try {
                     await parent.sync();
+                    emptied = await parent.stat();
                   } finally {
                     await parent.close();
                   }
-                } catch (error) {
-                  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+                  // A processed incarnation must leave the bounded scan, or
+                  // every retry would consume the same first 128 entries.
+                  // Only remove the exact proved directory, nonrecursively;
+                  // rmdir itself refuses any unknown files left alongside it.
+                  const emptyPaths = await Promise.all(dirs.map((path) => fs.lstat(path)));
+                  if (
+                    !current() ||
+                    !privateStat(emptied, true) ||
+                    emptied.dev !== beforeParents[2].dev ||
+                    emptied.ino !== beforeParents[2].ino ||
+                    emptyPaths.some(
+                      (stat, index) => !privateStat(stat, true) || !same(stat, index === 2 ? emptied : parents[index])
+                    )
+                  )
+                    return false;
+                  await fs.rmdir(dirs[2]);
+                  const nextParents = await Promise.all(dirs.slice(0, 2).map((path) => fs.lstat(path)));
+                  if (
+                    !current() ||
+                    nextParents.some((stat) => !privateStat(stat, true)) ||
+                    !same(nextParents[0], parents[0]) ||
+                    nextParents[1].dev !== parents[1].dev ||
+                    nextParents[1].ino !== parents[1].ino
+                  )
+                    return false;
+                  // Our rmdir changes the session directory's timestamps and
+                  // size, but cannot authorize a replacement parent inode.
+                  parents[1] = nextParents[1];
+                } catch {
+                  complete = false;
                 }
               }
             } finally {
