@@ -33,7 +33,9 @@ async function fixture(existing = false) {
     });
     vi.spyOn(handle, 'close').mockImplementation(async () => {
       await close();
-      closed.push(path);
+      // The create() writer now also owns explicit file handles; this assertion
+      // tracks the durability handles paired with the sync event list.
+      if (args[1] !== 'wx') closed.push(path);
     });
     return handle;
   });

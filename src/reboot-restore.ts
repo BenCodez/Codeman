@@ -313,6 +313,7 @@ export function newestPersistedActivity(persisted: Readonly<Record<string, Sessi
 interface CodexRebootIdentityCandidate {
   request: CodexIdentityRequest;
   expectedId?: string;
+  trackedSubmission: boolean;
 }
 
 /** Build only from an exact saved UUID or an exact durable ordinary-submission proof. */
@@ -323,8 +324,9 @@ function codexRebootIdentityCandidate(
   if (getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' || state.remote || state.docker)
     return undefined;
   if (!isCodexRestoreConfig(state.codexConfig)) return undefined;
+  const durableProof = fence ? fence.value : readRebootIdentityFence(state.id);
   const proof =
-    (fence ? fence.value : readRebootIdentityFence(state.id)) ??
+    durableProof ??
     (
       state as SessionState & {
         __codexRebootIdentity?: {
@@ -356,6 +358,7 @@ function codexRebootIdentityCandidate(
   if (!id && !proof?.submission) return undefined;
   return {
     expectedId: id,
+    trackedSubmission: !!(id && durableProof?.switchPending === false && durableProof.submission),
     request: {
       sessionId: state.id,
       workingDir: state.workingDir,
@@ -459,6 +462,11 @@ export async function verifyCodexRebootEvidence(
   if (!bindings?.has(state.id)) return undefined;
   const candidate = codexRebootIdentityCandidate(state, fence);
   if (!candidate) return undefined;
+  // A shared home's later prompt is not this pane's thread switch. Opt in only
+  // for an actual durable clean submission and a known owned incarnation; the
+  // exact historical journal and all witnesses remain mandatory below.
+  if (candidate.trackedSubmission && typeof bindings.get(state.id) === 'string')
+    candidate.request.historyScope = 'tracked-reboot-session';
   const identity = await resolveCodexIdentity(candidate.request);
   if (identity.reason !== 'verified' || !permitsCodexRebootRestore(identity)) return undefined;
   return candidate.expectedId === undefined || identity.conversationId === candidate.expectedId
@@ -499,7 +507,11 @@ export async function planVerifiedRebootRestore(
     )
       continue;
     const identity = codexRebootIdentityCandidate(state);
-    if (identity) candidates.push({ sessionId, identity });
+    if (identity) {
+      if (identity.trackedSubmission && typeof bindings.get(sessionId) === 'string')
+        identity.request.historyScope = 'tracked-reboot-session';
+      candidates.push({ sessionId, identity });
+    }
   }
   const resolutions = await resolveCodexIdentities(candidates.map((candidate) => candidate.identity.request));
   for (const [index, resolution] of resolutions.entries()) {

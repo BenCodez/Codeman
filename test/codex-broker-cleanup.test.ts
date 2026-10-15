@@ -73,6 +73,61 @@ it('prunes a certified closed unreferenced UUID incarnation from before startup'
   expect(await f.exists()).toBe(false);
   expect(await f.exists(f.session)).toBe(false);
 });
+it.each([
+  { kind: 'closed', retired: true },
+  { kind: 'never-started', retired: true },
+  { kind: 'broker-alive', retired: false },
+  { kind: 'child-alive', retired: false },
+  { kind: 'permission', retired: false },
+  { kind: 'unknown-native', retired: false },
+  { kind: 'tainted', retired: false },
+  { kind: 'reserved', retired: false },
+  { kind: 'referenced', retired: false },
+  { kind: 'malformed-birth', retired: false },
+  { kind: 'foreign-birth', retired: false },
+  { kind: 'unsupported-platform', retired: false },
+])(
+  'retires Darwin $kind evidence only when both recorded processes are certified absent',
+  async ({ kind, retired }) => {
+    const f = await fixture();
+    Object.assign(f.state, { brokerStart: null, childStart: null });
+    if (kind === 'never-started')
+      Object.assign(f.state, {
+        childPid: 0,
+        exitStatus: null,
+        startup: { nonce: f.config.startup.nonce, status: 'not-sent' },
+      });
+    if (kind === 'tainted') Object.assign(f.state, { tainted: true, rawGeneration: 1 });
+    if (kind === 'reserved') f.state.startup.status = 'reserved';
+    if (kind === 'referenced') f.refs({ previous: f.broker.incarnation });
+    if (kind === 'malformed-birth') Object.assign(f.state, { brokerStart: true });
+    if (kind === 'foreign-birth') Object.assign(f.state, { brokerStart: '1' });
+    await f.save();
+    const platform = kind === 'unsupported-platform' ? 'win32' : 'darwin';
+    const injection = `sys.platform=${JSON.stringify(platform)}
+real_open=os.open
+def without_proc(path,*args,**kwargs):
+    if isinstance(path,str) and path.startswith('/proc/'): raise AssertionError('Darwin has no proc witness')
+    return real_open(path,*args,**kwargs)
+os.open=without_proc
+def kernel_presence(pid,sig):
+    if sig!=0: raise AssertionError('No process signal is authorized')
+    if (${JSON.stringify(kind)}=='broker-alive' and pid==${f.state.pid}) or (${JSON.stringify(kind)}=='child-alive' and pid==${f.state.childPid}): return
+    if ${JSON.stringify(kind)}=='permission': raise PermissionError(errno.EPERM,'fixture denied')
+    if ${JSON.stringify(kind)}=='unknown-native': raise OSError(errno.EIO,'fixture unknown')
+    raise ProcessLookupError(errno.ESRCH,'fixture absent')
+os.kill=kernel_presence
+`;
+    const transport = ((command: string, args: readonly string[], options: Parameters<typeof spawn>[2]) =>
+      spawn(
+        command,
+        args.map((arg) => arg.replace('try: main()', injection + 'try: main()')),
+        options
+      )) as typeof spawn;
+    await f.prune(transport);
+    expect(await f.exists()).toBe(!retired);
+  }
+);
 it('prunes an already empty private UUID session directory', async () => {
   const f = await fixture();
   await fs.rm(f.broker.directory, { recursive: true });
