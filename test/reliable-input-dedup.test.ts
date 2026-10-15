@@ -10,7 +10,7 @@
  *
  * See docs/reliable-input-delivery.md.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { Session } from '../src/session.js';
 
 function makeSession(): Session {
@@ -25,6 +25,125 @@ function apply(s: Session, clientId: string, seq: number): boolean {
   if (accepted) s.commitInputSeq(clientId, seq);
   return accepted;
 }
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('abandoned known-unsent input admission', () => {
+  function clock() {
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    return (next: number) => {
+      now = next;
+    };
+  }
+
+  it('reclaims 256 abandoned never-dispatched clients after the monotonic lease', () => {
+    const setTime = clock();
+    const s = makeSession();
+    for (let i = 0; i < 256; i++) expect(s.deferInputSeq(`abandoned-${i}`, 1)).toBe(true);
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(false);
+    setTime(60_000);
+    expect(s.shouldApplyInput('fresh-client', 1)).toBe(true);
+    expect(s.hasAppliedInputSeq('fresh-client', 1)).toBe(false);
+    s.commitInputSeq('fresh-client', 1);
+    expect(s.hasAppliedInputSeq('fresh-client', 1)).toBe(true);
+  });
+
+  it('reclaims an expired 4096-frame unsent tail while retaining its committed watermark', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(apply(s, 'client', 7)).toBe(true);
+    for (let seq = 8; seq < 4104; seq++) expect(s.deferInputSeq('client', seq)).toBe(true);
+    expect(s.deferInputSeq('client', 4104)).toBe(false);
+    setTime(60_000);
+    expect(s.shouldApplyInput('client', 4104)).toBe(true);
+    expect(s.lastInputSeq('client')).toBe(7);
+    expect(s.hasAppliedInputSeq('client', 7)).toBe(true);
+    expect(s.hasAppliedInputSeq('client', 8)).toBe(false);
+  });
+
+  it('keeps actively retried known-unsent input ahead of later frames', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.deferInputSeq('active', 1)).toBe(true);
+    for (let i = 0; i < 255; i++) expect(s.deferInputSeq(`abandoned-${i}`, 1)).toBe(true);
+    for (const at of [30_000, 60_000, 90_000]) {
+      setTime(at);
+      expect(s.deferInputSeq('active', 1)).toBe(true);
+    }
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(true);
+    expect(s.shouldApplyInput('active', 2)).toBe(false);
+    expect(apply(s, 'active', 1)).toBe(true);
+    expect(apply(s, 'active', 2)).toBe(true);
+  });
+
+  it('retains a quiet known-unsent FIFO when no admission capacity needs reclaiming', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.deferInputSeq('quiet-client', 1)).toBe(true);
+    setTime(600_000);
+    expect(s.shouldApplyInput('quiet-client', 2)).toBe(false);
+    expect(s.hasAppliedInputSeq('quiet-client', 1)).toBe(false);
+    expect(apply(s, 'quiet-client', 1)).toBe(true);
+    expect(apply(s, 'quiet-client', 2)).toBe(true);
+  });
+
+  it.each(['failed', 'committed'] as const)('renews queued FIFO after a long pending delivery is %s', (outcome) => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.shouldApplyInput('active', 1)).toBe(true);
+    expect(s.deferInputSeq('active', 2)).toBe(true);
+    setTime(600_000);
+    if (outcome === 'failed') s.forgetInputSeq('active', 1);
+    else s.commitInputSeq('active', 1);
+    expect(s.shouldApplyInput('active', 3)).toBe(false);
+    if (outcome === 'failed') expect(apply(s, 'active', 1)).toBe(true);
+    expect(apply(s, 'active', 2)).toBe(true);
+    expect(apply(s, 'active', 3)).toBe(true);
+  });
+
+  it('never expires pending input or turns an earlier sparse unsent hole into an ACK', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.shouldApplyInput('pending', 10)).toBe(true);
+    expect(s.deferInputSeq('pending', 3)).toBe(true);
+    setTime(600_000);
+    expect(s.shouldApplyInput('pending', 10)).toBe(false);
+    expect(s.shouldApplyInput('pending', 11)).toBe(false);
+    expect(s.hasAppliedInputSeq('pending', 10)).toBe(false);
+    s.commitInputSeq('pending', 10);
+    setTime(1_200_000);
+    expect(s.shouldApplyInput('pending', 11)).toBe(false);
+    expect(s.lastInputSeq('pending')).toBe(10);
+    expect(s.hasAppliedInputSeq('pending', 3)).toBe(false);
+    expect(apply(s, 'pending', 3)).toBe(true);
+    expect(apply(s, 'pending', 11)).toBe(true);
+  });
+
+  it('preserves all pending clients under pressure even after the lease', () => {
+    const setTime = clock();
+    const s = makeSession();
+    for (let i = 0; i < 256; i++) expect(s.shouldApplyInput(`pending-${i}`, 1)).toBe(true);
+    setTime(600_000);
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(false);
+    expect(s.shouldApplyInput('pending-0', 1)).toBe(false);
+    s.commitInputSeq('pending-0', 1);
+    expect(s.hasAppliedInputSeq('pending-0', 1)).toBe(true);
+  });
+
+  it('does not expire known-unsent input after wall-clock changes or a backwards monotonic sample', () => {
+    const setTime = clock();
+    setTime(100);
+    const s = makeSession();
+    expect(s.deferInputSeq('active', 1)).toBe(true);
+    const wall = vi.spyOn(Date, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER);
+    setTime(99);
+    expect(s.shouldApplyInput('active', 2)).toBe(false);
+    expect(s.hasAppliedInputSeq('active', 1)).toBe(false);
+    wall.mockRestore();
+    expect(apply(s, 'active', 1)).toBe(true);
+  });
+});
 
 describe('Session.shouldApplyInput (exactly-once input dedup)', () => {
   it('accepts and deduplicates the schema-valid initial zero sequence', () => {

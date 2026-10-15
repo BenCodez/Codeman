@@ -51,6 +51,53 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('actual local stall controller with an abnormally dead owned pane', () => {
+  it.each([false, true].flatMap((remote) => [false, true].map((recentStop) => ({ remote, recentStop }))))(
+    'does not reclassify an owner-stopped unfinished worker as live silence (SSH=$remote, recent stop=$recentStop)',
+    async ({ remote, recentStop }) => {
+      const remoteCase = remote
+        ? await remoteFixture('collab_resume_end', { completed: null }, true, true, true)
+        : undefined;
+      const f =
+        remoteCase ??
+        (await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, false));
+      try {
+        if (!remote) expect(f.session.setPaneExit({ at: CHILD_NOW - 1000, status: 9 })).toBe(true);
+        expect((await f.adapter.observe()).stallRestartable).toBe(true);
+        Object.assign(f.session, { _recoveryIntentionalStopAt: CHILD_NOW - (recentStop ? 500 : 4000) });
+        const stopped = await f.adapter.observe();
+        expect(stopped).toMatchObject({
+          activity: 'crashed',
+          reason: 'process-crashed',
+          safeToAct: !recentStop,
+          stallRestartable: false,
+          progressAt: CHILD_NOW - 25_000,
+        });
+        expect(stopped.stallEvidenceKey).toBeDefined();
+        for (const delta of [0, 2000, 15_000, 17_000, 60_000, 62_000]) {
+          vi.setSystemTime(CHILD_NOW + delta);
+          await f.controller.inspect();
+          await f.controller.refresh();
+          await f.controller.retry();
+        }
+        expect(f.controller.getStatus()).toMatchObject({
+          activity: 'crashed',
+          lastReason: 'process-crashed',
+          needsAttention: false,
+          attempts: 0,
+        });
+        expect(f.controller.getStatus().stallAlert).toBeUndefined();
+        expect(f.store.get(f.session.id).history.some((event) => event.reason === 'stall-unverified')).toBe(false);
+        expect(f.delivered).not.toHaveBeenCalled();
+        if (remoteCase) {
+          expect(remoteCase.deps.restartRemote).not.toHaveBeenCalled();
+          expect(remoteCase.deps.deliverRemote).not.toHaveBeenCalled();
+        }
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
   it.each([false, true])(
     'withdraws restart consent during the actual adapter final proof without local or SSH effects (SSH=%s)',
     async (remote) => {

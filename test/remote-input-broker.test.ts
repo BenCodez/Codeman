@@ -52,9 +52,11 @@ elif op=='wait-for':
 elif op=='list-panes':
  s=state()
  if os.environ.get('OPPONENT')=='before-list':s['pane_pid']='9010'
- print('|'.join(s[x] for x in ['pane_dead','pane_id','pane_pid','pane_dead_status','pane_dead_signal','pid']))
+ fields=['session_name','session_id','pane_id','pane_pid','pane_dead','pane_dead_status','pane_dead_signal','pid'] if '#{session_name}' in a[-1] else ['pane_dead','pane_id','pane_pid','pane_dead_status','pane_dead_signal','pid']
+ print('|'.join(s[x] for x in fields))
 elif op=='if-shell':
- assert a[3:5]==['-F','-t'] and a[7]=='display-message -p CODEMAN_BROKER_OWNED' and a[8]=='display-message -p CODEMAN_BROKER_REFUSED'
+ ordinary='set-option -s escape-time 0 ; display-message -p CODEMAN_BROKER_OWNED'
+ assert a[3:5]==['-F','-t'] and a[7] in ['display-message -p CODEMAN_BROKER_OWNED',ordinary] and a[8]=='display-message -p CODEMAN_BROKER_REFUSED'
  terms=re.findall(r'#\{==:#\{([a-z_]+)\},([^{}]*)\}',a[6]); assert len(terms)==8
  expression='#{==:#{'+terms[0][0]+'},'+terms[0][1]+'}'
  for k,v in terms[1:]:expression='#{&&:'+expression+',#{==:#{'+k+'},'+v+'}}'
@@ -65,7 +67,12 @@ elif op=='if-shell':
   k={'pid':'pane_pid','dead':'pane_dead','status':'pane_dead_status','signal':'pane_dead_signal','session':'session_id','server':'pid'}[change]
   s[k]={'pid':'9010','dead':'0','status':'2','signal':'TERM','session':'$18','server':'17001'}[change]
  if change=='after-files' and count:s['pane_pid']='9010'
- print('CODEMAN_BROKER_OWNED' if a[5]==s['pane_id'] and all(s.get(k)==v for k,v in terms) else 'CODEMAN_BROKER_REFUSED')
+ owned=a[5]==s['pane_id'] and all(s.get(k)==v for k,v in terms)
+ if owned and a[7]==ordinary:
+  assert os.path.isfile(os.environ['FAKE_DIRECTORY']+'/config.json') and os.path.isfile(os.environ['FAKE_DIRECTORY']+'/broker.py')
+  s['escape_time']='0';save(s)
+  with open(log,'a') as f:f.write(json.dumps(['-L','codeman-remote','set-option','-s','escape-time','0'])+'\n')
+ print('CODEMAN_BROKER_OWNED' if owned else 'CODEMAN_BROKER_REFUSED')
 else:raise AssertionError('Unexpected native mutation '+op)
 `;
 
@@ -99,6 +106,7 @@ describe('owned SSH private broker provisioning', () => {
       PATH: `${bin}:/usr/bin:/bin`,
       FAKE_STATE: join(root, 'native.json'),
       FAKE_LOG: join(root, 'native.log'),
+      FAKE_DIRECTORY: join(privateRoot, SESSION, INCARNATION),
     };
     delete environment.CODEX_HOME;
     delete environment.CODEMAN_MUX;
@@ -164,21 +172,25 @@ describe('owned SSH private broker provisioning', () => {
     return provisionRemoteInputBroker(remote, input, authority(), { root: privateRoot, transport: runner() });
   }
 
-  it('plans the exact remote directory without creating a pane or private files', async () => {
-    const result = await provisionRemoteInputBroker(remote, material, authority(), {
-      root: privateRoot,
-      transport: runner(),
-      planOnly: true,
-    });
-    expect(result).toEqual({ status: 'planned', directory: directory(), incarnation: INCARNATION });
-    await expect(fs.stat(privateRoot)).rejects.toMatchObject({ code: 'ENOENT' });
-    await expect(fs.stat(environment.FAKE_STATE!)).rejects.toMatchObject({ code: 'ENOENT' });
-    const operations = (await fs.readFile(environment.FAKE_LOG!, 'utf8'))
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line));
-    expect(operations).toEqual([['-L', 'codeman-remote', 'has-session', '-t', 'codeman-ssh-aaaaaaaa']]);
-  });
+  it.each([false, true])(
+    'plans the exact remote directory without mutation (owner initial launch=%s)',
+    async (ownerInitialLaunch) => {
+      const result = await provisionRemoteInputBroker(remote, material, authority(), {
+        root: privateRoot,
+        transport: runner(),
+        planOnly: true,
+        ownerInitialLaunch,
+      });
+      expect(result).toEqual({ status: 'planned', directory: directory(), incarnation: INCARNATION });
+      await expect(fs.stat(privateRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+      await expect(fs.stat(environment.FAKE_STATE!)).rejects.toMatchObject({ code: 'ENOENT' });
+      const operations = (await fs.readFile(environment.FAKE_LOG!, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      expect(operations).toEqual([['-L', 'codeman-remote', 'has-session', '-t', 'codeman-ssh-aaaaaaaa']]);
+    }
+  );
 
   it.each(['foreign-incarnation', 'uncanonical-directory', 'extra-fields', 'wrong-root'] as const)(
     'rejects a malformed read-only %s plan before any second provisioning',
@@ -226,14 +238,91 @@ describe('owned SSH private broker provisioning', () => {
     expect(operations).not.toContain(secret);
   });
 
-  it('an existing remote session never provisions or rewrites a broker', async () => {
-    await fs.writeFile(environment.FAKE_STATE!, '{}');
-    await fs.mkdir(directory(), { recursive: true });
-    await fs.writeFile(join(directory(), 'config.json'), 'existing private config');
-    expect(await provision()).toEqual({ status: 'existing' });
-    expect(await fs.readFile(join(directory(), 'config.json'), 'utf8')).toBe('existing private config');
-    expect((await fs.readFile(environment.FAKE_LOG!, 'utf8')).trim().split('\n')).toHaveLength(1);
+  it('sets escape-time only for a proven new ordinary owner launch after its private files are durable', async () => {
+    const result = await provisionRemoteInputBroker(remote, material, authority(), {
+      root: privateRoot,
+      transport: runner(),
+      ownerInitialLaunch: true,
+    });
+    expect(result.status).toBe('provisioned');
+    const operations = (await fs.readFile(environment.FAKE_LOG!, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    const setting = ['-L', 'codeman-remote', 'set-option', '-s', 'escape-time', '0'];
+    expect(operations.filter((args) => args[2] === 'set-option' && args.includes('-s'))).toEqual([setting]);
+    const guards = operations.filter((args) => args[2] === 'if-shell');
+    expect(guards).toHaveLength(2);
+    expect(guards[0][7]).toBe('display-message -p CODEMAN_BROKER_OWNED');
+    expect(guards[1][7]).toBe('set-option -s escape-time 0 ; display-message -p CODEMAN_BROKER_OWNED');
+    expect(guards[1][6]).toContain('#{==:#{pid},17000}');
+    expect(JSON.parse(await fs.readFile(environment.FAKE_STATE!, 'utf8')).escape_time).toBe('0');
+    expect(await fs.readFile(join(directory(), 'config.json'), 'utf8')).toBe(material.configJson);
+    expect(operations.some((args) => args[2] === 'respawn-pane' || args[2] === 'send-keys')).toBe(false);
   });
+
+  it.each(['before-list', 'server', 'after-files', 'create-race'] as const)(
+    'does not change server options when an ordinary initial launch becomes uncertain at %s',
+    async (opponent) => {
+      environment.OPPONENT = opponent;
+      const result = await provisionRemoteInputBroker(remote, material, authority(), {
+        root: privateRoot,
+        transport: runner(),
+        ownerInitialLaunch: true,
+      });
+      expect(result.status).toBe('unknown');
+      const operations = (await fs.readFile(environment.FAKE_LOG!, 'utf8'))
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      expect(operations.filter((args) => args[2] === 'set-option' && args.includes('-s'))).toEqual([]);
+      if (opponent !== 'create-race')
+        expect(JSON.parse(await fs.readFile(environment.FAKE_STATE!, 'utf8')).escape_time).toBeUndefined();
+    }
+  );
+
+  it('does not change server options for an existing abnormal pane even if an initial-launch flag is supplied', async () => {
+    await fs.writeFile(
+      environment.FAKE_STATE!,
+      JSON.stringify({
+        session_name: 'codeman-ssh-aaaaaaaa',
+        session_id: '$17',
+        pane_id: '%9',
+        pane_pid: '9009',
+        pid: '17000',
+        pane_dead: '1',
+        pane_dead_status: '1',
+        pane_dead_signal: '',
+      })
+    );
+    const result = await provisionRemoteInputBroker(remote, material, authority(), {
+      root: privateRoot,
+      transport: runner(),
+      expectedPane: { paneId: '%9', panePid: 9009, status: 1 },
+      ownerInitialLaunch: true,
+    });
+    expect(result.status).toBe('provisioned');
+    expect(await fs.readFile(environment.FAKE_LOG!, 'utf8')).not.toMatch(/new-session|escape-time/);
+    expect(JSON.parse(await fs.readFile(environment.FAKE_STATE!, 'utf8')).escape_time).toBeUndefined();
+  });
+
+  it.each([false, true])(
+    'an existing remote session never provisions or changes server options (initial launch=%s)',
+    async (ownerInitialLaunch) => {
+      await fs.writeFile(environment.FAKE_STATE!, '{}');
+      await fs.mkdir(directory(), { recursive: true });
+      await fs.writeFile(join(directory(), 'config.json'), 'existing private config');
+      expect(
+        await provisionRemoteInputBroker(remote, material, authority(), {
+          root: privateRoot,
+          transport: runner(),
+          ownerInitialLaunch,
+        })
+      ).toEqual({ status: 'existing' });
+      expect(await fs.readFile(join(directory(), 'config.json'), 'utf8')).toBe('existing private config');
+      expect((await fs.readFile(environment.FAKE_LOG!, 'utf8')).trim().split('\n')).toHaveLength(1);
+    }
+  );
 
   it('missing Python leaves the missing pane and home untouched', async () => {
     await fs.writeFile(join(bin, 'python3'), '#!/bin/sh\nexit 127\n', { mode: 0o700 });

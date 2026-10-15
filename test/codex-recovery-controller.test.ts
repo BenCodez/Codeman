@@ -121,6 +121,45 @@ function stalled(key = 'stall-turn-1', restartable = false): RecoveryObservation
 }
 
 describe('recovery action authority', () => {
+  it.each(
+    [false, true].flatMap((safeToAct) =>
+      [false, undefined, null, 1, 'true'].map((stallRestartable) => ({ safeToAct, stallRestartable }))
+    )
+  )('preserves a selected stall veto instead of crash fallback (%j)', async ({ safeToAct, stallRestartable }) => {
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, recoverCrashes: true }));
+    f.observation = {
+      ...stalled(),
+      activity: 'crashed',
+      reason: 'process-crashed',
+      evidenceKey: 'actual-dead-pane',
+      safeToAct,
+      stallRestartable: stallRestartable as boolean | undefined,
+    };
+    for (const delta of [0, 2000, 15_000, 17_000]) {
+      vi.setSystemTime(NOW + delta);
+      await f.controller.inspect();
+      await f.controller.refresh();
+      await f.controller.retry();
+    }
+    expect(f.controller.getStatus()).toMatchObject({
+      activity: 'crashed',
+      lastReason: 'process-crashed',
+      needsAttention: false,
+      attempts: 0,
+    });
+    expect(f.controller.getStatus().stallAlert).toBeUndefined();
+    expect(f.controller.getStatus().history.some((event) => event.reason === 'stall-unverified')).toBe(false);
+    expect(f.act).not.toHaveBeenCalled();
+  });
+
+  it('retains ordinary owned crash recovery without an unfinished-turn stall key', async () => {
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, recoverCrashes: true }));
+    f.observation = failure('actual-dead-pane', { activity: 'crashed', reason: 'process-crashed' });
+    await f.controller.retry();
+    expect(f.act).toHaveBeenCalledOnce();
+    expect(f.act.mock.calls[0][0]).toMatchObject({ action: 'restart', reason: 'process-crashed' });
+  });
+
   it('durably reserves an explicit missing-remote restore and never duplicates an in-flight action', async () => {
     const f = fixture();
     f.observation = {

@@ -437,7 +437,6 @@ it.each(['rename-lost-ack', 'temporary-write'] as const)(
       expect(failure).toBe(ioError);
       expect(failure).not.toBeInstanceOf(TaskConfigurationCancelledError);
       await paused;
-      expect(f.store.getBrokerCleanupState()).toBeUndefined();
       if (fault === 'rename-lost-ack') {
         expect(f.store.getBrokerCleanupState()).toBeUndefined();
         await expect(f.store.save(SID, before)).rejects.toThrow(/uncertain/);
@@ -445,6 +444,8 @@ it.each(['rename-lost-ack', 'temporary-write'] as const)(
         await expect(f.store.pruneOrphans(() => false)).rejects.toThrow(/uncertain/);
         expect(await readFile(f.path, 'utf8')).toBe(duringCleanup);
       } else {
+        // The queued owner pause acknowledged a complete replacement snapshot.
+        expect(f.store.getBrokerCleanupState()).toEqual({ [SID]: new TaskStore(f.path).get(SID) });
         expect(new TaskStore(f.path).get(SID)).toMatchObject({
           objective: before.objective,
           criteria: before.criteria,
@@ -524,7 +525,7 @@ it('does not reuse a cancellation Error identity to certify a later I/O failure'
     expect(commit).not.toHaveBeenCalled();
     expect(f.store.getBrokerCleanupState()).toBeUndefined();
     await f.store.save(SID, priorState());
-    expect(f.store.getBrokerCleanupState()).toBeUndefined();
+    expect(f.store.getBrokerCleanupState()).toEqual({ [SID]: priorState() });
   } finally {
     await f.cleanup();
   }
@@ -546,7 +547,7 @@ it('withholds cleanup after temporary-file cleanup fails during an otherwise cer
     expect(await readFile(f.path, 'utf8')).toBe(original);
     expect(f.store.getBrokerCleanupState()).toBeUndefined();
     await f.store.save(SID, priorState());
-    expect(f.store.getBrokerCleanupState()).toBeUndefined();
+    expect(f.store.getBrokerCleanupState()).toEqual({ [SID]: priorState() });
     expect(f.act).not.toHaveBeenCalled();
   } finally {
     barrier.release();

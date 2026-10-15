@@ -2185,7 +2185,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         configJson: JSON.stringify(material.config),
       },
       authority,
-      { root: posix.dirname(posix.dirname(planned.directory)) }
+      { root: posix.dirname(posix.dirname(planned.directory)), ownerInitialLaunch: true }
     );
     if (provisioned.status !== 'provisioned' || provisioned.directory !== descriptor.directory || !current())
       throw new Error('Owned SSH launch provisioning needs owner inspection');

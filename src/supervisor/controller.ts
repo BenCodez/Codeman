@@ -4,6 +4,7 @@ import type { TaskState, TaskUpdate } from '../supervision/schema.js';
 import { TaskConfigurationCancelledError } from '../supervision/controller.js';
 import type { SupervisorWorkerInspection } from '../types/supervisor.js';
 import { SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from './manager-task.js';
+import { formatTaskPrompt } from '../supervision/prompt.js';
 import {
   SupervisorConfigSchema,
   SupervisorRequestSchema,
@@ -37,6 +38,8 @@ export function classifyRecoveryRetry(state: RecoveryState): GuardedDispatchOutc
 export interface SupervisorWorkerHandle {
   /** Exact selected Session/controller incarnation throughout one operation. */
   isCurrent?(): boolean;
+  /** Read-only current worker/issuer envelope check before an assignment reservation. */
+  admitPrompt?(prompt: string, authority: RecoveryActionAuthority): Promise<boolean>;
   task: {
     getStatus(): TaskState;
     update(patch: TaskUpdate, isCurrent?: () => boolean): Promise<TaskState>;
@@ -430,7 +433,7 @@ export class SupervisorController {
       workerId,
       requestId,
       'assign',
-      async (worker, configured) => {
+      async (worker, configured, authority) => {
         const task = worker.task.getStatus();
         if (task.inFlight) throw new SupervisorValidationError('Worker has an unresolved task delivery');
         const sameCompletedTask =
@@ -451,24 +454,30 @@ export class SupervisorController {
           throw new SupervisorValidationError(
             'Worker already completed the configured task; owner reconfiguration is required'
           );
+        if (worker.admitPrompt) {
+          const snapshot = JSON.stringify(task);
+          const sameTask = this.sameWorkerTask(task, configured);
+          const prompt = formatTaskPrompt({
+            objective: configured.task,
+            criteria: sameTask
+              ? task.criteria
+              : configured.criteria.map((criterion) => ({ ...criterion, verified: false })),
+            checkpoint: sameTask ? task.checkpoint : '',
+            nextAction: sameTask ? task.nextAction : '',
+          });
+          if ((await worker.admitPrompt(prompt, authority)) !== true)
+            throw new SupervisorValidationError('Worker prompt does not fit its current verified input envelope');
+          // The manager's final revalidation also awaits. Keep this exact prompt
+          // pinned until the operation is ready to perform its own Task update.
+          return () => JSON.stringify(worker.task.getStatus()) === snapshot;
+        }
+        return undefined;
       },
       async (worker, configured, isCurrent, runtimeStartedAt) => {
         const existing = worker.task.getStatus();
         // A matching unfinished task retains the owner's tighter limits and its
         // existing runtime origin; a manager grant can only narrow those limits.
-        const preservesTask =
-          existing.objective === configured.task &&
-          existing.outcome !== 'completed' &&
-          existing.criteria.length === configured.criteria.length &&
-          existing.criteria.every((criterion, index) => {
-            const expected = configured.criteria[index];
-            return (
-              criterion.id === expected.id &&
-              criterion.description === expected.description &&
-              criterion.kind === expected.kind &&
-              criterion.command === expected.command
-            );
-          });
+        const preservesTask = existing.outcome !== 'completed' && this.sameWorkerTask(existing, configured);
         await worker.task
           .update(
             {
@@ -506,6 +515,22 @@ export class SupervisorController {
         if (outcome === 'uncertain') throw new Error('Worker task delivery acceptance is uncertain');
         if (outcome === 'refused') throw new SupervisorOperationRefused('Worker was not ready for task kickoff');
       }
+    );
+  }
+
+  private sameWorkerTask(task: TaskState, configured: SupervisorState['workers'][number]): boolean {
+    return (
+      task.objective === configured.task &&
+      task.criteria.length === configured.criteria.length &&
+      task.criteria.every((criterion, index) => {
+        const expected = configured.criteria[index];
+        return (
+          criterion.id === expected.id &&
+          criterion.description === expected.description &&
+          criterion.kind === expected.kind &&
+          criterion.command === expected.command
+        );
+      })
     );
   }
 
@@ -595,7 +620,11 @@ export class SupervisorController {
     workerId: string,
     requestId: string,
     action: 'assign' | 'retry',
-    preflight: (worker: SupervisorWorkerHandle, configured: SupervisorState['workers'][number]) => Promise<void>,
+    preflight: (
+      worker: SupervisorWorkerHandle,
+      configured: SupervisorState['workers'][number],
+      authority: RecoveryActionAuthority
+    ) => Promise<void | (() => boolean)>,
     dispatch: (
       worker: SupervisorWorkerHandle,
       configured: SupervisorState['workers'][number],
@@ -621,6 +650,7 @@ export class SupervisorController {
       let worker = configured && this.deps.worker(workerId);
       if (!configured || !worker) throw new SupervisorValidationError('Worker is outside this supervisor');
       const selectedWorkerCurrent = worker.isCurrent?.bind(worker);
+      let preparedPromptIsCurrent = () => true;
       // The first operation spends runtime during preflight too. Persist its origin
       // only once dispatch is accepted; a certified unsent refusal starts no budget.
       const runtimeStartedAt = configured.startedAt ?? this.now();
@@ -633,6 +663,7 @@ export class SupervisorController {
         this.revision === revision &&
         this.state.phase === 'active' &&
         this.deps.hasManagerAuthority?.() === true &&
+        preparedPromptIsCurrent() &&
         (selectedWorkerCurrent ? selectedWorkerCurrent() === true : true) &&
         hasBudget() &&
         !!worker &&
@@ -667,7 +698,7 @@ export class SupervisorController {
       requireCurrent();
       if (!this.workerAllowsAction(worker, configured, action, true))
         throw new SupervisorValidationError('Worker task or recovery requires owner attention');
-      await preflight(worker, configured);
+      preparedPromptIsCurrent = (await preflight(worker, configured, isCurrent)) ?? (() => true);
       await requireManagerAuthority();
       requireCurrent();
       this.state.inFlight = { requestId, workerId, action, reservedAt: this.now() };
@@ -689,6 +720,7 @@ export class SupervisorController {
         if (!this.workerAllowsAction(worker, configured, action, true))
           throw new SupervisorOperationRefused('Worker task or recovery requires owner attention');
         requireCurrent();
+        preparedPromptIsCurrent = () => true;
         await dispatch(worker, configured, isCurrent, runtimeStartedAt);
       } catch (error) {
         if (error instanceof SupervisorOperationRefused) {

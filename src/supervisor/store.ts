@@ -72,6 +72,7 @@ export class SupervisorStore {
       if (Object.keys(next).length > 100) throw new Error('Supervisor journal is over capacity');
       await this.write(next);
       this.records = next;
+      this.cleanupWriteFailed = false;
     });
     const tracked = result
       .catch((error: unknown) => {
@@ -94,6 +95,7 @@ export class SupervisorStore {
       delete next[id];
       await this.write(next);
       this.records = next;
+      this.cleanupWriteFailed = false;
     });
     const tracked = result
       .catch((error: unknown) => {
@@ -122,6 +124,7 @@ export class SupervisorStore {
       if (removed) {
         await this.write(next);
         this.records = next;
+        this.cleanupWriteFailed = false;
       }
       return removed;
     });

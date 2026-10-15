@@ -2500,19 +2500,19 @@ export class WebServer extends EventEmitter {
   }
 
   private getSupervisorController(session: Session): SupervisorController | undefined {
-    if (
-      this.recoveryStopping ||
-      this.cleaningUp.has(session.id) ||
-      this.sessions.get(session.id) !== session ||
-      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout' ||
-      session.remote ||
-      session.docker ||
-      !session.getRecoveryContext().managed ||
-      !session.getRecoveryContext().noDaemon
-    )
+    if (this.recoveryStopping || this.cleaningUp.has(session.id) || this.sessions.get(session.id) !== session)
       return undefined;
+    // Revoked launch eligibility must not hide the owner's existing role or
+    // prevent its durable leases from being released through reset.
     const existing = this.supervisorControllers.get(session.id);
     if (existing) return existing;
+    const managerIsEligible = () =>
+      getCli(session.mode)?.capabilities.recovery === 'codex-rollout' &&
+      !session.remote &&
+      !session.docker &&
+      session.getRecoveryContext().managed &&
+      session.getRecoveryContext().noDaemon;
+    if (!managerIsEligible()) return undefined;
     const managerAdapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
     const managerScope = () => {
       const context = session.getRecoveryContext();
@@ -2700,6 +2700,11 @@ export class WebServer extends EventEmitter {
             ? {
                 task,
                 recovery,
+                admitPrompt: (prompt, authority) =>
+                  new CodexTaskAdapter(worker, () => this._persistSessionStateNow(worker)).admitPrompt(
+                    prompt,
+                    authority
+                  ),
                 isCurrent: () =>
                   !this.recoveryStopping &&
                   !this.cleaningUp.has(id) &&
@@ -2778,6 +2783,7 @@ export class WebServer extends EventEmitter {
         startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
           managerGrant = undefined;
           managerEvidence = undefined;
+          if (!managerIsEligible()) throw new SupervisorValidationError('Manager launch is not currently eligible');
           const task = this.getTaskController(session);
           if (!task) throw new Error('Supervisor task controller is unavailable');
           const scope = managerScope();
@@ -2787,6 +2793,7 @@ export class WebServer extends EventEmitter {
             !this.cleaningUp.has(session.id) &&
             this.sessions.get(session.id) === session &&
             this.taskControllers.get(session.id) === task &&
+            managerIsEligible() &&
             managerScope() === scope;
           try {
             await task.update(buildSupervisorManagerTask(objective), current);
@@ -2850,6 +2857,7 @@ export class WebServer extends EventEmitter {
     const controller = new TaskController(
       {
         observe: () => adapter.observe(),
+        admitPrompt: (prompt, authority, expected) => adapter.admitPrompt(prompt, authority, expected),
         acceptReservation: (key) => this.getActionArbiter(session.id).accept('task', key),
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('task', !this.controllerHasRecoveryFlight(session.id)),

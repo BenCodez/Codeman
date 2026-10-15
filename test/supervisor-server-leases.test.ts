@@ -18,6 +18,8 @@ import { initialTaskState } from '../src/supervision/schema.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import type { TaskController } from '../src/supervision/controller.js';
+import { registerSupervisorRoutes } from '../src/web/routes/supervisor-routes.js';
+import { createRouteTestHarness, type RouteTestHarness } from './routes/_route-test-utils.js';
 
 const OLD = '11111111-1111-4111-8111-111111111111';
 const NEXT = '22222222-2222-4222-8222-222222222222';
@@ -79,12 +81,39 @@ describe('server supervisor lease reconciliation', () => {
   let internals: Internals;
   let old: Session;
   let journal: SupervisorState;
+  let routes: RouteTestHarness[];
+
+  const route = async (username = 'alice') => {
+    vi.stubEnv('CODEMAN_MULTIUSER', '1');
+    const h = await createRouteTestHarness(
+      (app, ctx) =>
+        registerSupervisorRoutes(app, {
+          ...ctx,
+          sessions: internals.sessions,
+          getSupervisorController: (selected: Session) => internals.getSupervisorController(selected),
+        }),
+      { authUser: { username, role: 'user' } }
+    );
+    routes.push(h);
+    return h.app;
+  };
+
+  const revoke = async (kind: 'stopped' | 'breaker' | 'isolation') => {
+    if (kind === 'stopped') await old.stop(false);
+    else if (kind === 'breaker') Reflect.set(old, '_respawnBlocked', true);
+    else Reflect.set(old, '_codexConfig', { noDaemon: false });
+    expect(old.getRecoveryContext().managed && old.getRecoveryContext().noDaemon).toBe(false);
+  };
 
   beforeEach(async () => {
     vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+    // This suite isolates durable role/lease ownership; complete framing has
+    // dedicated real adapter and supervisor admission coverage.
+    vi.spyOn(CodexTaskAdapter.prototype, 'admitPrompt').mockResolvedValue(true);
     rebootRestoreRegistry.reset();
     server = new WebServer(0, false, true);
     internals = server as unknown as Internals;
+    routes = [];
     old = session(OLD);
     journal = {
       ...initialSupervisorState(OLD),
@@ -101,6 +130,7 @@ describe('server supervisor lease reconciliation', () => {
   });
 
   afterEach(async () => {
+    for (const h of routes) await h.app.close();
     rebootRestoreRegistry.reset();
     for (const id of [OLD, NEXT, WORKER]) {
       await internals.stopRecoveryController(id, true);
@@ -109,7 +139,113 @@ describe('server supervisor lease reconciliation', () => {
     }
     await server.stop().catch(() => {});
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
+
+  it.each(['stopped', 'breaker'] as const)(
+    'keeps owner status/pause/reset available for an existing %s manager and releases its durable lease',
+    async (kind) => {
+      internals.sessions.set(OLD, old);
+      const manager = internals.getSupervisorController(old)!;
+      const app = await route();
+      await revoke(kind);
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+      const status = await app.inject({ method: 'GET', url: `/api/sessions/${OLD}/supervisor` });
+      expect(status.statusCode).toBe(200);
+      expect(status.json().data.inFlight).toEqual(journal.inFlight);
+      const pause = await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/pause` });
+      expect(pause.statusCode).toBe(200);
+      expect(manager.getStatus()).toMatchObject({ enabled: true, phase: 'paused', inFlight: journal.inFlight });
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+      const reset = await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/reset` });
+      expect(reset.statusCode).toBe(200);
+      expect(reset.json().data).toMatchObject({ enabled: false, workers: [] });
+      expect(internals.supervisorStore.get(OLD).enabled).toBe(false);
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBeUndefined();
+      await expect(
+        internals.getSupervisorController(internals.sessions.get(NEXT)!)!.configure(config)
+      ).resolves.toMatchObject({ enabled: true });
+    }
+  );
+
+  it.each(['stopped', 'breaker'] as const)('does not create a new controller for a %s manager', async (kind) => {
+    internals.sessions.set(OLD, old);
+    await revoke(kind);
+    const app = await route();
+    expect((await app.inject({ method: 'GET', url: `/api/sessions/${OLD}/supervisor` })).statusCode).toBe(400);
+    expect(internals.supervisorStore.get(OLD)).toEqual(journal);
+    expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+  });
+
+  it.each(['stopped', 'breaker', 'isolation'] as const)(
+    'refuses a fresh task kickoff through the existing %s manager',
+    async (kind) => {
+      internals.sessions.set(OLD, old);
+      await internals.supervisorStore.save(OLD, { ...journal, inFlight: undefined });
+      const manager = internals.getSupervisorController(old)!;
+      const task = internals.getTaskController(old)!;
+      const update = vi.spyOn(task, 'update');
+      const resume = vi.spyOn(task, 'resume');
+      const act = vi.spyOn(CodexTaskAdapter.prototype, 'act');
+      const input = vi.spyOn(old, 'writeViaMux');
+      await revoke(kind);
+      const app = await route();
+      expect((await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/start` })).statusCode).toBe(400);
+      expect(update).not.toHaveBeenCalled();
+      expect(resume).not.toHaveBeenCalled();
+      expect(act).not.toHaveBeenCalled();
+      expect(input).not.toHaveBeenCalled();
+      expect(manager.getStatus().phase).toBe('paused');
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+    }
+  );
+
+  it.each(['stopped', 'breaker', 'isolation'] as const)(
+    'does not resume a manager task when %s eligibility is lost during its awaited update',
+    async (kind) => {
+      internals.sessions.set(OLD, old);
+      await internals.supervisorStore.save(OLD, { ...journal, inFlight: undefined });
+      const manager = internals.getSupervisorController(old)!;
+      const task = internals.getTaskController(old)!;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const update = vi.spyOn(task, 'update').mockImplementation(async () => {
+        entered.resolve();
+        await release.promise;
+        return task.getStatus();
+      });
+      const resume = vi.spyOn(task, 'resume');
+      const act = vi.spyOn(CodexTaskAdapter.prototype, 'act');
+      const input = vi.spyOn(old, 'writeViaMux');
+      const starting = manager.start();
+      await entered.promise;
+      await revoke(kind);
+      release.resolve();
+      await expect(starting).rejects.toThrow(/not ready/);
+      expect(update).toHaveBeenCalledOnce();
+      expect(resume).not.toHaveBeenCalled();
+      expect(act).not.toHaveBeenCalled();
+      expect(input).not.toHaveBeenCalled();
+      expect(manager.getStatus().phase).toBe('paused');
+    }
+  );
+
+  it.each(['', '/pause', '/reset', '/start'])(
+    'keeps foreign-owner access hidden for an existing revoked manager at %s',
+    async (suffix) => {
+      internals.sessions.set(OLD, old);
+      const manager = internals.getSupervisorController(old)!;
+      await revoke('breaker');
+      const before = manager.getStatus();
+      const app = await route('bob');
+      expect(
+        (await app.inject({ method: suffix ? 'POST' : 'GET', url: `/api/sessions/${OLD}/supervisor${suffix}` }))
+          .statusCode
+      ).toBe(404);
+      expect(manager.getStatus()).toEqual(before);
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+    }
+  );
 
   it('releases an unreachable pruned manager lease without erasing uncertain operations', async () => {
     expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);

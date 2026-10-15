@@ -483,6 +483,9 @@ export class RecoveryController {
       observation.reason === 'process-crashed' &&
       observation.stallEvidenceKey
     ) {
+      // An owner stop or incomplete stall proof must not become live silence,
+      // nor fall back to ordinary crash recovery under the selected stall policy.
+      if (observation.stallRestartable !== true) return { ...observation, safeToAct: false };
       // A watcher timestamp must not turn an unfinished turn into an immediate
       // crash retry when the owner selected repeated, quiet-time stall recovery.
       return { ...observation, activity: 'working', reason: 'turn-running', safeToAct: false };

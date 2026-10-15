@@ -1997,31 +1997,74 @@ describe('fresh agent progress authorizes only its own next action', () => {
     }
   });
 
-  it('still recovers a verified pre-marker crash when no agent has declared uncertainty', async () => {
-    const f = fixture();
-    try {
-      await f.controller.update({
-        objective: 'Owner task',
-        criteria: [{ id: 'review', description: 'Owner accepts', kind: 'manual' }],
-        config: { enabled: true },
-      });
-      expect(f.controller.getStatus().outcome).toBe('unknown');
-      f.clock(10002);
-      f.set({
-        activity: 'crashed',
-        liveProofAt: 10001,
-        reason: 'process-crashed',
-        at: 10001,
-        safeToAct: true,
-        evidenceKey: 'pre-marker-crash',
-      });
-      await f.controller.refresh();
-      expect(f.recover).toHaveBeenCalledOnce();
-      expect(f.act).not.toHaveBeenCalled();
-    } finally {
-      f.controller.stop();
+  it.each(['crashed', 'interrupted'] as const)(
+    'recovers a verified pre-marker %s within the task budget when no agent has declared uncertainty',
+    async (activity) => {
+      const f = fixture();
+      try {
+        await f.controller.update({
+          objective: 'Owner task',
+          criteria: [{ id: 'review', description: 'Owner accepts', kind: 'manual' }],
+          config: { enabled: true },
+        });
+        expect(f.controller.getStatus().outcome).toBe('unknown');
+        f.clock(10002);
+        f.set({
+          activity,
+          liveProofAt: 10001,
+          reason: activity === 'crashed' ? 'process-crashed' : 'turn-interrupted',
+          at: 10001,
+          safeToAct: true,
+          evidenceKey: `pre-marker-${activity}`,
+        });
+        await f.controller.refresh();
+        expect(f.recover).toHaveBeenCalledOnce();
+        expect(f.act).not.toHaveBeenCalled();
+        expect(f.controller.getStatus()).toMatchObject({
+          continuations: 1,
+          outcome: 'unknown',
+          reason: 'recovery-sent',
+        });
+        expect(f.controller.getStatus().inFlight?.action).toBe(activity === 'crashed' ? 'restart' : 'continue');
+      } finally {
+        f.controller.stop();
+      }
     }
-  });
+  );
+
+  it.each(['crashed', 'interrupted'] as const)(
+    'does not bypass an exhausted task budget for a pre-marker %s',
+    async (activity) => {
+      const f = fixture();
+      try {
+        await f.controller.update({
+          objective: 'Owner task',
+          criteria: [{ id: 'review', description: 'Owner accepts', kind: 'manual' }],
+          config: { enabled: true, maxContinuations: 0 },
+        });
+        f.clock(10002);
+        f.set({
+          activity,
+          liveProofAt: 10001,
+          reason: activity === 'crashed' ? 'process-crashed' : 'turn-interrupted',
+          at: 10001,
+          safeToAct: true,
+          evidenceKey: `pre-marker-${activity}`,
+        });
+        await f.controller.refresh();
+        expect(f.recover).not.toHaveBeenCalled();
+        expect(f.act).not.toHaveBeenCalled();
+        expect(f.controller.getStatus()).toMatchObject({
+          continuations: 0,
+          phase: 'blocked',
+          reason: 'budget-exhausted',
+        });
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
 
   it('retains explicit owner authority to edit progress incrementally', async () => {
     const f = fixture();

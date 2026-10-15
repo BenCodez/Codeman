@@ -28,6 +28,8 @@ import type { SupervisorStore } from '../src/supervisor/store.js';
 import { createDeferred } from './mocks/index.js';
 import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
 import type { CodexBrokerProof } from '../src/recovery/codex-input-broker.js';
+import type { CodexIdentityWitness } from '../src/recovery/codex-identity.js';
+import { taskPromptFits } from '../src/supervision/prompt.js';
 
 const MANAGER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
@@ -173,6 +175,7 @@ describe('manager authority at the real server boundary', () => {
   let recoveryAct: ReturnType<typeof vi.spyOn>;
   let rolloutPath: string;
   let workerRolloutPath: string;
+  let workerPaths: CodexIdentityWitness['paths'];
   let effects: ReturnType<typeof vi.fn>;
   let grantDirectory: string | undefined;
   let previousData: string | undefined;
@@ -182,6 +185,7 @@ describe('manager authority at the real server boundary', () => {
     previousData = process.env.CODEMAN_DATA_DIR;
     previousMode = process.env.CODEMAN_MULTIUSER;
     grantDirectory = undefined;
+    workerPaths = [];
     vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
     server = new WebServer(0, false, true);
     internals = server as unknown as Internals;
@@ -211,13 +215,22 @@ describe('manager authority at the real server boundary', () => {
     rolloutPath = dataPath('manager-authority-rollout.jsonl');
     workerRolloutPath = dataPath('worker-authority-rollout.jsonl');
     await writeFile(
+      rolloutPath,
+      JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'Initial owner prompt' } }) + '\n'
+    );
+    await writeFile(
       workerRolloutPath,
       JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }) + '\n'
     );
     vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async function () {
       const session = Reflect.get(this, 'session') as Session;
-      if (session.id === WORKER) {
-        const source = privateEvidenceSource(session, workerRolloutPath, WORKER_THREAD);
+      if (session.id === WORKER || session.id === MANAGER) {
+        const source = privateEvidenceSource(
+          session,
+          session.id === WORKER ? workerRolloutPath : rolloutPath,
+          session.id === WORKER ? WORKER_THREAD : MANAGER_THREAD
+        );
+        if (session.id === WORKER) source.identity.witness!.paths.push(...workerPaths);
         Reflect.set(Reflect.get(this, 'recovery'), 'verifiedTail', {
           ...source.identity,
           inputProof: inputProofs.get(session),
@@ -225,6 +238,7 @@ describe('manager authority at the real server boundary', () => {
           env: JSON.stringify(session.getEnvOverridesForPersist()),
         });
       }
+      const path = session.id === MANAGER ? rolloutPath : workerRolloutPath;
       return {
         observation:
           session.id === MANAGER
@@ -237,6 +251,7 @@ describe('manager authority at the real server boundary', () => {
                 safeToAct: false,
               },
         commands: new Map(),
+        marker: latestProgressMarker(readFileSync(path, 'utf8'), 0, Date.now()),
       };
     });
     vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async function () {
@@ -756,6 +771,47 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it('does not reserve the actual server assignment when current private metadata makes the worker prompt too large', async () => {
+    grantDirectory = await mkdtemp(join(homedir(), 'supervisor-envelope-'));
+    for (let index = 0; index < 40; index++) {
+      const path = join(grantDirectory, `${'directory-'.repeat(24)}${index}`);
+      await fs.mkdir(path);
+      const stat = lstatSync(path);
+      workerPaths.push({ path, kind: 'directory', dev: stat.dev, ino: stat.ino });
+    }
+    const largeWorker = {
+      ...config.workers[0],
+      task: 'o'.repeat(4000),
+      criteria: Array.from({ length: 28 }, (_, index) => ({
+        id: `c${index}`,
+        description: 'd'.repeat(1000),
+        kind: 'command' as const,
+        command: 'c'.repeat(1000),
+      })),
+    };
+    expect(
+      taskPromptFits({
+        objective: largeWorker.task,
+        criteria: largeWorker.criteria.map((criterion) => ({ ...criterion, verified: false })),
+        checkpoint: '',
+        nextAction: '',
+      })
+    ).toBe(true);
+    await manager.configure({ ...config, workers: [largeWorker] });
+    await manager.start();
+    taskAct.mockClear();
+    effects.mockClear();
+    const before = manager.getStatus();
+    const workerTask = internals.getTaskController(internals.sessions.get(WORKER)!)!;
+    const taskBefore = workerTask.getStatus();
+    await expect(manager.assign(WORKER, 'oversized-private-envelope')).rejects.toThrow(/envelope/);
+    expect(manager.getStatus()).toEqual(before);
+    expect(internals.supervisorStore.get(MANAGER)).toEqual(before);
+    expect(workerTask.getStatus()).toEqual(taskBefore);
+    expect(taskAct).not.toHaveBeenCalled();
+    expect(effects).not.toHaveBeenCalled();
+  });
+
   it.each(
     (['assign', 'retry'] as const).flatMap((action) =>
       [
@@ -991,6 +1047,15 @@ describe('manager authority at the real server boundary', () => {
     const safeConfig = { dangerouslyBypassApprovals: false, sandbox: 'read-only', approvalPolicy: 'on-request' };
     const workerSession = internals.sessions.get(WORKER)!;
     Reflect.set(workerSession, '_codexConfig', { ...workerSession.codexConfig, ...safeConfig });
+    if (kind === 'healthy-safe' && action === 'assign') {
+      // This table isolates the manager grant. Its worker delivery was already
+      // mocked; the synthetic distinct worker home has no unprivileged env grant.
+      // Keep manager admission real; actual worker admission/grants are covered separately.
+      const admit = CodexTaskAdapter.prototype.admitPrompt;
+      vi.spyOn(CodexTaskAdapter.prototype, 'admitPrompt').mockImplementation(function (...args) {
+        return Reflect.get(this, 'session').id === WORKER ? Promise.resolve(true) : admit.apply(this, args);
+      });
+    }
     if (kind === 'healthy-safe')
       Reflect.set(managerSession, '_codexConfig', { ...managerSession.codexConfig, ...safeConfig });
     if (['healthy-privileged', 'bypass-revoked'].includes(kind))
@@ -1150,6 +1215,7 @@ describe('manager authority at the real server boundary', () => {
       const reached = createDeferred();
       const release = createDeferred();
       let proofHeld = false;
+      let workerActionEntered = false;
       const confirm = CodexRecoveryAdapter.prototype.confirmLocalEvidence;
       vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementation(async function (
         this: CodexRecoveryAdapter,
@@ -1174,7 +1240,7 @@ describe('manager authority at the real server boundary', () => {
           if (args[0] === workerRolloutPath) {
             const read = file.read.bind(file);
             vi.spyOn(file, 'read').mockImplementation(async (...readArgs) => {
-              if (!proofHeld) {
+              if (!proofHeld && workerActionEntered) {
                 proofHeld = true;
                 reached.resolve();
                 await release.promise;
@@ -1186,6 +1252,11 @@ describe('manager authority at the real server boundary', () => {
         });
       }
       taskAct.mockRestore();
+      const realAct = CodexTaskAdapter.prototype.act;
+      vi.spyOn(CodexTaskAdapter.prototype, 'act').mockImplementation(async function (...args) {
+        if (Reflect.get(this, 'session').id === WORKER) workerActionEntered = true;
+        return realAct.apply(this, args);
+      });
       Reflect.set(worker, '_mux', {
         ...Reflect.get(worker, '_mux'),
         isAvailable: () => true,

@@ -1621,20 +1621,37 @@ describe('native uncertain Codex reboot ownership', () => {
   });
 });
 
-describe('non-Codex custom profile at the actual native launch boundary', () => {
+describe('non-Codex reboot restore at the actual native launch boundary', () => {
   it.each([
-    'healthy',
-    'changed-profile',
-    'cancelled',
-    'changed-session',
-    'changed-after-inert',
-    'changed-native-cleanup',
-    'worker-lost-ack',
-    'create-lost-ack',
-    'cancelled-after-launch',
-    'cancelled-lost-ack',
-    'cancel-after-commit-lost-ack',
-  ] as const)('checks the route profile after internal telemetry awaits: %s', async (kind) => {
+    ...(
+      [
+        'healthy',
+        'changed-profile',
+        'cancelled',
+        'changed-session',
+        'changed-after-inert',
+        'changed-native-cleanup',
+        'worker-lost-ack',
+        'create-lost-ack',
+        'cancelled-after-launch',
+        'cancelled-lost-ack',
+        'cancel-after-commit-lost-ack',
+      ] as const
+    ).map((kind) => ({ kind, customModel: true })),
+    ...(
+      [
+        'healthy',
+        'cancelled',
+        'changed-session',
+        'worker-refused',
+        'worker-lost-ack',
+        'create-lost-ack',
+        'cancelled-after-launch',
+        'cancelled-lost-ack',
+        'cancel-after-commit-lost-ack',
+      ] as const
+    ).map((kind) => ({ kind, customModel: false })),
+  ])('checks the route after internal telemetry awaits (custom=$customModel): $kind', async ({ kind, customModel }) => {
     const hooks = await import('../src/hooks-config.js');
     const { writeCustomModelHosts } = await import('../src/custom-model-hosts.js');
     const { customModelHostsPath } = await import('../src/custom-model-hosts.js');
@@ -1673,14 +1690,15 @@ describe('non-Codex custom profile at the actual native launch boundary', () => 
       currentTaskId: null,
       createdAt: Date.now() - 60000,
     };
-    Object.assign(state, {
-      __customModel: {
-        endpointId: endpoint.id,
-        modelId: 'fixture-model',
-        envKeys: [],
-        configDir: customModelConfigDir(ID),
-      },
-    });
+    if (customModel)
+      Object.assign(state, {
+        __customModel: {
+          endpointId: endpoint.id,
+          modelId: 'fixture-model',
+          envKeys: [],
+          configDir: customModelConfigDir(ID),
+        },
+      });
     rebootRestoreRegistry.set([
       { sessionId: ID, mode: 'claude', name: 'fixture', workingDir: root, resumeConversationId: THREAD, state },
     ]);
@@ -1711,7 +1729,12 @@ describe('non-Codex custom profile at the actual native launch boundary', () => 
       return false;
     });
     vi.spyOn(hooks, 'resolveStatusLineCliCommand').mockResolvedValue(undefined);
-    if (kind === 'worker-lost-ack' || kind === 'changed-native-cleanup' || kind === 'create-lost-ack') {
+    if (
+      kind === 'worker-lost-ack' ||
+      kind === 'worker-refused' ||
+      kind === 'changed-native-cleanup' ||
+      kind === 'create-lost-ack'
+    ) {
       effects.sync.mockImplementation((command: string) => {
         if (kind === 'create-lost-ack' && command.includes(' new-session ')) {
           expect(command).toContain('/bin/sleep 86400');
@@ -1719,7 +1742,13 @@ describe('non-Codex custom profile at the actual native launch boundary', () => 
         }
         if (kind === 'changed-native-cleanup' && command.includes('kill-pane '))
           return 'CODEMAN_REBOOT_CLEANUP_REFUSED\n';
-        if (kind === 'worker-lost-ack' && command.includes('respawn-pane ')) throw Error('Worker may have started');
+        if (kind === 'worker-refused' && command.includes('respawn-pane ')) return 'CODEMAN_REBOOT_LAUNCH_REFUSED\n';
+        if (
+          kind === 'worker-lost-ack' &&
+          (command.includes('respawn-pane ') ||
+            (!customModel && command.includes(' new-session ') && !command.includes('/bin/sleep 86400')))
+        )
+          throw Error('Worker may have started; response lost');
         return nativeOutput(command);
       });
     }
@@ -1793,6 +1822,7 @@ describe('non-Codex custom profile at the actual native launch boundary', () => 
         [
           'healthy',
           'worker-lost-ack',
+          'worker-refused',
           'cancelled-after-launch',
           'cancelled-lost-ack',
           'cancel-after-commit-lost-ack',
@@ -1817,6 +1847,17 @@ describe('non-Codex custom profile at the actual native launch boundary', () => 
         ).not.toHaveProperty('restoreUncertain');
         expect(launched[0][0]).toContain(`#{==:#{pane_pid},99999}`);
         expect(launched[0][0]).toContain('--resume');
+        expect(launched[0][0]).toContain(THREAD);
+        expect(effects.attach.mock.calls[0][0]).toBe('tmux');
+        expect(effects.attach.mock.calls[0][1]).toContain('attach-session');
+      } else if (kind === 'worker-refused') {
+        expect(result.skipped).toEqual([{ sessionId: ID, reason: 'rebuild-failed' }]);
+        expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
+        expect(manager.getSession(ID)).toBeUndefined();
+        expect(board.has(ID)).toBe(false);
+        expect(store.getSession(ID)).toEqual(historical);
+        expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([ID]);
+        expect(effects.sync.mock.calls.filter(([command]) => command.includes('kill-pane '))).toHaveLength(1);
       } else if (kind === 'cancelled-after-launch') {
         expect(result.skipped).toEqual([{ sessionId: ID, reason: 'restore-cancelled' }]);
         expect(legacyKill).not.toHaveBeenCalled();
@@ -1835,7 +1876,7 @@ describe('non-Codex custom profile at the actual native launch boundary', () => 
         expect(result.skipped).toEqual([{ sessionId: ID, reason: 'restore-uncertain' }]);
         expect(legacyKill).not.toHaveBeenCalled();
         expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
-        expect(statSync(customModelConfigDir(ID)).isDirectory()).toBe(true);
+        if (customModel) expect(statSync(customModelConfigDir(ID)).isDirectory()).toBe(true);
         expect(store.getSession(ID)).toEqual(committed ?? historical);
         store.flush();
         expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID]).toEqual(

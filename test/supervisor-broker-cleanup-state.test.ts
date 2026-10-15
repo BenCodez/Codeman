@@ -150,7 +150,7 @@ it('withholds while a later mutation remains queued or active after its predeces
 });
 
 it.each(['save', 'drop', 'prune'] as const)(
-  'keeps cleanup unknown after a landed %s rename loses its acknowledgment, even after later success',
+  'withholds cleanup after a lost %s rename acknowledgment until a complete rewrite succeeds',
   async (kind) => {
     const f = await fixture();
     const native = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
@@ -169,7 +169,7 @@ it.each(['save', 'drop', 'prune'] as const)(
       expect(f.store.getBrokerCleanupState()).toBeUndefined();
       await f.store.save(ID, { ...state(), objective: 'Later healthy write' });
       expect(f.store.get(ID).objective).toBe('Later healthy write');
-      expect(f.store.getBrokerCleanupState()).toBeUndefined();
+      expect(f.store.getBrokerCleanupState()).toEqual(new SupervisorStore(f.path).getBrokerCleanupState());
       expect(new SupervisorStore(f.path).getBrokerCleanupState()?.[ID].objective).toBe('Later healthy write');
     } finally {
       await f.cleanup();
