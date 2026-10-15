@@ -9,6 +9,7 @@ import {
   type TaskProgress,
 } from './schema.js';
 import { commandHash, type CommandSuccessEvidence } from './evidence.js';
+import { formatTaskPrompt, taskPromptFits } from './prompt.js';
 import { earliestActionDeadline } from '../recovery/action-deadline.js';
 import type { TaskSaveAuthority } from './store.js';
 import {
@@ -390,6 +391,8 @@ export class TaskController {
         throw new TaskValidationError('Task objective and criteria are required');
       if (candidate.inFlight && candidate.config.enabled)
         throw new TaskValidationError('Unresolved delivery requires reset');
+      // Even an unreadable-for-delivery legacy task can be explicitly disabled.
+      if (changed || patch.config?.enabled !== false) this.requirePromptSize(candidate);
       if (!candidate.agentProgressVeto && acceptanceCriteriaComplete(candidate)) candidate.outcome = 'completed';
       // Configuration saves do not reacquire authority cancelled by owner input or restart.
       const enabledChanged = candidate.config.enabled !== this.state.config.enabled;
@@ -487,19 +490,21 @@ export class TaskController {
           marker.key,
         ].slice(-32);
       }
-      this.state = candidate;
-      this.state.lastProgressAt = this.now();
-      this.state.outcome = acceptanceCriteriaComplete(this.state) ? 'completed' : patch.outcome;
-      this.state.checkpoint = patch.checkpoint ?? this.state.checkpoint;
-      this.state.nextAction = patch.nextAction ?? this.state.nextAction;
-      this.state.phase =
-        this.state.outcome === 'completed'
+      candidate.lastProgressAt = this.now();
+      candidate.outcome = acceptanceCriteriaComplete(candidate) ? 'completed' : patch.outcome;
+      candidate.checkpoint = patch.checkpoint ?? candidate.checkpoint;
+      candidate.nextAction = patch.nextAction ?? candidate.nextAction;
+      // Owner certification ends the task without sending another prompt.
+      if (candidate.outcome !== 'completed') this.requirePromptSize(candidate);
+      candidate.phase =
+        candidate.outcome === 'completed'
           ? 'completed'
-          : patch.outcome === 'unfinished' && this.state.config.enabled
+          : patch.outcome === 'unfinished' && candidate.config.enabled
             ? 'watching'
             : patch.outcome === 'blocked'
               ? 'blocked'
               : 'paused';
+      this.state = candidate;
       await this.save('progress-recorded');
       if (this.state.inFlight?.accepted) {
         const settled = await this.settleAcceptedFlight();
@@ -537,6 +542,7 @@ export class TaskController {
       if (this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
       if (!this.state.objective.trim() || !this.state.criteria.length || this.state.outcome === 'completed')
         throw new TaskValidationError('No unfinished task to supervise');
+      this.requirePromptSize(this.state);
       const beforeObserveCancelled = this.preserveCancelledDelivery(revision, 'not-sent', false, externallyCurrent);
       if (beforeObserveCancelled) return beforeObserveCancelled;
       delete this.state.agentProgressVeto;
@@ -629,10 +635,11 @@ export class TaskController {
       return result;
     });
   }
+  private requirePromptSize(state: TaskState): void {
+    if (!taskPromptFits(state)) throw new TaskValidationError('Task prompt must be valid UTF8 and fit 65536 bytes');
+  }
   private prompt(): string {
-    return `Work on the authorized objective: ${this.state.objective}\nLast verified checkpoint: ${this.state.checkpoint}\nNext action: ${this.state.nextAction}\nAcceptance criteria: ${JSON.stringify(this.state.criteria.map((c) => ({ id: c.id, description: c.description, kind: c.kind, command: c.command, verified: c.verified })))}\nInspect recent actions before proceeding. Do not repeat completed external actions or destructive operations. Stop for approval, authentication, usage limits, completion or unknown evidence. Report progress as one structured agent message: CODEMAN_TASK_PROGRESS followed by a JSON object with outcome (unfinished, blocked, unknown, completed), checkpoint, nextAction, and optional verifiedCriteria array. Command criteria require exact command exit0 evidence; manual criteria require owner verification. Do not claim successful checks without verified evidence.`
-      .replace(/[\r\n]+/g, ' ')
-      .trim();
+    return formatTaskPrompt(this.state);
   }
   private retainFinalEvidenceRefusal(): void {
     this.state.agentProgressVeto = true;
@@ -723,12 +730,13 @@ export class TaskController {
             }
             if (p.outcome === 'completed' && !acceptanceCriteriaComplete(this.state))
               return this.recordAgentAttention(marker, 'task-evidence-unknown');
-            this.state.outcome = acceptanceCriteriaComplete(this.state) ? 'completed' : p.outcome;
-            this.state.lastProgressAt = marker.at;
-            this.state.checkpoint =
-              p.outcome === 'unfinished' ? p.checkpoint! : (p.checkpoint ?? this.state.checkpoint);
-            this.state.nextAction =
-              p.outcome === 'unfinished' ? p.nextAction! : (p.nextAction ?? this.state.nextAction);
+            const candidate = this.getStatus();
+            candidate.outcome = acceptanceCriteriaComplete(candidate) ? 'completed' : p.outcome;
+            candidate.lastProgressAt = marker.at;
+            candidate.checkpoint = p.outcome === 'unfinished' ? p.checkpoint! : (p.checkpoint ?? candidate.checkpoint);
+            candidate.nextAction = p.outcome === 'unfinished' ? p.nextAction! : (p.nextAction ?? candidate.nextAction);
+            if (!taskPromptFits(candidate)) return this.recordAgentAttention(marker, 'task-evidence-unknown');
+            this.state = candidate;
             this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
             await this.save('progress-recorded');
             if (this.stopped || revision !== this.revision) return this.getStatus();
@@ -822,6 +830,11 @@ export class TaskController {
       if (o.activity !== 'completed' || !o.turnId || !o.conversationId || !o.processReady) return this.getStatus();
       const key = `${o.conversationId}:task:${o.turnId}`;
       if (o.at < this.evidenceBoundary() || this.state.handledEvidence.includes(key)) return this.getStatus();
+      if (!taskPromptFits(this.state)) {
+        this.retainFinalEvidenceRefusal();
+        this.state.phase = 'paused';
+        return this.save('task-evidence-unknown');
+      }
       const prompt = this.prompt();
       this.state.inFlight = {
         key,

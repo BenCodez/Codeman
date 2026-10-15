@@ -3984,9 +3984,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         }
         continue;
       }
-      const pid = active.get(session.muxName);
-      if (pid === undefined && Object.hasOwn(session, 'restoreUncertain') && session.restoreUncertain !== false)
+      if (!completeListing && Object.hasOwn(session, 'restoreUncertain') && session.restoreUncertain !== false)
         continue;
+      const pid = active.get(session.muxName);
       if (pid !== undefined) {
         alive.push(sessionId);
         if (pid !== session.pid) session.pid = pid;
