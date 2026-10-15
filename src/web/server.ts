@@ -1346,7 +1346,10 @@ export class WebServer extends EventEmitter {
 
   private async persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void> {
     const current = () =>
-      isCurrent() && this.sessions.get(session.id) === session && this.tentativeSessionRegistrations.has(session);
+      !this.recoveryStopping &&
+      isCurrent() &&
+      this.sessions.get(session.id) === session &&
+      this.tentativeSessionRegistrations.has(session);
     if (!current()) throw new Error('Reboot restoration was cancelled before durable commit');
     await this.mux.flushSessionsDurably(current);
     const nativeRestorePending = session.codexRestoreWorkerMayExist;
@@ -4592,7 +4595,7 @@ export class WebServer extends EventEmitter {
     // Don't delete sessions from the map or state.json — recovery needs them
 
     // Flush state store to prevent data loss from debounced saves
-    this.store.flushAll();
+    await this.store.flushAllAsync();
 
     // Clean up watcher listeners to prevent memory leaks
     this.cleanupSubagentWatcherListeners();
