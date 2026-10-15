@@ -1494,7 +1494,17 @@ export function registerSessionRoutes(
       // below re-looks-up the record by id, so the returned SessionState is unused here.
       findPersistedSessionOrFail(ctx.store, id, req);
       ctx.store.demoteOrRemoveSession(id);
-      if (killMux) ownedRemoteBrokerCache.retire(id);
+      if (killMux) {
+        const retiredState = ctx.store.getSessions()[id];
+        const retiredStateText = JSON.stringify(retiredState);
+        await ownedRemoteBrokerCache.retireAndDelete(
+          id,
+          () =>
+            !ctx.sessions.has(id) &&
+            ctx.store.getSessions()[id] === retiredState &&
+            JSON.stringify(retiredState) === retiredStateText
+        );
+      }
       // Mirrors the broadcast at the tail of the live-session cleanup path
       // (_doCleanupSession in server.ts) — without it, other open tabs keep
       // showing the retired row until their next unrelated fetch.

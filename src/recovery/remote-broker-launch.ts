@@ -1,7 +1,8 @@
 /** Controlled owner launches and acknowledgements for already provisioned SSH brokers. */
-import { spawn } from 'node:child_process';
 import { buildSshConnectionArgs, remoteLoginShellCommand, remoteSshTarget, shellescape } from '../remote-hosts.js';
-import { runWithRemoteSshLimit } from '../remote-ssh-limiter.js';
+import { performance } from 'node:perf_hooks';
+import { runWithRemoteSshLimit, RemoteSshAdmissionError } from '../remote-ssh-limiter.js';
+import { runRemoteBrokerStdin } from './remote-broker-transport.js';
 import type { SessionRemote } from '../types.js';
 import type { BrokerReceipt } from './codex-input-broker.js';
 import type { PrivateFileWitness } from './private-file-witness.js';
@@ -79,40 +80,6 @@ export function buildRemoteBrokerLaunchCommand(remote: SessionRemote): string {
   ].join(' ');
 }
 
-const transport: RemoteBrokerTransport = {
-  run(command, input) {
-    if (process.env.VITEST) throw new Error('Remote launch requires an injected fixture under VITEST');
-    return new Promise((resolve, reject) => {
-      const child = spawn(command, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
-      let stdout = '',
-        stderrBytes = 0,
-        settled = false;
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) {
-          child.kill();
-          reject(error);
-        } else resolve({ stdout });
-      };
-      const timer = setTimeout(() => finish(new Error('Remote launch expired')), 15_000);
-      child.stdout.on('data', (bytes: Buffer) => {
-        stdout += bytes.toString('utf8');
-        if (Buffer.byteLength(stdout) > MAX_OUTPUT) finish(new Error('Remote launch oversized'));
-      });
-      child.stderr.on('data', (bytes: Buffer) => {
-        stderrBytes += bytes.length;
-        if (stderrBytes > 16_384) finish(new Error('Remote launch diagnostics oversized'));
-      });
-      child.on('error', finish);
-      child.stdin.on('error', finish);
-      child.on('close', (code) => finish(code === 0 ? undefined : new Error('Remote launch unavailable')));
-      child.stdin.end(input);
-    });
-  },
-};
-
 /** An uncertain launch is never retried or replaced with a fresh remote/local conversation. */
 export async function observeOwnedRemoteBroker(
   remote: SessionRemote,
@@ -120,6 +87,7 @@ export async function observeOwnedRemoteBroker(
   authority: RemoteBrokerAuthority,
   options: { transport?: RemoteBrokerTransport } = {}
 ): Promise<RemoteBrokerObservation> {
+  const deadline = performance.now() + 15_000;
   let input: string, scope: string, snapshot: SessionRemote;
   try {
     input = JSON.stringify(request);
@@ -141,42 +109,52 @@ export async function observeOwnedRemoteBroker(
         void Promise.resolve(verdict).catch(() => {});
         return false;
       }
-      return verdict === true && JSON.stringify(remote) === scope;
+      return performance.now() < deadline && verdict === true && JSON.stringify(remote) === scope;
     } catch {
       return false;
     }
   };
-  return runWithRemoteSshLimit(async () => {
-    let dispatched = false;
-    try {
-      if (!current() || (await authority.prepare()) !== true || !current()) return { status: 'not-sent' };
-      const command = buildRemoteBrokerLaunchCommand(snapshot);
-      if (!current()) return { status: 'not-sent' };
-      dispatched = true;
-      const { stdout } = await (options.transport ?? transport).run(command, input);
-      if (!current() || Buffer.byteLength(stdout) > MAX_OUTPUT) return { status: 'unknown' };
-      const lines = stdout.split('\n').filter((line) => line.startsWith(MARKER));
-      if (lines.length !== 1) return { status: 'unknown' };
-      const encoded = lines[0].slice(MARKER.length),
-        bytes = Buffer.from(encoded, 'base64');
-      if (bytes.toString('base64') !== encoded || !Buffer.from(bytes.toString('utf8')).equals(bytes))
-        return { status: 'unknown' };
-      const value = JSON.parse(bytes.toString('utf8')) as RemoteBrokerObservation;
-      if ((value.status === 'not-sent' || value.status === 'unknown') && Object.keys(value).length === 1) return value;
-      if (
-        value.status !== 'observed' ||
-        Object.keys(value).sort().join(',') !== 'panePid,serialized,status,witness' ||
-        typeof value.serialized !== 'string' ||
-        Buffer.byteLength(value.serialized) > 98_304 ||
-        !Number.isSafeInteger(value.panePid) ||
-        value.panePid <= 0 ||
-        !value.witness ||
-        typeof value.witness !== 'object'
-      )
-        return { status: 'unknown' };
-      return value;
-    } catch {
-      return { status: dispatched ? 'unknown' : 'not-sent' };
-    }
-  });
+  return runWithRemoteSshLimit<RemoteBrokerObservation>(
+    async (retain) => {
+      let dispatched = false;
+      try {
+        if (!current() || (await authority.prepare()) !== true || !current()) return { status: 'not-sent' };
+        const command = buildRemoteBrokerLaunchCommand(snapshot);
+        if (!current()) return { status: 'not-sent' };
+        dispatched = true;
+        const { stdout } = await (options.transport
+          ? options.transport.run(command, input)
+          : runRemoteBrokerStdin(command, input, { inputBytes: 32_768, outputBytes: MAX_OUTPUT, deadline }, retain));
+        if (!current() || Buffer.byteLength(stdout) > MAX_OUTPUT) return { status: 'unknown' };
+        const lines = stdout.split('\n').filter((line) => line.startsWith(MARKER));
+        if (lines.length !== 1) return { status: 'unknown' };
+        const encoded = lines[0].slice(MARKER.length),
+          bytes = Buffer.from(encoded, 'base64');
+        if (bytes.toString('base64') !== encoded || !Buffer.from(bytes.toString('utf8')).equals(bytes))
+          return { status: 'unknown' };
+        const value = JSON.parse(bytes.toString('utf8')) as RemoteBrokerObservation;
+        if ((value.status === 'not-sent' || value.status === 'unknown') && Object.keys(value).length === 1)
+          return value;
+        if (
+          value.status !== 'observed' ||
+          Object.keys(value).sort().join(',') !== 'panePid,serialized,status,witness' ||
+          typeof value.serialized !== 'string' ||
+          Buffer.byteLength(value.serialized) > 98_304 ||
+          !Number.isSafeInteger(value.panePid) ||
+          value.panePid <= 0 ||
+          !value.witness ||
+          typeof value.witness !== 'object'
+        )
+          return { status: 'unknown' };
+        return value;
+      } catch {
+        return { status: dispatched ? 'unknown' : 'not-sent' };
+      }
+    },
+    { deadline, isCurrent: current }
+  ).catch(
+    (error: unknown): RemoteBrokerObservation => ({
+      status: error instanceof RemoteSshAdmissionError ? 'not-sent' : 'unknown',
+    })
+  );
 }

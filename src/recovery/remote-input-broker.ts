@@ -4,7 +4,9 @@ import { randomUUID } from 'node:crypto';
 import { posix } from 'node:path';
 import type { SessionRemote } from '../types.js';
 import { buildSshConnectionArgs, remoteLoginShellCommand, remoteSshTarget, shellescape } from '../remote-hosts.js';
-import { runWithRemoteSshLimit } from '../remote-ssh-limiter.js';
+import { performance as brokerPerformance } from 'node:perf_hooks';
+import { runWithRemoteSshLimit, RemoteSshAdmissionError } from '../remote-ssh-limiter.js';
+import { runRemoteBrokerStdin } from './remote-broker-transport.js';
 
 export interface RemoteBrokerMaterial {
   source: string;
@@ -449,42 +451,6 @@ export function buildRemoteBrokerProvisionCommand(remote: SessionRemote): string
   ].join(' ');
 }
 
-const transport: RemoteBrokerTransport = {
-  run(command, input) {
-    if (process.env.VITEST) throw new Error('Remote broker IO requires an injected fixture under VITEST');
-    return new Promise((resolve, reject) => {
-      const child = spawn(command, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
-      let stdout = '',
-        stderrBytes = 0,
-        settled = false;
-      const done = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (error) {
-          child.kill();
-          reject(error);
-        } else resolve({ stdout });
-      };
-      const timer = setTimeout(() => done(new Error('Remote broker transport expired')), 15_000);
-      child.stdout.on('data', (data: Buffer) => {
-        if (settled) return;
-        stdout += data.toString('utf8');
-        if (Buffer.byteLength(stdout) > MAX_OUTPUT) done(new Error('Remote broker response oversized'));
-      });
-      child.stderr.on('data', (data: Buffer) => {
-        if (settled) return;
-        stderrBytes += data.length;
-        if (stderrBytes > MAX_OUTPUT) done(new Error('Remote broker diagnostics oversized'));
-      });
-      child.on('error', done);
-      child.stdin.on('error', done);
-      child.on('close', (code) => done(code === 0 ? undefined : new Error('Remote broker transport failed')));
-      child.stdin.end(input);
-    });
-  },
-};
-
 function current(authority: RemoteBrokerAuthority): boolean {
   try {
     const result: unknown = authority.isCurrent();
@@ -517,7 +483,7 @@ export async function provisionRemoteInputBroker(
   let planned: RemoteBrokerMaterial;
   const expectedRoot = options.root;
   const planOnly = options.planOnly === true;
-  const selectedTransport = options.transport ?? transport;
+  const deadline = brokerPerformance.now() + 15_000;
   const positiveInteger = (value: unknown): value is number =>
     typeof value === 'number' && Number.isSafeInteger(value) && value > 0;
   const exact = (value: unknown, keys: string[]): value is Record<string, unknown> =>
@@ -574,76 +540,93 @@ export async function provisionRemoteInputBroker(
   } catch {
     return { status: 'not-sent' };
   }
-  const scopeCurrent = () => remote.owned !== false && JSON.stringify(remote) === remoteScope && current(authority);
-  return runWithRemoteSshLimit(async () => {
-    let dispatched = false;
-    try {
-      if (!scopeCurrent() || (await authority.prepare()) !== true || !scopeCurrent()) return { status: 'not-sent' };
-      const command = buildRemoteBrokerProvisionCommand(remoteSnapshot);
-      if (!scopeCurrent()) return { status: 'not-sent' };
-      dispatched = true;
-      const { stdout } = await selectedTransport.run(command, input);
-      if (Buffer.byteLength(stdout) > MAX_OUTPUT) return { status: 'unknown' };
-      const lines = stdout.split('\n').filter((line) => line.startsWith(MARKER));
-      if (lines.length !== 1) return { status: 'unknown' };
-      const encoded = lines[0].slice(MARKER.length),
-        bytes = Buffer.from(encoded, 'base64');
-      if (bytes.toString('base64') !== encoded || !Buffer.from(bytes.toString('utf8')).equals(bytes) || !scopeCurrent())
-        return { status: 'unknown' };
-      const value = JSON.parse(bytes.toString('utf8'));
-      if (planOnly && value.status === 'planned') {
+  const scopeCurrent = () =>
+    brokerPerformance.now() < deadline &&
+    remote.owned !== false &&
+    JSON.stringify(remote) === remoteScope &&
+    current(authority);
+  return runWithRemoteSshLimit<RemoteBrokerProvisionResult>(
+    async (retain) => {
+      let dispatched = false;
+      try {
+        if (!scopeCurrent() || (await authority.prepare()) !== true || !scopeCurrent()) return { status: 'not-sent' };
+        const command = buildRemoteBrokerProvisionCommand(remoteSnapshot);
+        if (!scopeCurrent()) return { status: 'not-sent' };
+        dispatched = true;
+        const { stdout } = await (options.transport
+          ? options.transport.run(command, input)
+          : runRemoteBrokerStdin(command, input, { inputBytes: MAX_INPUT, outputBytes: MAX_OUTPUT, deadline }, retain));
+        if (Buffer.byteLength(stdout) > MAX_OUTPUT) return { status: 'unknown' };
+        const lines = stdout.split('\n').filter((line) => line.startsWith(MARKER));
+        if (lines.length !== 1) return { status: 'unknown' };
+        const encoded = lines[0].slice(MARKER.length),
+          bytes = Buffer.from(encoded, 'base64');
         if (
-          !exact(value, ['status', 'directory', 'incarnation']) ||
+          bytes.toString('base64') !== encoded ||
+          !Buffer.from(bytes.toString('utf8')).equals(bytes) ||
+          !scopeCurrent()
+        )
+          return { status: 'unknown' };
+        const value = JSON.parse(bytes.toString('utf8'));
+        if (planOnly && value.status === 'planned') {
+          if (
+            !exact(value, ['status', 'directory', 'incarnation']) ||
+            value.incarnation !== planned.incarnation ||
+            !canonicalPrivateDirectory(value.directory) ||
+            !value.directory.endsWith(`/${planned.sessionId}/${planned.incarnation}`) ||
+            (expectedRoot !== undefined &&
+              value.directory !== posix.join(expectedRoot, planned.sessionId, planned.incarnation))
+          )
+            return { status: 'not-sent' };
+          return { status: 'planned', directory: value.directory, incarnation: value.incarnation };
+        }
+        if (
+          value.status === 'existing' ||
+          value.status === 'unsupported' ||
+          value.status === 'not-sent' ||
+          value.status === 'unknown'
+        )
+          return exact(value, ['status']) && scopeCurrent() ? { status: value.status } : { status: 'unknown' };
+        if (planOnly) return { status: 'not-sent' };
+        if (
+          !exact(value, ['status', 'directory', 'incarnation', 'pane']) ||
+          value.status !== 'provisioned' ||
           value.incarnation !== planned.incarnation ||
           !canonicalPrivateDirectory(value.directory) ||
-          !value.directory.endsWith(`/${planned.sessionId}/${planned.incarnation}`) ||
           (expectedRoot !== undefined &&
-            value.directory !== posix.join(expectedRoot, planned.sessionId, planned.incarnation))
+            value.directory !== posix.join(expectedRoot, planned.sessionId, planned.incarnation)) ||
+          !value.directory.endsWith(`/${planned.sessionId}/${planned.incarnation}`) ||
+          !exact(value.pane, ['sessionId', 'paneId', 'panePid', 'serverPid']) ||
+          typeof value.pane.sessionId !== 'string' ||
+          !/^\$(?:0|[1-9]\d*)$/.test(value.pane.sessionId) ||
+          !Number.isSafeInteger(Number(value.pane.sessionId.slice(1))) ||
+          typeof value.pane.paneId !== 'string' ||
+          !/^%(?:0|[1-9]\d*)$/.test(value.pane.paneId) ||
+          !Number.isSafeInteger(Number(value.pane.paneId.slice(1))) ||
+          !positiveInteger(value.pane.panePid) ||
+          !positiveInteger(value.pane.serverPid)
         )
-          return { status: 'not-sent' };
-        return { status: 'planned', directory: value.directory, incarnation: value.incarnation };
+          return { status: 'unknown' };
+        if (!scopeCurrent()) return { status: 'unknown' };
+        return {
+          status: 'provisioned',
+          directory: value.directory,
+          incarnation: value.incarnation,
+          pane: {
+            sessionId: value.pane.sessionId,
+            paneId: value.pane.paneId,
+            panePid: value.pane.panePid,
+            serverPid: value.pane.serverPid,
+          },
+        };
+      } catch {
+        return { status: dispatched ? 'unknown' : 'not-sent' };
       }
-      if (
-        value.status === 'existing' ||
-        value.status === 'unsupported' ||
-        value.status === 'not-sent' ||
-        value.status === 'unknown'
-      )
-        return exact(value, ['status']) && scopeCurrent() ? { status: value.status } : { status: 'unknown' };
-      if (planOnly) return { status: 'not-sent' };
-      if (
-        !exact(value, ['status', 'directory', 'incarnation', 'pane']) ||
-        value.status !== 'provisioned' ||
-        value.incarnation !== planned.incarnation ||
-        !canonicalPrivateDirectory(value.directory) ||
-        (expectedRoot !== undefined &&
-          value.directory !== posix.join(expectedRoot, planned.sessionId, planned.incarnation)) ||
-        !value.directory.endsWith(`/${planned.sessionId}/${planned.incarnation}`) ||
-        !exact(value.pane, ['sessionId', 'paneId', 'panePid', 'serverPid']) ||
-        typeof value.pane.sessionId !== 'string' ||
-        !/^\$(?:0|[1-9]\d*)$/.test(value.pane.sessionId) ||
-        !Number.isSafeInteger(Number(value.pane.sessionId.slice(1))) ||
-        typeof value.pane.paneId !== 'string' ||
-        !/^%(?:0|[1-9]\d*)$/.test(value.pane.paneId) ||
-        !Number.isSafeInteger(Number(value.pane.paneId.slice(1))) ||
-        !positiveInteger(value.pane.panePid) ||
-        !positiveInteger(value.pane.serverPid)
-      )
-        return { status: 'unknown' };
-      if (!scopeCurrent()) return { status: 'unknown' };
-      return {
-        status: 'provisioned',
-        directory: value.directory,
-        incarnation: value.incarnation,
-        pane: {
-          sessionId: value.pane.sessionId,
-          paneId: value.pane.paneId,
-          panePid: value.pane.panePid,
-          serverPid: value.pane.serverPid,
-        },
-      };
-    } catch {
-      return { status: dispatched ? 'unknown' : 'not-sent' };
-    }
-  });
+    },
+    { deadline, isCurrent: scopeCurrent }
+  ).catch(
+    (error: unknown): RemoteBrokerProvisionResult => ({
+      status: error instanceof RemoteSshAdmissionError ? 'not-sent' : 'unknown',
+    })
+  );
 }

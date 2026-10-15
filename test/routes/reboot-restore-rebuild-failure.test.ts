@@ -920,6 +920,69 @@ describe('Codex reboot launch and cancellation', () => {
       }
     }
   );
+  it.each(['missing', 'existing'] as const)(
+    'rebuilds a %s Claude profile with its saved workspace trust before launch',
+    async (initial) => {
+      const endpoint: CustomModelHost = {
+        id: 'restore-onboarding-endpoint',
+        label: 'Fixture',
+        baseUrl: 'http://endpoint.invalid',
+        apiKey: 'fixture-current-key',
+        models: ['fixture-model'],
+      };
+      await writeCustomModelHosts(getDataDir(), [endpoint]);
+      const entry = offerEntry(`claude-onboarding-${initial}`);
+      const workingDir = join(homedir(), 'owner restore workspace');
+      mkdirSync(workingDir, { recursive: true });
+      entry.workingDir = workingDir;
+      entry.state.workingDir = workingDir;
+      const profileDir = customModelConfigDir(entry.sessionId);
+      const unrelated = join(homedir(), 'unrelated workspace');
+      if (initial === 'existing') {
+        mkdirSync(profileDir, { recursive: true });
+        writeFileSync(
+          join(profileDir, '.claude.json'),
+          JSON.stringify({
+            preserve: 'existing-field',
+            projects: { [unrelated]: { hasTrustDialogAccepted: false } },
+          })
+        );
+      }
+      (entry.state as unknown as Record<string, unknown>).__customModel = {
+        endpointId: endpoint.id,
+        modelId: 'fixture-model',
+        envKeys: ['CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY'],
+        configDir: profileDir,
+      };
+      const historical = structuredClone(entry.state);
+      const profileChecked = vi.fn();
+      afterGuardConfirm = async () => {
+        const profile = JSON.parse(readFileSync(join(profileDir, '.claude.json'), 'utf8'));
+        expect(profile.hasCompletedOnboarding).toBe(true);
+        expect(profile.projects[workingDir]).toEqual({ hasTrustDialogAccepted: true });
+        if (initial === 'existing') {
+          expect(profile.preserve).toBe('existing-field');
+          expect(profile.projects[unrelated]).toEqual({ hasTrustDialogAccepted: false });
+        } else expect(Object.keys(profile.projects)).toEqual([workingDir]);
+        profileChecked();
+        callOrder.push('profileCheckedBeforeLaunch');
+      };
+      await rebootRestoreRegistry.set([entry]);
+      const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+      const app = await createHarness(ctx);
+      try {
+        const response = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+        expect(response.json().data.restored).toHaveLength(1);
+        expect(profileChecked).toHaveBeenCalledOnce();
+        expect(callOrder.indexOf('profileCheckedBeforeLaunch')).toBeLessThan(callOrder.indexOf('launchAccepted'));
+        expect(launchConfigs[0].workingDir).toBe(workingDir);
+        expect(entry.state).toEqual(historical);
+      } finally {
+        await app.close();
+      }
+    }
+  );
+
   it.each(
     ['reapply', 'setup'].flatMap((stage) =>
       ['removed', 'url', 'key', 'models', 'unchanged', 'unrelated'].map((change) => ({ stage, change }))
