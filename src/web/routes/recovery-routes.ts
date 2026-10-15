@@ -6,7 +6,7 @@
 import type { FastifyInstance, FastifyReply } from 'fastify';
 import { ZodError } from 'zod';
 import type { Session } from '../../session.js';
-import type { RecoveryController } from '../../recovery/controller.js';
+import { RecoveryResetBlockedError, type RecoveryController } from '../../recovery/controller.js';
 import { RecoveryActionSchema, RecoveryConfigSchema } from '../../recovery/schema.js';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { findSessionOrFail, parseBody } from '../route-helpers.js';
@@ -64,6 +64,12 @@ export function registerRecoveryRoutes(app: FastifyInstance, ctx: SessionPort & 
     if (req.body !== undefined) parseBody(RecoveryActionSchema, req.body, 'Recovery reset does not accept options');
     const controller = controllerOrFail(ctx, session, reply);
     if (!controller) return;
-    return { success: true, data: await controller.reset() };
+    try {
+      return { success: true, data: await controller.reset() };
+    } catch (error) {
+      if (error instanceof RecoveryResetBlockedError)
+        return reply.code(409).send(createErrorResponse(ApiErrorCode.CONFLICT, error.message));
+      throw error;
+    }
   });
 }
