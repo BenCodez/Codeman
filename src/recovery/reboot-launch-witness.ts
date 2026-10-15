@@ -476,14 +476,22 @@ export async function captureRebootLaunchWitness(
         if (contextLength !== undefined && (!Number.isFinite(contextLength) || contextLength <= 0))
           throw new Error('Invalid profile');
         const injection = buildCustomModelInjection(entry, endpoint, saved.modelId, contextLength);
-        if (
-          injection.kind !== 'configDir' ||
-          JSON.stringify({ [injection.dirEnvVar]: configDir, ...injection.extraEnv }) !== expectedEnv
-        )
-          throw new Error('Profile changed');
-        for (const file of injection.files)
-          if ((await budget.read(join(configDir, file.relPath), 2 * 1024 * 1024)) !== file.content)
-            throw new Error('Profile changed');
+        if (injection.kind === 'unsupported') throw new Error('Unsupported profile');
+        const currentEnv =
+          injection.kind === 'configDir'
+            ? { [injection.dirEnvVar]: configDir, ...injection.extraEnv }
+            : { ...injection.envOverrides, ...(injection.configDirVar ? { [injection.configDirVar]: configDir } : {}) };
+        if (JSON.stringify(currentEnv) !== expectedEnv) throw new Error('Profile changed');
+        if (injection.kind === 'configDir') {
+          for (const file of injection.files)
+            if ((await budget.read(join(configDir, file.relPath), 2 * 1024 * 1024)) !== file.content)
+              throw new Error('Profile changed');
+        } else if (injection.configDirVar) {
+          const directory = await fs.lstat(configDir);
+          budget.check();
+          if (!directory.isDirectory() || directory.isSymbolicLink()) throw new Error('Invalid profile directory');
+          budget.paths.push(snapshot(configDir, directory, 'directory'));
+        }
         profile = JSON.stringify({ injection, models: endpoint.models });
       }
       if (historical) {
