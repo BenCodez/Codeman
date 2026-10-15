@@ -56,6 +56,7 @@ import { isCodexRestoreConfig } from './recovery/reboot-state-binding.js';
 import { classifyCodexTail } from './recovery/codex-classifier.js';
 import type { CodexIdentityResult } from './recovery/codex-identity.js';
 import { isCleanPaneExit } from './pane-exit-sweep.js';
+import { probeRecoveryDirectory, type RecoveryDirectoryProbe } from './custom-model-recovery.js';
 
 /** Session statuses a reboot restore may rebuild. `stopped` is the kill marker. */
 const RESTORABLE_STATUSES: ReadonlySet<string> = new Set(['idle', 'busy', 'error']);
@@ -171,6 +172,8 @@ export interface RebootRestorePlan {
   skipped: RebootRestoreRejection[];
 }
 
+export type RebootWorkspaceStatus = 'present' | 'absent' | 'unknown';
+
 /**
  * Split the sessions reconciliation just killed into the ones a reboot restore
  * may offer and the ones it must leave alone.
@@ -186,7 +189,7 @@ export interface RebootRestorePlan {
 export function planRebootRestore(
   deadSessionIds: readonly string[],
   persisted: Readonly<Record<string, SessionState>>,
-  workspaceExists: (workingDir: string) => boolean,
+  workspaceExists: (workingDir: string) => boolean | RebootWorkspaceStatus,
   verifiedCodexConversationIds: ReadonlyMap<string, string> = new Map()
 ): RebootRestorePlan {
   const restore: RebootRestoreEntry[] = [];
@@ -254,8 +257,12 @@ export function planRebootRestore(
       skipped.push({ sessionId, reason: 'no-working-dir' });
       continue;
     }
-    if (!workspaceExists(state.workingDir)) {
-      skipped.push({ sessionId, reason: 'workspace-missing' });
+    const workspace = workspaceExists(state.workingDir);
+    if (workspace !== true && workspace !== 'present') {
+      skipped.push({
+        sessionId,
+        reason: workspace === false || workspace === 'absent' ? 'workspace-missing' : 'rebuild-failed',
+      });
       continue;
     }
     restore.push({
@@ -482,10 +489,29 @@ export async function verifyCodexRebootEvidence(
 export async function planVerifiedRebootRestore(
   deadSessionIds: readonly string[],
   persisted: Readonly<Record<string, SessionState>>,
-  workspaceExists: (workingDir: string) => boolean,
-  capturedBindings?: ReadonlyMap<string, string | null>
+  workspaceProbe: (
+    workingDir: string,
+    isCurrent: () => boolean,
+    deadline: number
+  ) => Promise<RecoveryDirectoryProbe> = (workingDir, isCurrent, deadline) =>
+    probeRecoveryDirectory(workingDir, isCurrent, true, deadline),
+  capturedBindings?: ReadonlyMap<string, string | null>,
+  isCurrent: () => boolean = () => true
 ): Promise<RebootRestorePlan> {
   const deadline = performance.now() + 2000;
+  const dataDir = getDataDirPath(),
+    snapshot = JSON.stringify(persisted);
+  const current = () => {
+    try {
+      const value: unknown = isCurrent();
+      if (value && typeof (value as { then?: unknown }).then === 'function')
+        void Promise.resolve(value).catch(() => {});
+      return value === true && getDataDirPath() === dataDir;
+    } catch {
+      return false;
+    }
+  };
+  const workspaces = new Map<string, RebootWorkspaceStatus>();
   const bindings = capturedBindings ?? (await captureRebootBrokerBindings(persisted, deadline));
   const boundPersisted = Object.fromEntries(
     Object.entries(persisted).map(([id, state]) => [
@@ -498,20 +524,34 @@ export async function planVerifiedRebootRestore(
   for (const sessionId of deadSessionIds) {
     const state = boundPersisted[sessionId];
     if (
-      !bindings?.has(sessionId) ||
       !state ||
-      getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' ||
       !RESTORABLE_STATUSES.has(state.status) ||
       state.pid == null ||
       isCleanPaneExit(state.paneExit) ||
       state.respawnBlocked ||
       state.remote ||
       state.docker ||
-      !state.workingDir ||
-      !workspaceExists(state.workingDir)
+      !state.workingDir
     )
       continue;
-    if (performance.now() >= deadline) break;
+    const cli = getCli(state.mode ?? 'claude');
+    const codex = cli?.capabilities.recovery === 'codex-rollout';
+    if (!codex && cli?.capabilities.transcript !== 'claude-jsonl') continue;
+    if (!workspaces.has(state.workingDir)) {
+      let status: RebootWorkspaceStatus = 'unknown';
+      if (current() && performance.now() < deadline) {
+        try {
+          const evidence = await workspaceProbe(state.workingDir, current, deadline);
+          if (current() && performance.now() < deadline && ['present', 'absent', 'unknown'].includes(evidence.status))
+            status = evidence.status;
+        } catch {
+          /* Unknown IO cannot become verified absence. */
+        }
+      }
+      workspaces.set(state.workingDir, status);
+    }
+    if (!codex || !bindings?.has(sessionId) || workspaces.get(state.workingDir) !== 'present') continue;
+    if (!current() || performance.now() >= deadline) continue;
     const identity = await codexRebootIdentityCandidate(state, undefined, deadline);
     if (identity) {
       if (identity.trackedSubmission && typeof bindings.get(sessionId) === 'string')
@@ -524,7 +564,7 @@ export async function planVerifiedRebootRestore(
     deadline
   );
   for (const [index, resolution] of resolutions.entries()) {
-    if (performance.now() >= deadline) break;
+    if (!current() || performance.now() >= deadline) break;
     const candidate = candidates[index];
     const id = resolution.conversationId;
     if (
@@ -547,5 +587,15 @@ export async function planVerifiedRebootRestore(
       }
     }
   }
-  return planRebootRestore(deadSessionIds, boundPersisted, workspaceExists, verified);
+  // This phase is pure: no callback can start another filesystem lookup after
+  // the shared scan budget. Completed evidence survives budget exhaustion, but
+  // a changed owner/state scope invalidates every earlier result.
+  const scopeValid = current() && JSON.stringify(persisted) === snapshot;
+  if (!scopeValid) verified.clear();
+  return planRebootRestore(
+    deadSessionIds,
+    boundPersisted,
+    (workingDir) => (scopeValid ? (workspaces.get(workingDir) ?? 'unknown') : 'unknown'),
+    verified
+  );
 }

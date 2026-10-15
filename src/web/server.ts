@@ -3700,8 +3700,9 @@ export class WebServer extends EventEmitter {
     const { restore, skipped } = await planVerifiedRebootRestore(
       dead,
       persisted,
-      (workingDir) => existsSync(workingDir),
-      bindings
+      undefined,
+      bindings,
+      () => this.store.getSessions() === persisted
     );
     if (skipped.length > 0) {
       console.log(`[Server] Reboot restore is passing over ${skipped.length} dead session(s):`);

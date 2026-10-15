@@ -89,7 +89,11 @@ function fixture(id: string, home = join(homedir(), '.codex'), workspace = join(
 }
 
 async function offer(state: SessionState): Promise<void> {
-  const plan = await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true);
+  const plan = await planVerifiedRebootRestore([state.id], { [state.id]: state }, async () => ({
+    status: 'present' as const,
+    dev: 1,
+    ino: 1,
+  }));
   expect(plan.skipped).toEqual([]);
   expect(plan.restore).toHaveLength(1);
   await rebootRestoreRegistry.set(plan.restore);

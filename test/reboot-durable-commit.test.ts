@@ -144,7 +144,11 @@ async function fixture(label: string, pruned = false) {
   store.setSession(id, state);
   store.flush();
   await rebootRestoreRegistry.configurePersistence(dataPath('reboot-restore-offer.json'));
-  const plan = await planVerifiedRebootRestore([id], { [id]: state }, () => true);
+  const plan = await planVerifiedRebootRestore([id], { [id]: state }, async () => ({
+    status: 'present' as const,
+    dev: 1,
+    ino: 1,
+  }));
   expect(plan.restore).toHaveLength(1);
   await rebootRestoreRegistry.set(plan.restore);
   if (pruned) {

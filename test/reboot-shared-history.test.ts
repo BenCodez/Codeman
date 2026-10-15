@@ -222,7 +222,11 @@ it.each([
     ).reason
   ).not.toBe('verified');
   expect(await verifyCodexRebootIdentity(state)).toBe(kind === 'healthy' ? CID_A : undefined);
-  const plan = await planVerifiedRebootRestore([SID_A, SID_B], states, () => true);
+  const plan = await planVerifiedRebootRestore([SID_A, SID_B], states, async () => ({
+    status: 'present' as const,
+    dev: 1,
+    ino: 1,
+  }));
   expect(plan.restore.some((entry) => entry.sessionId === SID_A)).toBe(kind === 'healthy');
   if (kind === 'healthy') {
     expect(plan.restore.map((entry) => entry.resumeConversationId)).toEqual([CID_A, CID_B]);
