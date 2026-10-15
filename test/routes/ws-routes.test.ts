@@ -197,6 +197,54 @@ describe('ws-routes', () => {
   // ========== Client input ==========
 
   describe('client input', () => {
+    it('recovers admission after 256 known-unsent clients disconnect during a pane reservation', async () => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      let now = 0;
+      const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+      const key = createDeferred<void>();
+      const held = session.sendNamedKey('\n', () => key.promise);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      const messages: unknown[] = [];
+      ws.on('message', (raw) => messages.push(JSON.parse(String(raw))));
+      let restored: WebSocket | undefined;
+      try {
+        expect(session.recoveryInputReserved).toBe(true);
+        for (let i = 0; i < 256; i++) ws.send(JSON.stringify({ t: 'i', d: 'unsent', cid: `abandoned-${i}`, seq: 1 }));
+        const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+        ws.ping();
+        await pong;
+        expect(Reflect.get(session, '_appliedInputSeq').size).toBe(256);
+        expect(written).not.toHaveBeenCalled();
+        expect(messages).toEqual([]);
+        const closed = waitForClose(ws);
+        ws.close();
+        await closed;
+        key.resolve();
+        await held;
+        now = 60_000;
+        restored = await connectWs('/ws/sessions/ws-test-session/terminal');
+        let ack = nextMessage(restored);
+        restored.send(JSON.stringify({ t: 'i', d: 'fresh', cid: 'fresh-client', seq: 1 }));
+        expect(await ack).toEqual({ t: 'ia', seq: 1 });
+        expect(written).toHaveBeenCalledExactlyOnceWith('fresh');
+        // Reclaiming a certified-unsent reservation must not ACK it as delivered.
+        ack = nextMessage(restored);
+        restored.send(JSON.stringify({ t: 'i', d: 'retried-unsent', cid: 'abandoned-0', seq: 1 }));
+        expect(await ack).toEqual({ t: 'ia', seq: 1 });
+        expect(written.mock.calls.map(([data]) => data)).toEqual(['fresh', 'retried-unsent']);
+      } finally {
+        clock.mockRestore();
+        key.resolve();
+        await held;
+        ws.close();
+        restored?.close();
+        await session.stop(false);
+      }
+    });
+
     it.each([
       { label: 'empty cid', metadata: { cid: '', seq: 1 } },
       { label: '129-char cid', metadata: { cid: 'c'.repeat(129), seq: 1 } },
