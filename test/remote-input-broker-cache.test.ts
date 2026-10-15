@@ -72,7 +72,7 @@ function fixture() {
     const sample = snapshot();
     return using.observe(scope, material.config.incarnation, sample.serialized, sample.witness, 700);
   };
-  return { scope, material, remoteDirectory, cache, file, state, observe };
+  return { scope, material, remoteDirectory, cache, file, state, observe, snapshot };
 }
 
 it('retains private launch material and returns only a secret-free reader descriptor', async () => {
@@ -368,3 +368,204 @@ it.each(['read', 'close'] as const)(
     }
   }
 );
+
+it('revokes both retained incarnations and already-returned signers, without touching private launch files', async () => {
+  const f = fixture();
+  const first = await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  const proof = f.observe()!;
+  const signer = f.cache.signer(f.scope, f.material.config.incarnation)!;
+  expect(proof).toBeDefined();
+  expect(signer.authority(proof)).toBeDefined();
+  expect(signer.canFrame).toBe(true);
+  const newer = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec newer-child', f.scope.codexHome);
+  const newerDirectory = '/remote/private/' + f.scope.sessionId + '/' + newer.config.incarnation;
+  expect(await f.cache.prepare(f.scope, newer, newerDirectory)).toBeDefined();
+  const bytes = await fs.readFile(f.file);
+  f.cache.retire(f.scope.sessionId);
+  expect(f.cache.get(f.scope, newer.config.incarnation)).toBeUndefined();
+  expect(f.cache.get(f.scope, f.material.config.incarnation)).toBeUndefined();
+  expect(f.cache.signer(f.scope, f.material.config.incarnation)).toBeUndefined();
+  expect(f.observe()).toBeUndefined();
+  expect(f.cache.activate(f.scope, newer.config.incarnation)).toBe(false);
+  expect(signer.canFrame).toBe(false);
+  expect(signer.authority(proof)).toBeUndefined();
+  expect(signer.frame('owner-pty', 'old draft')).toBeUndefined();
+  const stale = f.snapshot();
+  expect(signer.observeRemote(stale.serialized, stale.witness, 700)).toBeUndefined();
+  expect(signer.canFrame).toBe(false);
+  expect(f.observe()).toBeUndefined();
+  expect(await fs.readFile(f.file)).toEqual(bytes);
+  expect(await f.cache.load(f.scope, f.material.config.incarnation)).toEqual(first);
+  expect(f.observe()).toBeDefined();
+  expect(f.cache.signer(f.scope, f.material.config.incarnation)).not.toBe(signer);
+  expect(signer.authority(proof)).toBeUndefined();
+});
+
+it.each(['host', 'owner', 'home', 'incarnation'] as const)(
+  'does not lend retired material to a new %s scope',
+  async (kind) => {
+    const f = fixture();
+    await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+    const other = structuredClone(f.scope);
+    if (kind === 'host') other.remote.host = 'replacement.invalid';
+    if (kind === 'owner') other.owner = 'replacement-owner';
+    if (kind === 'home') other.codexHome += '-new';
+    f.cache.retire(f.scope.sessionId);
+    expect(
+      await f.cache.load(
+        other,
+        kind === 'incarnation' ? 'dddddddd-eeee-ffff-aaaa-bbbbbbbbbbbb' : f.material.config.incarnation
+      )
+    ).toBeUndefined();
+    expect(f.cache.get(other, f.material.config.incarnation)).toBeUndefined();
+    expect(f.cache.signer(other, f.material.config.incarnation)).toBeUndefined();
+    expect(f.observe()).toBeUndefined();
+    // A fresh explicit launch in the replacement scope can register its own secret.
+    const material = CodexInputBroker.provisioningMaterial(other.sessionId, 'exec replacement-child', other.codexHome);
+    expect(
+      await f.cache.prepare(other, material, '/remote/private/' + other.sessionId + '/' + material.config.incarnation)
+    ).toBeDefined();
+    expect(f.cache.get(f.scope, f.material.config.incarnation)).toBeUndefined();
+  }
+);
+
+it.each(['retire', 'activate'] as const)('does not publish a superseded prepare after %s', async (transition) => {
+  const f = fixture();
+  let release!: () => void, entered!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const started = new Promise<void>((resolve) => (entered = resolve));
+  const original = fs.open.bind(fs);
+  const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    const handle = await original(...args);
+    if (args[0] === f.file) {
+      const write = handle.writeFile.bind(handle);
+      handle.writeFile = async (...values: Parameters<typeof handle.writeFile>) => {
+        entered();
+        await held;
+        return write(...values);
+      };
+    }
+    return handle;
+  });
+  const preparing = f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  try {
+    await started;
+    if (transition === 'retire') f.cache.retire(f.scope.sessionId);
+    const replacement = structuredClone(f.scope);
+    if (transition === 'retire') replacement.owner = 'new-owner';
+    const material = CodexInputBroker.provisioningMaterial(
+      replacement.sessionId,
+      'exec replacement',
+      replacement.codexHome
+    );
+    const descriptor = await f.cache.prepare(
+      replacement,
+      material,
+      '/remote/private/' + replacement.sessionId + '/' + material.config.incarnation
+    );
+    expect(descriptor).toBeDefined();
+    if (transition === 'activate') expect(f.cache.activate(replacement, material.config.incarnation)).toBe(true);
+    release();
+    expect(await preparing).toBeUndefined();
+    expect(f.cache.get(f.scope, f.material.config.incarnation)).toBeUndefined();
+    expect(f.cache.get(replacement, material.config.incarnation)).toEqual(descriptor);
+    expect(f.observe()).toBeUndefined();
+    expect(f.cache.activate(f.scope, f.material.config.incarnation)).toBe(false);
+  } finally {
+    release();
+    await preparing;
+    spy.mockRestore();
+  }
+});
+
+it('does not join or publish a retired lookup when the same scope is legitimately rehydrated', async () => {
+  const f = fixture();
+  const descriptor = await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  f.cache.retire(f.scope.sessionId);
+  let release!: () => void, entered!: () => void;
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const started = new Promise<void>((resolve) => (entered = resolve));
+  const original = fs.open.bind(fs);
+  let reads = 0;
+  const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args: Parameters<typeof fs.open>) => {
+    const handle = await original(...args);
+    if (args[0] === f.file && ++reads === 1) {
+      const read = handle.read.bind(handle);
+      handle.read = (async (...values: unknown[]) => {
+        entered();
+        await held;
+        return (read as (...args: unknown[]) => Promise<unknown>)(...values);
+      }) as typeof handle.read;
+    }
+    return handle;
+  });
+  const loading = f.cache.load(f.scope, f.material.config.incarnation);
+  try {
+    await started;
+    f.cache.retire(f.scope.sessionId);
+    expect(await f.cache.load(f.scope, f.material.config.incarnation)).toEqual(descriptor);
+    expect(reads).toBe(2);
+    expect(f.observe()).toBeDefined();
+    const currentSigner = f.cache.signer(f.scope, f.material.config.incarnation);
+    release();
+    expect(await loading).toBeUndefined();
+    expect(f.cache.signer(f.scope, f.material.config.incarnation)).toBe(currentSigner);
+  } finally {
+    release();
+    await loading;
+    spy.mockRestore();
+  }
+});
+
+it('reclaims all per-session memory without accumulating retirement tombstones or failed lookup epochs', async () => {
+  const f = fixture();
+  await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  f.observe();
+  f.cache.retire(f.scope.sessionId);
+  for (let index = 0; index < 300; index++) f.cache.retire('retired-' + index);
+  expect(await f.cache.load(f.scope, 'dddddddd-eeee-ffff-aaaa-bbbbbbbbbbbb')).toBeUndefined();
+  for (const field of ['entries', 'scopes', 'epochs'])
+    expect((Reflect.get(f.cache, field) as Map<unknown, unknown>).size).toBe(0);
+});
+
+it('retires only the selected session, preserving another host/owner signer and pending owner counter', async () => {
+  const f = fixture();
+  await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  f.observe();
+  const other = structuredClone(f.scope);
+  other.sessionId = 'dddddddd-eeee-ffff-aaaa-bbbbbbbbbbbb';
+  other.owner = 'other-owner';
+  other.remote.host = 'other.invalid';
+  const material = CodexInputBroker.provisioningMaterial(other.sessionId, 'exec other-child', other.codexHome);
+  const directory = '/remote/private/' + other.sessionId + '/' + material.config.incarnation;
+  const descriptor = await f.cache.prepare(other, material, directory);
+  const state = {
+    ...f.state,
+    sessionId: other.sessionId,
+    incarnation: material.config.incarnation,
+    launchDigest: material.config.launchDigest,
+    homeDigest: material.config.homeDigest,
+    startup: { nonce: material.config.startup.nonce, status: 'started' },
+  };
+  const serialized = JSON.stringify(state);
+  expect(
+    f.cache.observe(
+      other,
+      material.config.incarnation,
+      serialized,
+      {
+        ...f.snapshot().witness,
+        path: directory + '/state.json',
+        size: Buffer.byteLength(serialized),
+        hash: createHash('sha256').update(serialized).digest('hex'),
+      },
+      700
+    )
+  ).toBeDefined();
+  const signer = f.cache.signer(other, material.config.incarnation)!;
+  const first = signer.frame('owner-pty', 'first')!;
+  f.cache.retire(f.scope.sessionId);
+  expect(f.cache.get(other, material.config.incarnation)).toEqual(descriptor);
+  expect(f.cache.signer(other, material.config.incarnation)).toBe(signer);
+  expect(signer.frame('owner-pty', 'second')?.receipt.counter).toBe(first.receipt.counter + 1);
+});
