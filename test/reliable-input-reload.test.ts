@@ -1,4 +1,5 @@
 /** Real browser queue methods with durable storage and fake transport effects. */
+import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import { resolve } from 'node:path';
@@ -6,6 +7,7 @@ import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 
 type RecordFrame = {
+  cid: string;
   seq: number;
   data: string;
   key?: string;
@@ -14,6 +16,7 @@ type RecordFrame = {
   replayUncertain?: boolean;
 };
 type App = {
+  _clientId: string;
   _sendInputAsync(session: string, input: string): void;
   _sendNamedKey(session: string, key: string, owner: object): void;
   _cancelPendingKeys(owner: object): void;
@@ -39,6 +42,7 @@ function harness(initial?: object) {
   let transport: typeof fetch = vi.fn(async () => new Response('{}', { status: 200 }));
   const context = vm.createContext({
     console,
+    crypto: { randomUUID },
     performance,
     setTimeout,
     clearTimeout,
@@ -53,6 +57,10 @@ function harness(initial?: object) {
     MobileDetection: {},
     fetch: (...args: Parameters<typeof fetch>) => transport(...args),
     localStorage: {
+      get length() {
+        return storage.size;
+      },
+      key: (index: number) => [...storage.keys()][index] ?? null,
       getItem: (key: string) => storage.get(key) ?? null,
       setItem: (key: string, value: string) => {
         if (failWrite) throw new Error('quota');
@@ -82,7 +90,15 @@ function harness(initial?: object) {
   };
   return {
     load,
-    snapshot: () => JSON.parse(storage.get('codeman:pendingInput') || '{}'),
+    snapshot: () => {
+      const pending: Record<string, RecordFrame[]> = {};
+      for (const [key, text] of storage)
+        if (key.startsWith('codeman:pendingInput:v3:')) {
+          const rec = JSON.parse(text);
+          (pending[rec.sessionId] ??= []).push(rec);
+        }
+      return { pending };
+    },
     transport: (next: typeof fetch) => {
       transport = next;
     },
@@ -120,13 +136,13 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
       };
       const landed: string[] = [];
       const requests: number[] = [];
-      let last = 0;
+      const last = new Map<string, number>();
       h.transport(
         vi.fn(async (_url, init) => {
           const body = JSON.parse(String(init?.body));
           requests.push(body.seq);
-          if (body.seq <= last) return duplicate(body.seq, last);
-          last = body.seq;
+          if (body.seq <= (last.get(body.clientId) ?? 0)) return duplicate(body.seq, last.get(body.clientId));
+          last.set(body.clientId, body.seq);
           landed.push(body.input);
           if (landed.length === 1) throw new Error('committed, response lost');
           return new Response('{}', { status: 200 });
@@ -134,7 +150,8 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
       );
       original._sendInputAsync(session, 'owner input');
       await settle(original);
-      expect(h.snapshot().pending[session][0].tries).toBe(quota ? 0 : 1);
+      // Immutable records may always say tries:0; reload must still treat them as uncertain.
+      expect(h.snapshot().pending[session][0].tries).toBe(0);
       h.failWrites(false);
       const restored = h.load();
       restored._drainSession(session);
@@ -144,7 +161,8 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
       expect(restored._pendingDeliveries.has(session)).toBe(false);
       restored._sendInputAsync(session, 'new owner input');
       await settle(restored);
-      expect(requests).toEqual([1, 1, 2]);
+      expect(requests).toEqual([1, 1, 1]);
+      expect(restored._clientId).not.toBe(original._clientId);
       expect(landed).toEqual(['owner input', 'new owner input']);
     }
   );
@@ -165,7 +183,8 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
       app._drainSession(session);
       await settle(app);
       expect(requests).toEqual([1]);
-      expect(app._seqCounters.get(session)).toBe(12);
+      expect(app._seqCounters.get(session)).toBeUndefined();
+      expect(app._clientId).not.toBe('c-reload-test');
       expect(app._pendingDeliveries.has(session)).toBe(false);
     }
   );
@@ -219,7 +238,7 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
     app._drainSession(session);
     expect(transport).not.toHaveBeenCalled();
     expect(app._pendingDeliveries.size).toBe(0);
-    expect(app._seqCounters.get(session)).toBe(1);
+    expect(app._seqCounters.get(session)).toBeUndefined();
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('format could not be verified'), 'warning');
   });
 
@@ -251,7 +270,7 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
     }
   );
 
-  it('preserves a valid persisted integer counter and exact replay identity before new input', () => {
+  it('preserves an original persisted sequence while fresh document input owns a different CID', async () => {
     const h = harness({
       version: 2,
       clientId: 'c-reload-test',
@@ -259,28 +278,30 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
       pending: { [session]: [{ seq: 17, data: 'already committed', tries: 1 }] },
     });
     const app = h.load();
-    const frames: Array<{ seq: number; d: string }> = [];
-    const applied: string[] = [];
-    const committed = new Set([17]);
+    const replay: { clientId: string; seq: number; input: string }[] = [];
+    h.transport(
+      vi.fn(async (_url, init) => {
+        const body = JSON.parse(String(init?.body));
+        replay.push(body);
+        return duplicate(body.seq, 17);
+      })
+    );
+    const frames: { cid: string; seq: number; d: string }[] = [];
     app._wsSessionId = session;
     app._ws = {
       readyState: 1,
       send: (raw) => {
         const frame = JSON.parse(raw);
         frames.push(frame);
-        const duplicate = committed.has(frame.seq);
-        if (!duplicate) applied.push(frame.d);
-        committed.add(frame.seq);
-        app._onWsInputAck(frame.seq, duplicate ? { dup: true, last: 17 } : {}, session);
+        app._onWsInputAck(frame.seq, {}, session);
       },
     };
     app._drainSession(session);
+    await settle(app);
+    expect(replay).toMatchObject([{ clientId: 'c-reload-test', seq: 17, input: 'already committed' }]);
     app._sendInputAsync(session, 'fresh owner input');
-    expect(frames.map((frame) => [frame.seq, frame.d])).toEqual([
-      [17, 'already committed'],
-      [18, 'fresh owner input'],
-    ]);
-    expect(applied).toEqual(['fresh owner input']);
+    expect(frames).toEqual([{ t: 'i', cid: app._clientId, seq: 1, d: 'fresh owner input' }]);
+    expect(app._clientId).not.toBe('c-reload-test');
     expect(app._pendingDeliveries.size).toBe(0);
     expect(app.showToast).not.toHaveBeenCalled();
   });
@@ -293,6 +314,8 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
       pending: {},
     });
     const app = h.load();
+    app._seqCounters.set(session, Number.MAX_SAFE_INTEGER);
+    const originalCid = app._clientId;
     const frames: string[] = [];
     const transport = vi.fn(async () => new Response('{}', { status: 200 }));
     h.transport(transport);
@@ -304,7 +327,8 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
     expect(transport).not.toHaveBeenCalled();
     expect(app._pendingDeliveries.size).toBe(0);
     expect(app._seqCounters.get(session)).toBe(Number.MAX_SAFE_INTEGER);
-    expect(h.snapshot()).toMatchObject({ clientId: 'c-reload-test', seqs: { [session]: Number.MAX_SAFE_INTEGER } });
+    expect(app._clientId).toBe(originalCid);
+    expect(h.snapshot().pending).toEqual({});
     expect(
       app.showToast.mock.calls.every(
         ([message, level]) => String(message).includes('delivery limit') && level === 'warning'
@@ -315,6 +339,7 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
   it('refuses an exhausted whole-queue repair without releasing its dependent newline/text', async () => {
     const h = harness({ seqs: { [session]: Number.MAX_SAFE_INTEGER - 3 } });
     const app = h.load();
+    app._seqCounters.set(session, Number.MAX_SAFE_INTEGER - 3);
     const requests: string[] = [];
     let finish: (() => void) | undefined;
     h.transport(
@@ -367,7 +392,8 @@ describe('reload never converts an uncertain occurrence into fresh input', () =>
       readyState: 1,
       send: (data) => {
         const frame = JSON.parse(data);
-        expect(h.snapshot().pending[session][0].tries).toBe(1);
+        expect(h.snapshot().pending[session][0].tries).toBe(0);
+        expect(app._pendingDeliveries.get(session)![0].tries).toBe(1);
         landed.push(frame.d);
         throw new Error('after bytes');
       },
@@ -440,7 +466,7 @@ describe('non-deduplicated newline boundaries survive as refusal barriers', () =
       app._drainSession(session);
       await settle(app);
       expect(requests).toEqual(['before']);
-      expect(app._seqCounters.get(session)).toBe(3);
+      expect(app._seqCounters.get(session)).toBeUndefined();
       expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
       expect(h.load()._pendingDeliveries.size).toBe(0);
     }
@@ -497,7 +523,7 @@ describe('non-deduplicated newline boundaries survive as refusal barriers', () =
     app._drainSession(session);
     await settle(app);
     expect(requests).toEqual(['before']);
-    expect(app._seqCounters.get(session)).toBe(3);
+    expect(app._seqCounters.get(session)).toBeUndefined();
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
   });
 
@@ -508,7 +534,7 @@ describe('non-deduplicated newline boundaries survive as refusal barriers', () =
     h.transport(transport);
     app._drainSession(session);
     expect(transport).not.toHaveBeenCalled();
-    expect(app._seqCounters.get(session)).toBe(2);
+    expect(app._seqCounters.get(session)).toBeUndefined();
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
   });
 
@@ -574,7 +600,8 @@ describe('non-deduplicated newline boundaries survive as refusal barriers', () =
     expect(requests).toEqual([`/api/sessions/${session}/send-key`]);
     expect(app._pendingDeliveries.size).toBe(0);
     expect(restored._pendingDeliveries.size).toBe(0);
-    expect(restored._seqCounters.get(session)).toBe(2);
+    expect(restored._seqCounters.get(session)).toBeUndefined();
+    expect(restored._clientId).not.toBe(app._clientId);
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
   });
 });

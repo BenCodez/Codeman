@@ -36,6 +36,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/split-pane-terminal.browser.test.ts',
   'test/terminal-tile-scroll.browser.test.ts',
   'test/shift-enter-keypress.browser.test.ts',
+  'test/reliable-input-multiwindow.browser.test.ts',
   'test/key-tester.browser.test.ts',
   'test/webhook-settings.browser.test.ts',
   'test/case-custom-path.browser.test.ts',
