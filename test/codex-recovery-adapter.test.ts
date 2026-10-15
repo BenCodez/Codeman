@@ -1684,6 +1684,77 @@ describe('owned remote evidence and mutation', () => {
     }
   );
 
+  it.each([false, true])(
+    'restarts only after the replacement SSH worker owns its full delay and final proof (final replacement=%s)',
+    async (replaceAtDispatch) => {
+      const owned = await ownedStallFixture();
+      const { f } = owned;
+      let finalReplacement = false;
+      const act = vi.fn(
+        (reservation: RecoveryFlight, authority: import('../src/recovery/types.js').RecoveryActionAuthority) =>
+          f.adapter.act(reservation, authority)
+      );
+      const controller = new RecoveryController({
+        observe: () => f.adapter.observe(),
+        act,
+        persist: async (state) => {
+          if (state.inFlight && replaceAtDispatch && !finalReplacement) {
+            finalReplacement = true;
+            await owned.replace();
+          }
+        },
+        changed: () => {},
+      });
+      try {
+        await controller.updateConfig({
+          enabled: true,
+          detectStalls: true,
+          restartStalls: true,
+          recoverCrashes: false,
+          stalledAfterMs: 10_000,
+          retryDelayMs: 10_000,
+          maxRetryDelayMs: 10_000,
+        });
+        vi.setSystemTime(NOW + 10_000);
+        await controller.refresh();
+        vi.setSystemTime(NOW + 12_000);
+        await controller.refresh();
+        expect(controller.getStatus().nextRetryAt).toBe(NOW + 22_000);
+        const original = await f.adapter.observe();
+        vi.setSystemTime(NOW + 20_000);
+        await owned.replace();
+        const replacement = await f.adapter.observe();
+        expect(replacement.stallEvidenceKey).toBe(original.stallEvidenceKey);
+        expect(replacement.progressEvidenceKey).toBe(original.progressEvidenceKey);
+        expect(replacement.processProofKey).not.toBe(original.processProofKey);
+        await controller.refresh();
+        expect(controller.getStatus().pending).toBeUndefined();
+        vi.setSystemTime(NOW + 22_000);
+        await controller.refresh();
+        expect(controller.getStatus().nextRetryAt).toBe(NOW + 32_000);
+        expect(act).not.toHaveBeenCalled();
+        vi.setSystemTime(NOW + 31_999);
+        await controller.refresh();
+        expect(f.deps.restartRemote).not.toHaveBeenCalled();
+        vi.setSystemTime(NOW + 32_000);
+        await controller.refresh();
+        expect(act).toHaveBeenCalledOnce();
+        expect(f.deps.restartRemote).toHaveBeenCalledTimes(replaceAtDispatch ? 0 : 1);
+        if (replaceAtDispatch) {
+          expect(finalReplacement).toBe(true);
+          expect(await act.mock.results[0].value).toBe('not-sent');
+          const final = await f.adapter.observe();
+          expect(final.processProofKey).not.toBe(replacement.processProofKey);
+          expect(final.stallEvidenceKey).toBe(replacement.stallEvidenceKey);
+        }
+      } finally {
+        controller.stop();
+        await controller.drain();
+        await owned.dispose();
+      }
+    }
+  );
+
   it.each([
     'healthy',
     'unbrokered',
