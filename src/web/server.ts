@@ -3693,6 +3693,8 @@ export class WebServer extends EventEmitter {
       return 0;
     }
 
+    const mergePlan = await rebootRestoreRegistry.preparePlanMerge();
+    const persistedSnapshot = JSON.stringify(persisted);
     const { restore, skipped } = await planVerifiedRebootRestore(
       dead,
       persisted,
@@ -3705,7 +3707,11 @@ export class WebServer extends EventEmitter {
         console.log(`[Server]   ${rejection.sessionId}: ${rejection.reason}`);
       }
     }
-    await rebootRestoreRegistry.set(restore);
+    await mergePlan(
+      restore,
+      () => this.store.getSessions() === persisted && JSON.stringify(persisted) === persistedSnapshot,
+      dead
+    );
     if (restore.length > 0) {
       console.log(`[Server] Host reboot detected; offering ${restore.length} session(s) for restore`);
     }

@@ -410,8 +410,10 @@ async function withHistoricalInput(
   state: SessionState,
   identity: CodexIdentityResult,
   binding: string | null,
-  planning = false
+  planning = false,
+  deadline = performance.now() + 2000
 ): Promise<CodexRebootEvidence | undefined> {
+  if (performance.now() >= deadline) return undefined;
   if (binding === null) return identity;
   const home = normalizedCodexHome((state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome);
   if (!home) return undefined;
@@ -419,7 +421,8 @@ async function withHistoricalInput(
     join(getDataDirPath(), 'codex-input-brokers', state.id, binding),
     state.id,
     binding,
-    home
+    home,
+    deadline
   );
   if (!evidence || !identity.witness) return undefined;
   const stored = state as SessionState & {
@@ -436,7 +439,7 @@ async function withHistoricalInput(
     witness: { paths: [...identity.witness.paths, ...evidence.paths] },
     historicalInput: evidence,
   };
-  return (await checkCodexIdentityWitnesses([combined], evidence.files)) ? combined : undefined;
+  return (await checkCodexIdentityWitnesses([combined], evidence.files, deadline)) ? combined : undefined;
 }
 
 /** Revalidate saved exact evidence; cwd and timestamps alone never authorize a thread. */
@@ -482,14 +485,14 @@ export async function planVerifiedRebootRestore(
   workspaceExists: (workingDir: string) => boolean,
   capturedBindings?: ReadonlyMap<string, string | null>
 ): Promise<RebootRestorePlan> {
-  const bindings = capturedBindings ?? (await captureRebootBrokerBindings(persisted));
+  const deadline = performance.now() + 2000;
+  const bindings = capturedBindings ?? (await captureRebootBrokerBindings(persisted, deadline));
   const boundPersisted = Object.fromEntries(
     Object.entries(persisted).map(([id, state]) => [
       id,
       bindings?.has(id) ? { ...state, __codexPriorInputBroker: bindings.get(id) } : state,
     ])
   );
-  const deadline = performance.now() + 2000;
   const verified = new Map<string, string>();
   const candidates: Array<{ sessionId: string; identity: CodexRebootIdentityCandidate }> = [];
   for (const sessionId of deadSessionIds) {
@@ -521,6 +524,7 @@ export async function planVerifiedRebootRestore(
     deadline
   );
   for (const [index, resolution] of resolutions.entries()) {
+    if (performance.now() >= deadline) break;
     const candidate = candidates[index];
     const id = resolution.conversationId;
     if (
@@ -533,7 +537,8 @@ export async function planVerifiedRebootRestore(
         boundPersisted[candidate.sessionId],
         resolution,
         bindings!.get(candidate.sessionId)!,
-        true
+        true,
+        deadline
       );
       if (evidence) {
         if (evidence.historicalInput)
