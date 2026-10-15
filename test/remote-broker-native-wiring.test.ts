@@ -36,6 +36,7 @@ vi.mock('node-pty', () => ({
     throw new Error('Real PTY effects forbidden');
   },
 }));
+let ownedRemoteBrokerCache: typeof import('../src/recovery/remote-input-broker-cache.js').ownedRemoteBrokerCache;
 let TmuxManager: typeof Manager;
 let Session: typeof SessionType;
 let root: string, oldData: string | undefined;
@@ -51,6 +52,7 @@ beforeAll(async () => {
   delete process.env.VITEST;
   try {
     ({ TmuxManager } = await import('../src/tmux-manager.js'));
+    ({ ownedRemoteBrokerCache } = await import('../src/recovery/remote-input-broker-cache.js'));
     ({ Session } = await import('../src/session.js'));
   } finally {
     if (vitest !== undefined) process.env.VITEST = vitest;
@@ -69,9 +71,22 @@ afterEach(async () => {
 beforeEach(async () => {
   effects.sync.mockReset().mockReturnValue('99999\n');
   effects.exec.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
-  effects.provision.mockReset().mockImplementation(async (_remote, material, authority) => {
+  effects.provision.mockReset().mockImplementation(async (_remote, material, authority, options) => {
     expect(authority.isCurrent()).toBe(true);
     expect(await authority.prepare()).toBe(true);
+    if (options?.planOnly === true)
+      return {
+        status: 'planned',
+        directory: `/fixture/private/${material.sessionId}/${material.incarnation}`,
+        incarnation: material.incarnation,
+      };
+    if (options?.root) {
+      const records = JSON.parse(await fs.readFile(join(root, 'mux-sessions.json'), 'utf8')) as MuxSession[];
+      expect(records.find((entry) => entry.sessionId === material.sessionId)?.recoveryInputBrokerPending).toBe(
+        material.incarnation
+      );
+      expect(options).toEqual({ root: '/fixture/private' });
+    }
     return {
       status: 'provisioned',
       directory: `/fixture/private/${material.sessionId}/${material.incarnation}`,
@@ -210,6 +225,8 @@ it('refuses remote fork when the exact pending registration cannot be acknowledg
   const { manager, options } = fixture();
   vi.spyOn(manager, 'flushSessionsDurably').mockRejectedValue(new Error('Durability lost'));
   await expect(manager.createSession(options)).rejects.toThrow('reservation needs owner inspection');
+  expect(effects.provision).toHaveBeenCalledOnce();
+  expect(effects.provision.mock.calls[0][3]).toEqual({ planOnly: true });
   expect(effects.observe).not.toHaveBeenCalled();
   expect(effects.sync).not.toHaveBeenCalled();
   expect(manager.getSession(options.sessionId)?.recoveryInputBrokerPending).toBeDefined();
@@ -310,4 +327,32 @@ it('a reconstructed pending remote registration retains its launch veto before a
   sessions.push(session);
   expect(session.codexRestoreWorkerMayExist).toBe(true);
   expect(session.getRecoveryContext()).toMatchObject({ managed: false, inputBrokerPending: true });
+});
+
+it.each(['return-undefined', 'throw'] as const)(
+  'does not create a remote pane when source material persistence fails (%s)',
+  async (failure) => {
+    const { manager, options } = fixture();
+    vi.spyOn(ownedRemoteBrokerCache, 'prepare').mockImplementation(async () => {
+      if (failure === 'throw') throw new Error('Fixture cache failure');
+      return undefined;
+    });
+    await expect(manager.createSession(options)).rejects.toThrow();
+    expect(effects.provision).toHaveBeenCalledOnce();
+    expect(effects.provision.mock.calls[0][3]).toEqual({ planOnly: true });
+    expect(effects.observe).not.toHaveBeenCalled();
+    expect(effects.sync).not.toHaveBeenCalled();
+    expect(manager.getSession(options.sessionId)).toBeUndefined();
+  }
+);
+it('retains the exact pending registration when ordinary remote provisioning loses its acknowledgement', async () => {
+  const { manager, options } = fixture();
+  const normal = effects.provision.getMockImplementation()!;
+  effects.provision.mockImplementation(async (...args) =>
+    args[3]?.planOnly === true ? normal(...args) : { status: 'unknown' }
+  );
+  await expect(manager.createSession(options)).rejects.toThrow('provisioning needs owner inspection');
+  expect(manager.getSession(options.sessionId)?.recoveryInputBrokerPending).toBeDefined();
+  expect(effects.observe).not.toHaveBeenCalled();
+  expect(effects.sync).not.toHaveBeenCalled();
 });

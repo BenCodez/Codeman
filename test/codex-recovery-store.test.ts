@@ -164,7 +164,7 @@ describe('recovery journal durability', () => {
       try {
         await controller.inspect();
         const accepted = new RecoveryStore(path).get('worker');
-        const handledKey = `stall:${createHash('sha256').update('same-turn').digest('hex')}:${nativeIdentity ? `remote:${'b'.repeat(64)}` : NOW - 20_000}`;
+        const handledKey = `stall:${createHash('sha256').update('same-turn').digest('hex')}:${nativeIdentity ? `remote:${'b'.repeat(64)}:${NOW - 20_000}` : NOW - 20_000}`;
         expect(accepted).toMatchObject({
           attempts: 1,
           lastSuccessfulRecovery: NOW,
@@ -207,6 +207,14 @@ describe('recovery journal durability', () => {
         ]) {
           expect(() => store.save('worker', incomplete)).toThrow();
           expect(await fs.readFile(path, 'utf8')).toBe(previous);
+        }
+        if (nativeIdentity) {
+          const legacy = { ...accepted, handledEvidence: [handledKey.slice(0, handledKey.lastIndexOf(':'))] };
+          await store.save('legacy-worker', legacy);
+          const reloaded = new RecoveryStore(path);
+          expect(reloaded.loadFailed).toBe(false);
+          expect(reloaded.get('legacy-worker')).toEqual(legacy);
+          await store.drop('legacy-worker');
         }
         controller.stop();
         observation = { activity: 'unknown', reason: 'identity-unverified', at: NOW, safeToAct: false };

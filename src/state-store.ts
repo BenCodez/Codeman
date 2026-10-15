@@ -237,6 +237,14 @@ export class StateStore {
     const record = typeof session === 'function' ? session() : session;
     const json = JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } });
     const temporary = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.reboot.tmp`;
+    const syncDirectory = () => {
+      const directory = openSync(dirname(this.filePath), 'r');
+      try {
+        fsyncSync(directory);
+      } finally {
+        closeSync(directory);
+      }
+    };
     const write = (text: string) => {
       const fd = openSync(temporary, 'wx', 0o600);
       try {
@@ -246,12 +254,7 @@ export class StateStore {
         closeSync(fd);
       }
       renameSync(temporary, this.filePath);
-      const directory = openSync(dirname(this.filePath), 'r');
-      try {
-        fsyncSync(directory);
-      } finally {
-        closeSync(directory);
-      }
+      syncDirectory();
     };
     this.saveDeb.cancel();
     try {
@@ -262,8 +265,10 @@ export class StateStore {
       // Restore the exact old bytes without publishing the tentative record in memory.
       if (existsSync(this.filePath) && readFileSync(this.filePath, 'utf8') !== previous) {
         try {
-          if (previous === undefined) unlinkSync(this.filePath);
-          else write(previous);
+          if (previous === undefined) {
+            unlinkSync(this.filePath);
+            syncDirectory();
+          } else write(previous);
         } catch {
           // The durable offer still owns the original complete historical record.
         }

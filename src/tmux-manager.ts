@@ -46,7 +46,7 @@ import {
   unlinkSync,
 } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
-import { dirname, join, isAbsolute } from 'node:path';
+import { dirname, join, isAbsolute, posix } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
 import { hasCodexComposerText } from './recovery/codex-classifier.js';
@@ -2129,7 +2129,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       codexHome,
     });
     const material = CodexInputBroker.provisioningMaterial(options.sessionId, command, codexHome);
-    const provisioned = await provisionRemoteInputBroker(
+    const planned = await provisionRemoteInputBroker(
       remote,
       {
         sessionId: options.sessionId,
@@ -2137,14 +2137,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         source: material.helper,
         configJson: JSON.stringify(material.config),
       },
-      authority
+      authority,
+      { planOnly: true }
     );
     if (!current()) throw new Error('Owned SSH launch authority changed');
-    if (provisioned.status === 'existing') return { command: buildOwnedRemoteAttachCommand(remote, options.sessionId) };
+    if (planned.status === 'existing') return { command: buildOwnedRemoteAttachCommand(remote, options.sessionId) };
     // A missing Python broker leaves a manual-only owner launch available. No
     // existing or uncertain remote pane is ever replaced by this branch.
-    if (provisioned.status === 'unsupported') return undefined;
-    if (provisioned.status !== 'provisioned') throw new Error('Owned SSH launch needs owner inspection');
+    if (planned.status === 'unsupported') return undefined;
+    if (planned.status !== 'planned') throw new Error('Owned SSH launch needs owner inspection');
     const scope: OwnedRemoteBrokerScope = {
       sessionId: options.sessionId,
       remote,
@@ -2152,7 +2153,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       codexHome,
       owner: options.owner,
     };
-    const descriptor = await ownedRemoteBrokerCache.prepare(scope, material, provisioned.directory);
+    const descriptor = await ownedRemoteBrokerCache.prepare(scope, material, planned.directory);
     if (!descriptor || !current()) throw new Error('Owned SSH launch material unavailable');
     // An owner launch has no local SSH wrapper yet. Save its exact pending
     // incarnation before the remote child can start; never rediscover a latest file.
@@ -2175,6 +2176,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     before = reservation;
     if (!(await this.reserveOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) || !current())
       throw new Error('Owned SSH launch reservation needs owner inspection');
+    const provisioned = await provisionRemoteInputBroker(
+      remote,
+      {
+        sessionId: options.sessionId,
+        incarnation: material.config.incarnation,
+        source: material.helper,
+        configJson: JSON.stringify(material.config),
+      },
+      authority,
+      { root: posix.dirname(posix.dirname(planned.directory)) }
+    );
+    if (provisioned.status !== 'provisioned' || provisioned.directory !== descriptor.directory || !current())
+      throw new Error('Owned SSH launch provisioning needs owner inspection');
     const observed = await observeOwnedRemoteBroker(
       remote,
       { sessionId: options.sessionId, descriptor, codexHome, pane: provisioned.pane },
@@ -4330,9 +4344,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         }
         continue;
       }
-      const pid = active.get(session.muxName);
-      if (pid === undefined && Object.hasOwn(session, 'restoreUncertain') && session.restoreUncertain !== false)
+      if (!completeListing && Object.hasOwn(session, 'restoreUncertain') && session.restoreUncertain !== false)
         continue;
+      const pid = active.get(session.muxName);
       if (pid !== undefined) {
         alive.push(sessionId);
         if (pid !== session.pid) session.pid = pid;
