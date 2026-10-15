@@ -236,6 +236,12 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             unspent.delete(entry);
             continue;
           }
+          // Generic constructors resolve effective CLI/env settings during setup.
+          // A later grant snapshot cannot authorize values prepared for an older owner role.
+          const initialGenericGrant =
+            !usesCodexRecovery && saved.owner
+              ? await clampRecoveryLaunchForOwner(saved.owner, {}, undefined)
+              : undefined;
           let envOverrides = await clampEnvOverridesForOwner(
             saved.owner,
             (saved as { __envOverrides?: Record<string, string> }).__envOverrides
@@ -482,6 +488,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 : ownerEnv;
             let granted = false;
             let grantIsCurrent = () => false;
+            let verifyGrantCurrent = async () => false;
             let grantFiles: readonly PrivateFileWitness[] = [];
             const launchScopeIsCurrent = () => {
               const peers = [...ctx.sessions.values()].filter((other) => other !== session);
@@ -506,13 +513,16 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               prepare: async () => {
                 granted = false;
                 grantIsCurrent = () => false;
+                verifyGrantCurrent = async () => false;
                 grantFiles = [];
                 const current = await clampRecoveryLaunchForOwner(saved.owner, { codexConfig }, envToAuthorize);
                 grantIsCurrent = current.isCurrent;
+                verifyGrantCurrent = current.verifyCurrent;
                 const grantFile = current.getFileWitness();
                 grantFiles = grantFile ? [grantFile] : [];
                 granted =
                   grantIsCurrent() === true &&
+                  (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
                   (await customModelIsCurrent(undefined, undefined, grantFiles)) === true &&
                   sameCodexLaunchConfig(current.configs.codexConfig as CodexConfig | undefined, codexConfig!) &&
                   JSON.stringify(current.env) === JSON.stringify(envToAuthorize);
@@ -522,7 +532,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               confirm: async () => {
                 return (
                   authorityIsCurrent() &&
+                  (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
+                  authorityIsCurrent() &&
                   (await customModelIsCurrent(finalEvidence!, fence, grantFiles)) === true &&
+                  (await verifyGrantCurrent()) &&
                   authorityIsCurrent()
                 );
               },
@@ -537,9 +550,16 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               await discardCancelledRestore();
               continue;
             }
+            let workspaceGranted = false;
+            let grantIsCurrent = () => false;
+            let verifyGrantCurrent = async () => false;
+            let grantFiles: readonly PrivateFileWitness[] = [];
             const launchScopeIsCurrent = () => {
               const peers = [...ctx.sessions.values()].filter((other) => other !== session);
               return (
+                workspaceGranted &&
+                (!initialGenericGrant || initialGenericGrant.isCurrent()) &&
+                grantIsCurrent() &&
                 ctx.sessions.get(session.id) === session &&
                 session.owner === saved.owner &&
                 rejectAlreadyLive(
@@ -552,11 +572,36 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             cancellationIsCurrent = launchScopeIsCurrent;
             const authorityIsCurrent = () => rebootRestoreRegistry.isHeld(entry, owner) && launchScopeIsCurrent();
             session.setRestoreLaunchGuard({
-              prepare: async () => {},
+              prepare: async () => {
+                workspaceGranted = false;
+                grantIsCurrent = () => false;
+                verifyGrantCurrent = async () => false;
+                grantFiles = [];
+                const current = await clampRecoveryLaunchForOwner(saved.owner, {}, undefined);
+                // The username-keyed confinement contract leaves legacy unowned
+                // records unrestricted; real owners require a live grant snapshot.
+                grantIsCurrent = saved.owner ? current.isCurrent : () => true;
+                verifyGrantCurrent = saved.owner ? current.verifyCurrent : async () => true;
+                const initialFile = initialGenericGrant?.getFileWitness();
+                const currentFile = saved.owner ? current.getFileWitness() : undefined;
+                grantFiles = [...(initialFile ? [initialFile] : []), ...(currentFile ? [currentFile] : [])];
+                workspaceGranted =
+                  (!initialGenericGrant || initialGenericGrant.isCurrent()) &&
+                  grantIsCurrent() &&
+                  (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
+                  grantIsCurrent();
+              },
               isCurrent: authorityIsCurrent,
               confirm: async () =>
                 authorityIsCurrent() &&
-                (!savedCustomModel || (await customModelIsCurrent()) === true) &&
+                (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
+                authorityIsCurrent() &&
+                (!initialGenericGrant || (await initialGenericGrant.verifyCurrent())) &&
+                (await verifyGrantCurrent()) &&
+                authorityIsCurrent() &&
+                // The final profile proof jointly rechecks its own files and the
+                // grants after every awaited grant read, immediately before dispatch.
+                (!savedCustomModel || (await customModelIsCurrent(undefined, undefined, grantFiles)) === true) &&
                 authorityIsCurrent(),
             });
           }

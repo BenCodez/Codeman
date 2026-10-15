@@ -22239,6 +22239,11 @@ html[data-header-stats='tiles'] .header-plan-usage:not(:has(.pu-row)) {
 #task-tab .task-form > label { font-size: 0.8rem; }
 #task-tab .task-form textarea { width: 100%; resize: vertical; box-sizing: border-box; }
 #task-tab .task-form > .btn-toolbar { align-self: flex-start; }
+#task-tab #taskCriteriaRows { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+#task-tab .task-criterion-editor { display: flex; flex-direction: column; gap: 8px; min-width: 0; border: 1px solid var(--border-light); border-radius: 8px; padding: 12px; }
+#task-tab .task-criterion-editor label { display: flex; flex-direction: column; gap: 6px; font-size: 0.8rem; }
+#task-tab .task-criterion-editor strong { font-size: 0.8rem; }
+#task-tab .task-criterion-editor > button { align-self: flex-end; }
 #task-tab .task-criterion { display: flex; gap: 8px; align-items: flex-start; padding: 8px 0; font-size: 0.8rem; overflow-wrap: anywhere; }
 #task-tab .task-history { max-height: 220px; overflow: auto; overflow-wrap: anywhere; padding-left: 24px; font-size: 0.8rem; }
 #task-tab .btn-toolbar:disabled { opacity: 0.45; cursor: default; }

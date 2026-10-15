@@ -54,6 +54,55 @@ afterEach(() => {
   for (const dom of doms.splice(0)) dom.window.close();
 });
 describe('Task supervision UI', () => {
+  it.each(['manual', 'command'] as const)(
+    'preserves an exact multiline %s criterion when another criterion of the same kind is edited',
+    async (kind) => {
+      const initial = state();
+      const exact = '  界 first line\r\nsecond line  ';
+      initial.criteria = [
+        {
+          id: 'first',
+          kind,
+          description: kind === 'manual' ? exact : 'First human label',
+          ...(kind === 'command' ? { command: exact } : {}),
+          verified: false,
+        },
+        {
+          id: 'other-kind',
+          kind: kind === 'manual' ? 'command' : 'manual',
+          description: 'Unchanged middle criterion',
+          ...(kind === 'manual' ? { command: 'unchanged command' } : {}),
+          verified: false,
+        },
+        {
+          id: 'second',
+          kind,
+          description: kind === 'manual' ? 'Edit this criterion' : 'Second human label',
+          ...(kind === 'command' ? { command: 'Edit this criterion' } : {}),
+          verified: false,
+        },
+      ] as any;
+      const h = harness(initial);
+      await h.open();
+      const field = h
+        .get('taskCriteriaRows')
+        .children[2].querySelector(`[data-task-field="${kind === 'manual' ? 'description' : 'command'}"]`);
+      field.value = '  Edited criterion\nwith a second line  ';
+      field.dispatchEvent(new h.dom.window.Event('input', { bubbles: true }));
+      await h.app.saveTaskConfiguration();
+      const criteria = h.app._apiJson.mock.calls[1][1].body.criteria;
+      expect(criteria).toHaveLength(3);
+      expect(criteria.map((criterion) => criterion.id)).toEqual(['first', 'other-kind', 'second']);
+      expect(criteria[0]).toMatchObject(
+        kind === 'manual' ? { description: exact } : { description: 'First human label', command: exact }
+      );
+      expect(criteria[2]).toMatchObject(
+        kind === 'manual'
+          ? { description: '  Edited criterion\nwith a second line  ' }
+          : { description: 'Second human label', command: '  Edited criterion\nwith a second line  ' }
+      );
+    }
+  );
   it('is separately disabled by default and sends no activation request on open', async () => {
     const h = harness();
     await h.open();
@@ -82,20 +131,21 @@ describe('Task supervision UI', () => {
     expect(h.app._apiJson).toHaveBeenCalledTimes(2);
   });
   it('sends a config-only patch without resetting exact completed criteria or spent budgets', async () => {
+    const exactCommand = '  printf "界"\r\nnpm run lint  ';
     const restored = initialTaskState();
     restored.objective = 'Ship the verified fix';
     restored.criteria = [
       {
         id: 'custom-command',
-        description: 'Unit and lint checks pass',
+        description: 'Unit and lint checks pass\r\n保留说明  ',
         kind: 'command',
-        command: 'npm test\nnpm run lint',
+        command: exactCommand,
         verified: true,
         evidence: { source: 'command', at: 10001, commandHash: 'a'.repeat(64) },
       },
       {
         id: 'custom-manual',
-        description: 'Owner approved UI\nOwner approved API',
+        description: '  Owner approved UI\r\nOwner approved API  ',
         kind: 'manual',
         verified: true,
         evidence: { source: 'owner', at: 10002 },
@@ -125,6 +175,9 @@ describe('Task supervision UI', () => {
       options?.method === 'PUT' ? controller.update(options.body) : controller.getStatus()
     );
     await h.open();
+    expect(h.get('taskCriteriaRows').querySelector('[data-task-field="command"]').value).toBe(
+      exactCommand.replace(/\r\n/g, '\n')
+    );
     h.get('taskMaxContinuations').value = '5';
 
     await h.app.saveTaskConfiguration();
@@ -143,7 +196,8 @@ describe('Task supervision UI', () => {
       config: { enabled: true, maxContinuations: 5, maxRuntimeMs: 900000 },
     });
 
-    h.get('taskManualCriteria').value += '\nSecurity review complete';
+    h.app.addTaskCriterion('manual');
+    h.get('taskCriteriaRows').lastElementChild.querySelector('textarea').value = 'Security review complete';
     await h.app.saveTaskConfiguration();
 
     expect(h.app._apiJson.mock.calls[2][1].body.criteria).toBeDefined();
@@ -152,11 +206,125 @@ describe('Task supervision UI', () => {
     expect(afterEdit.kickoffAt).toBeUndefined();
     expect(afterEdit.criteria.every((criterion) => !criterion.verified)).toBe(true);
     expect(afterEdit.criteria.find((criterion) => criterion.id === 'custom-command')).toMatchObject({
-      description: 'Unit and lint checks pass',
-      command: 'npm test\nnpm run lint',
+      description: 'Unit and lint checks pass\r\n保留说明  ',
+      command: exactCommand,
     });
     expect(afterEdit.criteria.filter((criterion) => criterion.kind === 'command')).toHaveLength(1);
     controller.stop();
+  });
+  it('keeps duplicate criterion identities and interleaved order through removal and a multiline paste', async () => {
+    const initial = state();
+    initial.criteria = [
+      { id: 'manual-first', kind: 'manual', description: 'Same text', verified: false },
+      { id: 'command-first', kind: 'command', description: 'Command label', command: 'Same text', verified: false },
+      { id: 'manual-second', kind: 'manual', description: 'Same text', verified: false },
+      {
+        id: 'command-second',
+        kind: 'command',
+        description: 'Other command label',
+        command: 'Same text',
+        verified: false,
+      },
+    ];
+    const h = harness(initial);
+    await h.open();
+    h.get('taskCriteriaRows').firstElementChild.querySelector('button').click();
+    h.app.addTaskCriterion('command');
+    const added = h.get('taskCriteriaRows').lastElementChild;
+    const command = added.querySelector('[data-task-field="command"]');
+    command.value = '  printf "你好"\nprintf "second line"  ';
+    command.dispatchEvent(new h.dom.window.Event('input', { bubbles: true }));
+    await h.app.saveTaskConfiguration();
+    const criteria = h.app._apiJson.mock.calls[1][1].body.criteria;
+    expect(criteria.slice(0, 3).map((criterion) => criterion.id)).toEqual([
+      'command-first',
+      'manual-second',
+      'command-second',
+    ]);
+    expect(criteria[0]).toEqual({
+      id: 'command-first',
+      kind: 'command',
+      description: 'Command label',
+      command: 'Same text',
+    });
+    expect(criteria[2]).toEqual({
+      id: 'command-second',
+      kind: 'command',
+      description: 'Other command label',
+      command: 'Same text',
+    });
+    expect(initial.criteria.map((criterion) => criterion.id)).not.toContain(criteria[3].id);
+    expect(criteria[3]).toMatchObject({ kind: 'command', command: command.value, description: command.value });
+  });
+  it('accepts a deliberate exact command edit while retaining its untouched CRLF description', async () => {
+    const initial = state();
+    initial.criteria[1].description = '  Label\r\n保留  ';
+    initial.criteria[1].command = 'old\r\ncommand';
+    const h = harness(initial);
+    await h.open();
+    const row = h.get('taskCriteriaRows').children[1];
+    const command = row.querySelector('[data-task-field="command"]');
+    command.value = '  new\n命令  ';
+    command.dispatchEvent(new h.dom.window.Event('input', { bubbles: true }));
+    h.app._onSessionTask({ sessionId: 'a', state: { ...initial, outcome: 'unfinished' } });
+    expect(h.get('taskCriteriaRows').children[1]).toBe(row);
+    await h.app.saveTaskConfiguration();
+    expect(h.app._apiJson.mock.calls[1][1].body.criteria[1]).toEqual({
+      id: 'command-a',
+      kind: 'command',
+      description: initial.criteria[1].description,
+      command: '  new\n命令  ',
+    });
+  });
+  it('keeps focused criterion fields mounted on status-only updates and refreshes changed criteria', async () => {
+    const initial = state();
+    const h = harness(initial);
+    await h.open();
+    const row = h.get('taskCriteriaRows').children[1];
+    const command = row.querySelector('[data-task-field="command"]');
+    command.focus();
+    command.setSelectionRange(2, 5);
+    expect(h.app._taskView.dirty).toBe(false);
+    h.app._onSessionTask({ sessionId: 'a', state: { ...initial, reason: 'configured', continuations: 1 } });
+    expect(h.get('taskCriteriaRows').children[1]).toBe(row);
+    expect(h.dom.window.document.activeElement).toBe(command);
+    expect([command.selectionStart, command.selectionEnd]).toEqual([2, 5]);
+    expect(h.get('taskAttempts').textContent).toBe('1 / 3');
+    const changed = structuredClone(initial);
+    changed.criteria[1].command = 'new exact command';
+    h.app._onSessionTask({ sessionId: 'a', state: changed });
+    expect(h.get('taskCriteriaRows').children[1]).not.toBe(row);
+    expect(h.get('taskCriteriaRows').children[1].querySelector('[data-task-field="command"]').value).toBe(
+      'new exact command'
+    );
+  });
+  it('refuses empty rows and caps additions without dropping existing criterion identities', async () => {
+    const initial = state();
+    initial.criteria = Array.from({ length: 30 }, (_, index) => ({
+      id: `m${index}`,
+      description: 'Owner check',
+      kind: 'manual',
+      verified: false,
+    }));
+    const h = harness(initial);
+    await h.open();
+    expect(h.get('taskAddManualCriterion').disabled).toBe(true);
+    h.app.addTaskCriterion('manual');
+    expect(h.get('taskCriteriaRows').children).toHaveLength(30);
+    h.get('taskCriteriaRows').firstElementChild.querySelector('button').click();
+    expect(h.get('taskAddCommandCriterion').disabled).toBe(false);
+    h.app.addTaskCriterion('manual');
+    await h.app.saveTaskConfiguration();
+    expect(h.app._apiJson).toHaveBeenCalledOnce();
+    expect(h.app.showToast).toHaveBeenCalledWith(
+      'Provide an objective, acceptance criteria, and valid task limits',
+      'warning'
+    );
+    expect([...h.get('taskCriteriaRows').children].slice(0, 29).map((row: any) => row.dataset.criterionId)).toEqual(
+      initial.criteria.slice(1).map((criterion) => criterion.id)
+    );
+    h.app.closeTaskOptions();
+    expect(h.get('taskCriteriaRows').children).toHaveLength(0);
   });
   it('submits owner verification only and guards exhausted, blocked and completed actions', async () => {
     const h = harness();
@@ -232,7 +400,8 @@ describe('Task supervision UI', () => {
     h.get('taskObjective').value = 'Review the updated objective';
     await h.app.saveTaskConfiguration();
     expect(controller.getStatus().phase).toBe('paused');
-    h.get('taskManualCriteria').value += '\nSecurity review';
+    h.app.addTaskCriterion('manual');
+    h.get('taskCriteriaRows').lastElementChild.querySelector('textarea').value = 'Security review';
     await h.app.saveTaskConfiguration();
     expect(controller.getStatus().phase).toBe('paused');
     await controller.refresh();
@@ -389,6 +558,12 @@ describe('Task supervision UI', () => {
       'Continuation attempt pending; acceptance unverified',
       'Provide an objective, acceptance criteria, and valid task limits',
       'Task action failed. Refresh status before trying again.',
+      'Owner acceptance criterion',
+      'Command acceptance check',
+      'Description',
+      'Exact command',
+      'Defaults to the command',
+      'Remove criterion',
     ])
       labels.add(label);
     translator.configure({ language: 'zh-CN' });

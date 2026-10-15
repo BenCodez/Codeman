@@ -1624,8 +1624,11 @@
               </div></div>
               <fieldset class="set-group task-form" id="taskSettings" disabled><legend>Task configuration</legend>
                 <label for="taskObjective">Objective</label><textarea class="set-textarea" id="taskObjective" rows="3" maxlength="4000" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
-                <label for="taskManualCriteria">Owner acceptance criteria (one per line)</label><textarea class="set-textarea" id="taskManualCriteria" rows="3" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
-                <label for="taskCommandCriteria">Command acceptance checks (one exact command per line)</label><textarea class="set-textarea" id="taskCommandCriteria" rows="3" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <div id="taskCriteriaRows"></div>
+                <div class="task-actions">
+                  <button class="btn-toolbar" type="button" id="taskAddManualCriterion" onclick="app.addTaskCriterion('manual')">Add owner criterion</button>
+                  <button class="btn-toolbar" type="button" id="taskAddCommandCriterion" onclick="app.addTaskCriterion('command')">Add command check</button>
+                </div>
                 <p class="set-group-hint">Commands are matched against structured successful execution in this conversation. Saving checks does not run shell commands.</p>
                 <label><input type="checkbox" id="taskEnabled" onchange="app.markTaskDraft()"> Enable task supervision</label>
                 <label for="taskMaxContinuations">Maximum continuations</label><input class="set-input" type="number" id="taskMaxContinuations" min="0" max="10" step="1" oninput="app.markTaskDraft()">
