@@ -64,12 +64,14 @@ const snapshot = (path: string, info: Stats, kind: ExpectedPath['kind']): Expect
 async function run<T>(
   key: string,
   dataDir: string,
-  execute: (budget: ReturnType<typeof budgetFor>) => Promise<T>
+  execute: (budget: ReturnType<typeof budgetFor>) => Promise<T>,
+  originalDeadline = Infinity
 ): Promise<T | undefined> {
+  const deadline = Math.min(performance.now() + 2_000, originalDeadline);
+  if (!Number.isFinite(deadline) || performance.now() >= deadline) return undefined;
   let job = pending.get(key);
   if (!job) {
     if (pending.size >= 2) return undefined;
-    const deadline = performance.now() + 2_000;
     const work = execute(budgetFor(deadline, dataDir)).catch(() => undefined);
     job = { deadline, work };
     pending.set(key, job);
@@ -77,7 +79,7 @@ async function run<T>(
       if (pending.get(key)?.work === work) pending.delete(key);
     });
   }
-  const remaining = job.deadline - performance.now();
+  const remaining = Math.min(job.deadline, deadline) - performance.now();
   if (remaining <= 0) return undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -87,7 +89,9 @@ async function run<T>(
         timer = setTimeout(() => resolve(undefined), remaining);
       }),
     ]);
-    return performance.now() < job.deadline && getDataDirPath() === dataDir ? (result as T | undefined) : undefined;
+    return performance.now() < Math.min(job.deadline, deadline) && getDataDirPath() === dataDir
+      ? (result as T | undefined)
+      : undefined;
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -191,7 +195,8 @@ function budgetFor(deadline: number, dataDir: string) {
 
 /** Bind the old incarnation before reconciliation or a new guarded launch replaces mux metadata. */
 export async function captureRebootBrokerBindings(
-  persisted: Readonly<Record<string, SessionState>>
+  persisted: Readonly<Record<string, SessionState>>,
+  deadline?: number
 ): Promise<Map<string, string | null> | undefined> {
   const dataDir = getDataDirPath();
   const states = Object.values(persisted).filter((state) => state.mode === 'codex' && !state.remote && !state.docker);
@@ -327,7 +332,8 @@ export async function captureRebootBrokerBindings(
       }
       if (!(await budget.finish())) throw new Error('Historical input binding changed');
       return result;
-    }
+    },
+    deadline
   );
 }
 

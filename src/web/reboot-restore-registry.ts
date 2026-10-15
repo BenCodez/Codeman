@@ -467,7 +467,8 @@ export class RebootRestoreRegistry {
     entries: ReadonlyMap<string, RebootRestoreEntry>,
     parked: ReadonlyMap<string, ParkedEntry>,
     builtAt: number,
-    expectedPreviousText?: string
+    expectedPreviousText?: string,
+    scopeCurrent: () => boolean = () => true
   ): Promise<void> {
     if (this.persistenceLoadFailed) throw new Error('Restore offer journal could not be loaded; refusing overwrite');
     if (!this.persistencePath) return;
@@ -480,6 +481,7 @@ export class RebootRestoreRegistry {
     const current = () =>
       this.epoch === epoch &&
       this.persistencePath === path &&
+      scopeCurrent() &&
       JSON.stringify({ version: 1, builtAt, entries: outstanding }) === text;
     if (!current()) throw new Error('Restore offer transaction was superseded');
     await this.snapshotWriter(path, text, current, expectedPreviousText);
@@ -526,6 +528,79 @@ export class RebootRestoreRegistry {
     )
       return undefined;
     return structuredClone({ entries: [...this.entries.values()], parked: [...this.parked.values()] });
+  }
+
+  /** Capture before boot verification; later owner changes always supersede this merge. */
+  async preparePlanMerge(): Promise<
+    (
+      entries: readonly RebootRestoreEntry[],
+      isCurrent?: () => boolean,
+      scannedIds?: readonly string[]
+    ) => Promise<boolean>
+  > {
+    this.dropIfExpired();
+    if (this.expiryScheduled) await this.writes;
+    const epoch = this.epoch,
+      revision = this.stateRevision,
+      builtAt = this.builtAt;
+    const snapshot = JSON.stringify([...this.entries]);
+    const available = () =>
+      !this.loading &&
+      !this.expired &&
+      !this.persistenceLoadFailed &&
+      !this.persistenceWriteFailed &&
+      !this.spending.size &&
+      !this.parked.size &&
+      !this.failedReleases.size;
+    const admitted = available() && this.pendingWrites.size === 0;
+    const unchanged = () =>
+      admitted &&
+      available() &&
+      this.epoch === epoch &&
+      this.stateRevision === revision &&
+      this.builtAt === builtAt &&
+      !(builtAt > 0 && Date.now() - builtAt > PLAN_TTL_MS) &&
+      [...this.entries.values()].every((entry) => !this.revoked.has(entry)) &&
+      JSON.stringify([...this.entries]) === snapshot;
+    return async (entries, isCurrent = () => true, scannedIds = []) => {
+      const current = () => {
+        try {
+          const verdict: unknown = isCurrent();
+          if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+            void Promise.resolve(verdict).catch(() => {});
+          return unchanged() && verdict === true;
+        } catch {
+          return false;
+        }
+      };
+      if (!current() || this.pendingWrites.size) return false;
+      // Only freshly scanned rows are replaced (including fresh refusals).
+      // Unrelated loaded offers retain their original identity and expiry.
+      const scanned = new Set(scannedIds);
+      const next = new Map([...this.entries].filter(([id]) => !scanned.has(id)));
+      for (const entry of entries) next.set(entry.sessionId, entry);
+      if (JSON.stringify([...next]) === snapshot) return true;
+      const nextBuiltAt = next.size ? builtAt || Date.now() : 0;
+      if (next.size > 1000 || Buffer.byteLength(JSON.stringify([...next.values()])) > MAX_SNAPSHOT_BYTES)
+        throw new Error('Restore offer exceeds storage budget');
+      const publish = () => {
+        this.entries = next;
+        this.builtAt = nextBuiltAt;
+        this.stateRevision++;
+      };
+      if (!this.persistencePath) {
+        if (!current()) return false;
+        publish();
+        return true;
+      }
+      return this.enqueue(async () => {
+        if (!current()) return false;
+        await this.persistState(next, this.parked, nextBuiltAt, undefined, current);
+        if (!current()) return false;
+        publish();
+        return true;
+      });
+    };
   }
 
   /** Replace the plan with what the boot pass found. An empty list clears it. */
