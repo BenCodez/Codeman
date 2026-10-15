@@ -1,3 +1,8 @@
+import fs from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
+import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 /** Real Session + real tmux input normalization, with an injected recording runner and no processes. */
 import { afterEach, describe, it, expect, vi } from 'vitest';
@@ -24,12 +29,14 @@ const THREAD = '11111111-2222-3333-4444-555555555555';
 const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 let session: Session | undefined;
 let controller: TaskController | undefined;
+const brokerRoots: string[] = [];
 afterEach(async () => {
   controller?.stop();
   await controller?.drain();
   await session?.stop(false);
   vi.restoreAllMocks();
   nativeRead.mockClear();
+  for (const root of brokerRoots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 const line = (at: number, payload: unknown) =>
   JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
@@ -70,16 +77,31 @@ function shellWords(command: string): string[] {
   return words;
 }
 describe('transport canonical task prompts', () => {
-  it.each(['unchanged', 'missing-tail', 'generation-changed'])(
+  it.each(['unchanged', 'missing-tail', 'generation-changed', 'malformed-command'])(
     'uses one coherent recovery snapshot for task evidence: %s',
     async (change) => {
       let generation = 1;
       const now = Date.now();
+      const command = {
+        call_id: 'acceptance',
+        turn_id: 'task-turn',
+        command: ['bash', '-lc', 'npm test'],
+        cwd: '/fixture/workspace',
+        parsed_cmd: [{ type: 'unknown', cmd: 'npm test' }],
+        source: 'agent',
+      };
       const tail =
         line(now - 4, { type: 'user_message', message: 'Authorized task' }) +
         line(now - 3, { type: 'task_started', turn_id: 'task-turn' }) +
-        line(now - 2, { type: 'exec_command_begin', call_id: 'acceptance', command: ['bash', '-lc', 'npm test'] }) +
-        line(now - 1, { type: 'exec_command_end', call_id: 'acceptance', exit_code: 0 }) +
+        line(now - 2, { ...command, type: 'exec_command_begin', started_at_ms: now - 2 }) +
+        line(now - 1, {
+          ...command,
+          type: 'exec_command_end',
+          completed_at_ms: now - 1,
+          exit_code: 0,
+          duration: { secs: 0, nanos: 1_000_000 },
+          status: change === 'malformed-command' ? 'future_status' : 'completed',
+        }) +
         line(now, { type: 'task_complete', turn_id: 'task-turn' }) +
         line(now, { type: 'agent_message', message: 'CODEMAN_TASK_PROGRESS {"outcome":"completed"}' });
       const fakeSession = {
@@ -308,6 +330,39 @@ describe('transport canonical task prompts', () => {
   );
 
   it('accepts both real kickoff and continuation bytes and processes subsequent structured progress', async () => {
+    vi.spyOn(Date, 'now').mockReturnValue(10_000);
+    const root = await fs.mkdtemp(join(homedir(), 'task-canonical-input-'));
+    brokerRoots.push(root);
+    const broker = await CodexInputBroker.create(root, SESSION, 'explicit fake worker', currentLocalCodexHome());
+    const privateConfig = JSON.parse(await fs.readFile(join(broker.directory, 'config.json'), 'utf8'));
+    const inputProof = fakeInputProvenance(
+      { brokerPid: 700, childPid: 701, incarnation: broker.incarnation, launchDigest: privateConfig.launchDigest },
+      currentLocalCodexHome()
+    );
+    inputProof.fileWitness!.path = join(broker.directory, 'state.json');
+    updateFakeInputProvenance(inputProof, {}, (proof) => ({
+      version: 1,
+      sessionId: SESSION,
+      incarnation: proof.incarnation,
+      pid: proof.brokerPid,
+      childPid: proof.childPid,
+      brokerStart: proof.brokerStart,
+      childStart: proof.childStart,
+      tainted: false,
+      rawGeneration: 0,
+      launchDigest: proof.launchDigest,
+      homeDigest: proof.homeDigest,
+      closed: false,
+      exitStatus: null,
+      exitSignal: null,
+      counters: { ...proof.ownerCounters, auto: 0, probe: 0 },
+      receipts: [],
+      startup: { nonce: privateConfig.startup.nonce, status: 'started' },
+    }));
+    const journalText = await fs.readFile(inputProof.fileWitness!.path, 'utf8');
+    expect(await broker.readState()).toBeDefined();
+    vi.spyOn(broker, 'prove').mockImplementation(async () => inputProof);
+    vi.spyOn(broker, 'receipt').mockResolvedValue('sent');
     const delivered: string[] = [];
     let enters = 0;
     const screen = '›\n  example-model high · /tmp\n';
@@ -334,7 +389,18 @@ describe('transport canonical task prompts', () => {
         expect(send.slice(0, 3)).toEqual(['send-keys', '-t', '%7']);
         if (send[3] === '-l') {
           expect(send).toHaveLength(5);
-          delivered.push(send[4]);
+          const match = send[4].match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):[a-f0-9]{64}/);
+          expect(match).not.toBeNull();
+          const packet = JSON.parse(Buffer.from(match![1], 'base64').toString());
+          expect(packet.channel).toBe('auto');
+          expect(packet.conversationId).toBe(THREAD);
+          const bytes = Buffer.from(packet.data, 'base64').toString();
+          if (bytes === '\r') {
+            enters++;
+            joinedScreen = screen;
+            return { stdout: '' };
+          }
+          delivered.push(bytes);
           joinedScreen = `› ${delivered.at(-1)}\n  example-model high · /tmp\n`;
         } else if (send[3] === 'Enter') {
           expect(send).toHaveLength(4);
@@ -356,7 +422,8 @@ describe('transport canonical task prompts', () => {
     const muxSession = {
       sessionId: SESSION,
       muxName: 'codeman-aaaaaaaa',
-      pid: 99999,
+      pid: 700,
+      recoveryInputBroker: broker.incarnation,
       createdAt: 10000,
       workingDir: '/tmp',
       mode: 'codex',
@@ -365,9 +432,11 @@ describe('transport canonical task prompts', () => {
       recoveryCodexHome: currentLocalCodexHome(),
     } as MuxSession;
     mux.registerSession(muxSession);
+    Reflect.get(mux, 'inputBrokers').set(SESSION, broker);
     vi.spyOn(mux, 'inspectPaneForRecovery').mockResolvedValue({
       paneId: '%7',
       panePid: 700,
+      inputProvenance: inputProof,
       dead: false,
       screen,
       status: undefined,
@@ -410,7 +479,23 @@ describe('transport canonical task prompts', () => {
           { action: 'continue', key, conversationId, startedAt: now },
           session!.getRecoveryContext().generation,
           isCurrent,
-          prompt
+          prompt,
+          Object.assign(async () => true, {
+            getEvidenceSource: () => ({
+              sessionId: SESSION,
+              inputBroker: broker.authority(inputProof),
+              files: [inputProof.fileWitness!],
+              identity: {
+                reason: 'verified' as const,
+                conversationId: THREAD,
+                path: inputProof.fileWitness!.path,
+                tail: journalText,
+                tailTruncated: false,
+                witness: { paths: [{ ...inputProof.fileWitness!, kind: 'file' as const }] },
+              },
+              isCurrent: () => true,
+            }),
+          })
         ),
     });
     await controller.update({

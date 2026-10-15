@@ -6,6 +6,7 @@ import { matchesNativePaneSignal } from './native-pane-signal.js';
 import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../session-env-clamp.js';
 import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
 import { checkCodexIdentityWitnesses } from './codex-witness-check.js';
+import type { CodexBrokerProof } from './codex-input-broker.js';
 import { currentLocalCodexHome } from './codex-home.js';
 import { classifyCodexTail, hasEmptyCodexComposer } from './codex-classifier.js';
 import {
@@ -60,6 +61,7 @@ export class CodexRecoveryAdapter {
     witness?: CodexIdentityWitness;
     config: string;
     env: string;
+    inputProof?: CodexBrokerProof;
   };
 
   constructor(
@@ -133,6 +135,20 @@ export class CodexRecoveryAdapter {
         env: JSON.stringify(this.session.getEnvOverridesForPersist()),
       };
     if (!pane) return unknown('pane-unverified');
+    // History identifies submitted input, not an unobserved direct /resume.
+    // Only a launch-owned input broker can exclude that unseen input path.
+    const inputProof = pane.inputProvenance;
+    if (!inputProof || !inputProof.fileWitness) return unknown('identity-unverified');
+    if (!context.codexHome || inputProof.homeDigest !== createHash('sha256').update(context.codexHome).digest('hex'))
+      return unknown('identity-unverified');
+    if (
+      inputProof.brokerPid !== pane.panePid ||
+      inputProof.closed !== pane.dead ||
+      !Number.isSafeInteger(inputProof.childPid) ||
+      inputProof.childPid <= 0
+    )
+      return unknown('pane-unverified');
+    if (this.verifiedTail) this.verifiedTail.inputProof = inputProof;
     if (session.codexConfig?.resumeSessionId !== identity.conversationId) {
       session.pinRecoveryConversation(identity.conversationId);
       this.persistSession();
@@ -140,12 +156,13 @@ export class CodexRecoveryAdapter {
     let observation: RecoveryObservation;
     if (pane.dead) {
       const exit = session.paneExit;
-      if (pane.status === 0 && !pane.signal) {
+      if (inputProof.exitStatus === 0 && !inputProof.exitSignal) {
         observation = { activity: 'exited', reason: 'clean-exit', at: exit?.at ?? Date.now(), safeToAct: false };
       } else if (
         exit &&
         pane.status === exit.status &&
         pane.signal === exit.signal &&
+        ((inputProof.exitStatus ?? 0) > 0 || (inputProof.exitSignal ?? 0) > 0) &&
         ((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0)
       ) {
         // A confirmed parent exit cannot clear child work, owner intent or permission/authentication vetoes.
@@ -236,6 +253,7 @@ export class CodexRecoveryAdapter {
             status: pane.status,
             signal: pane.signal,
             paneSignalToken: pane.paneSignalToken,
+            inputProvenance: inputProof,
           }
         : undefined;
     if (nativePane) observation.processProofKey = createHash('sha256').update(JSON.stringify(nativePane)).digest('hex');
@@ -271,6 +289,7 @@ export class CodexRecoveryAdapter {
       expected?.conversationId !== conversationId ||
       !expected.path ||
       !expected.witness ||
+      !expected.inputProof?.fileWitness ||
       context.generation !== generation ||
       expected.config !== JSON.stringify(this.session.codexConfig) ||
       expected.env !== JSON.stringify(this.session.getEnvOverridesForPersist())
@@ -286,8 +305,28 @@ export class CodexRecoveryAdapter {
         this.session.remote,
       ]);
     const snapshot = scope();
+    const authority = this.session.getRecoveryInputAuthority(expected.inputProof);
+    const leaf = expected.witness.paths.find((path) => path.path === expected.path && path.kind === 'file');
+    if (!authority || !leaf || leaf.size === undefined || leaf.mtimeMs === undefined || leaf.ctimeMs === undefined)
+      return undefined;
+    authority.files = [
+      ...(authority.files ?? []),
+      {
+        path: expected.path,
+        dev: leaf.dev,
+        ino: leaf.ino,
+        size: leaf.size,
+        mtimeMs: leaf.mtimeMs,
+        ctimeMs: leaf.ctimeMs,
+        hash: createHash('sha256').update(expected.tail).digest('hex'),
+        maxBytes: 262_144,
+      },
+    ];
+    authority.paths = expected.witness.paths.map((path) => ({ ...path }));
     return {
       sessionId: this.session.id,
+      inputBroker: authority,
+      files: authority.files,
       identity: {
         reason: 'verified',
         conversationId,
@@ -297,6 +336,7 @@ export class CodexRecoveryAdapter {
         witness: expected.witness,
       },
       isCurrent: () =>
+        !!this.session.getRecoveryInputAuthority(expected.inputProof!) &&
         this.verifiedTail === expected &&
         scope() === snapshot &&
         this.session.getRecoveryContext().generation === generation,
@@ -309,6 +349,27 @@ export class CodexRecoveryAdapter {
     generation: number,
     otherSource?: import('./types.js').RecoveryEvidenceSource
   ): Promise<boolean> {
+    const expected = this.verifiedTail?.inputProof;
+    if (!expected) return false;
+    const fresh = await this.session.inspectRecoveryInputProvenance(expected.brokerPid);
+    if (
+      !fresh ||
+      fresh.incarnation !== expected.incarnation ||
+      fresh.brokerPid !== expected.brokerPid ||
+      fresh.childPid !== expected.childPid ||
+      fresh.brokerStart !== expected.brokerStart ||
+      fresh.childStart !== expected.childStart ||
+      fresh.closed !== expected.closed ||
+      fresh.exitStatus !== expected.exitStatus ||
+      fresh.exitSignal !== expected.exitSignal ||
+      fresh.rawGeneration !== expected.rawGeneration ||
+      fresh.launchDigest !== expected.launchDigest ||
+      fresh.homeDigest !== expected.homeDigest ||
+      JSON.stringify(fresh.ownerCounters) !== JSON.stringify(expected.ownerCounters) ||
+      !fresh.fileWitness
+    )
+      return false;
+    if (this.verifiedTail) this.verifiedTail.inputProof = fresh;
     const source = this.getLocalEvidenceSource(conversationId, generation);
     if (
       !source ||
@@ -317,7 +378,10 @@ export class CodexRecoveryAdapter {
     )
       return false;
     return (
-      (await checkCodexIdentityWitnesses([source.identity, ...(otherSource ? [otherSource.identity] : [])])) &&
+      (await checkCodexIdentityWitnesses(
+        [source.identity, ...(otherSource ? [otherSource.identity] : [])],
+        [...(source.files ?? []), ...(otherSource?.files ?? [])]
+      )) &&
       isRecoveryEvidenceSourceCurrent(source) &&
       (!otherSource || isRecoveryEvidenceSourceCurrent(otherSource))
     );

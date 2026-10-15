@@ -63,6 +63,7 @@ interface ServerInternals {
 
 const WORKSPACE = join(homedir(), '.codeman-test-discard');
 const SESSION_ID = 'a1b2c3d4e5f60718';
+const DIRECT_ATTACH_SESSION_ID = '2af510ab-1111-2222-3333-444444444444';
 const FAILED_RESTORE_ID = 'custom-model-failed-restore';
 const CANCELLED_RESTORE_ID = 'custom-model-cancelled-restore';
 const REBOOT_UUID = '12345678-1234-1234-1234-123456789abc';
@@ -72,7 +73,7 @@ let internals: ServerInternals;
 let mux: TmuxManager;
 
 function removeFixedIdentityFences(): void {
-  for (const id of [SESSION_ID, FAILED_RESTORE_ID, CANCELLED_RESTORE_ID]) {
+  for (const id of [SESSION_ID, DIRECT_ATTACH_SESSION_ID, FAILED_RESTORE_ID, CANCELLED_RESTORE_ID]) {
     rmSync(dataPath('reboot-identities', `${id}.json`), { force: true });
   }
 }
@@ -105,7 +106,7 @@ beforeAll(async () => {
 beforeEach(removeFixedIdentityFences);
 
 afterEach(async () => {
-  for (const id of [SESSION_ID, FAILED_RESTORE_ID, CANCELLED_RESTORE_ID]) {
+  for (const id of [SESSION_ID, DIRECT_ATTACH_SESSION_ID, FAILED_RESTORE_ID, CANCELLED_RESTORE_ID]) {
     await internals.discardPartiallyBuiltSession(id).catch(() => {});
   }
   rebootRestoreRegistry.reset();
@@ -419,25 +420,28 @@ describe('custom-model reboot restore cleanup through the real server route', ()
 
 describe('reboot recovery evidence fence', () => {
   it('fences old conversation A before a supported attach can resume older conversation B', async () => {
+    // Earlier cases intentionally retain uncertain launches. This historical
+    // legacy attach owns a distinct ID and never deletes or adopts those panes.
+    const id = DIRECT_ATTACH_SESSION_ID;
     const oldConversation = '12345678-1234-1234-1234-123456789abc';
     const resumedOlderConversation = '99999999-1234-1234-1234-123456789abc';
     const home = join(WORKSPACE, 'direct-attach-codex-home');
     mkdirSync(join(home, 'sessions'), { recursive: true });
-    for (const [id, timestamp, fileStamp] of [
+    for (const [conversationId, timestamp, fileStamp] of [
       [oldConversation, '2026-10-13T15:00:00Z', '2026-10-13T15-00-00'],
       [resumedOlderConversation, '2025-10-13T15:00:00Z', '2025-10-13T15-00-00'],
     ]) {
       writeFileSync(
-        join(home, 'sessions', `rollout-${fileStamp}-${id}.jsonl`),
+        join(home, 'sessions', `rollout-${fileStamp}-${conversationId}.jsonl`),
         JSON.stringify({
           type: 'session_meta',
           timestamp,
-          payload: { id, cwd: WORKSPACE, originator: `codeman_${SESSION_ID}` },
+          payload: { id: conversationId, cwd: WORKSPACE, originator: `codeman_${id}` },
         }) + '\n'
       );
     }
     const session = new Session({
-      id: SESSION_ID,
+      id,
       workingDir: WORKSPACE,
       mode: 'codex',
       useMux: false,
@@ -449,18 +453,30 @@ describe('reboot recovery evidence fence', () => {
       pid: 1234,
       __envOverrides: { CODEX_HOME: home },
       __codexRecoveryHome: home,
+      __codexPriorInputBroker: null,
     };
+    const brokerDirectory = dataPath('codex-input-brokers', id);
+    expect(existsSync(brokerDirectory)).toBe(false);
+    // Even an explicit legacy offer cannot hide a now-unknown guarded launch.
+    // Create and remove only this fixture's new empty directory, never the
+    // previously retained uncertain workers or private journals.
+    mkdirSync(brokerDirectory, { recursive: true, mode: 0o700 });
+    try {
+      expect(await verifyCodexRebootIdentity(saved)).toBeUndefined();
+    } finally {
+      rmdirSync(brokerDirectory);
+    }
     expect(await verifyCodexRebootIdentity(saved)).toBe(oldConversation);
     await internals.registerSessionWithLayout(session);
     await internals.setupSessionListeners(session);
 
     const response = await internals.app.inject({
       method: 'POST',
-      url: `/api/sessions/${SESSION_ID}/direct-attach-fence`,
+      url: `/api/sessions/${id}/direct-attach-fence`,
       payload: {},
     });
     expect(response.statusCode).toBe(200);
-    expect(readRebootIdentityFence(SESSION_ID)).toEqual({
+    expect(readRebootIdentityFence(id)).toEqual({
       switchPending: true,
       submission: undefined,
       untrackedInput: true,
@@ -470,13 +486,13 @@ describe('reboot recovery evidence fence', () => {
     try {
       const browserInput = await internals.app.inject({
         method: 'POST',
-        url: `/api/sessions/${SESSION_ID}/input`,
+        url: `/api/sessions/${id}/input`,
         payload: { input: 'tracked browser prompt\r', useMux: false },
       });
       expect(browserInput.statusCode).toBe(200);
       expect(directWrite).toHaveBeenCalledWith('tracked browser prompt\r');
       expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
-      expect(readRebootIdentityFence(SESSION_ID)).toEqual({
+      expect(readRebootIdentityFence(id)).toEqual({
         switchPending: true,
         submission: undefined,
         untrackedInput: true,
@@ -492,9 +508,9 @@ describe('reboot recovery evidence fence', () => {
     // Reconstructing the live Session is the server-restart boundary. The new
     // object must reload the independent fence before any browser input can
     // publish an apparently exact proof over the still-untracked pane.
-    await internals.discardPartiallyBuiltSession(SESSION_ID, session);
+    await internals.discardPartiallyBuiltSession(id, session);
     const reconstructed = new Session({
-      id: SESSION_ID,
+      id,
       workingDir: WORKSPACE,
       mode: 'codex',
       useMux: false,
@@ -510,7 +526,7 @@ describe('reboot recovery evidence fence', () => {
     try {
       const browserInput = await internals.app.inject({
         method: 'POST',
-        url: `/api/sessions/${SESSION_ID}/input`,
+        url: `/api/sessions/${id}/input`,
         payload: { input: 'prompt after server restart\r', useMux: false },
       });
       expect(browserInput.statusCode).toBe(200);

@@ -213,7 +213,8 @@ describe('verified local Codex reboot offers', () => {
     expect(plan.skipped).toEqual([]);
     expect(plan.restore[0].resumeConversationId).toBe(UUID);
     expect(plan.restore[0].sessionId).toBe('original');
-    expect(plan.restore[0].state).toBe(state);
+    expect(plan.restore[0].state).toEqual({ ...state, __codexPriorInputBroker: null });
+    expect(state).not.toHaveProperty('__codexPriorInputBroker');
     expect(state.codexConfig?.noAltScreen).toBe(true);
   });
   it('refuses unverified, managed-daemon and conflicting persisted identities', async () => {

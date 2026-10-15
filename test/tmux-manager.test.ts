@@ -21,6 +21,8 @@ import {
   resolveActivePaneTarget,
 } from '../src/tmux-manager.js';
 import { execSync, exec } from 'node:child_process';
+import { shellescape } from '../src/remote-hosts.js';
+import type { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 import type { MuxSession } from '../src/mux-interface.js';
 
 // ============================================================================
@@ -728,6 +730,22 @@ describe('TmuxManager (unit)', () => {
       return module.TmuxManager;
     }
 
+    async function expectLiteralWorkspace(command: unknown, workspace: string): Promise<void> {
+      expect(typeof command).toBe('string');
+      const argument = (command as string).split(' bash -c ')[1];
+      expect(argument).toBeTypeOf('string');
+      const native = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      // Decode only the already-quoted single argument. Never execute the tmux
+      // command or the decoded pane payload; both remain fixture observations.
+      const decoded = native.execFileSync('/bin/sh', ['-c', `set -- ${argument}; printf '%s' "$1"`], {
+        encoding: 'utf8',
+        timeout: 1000,
+        env: { PATH: '/usr/bin:/bin' },
+      });
+      expect(decoded.startsWith(`cd ${shellescape(workspace)} && `)).toBe(true);
+      expect(decoded).toContain(workspace);
+    }
+
     beforeEach(() => {
       mockedExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('which tmux')) {
@@ -763,10 +781,27 @@ describe('TmuxManager (unit)', () => {
         nonTestManager as unknown as { buildPathExport(mode: string): { dir: string; pathExport: string } },
         'buildPathExport'
       ).mockReturnValue({ dir: '/fixture/bin', pathExport: 'export PATH=/fixture/bin:$PATH && ' });
+      // This fixture owns only fake native effects; startup mechanics/receipts
+      // are exercised against real disposable brokers in the dedicated suite.
+      const broker = {
+        directory: '/fixture/private-input-broker',
+        incarnation: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        configurationDigest: 'a'.repeat(64),
+        setStartupAuthority: vi.fn(async () => {
+          broker.configurationDigest = 'b'.repeat(64);
+        }),
+        startupReceipt: vi.fn(async () => 'started'),
+      } as unknown as CodexInputBroker;
+      vi.spyOn(
+        nonTestManager as unknown as { createInputBroker(): Promise<CodexInputBroker> },
+        'createInputBroker'
+      ).mockResolvedValue(broker);
       let workerMayBeRunning = false;
       let grant = true;
       mockedExecSync.mockImplementation((cmd: string) => {
         if (cmd.includes('respawn-pane')) {
+          expect(cmd).toContain('b'.repeat(64));
+          expect(cmd).not.toContain('a'.repeat(64));
           const persisted = JSON.parse(actualFs.readFileSync(metadataPath, 'utf8'));
           expect(persisted).toMatchObject([
             {
@@ -782,6 +817,8 @@ describe('TmuxManager (unit)', () => {
           workerMayBeRunning = true;
           throw new Error('Fixture response lost after worker dispatch');
         }
+        if (cmd.includes('respawn-pane') || cmd.includes('kill-pane')) return '';
+        if (cmd.includes('new-session')) return '$1|%7|4242|88\n';
         if (cmd.includes('which tmux')) return '/usr/bin/tmux\n';
         if (cmd.includes('setenv') && outcome === 'grant-revoked-during-shell-prep') grant = false;
         if (cmd.includes('display-message') && cmd.includes('#{pane_pid}')) return '4242\n';
@@ -796,6 +833,8 @@ describe('TmuxManager (unit)', () => {
         codexConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
         recoveryCodexHome: '/fixture/codex-home',
         codexRestoreGuard: {
+          getStartupEvidence: () => ({ files: [], paths: [], missing: [] }),
+          isCurrent: () => authorized && grant,
           prepare: async () => {
             await Promise.resolve();
             authorized = grant && outcome !== 'before-create';
@@ -819,7 +858,7 @@ describe('TmuxManager (unit)', () => {
         expect(commands.some((cmd) => cmd.includes('respawn-pane'))).toBe(
           ['unchanged', 'async-confirm', 'dispatch-uncertain'].includes(outcome)
         );
-        expect(commands.filter((cmd) => cmd.includes('kill-session'))).toHaveLength(
+        expect(commands.filter((cmd) => cmd.includes('kill-pane'))).toHaveLength(
           ['before-worker', 'grant-revoked-during-shell-prep'].includes(outcome) ? 1 : 0
         );
         expect(workerMayBeRunning).toBe(outcome === 'dispatch-uncertain');
@@ -864,7 +903,10 @@ describe('TmuxManager (unit)', () => {
           ([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane ')
         );
         expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abc12345"`);
-        expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project with spaces\\" &&');
+        expect(respawnCall?.[0]).toContain(
+          shellescape(`cd ${shellescape('/mnt/gdrive/project with spaces')} &&`).slice(0, -1)
+        );
+        await expectLiteralWorkspace(respawnCall?.[0], '/mnt/gdrive/project with spaces');
       } finally {
         nonTestManager.destroy();
       }
@@ -949,7 +991,8 @@ describe('TmuxManager (unit)', () => {
           .mocked(currentExec)
           .mock.calls.find(([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
         expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abcd1234"`);
-        expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project\\" &&');
+        expect(respawnCall?.[0]).toContain(shellescape(`cd ${shellescape('/mnt/gdrive/project')} &&`).slice(0, -1));
+        await expectLiteralWorkspace(respawnCall?.[0], '/mnt/gdrive/project');
       } finally {
         nonTestManager.destroy();
       }

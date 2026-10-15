@@ -90,6 +90,9 @@ export class CodexTaskAdapter {
     const canDispatch: RecoveryActionAuthority = () =>
       isCurrent() && (observation.activity !== 'crashed' || this.recovery.hasLivePaneProof(observation.liveProofAt!));
     if (isCurrent.prepareEvidence) canDispatch.prepareEvidence = (source) => isCurrent.prepareEvidence!(source);
+    if (isCurrent.getInputIssuer)
+      canDispatch.getInputIssuer = () => (canDispatch() ? isCurrent.getInputIssuer!() : undefined);
+    if (isCurrent.getActionDeadline) canDispatch.getActionDeadline = () => isCurrent.getActionDeadline!();
     return this.recovery.act(
       {
         key: observation.evidenceKey,

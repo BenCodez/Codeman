@@ -154,5 +154,8 @@ export async function clampRecoveryLaunchForOwner(
     configs: clampConfigsWithGrant(configs, grant.privileged),
     env: clampEnvWithGrant(env, grant.privileged),
     isCurrent: grant.isCurrent,
+    fileWitness: grant.fileWitness,
+    getFileWitness: grant.getFileWitness,
+    verifyCurrent: grant.verifyCurrent,
   };
 }

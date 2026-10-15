@@ -9,6 +9,7 @@ import {
   type TaskProgress,
 } from './schema.js';
 import { commandHash, type CommandSuccessEvidence } from './evidence.js';
+import { earliestActionDeadline } from '../recovery/action-deadline.js';
 import {
   CONTINUATION_PROMPT,
   hasFreshProcessReady,
@@ -142,6 +143,17 @@ export class TaskController {
   }
   private actionIsCurrent(revision: number): boolean {
     return !this.stopped && this.revision === revision && !this.runtimeBudgetExpired();
+  }
+  private actionAuthority(revision: number, inherited: RecoveryActionAuthority = () => true): RecoveryActionAuthority {
+    const authority: RecoveryActionAuthority = () => this.actionIsCurrent(revision) && inherited();
+    authority.getActionDeadline = () =>
+      earliestActionDeadline((this.state.startedAt ?? NaN) + this.state.config.maxRuntimeMs, inherited);
+    if (inherited.prepareEvidence)
+      authority.prepareEvidence = async (source) =>
+        authority() && (await inherited.prepareEvidence!(source)) === true && authority();
+    if (inherited.getInputIssuer)
+      authority.getInputIssuer = () => (authority() ? inherited.getInputIssuer!() : undefined);
+    return authority;
   }
   noteUserInput(): void {
     const hadAgentProgressVeto = !!this.state.agentProgressVeto;
@@ -507,11 +519,7 @@ export class TaskController {
       await this.save('kickoff-reserved');
       const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent', true, externallyCurrent);
       if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-      const canDispatch: RecoveryActionAuthority = () => this.actionIsCurrent(revision) && externallyCurrent();
-      if (externallyCurrent.prepareEvidence) {
-        canDispatch.prepareEvidence = async (source) =>
-          canDispatch() && (await externallyCurrent.prepareEvidence!(source)) === true && canDispatch();
-      }
+      const canDispatch = this.actionAuthority(revision, externallyCurrent);
       const delivered = await this.deps.act(key, o.conversationId, this.prompt(), canDispatch);
       const cancelled = this.preserveCancelledDelivery(revision, delivered, true, externallyCurrent);
       if (cancelled) return cancelled;
@@ -701,7 +709,7 @@ export class TaskController {
           await this.save('recovery-reserved');
           const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent');
           if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-          const result = await this.deps.recover(o, () => this.actionIsCurrent(revision));
+          const result = await this.deps.recover(o, this.actionAuthority(revision));
           const cancelled = this.preserveCancelledDelivery(revision, result);
           if (cancelled) return cancelled;
           if (result === 'not-sent') {
@@ -761,7 +769,7 @@ export class TaskController {
       await this.save('continuation-reserved');
       const beforeDeliveryCancelled = this.preserveCancelledDelivery(revision, 'not-sent');
       if (beforeDeliveryCancelled) return beforeDeliveryCancelled;
-      const result = await this.deps.act(key, o.conversationId, prompt, () => this.actionIsCurrent(revision));
+      const result = await this.deps.act(key, o.conversationId, prompt, this.actionAuthority(revision));
       const cancelled = this.preserveCancelledDelivery(revision, result);
       if (cancelled) return cancelled;
       if (result === 'unknown') {
