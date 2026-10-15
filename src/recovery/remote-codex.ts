@@ -24,6 +24,7 @@ import {
   withRemoteBrokerIssuerLease,
   type RemoteBrokerIssuer,
   type RemoteWorkerLeaseClaim,
+  type RemoteWorkerLeaseBinding,
   type RemoteBrokerPane,
   type RemoteBrokerTransport,
   type SourceHostLeaseTransport,
@@ -64,6 +65,7 @@ export type RemoteCodexEvidence =
       pane?: RemoteCodexPaneEvidence;
       clock?: RemoteClockWitness;
       inputBroker?: { serialized: string; witness: PrivateFileWitness; historical?: true };
+      frameAdmission?: RemoteFrameAdmission & { fits: boolean };
       identity: {
         reason: 'verified' | 'ambiguous' | 'unverified' | 'unreadable';
         conversationId?: string;
@@ -73,7 +75,15 @@ export type RemoteCodexEvidence =
       };
     };
 
+export interface RemoteFrameAdmission {
+  promptHash: string;
+  maxPhaseBytes: number;
+  issuerLeaseBytes: number;
+}
+
 export interface RemoteCodexEvidenceRequest {
+  /** Passive packet sizing only: never probes or allocates an input frame. */
+  frameAdmission?: RemoteFrameAdmission;
   sessionId: string;
   workingDir: string;
   codexHome?: string;
@@ -89,6 +99,7 @@ export interface RemoteCodexEvidenceRequest {
 }
 
 interface WireEvidence {
+  frameAdmission?: RemoteFrameAdmission & { fits: boolean };
   v: 1;
   session: 'missing' | 'present';
   action?: 'sent' | 'not-sent';
@@ -178,6 +189,73 @@ export function remoteInputPhases(prompt: string): string[] {
   return [...chunks, '\r'];
 }
 
+function remoteInputLeaseBound(prompt: string, issuer: RemoteBrokerIssuer) {
+  const max = Number.MAX_SAFE_INTEGER,
+    nonce = 'ffffffff-ffff-ffff-ffff-ffffffffffff';
+  const phases = remoteInputPhases(prompt);
+  const binding: RemoteWorkerLeaseBinding = {
+    sessionId: nonce,
+    incarnation: nonce,
+    conversationId: nonce,
+    action: 'input',
+    fullPayloadHash: createHash('sha256').update(prompt).digest('hex'),
+    allowedPhaseHashes: phases.map((phase) => createHash('sha256').update(phase).digest('hex')),
+    native: {
+      kind: 'input',
+      paneId: '%' + max,
+      brokerPid: max,
+      childPid: max,
+      brokerStart: String(max),
+      childStart: String(max),
+    },
+  };
+  const claim: RemoteWorkerLeaseClaim = {
+    ...binding,
+    version: 1,
+    managerSessionId: issuer.sessionId,
+    managerIncarnation: issuer.incarnation,
+    nonce,
+    issuedAt: max,
+    deadline: max,
+  };
+  return { binding, claim };
+}
+
+/** Size source-private lease input and the largest remote phase without allocating a lease. */
+export function remotePromptFrameAdmission(
+  prompt: string,
+  issuer?: RemoteBrokerIssuer
+): RemoteFrameAdmission | undefined {
+  const bytes = Buffer.from(prompt, 'utf8');
+  if (
+    !bytes.length ||
+    bytes.length > MAX_REMOTE_CODEX_PROMPT_BYTES ||
+    bytes.includes(0) ||
+    bytes.toString('utf8') !== prompt
+  )
+    return undefined;
+  const phases = remoteInputPhases(prompt);
+  let issuerLeaseBytes = 0;
+  if (issuer) {
+    if (phases.length > 9) return undefined;
+    if (!UUID.test(issuer.sessionId) || !UUID.test(issuer.incarnation)) return undefined;
+    const nonce = 'ffffffff-ffff-ffff-ffff-ffffffffffff',
+      max = Number.MAX_SAFE_INTEGER;
+    // These are the actual source lease transport's stdin and planned-binding bounds.
+    if (Buffer.byteLength(JSON.stringify({ issuer, durationMs: 2000, nonce }) + '\n') > 98_304) return undefined;
+    const { binding, claim } = remoteInputLeaseBound(prompt, issuer);
+    if (Buffer.byteLength(JSON.stringify(binding)) > 16_384) return undefined;
+    issuerLeaseBytes = Buffer.byteLength(
+      JSON.stringify({ claim, phaseIndex: max, remoteDeadline: 2 * max, clock: { localAt: max, min: -max, max: -max } })
+    );
+  }
+  return {
+    promptHash: createHash('sha256').update(bytes).digest('hex'),
+    maxPhaseBytes: Math.max(...phases.map((phase) => Buffer.byteLength(phase))),
+    issuerLeaseBytes,
+  };
+}
+
 /**
  * Runs wholly on the remote host. It emits one marked JSON record and no private
  * text outside base64 fields, caps traversal/read sizes, and refuses symlinks.
@@ -223,10 +301,12 @@ let identity={reason:'unverified'},identityTailHash,identityProof;try{visit(path
 const name=req.remoteSessionName;let session='present',pane,screenText,nativeFields;try{cp.execFileSync('tmux',['-L','codeman-remote','has-session','-t',name],{stdio:'ignore',timeout:1500})}catch(e){if(e&&e.status===1)session='missing';else refusal('unreadable')}
 if(session==='present'){const row=cp.execFileSync('tmux',['-L','codeman-remote','list-panes','-t',name,'-F','#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}|#{pane_pid}'],{encoding:'utf8',timeout:1500,maxBuffer:16384}).replace(/\n$/,'').split('\n');if(row.length!==1||row[0].includes('\r'))refusal('unverified');const f=row[0].split('|');if(f.length!==5||!/^[01]$/.test(f[0])||!/^%(?:0|[1-9]\d*)$/.test(f[3])||!Number.isSafeInteger(+f[3].slice(1))||!/^[1-9]\d*$/.test(f[4])||!Number.isSafeInteger(+f[4]))refusal('unverified');const number=x=>{if(x==="")return undefined;if(!/^(?:0|[1-9]\d{0,4})$/.test(x)||+x>255)refusal("unverified");return +x},signal=x=>{if(x===""||/^(?:0|[1-9]\d{0,4})$/.test(x)){const n=number(x);if(n!==undefined&&n!==0&&!Object.values(signals).includes(n))refusal("unverified");return n;}const n=/^[A-Z][A-Z0-9]{0,15}$/.test(x)?signals["SIG"+x]:undefined;if(!Number.isSafeInteger(n)||n<=0||n>65535)refusal("unverified");return n};pane={dead:f[0]==='1',status:number(f[1]),signal:signal(f[2]),paneId:f[3],panePid:+f[4]};if((pane.status!==undefined&&(pane.signal||0)>0)||(!pane.dead&&(pane.status!==undefined||pane.signal!==undefined)))refusal("unverified");nativeFields={session_name:name,pane_id:f[3],pane_pid:f[4],pane_dead:f[0],pane_dead_status:f[1],pane_dead_signal:f[2]};if(!pane.dead){screenText=cp.execFileSync('tmux',['-L','codeman-remote','capture-pane','-p','-t',pane.paneId],{encoding:'utf8',timeout:1500,maxBuffer:65536});pane.screen=Buffer.from(screenText).toString('base64')}}
 ${REMOTE_INPUT_BROKER_READER}
-let brokerVerified=false;try{if(req.inputBroker&&(session==='missing'||pane)){brokerOpen();if(req.action){const expected=req.action.expected.inputProof;if(!expected||expected.incarnation!==brokerDescriptor.incarnation||expected.brokerPid!==brokerState.pid||expected.childPid!==brokerState.childPid||expected.brokerStart!==brokerState.brokerStart||expected.childStart!==brokerState.childStart||expected.closed!==brokerState.closed||expected.rawGeneration!==0||expected.launchDigest!==brokerState.launchDigest||expected.homeDigest!==brokerState.homeDigest||!brokerExact(expected.ownerCounters,brokerOwners)||!brokerOwners.every(k=>expected.ownerCounters[k]===brokerState.counters[k])||!expected.fileWitness||JSON.stringify(expected.fileWitness)!==JSON.stringify(brokerSnapshot.witness))refusal('unverified')}brokerProbe();brokerVerified=true}}catch(e){identity={reason:e&&e.reason||'unreadable'}}
+let frameAdmission;const preview=req.frameAdmission;if(preview!==undefined&&(!brokerExact(preview,['promptHash','maxPhaseBytes','issuerLeaseBytes'])||req.action||!req.inputBroker||!/^([a-f0-9]{64})$/.test(preview.promptHash)||!Number.isSafeInteger(preview.maxPhaseBytes)||preview.maxPhaseBytes<1||preview.maxPhaseBytes>8192||!Number.isSafeInteger(preview.issuerLeaseBytes)||preview.issuerLeaseBytes<0||preview.issuerLeaseBytes>16384))refusal('unverified');
+let brokerVerified=false;try{if(req.inputBroker&&(session==='missing'||pane)){brokerOpen();if(req.action){const expected=req.action.expected.inputProof;if(!expected||expected.incarnation!==brokerDescriptor.incarnation||expected.brokerPid!==brokerState.pid||expected.childPid!==brokerState.childPid||expected.brokerStart!==brokerState.brokerStart||expected.childStart!==brokerState.childStart||expected.closed!==brokerState.closed||expected.rawGeneration!==0||expected.launchDigest!==brokerState.launchDigest||expected.homeDigest!==brokerState.homeDigest||!brokerExact(expected.ownerCounters,brokerOwners)||!brokerOwners.every(k=>expected.ownerCounters[k]===brokerState.counters[k])||!expected.fileWitness||JSON.stringify(expected.fileWitness)!==JSON.stringify(brokerSnapshot.witness))refusal('unverified')}if(!preview)brokerProbe();brokerVerified=true}}catch(e){identity={reason:e&&e.reason||'unreadable'}}
 if(!req.action&&identity.reason==='verified'){try{confirmWitness();if(brokerVerified)brokerCurrent()}catch(e){identity={reason:e&&e.reason||'unreadable'}}}
+if(preview&&brokerVerified&&session==='present'&&pane&&!pane.dead&&identity.reason==='verified'&&identity.tailTruncated===false){const proof=brokerWitnesses();brokerCurrent();brokerNative();const packet={version:1,sessionId:req.sessionId,incarnation:brokerDescriptor.incarnation,channel:'auto',counter:Number.MAX_SAFE_INTEGER,nonce:'ffffffff-ffff-ffff-ffff-ffffffffffff',conversationId:identity.conversationId,expectedOwners:Object.fromEntries(brokerOwners.map(k=>[k,brokerState.counters[k]])),monotonicDeadline:Number.MAX_SAFE_INTEGER,issuer:null,privateFiles:proof.files,privatePaths:proof.paths,missingPaths:[],data:'A'.repeat(4*Math.ceil(preview.maxPhaseBytes/3))};const bytes=Buffer.byteLength(JSON.stringify(packet))+(preview.issuerLeaseBytes?Buffer.byteLength(',\"issuerLease\":')+preview.issuerLeaseBytes:0);frameAdmission={...preview,fits:4*Math.ceil(bytes/3)+84<=122880};}
 let action,actionAt;if(req.action){action='not-sent';const a=req.action,e=a.expected;let identityMatch=brokerVerified&&!(brokerState.closed&&brokerState.exitStatus===0&&!brokerState.exitSignal)&&identity.reason==='verified'&&identity.tailTruncated===false&&identity.conversationId===e.conversationId&&identityTailHash===e.tailHash;const paneMatch=session==='present'&&pane&&pane.paneId===e.paneId&&pane.panePid===e.panePid;if(identityMatch){try{const h=header(identityProof.p),t=read(identityProof.p,262144,true),matched=history();confirmWitness();identityMatch=!!matched&&matched.id===identityProof.id&&h.id===identityProof.id&&h.cwd===identityProof.cwd&&h.origin===identityProof.origin&&h.createdAt===identityProof.createdAt&&!h.sub&&!t.truncated&&t.text.endsWith('\n')&&crypto.createHash('sha256').update(t.text,'utf8').digest('hex')===e.tailHash}catch{identityMatch=false}}if(a.kind==='input'&&identityMatch&&paneMatch&&!pane.dead&&crypto.createHash('sha256').update(screenText,'utf8').digest('hex')===e.screenHash){let pasted=false,pastedText="",chunk="",bytes=0,phase=0;const paste=()=>{brokerCurrent();if(pasted){if(!composerSettled(pane.paneId,pastedText,nativeFields))refusal("unverified")}else{const state=composerState(pane.paneId,undefined);if(state!=="current")return false}brokerCurrent();const r=brokerSend(brokerPacket('auto',chunk,phase++));if(r==='not-sent'||r.status!=='sent'){if(pasted||r!=='not-sent'&&r.status!=='not-sent')refusal('unverified');return false}pasted=true;pastedText+=chunk;return true};let current=true;for(const point of actionPrompt){const n=Buffer.byteLength(point,"utf8");if(bytes+n>8192){if(!paste()){current=false;break}chunk="";bytes=0}chunk+=point;bytes+=n}if(current&&(chunk||!pasted))current=paste();if(current){brokerCurrent();if(!composerSettled(pane.paneId,pastedText,nativeFields))refusal("unverified");brokerCurrent();check();const r=brokerSend(brokerPacket('auto','\r',phase),true);if(r==='not-sent'||r.status!=='sent')refusal('unverified');const at=r.deliveredAt;if(!brokerExact(at,['wallBefore','wallAfter','monoBefore','monoAfter'])||!Object.values(at).every(x=>Number.isSafeInteger(x)&&x>0)||at.wallBefore<started||at.wallAfter<at.wallBefore||at.wallAfter>Date.now()||at.wallAfter-at.wallBefore>500||at.monoAfter<at.monoBefore||Math.abs(at.wallAfter-at.wallBefore-at.monoAfter+at.monoBefore)>100)refusal('unverified');actionAt=at.wallBefore;action="sent"}}else if(a.kind==='restart'&&identityMatch&&paneMatch&&pane.dead&&pane.status===e.status&&pane.signal===e.signal&&req.newInputBroker){if(brokerRelaunch(a))action='sent'}else if(a.kind==='restore'&&identityMatch&&brokerHistorical&&req.newInputBroker){if(brokerRelaunch(a))action='sent'}}
-out({v:1,session,pane,identity,action,actionAt,inputBroker:brokerVerified?brokerEvidence():undefined,newInputBroker:newBrokerEvidence,clock:{remoteBefore:started,remoteAfter:Date.now()}});
+out({v:1,session,pane,identity,action,actionAt,frameAdmission,inputBroker:brokerVerified?brokerEvidence():undefined,newInputBroker:newBrokerEvidence,clock:{remoteBefore:started,remoteAfter:Date.now()}});
 `;
 
 // Encoding only the static reader avoids expanding its quotes at every nested
@@ -509,7 +589,29 @@ export function parseRemoteCodexEvidence(stdout: string): RemoteCodexEvidence | 
       )
         return undefined;
     }
-    return { transport: 'reachable', session: wire.session, pane, identity, inputBroker: wire.inputBroker };
+    const admission = wire.frameAdmission;
+    if (
+      admission !== undefined &&
+      (!admission ||
+        Object.keys(admission).sort().join(',') !== 'fits,issuerLeaseBytes,maxPhaseBytes,promptHash' ||
+        typeof admission.fits !== 'boolean' ||
+        !/^[a-f0-9]{64}$/.test(admission.promptHash) ||
+        !Number.isSafeInteger(admission.maxPhaseBytes) ||
+        admission.maxPhaseBytes < 1 ||
+        admission.maxPhaseBytes > 8192 ||
+        !Number.isSafeInteger(admission.issuerLeaseBytes) ||
+        admission.issuerLeaseBytes < 0 ||
+        admission.issuerLeaseBytes > 16384)
+    )
+      return undefined;
+    return {
+      transport: 'reachable',
+      session: wire.session,
+      pane,
+      identity,
+      inputBroker: wire.inputBroker,
+      frameAdmission: admission,
+    };
   } catch {
     return undefined;
   }
@@ -633,6 +735,84 @@ export function buildRemoteCodexInputCommand(remote: SessionRemote, request: Rem
     throw new RangeError('Remote Codex command exceeds the safe shell argument bound');
   }
   return command;
+}
+
+/** Preview both actual SSH command forms without allocating a frame, nonce or lease. */
+export function remotePromptCommandFits(
+  remote: SessionRemote,
+  request: RemoteCodexEvidenceRequest,
+  prompt: string,
+  evidence: Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>,
+  issuer?: RemoteBrokerIssuer
+): boolean {
+  try {
+    const state = JSON.parse(evidence.inputBroker?.serialized ?? 'null');
+    if (
+      !state ||
+      !request.inputBroker ||
+      !evidence.inputBroker ||
+      !evidence.pane ||
+      !evidence.identity.conversationId ||
+      !evidence.identity.tail ||
+      state.sessionId !== request.sessionId ||
+      state.incarnation !== request.inputBroker.incarnation ||
+      state.pid !== evidence.pane.panePid ||
+      state.closed !== false ||
+      !state.counters
+    )
+      return false;
+    const { frameAdmission: _preview, ...base } = request;
+    // Linux stat values are finite positive JSON numbers. 17 significant digits
+    // plus the longest non-exponential leading-zero prefix occupy at most 24 bytes.
+    const widestStat = 0.0000012345678901234567;
+    const proof: CodexBrokerProof = {
+      incarnation: state.incarnation,
+      brokerPid: state.pid,
+      childPid: state.childPid,
+      brokerStart: state.brokerStart,
+      childStart: state.childStart,
+      closed: state.closed,
+      rawGeneration: state.rawGeneration,
+      launchDigest: state.launchDigest,
+      homeDigest: state.homeDigest,
+      ownerCounters: Object.fromEntries(
+        ['owner-pty', 'owner-key', 'owner-mux'].map((key) => [key, state.counters[key]])
+      ) as CodexBrokerProof['ownerCounters'],
+      fileWitness: {
+        ...evidence.inputBroker.witness,
+        dev: widestStat,
+        ino: widestStat,
+        size: 98304,
+        mtimeMs: widestStat,
+        ctimeMs: widestStat,
+      },
+    };
+    const expected = {
+      conversationId: evidence.identity.conversationId,
+      tailHash: createHash('sha256').update(evidence.identity.tail).digest('hex'),
+      paneId: evidence.pane.paneId,
+      panePid: evidence.pane.panePid,
+      screenHash: createHash('sha256')
+        .update(evidence.pane.screen ?? '')
+        .digest('hex'),
+      inputProof: proof,
+    };
+    // Delivery first builds the original request, then the normalized clock/lease request.
+    buildRemoteCodexInputCommand(remote, { ...base, expected, prompt });
+    const max = Number.MAX_SAFE_INTEGER;
+    buildRemoteCodexInputCommand(remote, {
+      ...base,
+      submission: { at: max / 2, hash: request.submission!.hash, uncertaintyMs: 499.5 },
+      dispatchClock: { localAt: max, min: -max, max: -max },
+      actionDeadline: 2 * max,
+      ...(issuer ? { issuerLease: remoteInputLeaseBound(prompt, issuer).claim } : {}),
+      expected,
+      prompt,
+    });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function deliverRemoteCodexInput(

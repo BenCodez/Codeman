@@ -2484,6 +2484,7 @@ export class WebServer extends EventEmitter {
     const controller = new TaskController(
       {
         observe: () => adapter.observe(),
+        admitPrompt: (prompt, authority, expected) => adapter.admitPrompt(prompt, authority, expected),
         acceptReservation: (key) => this.getActionArbiter(session.id).accept('task', key),
         resetReservation: () =>
           this.getActionArbiter(session.id).reset('task', !this.controllerHasRecoveryFlight(session.id)),

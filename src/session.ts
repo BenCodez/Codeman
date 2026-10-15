@@ -6304,9 +6304,32 @@ export class Session extends EventEmitter {
    * long-lived session can't grow it without limit (insertion order = MRU, so
    * eviction drops the least-recently-active client).
    */
-  private _appliedInputSeq = new Map<string, { last?: number; pending: Set<number>; waiting: Set<number> }>();
+  private _appliedInputSeq = new Map<
+    string,
+    { last?: number; pending: Set<number>; waiting: Set<number>; deferredAt: number }
+  >();
   private static readonly MAX_INPUT_DEDUP_CLIENTS = 256;
   private static readonly MAX_PENDING_INPUT_SEQS = 4096;
+  private static readonly INPUT_DEFERRED_LEASE_MS = 60_000;
+
+  /** Reclaim only abandoned, certified-unsent tails; never erase delivery proof or sparse holes. */
+  private expireDeferredInputSeq(clientId: string, now: number): void {
+    const state = this._appliedInputSeq.get(clientId);
+    if (
+      !state ||
+      state.pending.size > 0 ||
+      !Number.isFinite(now) ||
+      !Number.isFinite(state.deferredAt) ||
+      now - state.deferredAt < Session.INPUT_DEFERRED_LEASE_MS
+    )
+      return;
+    // A retained sparse hole must not trigger another full scan on each refused frame.
+    state.deferredAt = now;
+    for (const seq of state.waiting) {
+      // An earlier known-unsent hole still outranks a higher committed watermark.
+      if (state.last === undefined || seq > state.last) state.waiting.delete(seq);
+    }
+  }
 
   /**
    * The highest committed/sealed input seq, or 0 before any dispatch. Admission
@@ -6334,17 +6357,28 @@ export class Session extends EventEmitter {
 
   /** Remember received identities, including lock rejection, without accepting bytes. */
   deferInputSeq(clientId: string, seq: number): boolean {
+    const now = performance.now();
     let state = this._appliedInputSeq.get(clientId);
+    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) this.expireDeferredInputSeq(clientId, now);
+    // Active retries renew the lease without relying on adjustable wall time.
+    if (state && now >= state.deferredAt) state.deferredAt = now;
     if (state && (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq))) return true;
     if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) return false;
     if (!state) {
       if (this._appliedInputSeq.size >= Session.MAX_INPUT_DEDUP_CLIENTS) {
         // Never evict an in-flight identity: its retry could apply twice.
-        const idle = [...this._appliedInputSeq].find(([, entry]) => entry.waiting.size === 0);
-        if (!idle) return false;
-        this._appliedInputSeq.delete(idle[0]);
+        let idle: string | undefined;
+        for (const [id, entry] of this._appliedInputSeq) {
+          this.expireDeferredInputSeq(id, now);
+          if (entry.waiting.size === 0 && entry.pending.size === 0) {
+            idle = id;
+            break;
+          }
+        }
+        if (idle === undefined) return false;
+        this._appliedInputSeq.delete(idle);
       }
-      state = { pending: new Set(), waiting: new Set() };
+      state = { pending: new Set(), waiting: new Set(), deferredAt: now };
     }
     // Re-insert to move this client to the MRU end for fair eviction.
     this._appliedInputSeq.delete(clientId);
@@ -6367,6 +6401,8 @@ export class Session extends EventEmitter {
   commitInputSeq(clientId: string, seq: number): void {
     const state = this._appliedInputSeq.get(clientId);
     if (!state?.pending.delete(seq)) return;
+    const now = performance.now();
+    if (now >= state.deferredAt) state.deferredAt = now;
     state.waiting.delete(seq);
     state.last = Math.max(state.last ?? seq, seq);
   }
@@ -6381,7 +6417,10 @@ export class Session extends EventEmitter {
    * closed even when a later listener or dispatch cleanup throws.
    */
   forgetInputSeq(clientId: string, seq: number): void {
-    this._appliedInputSeq.get(clientId)?.pending.delete(seq);
+    const state = this._appliedInputSeq.get(clientId);
+    if (!state?.pending.delete(seq)) return;
+    const now = performance.now();
+    if (now >= state.deferredAt) state.deferredAt = now;
   }
 
   /**

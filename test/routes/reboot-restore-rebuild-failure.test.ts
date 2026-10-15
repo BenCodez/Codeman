@@ -66,7 +66,6 @@ vi.mock('../../src/session.js', () => ({
     }
     async startInteractive() {
       callOrder.push('startInteractive');
-      await startBarrier;
       if (this.restoreGuard) {
         await this.restoreGuard.prepare();
         await afterGuardPrepare?.();
@@ -82,6 +81,8 @@ vi.mock('../../src/session.js', () => ({
         this.codexRestoreWorkerMayExist = true;
         this.restoreGuard.noteDispatch?.();
       }
+      callOrder.push('launchAccepted');
+      await startBarrier;
     }
     /** The mock route context projects a session through this on broadcast. */
     toState() {
@@ -284,6 +285,7 @@ describe('a rebuild that succeeds', () => {
       'reapply:before-spawn',
       'setupSessionListeners',
       'startInteractive',
+      'launchAccepted',
       'reapply:after-spawn',
     ]);
     await app.close();
@@ -389,7 +391,7 @@ describe('a dismiss that lands while a restore is running', () => {
     const app = await createHarness(ctx);
 
     const restore = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
-    await vi.waitFor(() => expect(callOrder).toContain('startInteractive'));
+    await vi.waitFor(() => expect(callOrder).toContain('launchAccepted'));
     const dismiss = await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });
     expect(dismiss.json().data.dismissed).toBe(1);
     releaseStart();

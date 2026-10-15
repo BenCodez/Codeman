@@ -181,6 +181,7 @@ export class RecoveryStore {
       if (Object.keys(next).length > 200) throw new Error('Recovery journal is over capacity');
       await this.write(next);
       this.records = next;
+      this.cleanupWriteFailed = false;
     });
     const tracked = result
       .catch((error: unknown) => {
@@ -203,6 +204,7 @@ export class RecoveryStore {
       delete next[id];
       await this.write(next);
       this.records = next;
+      this.cleanupWriteFailed = false;
     });
     const tracked = result
       .catch((error: unknown) => {
@@ -231,6 +233,7 @@ export class RecoveryStore {
       if (removed > 0) {
         await this.write(next);
         this.records = next;
+        this.cleanupWriteFailed = false;
       }
       return removed;
     });

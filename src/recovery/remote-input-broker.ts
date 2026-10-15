@@ -425,7 +425,7 @@ try{
  if(!dead)throw Error('not inert');
  const fields={session_name:name,session_id:sid,pane_id:pane,pane_pid:pid,pane_dead:1,pane_dead_status:status,pane_dead_signal:signal,pid:server};
  const terms=Object.entries(fields).map(([k,v])=>'#{==:#{'+k+'},'+v+'}'),predicate=terms.reduce((a,b)=>'#{&&:'+a+','+b+'}');
- const owned=()=>run(['if-shell','-F','-t',pane,predicate,'display-message -p CODEMAN_BROKER_OWNED','display-message -p CODEMAN_BROKER_REFUSED'])==='CODEMAN_BROKER_OWNED\n';
+ const owned=(initialize=false)=>run(['if-shell','-F','-t',pane,predicate,initialize?'set-option -s escape-time 0 ; display-message -p CODEMAN_BROKER_OWNED':'display-message -p CODEMAN_BROKER_OWNED','display-message -p CODEMAN_BROKER_REFUSED'])==='CODEMAN_BROKER_OWNED\n';
  if(!owned())throw Error('replacement');
  const privateDir=p=>{check();try{fs.mkdirSync(p,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(p);if(!s.isDirectory()||s.isSymbolicLink()||(s.mode&0o077)!==0||s.uid!==process.getuid())throw Error('private root');check()};
  created=true;privateDir(base);const sessionRoot=path.join(base,m.sessionId);privateDir(sessionRoot);
@@ -435,7 +435,7 @@ try{
   try{fs.writeFileSync(fd,data);fs.fsyncSync(fd)}finally{fs.closeSync(fd)}check()
  }
  for(const p of [directory,sessionRoot,base]){const fd=fs.openSync(p,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);try{fs.fsyncSync(fd)}finally{fs.closeSync(fd)}check()}
- if(!owned())throw Error('replacement');
+ if(!owned(req.ownerInitialLaunch===true&&!present))throw Error('replacement');
  emit({status:'provisioned',directory,incarnation:m.incarnation,pane:{sessionId:sid,paneId:pane,panePid:+pid,serverPid:+server}})
 }catch{emit({status:created?'unknown':'not-sent'})}
 `;
@@ -507,6 +507,8 @@ export async function provisionRemoteInputBroker(
     transport?: RemoteBrokerTransport;
     expectedPane?: RemoteBrokerDeadPane;
     planOnly?: boolean;
+    /** Only explicit ordinary owner creation may initialize the server input option. */
+    ownerInitialLaunch?: boolean;
   } = {}
 ): Promise<RemoteBrokerProvisionResult> {
   let input: string;
@@ -566,6 +568,7 @@ export async function provisionRemoteInputBroker(
       root: expectedRoot,
       expectedPane: options.expectedPane,
       planOnly,
+      ownerInitialLaunch: options.ownerInitialLaunch === true,
     });
     if (Buffer.byteLength(input) > MAX_INPUT) return { status: 'not-sent' };
   } catch {

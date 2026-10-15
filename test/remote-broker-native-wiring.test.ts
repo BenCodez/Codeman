@@ -85,7 +85,7 @@ beforeEach(async () => {
       expect(records.find((entry) => entry.sessionId === material.sessionId)?.recoveryInputBrokerPending).toBe(
         material.incarnation
       );
-      expect(options).toEqual({ root: '/fixture/private' });
+      expect(options).toEqual({ root: '/fixture/private', ownerInitialLaunch: true });
     }
     return {
       status: 'provisioned',
@@ -199,6 +199,10 @@ it('persists the exact pending incarnation before remote fork and commits before
   expect(session.recoveryIsolated).toBe(true);
   expect(session.pid).toBe(99999);
   expect(effects.observe).toHaveBeenCalledTimes(1);
+  expect(effects.provision.mock.calls.map((call) => call[3])).toEqual([
+    { planOnly: true },
+    { root: '/fixture/private', ownerInitialLaunch: true },
+  ]);
   expect(effects.observe.mock.calls[0][1]).toMatchObject({ codexHome: '/fixture/codex-home' });
   const native = effects.sync.mock.calls.map(([command]) => String(command));
   expect(native.filter((command) => command.includes('respawn-pane'))[0]).toContain('attach');
