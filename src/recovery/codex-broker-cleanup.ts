@@ -90,6 +90,62 @@ export async function pruneCodexInputBrokers(
     }
   };
   if (!current()) return;
+  await runBrokerCleanup(
+    { dataDir, references: snapshot.references },
+    (value) => {
+      if (Object.keys(value).join(',') === 'empty') {
+        return (
+          typeof value.empty === 'string' &&
+          /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value.empty) &&
+          current()
+        );
+      }
+      const [sid, inc, extra] = typeof value.ready === 'string' ? value.ready.split('/') : [];
+      return (
+        Object.keys(value).join(',') === 'ready' &&
+        extra === undefined &&
+        !!sid &&
+        !!inc &&
+        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(sid) &&
+        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(inc) &&
+        !snapshot!.references.includes(inc) &&
+        current()
+      );
+    },
+    testSpawn
+  );
+}
+
+/** Only create() supplies this private receipt, before it has returned any launch authority. */
+export interface BrokerProvisioningRollback {
+  root: string;
+  sessionId: string;
+  incarnation: string;
+  directory: { dev: number; ino: number };
+  parents: Array<{ path: string; dev: number; ino: number }>;
+  files: Array<{ name: string; dev: number; ino: number; size: number; hash: string }>;
+}
+export async function rollbackCodexBrokerProvisioning(
+  receipt: BrokerProvisioningRollback,
+  testSpawn?: typeof spawn
+): Promise<void> {
+  const request = structuredClone(receipt);
+  await runBrokerCleanup(
+    { rollback: request },
+    (value) =>
+      Object.keys(value).join(',') === 'rollback' && value.rollback === `${request.sessionId}/${request.incarnation}`,
+    testSpawn
+  );
+}
+
+async function runBrokerCleanup(
+  request: object,
+  accept: (value: Record<string, unknown>) => boolean,
+  testSpawn?: typeof spawn
+): Promise<void> {
+  if (active.size >= 2 || (process.env.VITEST && !testSpawn)) return;
+  const serialized = JSON.stringify(request);
+  if (Buffer.byteLength(serialized) > 2_097_152) return;
   let child: ChildProcessWithoutNullStreams;
   try {
     child = (testSpawn ?? spawn)('python3', ['-I', '-c', CODEX_BROKER_CLEANUP_SOURCE], {
@@ -141,29 +197,7 @@ export async function pruneCodexInputBrokers(
         output = output.slice(at + 1);
         try {
           const value = JSON.parse(line);
-          if (Object.keys(value).join(',') === 'empty') {
-            if (
-              typeof value.empty !== 'string' ||
-              !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value.empty) ||
-              !current()
-            ) {
-              child.kill('SIGKILL');
-              return;
-            }
-            child.stdin.write('ACK\n');
-            continue;
-          }
-          const [sid, inc, extra] = typeof value.ready === 'string' ? value.ready.split('/') : [];
-          if (
-            Object.keys(value).join(',') !== 'ready' ||
-            extra !== undefined ||
-            !sid ||
-            !inc ||
-            !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(sid) ||
-            !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(inc) ||
-            snapshot!.references.includes(inc) ||
-            !current()
-          ) {
+          if (!accept(value)) {
             child.kill('SIGKILL');
             return;
           }
@@ -174,6 +208,6 @@ export async function pruneCodexInputBrokers(
         }
       }
     });
-    child.stdin.write(JSON.stringify({ dataDir, references: snapshot!.references }) + '\n');
+    child.stdin.write(serialized + '\n');
   });
 }

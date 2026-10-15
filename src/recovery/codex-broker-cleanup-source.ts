@@ -69,7 +69,16 @@ def readat(parent, name, maximum=98304, secret=True):
     return bytes(data), signature(before), hashlib.sha256(data).hexdigest()
 
 def native_absent(pid, birth):
-    if type(pid) is not int or pid <= 0 or pid > 9007199254740991 or not isinstance(birth,str) or not re.fullmatch(r'[1-9][0-9]{0,23}',birth): return False
+    if type(pid) is not int or pid <= 0 or pid > 9007199254740991: return False
+    if sys.platform=='darwin':
+        # Darwin journals have no Linux birth token. PID reuse conservatively
+        # retains files; only the kernel's ESRCH proves the recorded PID absent.
+        if birth is not None: return False
+        try: os.kill(pid,0)
+        except ProcessLookupError: return True
+        except (OSError,OverflowError): return False
+        return False
+    if not isinstance(birth,str) or not re.fullmatch(r'[1-9][0-9]{0,23}',birth): return False
     try:
         fd = os.open('/proc/%d/stat'%pid, os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
     except FileNotFoundError:
@@ -414,9 +423,85 @@ def retire_empty_session(rootfd, datafd, sessionfd, sid, data_path):
         return True
     except (OSError,ValueError,TypeError,KeyError): return False
 
+def rollback_unlaunched(receipt):
+    # This receipt is sent only by create() before returning a broker. Never
+    # infer an unlaunched incarnation from an incomplete on-disk directory.
+    if not isinstance(receipt,dict) or set(receipt)!={'root','sessionId','incarnation','directory','parents','files'}: return
+    root=receipt['root']; sid=receipt['sessionId']; inc=receipt['incarnation']
+    if not canonical(root) or not isinstance(sid,str) or not UUID.fullmatch(sid) or not isinstance(inc,str) or not UUID.fullmatch(inc): return
+    def inode(value):
+        return isinstance(value,dict) and set(value)=={'dev','ino'} and all(type(value[k]) is int and 0<=value[k]<=9007199254740991 for k in value)
+    if not inode(receipt['directory']): return
+    parents=receipt['parents']; files=receipt['files']
+    if not isinstance(parents,list) or not 1<=len(parents)<=32 or not isinstance(files,list) or len(files)>3: return
+    expected_path=root
+    for parent in parents:
+        if not isinstance(parent,dict) or set(parent)!={'path','dev','ino'} or parent['path']!=expected_path or not canonical(parent['path']) or parent['path']=='/' or not inode({k:parent[k] for k in ('dev','ino')}): return
+        expected_path=os.path.dirname(expected_path)
+    expected={}
+    for f in files:
+        if not isinstance(f,dict) or set(f)!={'name','dev','ino','size','hash'} or f['name'] not in ('broker.py','config.json','lock') or f['name'] in expected or not inode({k:f[k] for k in ('dev','ino')}) or type(f['size']) is not int or not 0<=f['size']<=262144 or not isinstance(f['hash'],str) or not re.fullmatch(r'[a-f0-9]{64}',f['hash']): return
+        expected[f['name']]=f
+    if os.path.realpath(root)!=root: return
+    rootfd=directory(root); fd=lock=None
+    try:
+        if not private(os.fstat(rootfd),True): return
+        fd=os.open(inc,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=rootfd)
+        own=os.fstat(fd)
+        if not private(own,True) or (own.st_dev,own.st_ino)!=(receipt['directory']['dev'],receipt['directory']['ino']): return
+        names=namesat(fd,3)
+        if set(names)!=set(expected): return
+        captures={}
+        for name in names:
+            _,sig,digest=readat(fd,name,262144)
+            w=expected[name]
+            if sig[:3]!=(w['dev'],w['ino'],w['size']) or digest!=w['hash']: return
+            captures[name]=(sig,digest)
+        if 'lock' in captures:
+            lock=os.open('lock',os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
+            if not private(os.fstat(lock)) or signature(os.fstat(lock))!=captures['lock'][0]: return
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        def current():
+            for name,(sig,digest) in captures.items():
+                _,now,hashed=readat(fd,name,262144)
+                if now!=sig or hashed!=digest: return False
+            if set(namesat(fd,3))!=set(captures): return False
+            for name,(sig,_) in captures.items():
+                if signature(os.stat(name,dir_fd=fd,follow_symlinks=False))!=sig: return False
+            for parent in parents:
+                st=os.stat(parent['path'],follow_symlinks=False)
+                if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode & 0o022 or (st.st_dev,st.st_ino)!=(parent['dev'],parent['ino']): return False
+            st=os.stat(inc,dir_fd=rootfd,follow_symlinks=False)
+            if not private(st,True) or (st.st_dev,st.st_ino)!=(own.st_dev,own.st_ino): return False
+            if (os.fstat(rootfd).st_dev,os.fstat(rootfd).st_ino)!=(parents[0]['dev'],parents[0]['ino']): return False
+            check()
+            return True
+        if not current(): return
+        print(json.dumps({'rollback':sid+'/'+inc}),flush=True)
+        check()
+        if not select.select([sys.stdin],[],[],max(0,DEADLINE-time.monotonic()))[0] or sys.stdin.readline()!='ACK\n': return
+        if not current(): return
+        for name in list(captures):
+            if not current(): return
+            os.unlink(name,dir_fd=fd)
+            captures.pop(name)
+        # The incarnation is already empty. Its parent entry can be removed
+        # without requiring support for syncing the soon-to-be-removed leaf.
+        # The original provisioning error is still returned to the caller.
+        if not current(): return
+        os.rmdir(inc,dir_fd=rootfd)
+        os.fsync(rootfd)
+    except (OSError,ValueError,TypeError,KeyError): return
+    finally:
+        if lock is not None: os.close(lock)
+        if fd is not None: os.close(fd)
+        os.close(rootfd)
+
 def main():
-    if not sys.platform.startswith('linux'): return
+    if not (sys.platform.startswith('linux') or sys.platform=='darwin'): return
     request=strict_json(sys.stdin.readline(2097153))
+    if isinstance(request,dict) and set(request)=={'rollback'}:
+        rollback_unlaunched(request['rollback']); return
     data=request['dataDir']; refs=request['references']
     if not isinstance(data,str) or not data.startswith('/') or os.path.normpath(data)!=data or '\x00' in data or not isinstance(refs,list) or len(refs)>32768 or any(not isinstance(v,str) or not UUID.fullmatch(v) for v in refs): return
     if os.path.realpath(data)!=data: return

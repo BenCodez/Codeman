@@ -550,6 +550,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               await discardCancelledRestore();
               continue;
             }
+            let grantPreparationAttempted = false;
             let workspaceGranted = false;
             let grantIsCurrent = () => false;
             let verifyGrantCurrent = async () => false;
@@ -557,9 +558,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             const launchScopeIsCurrent = () => {
               const peers = [...ctx.sessions.values()].filter((other) => other !== session);
               return (
-                workspaceGranted &&
+                // Session checks the scope before calling prepare. Only that
+                // first check may precede the prepared grant; once attempted,
+                // failed or pending preparation must remain unauthorized.
+                (!grantPreparationAttempted || (workspaceGranted && grantIsCurrent())) &&
                 (!initialGenericGrant || initialGenericGrant.isCurrent()) &&
-                grantIsCurrent() &&
                 ctx.sessions.get(session.id) === session &&
                 session.owner === saved.owner &&
                 rejectAlreadyLive(
@@ -573,6 +576,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             const authorityIsCurrent = () => rebootRestoreRegistry.isHeld(entry, owner) && launchScopeIsCurrent();
             session.setRestoreLaunchGuard({
               prepare: async () => {
+                grantPreparationAttempted = true;
                 workspaceGranted = false;
                 grantIsCurrent = () => false;
                 verifyGrantCurrent = async () => false;
@@ -593,6 +597,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               },
               isCurrent: authorityIsCurrent,
               confirm: async () =>
+                grantPreparationAttempted &&
                 authorityIsCurrent() &&
                 (await isWorkingDirAllowedForUsername(saved.owner, session.workingDir)) &&
                 authorityIsCurrent() &&
