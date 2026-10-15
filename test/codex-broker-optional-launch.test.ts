@@ -3,7 +3,8 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vite
 import type { TmuxManager as Manager } from '../src/tmux-manager.js';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 
-const effects = vi.hoisted(() => ({ sync: vi.fn(), exec: vi.fn(), file: vi.fn() }));
+const effects = vi.hoisted(() => ({ sync: vi.fn(), exec: vi.fn(), file: vi.fn(), pty: vi.fn() }));
+vi.mock('node-pty', () => ({ spawn: effects.pty }));
 vi.mock('node:child_process', async (original) => {
   const actual = await original<typeof import('node:child_process')>();
   const exec = (...args: unknown[]) => {
@@ -50,8 +51,18 @@ beforeAll(async () => {
   }
 });
 beforeEach(() => {
-  effects.sync.mockReset().mockReturnValue('700\n');
-  effects.exec.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
+  effects.pty.mockReset().mockReturnValue({
+    pid: 0,
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+    onData: () => ({ dispose() {} }),
+    onExit: () => ({ dispose() {} }),
+  });
+  effects.sync.mockReset().mockImplementation((command: string) => nativeDispatchReceipt(command) || '700\n');
+  effects.exec
+    .mockReset()
+    .mockImplementation(async (command: string) => ({ stdout: nativeDispatchReceipt(command), stderr: '' }));
   effects.file.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
   manager = new TmuxManager();
   const internal = manager as unknown as {
@@ -71,6 +82,11 @@ afterAll(() => {
 });
 function commands() {
   return [...effects.sync.mock.calls, ...effects.exec.mock.calls].map(([command]) => String(command));
+}
+function nativeDispatchReceipt(command: string): string {
+  return command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED')
+    ? 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|$1|%7|700|800\n'
+    : '';
 }
 function successfulBroker() {
   return {
@@ -179,7 +195,7 @@ it.each(['native-dispatch', 'startup-receipt'] as const)(
     if (failure === 'native-dispatch')
       effects.sync.mockImplementation((command: string) => {
         if (command.includes('respawn-pane')) throw Error('lost native reply');
-        return '700\n';
+        return nativeDispatchReceipt(command) || '700\n';
       });
     else vi.mocked(broker.startupReceipt).mockRejectedValue(Error('lost broker reply'));
     await expect(manager.createSession(options)).rejects.toThrow();
@@ -211,11 +227,13 @@ function certifiedRefusal() {
       ? nativeRow
       : command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')
         ? 'CODEMAN_OPTIONAL_FALLBACK_STARTED|$1|%7|701|800\n'
-        : '',
+        : nativeDispatchReceipt(command),
     stderr: '',
   }));
-  effects.sync.mockImplementation(() =>
-    commands().some((command) => command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')) ? '701\n' : '700\n'
+  effects.sync.mockImplementation(
+    (command: string) =>
+      nativeDispatchReceipt(command) ||
+      (commands().some((command) => command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')) ? '701\n' : '700\n')
   );
   return broker;
 }
@@ -267,7 +285,7 @@ it.each([
 ] as const)('refuses ordinary fallback when native proof is %s', async (_name, row) => {
   certifiedRefusal();
   effects.exec.mockImplementation(async (command: string) => ({
-    stdout: command.includes(' list-panes -s ') ? row : '',
+    stdout: command.includes(' list-panes -s ') ? row : nativeDispatchReceipt(command),
     stderr: '',
   }));
   await expect(manager.createSession(options)).rejects.toThrow('could not safely fall back');
@@ -280,7 +298,7 @@ it('retains uncertainty when native fallback sees a replaced pane at its final a
       ? nativeRow
       : command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')
         ? 'CODEMAN_OPTIONAL_FALLBACK_REFUSED\n'
-        : '',
+        : nativeDispatchReceipt(command),
     stderr: '',
   }));
   registerOrdinary();
@@ -309,7 +327,7 @@ it('waits for the same refused broker to exit before a no-k fallback', async () 
         : nativeRow
       : command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')
         ? 'CODEMAN_OPTIONAL_FALLBACK_STARTED|$1|%7|701|800\n'
-        : '',
+        : nativeDispatchReceipt(command),
     stderr: '',
   }));
   expect((await manager.createSession(options)).recoveryInputBroker).toBeUndefined();
@@ -319,7 +337,11 @@ it('refuses a changed native server while waiting for a certified refused broker
   certifiedRefusal();
   let reads = 0;
   effects.exec.mockImplementation(async (command: string) => ({
-    stdout: command.includes(' list-panes -s ') ? (++reads === 1 ? '$1|%7|700|0|800\n' : '$1|%7|700|1|801\n') : '',
+    stdout: command.includes(' list-panes -s ')
+      ? ++reads === 1
+        ? '$1|%7|700|0|800\n'
+        : '$1|%7|700|1|801\n'
+      : nativeDispatchReceipt(command),
     stderr: '',
   }));
   await expect(manager.createSession(options)).rejects.toThrow('could not safely fall back');
@@ -334,7 +356,7 @@ it('does not fallback after the registered session is replaced during native evi
       registerOrdinary();
       return { stdout: nativeRow, stderr: '' };
     }
-    return { stdout: '', stderr: '' };
+    return { stdout: nativeDispatchReceipt(command), stderr: '' };
   });
   expect(await manager.respawnPane(options)).toBeNull();
   expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(1);
@@ -411,7 +433,7 @@ it.each(['unchanged', 'stop', 'owner', 'configuration', 'environment'] as const)
       return {
         stdout: command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')
           ? 'CODEMAN_OPTIONAL_FALLBACK_STARTED|$1|%7|701|800\n'
-          : '',
+          : nativeDispatchReceipt(command),
         stderr: '',
       };
     });
@@ -451,10 +473,156 @@ it.each(['session', 'pane', 'server', 'same-pid', 'missing-newline'] as const)(
         ? nativeRow
         : command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')
           ? ack
-          : '',
+          : nativeDispatchReceipt(command),
       stderr: '',
     }));
     await expect(manager.createSession(options)).rejects.toThrow('could not safely fall back');
     expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(2);
   }
 );
+
+for (const kind of ['create', 'ordinary-respawn'] as const) {
+  it.each(['session', 'pane', 'server'] as const)(
+    `never selects a first-observed replacement ${kind} tuple with the same broker PID (%s)`,
+    async (change) => {
+      certifiedRefusal();
+      if (kind === 'ordinary-respawn') registerOrdinary();
+      const fields = ['$1', '%7', '700', '1', '800'];
+      fields[{ session: 0, pane: 1, server: 4 }[change]] = { session: '$2', pane: '%8', server: '801' }[change];
+      effects.exec.mockImplementation(async (command: string) => ({
+        stdout: command.includes(' list-panes -s ')
+          ? fields.join('|') + '\n'
+          : command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED')
+            ? `CODEMAN_OPTIONAL_FALLBACK_STARTED|${fields[0]}|${fields[1]}|701|${fields[4]}\n`
+            : command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED')
+              ? 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|$1|%7|700|800\n'
+              : nativeDispatchReceipt(command),
+        stderr: '',
+      }));
+      if (kind === 'create') await expect(manager.createSession(options)).rejects.toThrow();
+      else expect(await manager.respawnPane(options)).toBeNull();
+      expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(1);
+      expect(commands().some((command) => command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED'))).toBe(false);
+    }
+  );
+}
+
+it.each([
+  'healthy',
+  'native-home-populated',
+  'native-home-replaced',
+  'replacement-tuple',
+  'lost-fallback-ack',
+  'owner-changed',
+  'configuration-changed',
+  'environment-changed',
+  'stopped',
+] as const)('the actual Session dead-pane path never creates another worker after %s', async (failure) => {
+  const { Session } = await import('../src/session.js');
+  certifiedRefusal();
+  registerOrdinary();
+  vi.spyOn(manager, 'isAvailable').mockReturnValue(true);
+  vi.spyOn(manager, 'muxSessionExists').mockReturnValue(true);
+  vi.spyOn(manager, 'isPaneDead').mockReturnValue(true);
+  const session = new Session({
+    id: SID,
+    mode: 'codex',
+    workingDir: options.workingDir,
+    useMux: true,
+    mux: manager,
+    muxSession: manager.getSession(SID),
+    codexConfig: { ...options.codexConfig },
+    envOverrides: { ...options.envOverrides },
+    owner: 'fixture-owner',
+  });
+  session.on('error', () => {});
+  const original = effects.exec.getMockImplementation()!;
+  effects.exec.mockImplementation(async (command: string) => {
+    if (command.includes(' list-panes -s ')) {
+      if (failure === 'native-home-populated') manager.getSession(SID)!.recoveryCodexHome = '/fixture/codex';
+      if (failure === 'native-home-replaced') manager.getSession(SID)!.recoveryCodexHome = '/different/home';
+      if (failure === 'owner-changed') session.owner = 'different-owner';
+      if (failure === 'configuration-changed')
+        Reflect.set(session, '_codexConfig', { ...options.codexConfig, model: 'different-model' });
+      if (failure === 'environment-changed') Reflect.set(session, '_envOverrides', { CODEX_HOME: '/different/home' });
+      if (failure === 'stopped') await session.stop(false);
+      return { stdout: failure === 'replacement-tuple' ? '$2|%7|700|1|800\n' : nativeRow, stderr: '' };
+    }
+    if (failure === 'lost-fallback-ack' && command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED'))
+      throw Error('Lost native fallback ACK');
+    return original(command);
+  });
+  try {
+    const healthy = failure === 'healthy' || failure === 'native-home-populated';
+    if (healthy) await session.startInteractive();
+    else await expect(session.startInteractive()).rejects.toThrow();
+    const expectedDispatches = healthy || failure === 'lost-fallback-ack' ? 2 : 1;
+    expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(expectedDispatches);
+    expect(commands().filter((command) => command.includes(' new-session '))).toHaveLength(0);
+    expect(effects.pty).toHaveBeenCalledTimes(healthy ? 1 : 0);
+    await expect(session.startInteractive()).rejects.toThrow();
+    expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(expectedDispatches);
+  } finally {
+    await session.stop(false);
+  }
+});
+
+for (const kind of ['create', 'ordinary-respawn'] as const) {
+  it.each([
+    'missing',
+    'missing-newline',
+    'double-newline',
+    'multiple-rows',
+    'zero-pid',
+    'zero-server',
+    'wrong-marker',
+    'lost-ack',
+  ] as const)(`never falls back without an exact original ${kind} dispatch acknowledgement (%s)`, async (failure) => {
+    const broker = certifiedRefusal();
+    if (kind === 'ordinary-respawn') registerOrdinary();
+    const row = 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|$1|%7|700|800\n';
+    const malformed = {
+      missing: '',
+      'missing-newline': row.trimEnd(),
+      'double-newline': row + '\n',
+      'multiple-rows': row + row,
+      'zero-pid': row.replace('|700|', '|0|'),
+      'zero-server': row.replace('|800', '|0'),
+      'wrong-marker': row.replace('DISPATCHED', 'OTHER'),
+      'lost-ack': '',
+    }[failure];
+    const sync = effects.sync.getMockImplementation()!;
+    const exec = effects.exec.getMockImplementation()!;
+    const response = () => {
+      if (failure === 'lost-ack') throw Error('Native dispatch acknowledgement lost');
+      return malformed;
+    };
+    effects.sync.mockImplementation((command: string) =>
+      command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED') ? response() : sync(command)
+    );
+    effects.exec.mockImplementation(async (command: string) =>
+      command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED') ? { stdout: response(), stderr: '' } : exec(command)
+    );
+    if (kind === 'create') await expect(manager.createSession(options)).rejects.toThrow();
+    else {
+      expect(await manager.respawnPane(options)).toBeNull();
+      expect(manager.getSession(SID)).toMatchObject({ pid: 0, recoveryInputBroker: broker.incarnation });
+    }
+    expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(1);
+    expect(commands().some((command) => command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED'))).toBe(false);
+    expect(broker.startupReceipt).not.toHaveBeenCalled();
+  });
+  it(`uses the original ${kind} dispatch PID rather than a later numeric PID alias`, async () => {
+    const broker = certifiedRefusal();
+    if (kind === 'ordinary-respawn') registerOrdinary();
+    const sync = effects.sync.getMockImplementation()!;
+    effects.sync.mockImplementation((command: string) =>
+      command.includes('display-message -p') && !command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED')
+        ? '999\n'
+        : sync(command)
+    );
+    if (kind === 'create') expect((await manager.createSession(options)).pid).toBe(701);
+    else expect(await manager.respawnPane(options)).toBe(701);
+    expect(broker.startupReceipt).toHaveBeenCalledExactlyOnceWith(700);
+  });
+}

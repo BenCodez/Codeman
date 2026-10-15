@@ -1876,13 +1876,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private brokerCommand(broker: CodexInputBroker): string {
     return `exec python3 ${shellescape(`${broker.directory}/broker.py`)} ${shellescape(broker.directory)} ${shellescape(broker.configurationDigest)}`;
   }
+  private optionalBrokerDispatchReceipt(
+    output: unknown
+  ): { sessionNativeId: string; paneId: string; brokerPid: number; serverPid: number } | undefined {
+    if (typeof output !== 'string') return undefined;
+    const row =
+      /^CODEMAN_OPTIONAL_BROKER_DISPATCHED\|(\$(?:0|[1-9]\d{0,9}))\|(%(?:0|[1-9]\d{0,9}))\|([1-9]\d{0,9})\|([1-9]\d{0,9})\n$/.exec(
+        output
+      );
+    return row && row[0] === output
+      ? { sessionNativeId: row[1], paneId: row[2], brokerPid: Number(row[3]), serverPid: Number(row[4]) }
+      : undefined;
+  }
   /** A certified no-child refusal can fall back only in the same now-dead native pane. */
   private async fallbackOptionalBroker(
     muxName: string,
     brokerPid: number,
     originalLaunch: string,
-    isCurrent: () => boolean
+    isCurrent: () => boolean,
+    expectedNative?: { sessionNativeId: string; paneId: string; serverPid: number },
+    noteDispatch?: () => void
   ): Promise<number | null> {
+    if (!expectedNative) return null;
     const deadline = performance.now() + 2_000;
     let fields: string[] | undefined;
     let tuple: string | undefined;
@@ -1904,6 +1919,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         !/^%(?:0|[1-9]\d{0,9})$/.test(paneId) ||
         !positivePid(rawPid) ||
         Number(rawPid) !== brokerPid ||
+        sessionId !== expectedNative.sessionNativeId ||
+        paneId !== expectedNative.paneId ||
+        Number(serverPid) !== expectedNative.serverPid ||
         !/^[01]$/.test(dead) ||
         !positivePid(serverPid)
       )
@@ -1930,6 +1948,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const spawn = `respawn-pane -c ${TMUX_LAUNCH_CWD} -t ${shellescape(paneId)} bash -c ${shellescape(originalLaunch)}`;
     if (!isCurrent()) return null;
     const acknowledgement = `display-message -p -t ${shellescape(paneId)} 'CODEMAN_OPTIONAL_FALLBACK_STARTED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'`;
+    noteDispatch?.();
     const { stdout: result } = await execAsync(
       `${this.tmux()} if-shell -F -t ${shellescape(paneId)} ${shellescape(predicate)} ${shellescape(`${spawn} ; ${acknowledgement}`)} ${shellescape('display-message -p CODEMAN_OPTIONAL_FALLBACK_REFUSED')}`,
       { timeout: Math.max(1, Math.ceil(deadline - performance.now())), maxBuffer: 1_024 }
@@ -2572,13 +2591,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
       const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
-      execSync(
-        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}`,
+      const dispatchOutput = execSync(
+        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}${inputBroker ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
         {
           timeout: EXEC_TIMEOUT_MS,
-          stdio: 'ignore',
+          stdio: inputBroker ? ['ignore', 'pipe', 'ignore'] : 'ignore',
+          encoding: 'utf8',
+          maxBuffer: 1_024,
         }
       );
+      const dispatchReceipt = inputBroker ? this.optionalBrokerDispatchReceipt(dispatchOutput) : undefined;
+      if (inputBroker && !dispatchReceipt) throw new Error('Optional input guard native dispatch receipt unavailable');
 
       // Wait for tmux session to be queryable
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
@@ -2620,8 +2643,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       void Promise.all(configPromises);
 
       // Get the PID of the pane process (retry for tmux server cold-start)
-      let pid = this.getPanePid(muxName);
-      for (let i = 0; !pid && i < GET_PID_MAX_RETRIES; i++) {
+      let pid = dispatchReceipt?.brokerPid ?? this.getPanePid(muxName);
+      for (let i = 0; !pid && !dispatchReceipt && i < GET_PID_MAX_RETRIES; i++) {
         await new Promise((resolve) => setTimeout(resolve, GET_PID_RETRY_MS));
         pid = this.getPanePid(muxName);
       }
@@ -2637,7 +2660,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           originalLaunch,
           () =>
             this.sessions.get(sessionId) === priorRegistration &&
-            (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true)
+            (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true),
+          dispatchReceipt
         );
         if (!fallbackPid) throw new Error('Optional input guard refusal could not safely fall back');
         pid = fallbackPid;
@@ -2933,8 +2957,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : undefined;
       // The server evaluates this exact dead-process fence before queuing a no-k
       // respawn. A refused or lost response remains uncertainty-sealed by Session.
+      const optionalDispatch = !!inputBroker && !guard && !options.onlyIfDead;
+      if (optionalDispatch) {
+        // This effect may land even if the native dispatch acknowledgement is lost.
+        session.pid = 0;
+        session.recoveryInputBroker = inputBroker.incarnation;
+        this.inputBrokers.set(sessionId, inputBroker);
+        this.saveSessions();
+      }
       const { stdout: spawnOutput } = await execAsync(
-        `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(expected!.paneId)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}`,
+        `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(expected!.paneId)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}${inputBroker && !guard && !options.onlyIfDead ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
         {
           timeout: EXEC_TIMEOUT_MS,
         }
@@ -2947,16 +2979,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // poll also invalidates any read already in flight, which would otherwise
       // write the old death back over the pane that just replaced it.
       this.clearPaneExit(muxName);
-      let pid = this.getPanePid(muxName);
+      const dispatchReceipt = optionalDispatch ? this.optionalBrokerDispatchReceipt(spawnOutput) : undefined;
+      let pid = optionalDispatch ? (dispatchReceipt?.brokerPid ?? 0) : this.getPanePid(muxName);
       let activeBroker = inputBroker;
       // A native dispatch may already have started this incarnation. Retain it
       // before awaiting the receipt so a lost reply cannot restore old authority.
-      if (pid && inputBroker) {
-        session.pid = pid;
+      if (inputBroker && (pid || optionalDispatch)) {
+        session.pid = pid ?? 0;
         session.recoveryInputBroker = inputBroker.incarnation;
         this.inputBrokers.set(sessionId, inputBroker);
         this.saveSessions();
       }
+      if (optionalDispatch && !dispatchReceipt) return null;
       if (pid && inputBroker && !guard && !options.onlyIfDead) {
         if ((await inputBroker.startupReceipt(pid)) === 'not-sent') {
           if (this.sessions.get(sessionId) !== session) return null;
@@ -2966,7 +3000,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             originalLaunch,
             () =>
               this.sessions.get(sessionId) === session &&
-              (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true)
+              (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true),
+            dispatchReceipt
           );
           if (!fallbackPid || this.sessions.get(sessionId) !== session) return null;
           pid = fallbackPid;
@@ -4258,10 +4293,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           accepted =
             !/esc to interrupt|reconnecting|would you like|approve this|sign in|log in|authentication failed|usage limit|limit reached/i.test(
               chrome
-            ) &&
-            (expected === undefined
-              ? hasCodexComposerText(screen, '') || hasCodexComposerText(screen, 'Ask Codex to do anything')
-              : hasCodexComposerText(screen, expected));
+            ) && (expected === undefined ? hasCodexComposerText(screen, '') : hasCodexComposerText(screen, expected));
           if (accepted) composerScreen = screen;
         } catch {
           // No native input has been attempted by this read.

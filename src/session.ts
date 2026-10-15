@@ -2111,8 +2111,14 @@ export class Session extends EventEmitter {
       // check ran, so it still carries the pre-pin ompConfig; rebuild it.
       this._pinOmpRespawnId();
       const respawnOptions = await this._buildRespawnPaneOptionsWithResumePin();
+      // A successful mux result can legitimately pin native launch metadata.
+      // Keep owner intent separate from that result while preserving the stricter dispatch fence.
+      const ownerIsCurrentAfterRespawn = this._captureOwnerLaunchAuthority('ignore');
       const newPid = await mux.respawnPane(respawnOptions);
+      if (!ownerIsCurrentAfterRespawn()) throw new Error('Owner launch authority changed during pane respawn');
       if (!newPid) {
+        if (getCli(this.mode)?.capabilities.recovery === 'codex-rollout')
+          throw new Error('An uncertain Codex respawn cannot create another worker');
         console.error('[Session] Failed to respawn pane, will create new session');
         needsNewSession = true;
       } else {
@@ -2724,8 +2730,23 @@ export class Session extends EventEmitter {
   }
 
   /** A refused optional guard cannot revive an owner launch canceled while it was awaited. */
-  private _captureOwnerLaunchAuthority(): () => boolean {
+  private _captureOwnerLaunchAuthority(nativeHome: 'create' | 'respawn' | 'ignore' = 'create'): () => boolean {
     const generation = this._recoveryGeneration;
+    const initialNativeHome = this._muxSession?.recoveryCodexHome;
+    const envHome = this._envOverrides?.CODEX_HOME || undefined;
+    const expectedHome =
+      !this._remote && !this._docker && getCli(this.mode)?.capabilities.recovery === 'codex-rollout'
+        ? normalizedCodexHome(
+            nativeHome === 'respawn'
+              ? (envHome ?? this._recoveryCodexHome ?? currentLocalCodexHome())
+              : (this._recoveryCodexHome ?? envHome ?? currentLocalCodexHome())
+          )
+        : undefined;
+    const currentNativeHome = () => {
+      const value = this._muxSession?.recoveryCodexHome;
+      if (nativeHome === 'ignore' || (initialNativeHome === undefined && value === expectedHome)) return undefined;
+      return value;
+    };
     const scope = () =>
       JSON.stringify([
         this.mode,
@@ -2739,7 +2760,8 @@ export class Session extends EventEmitter {
         this._advisorModel,
         this._resumeSessionId,
         this._customModel,
-        this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
+        this._recoveryCodexHome,
+        currentNativeHome(),
         this._remote,
         this._docker,
       ]);
@@ -2755,7 +2777,7 @@ export class Session extends EventEmitter {
    */
   private _buildRespawnPaneOptions(): import('./mux-interface.js').RespawnPaneOptions {
     const options: import('./mux-interface.js').RespawnPaneOptions = {
-      ownerLaunchIsCurrent: this._captureOwnerLaunchAuthority(),
+      ownerLaunchIsCurrent: this._captureOwnerLaunchAuthority('respawn'),
       sessionId: this.id,
       workingDir: this.workingDir,
       mode: this.mode,
