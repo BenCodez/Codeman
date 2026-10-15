@@ -21,17 +21,19 @@ import { describe, it, expect, afterEach, vi, beforeEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
 import { appendFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { dataPath, getDataDir } from '../../src/config/instance.js';
 import { writeCustomModelHosts, type CustomModelHost } from '../../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
-import { createUser, deleteUser, invalidateUsersCache } from '../../src/user-store.js';
+import { createUser, deleteUser, updateUser, findUser, invalidateUsersCache } from '../../src/user-store.js';
 
 /** Set per test: whether the mocked `startInteractive()` rejects. */
 let startShouldThrow = false;
 let startBarrier: Promise<void> | undefined;
 let afterGuardPrepare: (() => Promise<void>) | undefined;
+let afterGuardConfirm: (() => Promise<void>) | undefined;
 /** Ordering log, so a test can assert what ran before the pane spawned. */
 const callOrder: string[] = [];
 const launchConfigs: Record<string, unknown>[] = [];
@@ -70,11 +72,16 @@ vi.mock('../../src/session.js', () => ({
         await this.restoreGuard.prepare();
         await afterGuardPrepare?.();
         if ((await this.restoreGuard.confirm()) !== true) throw new Error('Reboot restoration authority changed');
+        await afterGuardConfirm?.();
+        if (this.restoreGuard.isCurrent?.() !== true) throw new Error('Reboot restoration authority changed');
       }
       if (this.profileGuard) {
         await this.profileGuard.prepare();
+        await afterGuardPrepare?.();
         if ((await this.profileGuard.confirm()) !== true || !this.profileGuard.isCurrent())
           throw new Error('Custom profile authority changed');
+        await afterGuardConfirm?.();
+        if (this.profileGuard.isCurrent() !== true) throw new Error('Custom profile authority changed');
       }
       if (startShouldThrow) throw new Error('spawn claude ENOENT');
       if (this.restoreGuard) {
@@ -153,6 +160,7 @@ beforeEach(() => {
   startShouldThrow = false;
   startBarrier = undefined;
   afterGuardPrepare = undefined;
+  afterGuardConfirm = undefined;
   callOrder.length = 0;
   launchConfigs.length = 0;
 });
@@ -560,6 +568,133 @@ describe('Codex reboot launch and cancellation', () => {
     (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = home;
     return entry;
   }
+  it.each(
+    ['codex', 'claude'].flatMap((mode) =>
+      ['setup', 'after-prepare', 'after-confirm'].flatMap((stage) =>
+        [
+          'downgrade',
+          'deleted',
+          'disabled',
+          'admin',
+          'confined',
+          ...(stage === 'after-confirm' ? [] : ['disk-downgrade']),
+          ...(mode === 'claude' ? ['legacy', 'confined-downgrade', 'confined-admin'] : []),
+        ].map((change) => ({ mode, stage, change }))
+      )
+    )
+  )(
+    'rechecks owner workspace confinement for $mode/$change at $stage before native dispatch',
+    async ({ mode, stage, change }) => {
+      const previousMultiuser = process.env.CODEMAN_MULTIUSER,
+        previousSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+      const spaces = join(homedir(), 'restore-confinement-spaces');
+      process.env.CODEMAN_MULTIUSER = '1';
+      process.env.CODEMAN_USER_SPACES_DIR = spaces;
+      writeFileSync(dataPath('users.json'), JSON.stringify({ version: 1, users: [] }));
+      invalidateUsersCache();
+      await createUser({ username: 'operator', role: 'admin', password: 'fixture-password' });
+      await createUser({
+        username: 'alice',
+        role: change === 'confined' ? 'user' : 'admin',
+        password: 'fixture-password',
+      });
+      const workspace = change.startsWith('confined') ? join(spaces, 'alice', 'cases', 'project') : WORKSPACE;
+      mkdirSync(workspace, { recursive: true });
+      const entry = offerEntry(
+        mode === 'codex' ? 'codex-original' : 'generic-original',
+        change === 'legacy' ? undefined : 'alice'
+      );
+      entry.workingDir = workspace;
+      entry.state.workingDir = workspace;
+      if (change === 'confined-downgrade' || change === 'confined-admin')
+        (entry.state as unknown as Record<string, unknown>).__envOverrides = {
+          CLAUDE_CODE_MAX_CONTEXT_TOKENS: '100000',
+        };
+      let rolloutPath: string | undefined;
+      if (mode === 'codex') {
+        const home = join(homedir(), '.codex');
+        mkdirSync(join(home, 'sessions'), { recursive: true });
+        rolloutPath = join(home, 'sessions', `rollout-confinement-${uuid}.jsonl`);
+        writeFileSync(
+          rolloutPath,
+          JSON.stringify({
+            type: 'session_meta',
+            payload: {
+              id: uuid,
+              cwd: workspace,
+              timestamp: '2026-10-13T15:00:00Z',
+              originator: 'codeman_codex-original',
+            },
+          }) + '\n'
+        );
+        entry.mode = 'codex';
+        entry.state.mode = 'codex';
+        entry.resumeConversationId = uuid;
+        entry.state.codexConfig = {
+          noDaemon: true,
+          resumeSessionId: uuid,
+          sandbox: 'read-only',
+          approvalPolicy: 'on-request',
+        };
+        (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = home;
+      }
+      const original = structuredClone(entry.state),
+        rollout = rolloutPath && readFileSync(rolloutPath, 'utf8');
+      const mutate = async () => {
+        if (change === 'downgrade' || change === 'confined-downgrade') await updateUser('alice', { role: 'user' });
+        else if (change === 'deleted') await deleteUser('alice');
+        else if (change === 'disabled') await updateUser('alice', { disabled: true });
+        else if (change === 'disk-downgrade') {
+          const file = JSON.parse(readFileSync(dataPath('users.json'), 'utf8'));
+          file.users.find((user: { username: string }) => user.username === 'alice').role = 'user';
+          writeFileSync(dataPath('users.json'), JSON.stringify(file));
+          // The ordinary auth cache still says admin: the exact final file proof must veto.
+          expect((await findUser('alice'))?.role).toBe('admin');
+        } else expect((await findUser('alice'))?.role).toBe(change === 'confined' ? 'user' : 'admin');
+      };
+      rebootRestoreRegistry.set([entry]);
+      const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+      if (stage === 'setup') ctx.setupSessionListeners.mockImplementation(mutate);
+      else if (stage === 'after-prepare') afterGuardPrepare = mutate;
+      else afterGuardConfirm = mutate;
+      const app = await createHarness(ctx);
+      try {
+        const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json()
+          .data;
+        const allowed =
+          change === 'admin' || change === 'confined' || change === 'confined-admin' || change === 'legacy';
+        if (change === 'confined-downgrade' || change === 'confined-admin')
+          expect(launchConfigs[0]).toMatchObject({
+            claudeMode: 'dangerously-skip-permissions',
+            envOverrides: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '100000' },
+          });
+        expect(callOrder).toContain('startInteractive');
+        expect(callOrder.filter((x) => x === 'launchAccepted')).toHaveLength(allowed ? 1 : 0);
+        expect(result.restored).toHaveLength(allowed ? 1 : 0);
+        expect(entry.state).toEqual(original);
+        if (rolloutPath) expect(readFileSync(rolloutPath, 'utf8')).toBe(rollout);
+        if (!allowed) {
+          expect(result.skipped).toEqual([{ sessionId: entry.sessionId, reason: 'rebuild-failed' }]);
+          expect(ctx.persistRebootRestoreDurably).not.toHaveBeenCalled();
+          expect(ctx.sessions.has(entry.sessionId)).toBe(false);
+          expect(rebootRestoreRegistry.list(() => true)).toEqual([entry]);
+          expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith(
+            entry.sessionId,
+            expect.objectContaining({ codexRestoreWorkerMayExist: false })
+          );
+        }
+      } finally {
+        await app.close();
+        if (rolloutPath) rmSync(rolloutPath, { force: true });
+        rmSync(dataPath('users.json'), { force: true });
+        invalidateUsersCache();
+        if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+        if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+        else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
+      }
+    }
+  );
   it('launches original UUID with supported settings and preserves the original journal key', async () => {
     const entry = codexOffer();
     rebootRestoreRegistry.set([entry]);
@@ -685,6 +820,99 @@ describe('Codex reboot launch and cancellation', () => {
         else process.env.CODEMAN_MULTIUSER = previousMultiuser;
         if (previousSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
         else process.env.CODEMAN_USER_SPACES_DIR = previousSpaces;
+      }
+    }
+  );
+  it.each(['changed', 'unchanged', 'grant-during-profile'] as const)(
+    'rechecks a generic profile/grant %s across a held final read',
+    async (change) => {
+      const previousMode = process.env.CODEMAN_MULTIUSER;
+      process.env.CODEMAN_MULTIUSER = '1';
+      writeFileSync(dataPath('users.json'), JSON.stringify({ version: 1, users: [] }));
+      invalidateUsersCache();
+      await createUser({ username: 'alice', role: 'admin', password: 'fixture-password' });
+      const endpoint: CustomModelHost = {
+        id: 'held-grant-endpoint',
+        label: 'Fixture',
+        baseUrl: 'http://127.0.0.1:8080',
+        apiKey: 'fixture-key',
+        models: ['fixture-model'],
+      };
+      await writeCustomModelHosts(getDataDir(), [endpoint]);
+      const entry = offerEntry('held-grant-profile', 'alice'),
+        profileDir = customModelConfigDir(entry.sessionId);
+      mkdirSync(profileDir, { recursive: true });
+      (entry.state as unknown as Record<string, unknown>).__customModel = {
+        endpointId: endpoint.id,
+        modelId: 'fixture-model',
+        envKeys: ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'CLAUDE_CONFIG_DIR'],
+        configDir: profileDir,
+      };
+      const original = structuredClone(entry.state);
+      let reached!: () => void,
+        release!: () => void,
+        held = false;
+      const entered = new Promise<void>((resolve) => {
+          reached = resolve;
+        }),
+        barrier = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      const originalOpen = fs.open.bind(fs);
+      let openSpy: ReturnType<typeof vi.spyOn> | undefined;
+      afterGuardPrepare = async () => {
+        openSpy = vi.spyOn(fs, 'open').mockImplementation(async (path, flags, mode) => {
+          const handle = await originalOpen(path, flags, mode);
+          if (
+            !held &&
+            String(path) === dataPath(change === 'grant-during-profile' ? 'custom-model-hosts.json' : 'users.json')
+          ) {
+            held = true;
+            reached();
+            await barrier;
+          }
+          return handle;
+        });
+      };
+      rebootRestoreRegistry.set([entry]);
+      const ctx = createMockRouteContext({ workspaceHooksEnabled: false }),
+        app = await createHarness(ctx);
+      try {
+        const response = app
+          .inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })
+          .then((result) => result);
+        await Promise.race([
+          entered,
+          response.then(() => {
+            throw Error('Restore finished before the held grant read');
+          }),
+        ]);
+        if (change === 'changed') await writeCustomModelHosts(getDataDir(), [{ ...endpoint, apiKey: 'changed-key' }]);
+        if (change === 'grant-during-profile') {
+          const users = JSON.parse(readFileSync(dataPath('users.json'), 'utf8'));
+          users.users[0].role = 'user';
+          writeFileSync(dataPath('users.json'), JSON.stringify(users));
+          expect((await findUser('alice'))?.role).toBe('admin');
+        }
+        expect(callOrder).not.toContain('launchAccepted');
+        release();
+        const result = (await response).json().data;
+        expect(held).toBe(true);
+        expect(callOrder.filter((x) => x === 'launchAccepted')).toHaveLength(change === 'unchanged' ? 1 : 0);
+        expect(result.restored).toHaveLength(change === 'unchanged' ? 1 : 0);
+        expect(entry.state).toEqual(original);
+        if (change !== 'unchanged') {
+          expect(ctx.persistRebootRestoreDurably).not.toHaveBeenCalled();
+          expect(rebootRestoreRegistry.list(() => true)).toEqual([entry]);
+        }
+      } finally {
+        release();
+        openSpy?.mockRestore();
+        await app.close();
+        rmSync(dataPath('users.json'), { force: true });
+        invalidateUsersCache();
+        if (previousMode === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = previousMode;
       }
     }
   );

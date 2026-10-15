@@ -367,13 +367,15 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
           const cid = typeof msg.cid === 'string' ? msg.cid : null;
           const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
           if (!canQueueInputDispatch(session, msg.d.length)) {
-            if (cid && seq !== null) {
-              if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
-            } else socket.close(4008, 'Input backlog full');
+            // Capacity can recover. Leave reliable frames unacknowledged so
+            // reconnect/HTTP retry keeps their exact durable FIFO identities.
+            if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
             return;
           }
           if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
-            if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
+            // Capacity is temporary: an error ACK would permanently discard
+            // the browser's durable input. Reconnect retries the same identity.
+            if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
             return;
           }
           const paneStartedAt = session.paneStartedAt;

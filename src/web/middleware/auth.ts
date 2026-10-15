@@ -692,7 +692,7 @@ export function registerSecurityHeaders(app: FastifyInstance, https: boolean, ba
         if (url.hostname === 'localhost' || url.hostname === '127.0.0.1' || url.hostname === '::1') {
           reply.header('Access-Control-Allow-Origin', origin);
           reply.header('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
-          reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+          reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Codeman-Supervisor-Session');
           reply.header('Access-Control-Max-Age', '86400');
         }
       } catch {
