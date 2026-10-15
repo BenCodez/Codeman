@@ -71,7 +71,8 @@ function expectManagerEvidenceUnchanged(actual: TaskState, before: TaskState, pa
   expect(actual).toEqual(expected);
 }
 const inputProofs = new WeakMap<Session, CodexBrokerProof>();
-function fakeSession(id: string, conversationId: string): Session {
+const constructedSessions: Session[] = [];
+async function fakeSession(id: string, conversationId: string): Promise<Session> {
   const muxSession = {
     sessionId: id,
     muxName: `fixture-${id}`,
@@ -114,8 +115,11 @@ function fakeSession(id: string, conversationId: string): Session {
     muxSession,
     codexConfig: { noDaemon: true, resumeSessionId: conversationId },
   });
+  constructedSessions.push(session);
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   inputProofs.set(session, inputProof);
   session.trackUserInput('Exact initial owner fixture prompt\r');
+  await Reflect.get(session, '_recoveryFencePublication');
   return session;
 }
 
@@ -178,6 +182,7 @@ describe('manager authority at the real server boundary', () => {
   let workerPaths: CodexIdentityWitness['paths'];
   let effects: ReturnType<typeof vi.fn>;
   let grantDirectory: string | undefined;
+  let fixtureData: string;
   let previousData: string | undefined;
   let previousMode: string | undefined;
 
@@ -185,14 +190,16 @@ describe('manager authority at the real server boundary', () => {
     previousData = process.env.CODEMAN_DATA_DIR;
     previousMode = process.env.CODEMAN_MULTIUSER;
     grantDirectory = undefined;
+    fixtureData = await mkdtemp(join(homedir(), 'manager-authority-state-'));
+    process.env.CODEMAN_DATA_DIR = fixtureData;
     workerPaths = [];
     vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
     server = new WebServer(0, false, true);
     internals = server as unknown as Internals;
     originalTaskStore = internals.taskStore;
-    managerSession = fakeSession(MANAGER, MANAGER_THREAD);
+    managerSession = await fakeSession(MANAGER, MANAGER_THREAD);
     internals.sessions.set(MANAGER, managerSession);
-    internals.sessions.set(WORKER, fakeSession(WORKER, WORKER_THREAD));
+    internals.sessions.set(WORKER, await fakeSession(WORKER, WORKER_THREAD));
     observation = {
       conversationId: MANAGER_THREAD,
       activity: 'idle',
@@ -346,6 +353,7 @@ describe('manager authority at the real server boundary', () => {
   });
 
   afterEach(async () => {
+    for (const session of constructedSessions.splice(0)) await Reflect.get(session, '_recoveryFencePublication');
     internals.taskStore = originalTaskStore;
     for (const id of [MANAGER, WORKER]) {
       await internals.stopRecoveryController(id, true).catch(() => {});
@@ -358,6 +366,7 @@ describe('manager authority at the real server boundary', () => {
     else process.env.CODEMAN_MULTIUSER = previousMode;
     invalidateUsersCache();
     if (grantDirectory) await rm(grantDirectory, { recursive: true, force: true });
+    await rm(fixtureData, { recursive: true, force: true });
     vi.restoreAllMocks();
   });
 
@@ -424,7 +433,7 @@ describe('manager authority at the real server boundary', () => {
       expect(managerTask.getStatus()).toEqual(before);
       expect(await fs.readFile(Reflect.get(internals.taskStore, 'path') as string, 'utf8')).toBe(bytes);
       if (outcome === 'pause' || outcome === 'io-pause') pausing = manager.pause();
-      if (outcome === 'manager-session') internals.sessions.set(MANAGER, fakeSession(MANAGER, MANAGER_THREAD));
+      if (outcome === 'manager-session') internals.sessions.set(MANAGER, await fakeSession(MANAGER, MANAGER_THREAD));
       if (outcome === 'manager-controller')
         internals.taskControllers.set(MANAGER, new TaskController(taskDeps, before));
       if (outcome === 'manager-owner') managerSession.owner = 'replacement-owner';
@@ -1294,10 +1303,13 @@ describe('manager authority at the real server boundary', () => {
           }),
         ]);
         if (change === 'private-file') await appendProgress({ outcome: 'blocked' });
-        if (change === 'owner-input') managerSession.trackUserInput('New owner draft');
+        if (change === 'owner-input') {
+          managerSession.trackUserInput('New owner draft');
+          await Reflect.get(managerSession, '_recoveryFencePublication');
+        }
         if (change === 'owner-changed') Reflect.set(managerSession, '_owner', 'bob');
-        if (change === 'manager-replaced') internals.sessions.set(MANAGER, fakeSession(MANAGER, MANAGER_THREAD));
-        if (change === 'worker-replaced') internals.sessions.set(WORKER, fakeSession(WORKER, WORKER_THREAD));
+        if (change === 'manager-replaced') internals.sessions.set(MANAGER, await fakeSession(MANAGER, MANAGER_THREAD));
+        if (change === 'worker-replaced') internals.sessions.set(WORKER, await fakeSession(WORKER, WORKER_THREAD));
         if (change === 'grant-revoked') {
           const path = dataPath('users.json');
           await writeFile(
@@ -1405,7 +1417,10 @@ describe('manager authority at the real server boundary', () => {
     const source = privateEvidenceSource(worker, workerRolloutPath, WORKER_THREAD);
     if (kind === 'wrong-session') source.sessionId = MANAGER;
     if (kind === 'wrong-uuid') source.identity.conversationId = OTHER_THREAD;
-    if (kind === 'stale') worker.trackUserInput('Later owner draft');
+    if (kind === 'stale') {
+      worker.trackUserInput('Later owner draft');
+      await Reflect.get(worker, '_recoveryFencePublication');
+    }
     if (kind === 'throws')
       source.isCurrent = () => {
         throw new Error('Fixture source check failed');

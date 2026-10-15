@@ -213,7 +213,11 @@ describe('session-routes', () => {
         } as MuxSession,
         codexConfig: { noDaemon: true, resumeSessionId: thread },
       });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written, kill: vi.fn() } });
+      expect(await session.ensureRecoveryIdentityFence()).toBe(true);
       (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      let queuedInput: Promise<{ statusCode: number }> | undefined;
       let complete: (err: Error | null) => void = () => {};
       execFile.mockReset();
       execFile.mockImplementation((_bin: string, _argv: string[], _opts: unknown, cb: typeof complete) => {
@@ -230,11 +234,11 @@ describe('session-routes', () => {
         await vi.waitFor(() => expect(execFile).toHaveBeenCalledTimes(1));
         expect(session.recoveryInputReserved).toBe(true);
         expect(session.paneLifecycleInFlight).toBe(true);
-        expect(session.getRecoveryContext().generation).toBe(1);
+        expect(session.getRecoveryContext().generation).toBe(2);
         expect(
           await session.deliverRecovery(
             { action: 'continue', key: 'fixture', conversationId: thread, startedAt: Date.now() },
-            1
+            2
           )
         ).toBe('not-sent');
         expect(mux.sendInput).not.toHaveBeenCalled();
@@ -245,21 +249,38 @@ describe('session-routes', () => {
         });
         expect(blockedKey.statusCode).toBe(422);
         expect(blockedKey.json()).toMatchObject({ retryable: true, notSent: true });
-        const blockedInput = await harness.app.inject({
-          method: 'POST',
-          url: `/api/sessions/${session.id}/input`,
-          payload: { input: 'later', clientId: 'fixture', seq: 1 },
-        });
-        expect(blockedInput.statusCode).toBe(422);
+        expect(await session.writeAsync('refused concurrent owner input', { fromUser: true })).toBe(false);
+        const admitted = vi.spyOn(session, 'deferInputSeq');
+        let inputCompleted = false;
+        queuedInput = harness.app
+          .inject({
+            method: 'POST',
+            url: `/api/sessions/${session.id}/input`,
+            payload: { input: 'later', useMux: false, clientId: 'fixture', seq: 1 },
+          })
+          .then((response) => {
+            inputCompleted = true;
+            return response;
+          });
+        await vi.waitFor(() => expect(admitted).toHaveBeenCalledWith('fixture', 1));
+        expect(inputCompleted).toBe(false);
+        expect(session.hasAppliedInputSeq('fixture', 1)).toBe(false);
+        expect(written).not.toHaveBeenCalled();
+        expect(session.getRecoveryContext().generation).toBe(2);
         expect(execFile).toHaveBeenCalledTimes(1);
         complete(null);
         expect((await sending).statusCode).toBe(200);
+        expect((await queuedInput).statusCode).toBe(200);
+        expect(written).toHaveBeenCalledExactlyOnceWith('later');
+        expect(session.hasAppliedInputSeq('fixture', 1)).toBe(true);
         expect(session.recoveryInputReserved).toBe(false);
         expect(session.paneLifecycleInFlight).toBe(false);
-        expect(session.getRecoveryContext().generation).toBe(1); // no post-callback double tracking
+        // One preparation + one tracking step for each of the key and queued frame.
+        expect(session.getRecoveryContext().generation).toBe(4);
       } finally {
         complete(null);
         await sending;
+        await queuedInput;
         await session.stop(false);
       }
     });

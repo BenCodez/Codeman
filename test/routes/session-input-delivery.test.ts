@@ -198,12 +198,19 @@ describe('POST /api/sessions/:id/input rollback wiring', () => {
       (response) => response
     );
     await vi.waitFor(() => expect(write).toHaveBeenCalledTimes(1));
-    const pending = await post({ input: 'pending', useMux: true, clientId: 'pending-client', seq: 7 });
-    expect(pending.statusCode).toBe(422);
-    expect(pending.headers['x-codeman-input-ack']).toBeUndefined();
+    let duplicateAcknowledged = false;
+    const pending = post({ input: 'pending', useMux: true, clientId: 'pending-client', seq: 7 }).then((response) => {
+      duplicateAcknowledged = true;
+      return response;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(duplicateAcknowledged).toBe(false);
     expect(session.lastInputSeq('pending-client')).toBe(0);
     finish(true);
     expect((await original).statusCode).toBe(200);
+    const acknowledged = await pending;
+    expect(acknowledged.statusCode).toBe(200);
+    expect(JSON.parse(String(acknowledged.headers['x-codeman-input-ack']))).toEqual({ seq: 7, dup: true, last: 7 });
     expect(session.lastInputSeq('pending-client')).toBe(7);
     const retry = await post({ input: 'pending', useMux: true, clientId: 'pending-client', seq: 7 });
     expect(retry.statusCode).toBe(200);
@@ -216,7 +223,7 @@ describe('POST /api/sessions/:id/input rollback wiring', () => {
     (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
     session.shouldApplyInput('two-tabs', 10);
     session.commitInputSeq('two-tabs', 10);
-    const direct = vi.spyOn(session, 'write').mockReturnValue(true);
+    const direct = vi.spyOn(session, 'writeAsync').mockResolvedValue(true);
     const duplicate = await post({ input: 'before', clientId: 'two-tabs', seq: 1 });
     expect(duplicate.statusCode).toBe(200);
     expect(duplicate.json()).toEqual({ success: true, data: {} });
@@ -358,7 +365,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
     const res = await post({ input: LONG_PROMPT });
 
     expect(res.statusCode).toBe(200);
-    expect(viaMux).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true });
+    expect(viaMux).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true, isCurrent: expect.any(Function) });
     expect(direct).not.toHaveBeenCalled();
   });
 
@@ -384,7 +391,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
 
     await post({ input: 'hello\r' });
 
-    expect(direct).toHaveBeenCalledWith('hello\r', { fromUser: true });
+    expect(direct).toHaveBeenCalledWith('hello\r', { fromUser: true, isCurrent: expect.any(Function) });
   });
 
   it('keeps the raw write for an explicit useMux: false', async () => {
@@ -392,7 +399,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
 
     await post({ input: LONG_PROMPT, useMux: false });
 
-    expect(direct).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true });
+    expect(direct).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true, isCurrent: expect.any(Function) });
     expect(viaMux).not.toHaveBeenCalled();
   });
 
@@ -409,7 +416,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
 
     await post({ input });
 
-    expect(direct).toHaveBeenCalledWith(input, { fromUser: true });
+    expect(direct).toHaveBeenCalledWith(input, { fromUser: true, isCurrent: expect.any(Function) });
     expect(viaMux).not.toHaveBeenCalled();
   });
 });

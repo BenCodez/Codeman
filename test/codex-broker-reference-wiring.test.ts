@@ -145,13 +145,13 @@ it.each(['active', 'parked', 'spending', 'unreadable'] as const)(
         state: { id: SID, mode: 'codex', workingDir: root, __codexPriorInputBroker: INC },
       } as unknown as RebootRestoreEntry;
       const prior = internal.captureInputBrokerCleanupReferences()!;
-      rebootRestoreRegistry.set([entry]);
+      await rebootRestoreRegistry.set([entry]);
       if (kind === 'parked') rebootRestoreRegistry.take(() => true, undefined, 'owner');
       if (kind === 'spending') rebootRestoreRegistry.beginSpending('owner');
       if (kind === 'unreadable') {
         const path = join(root, 'malformed-offer.json');
         await fs.writeFile(path, '{');
-        rebootRestoreRegistry.configurePersistence(path);
+        await rebootRestoreRegistry.configurePersistence(path);
       }
       expect(prior.isCurrent()).toBe(false);
       const snapshot = internal.captureInputBrokerCleanupReferences();

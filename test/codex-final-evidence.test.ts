@@ -7,6 +7,7 @@ import { Session } from '../src/session.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import type { RecoveryFlight } from '../src/recovery/types.js';
+import { loadRebootIdentityFence } from '../src/recovery/reboot-identity-fence.js';
 import { resolveCodexIdentity } from '../src/recovery/codex-identity.js';
 import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 
@@ -34,6 +35,8 @@ for (const action of ['continue', 'restart'] as const) {
     'owned-identity-conflict',
   ])(`${action} rechecks %s evidence after the actual Session pane await`, async (change) => {
     const home = await fs.mkdtemp(join(homedir(), 'codex-final-evidence-'));
+    const previousData = process.env.CODEMAN_DATA_DIR;
+    process.env.CODEMAN_DATA_DIR = join(home, 'manager');
     const work = join(home, 'work');
     await fs.mkdir(work);
     await fs.mkdir(join(home, 'sessions'));
@@ -133,7 +136,10 @@ for (const action of ['continue', 'restart'] as const) {
       paneExit: action === 'restart' ? { at: NOW, status: 1 } : undefined,
     });
     try {
+      expect(await session.ensureRecoveryIdentityFence()).toBe(true);
       session.trackUserInput('Initial owner request\r');
+      await Reflect.get(session, '_recoveryFencePublication');
+      expect(session.getRecoveryContext().switchPending).toBe(false);
       const submission = session.getRecoveryContext().submission;
       expect(submission).toBeDefined();
       await fs.writeFile(
@@ -221,6 +227,14 @@ for (const action of ['continue', 'restart'] as const) {
         );
     } finally {
       await session.stop(false);
+      await vi.waitFor(
+        async () => {
+          await loadRebootIdentityFence(session.id);
+        },
+        { timeout: 3000, interval: 5 }
+      );
+      if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+      else process.env.CODEMAN_DATA_DIR = previousData;
       await fs.rm(home, { recursive: true, force: true });
     }
   });

@@ -137,7 +137,7 @@ it('preserves explicitly unframed legacy newline delivery', async () => {
 
 it('keeps a refused newline out of the draft and drains malformed async formatters', async () => {
   const f = await fixture();
-  expect(f.session.write('first', { fromUser: true })).toBe(true);
+  expect(await f.session.writeAsync('first', { fromUser: true })).toBe(true);
   f.wrap.mockImplementationOnce(() => Promise.reject(new Error('Isolated malformed key formatter')));
   const refused = await f.post();
   expect(refused.statusCode).toBe(422);
@@ -149,6 +149,6 @@ it('keeps a refused newline out of the draft and drains malformed async formatte
   expect(f.effects).toHaveLength(0);
   f.wrap.mockReturnValue({ status: 'framed', data: 'ready-newline' });
   expect((await f.post()).statusCode).toBe(200);
-  expect(f.session.write('second\r', { fromUser: true })).toBe(true);
+  expect(await f.session.writeAsync('second\r', { fromUser: true })).toBe(true);
   expect(f.session.getRecoveryContext().submission?.hash).toBe(hashCodexPrompt('first\nsecond'));
 });

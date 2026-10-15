@@ -48,6 +48,7 @@ async function withJournal(
   await internals.actionReservationStore.save(id, initialTaskState());
   await internals.recoveryStore.save(id, initialRecoveryState());
   const session = new Session({ id, workingDir: root, mode, useMux: false });
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   internals.sessions.set(id, session);
   internals.supervisorStore = journal;
   vi.spyOn(session, 'stop').mockResolvedValue();

@@ -16,6 +16,7 @@ const io = vi.hoisted(() => ({
   writes: 0,
   directorySyncs: 0,
   commits: 0,
+  temporary: '',
   primaryCloses: 0,
 }));
 vi.mock('node:fs/promises', async (original) => {
@@ -29,8 +30,12 @@ vi.mock('node:fs/promises', async (original) => {
   return {
     ...real,
     open: async (...args: Parameters<typeof real.open>) => {
-      const file = await real.open(...args);
       const path = String(args[0]);
+      if (path.endsWith('.reboot.tmp') && args[1] === 'wx') {
+        io.temporary = path;
+        if (io.failure === 'wx-collision') await real.writeFile(path, 'foreign temporary');
+      }
+      const file = await real.open(...args);
       const candidate = path.endsWith('.reboot.tmp') && args[1] === 'wx';
       if (candidate) await pause('open');
       return new Proxy(file, {
@@ -63,9 +68,11 @@ vi.mock('node:fs/promises', async (original) => {
           if (key === 'close')
             return async () => {
               const directory = (await target.stat()).isDirectory();
+              if (path.endsWith('.reboot.tmp') && typeof args[1] === 'number') await pause('temp-proof-close');
               if (candidate) await pause('close');
               else if (directory) await pause('directory-close');
               else if (path.endsWith('state.json')) {
+                if (io.writes === 0) await pause('initial-proof-close');
                 io.primaryCloses++;
                 if (io.writes >= 2) await pause('rollback-proof-close');
               }
@@ -76,9 +83,9 @@ vi.mock('node:fs/promises', async (original) => {
         },
       });
     },
-    unlink: async (...args: Parameters<typeof real.unlink>) => {
+    lstat: async (...args: Parameters<typeof real.lstat>) => {
       if (String(args[0]).endsWith('.reboot.tmp') && io.commits > 0) await pause('success-cleanup');
-      return real.unlink(...args);
+      return real.lstat(...args);
     },
     rename: async (...args: Parameters<typeof real.rename>) => {
       if (String(args[0]).endsWith('.reboot.tmp')) {
@@ -416,4 +423,79 @@ it('does not transfer a failed older ordinary save into the independent durable 
   await committing;
   expect(reload().getSession(ID)).toEqual(tentative());
   expect(reload().getSession(OTHER)?.name).toBe('New owner edit');
+});
+
+it('preserves a foreign temporary file when strict state creation collides', async () => {
+  const original = fs.readFileSync(path, 'utf8');
+  io.failure = 'wx-collision';
+  await expect(store.persistSessionDurably(ID, tentative())).rejects.toMatchObject({ code: 'EEXIST' });
+  expect(fs.readFileSync(io.temporary, 'utf8')).toBe('foreign temporary');
+  expect(fs.readFileSync(path, 'utf8')).toBe(original);
+});
+it('never publishes or removes a same-byte replacement of its strict candidate temporary inode', async () => {
+  const original = fs.readFileSync(path, 'utf8'),
+    entered = hold('close');
+  const operation = store.persistSessionDurably(ID, tentative()),
+    rejected = expect(operation).rejects.toThrow('staged file changed');
+  await reached(entered, operation);
+  const bytes = fs.readFileSync(io.temporary, 'utf8'),
+    inode = fs.statSync(io.temporary).ino;
+  const foreign = join(root, 'foreign-temporary');
+  fs.writeFileSync(foreign, bytes);
+  fs.renameSync(foreign, io.temporary);
+  expect(fs.statSync(io.temporary).ino).not.toBe(inode);
+  release!();
+  await rejected;
+  expect(fs.readFileSync(io.temporary, 'utf8')).toBe(bytes);
+  expect(fs.readFileSync(path, 'utf8')).toBe(original);
+  expect(io.commits).toBe(0);
+});
+it('refuses a foreign equal-byte rollback temporary instead of publishing or deleting it', async () => {
+  const previous = fs.readFileSync(path, 'utf8');
+  io.failure = 'directory-sync';
+  const entered = hold('rollback-write');
+  const operation = store.persistSessionDurably(ID, tentative()),
+    rejected = expect(operation).rejects.toBe(io.error);
+  await reached(entered, operation);
+  // Pause occurs before this FileHandle writes; move its owned inode aside and
+  // replace its pathname with the exact bytes that rollback is about to write.
+  const bytes = previous;
+  const foreign = join(root, 'foreign-rollback');
+  fs.writeFileSync(foreign, bytes);
+  fs.renameSync(foreign, io.temporary);
+  release!();
+  await rejected;
+  expect(fs.readFileSync(io.temporary, 'utf8')).toBe(bytes);
+  expect(JSON.parse(fs.readFileSync(path, 'utf8')).sessions[ID].name).toBe('Restored');
+  expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(true);
+});
+it('retains a primary replaced while its temporary proof descriptor closes', async () => {
+  const entered = hold('temp-proof-close'),
+    operation = store.persistSessionDurably(ID, tentative());
+  const rejected = expect(operation).rejects.toThrow('target changed');
+  await reached(entered, operation);
+  const current = JSON.parse(fs.readFileSync(path, 'utf8'));
+  current.sessions[ID].name = 'Foreign owner';
+  const bytes = JSON.stringify(current),
+    foreign = join(root, 'foreign-primary');
+  fs.writeFileSync(foreign, bytes);
+  fs.renameSync(foreign, path);
+  release!();
+  await rejected;
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(io.commits).toBe(0);
+  expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(true);
+});
+
+it('does not reinterpret removal during the initial primary proof close as an absent original', async () => {
+  const entered = hold('initial-proof-close'),
+    operation = store.persistSessionDurably(ID, tentative());
+  const rejected = expect(operation).rejects.toThrow('State file changed');
+  await reached(entered, operation);
+  fs.unlinkSync(path);
+  release!();
+  await rejected;
+  expect(fs.existsSync(path)).toBe(false);
+  expect(io.commits).toBe(0);
+  expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(true);
 });

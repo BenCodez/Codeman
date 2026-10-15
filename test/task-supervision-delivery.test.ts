@@ -49,6 +49,7 @@ const brokerRoots: string[] = [];
 afterEach(async () => {
   controller?.stop();
   await controller?.drain();
+  if (session) await Reflect.get(session, '_recoveryFencePublication');
   await session?.stop(false);
   vi.restoreAllMocks();
   vi.useRealTimers();
@@ -130,6 +131,7 @@ describe('transport canonical task prompts', () => {
       muxSession,
       codexConfig: { noDaemon: true, sandbox: 'workspace-write', approvalPolicy: 'on-request' },
     });
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     session.pinRecoveryConversation(THREAD);
     controller = new TaskController({
       now: () => 10_000,
@@ -569,6 +571,7 @@ describe('transport canonical task prompts', () => {
         approvalPolicy: 'on-request',
       },
     });
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     session.pinRecoveryConversation(THREAD);
     let now = 10000;
     let tail =
@@ -781,8 +784,10 @@ describe('transport canonical task prompts', () => {
     const brokerFixture = installOwnedRemoteBrokerFixture(mux, muxSession, session.remote!, '/fixture/codex-home');
     decorate = brokerFixture;
     recordSent = brokerFixture.recordSent;
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     await session.prepareUserInputClock('Initial owner request\r', { fromUser: true });
     session.trackUserInput('Initial owner request\r');
+    await Reflect.get(session, '_recoveryFencePublication');
     const adapter = new CodexTaskAdapter(session, () => {}, deps);
     controller = new TaskController({
       persist: async () => {},
@@ -807,6 +812,7 @@ describe('transport canonical task prompts', () => {
 
     tailTruncated = false;
     await controller.resume();
+    await Reflect.get(session, '_recoveryFencePublication');
     const kickoff = delivered[0];
     expect(Buffer.byteLength(kickoff, 'utf8')).toBeGreaterThan(16 * 1024);
     expect(delivered).toEqual([kickoff]);
@@ -926,8 +932,10 @@ describe('transport canonical task prompts', () => {
       envOverrides: { CODEX_HOME: '/fixture/codex-home' },
     });
     const decorate = installOwnedRemoteBrokerFixture(mux, muxSession, session.remote!, '/fixture/codex-home');
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     await session.prepareUserInputClock('Initial owner request\r', { fromUser: true });
     session.trackUserInput('Initial owner request\r');
+    await Reflect.get(session, '_recoveryFencePublication');
     const adapter = new CodexTaskAdapter(session, () => {}, deps);
     expect((await adapter.observe()).observation).toMatchObject({ activity: 'completed' });
 

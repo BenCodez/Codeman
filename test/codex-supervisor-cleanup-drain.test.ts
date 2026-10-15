@@ -75,6 +75,7 @@ async function fixture(
   await internals.actionReservationStore.save(ID, initialTaskState());
   await internals.supervisorStore.save(ID, initialSupervisorState(ID));
   const session = new Session({ id: ID, mode: 'codex', workingDir: root, useMux: false });
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   internals.sessions.set(ID, session);
   const arbiter = internals.getActionArbiter(ID);
   const workerStarted = createDeferred<void>();

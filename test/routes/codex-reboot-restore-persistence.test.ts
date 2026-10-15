@@ -92,7 +92,7 @@ async function offer(state: SessionState): Promise<void> {
   const plan = await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true);
   expect(plan.skipped).toEqual([]);
   expect(plan.restore).toHaveLength(1);
-  rebootRestoreRegistry.set(plan.restore);
+  await rebootRestoreRegistry.set(plan.restore);
 }
 
 afterEach(async () => {
@@ -167,7 +167,7 @@ describe('durable Codex reboot completion', () => {
         join(home, 'history.jsonl'),
         JSON.stringify({ session_id: UUID, ts: submission.at / 1000, text: prompt }) + '\n'
       );
-      writeRebootIdentityFence(id, { switchPending: false, submission });
+      await writeRebootIdentityFence(id, { switchPending: false, submission });
       await offer(state);
       const { server, app, ctx, store } = await harness();
       store.setSession(id, state);
@@ -313,7 +313,7 @@ describe('durable Codex reboot completion', () => {
       }
       store.flush();
       const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
-      writeRebootIdentityFence(id, { resumeSessionId: UUID, switchPending: true, untrackedInput: true });
+      await writeRebootIdentityFence(id, { resumeSessionId: UUID, switchPending: true, untrackedInput: true });
       const nativeConfig =
         pane === 'partial-native-missing-config'
           ? undefined
@@ -448,7 +448,7 @@ describe('durable Codex reboot completion', () => {
       expect(readFileSync(rollout, 'utf8')).toBe(priorRollout);
       store.flush();
       expect(JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id]).toEqual(historical);
-      expect(readRebootIdentityFence(id)).toMatchObject({ switchPending: true });
+      expect(await readRebootIdentityFence(id)).toMatchObject({ switchPending: true });
       expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
       expect(rebootRestoreRegistry.list(() => true)).toHaveLength(1);
     }
@@ -568,14 +568,14 @@ describe('durable Codex reboot completion', () => {
       join(home, 'history.jsonl'),
       JSON.stringify({ session_id: UUID, ts: now / 1000, text: prompt }) + '\n'
     );
-    writeRebootIdentityFence(id, { switchPending: false, submission });
+    await writeRebootIdentityFence(id, { switchPending: false, submission });
     await offer(state);
     const { server, app, ctx, store } = await harness();
     store.setSession(id, state);
     store.flush();
     const historical = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
     let changed = false;
-    const mutate = () => {
+    const mutate = async () => {
       if (changed) return;
       changed = true;
       const event = (payload: unknown) =>
@@ -608,29 +608,30 @@ describe('durable Codex reboot completion', () => {
             payload: { id: other, cwd: state.workingDir, originator: `codeman_${id}` },
           }) + '\n'
         );
-      } else if (change === 'switch') writeRebootIdentityFence(id, { switchPending: true });
-      else if (change === 'untracked') writeRebootIdentityFence(id, { switchPending: true, untrackedInput: true });
+      } else if (change === 'switch') await writeRebootIdentityFence(id, { switchPending: true });
+      else if (change === 'untracked')
+        await writeRebootIdentityFence(id, { switchPending: true, untrackedInput: true });
       else if (change === 'submission')
-        writeRebootIdentityFence(id, {
+        await writeRebootIdentityFence(id, {
           switchPending: false,
           submission: { at: now + 1, hash: hashCodexPrompt('New owner request') },
         });
       else if (change === 'owner-input')
-        expect(sessionMap(server).get(id)!.write('New owner request\r', { fromUser: true })).toBe(false);
+        expect(await sessionMap(server).get(id)!.writeAsync('New owner request\r', { fromUser: true })).toBe(false);
     };
     if (stage === 'final-grant') {
       const clamp = launchGrants.clampExternalCliConfigsForOwner;
       let calls = 0;
       vi.spyOn(launchGrants, 'clampExternalCliConfigsForOwner').mockImplementation(async (...args) => {
         const result = await clamp(...args);
-        if (++calls === 2) mutate();
+        if (++calls === 2) await mutate();
         return result;
       });
     }
     const originalCreate = ctx.mux.createSession.bind(ctx.mux);
     const effects: string[] = [];
     vi.spyOn(ctx.mux, 'createSession').mockImplementation(async (options) => {
-      if (stage === 'mux-preparation') mutate();
+      if (stage === 'mux-preparation') await mutate();
       const result = await originalCreate(options);
       effects.push(result.sessionId);
       return result;
@@ -724,7 +725,7 @@ describe('durable Codex reboot completion', () => {
       totalCost: 12,
     });
     state.codexConfig!.resumeSessionId = UUID;
-    writeRebootIdentityFence(state.id, { switchPending: false, resumeSessionId: UUID });
+    await writeRebootIdentityFence(state.id, { switchPending: false, resumeSessionId: UUID });
     await offer(state);
     const { server, app, store } = await harness();
     store.setSession(state.id, state);
@@ -747,15 +748,15 @@ describe('durable Codex reboot completion', () => {
     try {
       await vi.waitFor(() => expect(launching).toBeDefined());
       expect(sessionMap(server).get(state.id)).toBe(launching);
-      if (input === 'direct-attach') launching!.fenceUntrackedInput();
-      else expect(launching!.write('queued launch input\r', { fromUser: input === 'user' })).toBe(false);
+      if (input === 'direct-attach') await launching!.fenceUntrackedInput();
+      else expect(await launching!.writeAsync('queued launch input\r', { fromUser: input === 'user' })).toBe(false);
       // Exercise the debounced writer too, beyond its ordinary 100ms window.
       Reflect.get(server, 'persistSessionState').call(server, launching);
       await new Promise((resolve) => setTimeout(resolve, 150));
       store.flush();
       expect(store.getSession(state.id)).toEqual(state);
       expect(persisted()).toEqual(originalSnapshot);
-      expect(readRebootIdentityFence(state.id)).toMatchObject({
+      expect(await readRebootIdentityFence(state.id)).toMatchObject({
         switchPending: true,
         ...(input === 'direct-attach' ? { untrackedInput: true } : {}),
       });
@@ -816,14 +817,14 @@ describe('durable Codex reboot completion', () => {
       outputTokens: 123,
       totalCost: 12,
     });
-    expect(readRebootIdentityFence(state.id)).toMatchObject({ switchPending: false, resumeSessionId: UUID });
+    expect(await readRebootIdentityFence(state.id)).toMatchObject({ switchPending: false, resumeSessionId: UUID });
     const session = sessionMap(server).get(state.id)!;
     expect(session.codexRestoreWorkerMayExist).toBe(false);
     session.restoreTokens(235, 124, 13);
-    expect(session.write('Current exact prompt\r', { fromUser: true })).toBe(true);
+    expect(await session.writeAsync('Current exact prompt\r', { fromUser: true })).toBe(true);
     expect(store.getSession(state.id)).toMatchObject({ inputTokens: 235, outputTokens: 124, totalCost: 13 });
     expect(store.getSession(state.id)?.lastSubmitAt).toBeGreaterThan(0);
-    expect(readRebootIdentityFence(state.id)).toMatchObject({
+    expect(await readRebootIdentityFence(state.id)).toMatchObject({
       switchPending: false,
       submission: { hash: hashCodexPrompt('Current exact prompt') },
     });
@@ -839,13 +840,13 @@ describe('durable Codex reboot completion', () => {
       join(home, 'history.jsonl'),
       JSON.stringify({ session_id: UUID, ts: submission.at / 1000, text: prompt }) + '\n'
     );
-    writeRebootIdentityFence(state.id, { switchPending: false, submission });
+    await writeRebootIdentityFence(state.id, { switchPending: false, submission });
     await offer(state);
     const first = await harness();
 
     const result = await first.app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
     expect(result.json().restored.map((item: { id: string }) => item.id)).toEqual([state.id]);
-    expect(readRebootIdentityFence(state.id)).toEqual({
+    expect(await readRebootIdentityFence(state.id)).toEqual({
       switchPending: false,
       submission: undefined,
       resumeSessionId: UUID,
@@ -894,7 +895,7 @@ describe('durable Codex reboot completion', () => {
       async function (session, saved, phase, options) {
         await original.call(this, session, saved, phase, options);
         if (phase === 'after-spawn') {
-          if (kind === 'untracked') session.fenceUntrackedInput();
+          if (kind === 'untracked') await session.fenceUntrackedInput();
           else session.trackUserInput('/resume different-thread\r');
         }
       }
@@ -902,8 +903,8 @@ describe('durable Codex reboot completion', () => {
     const { server, app } = await harness();
     const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
     expect(result.json().restored).toHaveLength(1);
-    expect(readRebootIdentityFence(state.id)).toMatchObject({ switchPending: true });
-    if (kind === 'untracked') expect(readRebootIdentityFence(state.id)?.untrackedInput).toBe(true);
+    expect(await readRebootIdentityFence(state.id)).toMatchObject({ switchPending: true });
+    if (kind === 'untracked') expect((await readRebootIdentityFence(state.id))?.untrackedInput).toBe(true);
     expect(await verifyCodexRebootIdentity(sessionMap(server).get(state.id)!.toState())).toBeUndefined();
   });
 
@@ -972,7 +973,7 @@ describe('durable Codex reboot completion', () => {
     if (outcome !== 'healthy') {
       await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });
       if (outcome === 'changed-owner') launching!.owner = 'replacement-owner';
-      if (outcome === 'changed-generation') launching!.fenceUntrackedInput();
+      if (outcome === 'changed-generation') await launching!.fenceUntrackedInput();
       if (outcome === 'changed-configuration')
         Reflect.set(launching!, '_envOverrides', { CODEX_HOME: 'different-home' });
       if (outcome === 'changed-registration')
@@ -1012,19 +1013,19 @@ describe('durable Codex reboot completion', () => {
       join(home, 'history.jsonl'),
       JSON.stringify({ session_id: UUID, ts: submission.at / 1000, text: 'pre-reboot task' }) + '\n'
     );
-    writeRebootIdentityFence(state.id, { switchPending: false, submission });
+    await writeRebootIdentityFence(state.id, { switchPending: false, submission });
     await offer(state);
     const original = WebServer.prototype.reapplyPersistedSessionState;
     vi.spyOn(WebServer.prototype, 'reapplyPersistedSessionState').mockImplementation(async function (...args) {
       await original.apply(this, args);
-      if (args[2] === 'after-spawn') rebootRestoreRegistry.clear(() => true);
+      if (args[2] === 'after-spawn') await rebootRestoreRegistry.clear(() => true);
     });
     const { server, app, ctx } = await harness();
     const kill = vi.spyOn(ctx.mux, 'killSession');
     const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
     expect(result.json().skipped).toEqual([{ sessionId: state.id, reason: 'restore-cancelled' }]);
     expect(sessionMap(server).has(state.id)).toBe(false);
-    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: false, submission });
+    expect(await readRebootIdentityFence(state.id)).toEqual({ switchPending: false, submission });
     expect(ctx.mux.getSession(state.id)).toBeUndefined();
     expect(kill).not.toHaveBeenCalled();
   });
@@ -1102,7 +1103,7 @@ describe('deleted custom endpoint on reboot', () => {
       await writeCustomModelHosts(getDataDir(), [
         { id: 'joint-endpoint', label: 'joint', baseUrl: 'http://127.0.0.1:8080', apiKey: 'joint-fixture-key' },
       ]);
-      writeRebootIdentityFence(id, { switchPending: false, resumeSessionId: UUID });
+      await writeRebootIdentityFence(id, { switchPending: false, resumeSessionId: UUID });
       await offer(state);
       const { server, app, ctx, store } = await harness();
       store.setSession(id, state);

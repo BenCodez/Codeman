@@ -12,6 +12,7 @@ import {
   type BrokerChannel,
   type CodexBrokerState,
 } from '../src/recovery/codex-input-broker.js';
+import { loadRebootIdentityFence } from '../src/recovery/reboot-identity-fence.js';
 import { Session } from '../src/session.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import type { RecoveryMuxDispatchGuard, TerminalMultiplexer } from '../src/mux-interface.js';
@@ -337,6 +338,8 @@ it.each(['shared-deadline', 'event-loop-overshoot'] as const)(
 
 it.each([false, true])('real Session and adapter exclude an unobserved older resume (direct=%s)', async (direct) => {
   const { broker, child, root, bytes } = await fixture();
+  const previousData = process.env.CODEMAN_DATA_DIR;
+  process.env.CODEMAN_DATA_DIR = join(root, 'manager');
   await fs.mkdir(join(root, 'sessions'));
   const effects: string[] = [];
   const mux = {
@@ -390,11 +393,14 @@ it.each([false, true])('real Session and adapter exclude an unobserved older res
     envOverrides: { CODEX_HOME: root },
   });
   try {
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     const request = 'Initial owner fixture';
     session.trackUserInput(`${request}\r`);
     const owner = broker.frame('owner-pty', `${request}\r`)!;
     child.stdin.write(owner.data);
     expect(await broker.receipt(owner.receipt)).toBe('sent');
+    await Reflect.get(session, '_recoveryFencePublication');
+    expect(session.getRecoveryContext().switchPending).toBe(false);
     const submission = session.getRecoveryContext().submission!;
     await fs.writeFile(
       join(root, 'history.jsonl'),
@@ -447,6 +453,14 @@ it.each([false, true])('real Session and adapter exclude an unobserved older res
     }
   } finally {
     await session.stop(false);
+    await vi.waitFor(
+      async () => {
+        await loadRebootIdentityFence(session.id);
+      },
+      { timeout: 3000, interval: 5 }
+    );
+    if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+    else process.env.CODEMAN_DATA_DIR = previousData;
   }
 });
 

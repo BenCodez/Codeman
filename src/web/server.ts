@@ -44,7 +44,6 @@ import { hostname as getHostname, uptime as osUptime } from 'node:os';
 import { looksLikeHostReboot, newestPersistedActivity, planVerifiedRebootRestore } from '../reboot-restore.js';
 import { captureRebootBrokerBindings } from '../recovery/reboot-launch-witness.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
-import { writeRebootIdentityFence } from '../recovery/reboot-identity-fence.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { WebhookNotifier, readWebhookConfig } from '../webhook-notify.js';
 import type { WebhookUrgency } from '../types/push.js';
@@ -2974,14 +2973,8 @@ export class WebServer extends EventEmitter {
       this._persistSessionStateNow(session);
     };
     const identityChanged = () => {
-      const context = session.getRecoveryContext();
-      // This synchronous, fsynced fence must succeed before input dispatch.
-      // state.json itself is debounced and cannot provide that guarantee.
-      writeRebootIdentityFence(session.id, {
-        switchPending: context.switchPending,
-        submission: context.submission,
-        untrackedInput: context.untrackedInput,
-      });
+      // Session owns the awaited durable fence before dispatch. EventEmitter
+      // listeners remain pure bookkeeping and cannot conceal asynchronous I/O.
       input();
     };
     this.rebootIdentityListeners.set(session.id, identityChanged);
@@ -4103,7 +4096,7 @@ export class WebServer extends EventEmitter {
     livePaneCount: number,
     bindings?: ReadonlyMap<string, string | null>
   ): Promise<number> {
-    rebootRestoreRegistry.configurePersistence(join(getDataDir(), 'reboot-restore-offer.json'));
+    await rebootRestoreRegistry.configurePersistence(join(getDataDir(), 'reboot-restore-offer.json'));
     if (dead.length === 0) return 0;
 
     const persisted = this.store.getSessions();
@@ -4131,7 +4124,7 @@ export class WebServer extends EventEmitter {
         console.log(`[Server]   ${rejection.sessionId}: ${rejection.reason}`);
       }
     }
-    rebootRestoreRegistry.set(restore);
+    await rebootRestoreRegistry.set(restore);
     if (restore.length > 0) {
       console.log(`[Server] Host reboot detected; offering ${restore.length} session(s) for restore`);
     }
@@ -5038,6 +5031,7 @@ export class WebServer extends EventEmitter {
     // Don't delete sessions from the map or state.json — recovery needs them
 
     // Flush state store to prevent data loss from debounced saves
+    await rebootRestoreRegistry.flush();
     await this.store.flushAllAsync();
 
     // Clean up watcher listeners to prevent memory leaks
@@ -5115,6 +5109,10 @@ export class WebServer extends EventEmitter {
     this.pushStore.dispose();
 
     await this.app.close();
+    // GET expiry can enqueue background cleanup until the last request closes.
+    await rebootRestoreRegistry.flush();
+    // Closing in-flight requests can enqueue late reservation/uncertainty writes.
+    await this.mux.drainSessionSaves?.();
   }
 }
 

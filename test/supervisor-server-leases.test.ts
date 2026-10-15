@@ -1,6 +1,7 @@
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 import { join, dirname } from 'node:path';
-import { readFile } from 'node:fs/promises';
+import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { dataPath } from '../src/config/instance.js';
 import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 /** @fileoverview Supervisor leases follow surviving/restorable manager identities after boot. */
@@ -56,7 +57,7 @@ interface Internals {
   discardPartiallyBuiltSession(id: string, expected: Session): Promise<void>;
 }
 
-function session(id: string): Session {
+async function session(id: string): Promise<Session> {
   const muxSession = {
     sessionId: id,
     muxName: `fixture-${id}`,
@@ -74,7 +75,7 @@ function session(id: string): Session {
     getSession: () => muxSession,
     registerSession: vi.fn(),
   } as unknown as TerminalMultiplexer;
-  return new Session({
+  const value = new Session({
     id,
     mode: 'codex',
     owner: 'alice',
@@ -84,6 +85,8 @@ function session(id: string): Session {
     muxSession,
     codexConfig: { noDaemon: true },
   });
+  expect(await value.ensureRecoveryIdentityFence()).toBe(true);
+  return value;
 }
 
 describe('server supervisor lease reconciliation', () => {
@@ -92,6 +95,8 @@ describe('server supervisor lease reconciliation', () => {
   let old: Session;
   let journal: SupervisorState;
   let routes: RouteTestHarness[];
+  let fixtureData: string;
+  let previousData: string | undefined;
 
   const route = async (username = 'alice') => {
     vi.stubEnv('CODEMAN_MULTIUSER', '1');
@@ -116,6 +121,9 @@ describe('server supervisor lease reconciliation', () => {
   };
 
   beforeEach(async () => {
+    previousData = process.env.CODEMAN_DATA_DIR;
+    fixtureData = await mkdtemp(join(homedir(), 'supervisor-lease-state-'));
+    process.env.CODEMAN_DATA_DIR = fixtureData;
     vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
     // This suite isolates durable role/lease ownership; complete framing has
     // dedicated real adapter and supervisor admission coverage.
@@ -124,7 +132,7 @@ describe('server supervisor lease reconciliation', () => {
     server = new WebServer(0, false, true);
     internals = server as unknown as Internals;
     routes = [];
-    old = session(OLD);
+    old = await session(OLD);
     journal = {
       ...initialSupervisorState(OLD),
       ...config,
@@ -134,8 +142,8 @@ describe('server supervisor lease reconciliation', () => {
     };
     await internals.supervisorStore.save(OLD, journal);
     internals.store.setSession(OLD, old.toState());
-    internals.sessions.set(WORKER, session(WORKER));
-    internals.sessions.set(NEXT, session(NEXT));
+    internals.sessions.set(WORKER, await session(WORKER));
+    internals.sessions.set(NEXT, await session(NEXT));
     internals.tabLayouts.markRestorationComplete();
   });
 
@@ -148,6 +156,9 @@ describe('server supervisor lease reconciliation', () => {
       internals.store.removeSession(id);
     }
     await server.stop().catch(() => {});
+    if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+    else process.env.CODEMAN_DATA_DIR = previousData;
+    await rm(fixtureData, { recursive: true, force: true });
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
   });
@@ -179,7 +190,7 @@ describe('server supervisor lease reconciliation', () => {
   );
 
   it.each(['stopped', 'breaker'] as const)('does not create a new controller for a %s manager', async (kind) => {
-    const fresh = session(FRESH);
+    const fresh = await session(FRESH);
     internals.sessions.set(FRESH, fresh);
     if (kind === 'stopped') await fresh.stop(false);
     else Reflect.set(fresh, '_respawnBlocked', true);
@@ -457,12 +468,12 @@ describe('server supervisor lease reconciliation', () => {
       resumeConversationId: '44444444-4444-4444-8444-444444444444',
       state: old.toState(),
     } as RebootRestoreEntry;
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     await internals.cleanupStaleSessions();
     expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
     expect(rebootRestoreRegistry.take(() => true, [OLD], 'alice')).toEqual([entry]);
     expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
-    rebootRestoreRegistry.clear(() => true);
+    await rebootRestoreRegistry.clear(() => true);
     expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBeUndefined();
     expect(internals.supervisorStore.get(OLD).inFlight).toEqual(journal.inFlight);
   });
@@ -491,6 +502,7 @@ describe('server supervisor lease reconciliation', () => {
     });
     internals.sessions.get(NEXT)!.pinRecoveryConversation('44444444-4444-4444-8444-444444444444');
     internals.sessions.get(NEXT)!.trackUserInput('Initial owner prompt in the selected manager thread\r');
+    await Reflect.get(internals.sessions.get(NEXT)!, '_recoveryFencePublication');
     vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockResolvedValue(true);
     // This lease test stubs identity verification above; supply its explicit
     // private issuer scope too. Native delivery stays mocked by `act`.

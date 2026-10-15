@@ -138,7 +138,7 @@ describe('Codex recovery journal startup pruning', () => {
           state: session.toState(),
         };
       });
-      rebootRestoreRegistry.set(entries);
+      await rebootRestoreRegistry.set(entries);
       rebootRestoreRegistry.take(() => true, ['taken'], undefined);
       expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual(['offered']);
       f.internals.recoveryControllers.set('controller', {});

@@ -1,18 +1,6 @@
-/** @fileoverview Private synchronous identity fence committed before a thread-changing input is dispatched. */
-import {
-  closeSync,
-  constants,
-  fstatSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  readSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
-import type { Stats } from 'node:fs';
+/** Private durable identity veto, acknowledged asynchronously before thread-changing input. */
+import { constants, type Stats } from 'node:fs';
+import fs from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getDataDirPath } from '../config/instance.js';
@@ -23,7 +11,6 @@ export interface RebootIdentityFence {
   submission?: RecoverySubmission;
   /** Exact UUID validated and launched by a completed new-pane reboot restore. */
   resumeSessionId?: string;
-  /** Direct tmux owned stdin, so tracked writes can no longer prove the pane's thread. */
   untrackedInput?: boolean;
 }
 export class RebootIdentityFenceError extends Error {
@@ -36,146 +23,334 @@ export function rebootIdentityFencePath(id: string): string {
   if (!/^[\w-]{1,100}$/.test(id)) throw new Error('Invalid reboot identity');
   return join(getDataDirPath(), 'reboot-identities', `${id}.json`);
 }
-// Repeated edits of an already-fenced draft need no additional synchronous fsync.
-// Cache only a completed durable veto, and invalidate it BEFORE any replacement attempt.
 type FenceFile = Pick<Stats, 'dev' | 'ino' | 'size' | 'mtimeMs' | 'ctimeMs'>;
+const sameFile = (a: FenceFile, b: FenceFile) =>
+  (['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'] as const).every((key) => a[key] === b[key]);
 const committedVetoes = new Map<string, { veto: 'pending' | 'untracked'; file: FenceFile }>();
-const sameFenceFile = (before: FenceFile, after: FenceFile) =>
-  (['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'] as const).every((key) => before[key] === after[key]);
-
-function readFenceSnapshot(path: string): { value: RebootIdentityFence; text: string; file: FenceFile } | undefined {
-  let before: Stats;
-  try {
-    before = lstatSync(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-    throw error;
-  }
-  if (!before.isFile() || before.isSymbolicLink() || before.size > 1024) throw new Error('Invalid fence');
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-  try {
-    const opened = fstatSync(fd);
-    if (!opened.isFile() || !sameFenceFile(before, opened)) throw new Error('Fence changed');
-    const bytes = Buffer.alloc(1025);
-    let size = 0;
-    while (size < bytes.length) {
-      const count = readSync(fd, bytes, size, bytes.length - size, size);
-      if (!count) break;
-      size += count;
+// Retain actual work until it settles, including after a caller's timeout. A
+// subsequent clean write cannot overtake an older pending/uncertain operation.
+const pending = new Map<string, Promise<unknown>>();
+const BUDGET_MS = 2000;
+async function bounded<T>(
+  path: string,
+  operation: (check: () => void) => Promise<T>,
+  originalDeadline = Infinity
+): Promise<T> {
+  if (pending.has(path) || pending.size >= 2) throw new RebootIdentityFenceError();
+  const deadline = Math.min(performance.now() + BUDGET_MS, originalDeadline);
+  if (!Number.isFinite(deadline) || deadline <= performance.now()) throw new RebootIdentityFenceError();
+  const check = () => {
+    if (performance.now() >= deadline) throw new RebootIdentityFenceError();
+  };
+  const work = Promise.resolve().then(() => operation(check));
+  pending.set(path, work);
+  void work.then(
+    () => {
+      if (pending.get(path) === work) pending.delete(path);
+    },
+    () => {
+      if (pending.get(path) === work) pending.delete(path);
     }
-    if (size > 1024 || size !== opened.size || !sameFenceFile(opened, fstatSync(fd))) throw new Error('Fence changed');
-    const after = lstatSync(path);
-    if (!after.isFile() || after.isSymbolicLink() || !sameFenceFile(opened, after)) throw new Error('Fence changed');
-    const data = bytes.subarray(0, size);
-    const text = data.toString('utf8');
-    if (!Buffer.from(text, 'utf8').equals(data)) throw new Error('Invalid fence');
-    return { value: parseRebootIdentityFence(text), text, file: after };
+  );
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const value = await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new RebootIdentityFenceError()), Math.max(0, deadline - performance.now()));
+      }),
+    ]);
+    check();
+    return value;
   } finally {
-    closeSync(fd);
+    if (timer) clearTimeout(timer);
   }
 }
-
-export function writeRebootIdentityFence(id: string, identity: RebootIdentityFence): void {
-  const path = rebootIdentityFencePath(id);
-  // A supported TUI handoff gives tmux stdin directly. Once that has happened,
-  // an ordinary browser Enter can be concurrent with more invisible terminal
-  // input and therefore cannot clear the handoff taint. Only deleting/replacing
-  // this private identity file as part of a separately proven new-pane lifecycle
-  // may establish a fresh identity boundary.
-  const cached = committedVetoes.get(path);
-  let existing: ReturnType<typeof readFenceSnapshot>;
+async function snapshot(
+  path: string,
+  check: () => void
+): Promise<{ value: RebootIdentityFence; text: string; file: FenceFile } | undefined> {
+  check();
+  let before: Stats;
   try {
-    existing = readFenceSnapshot(path);
-  } catch {
-    // A damaged/replaced fence cannot qualify for the cache shortcut.
+    before = await fs.lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      check();
+      return undefined;
+    }
+    throw error;
   }
-  const untrackedInput =
-    identity.untrackedInput === true || existing?.value.untrackedInput === true || cached?.veto === 'untracked';
-  const durableIdentity = untrackedInput ? { ...identity, untrackedInput: true } : identity;
-  const veto: 'pending' | 'untracked' | undefined = untrackedInput
-    ? 'untracked'
-    : identity.switchPending && identity.submission === undefined
-      ? 'pending'
-      : undefined;
-  const existingVeto = existing?.value.untrackedInput
-    ? 'untracked'
-    : existing?.value.switchPending && existing.value.submission === undefined
-      ? 'pending'
-      : undefined;
-  if (veto && cached?.veto === veto && existingVeto === veto && existing && sameFenceFile(cached.file, existing.file))
-    return;
-  committedVetoes.delete(path);
-  const temporary = `${path}.${randomUUID()}.tmp`;
-  const text = JSON.stringify({ version: 1, ...durableIdentity });
+  check();
+  if (!before.isFile() || before.isSymbolicLink() || before.size > 1024) throw new RebootIdentityFenceError();
+  let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+  let text: string, opened: Stats;
   try {
-    const fenceDirectory = dirname(path);
-    mkdirSync(fenceDirectory, { recursive: true, mode: 0o700 });
-    // The first fence creates this child directory. Its parent link must be durable too:
-    // syncing only the file and child directory can lose the entire fence after reboot.
-    // Repeat after a failed parent sync, even though mkdir now finds the directory.
-    const parent = openSync(dirname(fenceDirectory), 'r');
-    try {
-      fsyncSync(parent);
-    } finally {
-      closeSync(parent);
+    file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    check();
+    opened = await file.stat();
+    check();
+    if (!opened.isFile() || !sameFile(before, opened)) throw new RebootIdentityFenceError();
+    const bytes = Buffer.alloc(opened.size + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const read = await file.read(bytes, size, bytes.length - size, size);
+      check();
+      if (!read.bytesRead) break;
+      size += read.bytesRead;
     }
-    const fd = openSync(temporary, 'wx', 0o600);
-    let owned: FenceFile | undefined;
-    try {
-      writeFileSync(fd, text);
-      fsyncSync(fd);
+    const after = await file.stat();
+    check();
+    if (size !== opened.size || !sameFile(opened, after)) throw new RebootIdentityFenceError();
+    const data = bytes.subarray(0, size);
+    text = data.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(data)) throw new RebootIdentityFenceError();
+    await file.close();
+    file = undefined;
+    check();
+  } finally {
+    if (file) await file.close().catch(() => {});
+  }
+  const current = await fs.lstat(path);
+  check();
+  if (!current.isFile() || current.isSymbolicLink() || !sameFile(opened!, current))
+    throw new RebootIdentityFenceError();
+  return { value: parseRebootIdentityFence(text!), text: text!, file: current };
+}
+async function remains(path: string, expected: FenceFile | undefined, check: () => void): Promise<void> {
+  let current: Stats;
+  try {
+    current = await fs.lstat(path);
+  } catch (error) {
+    check();
+    if (!expected && (error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  check();
+  if (!expected || !current.isFile() || current.isSymbolicLink() || !sameFile(expected, current))
+    throw new RebootIdentityFenceError();
+}
+async function syncDirectory(path: string, check: () => void): Promise<void> {
+  let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+  try {
+    file = await fs.open(
+      path,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+    );
+    check();
+    await file.sync();
+    check();
+  } finally {
+    if (file) await file.close();
+  }
+  check();
+}
+/** A busy or timed-out journal is known unsent; callers retain and retry their original input identity. */
+export async function writeRebootIdentityFence(
+  id: string,
+  identity: RebootIdentityFence,
+  isCurrent: () => boolean = () => true
+): Promise<RebootIdentityFence> {
+  const path = rebootIdentityFencePath(id);
+  const captured = structuredClone(identity);
+  try {
+    return await bounded(path, async (deadlineCheck) => {
+      const check = () => {
+        deadlineCheck();
+        if (isCurrent() !== true) throw new RebootIdentityFenceError();
+      };
+      check();
+      const existing = await snapshot(path, check);
+      const cached = committedVetoes.get(path);
+      const untrackedInput =
+        captured.untrackedInput === true || existing?.value.untrackedInput === true || cached?.veto === 'untracked';
+      const durable = untrackedInput ? { ...captured, untrackedInput: true } : captured;
+      const veto = untrackedInput
+        ? 'untracked'
+        : durable.switchPending && durable.submission === undefined
+          ? 'pending'
+          : undefined;
+      const previousVeto = existing?.value.untrackedInput
+        ? 'untracked'
+        : existing?.value.switchPending && existing.value.submission === undefined
+          ? 'pending'
+          : undefined;
+      if (veto && cached?.veto === veto && previousVeto === veto && existing && sameFile(cached.file, existing.file))
+        return existing.value;
+      committedVetoes.delete(path);
+      const temporary = `${path}.${randomUUID()}.tmp`;
+      const text = JSON.stringify({ version: 1, ...durable });
+      if (Buffer.byteLength(text) > 1024) throw new RebootIdentityFenceError();
+      let temporaryPresent = true;
+      let renameAttempted = false;
+      let ownedTemporary: { dev: number; ino: number } | undefined;
       try {
-        owned = fstatSync(fd);
-      } catch {
-        // Metadata is only a cache optimization, not part of the durable write.
-      }
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(temporary, path);
-    const directory = openSync(dirname(path), 'r');
-    try {
-      fsyncSync(directory);
-    } finally {
-      closeSync(directory);
-    }
-    if (veto) {
-      try {
-        const acknowledged = readFenceSnapshot(path);
+        await fs.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+        check();
+        const parent = await fs.lstat(dirname(path));
+        check();
+        if (!parent.isDirectory() || parent.isSymbolicLink()) throw new RebootIdentityFenceError();
+        await syncDirectory(dirname(dirname(path)), check);
+        const file = await fs.open(
+          temporary,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+          0o600
+        );
+        try {
+          check();
+          const opened = await file.stat();
+          ownedTemporary = { dev: opened.dev, ino: opened.ino };
+          check();
+          await file.writeFile(text);
+          check();
+          await file.sync();
+          check();
+        } finally {
+          await file.close();
+        }
+        check();
+        const ready = await snapshot(temporary, check);
         if (
-          acknowledged &&
-          owned &&
-          acknowledged.file.dev === owned.dev &&
-          acknowledged.file.ino === owned.ino &&
-          acknowledged.file.size === owned.size &&
-          acknowledged.file.mtimeMs === owned.mtimeMs &&
-          acknowledged.text === text
-        ) {
+          !ready ||
+          ready.file.dev !== ownedTemporary?.dev ||
+          ready.file.ino !== ownedTemporary?.ino ||
+          ready.text !== text
+        )
+          throw new RebootIdentityFenceError();
+        const stillExisting = await snapshot(path, check);
+        if (
+          existing
+            ? !stillExisting || stillExisting.text !== existing.text || !sameFile(stillExisting.file, existing.file)
+            : stillExisting !== undefined
+        )
+          throw new RebootIdentityFenceError();
+        // Both private read handles are closed before the common pathname scan.
+        await remains(temporary, ready.file, check);
+        await remains(path, stillExisting?.file, check);
+        check();
+        renameAttempted = true;
+        await fs.rename(temporary, path);
+        temporaryPresent = false;
+        check();
+        await syncDirectory(dirname(path), check);
+        const acknowledged = await snapshot(path, check);
+        if (
+          !acknowledged ||
+          acknowledged.text !== text ||
+          acknowledged.file.dev !== ownedTemporary?.dev ||
+          acknowledged.file.ino !== ownedTemporary?.ino
+        )
+          throw new RebootIdentityFenceError();
+        if (veto) {
           if (committedVetoes.size >= 256) committedVetoes.clear();
           committedVetoes.set(path, { veto, file: acknowledged.file });
         }
-      } catch {
-        // The write was durable; inability to pin its exact inode only disables reuse.
+        return acknowledged.value;
+      } catch (error) {
+        // A cancelled clean publication may have reached rename already. Restore
+        // only this invocation's exact clean inode to its captured pending veto;
+        // never replace a foreign/newer primary, and never extend the I/O budget.
+        if (renameAttempted && !durable.switchPending && existing?.value.switchPending && ownedTemporary) {
+          let rollbackPath: string | undefined;
+          let rollbackOwned: { dev: number; ino: number } | undefined;
+          try {
+            const clean = await snapshot(path, deadlineCheck);
+            if (
+              clean &&
+              clean.text === text &&
+              clean.file.dev === ownedTemporary.dev &&
+              clean.file.ino === ownedTemporary.ino
+            ) {
+              rollbackPath = `${path}.${randomUUID()}.tmp`;
+              const rollback = await fs.open(
+                rollbackPath,
+                constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+                0o600
+              );
+              try {
+                deadlineCheck();
+                const info = await rollback.stat();
+                rollbackOwned = { dev: info.dev, ino: info.ino };
+                deadlineCheck();
+                await rollback.writeFile(existing.text);
+                deadlineCheck();
+                await rollback.sync();
+                deadlineCheck();
+              } finally {
+                await rollback.close();
+              }
+              const ready = await snapshot(rollbackPath, deadlineCheck),
+                stillClean = await snapshot(path, deadlineCheck);
+              if (
+                !ready ||
+                ready.text !== existing.text ||
+                ready.file.dev !== rollbackOwned.dev ||
+                ready.file.ino !== rollbackOwned.ino ||
+                !stillClean ||
+                stillClean.text !== clean.text ||
+                !sameFile(stillClean.file, clean.file)
+              )
+                throw new RebootIdentityFenceError();
+              await remains(rollbackPath, ready.file, deadlineCheck);
+              await remains(path, stillClean.file, deadlineCheck);
+              deadlineCheck();
+              await fs.rename(rollbackPath, path);
+              rollbackPath = undefined;
+              await syncDirectory(dirname(path), deadlineCheck);
+            }
+          } catch {
+            /* Unknown restoration stays fenced in the live Session. */
+          } finally {
+            if (rollbackPath && rollbackOwned) {
+              try {
+                const info = await fs.lstat(rollbackPath);
+                if (
+                  info.isFile() &&
+                  !info.isSymbolicLink() &&
+                  info.dev === rollbackOwned.dev &&
+                  info.ino === rollbackOwned.ino
+                )
+                  await fs.unlink(rollbackPath);
+              } catch {
+                /* Unknown private entries are retained. */
+              }
+            }
+          }
+        }
+        throw error;
+      } finally {
+        if (temporaryPresent && ownedTemporary) {
+          try {
+            const owned = await fs.lstat(temporary);
+            if (
+              owned.isFile() &&
+              !owned.isSymbolicLink() &&
+              owned.dev === ownedTemporary.dev &&
+              owned.ino === ownedTemporary.ino
+            )
+              await fs.unlink(temporary);
+          } catch {
+            /* An unknown replacement or lost unlink acknowledgement is retained. */
+          }
+        }
       }
-    }
+    });
   } catch {
     throw new RebootIdentityFenceError();
-  } finally {
-    try {
-      unlinkSync(temporary);
-    } catch {
-      /* already renamed */
-    }
   }
 }
-
-/** Missing means a legacy session. Corruption always leaves restoration fenced. */
-export function readRebootIdentityFence(id: string): RebootIdentityFence | undefined {
+/** Missing is legacy; unknown reads keep recovery fenced and can be retried later. */
+export async function readRebootIdentityFence(id: string, deadline?: number): Promise<RebootIdentityFence | undefined> {
   try {
-    return readFenceSnapshot(rebootIdentityFencePath(id))?.value;
+    return await loadRebootIdentityFence(id, deadline);
   } catch {
     return { switchPending: true };
   }
+}
+/** Initialisation needs to distinguish unavailable evidence from a known durable pending veto. */
+export async function loadRebootIdentityFence(id: string, deadline?: number): Promise<RebootIdentityFence | undefined> {
+  const path = rebootIdentityFencePath(id);
+  return bounded(path, async (check) => (await snapshot(path, check))?.value, deadline);
 }
 
 /** Pure parser shared by bounded private launch reads; malformed evidence throws. */

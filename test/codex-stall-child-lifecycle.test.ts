@@ -477,12 +477,12 @@ async function remoteFixture(
     _remote: remote,
     ptyProcess: { write: vi.fn(), kill: vi.fn() },
   });
-  // Prepare the real Session admission before the owner bytes, with exclusively fake clock IO.
-  if (preparedClock) {
-    const admission = await f.session.prepareUserInputClock('Sanitized fixture request\r', { fromUser: true });
-    expect(admission?.()).toBe(true);
-  }
-  expect(f.session.write('Sanitized fixture request\r', { fromUser: true })).toBe(true);
+  // The real async owner path persists its pending identity before sampling
+  // the exclusively fake SSH clock and delivering bytes to the fake PTY.
+  // Legacy provenance opponents model an unavailable sample, rather than
+  // bypassing the same durable admission used by a healthy owner submission.
+  if (!preparedClock) vi.mocked(sampleRemoteCodexClock).mockResolvedValueOnce(undefined);
+  expect(await f.session.writeAsync('Sanitized fixture request\r', { fromUser: true })).toBe(true);
   expect(f.session.getRecoveryContext()).toMatchObject({ managed: true, noDaemon: true, remoteOwned: true });
   expect(f.session.getRecoveryContext().submission).toBeDefined();
   if (preparedClock)
@@ -1161,7 +1161,8 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
         if (veto === 'progress')
           f.evidence.identity.tail +=
             childEvent({ type: 'agent_message', message: 'Fresh structured remote work before dispatch' }, 500) + '\n';
-        if (veto === 'owner-input') f.session.write('Owner changed intent\r', { fromUser: true });
+        if (veto === 'owner-input')
+          expect(await f.session.writeAsync('Owner changed intent\r', { fromUser: true })).toBe(true);
         if (veto === 'grants')
           vi.mocked(clampExternalCliConfigsForOwner).mockResolvedValueOnce({
             codexConfig: { ...f.session.codexConfig, noDaemon: false },

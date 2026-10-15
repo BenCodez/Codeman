@@ -8,22 +8,34 @@ import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../src/recovery/reboot-identity-fence.js';
 
 const sync = vi.hoisted(() => ({ parentPath: '', failParent: false, acknowledged: false, parentCalls: 0 }));
-vi.mock('node:fs', async (original) => {
-  const actual = await original<typeof import('node:fs')>();
-  return {
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>();
+  const operations = {
     ...actual,
-    fsyncSync(fd: number) {
-      const parent = sync.parentPath ? actual.statSync(sync.parentPath) : undefined;
-      const target = actual.fstatSync(fd);
-      const isParent = parent && target.isDirectory() && target.dev === parent.dev && target.ino === parent.ino;
-      if (isParent) {
-        sync.parentCalls++;
-        if (sync.failParent) throw new Error('Sanitized parent directory sync failure');
-      }
-      actual.fsyncSync(fd);
-      if (isParent) sync.acknowledged = true;
+    open: async (...args: Parameters<typeof actual.open>) => {
+      const handle = await actual.open(...args);
+      return new Proxy(handle, {
+        get(target, key) {
+          if (key === 'sync')
+            return async () => {
+              const parent = sync.parentPath ? await actual.stat(sync.parentPath) : undefined;
+              const current = await target.stat();
+              const isParent =
+                parent && current.isDirectory() && current.dev === parent.dev && current.ino === parent.ino;
+              if (isParent) {
+                sync.parentCalls++;
+                if (sync.failParent) throw Error('Sanitized parent directory sync failure');
+              }
+              await target.sync();
+              if (isParent) sync.acknowledged = true;
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
     },
   };
+  return { ...operations, default: operations };
 });
 
 const sessions: Session[] = [];
@@ -48,7 +60,7 @@ function fixture() {
     clearPaneExit: vi.fn(),
     sendInput: vi.fn(async () => {
       expect(sync.acknowledged).toBe(true);
-      expect(readRebootIdentityFence(id)).toMatchObject({ switchPending: true });
+      expect(await readRebootIdentityFence(id)).toMatchObject({ switchPending: true });
       return true;
     }),
   };
@@ -71,7 +83,6 @@ function fixture() {
     } as MuxSession,
     codexConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
   });
-  session.on('recoveryIdentityChanged', () => writeRebootIdentityFence(id, { switchPending: true }));
   sessions.push(session);
   return { id, session, mux, path: join(sync.parentPath, 'reboot-identities', `${id}.json`) };
 }
@@ -102,7 +113,10 @@ it('refuses input and retries parent durability after a failed first-directory s
 
 it('preserves existing fence bytes and prevents input when parent syncing fails', async () => {
   const f = fixture();
-  writeRebootIdentityFence(f.id, { switchPending: false, resumeSessionId: '11111111-2222-3333-4444-555555555555' });
+  await writeRebootIdentityFence(f.id, {
+    switchPending: false,
+    resumeSessionId: '11111111-2222-3333-4444-555555555555',
+  });
   const before = await fs.readFile(f.path, 'utf8');
   sync.failParent = true;
   await expect(f.session.writeViaMux('/resume fixture\r', { fromUser: true })).rejects.toThrow();

@@ -32,7 +32,7 @@ interface StartupFixture {
   root: string;
   paths: Record<string, string>;
   layout: TabLayoutService;
-  session(id: string, mode?: 'codex' | 'shell'): Session;
+  session(id: string, mode?: 'codex' | 'shell'): Promise<Session>;
   rows(name: string): Promise<string[]>;
 }
 
@@ -97,8 +97,9 @@ async function fixture(
       action(new Set(Object.keys(internals.store.getSessions())))
     ),
   };
-  const session = (id: string, mode: 'codex' | 'shell' = 'codex') => {
+  const session = async (id: string, mode: 'codex' | 'shell' = 'codex') => {
     const value = new Session({ id, mode, workingDir: root, useMux: false });
+    expect(await value.ensureRecoveryIdentityFence()).toBe(true);
     vi.spyOn(value, 'stop').mockResolvedValue();
     return value;
   };
@@ -127,7 +128,7 @@ it('reclaims 100 unreachable settled manager roles without losing the live worke
     Array.from({ length: 100 }, (_, i) => [`orphan-manager-${i}`, manager(`orphan-manager-${i}`)])
   );
   await fixture(records, [...Object.keys(records), WORKER], async ({ internals, session, rows }) => {
-    internals.sessions.set(WORKER, session(WORKER));
+    internals.sessions.set(WORKER, await session(WORKER));
     await expect(internals.supervisorStore.save('new-manager', initialSupervisorState('new-manager'))).rejects.toThrow(
       /capacity/
     );
@@ -157,15 +158,17 @@ it('retains pinned, offered, taken, live and uncertain manager/worker ownership 
   records['orphan-manager'] = manager('orphan-manager');
   const retained = [...names, WORKER, uncertainWorker, liveWorker];
   await fixture(records, [...retained, 'orphan-manager'], async ({ internals, session, root, rows }) => {
-    internals.store.setSession('pinned-manager', { ...session('pinned-manager').toState(), pinned: true });
-    const entries = ['offered-manager', 'taken-manager'].map((sessionId) => ({
-      sessionId,
-      workingDir: root,
-      mode: 'codex',
-      resumeConversationId: THREAD,
-      state: session(sessionId).toState(),
-    }));
-    rebootRestoreRegistry.set(entries);
+    internals.store.setSession('pinned-manager', { ...(await session('pinned-manager')).toState(), pinned: true });
+    const entries = [];
+    for (const sessionId of ['offered-manager', 'taken-manager'])
+      entries.push({
+        sessionId,
+        workingDir: root,
+        mode: 'codex',
+        resumeConversationId: THREAD,
+        state: (await session(sessionId)).toState(),
+      });
+    await rebootRestoreRegistry.set(entries);
     rebootRestoreRegistry.take(() => true, ['taken-manager'], undefined);
     const controller = new SupervisorController(
       {
@@ -199,7 +202,7 @@ it('retains pinned, offered, taken, live and uncertain manager/worker ownership 
 it('preserves unknown supervisor ownership while allowing unrelated stale shell state cleanup', async () => {
   await fixture('{unreadable}', ['orphan-manager'], async ({ internals, paths, session }) => {
     const before = await Promise.all(Object.values(paths).map((path) => fs.readFile(path as string, 'utf8')));
-    internals.store.setSession('unrelated-shell', session('unrelated-shell', 'shell').toState());
+    internals.store.setSession('unrelated-shell', (await session('unrelated-shell', 'shell')).toState());
     expect(await internals.cleanupStaleSessions()).toBe(1);
     expect(internals.store.getSession('unrelated-shell')).toBeNull();
     expect(await Promise.all(Object.values(paths).map((path) => fs.readFile(path as string, 'utf8')))).toEqual(before);

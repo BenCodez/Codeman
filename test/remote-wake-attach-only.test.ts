@@ -41,7 +41,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
-function fixture(mode: 'codex' | 'claude', owned?: boolean, bound = true) {
+function fixture(mode: 'codex' | 'claude', owned?: boolean, bound = true, stubReadiness = true) {
   effects.exec.mockReset().mockResolvedValue({ stdout: '99999\n', stderr: '' });
   effects.sync.mockReset().mockReturnValue('99999\n');
   const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
@@ -53,6 +53,7 @@ function fixture(mode: 'codex' | 'claude', owned?: boolean, bound = true) {
     createdAt: Date.now(),
     workingDir: '/fixture/workspace',
     mode,
+    owner: 'fixture-owner',
     attached: true,
   } as MuxSession;
   Reflect.set(manager, 'sessions', new Map([[id, record]]));
@@ -93,11 +94,14 @@ function fixture(mode: 'codex' | 'claude', owned?: boolean, bound = true) {
       remoteSessionName: 'discovered-worker',
     },
   });
+  record.remote = worker.remote;
   workers.push(worker);
   // These cases isolate attach-command generation. Private target readiness
   // is exercised by the actual Session readiness suite.
-  vi.spyOn(worker, 'confirmRemoteWakeReady').mockResolvedValue(true);
-  vi.spyOn(worker, 'isRemoteWakeReadyCurrent').mockReturnValue(true);
+  if (stubReadiness) {
+    vi.spyOn(worker, 'confirmRemoteWakeReady').mockResolvedValue(true);
+    vi.spyOn(worker, 'isRemoteWakeReadyCurrent').mockReturnValue(true);
+  }
   const registry = new RemoteWakeRegistry({
     probe: async () => false,
     wake: async () => true,
@@ -132,6 +136,17 @@ it('ordinary reconnect uses attach-only even before a Codex conversation is boun
   expect(f.command()).toContain(' attach -t ');
   expect(f.command()).not.toContain('new-session');
   expect(f.command()).not.toContain('dangerously-bypass');
+});
+
+it('wakes an unguarded owned Codex worker through actual Session readiness and attach-only command generation', async () => {
+  const f = fixture('codex', true, false, false);
+  await expect(f.registry.ensureAwake(f.worker)).resolves.toBe(true);
+  expect(f.worker.remoteWakeInputScope()).toBeUndefined();
+  expect(f.command()).toContain(' attach -t ');
+  expect(f.command()).not.toContain('new-session');
+  expect(f.command()).not.toContain('exec codex');
+  expect(f.command()).not.toContain('dangerously-bypass');
+  expect(await f.worker.getOwnedRemoteInputBroker()).toBeUndefined();
 });
 
 it('retains ordinary launch/reattach semantics for other owned CLI sessions', async () => {
