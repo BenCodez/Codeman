@@ -27,6 +27,9 @@ export interface CodexIdentityRequest {
   noDaemon: boolean;
   submission?: { at: number; hash: string };
   previousId?: string;
+  /** Reboot-only: caller must validate a clean durable per-session fence and
+   * its exact owned historical broker before exposing any result. */
+  historyScope?: 'tracked-reboot-session';
 }
 
 /** Bounded private identity inputs; their freshness must survive the final pane/grant awaits. */
@@ -357,7 +360,12 @@ function matchingHistory(index: HistoryIndex, request: CodexIdentityRequest): Hi
   // Direct TUI /resume can activate an older thread without changing the saved
   // submission. Historical attribution must also agree with the latest history
   // UUID; a different or unknown current thread cannot rebind this authority.
-  if (index.entries.at(-1)?.id !== matches[0].id) throw new Refusal('unverified');
+  if (request.historyScope === 'tracked-reboot-session') {
+    // Other panes share history.jsonl. A reboot caller can certify the saved
+    // pane's tracked input separately; the submission must still name its exact
+    // saved UUID, never an arbitrary older conversation or hash-only fallback.
+    if (!request.resumeId || matches[0].id !== request.resumeId) throw new Refusal('unverified');
+  } else if (index.entries.at(-1)?.id !== matches[0].id) throw new Refusal('unverified');
   return matches[0];
 }
 
@@ -457,6 +465,8 @@ function prepareRequest(request: CodexIdentityRequest): { home: string } | { res
     !isAbsolute(request.workingDir) ||
     (request.resumeId !== undefined && !UUID.test(request.resumeId)) ||
     (request.previousId !== undefined && !UUID.test(request.previousId)) ||
+    (request.historyScope !== undefined &&
+      (request.historyScope !== 'tracked-reboot-session' || !request.resumeId || !request.submission)) ||
     (request.submission !== undefined &&
       (!Number.isFinite(request.submission.at) ||
         request.submission.at <= 0 ||
@@ -480,6 +490,7 @@ export async function resolveCodexIdentity(request: CodexIdentityRequest): Promi
     request.submission?.at,
     request.submission?.hash,
     request.previousId,
+    request.historyScope,
   ]);
   const existing = pendingHomes.get(home);
   if (existing) {
