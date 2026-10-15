@@ -58,10 +58,14 @@ export class TaskController {
   private userInputSaveQueued = false;
   private stopped = false;
   private configurationCommitUncertain = false;
+  private evidenceFreshnessFloor: number;
   constructor(
     private readonly deps: TaskDependencies,
     restored?: TaskState
   ) {
+    // Reloaded unverified evidence must be observed anew after owner resume.
+    // Keep this conservative floor private so durable/live task bytes agree.
+    this.evidenceFreshnessFloor = this.now();
     this.state = structuredClone(restored ?? initialTaskState());
     if (!this.state.agentProgressVeto && acceptanceCriteriaComplete(this.state)) this.state.outcome = 'completed';
     if (this.state.config.enabled && this.state.inFlight) {
@@ -114,13 +118,19 @@ export class TaskController {
     return this.getStatus();
   }
   /** Delegated configuration stays private until the journal's authorized commit. */
-  private async saveGuardedUpdate(candidate: TaskState, reason: string, isCurrent: () => boolean): Promise<TaskState> {
+  private async saveGuardedUpdate(
+    candidate: TaskState,
+    reason: string,
+    isCurrent: () => boolean,
+    renewEvidence: boolean
+  ): Promise<TaskState> {
     candidate.reason = reason;
     candidate.history = [...candidate.history, { at: this.now(), reason }].slice(-100);
     const snapshot = structuredClone(candidate);
     let committed = false;
     const commit = () => {
       this.state = candidate;
+      if (renewEvidence) this.evidenceFreshnessFloor = this.now();
       committed = true;
     };
     try {
@@ -182,10 +192,13 @@ export class TaskController {
       !!evidence &&
       Number.isFinite(evidence.startedAt) &&
       Number.isFinite(evidence.completedAt) &&
-      evidence.startedAt >= (this.state.configuredAt ?? this.state.startedAt ?? this.now()) &&
+      evidence.startedAt >= this.evidenceBoundary() &&
       evidence.completedAt >= evidence.startedAt &&
       evidence.completedAt <= this.now() + 2000
     );
+  }
+  private evidenceBoundary(): number {
+    return Math.max(this.evidenceFreshnessFloor, this.state.configuredAt ?? this.state.startedAt ?? this.now());
   }
   private actionIsCurrent(revision: number): boolean {
     return !this.stopped && this.revision === revision && !this.runtimeBudgetExpired();
@@ -373,7 +386,7 @@ export class TaskController {
         candidate.lastProgressAt = this.now();
       }
       if (patch.config) candidate.config = { ...candidate.config, ...patch.config };
-      if (candidate.config.enabled && (!candidate.objective || !candidate.criteria.length))
+      if (candidate.config.enabled && (!candidate.objective.trim() || !candidate.criteria.length))
         throw new TaskValidationError('Task objective and criteria are required');
       if (candidate.inFlight && candidate.config.enabled)
         throw new TaskValidationError('Unresolved delivery requires reset');
@@ -401,10 +414,11 @@ export class TaskController {
             : 'configured';
       if (candidate.config.enabled) candidate.startedAt ??= this.now();
       let result: TaskState;
-      if (externallyCurrent) result = await this.saveGuardedUpdate(candidate, reason, isCurrent);
+      if (externallyCurrent) result = await this.saveGuardedUpdate(candidate, reason, isCurrent, changed);
       else {
         this.state = candidate;
         result = await this.save(reason);
+        if (changed) this.evidenceFreshnessFloor = this.now();
       }
       this.arm();
       return result;
@@ -521,7 +535,7 @@ export class TaskController {
     return this.enqueue(async () => {
       this.requireCurrent(revision);
       if (this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
-      if (!this.state.objective || !this.state.criteria.length || this.state.outcome === 'completed')
+      if (!this.state.objective.trim() || !this.state.criteria.length || this.state.outcome === 'completed')
         throw new TaskValidationError('No unfinished task to supervise');
       const beforeObserveCancelled = this.preserveCancelledDelivery(revision, 'not-sent', false, externallyCurrent);
       if (beforeObserveCancelled) return beforeObserveCancelled;
@@ -609,6 +623,7 @@ export class TaskController {
       );
       this.arm();
       const result = await this.save('owner-reset');
+      this.evidenceFreshnessFloor = this.now();
       // Clear the shared reservation only after this controller's uncertainty is durably gone.
       await this.deps.resetReservation?.();
       return result;
@@ -679,7 +694,7 @@ export class TaskController {
         marker.submissionKey === o.submissionKey &&
         !this.state.handledEvidence.includes(marker.key);
       const progressBoundary = this.state.lastProgressAt ?? 0;
-      const configurationBoundary = this.state.configuredAt ?? this.state.startedAt ?? this.now();
+      const configurationBoundary = this.evidenceBoundary();
       if (markerIsCurrent && marker.latestAt !== undefined) {
         const intervalValid =
           Number.isFinite(marker.at) &&
@@ -822,11 +837,7 @@ export class TaskController {
       }
       if (o.activity !== 'completed' || !o.turnId || !o.conversationId || !o.processReady) return this.getStatus();
       const key = `${o.conversationId}:task:${o.turnId}`;
-      if (
-        o.at < (this.state.configuredAt ?? this.state.startedAt ?? this.now()) ||
-        this.state.handledEvidence.includes(key)
-      )
-        return this.getStatus();
+      if (o.at < this.evidenceBoundary() || this.state.handledEvidence.includes(key)) return this.getStatus();
       const prompt = this.prompt();
       this.state.inFlight = {
         key,

@@ -192,6 +192,26 @@ if op=='send-keys':
  assert a[3]=='-l' and a[4:6]==['-t','%7'] and len(a)==7
  data=a[6].encode('utf8');assert data.startswith(b'\x1eCODEMAN_INPUT_V1:') and data.endswith(b'\x1f')
  packet=json.loads(base64.b64decode(data.split(b':')[1]))
+ expiry_event=None
+ if packet['channel']=='auto' and base64.b64decode(packet['data'])==b'\r' and os.path.exists(root+'/expire-enter'):
+  plan=json.load(open(root+'/expire-enter'));literal=open(root+'/bytes','rb').read();assert literal==plan['prompt'].encode('utf8')
+  journal=json.load(open(root+'/private/'+packet['sessionId']+'/'+packet['incarnation']+'/state.json'))
+  prior=[r for r in journal['receipts'] if r['channel']=='auto' and r['counter']==packet['counter']-1]
+  assert len(prior)==1 and prior[0]['status']=='sent' and prior[0]['hash']==hashlib.sha256(literal).hexdigest()
+  before=time.monotonic()*1000
+  expiry=before+(plan['actionDeadline']-time.time()*1000) if 'actionDeadline' in plan else packet['monotonicDeadline']
+  assert 0<expiry-before<=2000
+  expiry_event={'counter':packet['counter'],'nonce':packet['nonce'],'hash':hashlib.sha256(b'\r').hexdigest(),'packetDeadline':packet['monotonicDeadline'],'expiry':expiry,'before':before,'literal':prior[0]}
+  queued=os.fork()
+  if queued:
+   fields=open('/proc/'+str(queued)+'/stat').read().rsplit(')',1)[1].split();birth=fields[19];assert birth.isascii() and birth.isdigit() and int(birth)>0
+   with open(root+'/enter-queue-process.tmp','w') as f:json.dump({'pid':queued,'birth':birth},f)
+   os.replace(root+'/enter-queue-process.tmp',root+'/enter-queue-process.json')
+   sys.exit(0)
+  null=os.open('/dev/null',os.O_RDWR)
+  for descriptor in (0,1,2):os.dup2(null,descriptor)
+  if null>2:os.close(null)
+  time.sleep(max(0,(expiry-time.monotonic()*1000)/1000)+.02)
  if packet['channel']=='auto' and base64.b64decode(packet['data'])==b'\r' and os.path.exists(root+'/enter-delay'):time.sleep(float(open(root+'/enter-delay').read()))
  with open(root+'/effects','a') as f:f.write(json.dumps({'frame':len(data)})+'\n')
  fd=os.open(root+'/input',os.O_WRONLY|os.O_NONBLOCK);end=time.monotonic()+1.5;offset=0
@@ -202,6 +222,12 @@ if op=='send-keys':
     if time.monotonic()>=end:raise
     select.select([],[fd],[],.01)
  finally:os.close(fd)
+ if expiry_event is not None:
+  expiry_event['forwarded']=time.monotonic()*1000
+  target=root+'/enter-expiry-forwarded';temporary=target+'.'+str(os.getpid())
+  previous=open(target).read() if os.path.exists(target) else ''
+  with open(temporary,'w') as f:f.write(previous+json.dumps(expiry_event)+'\n')
+  os.replace(temporary,target)
  sys.exit(0)
 raise AssertionError(op)
 `,
@@ -447,6 +473,43 @@ if op == 'if-shell':`
     marker: (name: string, value = '1') => fs.writeFile(join(root, name), value),
     diagnostics: () => diagnostics,
     close: async () => {
+      try {
+        const queued = JSON.parse(await fs.readFile(join(root, 'enter-queue-process.json'), 'utf8'));
+        if (
+          Number.isSafeInteger(queued.pid) &&
+          queued.pid > 0 &&
+          typeof queued.birth === 'string' &&
+          /^[1-9]\d*$/.test(queued.birth)
+        ) {
+          const isSameWriter = async () => {
+            try {
+              const stat = await fs.readFile('/proc/' + queued.pid + '/stat', 'utf8');
+              const end = stat.lastIndexOf(')');
+              if (end < 0) return false;
+              const fields = stat
+                .slice(end + 1)
+                .trim()
+                .split(/\s+/);
+              if (fields[19] !== queued.birth || fields[0] === 'Z' || fields[0] === 'X') return false;
+              return (await fs.readFile('/proc/' + queued.pid + '/cmdline', 'utf8')).includes(root + '/bin/');
+            } catch {
+              return false;
+            }
+          };
+          // Let the already-forwarded disposable writer exit normally. Unknown
+          // or changed native identity can never authorize a cleanup signal.
+          const end = process.hrtime.bigint() + 300_000_000n;
+          while (await isSameWriter()) {
+            if (process.hrtime.bigint() >= end) {
+              if (await isSameWriter()) process.kill(queued.pid, 'SIGKILL');
+              break;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 5));
+          }
+        }
+      } catch {
+        /* Missing, malformed or exited queued-process evidence is retained. */
+      }
       pumping = false;
       await pump;
       await fifoHandle.close().catch(() => {});

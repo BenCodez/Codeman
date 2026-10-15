@@ -169,15 +169,34 @@ it('keeps a partial phase unknown when its original lease expires between child 
       source
         .slice(boundary)
         .replace(needle, 'count = os.write(master, data[offset:offset + 1])')
-        .replace('while offset < len(data):\n', 'while offset < len(data):\n            if offset: time.sleep(.12)\n')
+        .replace(
+          'while offset < len(data):\n',
+          String.raw`while offset < len(data):
+            if offset:
+                if end is None: raise AssertionError('Fixture requires an automatic phase deadline')
+                marker_path = os.path.join(os.environ['CODEX_HOME'],'partial-written')
+                with open(marker_path+'.pending','w') as marker:
+                    json.dump({'offset':offset,'end':end,'at':time.monotonic()},marker)
+                os.replace(marker_path+'.pending',marker_path)
+                while time.monotonic() <= end: time.sleep(.005)
+`
+        )
     );
   });
   const value = await lease(f, ['partial text']);
-  value.lease.claim.deadline = Date.now() + 80;
-  value.lease.remoteDeadline = value.lease.claim.deadline;
-  value.expiry = Number(process.hrtime.bigint() / 1_000_000n) + 80;
   const packet = frame(f, 'partial text', value, 0);
   f.process.stdin.write(packet.data);
+  await eventually(async () =>
+    fs.access(join(f.root, 'partial-written')).then(
+      () => true,
+      () => false
+    )
+  );
+  const held = JSON.parse(await fs.readFile(join(f.root, 'partial-written'), 'utf8'));
+  expect(held.offset).toBe(1);
+  expect(held.at).toBeLessThan(held.end);
+  expect(held.end).toBe(value.expiry / 1000);
+  await eventually(async () => (await f.bytes()).toString() === 'p');
   expect(await f.broker.receipt(packet.receipt)).toBe('unknown');
   expect((await f.broker.readState())?.receipts.at(-1)?.status).toBe('reserved');
   expect(await f.broker.prove(f.process.pid!)).toBeUndefined();

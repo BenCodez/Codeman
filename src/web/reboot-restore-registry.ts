@@ -26,6 +26,7 @@
  */
 
 import {
+  chmodSync,
   closeSync,
   constants,
   fstatSync,
@@ -41,7 +42,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { getCli } from '../config/cli-registry/registry.js';
 import { planRebootRestore } from '../reboot-restore.js';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { RebootRestoreEntry } from '../reboot-restore.js';
 
 /**
@@ -172,12 +173,48 @@ function replaceSnapshot(path: string, text: string): void {
   }
 }
 
+/** Preserve an unacknowledged primary without parsing or opening potentially damaged bytes. */
+function preserveUnacknowledgedPrimary(path: string): void {
+  let original;
+  try {
+    original = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+    throw error;
+  }
+  if (!original.isFile() || original.isSymbolicLink()) throw new Error('Restore offer journal is unreadable');
+  // An exclusive private directory gives rename an absent destination. The
+  // artifact is deliberately retained for owner inspection, including on error.
+  const directory = `${path}.unacknowledged-${randomUUID()}`;
+  mkdirSync(directory, { mode: 0o700 });
+  syncSnapshotDirectory(path);
+  const matches = (current: typeof original) =>
+    current.isFile() &&
+    !current.isSymbolicLink() &&
+    current.dev === original.dev &&
+    current.ino === original.ino &&
+    current.size === original.size &&
+    current.mtimeMs === original.mtimeMs &&
+    current.mode === original.mode;
+  const before = lstatSync(path);
+  if (!matches(before) || before.ctimeMs !== original.ctimeMs) throw new Error('Restore offer journal changed');
+  const preserved = join(directory, 'primary');
+  renameSync(path, preserved);
+  const moved = lstatSync(preserved);
+  // Our rename can advance ctime; it cannot change the file identity or bytes.
+  if (!matches(moved) || moved.ctimeMs < original.ctimeMs) throw new Error('Restore offer journal changed');
+  chmodSync(preserved, 0o600);
+  syncSnapshotDirectory(preserved);
+  syncSnapshotDirectory(path);
+}
+
 function writeAtomicSnapshot(path: string, text: string): void {
   // A surviving shadow marks an earlier unacknowledged replacement. It remains
   // authoritative until a retry commits; current pathname contents alone cannot.
-  const current = readSnapshotBytes(path);
   const shadowPath = `${path}.previous`;
-  const previous = readSnapshotBytes(shadowPath) ?? current ?? JSON.stringify({ version: 1, builtAt: 0, entries: [] });
+  const shadow = readSnapshotBytes(shadowPath);
+  const previous = shadow ?? readSnapshotBytes(path) ?? JSON.stringify({ version: 1, builtAt: 0, entries: [] });
+  if (shadow !== undefined) preserveUnacknowledgedPrimary(path);
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
   replaceSnapshot(shadowPath, previous);
   try {
@@ -234,8 +271,7 @@ export class RebootRestoreRegistry {
     this.failedReleases.clear();
     this.builtAt = 0;
     try {
-      const current = readSnapshotBytes(path);
-      const raw = readSnapshotBytes(`${path}.previous`) ?? current;
+      const raw = readSnapshotBytes(`${path}.previous`) ?? readSnapshotBytes(path);
       if (raw === undefined) return;
       const saved = validateSnapshot(JSON.parse(raw));
       const entries = saved.entries;

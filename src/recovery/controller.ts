@@ -198,6 +198,10 @@ export class RecoveryController {
     this.revision++;
     return this.enqueue(async () => {
       const config = RecoveryConfigSchema.parse({ ...this.state.config, ...patch }) as RecoveryConfig;
+      const consentChanged = (['enabled', 'recoverCrashes', 'recoverInterrupted', 'detectStalls'] as const).some(
+        (key) => config[key] !== this.state.config[key]
+      );
+      if (consentChanged) this.confirmation = undefined;
       const hadStall = this.state.lastReason === 'stalled' && this.state.needsAttention;
       const enabledNow = config.enabled && !this.state.config.enabled;
       this.state.config = config;

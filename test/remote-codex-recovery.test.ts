@@ -324,9 +324,19 @@ cp.execFileSync=function(file,args,options){
       const delayedPrompt = 'Record the remote send instant before this delayed acknowledgement.';
       await f.marker('enter-delay', '0.4');
       const delayedReceipt = await input(delayedPrompt).then(async (receipt) => {
-        const historyAt = Date.now();
         if (!receipt || receipt.status !== 'sent') throw Error('Missing actual broker sent receipt');
-        expect(Math.abs(historyAt - receipt.submittedAt)).toBeLessThan(500);
+        const entered = (await f.broker.readState())?.receipts
+          .filter(
+            (item) =>
+              item.channel === 'auto' &&
+              item.conversationId === resumed &&
+              item.hash === sha('\r') &&
+              item.status === 'sent'
+          )
+          .at(-1)?.deliveredAt;
+        if (!entered) throw Error('Missing independent broker Enter evidence');
+        expect(receipt.submittedAt).toBe(entered.wallBefore);
+        const historyAt = entered.wallBefore;
         await writeFile(
           join(f.home, 'history.jsonl'),
           JSON.stringify({ session_id: resumed, ts: historyAt / 1000, text: delayedPrompt }) + '\n'
@@ -567,7 +577,17 @@ cp.execFileSync=function(file,args,options){
           else rmSync(join(existing.root, 'missing'));
         });
         expect(result.result).toBe('not-sent');
-        expect(result.pending).toBeUndefined();
+        // Material and the pending incarnation are retained before the first
+        // provisioning effect, including a certified native preflight refusal.
+        expect(result.pending).toMatch(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+        expect(result.pending).not.toBe(existing.descriptor.incarnation);
+        expect(existing.cache.get(existing.scope, result.pending!)).toMatchObject({
+          incarnation: result.pending,
+          directory: join(existing.descriptor.directory, '..', result.pending!),
+          homeDigest: sha(existing.home),
+        });
+        expect(existing.cache.get(existing.scope, existing.descriptor.incarnation)).toEqual(existing.descriptor);
+        expect(result.promoted).toBeUndefined();
         expect(await existing.starts()).toBe(1);
         expect(await existing.bytes()).toHaveLength(0);
         expect(await readFile(join(existing.root, 'native-events'), 'utf8')).not.toContain('respawn-pane');
@@ -588,7 +608,15 @@ cp.execFileSync=function(file,args,options){
           authority.isCurrent = () => current;
         });
         expect(result.result).toBe('unknown');
-        expect(result.pending).toBeUndefined();
+        expect(result.pending).toMatch(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+        expect(result.pending).not.toBe(canceled.descriptor.incarnation);
+        expect(canceled.cache.get(canceled.scope, result.pending!)).toMatchObject({
+          incarnation: result.pending,
+          directory: join(canceled.descriptor.directory, '..', result.pending!),
+          homeDigest: sha(canceled.home),
+        });
+        expect(canceled.cache.get(canceled.scope, canceled.descriptor.incarnation)).toEqual(canceled.descriptor);
+        expect(result.promoted).toBeUndefined();
         expect(await canceled.starts()).toBe(1);
         expect(await canceled.bytes()).toHaveLength(0);
         expect(await readFile(join(canceled.root, 'native-events'), 'utf8')).not.toContain('respawn-pane');

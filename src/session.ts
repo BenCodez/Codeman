@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { v4 as uuidv4 } from 'uuid';
@@ -148,6 +149,7 @@ import { CodexInputProofTracker, type CodexInputProof } from './recovery/codex-i
 import { CONTINUATION_PROMPT, isRecoveryEvidenceSourceCurrent, type RecoveryFlight } from './recovery/types.js';
 import { checkCodexIdentityWitnesses, checkPrivateFileWitnesses } from './recovery/codex-witness-check.js';
 import type { PrivateFileWitness } from './recovery/private-file-witness.js';
+import { observeOwnedRemoteBroker } from './recovery/remote-broker-launch.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
 import { readRebootIdentityFence, RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
 import {
@@ -2261,6 +2263,18 @@ export class Session extends EventEmitter {
     if (!this._remote) return false; // not a remote session
     if (!this._useMux || !this._mux || !this._muxSession) return false;
     const mux = this._mux;
+    const record = this._muxSession,
+      remote = this._remote,
+      configuration = this.remoteWakeScope();
+    const generation = this._recoveryGeneration;
+    const unchanged = () =>
+      !this._closing &&
+      !this._isStopped &&
+      this._mux === mux &&
+      this._muxSession === record &&
+      this._remote === remote &&
+      configuration === this.remoteWakeScope() &&
+      generation === this._recoveryGeneration;
 
     // If tmux lost the whole session (not just a dead pane), there is nothing to
     // respawn into — a genuine death, leave it for normal recovery/reconcile.
@@ -2268,6 +2282,7 @@ export class Session extends EventEmitter {
       console.log('[Session] reattachRemote: mux session gone, skipping:', this._muxSession.muxName);
       return false;
     }
+    if (!(await this.confirmRemoteWakeReady()) || !this.isRemoteWakeReadyCurrent() || !unchanged()) return false;
 
     // Confirmed the mux session (and thus the pane) exists but this reattach
     // is about to respawn it — safe to resolve/pin now.
@@ -2277,6 +2292,8 @@ export class Session extends EventEmitter {
       console.error('[Session] reattachRemote: respawnPane failed for', this._muxSession.muxName);
       return false;
     }
+    if (!unchanged() || !(await this.confirmRemoteWakeReady()) || !this.isRemoteWakeReadyCurrent() || !unchanged())
+      return false;
     // No-op for the record (a remote session's field is always UNKNOWN), but the
     // mux layer's cache is keyed by muxName and this pane now runs a new client.
     this.clearPaneExitForNewPane();
@@ -2322,6 +2339,199 @@ export class Session extends EventEmitter {
     configuration: string;
     isCurrent: () => boolean;
   };
+  private _remoteWakeReady?: () => boolean;
+  private _remoteWakeReadinessWork?: Promise<boolean>;
+  private _remoteWakeReadinessRevision = 0;
+
+  /** Stable private scope across acknowledged owner input, without exposing environment values. */
+  remoteWakeScope(): string {
+    return createHash('sha256')
+      .update(
+        JSON.stringify([
+          this.remoteRecoveryConfiguration(),
+          this._recoveryCodexHome,
+          this._muxSession?.sessionId,
+          this._muxSession?.muxName,
+          this._muxSession?.recoveryInputBroker,
+          this._muxSession?.recoveryCodexHome,
+        ])
+      )
+      .digest('hex');
+  }
+
+  /** Logical destination of queued owner input, retained across failed wake attempts. */
+  remoteWakeInputScope(): { configuration: string; conversationId?: string; incarnation?: string } | undefined {
+    if (!this._remote || this._remote.owned === false || getCli(this.mode)?.capabilities.recovery !== 'codex-rollout')
+      return undefined;
+    const config = { ...this._codexConfig };
+    delete config.resumeSessionId;
+    const env = { ...this._envOverrides };
+    const recordedHome = normalizedCodexHome(this._muxSession?.recoveryCodexHome);
+    const recoveryHome = normalizedCodexHome(this._recoveryCodexHome) ?? recordedHome;
+    const home = env.CODEX_HOME === undefined ? recoveryHome : (normalizedCodexHome(env.CODEX_HOME) ?? env.CODEX_HOME);
+    if (home !== undefined) env.CODEX_HOME = home;
+    const uuid = (value: unknown): value is string =>
+      typeof value === 'string' && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value);
+    return {
+      configuration: createHash('sha256')
+        .update(
+          JSON.stringify([
+            this.mode,
+            this.workingDir,
+            Object.entries(config).sort(),
+            Object.entries(env).sort(),
+            recordedHome,
+            recoveryHome,
+          ])
+        )
+        .digest('hex'),
+      ...(uuid(this._codexConfig?.resumeSessionId)
+        ? { conversationId: this._codexConfig.resumeSessionId.toLowerCase() }
+        : {}),
+      ...(uuid(this._muxSession?.recoveryInputBroker)
+        ? { incarnation: this._muxSession.recoveryInputBroker.toLowerCase() }
+        : {}),
+    };
+  }
+
+  /** Transport readiness is independent of conversation discovery and never creates a worker. */
+  async confirmRemoteWakeReady(): Promise<boolean> {
+    const revision = ++this._remoteWakeReadinessRevision;
+    this._remoteWakeReady = () => false;
+    if (!this._remote || this._remote.owned === false || getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') {
+      this._remoteWakeReady = undefined;
+      return true;
+    }
+    if (this._remoteWakeReadinessWork) return false;
+    const started = performance.now(),
+      wall = Date.now(),
+      deadline = started + 2000;
+    const mux = this._mux,
+      record = this._muxSession,
+      remote = this._remote;
+    const home = normalizedCodexHome(record?.recoveryCodexHome),
+      recoveryHome = this._recoveryCodexHome;
+    const configuration = this.remoteRecoveryConfiguration(),
+      generation = this._recoveryGeneration;
+    const paneStartedAt = this._paneStartedAt,
+      lifecycle = this._paneLifecycleOps;
+    const current = () => {
+      const elapsed = performance.now() - started,
+        wallElapsed = Date.now() - wall;
+      return (
+        elapsed >= 0 &&
+        revision === this._remoteWakeReadinessRevision &&
+        elapsed < 2000 &&
+        wallElapsed >= 0 &&
+        Math.abs(elapsed - wallElapsed) <= 100 &&
+        !this._closing &&
+        !this._isStopped &&
+        !this._discoveredMuxSession &&
+        !this._respawnBlocked &&
+        !this._recoverySwitchPending &&
+        !this._recoveryUntrackedInput &&
+        !this._docker &&
+        this._useMux &&
+        this._mux === mux &&
+        this._muxSession === record &&
+        !!record &&
+        mux?.getSession(this.id) === record &&
+        this._remote === remote &&
+        remote.owned !== false &&
+        this._codexConfig?.noDaemon === true &&
+        configuration === this.remoteRecoveryConfiguration() &&
+        generation === this._recoveryGeneration &&
+        paneStartedAt === this._paneStartedAt &&
+        lifecycle === this._paneLifecycleOps &&
+        record.recoveryInputBrokerPending === undefined &&
+        record.sessionId === this.id &&
+        record.mode === this.mode &&
+        record.owner === this.owner &&
+        record.workingDir === this.workingDir &&
+        JSON.stringify(record.remote) === JSON.stringify(remote) &&
+        home !== undefined &&
+        record.recoveryCodexHome === home &&
+        recoveryHome === this._recoveryCodexHome &&
+        (recoveryHome === undefined || normalizedCodexHome(recoveryHome) === home) &&
+        (this._envOverrides?.CODEX_HOME === undefined || normalizedCodexHome(this._envOverrides.CODEX_HOME) === home)
+      );
+    };
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const work = (async () => {
+      try {
+        if (!current()) return false;
+        const descriptor = await this.getOwnedRemoteInputBroker();
+        if (
+          !descriptor ||
+          !current() ||
+          descriptor.incarnation !== record!.recoveryInputBroker ||
+          descriptor.homeDigest !== createHash('sha256').update(home!).digest('hex')
+        )
+          return false;
+        const launch = await clampRecoveryLaunchForOwner(
+          this.owner,
+          { codexConfig: this._codexConfig },
+          this._envOverrides
+        );
+        const granted = () =>
+          current() &&
+          launch.isCurrent() === true &&
+          JSON.stringify(launch.configs.codexConfig) === JSON.stringify(this._codexConfig) &&
+          JSON.stringify(launch.env) === JSON.stringify(this._envOverrides);
+        const grantFile = launch.getFileWitness?.() ?? launch.fileWitness;
+        if (!granted()) return false;
+        const observed = await observeOwnedRemoteBroker(
+          remote,
+          { sessionId: this.id, descriptor, inspect: true },
+          { prepare: async () => granted(), isCurrent: granted }
+        );
+        if (observed.status !== 'observed' || !granted()) return false;
+        const proof = this.observeOwnedRemoteInputBroker(observed.serialized, observed.witness, observed.panePid);
+        const ready = () =>
+          granted() &&
+          !!proof &&
+          !proof.closed &&
+          proof.incarnation === descriptor.incarnation &&
+          proof.brokerPid === observed.panePid &&
+          this.isOwnedRemoteInputBrokerProofCurrent(proof);
+        if (!ready() || (grantFile && !(await checkPrivateFileWitnesses([grantFile], deadline))) || !ready())
+          return false;
+        this._remoteWakeReady = ready;
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    this._remoteWakeReadinessWork = work;
+    void work.finally(() => {
+      if (this._remoteWakeReadinessWork === work) this._remoteWakeReadinessWork = undefined;
+    });
+    try {
+      const result = await Promise.race([
+        work,
+        new Promise<false>((resolve) => {
+          timer = setTimeout(() => resolve(false), Math.max(0, deadline - performance.now()));
+        }),
+      ]);
+      return result === true && this.isRemoteWakeReadyCurrent();
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** Pure, short-lived authority for flushing only to the freshly observed owned worker. */
+  isRemoteWakeReadyCurrent(): boolean {
+    if (this._remoteWakeReady) {
+      try {
+        return this._remoteWakeReady() === true;
+      } catch {
+        return false;
+      }
+    }
+    return (
+      !this._remote || this._remote.owned === false || getCli(this.mode)?.capabilities.recovery !== 'codex-rollout'
+    );
+  }
   private _recoveryIntentionalStopAt = 0;
   private _recoverySwitchPending = false;
   private _recoveryUntrackedInput = false;

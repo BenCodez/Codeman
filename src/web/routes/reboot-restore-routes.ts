@@ -260,19 +260,17 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
               continue;
             }
-            if (usesCodexRecovery) {
-              const witness = await captureCustomModelRecoveryWitness(
-                saved.mode ?? 'claude',
-                saved.id,
-                savedCustomModel,
-                trustedCustomModelEnv
-              );
-              if (!witness) {
-                failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
-                continue;
-              }
-              customModelIsCurrent = witness;
+            const witness = await captureCustomModelRecoveryWitness(
+              saved.mode ?? 'claude',
+              saved.id,
+              savedCustomModel,
+              trustedCustomModelEnv
+            );
+            if (!witness) {
+              failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
+              continue;
             }
+            customModelIsCurrent = witness;
             const customModelKeys = new Set(savedCustomModel.envKeys);
             envOverrides = {
               ...Object.fromEntries(Object.entries(envOverrides ?? {}).filter(([key]) => !customModelKeys.has(key))),
@@ -503,6 +501,27 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 );
               },
             });
+          }
+          if (!usesCodexRecovery && savedCustomModel) {
+            // Non-Codex restores do not enter the Codex launch guard. Their
+            // constructor environment must still match the same current admin
+            // recipe after all asynchronous session preparation has completed.
+            if (!(await customModelIsCurrent())) throw new Error('Custom model profile changed before restore');
+            if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+              await discardCancelledRestore();
+              continue;
+            }
+            const peers = [...ctx.sessions.values()].filter((other) => other !== session);
+            if (
+              ctx.sessions.get(session.id) !== session ||
+              session.owner !== saved.owner ||
+              rejectAlreadyLive(
+                [entry],
+                new Set(peers.map((other) => other.id)),
+                new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
+              ).skipped.length
+            )
+              throw new Error('Restore session authority changed');
           }
           await session.startInteractive();
           // Launch is a real await: Dismiss can remove this parked offer while

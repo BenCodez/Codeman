@@ -409,7 +409,7 @@ try{
  const channel='codeman-broker-'+crypto.randomBytes(16).toString('hex');
  let row,status='1',signal='';
  if(present){const e=req.expectedPane,f=run(['list-panes','-t',name,'-F','#{session_name}|#{session_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pid}']).replace(/\n$/,'').split('|');const number=x=>x===''?undefined:/^(?:0|[1-9]\d{0,4})$/.test(x)&&+x<=255?+x:NaN,signum=x=>x===''?undefined:/^(?:0|[1-9]\d{0,4})$/.test(x)&&(+x===0||Object.values(os.constants.signals).includes(+x))?+x:/^[A-Z][A-Z0-9]{0,15}$/.test(x)&&os.constants.signals['SIG'+x]||NaN;if(!e||f.length!==8||f[0]!==name||f[2]!==e.paneId||+f[3]!==e.panePid||f[4]!=='1'||number(f[5])!==e.status||signum(f[6])!==e.signal||(!e.status&&!e.signal))throw Error('replacement');row=[f[1],f[2],f[3],f[7]];status=f[5];signal=f[6]}
- else{row=run(['new-session','-d','-P','-F','#{session_id}|#{pane_id}|#{pane_pid}|#{pid}','-s',name,'-c',req.workingDir,'/bin/sh','-c','tmux -L codeman-remote wait-for '+channel+'; exit 1']).trim().split('|');created=true}
+ else{created=true;row=run(['new-session','-d','-P','-F','#{session_id}|#{pane_id}|#{pane_pid}|#{pid}','-s',name,'-c',req.workingDir,'/bin/sh','-c','tmux -L codeman-remote wait-for '+channel+'; exit 1']).trim().split('|');created=true}
  if(row.length!==4||!/^\$(?:0|[1-9]\d*)$/.test(row[0])||!Number.isSafeInteger(+row[0].slice(1))||!/^%(?:0|[1-9]\d*)$/.test(row[1])||!Number.isSafeInteger(+row[1].slice(1))||!row.slice(2).every(x=>/^[1-9]\d*$/.test(x)&&Number.isSafeInteger(+x)))throw Error('invalid pane');
  const [sid,pane,pid,server]=row;
  if(!present){run(['set-option','-t',sid,'status','off',';','set-option','-t',sid,'mouse','off',';','set-option','-t',sid,'prefix','C-q',';','set-option','-t',sid,'window-size','latest',';','set-option','-t',sid,'remain-on-exit','failed']);
@@ -426,7 +426,7 @@ try{
  const owned=()=>run(['if-shell','-F','-t',pane,predicate,'display-message -p CODEMAN_BROKER_OWNED','display-message -p CODEMAN_BROKER_REFUSED'])==='CODEMAN_BROKER_OWNED\n';
  if(!owned())throw Error('replacement');
  const privateDir=p=>{check();try{fs.mkdirSync(p,{mode:0o700})}catch(e){if(e.code!=='EEXIST')throw e}const s=fs.lstatSync(p);if(!s.isDirectory()||s.isSymbolicLink()||(s.mode&0o077)!==0||s.uid!==process.getuid())throw Error('private root');check()};
- privateDir(base);const sessionRoot=path.join(base,m.sessionId);privateDir(sessionRoot);
+ created=true;privateDir(base);const sessionRoot=path.join(base,m.sessionId);privateDir(sessionRoot);
  const directory=path.join(sessionRoot,m.incarnation);fs.mkdirSync(directory,{mode:0o700});check();
  for(const [file,data] of [['broker.py',m.source],['config.json',m.configJson],['lock','']]){
   check();const fd=fs.openSync(path.join(directory,file),fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o600);
