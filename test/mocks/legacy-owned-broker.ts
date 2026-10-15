@@ -223,10 +223,12 @@ if op=='list-panes':
  if len(fields)!=5 or names==['pane_dead','pane_dead_status','pane_dead_signal','pane_id','pane_pid']:sys.stdout.write(row+'\n');sys.exit(0)
  state=dict(zip(['pane_dead','pane_dead_status','pane_dead_signal','pane_id','pane_pid'],fields));state.update(session_name='codeman-ssh-aaaaaaaa',session_id='$17',pid='17000')
  sys.stdout.write('|'.join(state[n] for n in names)+'\n');sys.exit(0)
-if op=='send-keys':
+if op=='paste-buffer':
  import select
- assert a[3:6]==['-l','-t','%7'] and len(a)==7
- wire=a[6].encode();assert wire.startswith(b'\x1eCODEMAN_INPUT_V1:') and wire.endswith(b'\x1f')
+ assert a[3:6]==['-r','-d','-b'] and a[7:]==['-t','%7'] and len(a)==9
+ buffer_path=os.environ['EFFECT_LOG']+'.buffer-'+a[6]
+ wire=open(buffer_path,'rb').read();os.unlink(buffer_path)
+ assert wire.startswith(b'\x1eCODEMAN_INPUT_V1:') and wire.endswith(b'\x1f')
  packet=json.loads(base64.b64decode(wire.split(b':')[1]));data=base64.b64decode(packet['data'])
  fd=os.open(root+'/broker-input',os.O_WRONLY|os.O_NONBLOCK);offset=0;end=time.monotonic()+1
  try:
@@ -268,7 +270,7 @@ os.execv(os.environ['OWNED_LEGACY_NATIVE'],[os.environ['OWNED_LEGACY_NATIVE']]+a
       .replace('import json, os, re, sys', 'import json, os, re, sys, base64')
       .replace(
         "change = os.environ.get('NATIVE_BEFORE_EFFECT', '')",
-        "probe = bool(re.search(r'CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):', args[7])) and json.loads(base64.b64decode(re.search(r'CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):', args[7]).group(1)))['channel']=='probe'\n    change = '' if probe else os.environ.get('NATIVE_BEFORE_EFFECT', '')"
+        "name = re.search(r'codeman-private-[a-f0-9-]{36}', args[7])\n    wire = open(buffer_root+name.group(0),'rb').read() if name else b''\n    probe = bool(wire) and json.loads(base64.b64decode(wire.split(b':')[1]))['channel']=='probe'\n    change = '' if probe else os.environ.get('NATIVE_BEFORE_EFFECT', '')"
       )
       .replace(
         "if change == 'signal-alias': state['pane_dead_signal'] = 'KILL'",

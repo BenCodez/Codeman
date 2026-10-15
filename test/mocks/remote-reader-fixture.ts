@@ -14,6 +14,7 @@ import {
   buildRemoteCodexRestoreCommand,
   parseRemoteCodexAction,
   parseRemoteCodexEvidence,
+  type RemoteCodexCommand,
 } from '../../src/recovery/remote-codex.js';
 
 const execFileAsync = promisify(execFile);
@@ -299,7 +300,8 @@ fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return 
     );
     const executableHashes = await Promise.all(executablePaths.map(async (path) => sha(await readFile(path, 'utf8'))));
     let refused = false;
-    const run = async (cmd: string, change = mutation) => {
+    const run = async (request: RemoteCodexCommand, change = mutation) => {
+      const { command: cmd, input } = request;
       if (
         env.PATH !== bin + ':/usr/bin:/bin' ||
         env.SHELL !== join(bin, 'login-shell') ||
@@ -314,13 +316,13 @@ fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return 
       )
         throw Error('Fixture refused unverified executable environment');
       try {
-        return (
-          await execFileAsync('/bin/sh', ['-c', cmd], {
-            env: { ...env, MUTATION: change },
-            timeout: 10_000,
-            maxBuffer: 768 * 1024,
-          })
-        ).stdout;
+        const task = execFileAsync('/bin/sh', ['-c', cmd], {
+          env: { ...env, MUTATION: change },
+          timeout: 10_000,
+          maxBuffer: 768 * 1024,
+        });
+        task.child.stdin?.end(input);
+        return (await task).stdout;
       } catch (error) {
         if (
           correlation?.paneRow === undefined &&
