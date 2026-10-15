@@ -35,6 +35,8 @@ if op == 'if-shell':
         assert len(fields) == 5
         state = dict(zip(['pane_dead', 'pane_dead_status', 'pane_dead_signal', 'pane_id', 'pane_pid'], fields))
         state['session_name'] = 'codeman-ssh-aaaaaaaa'
+        state['session_id'] = '$17'
+        state['pid'] = '17000'
     try:
         with open(counter) as f: count = int(f.read())
     except FileNotFoundError: count = 0

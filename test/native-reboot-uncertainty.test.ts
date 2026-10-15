@@ -1,18 +1,35 @@
 /** @fileoverview Native launch branches with injected child/PTY effects and temporary metadata. */
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import { createHash, randomUUID } from 'node:crypto';
+import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
+import type { CodexRestoreLaunchGuard } from '../src/mux-interface.js';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import Fastify from 'fastify';
+import fastifyCookie from '@fastify/cookie';
+import { planVerifiedRebootRestore } from '../src/reboot-restore.js';
+import { rebootRestoreRegistry } from '../src/web/reboot-restore-registry.js';
+import type { registerRebootRestoreRoutes as RegisterRebootRestoreRoutes } from '../src/web/routes/reboot-restore-routes.js';
+let registerRebootRestoreRoutes: typeof RegisterRebootRestoreRoutes;
+import { installRouteErrorHandler } from '../src/web/route-error-handler.js';
 import type { MuxSession } from '../src/mux-interface.js';
 import type { Session as SessionType } from '../src/session.js';
 import type { TmuxManager as ManagerType } from '../src/tmux-manager.js';
 import type { WebServer as ServerType } from '../src/web/server.js';
 import type { SessionState } from '../src/types.js';
+import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 import { rebootStateBinding } from '../src/recovery/reboot-state-binding.js';
 
-const effects = vi.hoisted(() => ({ sync: vi.fn(), exec: vi.fn(), attach: vi.fn() }));
+const effects = vi.hoisted(() => ({
+  sync: vi.fn(),
+  exec: vi.fn(),
+  attach: vi.fn(),
+  python: undefined as typeof import('node:child_process').spawn | undefined,
+}));
 vi.mock('node:child_process', async (original) => {
   const actual = await original<typeof import('node:child_process')>();
+  effects.python = actual.spawn;
   const refused = () => {
     throw new Error('Unmocked process effects forbidden');
   };
@@ -58,12 +75,13 @@ beforeAll(async () => {
     ({ TmuxManager } = await import('../src/tmux-manager.js'));
     ({ Session } = await import('../src/session.js'));
     ({ WebServer } = await import('../src/web/server.js'));
+    ({ registerRebootRestoreRoutes } = await import('../src/web/routes/reboot-restore-routes.js'));
   } finally {
     if (vitest !== undefined) process.env.VITEST = vitest;
   }
 });
 beforeEach(() => {
-  effects.sync.mockReset().mockReturnValue('99999\n');
+  effects.sync.mockReset().mockImplementation(nativeOutput);
   effects.exec.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
   effects.attach.mockReset().mockReturnValue({
     pid: 0,
@@ -74,8 +92,10 @@ beforeEach(() => {
     onExit: () => ({ dispose() {} }),
   });
   rmSync(metadata, { force: true });
+  rmSync(join(root, 'reboot-identities', `${ID}.json`), { force: true });
 });
 afterEach(async () => {
+  rebootRestoreRegistry.reset();
   for (const server of servers.splice(0)) await server.stop();
   for (const session of sessions.splice(0)) await session.stop(false);
   for (const manager of managers.splice(0)) await Reflect.get(manager, 'sessionSaves');
@@ -87,11 +107,20 @@ afterAll(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-function fixture() {
+function nativeOutput(command: string): string {
+  if (command.includes(' new-session ')) return '$1|%7|99999|88\n';
+  if (command.includes('respawn-pane ') || command.includes('kill-pane ')) return '';
+  return '99999\n';
+}
+
+function fixture(workerCommand = 'unused fake worker') {
   const home = join(root, 'codex-home');
   mkdirSync(home, { recursive: true });
   const manager = Object.create(TmuxManager.prototype) as ManagerType;
   Reflect.set(manager, 'sessions', new Map());
+  Reflect.set(manager, 'inputBrokers', new Map());
+  Reflect.set(manager, 'inputBrokerLoads', new Map());
+  Reflect.set(manager, 'inputQueues', new Map());
   Reflect.set(manager, 'sessionSaves', Promise.resolve());
   Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
   Reflect.set(manager, 'paneExits', new Map());
@@ -100,6 +129,16 @@ function fixture() {
   Reflect.set(manager, 'reconnectGuard', new Map());
   Reflect.set(manager, 'remoteAliveCache', new Map());
   Reflect.set(manager, 'remoteAliveInFlight', new Map());
+  let broker: Promise<CodexInputBroker> | undefined;
+  const getBroker = () =>
+    (broker ??= CodexInputBroker.create(join(root, randomUUID()), ID, workerCommand, home).then((value) => {
+      vi.spyOn(value, 'startupReceipt').mockResolvedValue('started');
+      return value;
+    }));
+  vi.spyOn(
+    manager as unknown as { createInputBroker(): Promise<CodexInputBroker> },
+    'createInputBroker'
+  ).mockImplementation(getBroker);
   managers.push(manager);
   vi.spyOn(manager, 'isAvailable').mockReturnValue(true);
   vi.spyOn(manager, 'resizeWindow').mockImplementation(() => {});
@@ -115,10 +154,540 @@ function fixture() {
   vi.spyOn(manager as unknown as { supportsLiveHistoryResize(): boolean }, 'supportsLiveHistoryResize').mockReturnValue(
     true
   );
-  return { manager, home };
+  return { manager, home, getBroker };
+}
+
+function healthyGuard(): CodexRestoreLaunchGuard {
+  return {
+    prepare: async () => {},
+    confirm: () => true,
+    isCurrent: () => true,
+    getStartupEvidence: () => ({ files: [], paths: [], missing: [] }),
+  };
 }
 
 describe('native uncertain Codex reboot ownership', () => {
+  it.each(['before-dispatch', 'no-child-receipt', 'unproven-creation'] as const)(
+    'the actual restore route preserves history and inspection after uncertain native cleanup: %s',
+    async (phase) => {
+      const { manager, home, getBroker } = fixture();
+      const broker = await getBroker();
+      mkdirSync(join(home, 'sessions'), { recursive: true });
+      writeFileSync(
+        join(home, 'sessions', `rollout-2026-10-13T15-00-00-${THREAD}.jsonl`),
+        JSON.stringify({
+          type: 'session_meta',
+          timestamp: '2026-10-13T15:00:00Z',
+          payload: { id: THREAD, cwd: root, originator: `codeman_${ID}` },
+        }) + '\n'
+      );
+      vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+      const server = new WebServer(0, false, true);
+      servers.push(server);
+      Reflect.set(server, 'mux', manager);
+      for (const method of [
+        'startStatsCollection',
+        'startMouseModeSync',
+        'startPaneExitWatcher',
+        'startRemoteReconnectWatcher',
+        'destroy',
+      ] as const)
+        vi.spyOn(manager, method).mockImplementation(() => {});
+      const board = Reflect.get(server, 'sessions') as Map<string, SessionType>;
+      let nativeCurrent = true;
+      if (phase === 'before-dispatch') {
+        const original = broker.setStartupAuthority.bind(broker);
+        vi.spyOn(broker, 'setStartupAuthority').mockImplementation(async (...args) => {
+          await original(...args);
+          board.get(ID)!.fenceUntrackedInput();
+          nativeCurrent = false;
+        });
+      } else if (phase === 'no-child-receipt')
+        vi.mocked(broker.startupReceipt).mockImplementation(async () => {
+          nativeCurrent = false;
+          return 'not-sent';
+        });
+      effects.sync.mockImplementation((command: string) => {
+        if (phase === 'unproven-creation' && command.includes(' new-session ')) return 'incomplete native tuple';
+        if (command.includes('kill-pane ')) {
+          expect(nativeCurrent).toBe(false);
+          return 'CODEMAN_REBOOT_CLEANUP_REFUSED\n';
+        }
+        return nativeOutput(command);
+      });
+      const state: SessionState = {
+        id: ID,
+        mode: 'codex',
+        pid: 1234,
+        status: 'idle',
+        workingDir: root,
+        currentTaskId: null,
+        createdAt: Date.now() - 60_000,
+        codexConfig: config,
+      };
+      Object.assign(state, { __codexRecoveryHome: home, __envOverrides: { CODEX_HOME: home } });
+      const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+      store.setSession(ID, state);
+      store.flush();
+      const historical = structuredClone(store.getSession(ID));
+      const plan = await planVerifiedRebootRestore([ID], { [ID]: state }, () => true);
+      expect(plan.skipped).toEqual([]);
+      rebootRestoreRegistry.set(plan.restore);
+      const ctx = Reflect.get(server, 'createRouteContext').call(server) as Parameters<
+        typeof registerRebootRestoreRoutes
+      >[1];
+      ctx.getWorkspaceHooksEnabled = async () => false;
+      ctx.getAgentSkillEnabled = async () => false;
+      const app = Fastify({ logger: false });
+      await app.register(fastifyCookie);
+      registerRebootRestoreRoutes(app, ctx);
+      installRouteErrorHandler(app);
+      await app.ready();
+      const kill = vi.spyOn(manager, 'killSession');
+      try {
+        const response = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+        expect(response.statusCode).toBe(200);
+        expect(response.json()).toMatchObject({
+          restored: [],
+          skipped: [{ sessionId: ID, reason: 'restore-uncertain' }],
+        });
+        const session = board.get(ID)!;
+        sessions.push(session);
+        expect(session.codexRestoreWorkerMayExist).toBe(true);
+        expect(store.getSession(ID)).toEqual(historical);
+        expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID]).toEqual(historical);
+        expect(kill).not.toHaveBeenCalled();
+        expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
+      } finally {
+        await app.close();
+      }
+    }
+  );
+
+  it.each(['before-dispatch', 'no-child-receipt'] as const)(
+    'retains actual Server inspection instead of generic cleanup after native replacement: %s',
+    async (phase) => {
+      const { manager, home, getBroker } = fixture();
+      const broker = await getBroker();
+      let current = true;
+      let nativeCurrent = true;
+      if (phase === 'before-dispatch') {
+        const original = broker.setStartupAuthority.bind(broker);
+        vi.spyOn(broker, 'setStartupAuthority').mockImplementation(async (...args) => {
+          await original(...args);
+          current = false;
+          nativeCurrent = false;
+        });
+      } else
+        vi.mocked(broker.startupReceipt).mockImplementation(async () => {
+          nativeCurrent = false;
+          return 'not-sent';
+        });
+      effects.sync.mockImplementation((command: string) => {
+        if (command.includes('kill-pane ')) {
+          expect(nativeCurrent).toBe(false);
+          return 'CODEMAN_REBOOT_CLEANUP_REFUSED\n';
+        }
+        return nativeOutput(command);
+      });
+      const session = new Session({
+        id: ID,
+        workingDir: root,
+        owner: 'worker',
+        mode: 'codex',
+        useMux: true,
+        mux: manager,
+        codexConfig: config,
+        recoveryCodexHome: home,
+      });
+      sessions.push(session);
+      const noChild = vi.fn();
+      session.setCodexRestoreLaunchGuard({ ...healthyGuard(), isCurrent: () => current, noteBrokerRefusal: noChild });
+      await expect(session.startInteractive()).rejects.toThrow();
+      expect(session.codexRestoreWorkerMayExist).toBe(true);
+      expect(noChild).not.toHaveBeenCalled();
+      const kill = vi.spyOn(manager, 'killSession');
+      const server = new WebServer(0, false, true);
+      servers.push(server);
+      Reflect.set(server, 'mux', manager);
+      for (const method of [
+        'startStatsCollection',
+        'startMouseModeSync',
+        'startPaneExitWatcher',
+        'startRemoteReconnectWatcher',
+        'destroy',
+      ] as const)
+        vi.spyOn(manager, method).mockImplementation(() => {});
+      const board = Reflect.get(server, 'sessions') as Map<string, SessionType>;
+      board.set(ID, session);
+      await server.discardPartiallyBuiltSession(ID, session, {
+        preserveCustomModelConfigDir: true,
+        preserveMuxPane: true,
+        retainForInspection: true,
+      });
+      expect(board.get(ID)).toBe(session);
+      expect(manager.getSession(ID)).toMatchObject({ codexRestoreUncertain: true });
+      expect(kill).not.toHaveBeenCalled();
+      expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
+    }
+  );
+
+  it.each(['healthy', 'pane-replaced', 'session-replaced', 'server-restarted', 'extra-pane', 'extra-window'] as const)(
+    'binds native launch and no-child cleanup to the atomically created single pane: %s',
+    async (change) => {
+      const { manager, home, getBroker } = fixture();
+      const broker = await getBroker();
+      const native = { session: '$1', pid: 99999, server: 88, panes: 1, windows: 1 };
+      const original = broker.setStartupAuthority.bind(broker);
+      vi.spyOn(broker, 'setStartupAuthority').mockImplementation(async (...args) => {
+        await original(...args);
+        if (change === 'pane-replaced') native.pid = 77777;
+        if (change === 'session-replaced') native.session = '$2';
+        if (change === 'server-restarted') native.server = 99;
+        if (change === 'extra-pane') native.panes = 2;
+        if (change === 'extra-window') native.windows = 2;
+      });
+      let workerEffects = 0;
+      let cleanupEffects = 0;
+      effects.sync.mockImplementation((command: string) => {
+        if (command.includes('respawn-pane ') || command.includes('kill-pane ')) {
+          expect(command).toContain("if-shell -F -t '%7'");
+          for (const term of [
+            '#{==:#{pid},88}',
+            '#{==:#{session_id},$1}',
+            '#{==:#{pane_id},%7}',
+            '#{==:#{pane_pid},99999}',
+            '#{==:#{window_panes},1}',
+            '#{==:#{session_windows},1}',
+          ])
+            expect(command).toContain(term);
+          const same =
+            native.server === 88 &&
+            native.session === '$1' &&
+            native.pid === 99999 &&
+            native.panes === 1 &&
+            native.windows === 1;
+          if (command.includes('respawn-pane ')) {
+            if (same) workerEffects++;
+            return same ? '' : 'CODEMAN_REBOOT_LAUNCH_REFUSED\n';
+          }
+          if (same) cleanupEffects++;
+          return same ? '' : 'CODEMAN_REBOOT_CLEANUP_REFUSED\n';
+        }
+        return nativeOutput(command);
+      });
+      const refused = vi.fn();
+      const launch = manager.createSession({
+        sessionId: ID,
+        workingDir: root,
+        mode: 'codex',
+        codexConfig: config,
+        recoveryCodexHome: home,
+        codexRestoreGuard: { ...healthyGuard(), noteBrokerRefusal: refused },
+      });
+      if (change === 'healthy') expect(await launch).toHaveProperty('pid', 99999);
+      else {
+        await expect(launch).rejects.toThrow('inert pane changed');
+        expect(manager.getSession(ID)).toMatchObject({ pid: 0, codexRestoreUncertain: true });
+      }
+      expect(workerEffects).toBe(change === 'healthy' ? 1 : 0);
+      expect(cleanupEffects).toBe(0);
+      expect(refused).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each(['existing-session', 'malformed-created-tuple'] as const)(
+    'never adopts or cleans an unproven new pane: %s',
+    async (failure) => {
+      const { manager, home } = fixture();
+      effects.sync.mockImplementation((command: string) => {
+        if (command.includes(' new-session ')) {
+          if (failure === 'existing-session') throw new Error('Duplicate native session');
+          return 'malformed native receipt';
+        }
+        return nativeOutput(command);
+      });
+      await expect(
+        manager.createSession({
+          sessionId: ID,
+          workingDir: root,
+          mode: 'codex',
+          codexConfig: config,
+          recoveryCodexHome: home,
+          codexRestoreGuard: healthyGuard(),
+        })
+      ).rejects.toThrow();
+      expect(
+        effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane ') || command.includes('kill-pane '))
+      ).toBe(false);
+      expect(manager.getSession(ID)).toBeUndefined();
+    }
+  );
+
+  it.each([
+    'healthy',
+    'grant-changed',
+    'rollout-changed',
+    'fence-created',
+    'config-replaced',
+    'scope-changed',
+    'deadline-expired',
+  ] as const)('revalidates saved startup evidence inside the actual disposable broker: %s', async (outcome) => {
+    const marker = join(root, `child-started-${randomUUID()}`);
+    const { manager, home, getBroker } = fixture(`printf child > '${marker}'`);
+    const broker = await getBroker();
+    vi.mocked(broker.startupReceipt).mockRestore();
+    const grant = join(root, `grant-${randomUUID()}`);
+    const rollout = join(root, `rollout-${randomUUID()}`);
+    const fence = join(root, `missing-fence-${randomUUID()}`);
+    for (const path of [grant, rollout]) writeFileSync(path, 'initial', { mode: 0o600 });
+    const files = [grant, rollout].map((path) => {
+      const stat = statSync(path);
+      return {
+        path,
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs,
+        hash: createHash('sha256').update(readFileSync(path)).digest('hex'),
+        maxBytes: 262_144,
+      };
+    });
+    const directory = statSync(root);
+    const paths = [{ path: root, dev: directory.dev, ino: directory.ino, kind: 'directory' as const }];
+    let current = true;
+    const setAuthority = broker.setStartupAuthority.bind(broker);
+    const savedAuthority = vi.spyOn(broker, 'setStartupAuthority').mockImplementation(async (...args) => {
+      await setAuthority(...args);
+      if (outcome === 'scope-changed') current = false;
+      if (outcome === 'deadline-expired') await new Promise((resolve) => setTimeout(resolve, 2_050));
+    });
+    let pid = 99999;
+    let closed: Promise<number | null> | undefined;
+    effects.sync.mockImplementation((command: string) => {
+      if (command.includes('respawn-pane ')) {
+        if (outcome === 'grant-changed') writeFileSync(grant, 'modified');
+        if (outcome === 'rollout-changed') writeFileSync(rollout, 'new evidence');
+        if (outcome === 'fence-created') writeFileSync(fence, 'cancelled');
+        const digests = command.match(/[a-f0-9]{64}/g);
+        expect(digests).toHaveLength(1);
+        expect(digests![0]).toBe(broker.configurationDigest);
+        if (outcome === 'config-replaced') {
+          const path = join(broker.directory, 'config.json');
+          const changed = JSON.parse(readFileSync(path, 'utf8'));
+          changed.command = `printf wrong > '${marker}'`;
+          changed.launchDigest = createHash('sha256').update(changed.command).digest('hex');
+          changed.startup.privateFiles = [];
+          writeFileSync(path, JSON.stringify(changed), { mode: 0o600 });
+        }
+        const child = effects.python!('python3', [join(broker.directory, 'broker.py'), broker.directory, digests![0]], {
+          env: { ...process.env, CODEX_HOME: home },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        pid = child.pid!;
+        child.stdout!.resume();
+        child.stderr!.resume();
+        closed = new Promise((resolve) => child.once('close', resolve));
+      }
+      if (command.includes('respawn-pane ')) return '';
+      if (command.includes(' new-session ')) return '$1|%7|99999|88\n';
+      if (command.includes('kill-pane ')) return '';
+      return `${pid}\n`;
+    });
+    const dispatch = vi.fn();
+    const refused = vi.fn();
+    const confirm = vi.fn(() => true);
+    const launch = manager.createSession({
+      sessionId: ID,
+      workingDir: root,
+      mode: 'codex',
+      codexConfig: config,
+      recoveryCodexHome: home,
+      codexRestoreGuard: {
+        prepare: async () => {},
+        confirm,
+        isCurrent: () => current,
+        getStartupEvidence: () => ({ files, paths, missing: [fence] }),
+        noteDispatch: dispatch,
+        noteBrokerRefusal: refused,
+      },
+    });
+    if (outcome === 'healthy') {
+      const record = await launch;
+      expect(record).toMatchObject({ pid, recoveryInputBroker: broker.incarnation });
+      expect(readFileSync(marker, 'utf8')).toBe('child');
+    } else {
+      await expect(launch).rejects.toThrow();
+      expect(() => readFileSync(marker)).toThrow();
+    }
+    if (closed) await closed;
+    expect(savedAuthority).toHaveBeenCalledOnce();
+    expect(savedAuthority.mock.calls[0].slice(0, 4)).toEqual([files, undefined, paths, [fence]]);
+    expect(confirm).toHaveBeenCalledTimes(3); // No new FD/probe observation after config persistence.
+    expect(dispatch).toHaveBeenCalledTimes(['scope-changed', 'deadline-expired'].includes(outcome) ? 0 : 1);
+    expect(refused).toHaveBeenCalledTimes(
+      ['healthy', 'scope-changed', 'deadline-expired', 'config-replaced'].includes(outcome) ? 0 : 1
+    );
+    if (outcome === 'config-replaced')
+      expect(manager.getSession(ID)).toMatchObject({
+        recoveryInputBrokerPending: broker.incarnation,
+        codexRestoreUncertain: true,
+      });
+    else if (outcome !== 'healthy') expect(manager.getSession(ID)).toBeUndefined();
+  });
+
+  it.each(['healthy', 'config-replaced'] as const)(
+    'the actual respawn broker receives the final config digest and seals a changed config: %s',
+    async (outcome) => {
+      const marker = join(root, `respawn-marker-${randomUUID()}`);
+      const { manager, home, getBroker } = fixture(`printf child > '${marker}'`);
+      const broker = await getBroker();
+      vi.mocked(broker.startupReceipt).mockRestore();
+      const oldInc = randomUUID();
+      const proof = fakeInputProvenance({ incarnation: oldInc, closed: true, exitStatus: 9 }, home);
+      vi.spyOn(broker, 'prove').mockResolvedValue(proof);
+      vi.spyOn(
+        manager as unknown as { getInputBroker(): Promise<CodexInputBroker> },
+        'getInputBroker'
+      ).mockResolvedValue(broker);
+      manager.registerSession({
+        sessionId: ID,
+        muxName: 'codeman-aaaaaaaa',
+        pid: 700,
+        createdAt: Date.now(),
+        workingDir: root,
+        mode: 'codex',
+        attached: false,
+        recoveryCodexHome: home,
+        recoveryIsolated: true,
+        recoveryInputBroker: oldInc,
+      });
+      await manager.flushSessionsDurably();
+      const pristine = broker.configurationDigest;
+      let pid = 700,
+        closed: Promise<number | null> | undefined;
+      effects.sync.mockImplementation(() => `${pid}\n`);
+      effects.exec.mockImplementation(async (command: string) => {
+        if (!command.includes('respawn-pane ')) return { stdout: '', stderr: '' };
+        const digests = command.match(/[a-f0-9]{64}/g);
+        expect(digests).toHaveLength(1);
+        expect(digests![0]).toBe(broker.configurationDigest);
+        expect(digests![0]).not.toBe(pristine);
+        if (outcome === 'config-replaced') {
+          const path = join(broker.directory, 'config.json');
+          const changed = JSON.parse(readFileSync(path, 'utf8'));
+          changed.command = `printf wrong > '${marker}'`;
+          changed.launchDigest = createHash('sha256').update(changed.command).digest('hex');
+          writeFileSync(path, JSON.stringify(changed), { mode: 0o600 });
+        }
+        const child = effects.python!('python3', [join(broker.directory, 'broker.py'), broker.directory, digests![0]], {
+          env: { ...process.env, CODEX_HOME: home },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+        pid = child.pid!;
+        child.stdout!.resume();
+        child.stderr!.resume();
+        closed = new Promise((resolve) => child.once('close', resolve));
+        return { stdout: '', stderr: '' };
+      });
+      const refused = vi.fn();
+      const result = await manager.respawnPane({
+        sessionId: ID,
+        workingDir: root,
+        mode: 'codex',
+        codexConfig: config,
+        recoveryCodexHome: home,
+        onlyIfDead: true,
+        expectedRecoveryPane: { paneId: '%7', panePid: 700, status: 9, inputProvenance: proof },
+        recoveryDispatchGuard: {
+          inputProof: proof,
+          prepareEvidence: async () => true,
+          confirm: () => true,
+          noteDispatch: vi.fn(),
+          noteBrokerRefusal: refused,
+        },
+      });
+      if (closed) await closed;
+      expect(refused).not.toHaveBeenCalled();
+      if (outcome === 'healthy') {
+        expect(result).toBe(pid);
+        expect(readFileSync(marker, 'utf8')).toBe('child');
+        expect(manager.getSession(ID)?.recoveryInputBrokerPending).toBeUndefined();
+      } else {
+        expect(result).toBeNull();
+        expect(() => readFileSync(marker)).toThrow();
+        expect(manager.getSession(ID)).toMatchObject({
+          recoveryInputBrokerPending: broker.incarnation,
+          codexRestoreUncertain: true,
+        });
+      }
+    }
+  );
+
+  it.each(['not-sent', 'not-sent-replaced', 'unknown'] as const)(
+    'retains uncertainty except for an exact %s receipt',
+    async (status) => {
+      const { manager, home, getBroker } = fixture();
+      const broker = await getBroker();
+      vi.mocked(broker.startupReceipt).mockImplementation(async () => {
+        if (status === 'not-sent-replaced') manager.registerSession({ ...manager.getSession(ID)!, pid: 77777 });
+        return status === 'unknown' ? 'unknown' : 'not-sent';
+      });
+      const refused = vi.fn();
+      await expect(
+        manager.createSession({
+          sessionId: ID,
+          workingDir: root,
+          mode: 'codex',
+          codexConfig: config,
+          recoveryCodexHome: home,
+          codexRestoreGuard: { ...healthyGuard(), noteBrokerRefusal: refused },
+        })
+      ).rejects.toThrow();
+      expect(refused).toHaveBeenCalledTimes(status === 'not-sent' ? 1 : 0);
+      if (status === 'unknown') {
+        expect(manager.getSession(ID)).toMatchObject({
+          pid: 99999,
+          recoveryInputBroker: broker.incarnation,
+          codexRestoreUncertain: true,
+          codexRestoreConfig: config,
+        });
+        await manager.flushSessionsDurably();
+        expect(JSON.parse(readFileSync(metadata, 'utf8'))[0]).toMatchObject({
+          pid: 99999,
+          recoveryInputBroker: broker.incarnation,
+        });
+      } else if (status === 'not-sent-replaced') expect(manager.getSession(ID)).toMatchObject({ pid: 77777 });
+      else expect(manager.getSession(ID)).toBeUndefined();
+      expect(effects.sync.mock.calls.filter(([command]) => command.includes('kill-pane '))).toHaveLength(
+        status === 'not-sent' ? 1 : 0
+      );
+    }
+  );
+
+  it('requires the broker before creating even the inert restore pane when Python is unavailable', async () => {
+    const { manager, home } = fixture();
+    const create = vi
+      .spyOn(manager as unknown as { createInputBroker(): Promise<CodexInputBroker> }, 'createInputBroker')
+      .mockRejectedValue(new Error('Python unavailable'));
+    const dispatch = vi.fn();
+    await expect(
+      manager.createSession({
+        sessionId: ID,
+        workingDir: root,
+        mode: 'codex',
+        codexConfig: config,
+        recoveryCodexHome: home,
+        codexRestoreGuard: { ...healthyGuard(), noteDispatch: dispatch },
+      })
+    ).rejects.toThrow();
+    expect(create.mock.calls[0]).toHaveLength(4);
+    expect(create.mock.calls[0][3]).toBe(true);
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(effects.sync.mock.calls.some(([command]) => / (?:new-session|respawn-pane) /.test(command))).toBe(false);
+  });
+
   it.each(['authorized', 'refused', 'throwing'] as const)(
     'awaits the final asynchronous launch proof before any worker effect: %s',
     async (outcome) => {
@@ -138,6 +707,7 @@ describe('native uncertain Codex reboot ownership', () => {
         codexConfig: config,
         recoveryCodexHome: home,
         codexRestoreGuard: {
+          ...healthyGuard(),
           prepare: async () => {},
           confirm: () => (++confirmations === 3 ? held : true),
           noteDispatch: dispatch,
@@ -151,18 +721,18 @@ describe('native uncertain Codex reboot ownership', () => {
         await vi.waitFor(() => expect(confirmations).toBe(3));
         await new Promise<void>((resolve) => setImmediate(resolve));
         expect(dispatch).not.toHaveBeenCalled();
-        expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
+        expect(effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane '))).toBe(false);
         if (outcome === 'throwing') fail(new Error('Fixture private proof unavailable'));
         else finish(outcome === 'authorized');
         const result = await settled;
         if (outcome === 'authorized') {
           expect(result).toHaveProperty('value');
           expect(dispatch).toHaveBeenCalledOnce();
-          expect(effects.sync.mock.calls.filter(([command]) => command.includes(' respawn-pane '))).toHaveLength(1);
+          expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
         } else {
           expect(result).toHaveProperty('error');
           expect(dispatch).not.toHaveBeenCalled();
-          expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
+          expect(effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane '))).toBe(false);
           expect(manager.getSession(ID)).toBeUndefined();
         }
       } finally {
@@ -190,7 +760,7 @@ describe('native uncertain Codex reboot ownership', () => {
     });
     const proof = vi.fn(() => held);
     const create = vi.spyOn(manager, 'createSession');
-    session.setCodexRestoreLaunchGuard({ prepare: async () => {}, confirm: proof });
+    session.setCodexRestoreLaunchGuard({ ...healthyGuard(), prepare: async () => {}, confirm: proof });
     const launch = session.startInteractive().then(
       () => undefined,
       (error: unknown) => error
@@ -201,7 +771,7 @@ describe('native uncertain Codex reboot ownership', () => {
       finish(true);
       expect(await launch).toBeInstanceOf(Error);
       expect(create).not.toHaveBeenCalled();
-      expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
+      expect(effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane '))).toBe(false);
     } finally {
       finish(false);
       await launch;
@@ -214,7 +784,7 @@ describe('native uncertain Codex reboot ownership', () => {
       const { manager, home } = fixture();
       const dispatch = vi.fn();
       effects.sync.mockImplementation((command: string) => {
-        if (command.includes(' respawn-pane ')) {
+        if (command.includes('respawn-pane ')) {
           const [saved] = JSON.parse(readFileSync(metadata, 'utf8'));
           expect(saved).toMatchObject({
             sessionId: ID,
@@ -228,7 +798,7 @@ describe('native uncertain Codex reboot ownership', () => {
           });
           if (failure === 'lost-receipt') throw new Error('Fixture receipt lost after dispatch');
         }
-        return '99999\n';
+        return nativeOutput(command);
       });
       if (failure === 'unknown-pid')
         vi.spyOn(manager as unknown as { getPanePid(name: string): number | null }, 'getPanePid').mockReturnValue(null);
@@ -241,7 +811,12 @@ describe('native uncertain Codex reboot ownership', () => {
           mode: 'codex',
           codexConfig: config,
           recoveryCodexHome: home,
-          codexRestoreGuard: { prepare: async () => {}, confirm: () => true, noteDispatch: dispatch },
+          codexRestoreGuard: {
+            ...healthyGuard(),
+            prepare: async () => {},
+            confirm: () => true,
+            noteDispatch: dispatch,
+          },
         })
       ).rejects.toThrow();
       expect(dispatch).toHaveBeenCalledOnce();
@@ -251,8 +826,8 @@ describe('native uncertain Codex reboot ownership', () => {
         codexRestoreUncertain: true,
         codexRestoreConfig: config,
       });
-      expect(effects.sync.mock.calls.filter(([command]) => command.includes(' respawn-pane '))).toHaveLength(1);
-      expect(effects.sync.mock.calls.some(([command]) => command.includes(' kill-session '))).toBe(false);
+      expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
+      expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-pane '))).toBe(false);
       expect(JSON.parse(readFileSync(metadata, 'utf8'))[0].sessionId).toBe(ID);
       const session = new Session({
         id: ID,
@@ -283,6 +858,7 @@ describe('native uncertain Codex reboot ownership', () => {
         codexConfig: config,
         recoveryCodexHome: home,
         codexRestoreGuard: {
+          ...healthyGuard(),
           prepare: async () => {
             prepares++;
           },
@@ -292,8 +868,8 @@ describe('native uncertain Codex reboot ownership', () => {
       })
     ).rejects.toThrow();
     expect(dispatch).not.toHaveBeenCalled();
-    expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
-    expect(effects.sync.mock.calls.filter(([command]) => command.includes(' kill-session '))).toHaveLength(1);
+    expect(effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane '))).toBe(false);
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('kill-pane '))).toHaveLength(1);
     expect(manager.getSession(ID)).toBeUndefined();
     expect(JSON.parse(readFileSync(metadata, 'utf8'))).toEqual([]);
   });
@@ -311,13 +887,21 @@ describe('native uncertain Codex reboot ownership', () => {
           mode: 'codex',
           codexConfig: config,
           recoveryCodexHome: home,
-          codexRestoreGuard: { prepare: async () => {}, confirm: () => true, noteDispatch: dispatch },
+          codexRestoreGuard: {
+            ...healthyGuard(),
+            prepare: async () => {},
+            confirm: () => true,
+            noteDispatch: dispatch,
+          },
         })
       ).rejects.toThrow();
       expect(dispatch).not.toHaveBeenCalled();
-      expect(effects.sync.mock.calls.some(([command]) => command.includes(' respawn-pane '))).toBe(false);
-      expect(effects.sync.mock.calls.filter(([command]) => command.includes(' kill-session '))).toHaveLength(1);
-      expect(manager.getSession(ID)).toBeUndefined();
+      expect(effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane '))).toBe(false);
+      expect(effects.sync.mock.calls.filter(([command]) => command.includes('kill-pane '))).toHaveLength(1);
+      expect(manager.getSession(ID)).toMatchObject({
+        recoveryInputBrokerPending: expect.any(String),
+        codexRestoreUncertain: true,
+      });
       expect(readFileSync(metadata, 'utf8')).toBe(damaged);
     }
   );
@@ -327,8 +911,8 @@ describe('native uncertain Codex reboot ownership', () => {
     async (metadataKind) => {
       const { manager, home } = fixture();
       effects.sync.mockImplementation((command: string) => {
-        if (command.includes(' respawn-pane ')) throw new Error('Fixture receipt lost after dispatch');
-        return '99999\n';
+        if (command.includes('respawn-pane ')) throw new Error('Fixture receipt lost after dispatch');
+        return nativeOutput(command);
       });
       const session = new Session({
         id: ID,
@@ -342,7 +926,7 @@ describe('native uncertain Codex reboot ownership', () => {
         recoveryCodexHome: home,
       });
       sessions.push(session);
-      session.setCodexRestoreLaunchGuard({ prepare: async () => {}, confirm: () => true });
+      session.setCodexRestoreLaunchGuard({ ...healthyGuard(), prepare: async () => {}, confirm: () => true });
       await expect(session.startInteractive()).rejects.toThrow();
       expect(session.codexRestoreWorkerMayExist).toBe(true);
       const record = manager.getSession(ID)!;
@@ -370,8 +954,8 @@ describe('native uncertain Codex reboot ownership', () => {
         await session.startInteractive();
         expect(effects.attach).toHaveBeenCalledOnce();
       } else await expect(session.startInteractive()).rejects.toThrow();
-      expect(effects.sync.mock.calls.filter(([command]) => command.includes(' respawn-pane '))).toHaveLength(1);
-      expect(effects.sync.mock.calls.some(([command]) => command.includes(' kill-session '))).toBe(false);
+      expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
+      expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-pane '))).toBe(false);
     }
   );
 
@@ -417,9 +1001,7 @@ describe('native uncertain Codex reboot ownership', () => {
       expect(
         effects.sync.mock.calls.some(
           ([command]) =>
-            command.includes(' respawn-pane ') ||
-            command.includes(' new-session ') ||
-            command.includes(' kill-session ')
+            command.includes('respawn-pane ') || command.includes(' new-session ') || command.includes('kill-pane ')
         )
       ).toBe(false);
       expect(session.codexRestoreWorkerMayExist).toBe(true);
@@ -656,16 +1238,220 @@ describe('native uncertain Codex reboot ownership', () => {
     }
   );
 
+  it.each(['unknown-startup', 'lost-wire', 'no-child', 'healthy'] as const)(
+    'generic Server discard protects an ordinary uncertain launch without caller preservation flags: %s',
+    async (outcome) => {
+      const { manager, home, getBroker } = fixture();
+      const broker = await getBroker();
+      if (outcome === 'unknown-startup') vi.mocked(broker.startupReceipt).mockResolvedValue('unknown');
+      if (outcome === 'no-child') vi.mocked(broker.startupReceipt).mockResolvedValue('not-sent');
+      if (outcome === 'lost-wire')
+        effects.sync.mockImplementation((command: string) => {
+          if (command.includes('respawn-pane ')) throw new Error('Fixture unknown worker launch');
+          return nativeOutput(command);
+        });
+      vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+      const server = new WebServer(0, false, true);
+      servers.push(server);
+      Reflect.set(server, 'mux', manager);
+      for (const method of [
+        'startStatsCollection',
+        'startMouseModeSync',
+        'startPaneExitWatcher',
+        'startRemoteReconnectWatcher',
+        'destroy',
+      ] as const)
+        vi.spyOn(manager, method).mockImplementation(() => {});
+      const session = new Session({
+        id: ID,
+        mode: 'codex',
+        workingDir: root,
+        useMux: true,
+        mux: manager,
+        codexConfig: config,
+        recoveryCodexHome: home,
+      });
+      sessions.push(session);
+      const board = Reflect.get(server, 'sessions') as Map<string, SessionType>;
+      board.set(ID, session);
+      const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+      const historical = { ...session.toState(), pid: 1234, name: 'Preserved history', totalCost: 7 };
+      store.setSession(ID, historical);
+      store.flush();
+      const configDir = join(root, 'custom-model-configs', ID);
+      mkdirSync(configDir, { recursive: true });
+      const marker = join(configDir, 'owned-home-marker');
+      writeFileSync(marker, 'preserved config');
+      if (outcome === 'healthy') await session.startInteractive();
+      else await expect(session.startInteractive()).rejects.toThrow();
+      const uncertain = outcome === 'unknown-startup' || outcome === 'lost-wire';
+      expect(session.codexRestoreWorkerMayExist).toBe(uncertain);
+      const stop = vi.spyOn(session, 'stop');
+      const kill = vi.spyOn(manager, 'killSession');
+      await server.discardPartiallyBuiltSession(ID, session);
+      if (uncertain) {
+        expect(board.get(ID)).toBe(session);
+        expect(stop).not.toHaveBeenCalled();
+        expect(kill).not.toHaveBeenCalled();
+        expect(readFileSync(marker, 'utf8')).toBe('preserved config');
+        Reflect.get(server, '_persistSessionStateNow').call(server, session);
+        expect(store.getSession(ID)).toEqual(historical);
+        expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID]).toEqual(historical);
+        expect(manager.getSession(ID)).toMatchObject({
+          recoveryInputBrokerPending: broker.incarnation,
+          codexRestoreUncertain: true,
+        });
+      } else {
+        expect(board.has(ID)).toBe(false);
+        expect(stop).toHaveBeenCalledWith(true);
+        expect(() => statSync(marker)).toThrow();
+      }
+    }
+  );
+
+  it.each(['started', 'lost-wire', 'unknown-startup', 'no-child', 'promotion-failure'] as const)(
+    'durably reserves a new ordinary broker before the worker can receive bytes: %s',
+    async (outcome) => {
+      const { manager, home, getBroker } = fixture();
+      const broker = await getBroker();
+      if (outcome === 'unknown-startup') vi.mocked(broker.startupReceipt).mockResolvedValue('unknown');
+      if (outcome === 'no-child') vi.mocked(broker.startupReceipt).mockResolvedValue('not-sent');
+      const flush = manager.flushSessionsDurably.bind(manager);
+      let flushes = 0;
+      if (outcome === 'promotion-failure')
+        vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async (scope) => {
+          if (++flushes === 2) throw new Error('Fixture promotion fsync failed');
+          await flush(scope);
+        });
+      let snapshot: MuxSession | undefined;
+      effects.sync.mockImplementation((command: string) => {
+        if (command.includes(' new-session ')) expect(command).toContain('/bin/sleep 86400');
+        if (command.includes('respawn-pane ')) {
+          snapshot = JSON.parse(readFileSync(metadata, 'utf8'))[0];
+          expect(snapshot).toMatchObject({
+            pid: 0,
+            recoveryInputBroker: broker.incarnation,
+            recoveryInputBrokerPending: broker.incarnation,
+            codexRestoreUncertain: true,
+          });
+          if (outcome === 'lost-wire') throw new Error('Fixture lost worker launch receipt');
+        }
+        return nativeOutput(command);
+      });
+      const launch = manager.createSession({
+        sessionId: ID,
+        workingDir: root,
+        mode: 'codex',
+        codexConfig: config,
+        recoveryCodexHome: home,
+      });
+      if (outcome === 'started') {
+        await launch;
+        expect(manager.getSession(ID)?.recoveryInputBrokerPending).toBeUndefined();
+        expect(JSON.parse(readFileSync(metadata, 'utf8'))[0]).toMatchObject({
+          recoveryInputBroker: broker.incarnation,
+        });
+        expect(JSON.parse(readFileSync(metadata, 'utf8'))[0].recoveryInputBrokerPending).toBeUndefined();
+      } else {
+        await expect(launch).rejects.toThrow();
+        if (outcome === 'no-child') {
+          expect(manager.getSession(ID)).toBeUndefined();
+          expect(JSON.parse(readFileSync(metadata, 'utf8'))).toEqual([]);
+        } else {
+          expect(manager.getSession(ID)).toMatchObject({
+            recoveryInputBrokerPending: broker.incarnation,
+            codexRestoreUncertain: true,
+          });
+          expect(JSON.parse(readFileSync(metadata, 'utf8'))[0]).toMatchObject({
+            recoveryInputBrokerPending: broker.incarnation,
+            codexRestoreUncertain: true,
+          });
+        }
+      }
+      expect(snapshot).toBeDefined();
+      expect(effects.sync.mock.calls.filter(([command]) => command.includes('kill-pane '))).toHaveLength(
+        outcome === 'no-child' ? 1 : 0
+      );
+    }
+  );
+
+  it('retains the reservation when exact no-child cleanup cannot acknowledge metadata rollback', async () => {
+    const { manager, home, getBroker } = fixture();
+    const broker = await getBroker();
+    vi.mocked(broker.startupReceipt).mockResolvedValue('not-sent');
+    const flush = manager.flushSessionsDurably.bind(manager);
+    let writes = 0;
+    vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async (scope) => {
+      if (++writes > 1) throw new Error('Fixture cleanup metadata fsync failed');
+      await flush(scope);
+    });
+    const refused = vi.fn(),
+      uncertain = vi.fn();
+    await expect(
+      manager.createSession({
+        sessionId: ID,
+        workingDir: root,
+        mode: 'codex',
+        codexConfig: config,
+        recoveryCodexHome: home,
+        codexRestoreGuard: { ...healthyGuard(), noteBrokerRefusal: refused, noteCleanupUncertain: uncertain },
+      })
+    ).rejects.toThrow();
+    expect(refused).not.toHaveBeenCalled();
+    expect(uncertain).toHaveBeenCalledOnce();
+    expect(manager.getSession(ID)).toMatchObject({
+      recoveryInputBrokerPending: broker.incarnation,
+      codexRestoreUncertain: true,
+    });
+    expect(JSON.parse(readFileSync(metadata, 'utf8'))[0]).toMatchObject({
+      recoveryInputBrokerPending: broker.incarnation,
+    });
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('kill-pane '))).toHaveLength(1);
+  });
+
+  it('keeps an ordinary launch receipt loss available for inspection without another launch', async () => {
+    const { manager, home } = fixture();
+    effects.sync.mockImplementation((command: string) => {
+      if (command.includes('respawn-pane ')) throw new Error('Fixture unknown worker');
+      return nativeOutput(command);
+    });
+    const session = new Session({
+      id: ID,
+      mode: 'codex',
+      workingDir: root,
+      useMux: true,
+      mux: manager,
+      codexConfig: config,
+      recoveryCodexHome: home,
+    });
+    sessions.push(session);
+    await expect(session.startInteractive()).rejects.toThrow();
+    expect(session.codexRestoreWorkerMayExist).toBe(true);
+    expect(session.getRecoveryContext().managed).toBe(false);
+    vi.spyOn(manager, 'muxSessionExists').mockReturnValue(true);
+    vi.spyOn(manager, 'isPaneDead').mockReturnValue(false);
+    await session.startInteractive();
+    expect(effects.attach).toHaveBeenCalledOnce();
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
+  });
+
   it.each([
     'sent',
     'lost-receipt',
     'revoked-before',
     'revoked-during-retirement',
     'retirement-file-failure',
+    'rollback-file-failure',
     'private-proof-refused',
     'record-replaced',
   ] as const)('retires a previous reboot binding before any later native respawn effect (%s)', async (outcome) => {
-    const { manager, home } = fixture();
+    const { manager, home, getBroker } = fixture();
+    const broker = await getBroker();
+    const proof = fakeInputProvenance({ incarnation: broker.incarnation, closed: true, exitStatus: 9 }, home);
+    vi.spyOn(broker, 'prove').mockResolvedValue(proof);
+    vi.spyOn(manager as unknown as { getInputBroker(): Promise<CodexInputBroker> }, 'getInputBroker').mockResolvedValue(
+      broker
+    );
     const record: MuxSession = {
       sessionId: ID,
       muxName: 'codeman-aaaaaaaa',
@@ -680,6 +1466,7 @@ describe('native uncertain Codex reboot ownership', () => {
       codexRestoreUncertain: false,
       codexRestoreConfig: config,
       codexRestoreStateBinding: 'a'.repeat(64),
+      recoveryInputBroker: '99999999-2222-3333-4444-555555555555',
     };
     manager.registerSession(record);
     await manager.flushSessionsDurably();
@@ -692,6 +1479,14 @@ describe('native uncertain Codex reboot ownership', () => {
       });
     if (outcome === 'retirement-file-failure')
       vi.spyOn(manager, 'flushSessionsDurably').mockRejectedValueOnce(new Error('Fixture metadata fsync refused'));
+    if (outcome === 'rollback-file-failure') {
+      let calls = 0;
+      vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async (scope) => {
+        if (++calls > 1) throw new Error('Fixture rollback fsync failed');
+        await flush(scope);
+        authorized = false;
+      });
+    }
     let replacement: MuxSession | undefined;
     if (outcome === 'record-replaced')
       vi.spyOn(manager, 'flushSessionsDurably').mockImplementationOnce(async (current) => {
@@ -704,11 +1499,14 @@ describe('native uncertain Codex reboot ownership', () => {
         manager.registerSession(replacement);
       });
     effects.exec.mockImplementation(async (command: string) => {
-      if (command.includes(' respawn-pane ')) {
+      if (command.includes('respawn-pane ')) {
         const saved = JSON.parse(readFileSync(metadata, 'utf8')).find((row: MuxSession) => row.sessionId === ID);
         expect(saved.codexRestoreStateBinding).toBeUndefined();
-        expect(saved.codexRestoreConfig).toBeUndefined();
+        expect(saved.codexRestoreConfig).toEqual({ ...config, model: 'new-owner-model' });
         expect(saved.recoveryCodexHome).toBe(home);
+        expect(saved.recoveryInputBroker).toBe('99999999-2222-3333-4444-555555555555');
+        expect(saved.recoveryInputBrokerPending).toBe(broker.incarnation);
+        expect(saved.codexRestoreUncertain).toBe(true);
         if (outcome === 'lost-receipt') throw new Error('Fixture response lost after respawn');
       }
       return { stdout: '', stderr: '' };
@@ -721,14 +1519,16 @@ describe('native uncertain Codex reboot ownership', () => {
       codexConfig: { ...config, model: 'new-owner-model' },
       recoveryCodexHome: home,
       onlyIfDead: true,
+      expectedRecoveryPane: { paneId: '%7', panePid: 700, status: 9, inputProvenance: proof },
       recoveryDispatchGuard: {
-        confirm: () => authorized,
+        inputProof: proof,
+        confirm: () => authorized && record.recoveryInputBroker === '99999999-2222-3333-4444-555555555555',
         prepareEvidence: async () => outcome !== 'private-proof-refused',
         noteDispatch: vi.fn(),
       },
     });
     expect(result).toBe(outcome === 'sent' ? 99999 : null);
-    expect(effects.exec.mock.calls.filter(([command]) => String(command).includes(' respawn-pane '))).toHaveLength(
+    expect(effects.exec.mock.calls.filter(([command]) => String(command).includes('respawn-pane '))).toHaveLength(
       outcome === 'sent' || outcome === 'lost-receipt' ? 1 : 0
     );
     if (
@@ -742,9 +1542,22 @@ describe('native uncertain Codex reboot ownership', () => {
       expect(saved.codexRestoreConfig).toEqual(config);
       expect(record.codexRestoreStateBinding).toBe('a'.repeat(64));
       expect(record.codexRestoreConfig).toEqual(config);
+      expect(record.recoveryInputBrokerPending).toBeUndefined();
+      expect(record.codexRestoreUncertain).toBe(false);
     } else {
       expect(record.codexRestoreStateBinding).toBeUndefined();
-      expect(record.codexRestoreConfig).toBeUndefined();
+      expect(record.codexRestoreConfig).toEqual({ ...config, model: 'new-owner-model' });
+      if (outcome === 'rollback-file-failure' || outcome === 'lost-receipt') {
+        expect(record.recoveryInputBrokerPending).toBe(broker.incarnation);
+        expect(record.codexRestoreUncertain).toBe(true);
+        expect(JSON.parse(readFileSync(metadata, 'utf8'))[0]).toMatchObject({
+          recoveryInputBrokerPending: broker.incarnation,
+        });
+      }
+      if (outcome === 'sent') {
+        expect(record.recoveryInputBrokerPending).toBeUndefined();
+        expect(JSON.parse(readFileSync(metadata, 'utf8'))[0].recoveryInputBrokerPending).toBeUndefined();
+      }
       if (outcome === 'record-replaced') {
         expect(manager.getSession(ID)).toBe(replacement);
         expect(replacement!.codexRestoreStateBinding).toBe('b'.repeat(64));

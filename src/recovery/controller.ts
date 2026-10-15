@@ -59,6 +59,8 @@ export class RecoveryController {
     restored?: RecoveryState
   ) {
     this.state = structuredClone(restored ?? initialRecoveryState());
+    // Existing journals opted into attention-only detection, never restart consent.
+    this.state.config.restartStalls = this.state.config.restartStalls === true;
     if (!this.state.stallAlert && this.state.needsAttention) {
       let alertIndex = this.state.history.length - 1;
       while (alertIndex >= 0 && this.state.history[alertIndex].kind !== 'attention') alertIndex--;
@@ -253,12 +255,29 @@ export class RecoveryController {
       const config = RecoveryConfigSchema.parse({ ...this.state.config, ...patch }) as RecoveryConfig;
       const enabledNow = config.enabled && !this.state.config.enabled;
       const stallEnabledNow = config.detectStalls && !this.state.config.detectStalls;
+      const stallRestartEnabledNow = config.restartStalls && !this.state.config.restartStalls;
       this.state.config = config;
-      if (enabledNow || stallEnabledNow) this.state.armedAt = this.now();
+      if (enabledNow || stallEnabledNow || stallRestartEnabledNow) this.state.armedAt = this.now();
+      if (!(config.detectStalls && config.restartStalls) && this.state.pending?.reason === 'stalled') {
+        this.state.pending = undefined;
+        this.state.nextRetryAt = undefined;
+        this.confirmation = undefined;
+        this.state.phase = config.enabled ? 'watching' : 'idle';
+      }
       if (!config.enabled) {
         this.state.pending = undefined;
         this.state.nextRetryAt = undefined;
         if (!this.state.inFlight) this.state.phase = 'idle';
+      }
+      if (
+        !config.restartStalls &&
+        (this.state.stallAlert || this.legacyStallAlert) &&
+        !this.state.inFlight &&
+        !this.state.circuitOpen
+      ) {
+        // Withdrawing restart consent must not dismiss unresolved attention-only silence.
+        this.state.needsAttention = true;
+        this.state.phase = 'paused';
       }
       this.event('state', config.enabled ? 'observing' : 'disabled');
       await this.save();
@@ -422,6 +441,7 @@ export class RecoveryController {
   private applyStallPolicy(observation: RecoveryObservation): RecoveryObservation {
     if (
       this.state.config.detectStalls &&
+      this.state.config.restartStalls &&
       observation.activity === 'crashed' &&
       observation.reason === 'process-crashed' &&
       observation.stallEvidenceKey
@@ -500,7 +520,11 @@ export class RecoveryController {
     const confirmation = this.confirmation;
     if (!confirmation) return;
     const stall = this.detectsStall(observation);
-    const kind = stall ? (observation.stallRestartable === true ? 'dead-stall' : 'live-stall') : 'failure';
+    const kind = stall
+      ? this.state.config.restartStalls === true && observation.stallRestartable === true
+        ? 'dead-stall'
+        : 'live-stall'
+      : 'failure';
     const failure = observation.activity === 'interrupted' || observation.activity === 'crashed';
     if (
       (!stall && (!failure || !observation.safeToAct)) ||
@@ -668,7 +692,8 @@ export class RecoveryController {
     if (this.state.circuitOpen) return;
     const failure = observation.activity === 'interrupted' || observation.activity === 'crashed';
     const stallDetected = this.detectsStall(observation);
-    const restartableStall = stallDetected && observation.stallRestartable === true;
+    const restartableStall =
+      stallDetected && this.state.config.restartStalls === true && observation.stallRestartable === true;
     const permitted =
       observation.activity === 'crashed' ? this.state.config.recoverCrashes : this.state.config.recoverInterrupted;
     const actionableFailure =
@@ -875,11 +900,13 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const isCurrent = () =>
+    const isCurrent: RecoveryActionAuthority = () =>
       !this.stopped &&
       revision === this.revision &&
+      (!restartableStall || (this.state.config.detectStalls === true && this.state.config.restartStalls === true)) &&
       !this.recoveryWindowExpired() &&
       (this.deps.hasActionAuthority ? this.deps.hasActionAuthority() === true : true);
+    isCurrent.getActionDeadline = () => (this.state.windowStartedAt ?? NaN) + this.state.config.maxRecoveryDurationMs;
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
       outcome = isCurrent() ? await this.deps.act(this.state.inFlight, isCurrent) : 'not-sent';

@@ -13,6 +13,7 @@ const RECOVERY_UI_FIELDS = Object.freeze({
   recoverInterrupted: { id: 'recoveryInterrupted', boolean: true },
   recoverCrashes: { id: 'recoveryCrashes', boolean: true },
   detectStalls: { id: 'recoveryStalls', boolean: true },
+  restartStalls: { id: 'recoveryRestartStalls', boolean: true },
   maxRetries: { id: 'recoveryMaxRetries', scale: 1 },
   retryDelayMs: { id: 'recoveryRetryDelay', scale: 1000 },
   maxRetryDelayMs: { id: 'recoveryMaxDelay', scale: 1000 },
@@ -212,7 +213,7 @@ Object.assign(CodemanApp.prototype, {
         !!state.inFlight ||
         !(
           ['interrupted', 'crashed'].includes(state.activity) ||
-          (state.config.detectStalls && state.activity === 'working')
+          (state.config.detectStalls && state.config.restartStalls && state.activity === 'working')
         ) ||
         ['managed-daemon', 'unsupported-location', 'unowned-session'].includes(state.lastReason);
     }

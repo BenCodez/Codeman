@@ -8,6 +8,7 @@ export const RecoveryConfigSchema = z
     recoverInterrupted: z.boolean().optional(),
     recoverCrashes: z.boolean().optional(),
     detectStalls: z.boolean().optional(),
+    restartStalls: z.boolean().optional(),
     maxRetries: z.number().int().min(1).max(10).optional(),
     retryDelayMs: z.number().int().min(1_000).max(300_000).optional(),
     maxRetryDelayMs: z.number().int().min(1_000).max(3_600_000).optional(),

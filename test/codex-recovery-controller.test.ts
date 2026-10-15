@@ -427,7 +427,7 @@ describe('recovery action authority', () => {
   });
 
   it('restarts a confirmed abnormal dead pane only after repeated same-turn probes and delay', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('stall-turn', true);
     await f.controller.refresh();
     advance(1999);
@@ -450,22 +450,29 @@ describe('recovery action authority', () => {
     expect(f.act.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
   });
 
-  it.each(['automation', 'stall-policy'] as const)(
+  it.each(['automation', 'stall-policy', 'stall-restart'] as const)(
     'starts a durable fresh quiet interval when enabling %s despite historical silence',
     async (optIn) => {
       for (const dead of [false, true]) {
         const state = initialRecoveryState();
         state.config = {
           ...state.config,
-          enabled: optIn === 'stall-policy',
-          detectStalls: optIn === 'automation',
+          enabled: optIn !== 'automation',
+          detectStalls: optIn !== 'stall-policy',
+          restartStalls: optIn !== 'stall-restart',
           stalledAfterMs: 10_000,
           retryDelayMs: 1000,
         };
         state.armedAt = NOW - 60_000;
         const f = fixture(state);
         f.observation = stalled(`new-opt-in-${optIn}-${dead}`, dead);
-        await f.controller.updateConfig(optIn === 'automation' ? { enabled: true } : { detectStalls: true });
+        await f.controller.updateConfig(
+          optIn === 'automation'
+            ? { enabled: true }
+            : optIn === 'stall-policy'
+              ? { detectStalls: true }
+              : { restartStalls: true }
+        );
         expect(f.controller.getStatus().armedAt).toBe(NOW);
         for (const offset of [0, 2000, 9999]) {
           vi.setSystemTime(NOW + offset);
@@ -505,7 +512,7 @@ describe('recovery action authority', () => {
   );
 
   it('requests attention for repeated live-turn silence and never acts, even on manual Retry', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('silent-live-turn');
     await f.controller.refresh();
     advance(2000);
@@ -542,6 +549,7 @@ describe('recovery action authority', () => {
   it('permits two guarded manual probes of a dead-pane stall with automation off', async () => {
     const state = initialRecoveryState();
     state.config.detectStalls = true;
+    state.config.restartStalls = true;
     state.config.stalledAfterMs = 10_000;
     const f = fixture(state);
     f.observation = stalled('manual-dead-pane', true);
@@ -557,7 +565,7 @@ describe('recovery action authority', () => {
   it.each([true, false])(
     'requires two fresh dead probes after a live silence alert (automatic: %s)',
     async (enabled) => {
-      const f = fixture(enabledState({}, { enabled, detectStalls: true, stalledAfterMs: 10_000 }));
+      const f = fixture(enabledState({}, { enabled, detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = stalled('live-then-dead');
       await f.controller.retry();
       advance(2000);
@@ -582,7 +590,7 @@ describe('recovery action authority', () => {
   it.each(['live pane', 'progress'] as const)(
     'invalidates dead proof when status inspection observes %s',
     async (change) => {
-      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = stalled('intervening-healthy-read', true);
       await f.controller.retry();
       advance(2000);
@@ -604,7 +612,7 @@ describe('recovery action authority', () => {
   );
 
   it('keeps a restored stall warning separate from fresh restart confirmation', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('restored-warning');
     await f.controller.retry();
     advance(2000);
@@ -635,7 +643,7 @@ describe('recovery action authority', () => {
             needsAttention: true,
             history: [{ at: NOW, kind: 'attention', reason: legacyReason, attempt: 0 }],
           },
-          { detectStalls: true, stalledAfterMs: 10_000 }
+          { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }
         )
       );
       f.observation = stalled('legacy-warning');
@@ -661,7 +669,9 @@ describe('recovery action authority', () => {
   );
 
   it('recovers successive independently confirmed deaths in one turn without resetting the durable retry budget', async () => {
-    let f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000, maxRetries: 2 }));
+    let f = fixture(
+      enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000, maxRetries: 2 })
+    );
     const firstProgress = NOW - 20_000;
     f.observation = stalled('same-unfinished-turn', true);
     await f.controller.retry();
@@ -720,7 +730,7 @@ describe('recovery action authority', () => {
   it.each([undefined, NaN, Infinity, -1, 0, Number.MAX_SAFE_INTEGER + 1, NOW + 1])(
     'never authorizes a stall restart from invalid structured progress %s',
     async (progressAt) => {
-      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = { ...stalled('bad-progress', true), progressAt };
       await f.controller.retry();
       advance(2000);
@@ -732,7 +742,7 @@ describe('recovery action authority', () => {
   it.each([NaN, Infinity, -1, 0, Number.MAX_SAFE_INTEGER + 1, NOW + 10_000])(
     'rejects inconsistent activity timestamps %s without consuming a stall attempt',
     async (at) => {
-      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = { ...stalled('bad-at', true), at };
       await f.controller.retry();
       advance(2000);
@@ -744,13 +754,16 @@ describe('recovery action authority', () => {
 
   it('retains legacy handled turn and unknown-delivery vetoes despite new structured progress', async () => {
     for (const restored of [
-      enabledState({ handledEvidence: ['legacy-stall'] }, { detectStalls: true, stalledAfterMs: 10_000 }),
+      enabledState(
+        { handledEvidence: ['legacy-stall'] },
+        { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }
+      ),
       enabledState(
         {
           handledEvidence: [`stall:${createHash('sha256').update('legacy-stall').digest('hex')}:malformed`],
           lastSuccessfulRecovery: NOW - 20_000,
         },
-        { detectStalls: true, stalledAfterMs: 10_000 }
+        { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }
       ),
       enabledState(
         {
@@ -763,7 +776,7 @@ describe('recovery action authority', () => {
             stallProgressAt: NOW - 20_000,
           },
         },
-        { detectStalls: true, stalledAfterMs: 10_000 }
+        { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }
       ),
     ]) {
       const f = fixture(restored);
@@ -776,7 +789,7 @@ describe('recovery action authority', () => {
   });
 
   it('retains a stall warning through inconclusive evidence and clears it on owner input', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('warning-owner-cancel');
     await f.controller.retry();
     advance(2000);
@@ -795,7 +808,7 @@ describe('recovery action authority', () => {
   it.each(['inspect', 'refresh'] as const)(
     'clears accepted stall restart attention through %s and requires a full fresh quiet interval before warning again',
     async (acceptanceRead) => {
-      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = stalled('accepted-stall-warning');
       await f.controller.retry();
       advance(2000);
@@ -972,7 +985,7 @@ describe('recovery action authority', () => {
               { at: NOW, kind: 'state', reason: lastReason, attempt: 0 },
             ],
           },
-          { enabled: lastReason !== 'disabled', detectStalls: true, stalledAfterMs: 10_000 }
+          { enabled: lastReason !== 'disabled', detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }
         )
       );
       f.observation = stalled('settings-parent-warning');
@@ -993,7 +1006,7 @@ describe('recovery action authority', () => {
   it.each(['sent', 'unknown', 'not-sent'] as const)(
     'does not grant a new quiet baseline or lose warning ownership for an unaccepted %s restart',
     async (outcome) => {
-      const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+      const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = stalled('unaccepted-stall-warning');
       await f.controller.retry();
       advance(2000);
@@ -1104,7 +1117,7 @@ describe('recovery action authority', () => {
   );
 
   it('restarts stall confirmation when the current turn changes or user input intervenes', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('turn-a');
     await f.controller.refresh();
     advance(2000);
@@ -1131,7 +1144,7 @@ describe('recovery action authority', () => {
   });
 
   it('expires widely spaced stall probes instead of combining stale reads', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('bounded-stall', true);
     await f.controller.refresh();
     advance(15_001);
@@ -1146,7 +1159,7 @@ describe('recovery action authority', () => {
   });
 
   it('clears an ambiguous stall alert when progress resumes', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('resumed-turn');
     await f.controller.refresh();
     advance(2000);
@@ -1160,7 +1173,7 @@ describe('recovery action authority', () => {
   it.each([true, false])(
     'clears owned stall attention after settings change its reason (automatic: %s)',
     async (enabled) => {
-      const f = fixture(enabledState({}, { enabled, detectStalls: true, stalledAfterMs: 10_000 }));
+      const f = fixture(enabledState({}, { enabled, detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = stalled('settings-during-stall');
       await f.controller.retry();
       advance(2000);
@@ -1183,7 +1196,7 @@ describe('recovery action authority', () => {
   );
 
   it('relinquishes stall attention ownership to a newer delivery failure', async () => {
-    const f = fixture(enabledState({}, { detectStalls: true, stalledAfterMs: 10_000 }));
+    const f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
     f.observation = stalled('replaced-stall-alert');
     await f.controller.retry();
     advance(2000);
@@ -1210,15 +1223,15 @@ describe('recovery action authority', () => {
 
   it.each([
     ['stall detection off', { detectStalls: false }, stalled('off', true)],
-    ['below threshold', { detectStalls: true, stalledAfterMs: 30_000 }, stalled('recent', true)],
+    ['below threshold', { detectStalls: true, restartStalls: true, stalledAfterMs: 30_000 }, stalled('recent', true)],
     [
       'provider retry',
-      { detectStalls: true, stalledAfterMs: 10_000 },
+      { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 },
       { ...stalled('retry'), reason: 'internal-retry' },
     ],
     [
       'background work',
-      { detectStalls: true, stalledAfterMs: 10_000 },
+      { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 },
       { ...stalled('agent'), activity: 'watching', reason: 'background-work' },
     ],
   ] as const)('keeps %s non-actionable', async (_label, config, observation) => {

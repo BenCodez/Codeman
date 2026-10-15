@@ -12,9 +12,17 @@ describe('strict native remote pane frames', () => {
         paneRow: `1||${token}|%7|4242`,
         expectedPane: { paneId: '%7', panePid: 4242, signal },
       });
-      expect(result).toMatchObject({ status: 'sent', pane: { dead: true, signal, paneId: '%7', panePid: 4242 } });
-      expect(result.effects).toContain('respawn-pane');
-      expect(result.effects).not.toContain(' -k ');
+      // A signal killing the broker cannot certify its worker's own exit.
+      expect(result).toMatchObject({ status: 'not-sent', pane: { dead: true, signal, paneId: '%7', panePid: 4242 } });
+      expect(result.effects).toBe('');
+      const wrapped = await fixture('restart', 'none', false, {
+        paneRow: `1|${128 + signal}||%7|4242`,
+        expectedPane: { paneId: '%7', panePid: 4242, status: 128 + signal },
+        childSignal: signal,
+      });
+      expect(wrapped).toMatchObject({ status: 'sent', closedWorkerSignal: signal });
+      expect(wrapped.effects).toContain('respawn-pane');
+      expect(wrapped.effects).not.toContain(' -k ');
     }
   );
 

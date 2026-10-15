@@ -16,13 +16,14 @@
  * See `docs/multi-user-plan.md` sections 4.1, 5, 6.3.
  */
 
-import { existsSync, mkdirSync, statSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
-import { isAbsolute, join, relative } from 'node:path';
-import { randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
+import { isAbsolute, join, relative, resolve } from 'node:path';
+import { createHash, randomBytes, scrypt as scryptCb, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
-import { dataPath, getDataDir } from './config/instance.js';
+import { dataPath, getDataDir, getDataDirPath } from './config/instance.js';
 import { getUserSpacesDir, isMultiUserMode, maxUsers } from './config/multiuser.js';
+import type { PrivateFileWitness } from './recovery/private-file-witness.js';
 import type { AuthUser, ClaudeMode, PasswordHash, PublicUser, UserRecord, UserRole, UsersFile } from './types.js';
 
 const scrypt = promisify(scryptCb) as (
@@ -164,11 +165,20 @@ export function canRunPrivilegedCommands(grant: { role: UserRole; canBypassPermi
 
 // ─────────────────────────────── IO layer ───────────────────────────────
 
-let cache: { users: UserRecord[]; ts: number; recoveryRecognized: boolean } | null = null;
+let cache: {
+  users: UserRecord[];
+  ts: number;
+  recoveryRecognized: boolean;
+  recoveryFile?: { path: string; hash: string };
+} | null = null;
+let cacheRevision = 0;
+let recoveryMutationRevision = 0;
 
 /** Drop the in-process cache (called after every write; exported for tests). */
 export function invalidateUsersCache(): void {
   cache = null;
+  cacheRevision++;
+  recoveryMutationRevision++;
 }
 
 export async function readUsers(force = false): Promise<UserRecord[]> {
@@ -183,6 +193,7 @@ export async function readUsers(force = false): Promise<UserRecord[]> {
     // empty store — do NOT cache [] and do NOT let it look empty, or a following
     // createUser/bootstrap would overwrite users.json and destroy every account.
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      cacheRevision++;
       cache = { users: [], ts: now, recoveryRecognized: false };
       return [];
     }
@@ -192,6 +203,7 @@ export async function readUsers(force = false): Promise<UserRecord[]> {
   // read as empty, so mutators/bootstrap abort instead of clobbering it.
   const parsed = JSON.parse(raw) as Partial<UsersFile>;
   const users = Array.isArray(parsed.users) ? parsed.users : [];
+  cacheRevision++;
   cache = {
     users,
     ts: now,
@@ -224,6 +236,8 @@ async function writeUsers(users: UserRecord[]): Promise<void> {
     await fs.unlink(tmpPath).catch(() => {});
     throw err;
   }
+  cacheRevision++;
+  recoveryMutationRevision++;
   cache = { users, ts: Date.now(), recoveryRecognized: true };
 }
 
@@ -480,63 +494,236 @@ export async function canUsernameRunPrivilegedCommands(username: string | undefi
   return canRunPrivilegedCommands(user ?? { role: 'user' });
 }
 
-/** A recovery grant must remain current after its last asynchronous lookup. */
-export async function prepareRecoveryPrivilegeGrant(username: string | undefined): Promise<{
+/** Private bounded owner evidence; final dispatch joins this file with its other FD witnesses. */
+export interface RecoveryPrivilegeGrant {
   privileged: boolean;
   isCurrent(): boolean;
-}> {
-  if (!isMultiUserMode()) return { privileged: true, isCurrent: () => !isMultiUserMode() };
-  if (!username) return { privileged: false, isCurrent: () => false };
-  const norm = normalizeUsername(username);
-  if (!isValidUsername(norm)) return { privileged: false, isCurrent: () => false };
-  const version = () => {
-    try {
-      const value = statSync(dataPath(USERS_FILE));
-      if (
-        !value.isFile() ||
-        !Number.isSafeInteger(value.size) ||
-        value.size < 0 ||
-        value.size > 2 * 1024 * 1024 ||
-        ![value.dev, value.ino, value.mtimeMs, value.ctimeMs].every(Number.isFinite)
-      )
-        return undefined;
-      return [value.dev, value.ino, value.size, value.mtimeMs, value.ctimeMs].join(':');
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === 'ENOENT' ? 'missing' : undefined;
-    }
+  readonly fileWitness?: Readonly<PrivateFileWitness>;
+  getFileWitness(): PrivateFileWitness | undefined;
+  /** Standalone inspection only; final actions use the common private-file barrier. */
+  verifyCurrent(): Promise<boolean>;
+}
+
+const RECOVERY_USERS_MAX_BYTES = 2 * 1024 * 1024;
+const RECOVERY_USERS_TIMEOUT_MS = 2_000;
+const recoveryUserReads = new Map<
+  string,
+  { deadline: number; work: Promise<{ bytes: Buffer; witness: PrivateFileWitness } | undefined> }
+>();
+
+function sameRecoveryFile(stat: Stats, witness: PrivateFileWitness): boolean {
+  return (
+    stat.isFile() &&
+    !stat.isSymbolicLink() &&
+    stat.dev === witness.dev &&
+    stat.ino === witness.ino &&
+    stat.size === witness.size &&
+    stat.mtimeMs === witness.mtimeMs &&
+    stat.ctimeMs === witness.ctimeMs
+  );
+}
+
+async function readRecoveryUsers(path: string) {
+  let job = recoveryUserReads.get(path);
+  if (!job) {
+    if (recoveryUserReads.size >= 2) return undefined;
+    const deadline = performance.now() + RECOVERY_USERS_TIMEOUT_MS;
+    const work = readRecoveryUsersFile(path, deadline);
+    job = { deadline, work };
+    recoveryUserReads.set(path, job);
+    void work.finally(() => {
+      if (recoveryUserReads.get(path)?.work === work) recoveryUserReads.delete(path);
+    });
+  }
+  const remaining = job.deadline - performance.now();
+  if (remaining <= 0) return undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      job.work,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), remaining);
+      }),
+    ]);
+    return result && performance.now() < job.deadline ? { ...result, deadline: job.deadline } : undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function readRecoveryUsersFile(path: string, deadline: number) {
+  let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+  const current = () => {
+    if (performance.now() >= deadline) throw new Error('Recovery owner evidence expired');
   };
-  const key = (users: UserRecord[]) => {
-    const matches = users.filter(
-      (user) => typeof user?.username === 'string' && normalizeUsername(user.username) === norm
-    );
-    const user = matches.length === 1 ? matches[0] : undefined;
+  try {
+    current();
+    const leaf = await fs.lstat(path);
+    current();
     if (
-      !user ||
-      user.username !== norm ||
-      !['admin', 'user'].includes(user.role) ||
-      (user.disabled !== undefined && typeof user.disabled !== 'boolean') ||
-      (user.canBypassPermissions !== undefined && typeof user.canBypassPermissions !== 'boolean')
+      !leaf.isFile() ||
+      leaf.isSymbolicLink() ||
+      !Number.isSafeInteger(leaf.size) ||
+      leaf.size < 0 ||
+      leaf.size > RECOVERY_USERS_MAX_BYTES ||
+      ![leaf.dev, leaf.ino, leaf.mtimeMs, leaf.ctimeMs].every(Number.isFinite)
     )
       return undefined;
-    return JSON.stringify([user.role, !!user.disabled, !!user.canBypassPermissions]);
+    const witness: PrivateFileWitness = {
+      path,
+      dev: leaf.dev,
+      ino: leaf.ino,
+      size: leaf.size,
+      mtimeMs: leaf.mtimeMs,
+      ctimeMs: leaf.ctimeMs,
+      hash: '',
+      maxBytes: RECOVERY_USERS_MAX_BYTES,
+    };
+    file = await fs.open(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    current();
+    if (!sameRecoveryFile(await file.stat(), witness)) return undefined;
+    current();
+    const bytes = Buffer.alloc(witness.size);
+    const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+    current();
+    if (bytesRead !== bytes.length || !sameRecoveryFile(await file.stat(), witness)) return undefined;
+    current();
+    witness.hash = createHash('sha256').update(bytes).digest('hex');
+    await file.close();
+    file = undefined;
+    current();
+    const after = await fs.lstat(path);
+    current();
+    if (!sameRecoveryFile(after, witness)) return undefined;
+    return { bytes, witness };
+  } catch {
+    return undefined;
+  } finally {
+    if (file) await file.close().catch(() => {});
+  }
+}
+
+function recoveryPermissionKey(users: UserRecord[], norm: string): string | undefined {
+  const matches = users.filter(
+    (user) => typeof user?.username === 'string' && normalizeUsername(user.username) === norm
+  );
+  const user = matches.length === 1 ? matches[0] : undefined;
+  if (
+    !user ||
+    user.username !== norm ||
+    !['admin', 'user'].includes(user.role) ||
+    (user.disabled !== undefined && typeof user.disabled !== 'boolean') ||
+    (user.canBypassPermissions !== undefined && typeof user.canBypassPermissions !== 'boolean')
+  )
+    return undefined;
+  return JSON.stringify([user.role, !!user.disabled, !!user.canBypassPermissions]);
+}
+
+function recoveryPermissionsSnapshot(records: UserRecord[]): string | undefined {
+  try {
+    return JSON.stringify(
+      records.map((record) => [record?.username, record?.role, record?.disabled, record?.canBypassPermissions])
+    );
+  } catch {
+    return undefined;
+  }
+}
+
+/** Prepare without blocking the event loop; isCurrent is deliberately memory-only. */
+export async function prepareRecoveryPrivilegeGrant(username: string | undefined): Promise<RecoveryPrivilegeGrant> {
+  const dir = getDataDirPath();
+  const rawDir = process.env.CODEMAN_DATA_DIR;
+  const rawHome = process.env.HOME;
+  const rawMode = process.env.CODEMAN_MULTIUSER;
+  const rawInstance = process.env.CODEMAN_INSTANCE;
+  const scopeCurrent = () =>
+    getDataDirPath() === dir &&
+    process.env.CODEMAN_DATA_DIR === rawDir &&
+    process.env.HOME === rawHome &&
+    process.env.CODEMAN_MULTIUSER === rawMode &&
+    process.env.CODEMAN_INSTANCE === rawInstance;
+  const denied: RecoveryPrivilegeGrant = {
+    privileged: false,
+    isCurrent: () => false,
+    getFileWitness: () => undefined,
+    verifyCurrent: async () => false,
   };
-  const before = version();
-  if (before === undefined) return { privileged: false, isCurrent: () => false };
-  // Recovery uses a fresh lookup even when ordinary authentication's short cache is warm.
-  const users = await readUsers(true);
-  const after = version();
-  const permission = key(users);
+  if (!isMultiUserMode()) {
+    const isCurrent = () => scopeCurrent() && !isMultiUserMode();
+    return { privileged: true, isCurrent, getFileWitness: () => undefined, verifyCurrent: async () => isCurrent() };
+  }
+  if (!username) return denied;
+  const norm = normalizeUsername(username);
+  if (!isValidUsername(norm)) return denied;
+  const revision = recoveryMutationRevision;
+  const initialCache = cacheRevision;
+  const initialUsers = cache?.users;
+  const initialPermissions = initialUsers && recoveryPermissionsSnapshot(initialUsers);
+  if (initialUsers && initialPermissions === undefined) return denied;
+  const path = resolve(dir, USERS_FILE);
+  const result = await readRecoveryUsers(path);
+  if (!result || !scopeCurrent() || !isMultiUserMode() || revision !== recoveryMutationRevision) return denied;
+  const text = result.bytes.toString('utf8');
+  if (!Buffer.from(text, 'utf8').equals(result.bytes)) return denied;
+  let parsed: Partial<UsersFile>;
+  try {
+    parsed = JSON.parse(text) as Partial<UsersFile>;
+  } catch {
+    return denied;
+  }
+  if (
+    !parsed ||
+    typeof parsed !== 'object' ||
+    Array.isArray(parsed) ||
+    Object.keys(parsed).length !== 2 ||
+    parsed.version !== 1 ||
+    !Array.isArray(parsed.users)
+  )
+    return denied;
+  const users = parsed.users;
+  const permission = recoveryPermissionKey(users, norm);
   const user = users.find((record) => record?.username === norm);
-  const authorized = before === after && !!cache?.recoveryRecognized && permission !== undefined && !user?.disabled;
+  if (permission === undefined || user?.disabled) return denied;
+  // findUser exposes mutable cached records; a known in-memory revocation during
+  // this read must not be overwritten by the earlier captured disk bytes.
+  if (initialUsers && recoveryPermissionsSnapshot(initialUsers) !== initialPermissions) return denied;
+  // A late lookup cannot overwrite newer ordinary auth or a known mutation. Concurrent
+  // manager/worker snapshots of the same exact file may share their current grant.
+  if (
+    cacheRevision !== initialCache &&
+    (cache?.recoveryFile?.path !== path ||
+      cache.recoveryFile.hash !== result.witness.hash ||
+      recoveryPermissionsSnapshot(cache.users) !== recoveryPermissionsSnapshot(users))
+  )
+    return denied;
+  if (performance.now() >= result.deadline) return denied;
+  cacheRevision++;
+  cache = { users, ts: Date.now(), recoveryRecognized: true, recoveryFile: { path, hash: result.witness.hash } };
+  const witness = Object.freeze({ ...result.witness });
+  const isCurrent = () =>
+    scopeCurrent() &&
+    isMultiUserMode() &&
+    revision === recoveryMutationRevision &&
+    cache !== null &&
+    cache.recoveryRecognized &&
+    recoveryPermissionKey(cache.users, norm) === permission;
+  const getFileWitness = () => ({ ...witness });
   return {
-    privileged: authorized && canRunPrivilegedCommands(user!),
-    isCurrent: () =>
-      authorized &&
-      isMultiUserMode() &&
-      after === version() &&
-      cache !== null &&
-      cache.recoveryRecognized &&
-      key(cache.users) === permission,
+    privileged: canRunPrivilegedCommands(user!),
+    isCurrent,
+    fileWitness: witness,
+    getFileWitness,
+    verifyCurrent: async () => {
+      if (!isCurrent()) return false;
+      const next = await readRecoveryUsers(path);
+      return (
+        !!next &&
+        isCurrent() &&
+        Object.keys(witness).every(
+          (key) => next.witness[key as keyof PrivateFileWitness] === witness[key as keyof PrivateFileWitness]
+        )
+      );
+    },
   };
 }
 

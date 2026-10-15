@@ -1,5 +1,15 @@
 /** @fileoverview Actual Session/TmuxManager effect boundaries, exclusively injected children and temporary owner data. */
-import { appendFileSync, mkdtempSync, mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  appendFileSync,
+  readFileSync,
+  statSync,
+  mkdtempSync,
+  mkdirSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { parseNativePaneSignal } from '../src/recovery/native-pane-signal.js';
 import { join } from 'node:path';
@@ -8,6 +18,8 @@ import type { MuxSession } from '../src/mux-interface.js';
 import type { Session as SessionType } from '../src/session.js';
 import type { TmuxManager as ManagerType } from '../src/tmux-manager.js';
 import type { RecoveryActionAuthority } from '../src/recovery/types.js';
+import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
+import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
 
 const effects = vi.hoisted(() => ({ exec: vi.fn(), sync: vi.fn() }));
 vi.mock('node:child_process', async (original) => {
@@ -43,6 +55,7 @@ let directory: string;
 let previousData: string | undefined;
 let previousMode: string | undefined;
 const workers: SessionType[] = [];
+const acceptedPackets = new Map<string, 'sent' | 'not-sent'>();
 beforeAll(async () => {
   // Enable the real command branches only after every child API is mocked.
   const vitest = process.env.VITEST;
@@ -55,6 +68,7 @@ beforeAll(async () => {
   }
 });
 beforeEach(() => {
+  acceptedPackets.clear();
   directory = mkdtempSync(join(homedir(), 'native-recovery-'));
   previousData = process.env.CODEMAN_DATA_DIR;
   previousMode = process.env.CODEMAN_MULTIUSER;
@@ -81,6 +95,12 @@ function setGrant(granted: boolean) {
   );
   renameSync(`${path}.fixture`, path);
 }
+function bareManager(): ManagerType {
+  const manager = Object.create(TmuxManager.prototype) as ManagerType;
+  for (const name of ['sessions', 'inputBrokers', 'inputBrokerLoads', 'inputQueues'])
+    Reflect.set(manager, name, new Map());
+  return manager;
+}
 async function fixture(
   action: 'continue' | 'restart',
   stalledOrPrompt: boolean | string = false,
@@ -100,24 +120,77 @@ async function fixture(
     signal: paneSignalToken ? parseNativePaneSignal(paneSignalToken)! : undefined,
     paneSignalToken,
     screen: action === 'restart' ? null : '›\n  fixture-model high · /tmp\n',
+    inputProvenance: fakeInputProvenance(
+      {
+        closed: action === 'restart',
+        exitStatus: action === 'restart' && !paneSignalToken ? 1 : undefined,
+        exitSignal: paneSignalToken ? parseNativePaneSignal(paneSignalToken)! : undefined,
+      },
+      home
+    ),
   };
+  const inputBroker = await CodexInputBroker.create(
+    join(home, 'broker-control'),
+    id,
+    'explicit fake native child',
+    home
+  );
+  pane.inputProvenance.fileWitness!.path = join(inputBroker.directory, 'state.json');
+  const config = JSON.parse(readFileSync(join(inputBroker.directory, 'config.json'), 'utf8'));
+  updateFakeInputProvenance(
+    pane.inputProvenance,
+    { incarnation: inputBroker.incarnation, launchDigest: config.launchDigest },
+    (proof) => ({
+      version: 1,
+      sessionId: id,
+      incarnation: proof.incarnation,
+      pid: proof.brokerPid,
+      childPid: proof.childPid,
+      brokerStart: proof.brokerStart,
+      childStart: proof.childStart,
+      tainted: proof.rawGeneration > 0,
+      rawGeneration: proof.rawGeneration,
+      launchDigest: proof.launchDigest,
+      homeDigest: proof.homeDigest,
+      closed: proof.closed,
+      exitStatus: proof.exitStatus ?? null,
+      exitSignal: proof.exitSignal ?? null,
+      counters: { ...proof.ownerCounters, auto: 0, probe: 0 },
+      receipts: [],
+      startup: { nonce: config.startup.nonce, status: 'started' },
+    })
+  );
+  expect(await inputBroker.readState()).toBeDefined();
+  vi.spyOn(inputBroker, 'prove').mockImplementation(async () => pane.inputProvenance);
+  vi.spyOn(inputBroker, 'receipt').mockImplementation(
+    async (receipt) => acceptedPackets.get(receipt.nonce) ?? 'unknown'
+  );
+  vi.spyOn(inputBroker, 'startupReceipt').mockResolvedValue('started');
   // Bypass constructor/background discovery; use the real effect methods with a single owned registry entry.
-  const manager = Object.create(TmuxManager.prototype) as ManagerType;
+  const manager = bareManager();
   const record = {
     sessionId: id,
     muxName: 'codeman-aaaaaaaa',
-    pid: 99999,
+    pid: 700,
     createdAt: Date.now(),
     workingDir: directory,
     mode: 'codex',
     attached: true,
     recoveryIsolated: true,
     recoveryCodexHome: home,
+    recoveryInputBroker: inputBroker.incarnation,
   } as MuxSession;
   Reflect.set(manager, 'sessions', new Map([[id, record]]));
   Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
   Reflect.set(manager, 'paneExits', new Map());
   Reflect.set(manager, 'paneExitGeneration', 0);
+  Reflect.set(manager, 'inputBrokers', new Map([[id, inputBroker]]));
+  Reflect.set(manager, 'inputBrokerLoads', new Map());
+  Reflect.set(manager, 'inputQueues', new Map());
+  vi.spyOn(
+    manager as unknown as { createInputBroker(): Promise<CodexInputBroker> },
+    'createInputBroker'
+  ).mockResolvedValue(inputBroker);
   vi.spyOn(manager, 'isAvailable').mockReturnValue(true);
   vi.spyOn(manager, 'inspectPaneForRecovery').mockImplementation(async () => ({ ...pane }));
   effects.sync.mockImplementation((command: string) => {
@@ -127,6 +200,11 @@ async function fixture(
     return '99999\n';
   });
   effects.exec.mockImplementation(async (command: string) => {
+    if (command.includes('display-message') && !command.includes('if-shell'))
+      return {
+        stdout: `codeman-aaaaaaaa|${pane.paneId}|${pane.panePid}|${pane.dead ? 1 : 0}|${pane.status ?? ''}|\n`,
+        stderr: '',
+      };
     if (command.includes('if-shell') && command.includes('send-keys')) {
       const expected = {
         session_name: 'codeman-aaaaaaaa',
@@ -141,7 +219,8 @@ async function fixture(
       if (!terms.every((term) => expected[term[1] as keyof typeof expected] === term[2]))
         return { stdout: 'CODEMAN_RECOVERY_PANE_REFUSED\n', stderr: '' };
     }
-    if (command.includes('send-keys') && command.includes(' -l '))
+    acceptInput(command);
+    if (isLiteral(command) && acceptedPackets.get(inputPacket(command)!.nonce) === 'sent')
       pane.screen = `› ${prompt.replace(/\r/g, '').replace(/\n/g, '').trimEnd()}\n  fixture-model high · /tmp\n`;
     return { stdout: '', stderr: '' };
   });
@@ -170,8 +249,39 @@ async function fixture(
   const deliver = (
     proof: () => boolean | Promise<boolean> = () => evidence,
     authority: RecoveryActionAuthority = () => current
-  ) =>
-    worker.deliverRecovery(
+  ) => {
+    const evidenceGuard = proof as import('../src/recovery/types.js').RecoveryEvidenceGuard;
+    evidenceGuard.getEvidenceSource = () => {
+      const leaf = pane.inputProvenance.fileWitness!;
+      const tail = readFileSync(leaf.path, 'utf8');
+      return {
+        sessionId: id,
+        inputBroker: inputBroker.authority(pane.inputProvenance),
+        files: [leaf],
+        identity: {
+          reason: 'verified',
+          conversationId: thread,
+          path: leaf.path,
+          tail,
+          tailTruncated: false,
+          witness: {
+            paths: [
+              {
+                path: leaf.path,
+                kind: 'file',
+                dev: leaf.dev,
+                ino: leaf.ino,
+                size: leaf.size,
+                mtimeMs: leaf.mtimeMs,
+                ctimeMs: leaf.ctimeMs,
+              },
+            ],
+          },
+        },
+        isCurrent: () => current,
+      };
+    };
+    return worker.deliverRecovery(
       {
         action,
         key: 'fixture',
@@ -182,9 +292,19 @@ async function fixture(
       worker.getRecoveryContext().generation,
       authority,
       prompt,
-      proof,
-      stalled ? { paneId: '%7', panePid: 700, status: pane.status, signal: pane.signal, paneSignalToken } : undefined
+      evidenceGuard,
+      stalled
+        ? {
+            paneId: '%7',
+            panePid: 700,
+            status: pane.status,
+            signal: pane.signal,
+            paneSignalToken,
+            inputProvenance: pane.inputProvenance,
+          }
+        : undefined
     );
+  };
   return {
     worker,
     manager,
@@ -201,8 +321,62 @@ async function fixture(
     },
   };
 }
+function acceptInput(command: string): void {
+  const packet = inputPacket(command);
+  if (!packet) return;
+  const accepted = packet.privateFiles.every((file) => {
+    try {
+      const stat = statSync(file.path);
+      return (
+        stat.dev === file.dev &&
+        stat.ino === file.ino &&
+        stat.size === file.size &&
+        stat.mtimeMs === file.mtimeMs &&
+        stat.ctimeMs === file.ctimeMs &&
+        createHash('sha256').update(readFileSync(file.path)).digest('hex') === file.hash
+      );
+    } catch {
+      return false;
+    }
+  });
+  acceptedPackets.set(packet.nonce, accepted ? 'sent' : 'not-sent');
+}
+function childCommands(): string[] {
+  return commands().filter((command) => {
+    const packet = inputPacket(command);
+    return packet
+      ? packet.channel !== 'probe' && acceptedPackets.get(packet.nonce) === 'sent'
+      : !command.includes('send-keys');
+  });
+}
 function isEnter(command: string) {
-  return command.includes('send-keys') && !command.includes(' -l ') && / Enter(?:'|$)/.test(command);
+  return (
+    inputData(command) === '\r' ||
+    (command.includes('send-keys') && !command.includes(' -l ') && / Enter(?:'|$)/.test(command))
+  );
+}
+function inputPacket(command: string):
+  | {
+      data: string;
+      nonce: string;
+      channel: string;
+      privateFiles: import('../src/recovery/private-file-witness.js').PrivateFileWitness[];
+    }
+  | undefined {
+  const encoded = command.match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):[a-f0-9]{64}/)?.[1];
+  return encoded ? JSON.parse(Buffer.from(encoded, 'base64').toString()) : undefined;
+}
+function inputData(command: string): string | undefined {
+  const packet = inputPacket(command);
+  return packet && Buffer.from(packet.data, 'base64').toString();
+}
+function isLiteral(command: string): boolean {
+  return (
+    command.includes('send-keys') &&
+    command.includes(' -l ') &&
+    inputPacket(command)?.channel !== 'probe' &&
+    !isEnter(command)
+  );
 }
 function commands() {
   return effects.exec.mock.calls.map(([command]) => String(command));
@@ -243,7 +417,7 @@ describe('native recovery pane frame validation', () => {
     '1|9| |%7|700',
     '0|garbage||%7|700',
   ])('rejects the whole malformed native frame before screen capture: %j', async (frame) => {
-    const manager = Object.create(TmuxManager.prototype) as ManagerType;
+    const manager = bareManager();
     Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
     effects.exec.mockResolvedValue({ stdout: frame, stderr: '' });
     expect(await manager.inspectPaneForRecovery('codeman-aaaaaaaa')).toBeNull();
@@ -261,7 +435,7 @@ describe('native recovery pane frame validation', () => {
   ])(
     'accepts a complete bounded native frame with normal empty exit fields: $frame',
     async ({ frame, dead, status, signal }) => {
-      const manager = Object.create(TmuxManager.prototype) as ManagerType;
+      const manager = bareManager();
       Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
       effects.exec.mockImplementation(async (command: string) => {
         if (command.includes('list-panes')) return { stdout: frame, stderr: '' };
@@ -288,7 +462,8 @@ describe('native continuation after literal input', () => {
     async (change) => {
       const f = await fixture('continue');
       effects.exec.mockImplementation(async (command: string) => {
-        if (command.includes('send-keys') && command.includes(' -l ')) {
+        acceptInput(command);
+        if (isLiteral(command)) {
           f.pane.screen = '› Authorized fixture continuation\n  fixture-model high · /tmp\n';
           if (change === 'cancel') f.cancel();
           if (change === 'grant') setGrant(false);
@@ -302,8 +477,8 @@ describe('native continuation after literal input', () => {
         return { stdout: '', stderr: '' };
       });
       expect(await f.deliver()).toBe(change === 'unchanged' ? 'sent' : 'unknown');
-      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
-      expect(commands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
+      expect(childCommands().filter(isLiteral)).toHaveLength(1);
+      expect(childCommands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
       expect(commands().filter((command) => command.includes('kill-'))).toHaveLength(0);
     }
   );
@@ -321,7 +496,7 @@ describe('native continuation after literal input', () => {
   it('still sends ordinary two-argument input through the existing literal/Enter behavior', async () => {
     const f = await fixture('continue');
     expect(await f.manager.sendInput(f.worker.id, 'ordinary fixture\r')).toBe(true);
-    expect(commands().filter(isEnter)).toHaveLength(1);
+    expect(childCommands().filter(isEnter)).toHaveLength(1);
   });
 
   it('keeps post-paste composer uncertainty sealed through refresh, retry and durable reload', async () => {
@@ -333,7 +508,7 @@ describe('native continuation after literal input', () => {
     const send = effects.exec.getMockImplementation()!;
     effects.exec.mockImplementation(async (command: string) => {
       const result = await send(command);
-      if (command.includes('send-keys') && command.includes(' -l '))
+      if (isLiteral(command))
         f.pane.screen = '› Authorized fixture continuation edited by owner\n  fixture-model high · /tmp\n';
       return result;
     });
@@ -360,8 +535,8 @@ describe('native continuation after literal input', () => {
       restored = new RecoveryController(deps, new RecoveryStore(join(directory, 'composer-recovery.json')).get(f.id));
       await restored.refresh();
       await restored.retry();
-      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
-      expect(commands().filter(isEnter)).toHaveLength(0);
+      expect(childCommands().filter(isLiteral)).toHaveLength(1);
+      expect(childCommands().filter(isEnter)).toHaveLength(0);
       expect(restored.getStatus().inFlight).toBeDefined();
     } finally {
       controller.stop();
@@ -374,7 +549,7 @@ describe('native continuation after literal input', () => {
 
 describe('direct TUI composer edits at automatic input boundaries', () => {
   it.each(
-    [6, 10].flatMap((holdAt) =>
+    [1, 3].flatMap((holdAt) =>
       [
         'unchanged',
         'draft',
@@ -402,19 +577,24 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       release = resolve;
     });
     let checks = 0;
-    const proof = async () => {
-      if (++checks === holdAt) {
-        reached();
-        await held;
-      }
-      return true;
-    };
+    const nativeSend = f.manager.sendInput.bind(f.manager);
+    vi.spyOn(f.manager, 'sendInput').mockImplementation((id, input, guard) => {
+      const prepare = guard!.prepareEvidence!;
+      guard!.prepareEvidence = async () => {
+        if (++checks === holdAt) {
+          reached();
+          await held;
+        }
+        return prepare();
+      };
+      return nativeSend(id, input, guard);
+    });
     let issuerCurrent = true;
     const issuer: RecoveryActionAuthority = () => issuerCurrent;
     issuer.prepareEvidence = async () => true;
-    const delivery = f.deliver(proof, issuer);
+    const delivery = f.deliver(() => true, issuer);
     await entered;
-    expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(holdAt === 6 ? 0 : 1);
+    expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(holdAt === 1 ? 0 : 1);
     if (change === 'draft') f.pane.screen = '› Direct TUI edit during private proof\n  fixture-model high · /tmp\n';
     if (change === 'busy') f.pane.screen = 'Working (esc to interrupt)\n' + f.pane.screen;
     if (change === 'approval') f.pane.screen = 'Would you like to approve this?\n' + f.pane.screen;
@@ -426,8 +606,8 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
     if (change === 'native-dead') f.pane.dead = true;
     if (change === 'expired') vi.spyOn(performance, 'now').mockReturnValue(performance.now() + 3_000);
     release();
-    expect(await delivery).toBe(change === 'unchanged' ? 'sent' : holdAt === 6 ? 'not-sent' : 'unknown');
-    expect(commands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
+    expect(await delivery).toBe(change === 'unchanged' ? 'sent' : holdAt === 1 ? 'not-sent' : 'unknown');
+    expect(childCommands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
   });
 
   it.each([
@@ -456,7 +636,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       );
     }
     expect(await f.deliver()).toBe('not-sent');
-    expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(0);
+    expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(0);
   });
 
   it.each(
@@ -523,7 +703,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       const send = effects.exec.getMockImplementation()!;
       effects.exec.mockImplementation(async (command: string) => {
         const result = await send(command);
-        if (command.includes('send-keys') && command.includes(' -l ')) {
+        if (isLiteral(command)) {
           entered();
           await held;
         }
@@ -535,8 +715,8 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
         f.pane.screen = '› Direct owner edit during pending literal child\n  fixture-model high · /tmp\n';
       release();
       expect(await delivery).toBe(change === 'unchanged' ? 'sent' : 'unknown');
-      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
-      expect(commands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
+      expect(childCommands().filter(isLiteral)).toHaveLength(1);
+      expect(childCommands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
     }
   );
 
@@ -556,8 +736,8 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
         return screen;
       });
       expect(await f.deliver()).toBe(capture === 1 ? 'not-sent' : 'unknown');
-      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(capture - 1);
-      expect(commands().filter(isEnter)).toHaveLength(0);
+      expect(childCommands().filter(isLiteral)).toHaveLength(capture - 1);
+      expect(childCommands().filter(isEnter)).toHaveLength(0);
     }
   );
 
@@ -591,7 +771,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       expect(f.worker.getRecoveryContext().generation).toBe(generation);
       release();
       expect(await delivery).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
-      expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(
+      expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(
         change === 'unchanged' ? 2 : 0
       );
     }
@@ -610,7 +790,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
         return nativeSend(...args);
       });
       expect(await f.deliver()).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
-      expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(
+      expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(
         change === 'unchanged' ? 2 : 0
       );
     }
@@ -623,7 +803,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       const send = effects.exec.getMockImplementation()!;
       effects.exec.mockImplementation(async (command: string) => {
         const result = await send(command);
-        if (command.includes('send-keys') && command.includes(' -l ')) {
+        if (isLiteral(command)) {
           if (change === 'draft')
             f.pane.screen = '› Authorized fixture continuation owner edit\n  fixture-model high · /tmp\n';
           if (change === 'busy') f.pane.screen = 'Working (esc to interrupt)\n' + f.pane.screen;
@@ -634,11 +814,11 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
         return result;
       });
       expect(await f.deliver()).toBe(change === 'unchanged' ? 'sent' : 'unknown');
-      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
-      expect(commands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
+      expect(childCommands().filter(isLiteral)).toHaveLength(1);
+      expect(childCommands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
       // The generic delayed submit verifier must never press Enter after this refusal.
       await new Promise((resolve) => setTimeout(resolve, 75));
-      expect(commands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
+      expect(childCommands().filter(isEnter)).toHaveLength(change === 'unchanged' ? 1 : 0);
     }
   );
 
@@ -655,7 +835,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       .filter((command) => command.includes('capture-pane'));
     expect(captures).toHaveLength(4);
     expect(captures.every((command) => command.includes(' -J '))).toBe(true);
-    expect(commands().filter(isEnter)).toHaveLength(1);
+    expect(childCommands().filter(isEnter)).toHaveLength(1);
   });
 
   it.each(
@@ -669,13 +849,12 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       const send = effects.exec.getMockImplementation()!;
       effects.exec.mockImplementation(async (command: string) => {
         const result = await send(command);
-        if (surroundingVeto && command.includes('send-keys') && command.includes(' -l '))
-          f.pane.screen = `${prompt}\n${f.pane.screen}`;
+        if (surroundingVeto && isLiteral(command)) f.pane.screen = `${prompt}\n${f.pane.screen}`;
         return result;
       });
       expect(await f.deliver()).toBe(surroundingVeto ? 'unknown' : 'sent');
-      expect(commands().filter((command) => command.includes(' -l '))).toHaveLength(1);
-      expect(commands().filter(isEnter)).toHaveLength(surroundingVeto ? 0 : 1);
+      expect(childCommands().filter(isLiteral)).toHaveLength(1);
+      expect(childCommands().filter(isEnter)).toHaveLength(surroundingVeto ? 0 : 1);
     }
   );
 });
@@ -816,7 +995,7 @@ describe('current native identity after direct TUI resume', () => {
     );
     if (change.startsWith('held-issuer-')) {
       await entered;
-      expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(0);
+      expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(0);
       if (change === 'held-issuer-history-change') appendResume();
       if (change === 'held-issuer-rollout-change')
         appendFileSync(
@@ -827,7 +1006,7 @@ describe('current native identity after direct TUI resume', () => {
     }
     const healthy = change === 'unchanged' || change === 'held-issuer-unchanged';
     expect(await delivery).toBe(healthy ? 'sent' : 'not-sent');
-    expect(commands().filter((command) => command.includes('send-keys'))).toHaveLength(healthy ? 2 : 0);
+    expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(healthy ? 2 : 0);
   });
 });
 
@@ -874,10 +1053,12 @@ describe('native restart final preparation boundary', () => {
       f.pane.dead = false;
       f.pane.status = undefined;
       f.pane.screen = '›\n  fixture-model high · /tmp\n';
+      updateFakeInputProvenance(f.pane.inputProvenance, { closed: false, exitStatus: undefined });
       await adapter.observe();
       f.pane.dead = true;
       f.pane.status = 1;
       f.pane.screen = null;
+      updateFakeInputProvenance(f.pane.inputProvenance, { closed: true, exitStatus: 1 });
       f.worker.setPaneExit({ at: Date.now(), status: 1 });
       const observed = await adapter.observe();
       const observation = 'observation' in observed ? observed.observation : observed;
@@ -1004,6 +1185,27 @@ describe('native restart final preparation boundary', () => {
       expect(commands().filter((command) => command.includes('kill-'))).toHaveLength(0);
     }
   );
+  it('renders the native worker argv from the final persisted startup authority', async () => {
+    const f = await fixture('restart');
+    const broker = (Reflect.get(f.manager, 'inputBrokers') as Map<string, CodexInputBroker>).get(f.id)!;
+    const before = broker.configurationDigest;
+    effects.sync.mockReturnValue('99999\n');
+    const original = effects.exec.getMockImplementation()!;
+    const spawned: string[] = [];
+    effects.exec.mockImplementation(async (command: string) => {
+      if (command.includes('respawn-pane ')) spawned.push(command);
+      return original(command);
+    });
+    expect(await f.deliver()).toBe('sent');
+    expect(spawned).toHaveLength(1);
+    const final = createHash('sha256')
+      .update(readFileSync(join(broker.directory, 'config.json')))
+      .digest('hex');
+    expect(final).not.toBe(before);
+    expect(broker.configurationDigest).toBe(final);
+    expect(spawned[0]).toContain(final);
+    expect(spawned[0]).not.toContain(before);
+  });
   it('keeps a worker child response loss uncertain and never kills the worker', async () => {
     const f = await fixture('restart');
     effects.exec.mockImplementation(async () => {

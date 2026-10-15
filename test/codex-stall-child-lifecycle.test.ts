@@ -1,4 +1,11 @@
 /** Shared child statuses must veto local stall and remote recovery authority. No process launches. */
+import fs from 'node:fs/promises';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { CodexInputBroker, type CodexBrokerState, type CodexBrokerProof } from '../src/recovery/codex-input-broker.js';
+import { OwnedRemoteBrokerCache, type OwnedRemoteBrokerScope } from '../src/recovery/remote-input-broker-cache.js';
+import type { PrivateFileWitness } from '../src/recovery/private-file-witness.js';
+import { buildCodexCommand } from '../src/tmux-manager.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../src/recovery/codex-adapter.js';
 import type { RemoteCodexEvidence } from '../src/recovery/remote-codex.js';
@@ -8,12 +15,15 @@ import { initialRecoveryState } from '../src/recovery/types.js';
 import { RecoveryStore } from '../src/recovery/store.js';
 import { sampleRemoteCodexClock } from '../src/recovery/remote-clock.js';
 import { clampExternalCliConfigsForOwner } from '../src/session-env-clamp.js';
+import { createDeferred } from './mocks/index.js';
+import { updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
 import {
   CHILD_NOW,
+  CHILD_ID,
   childEvent,
   CHILD_READY,
   CHILD_THREAD,
-  createChildLifecycleFixture,
+  createChildLifecycleFixture as createBaseChildLifecycleFixture,
   returnedChildTail,
 } from './helpers/codex-child-lifecycle-fixture.js';
 
@@ -30,6 +40,10 @@ vi.mock('../src/session-env-clamp.js', () => ({
 
 const REACTIVATIONS = ['collab_agent_interaction_end', 'collab_resume_end', 'collab_wait_end'];
 
+function createChildLifecycleFixture(...args: Parameters<typeof createBaseChildLifecycleFixture>) {
+  return createBaseChildLifecycleFixture(args[0], args[1], args[2], args[3], { restartStalls: true, ...args[4] });
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(CHILD_NOW);
@@ -37,6 +51,58 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('actual local stall controller with an abnormally dead owned pane', () => {
+  it.each([false, true])(
+    'withdraws restart consent during the actual adapter final proof without local or SSH effects (SSH=%s)',
+    async (remote) => {
+      const remoteCase = remote
+        ? await remoteFixture('collab_resume_end', { completed: null }, true, true, true)
+        : undefined;
+      const f =
+        remoteCase ??
+        (await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, false));
+      const entered = createDeferred<void>();
+      const release = createDeferred<void>();
+      const observe = f.adapter.observe.bind(f.adapter);
+      let held = false;
+      const observation = vi.spyOn(f.adapter, 'observe').mockImplementation(async () => {
+        const result = await observe();
+        if (f.controller.getStatus().inFlight && !held) {
+          held = true;
+          entered.resolve();
+          await release.promise;
+        }
+        return result;
+      });
+      try {
+        // A broken fixture must fail here rather than waiting for a dispatch
+        // boundary that the production proof correctly refuses to enter.
+        expect((await f.adapter.observe()).stallRestartable).toBe(true);
+        const first = CHILD_NOW + (remote ? 15_000 : 0);
+        vi.setSystemTime(first);
+        await f.controller.refresh();
+        vi.setSystemTime(first + 2000);
+        await f.controller.refresh();
+        vi.setSystemTime(first + 3000);
+        const action = f.controller.refresh();
+        await entered.promise;
+        const withdrawing = f.controller.updateConfig({ restartStalls: false });
+        release.resolve();
+        await action;
+        await withdrawing;
+        expect(f.delivered).not.toHaveBeenCalled();
+        if (remoteCase) {
+          expect(remoteCase.deps.restartRemote).not.toHaveBeenCalled();
+          expect(remoteCase.deps.deliverRemote).not.toHaveBeenCalled();
+        }
+        expect(f.controller.getStatus()).toMatchObject({ attempts: 0, config: { restartStalls: false } });
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+      } finally {
+        release.resolve();
+        observation.mockRestore();
+        await f.cleanup();
+      }
+    }
+  );
   it.each([true, false])(
     'keeps a pinned UUID and owned header without tracked input non-actionable (watcher=%s)',
     async (storedExit) => {
@@ -69,39 +135,103 @@ describe('actual local stall controller with an abnormally dead owned pane', () 
     }
   );
 
-  it('requires two fresh observations of one exact native process rather than mixing different dead pane PIDs', async () => {
-    const f = await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, true);
-    try {
-      await f.controller.refresh();
-      vi.setSystemTime(CHILD_NOW + 2000);
-      vi.spyOn(f.session, 'inspectRecoveryPane').mockResolvedValue({
-        dead: true,
-        status: 9,
-        screen: null,
-        paneId: '%7',
-        panePid: 701,
-      });
-      await f.controller.refresh();
-      vi.setSystemTime(CHILD_NOW + 3000);
-      await f.controller.refresh();
-      expect(f.delivered).not.toHaveBeenCalled();
-      expect(f.controller.getStatus().attempts).toBe(0);
-      vi.setSystemTime(CHILD_NOW + 4000);
-      await f.controller.refresh();
-      vi.setSystemTime(CHILD_NOW + 5000);
-      await f.controller.refresh();
-      expect(f.delivered).toHaveBeenCalledOnce();
-    } finally {
-      await f.cleanup();
+  it.each([false, true])(
+    'never mixes native PIDs and requires an explicitly owned replacement proof before fresh confirmation (owned=%s)',
+    async (owned) => {
+      const f = await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, true);
+      try {
+        const original = await f.session.inspectRecoveryPane();
+        expect(original?.inputProvenance?.brokerPid).toBe(700);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 2000);
+        let proof = original!.inputProvenance!;
+        if (owned) {
+          // Provision only private fixture files, never execute the helper or
+          // child. A distinct owned incarnation must have its own config,
+          // journal, registered PID and cached signer; two reads cannot adopt it.
+          const home = f.session.getRecoveryContext().codexHome!;
+          const broker = await CodexInputBroker.create(
+            join(home, 'replacement-brokers'),
+            f.session.id,
+            buildCodexCommand(f.session.codexConfig),
+            home
+          );
+          const config = JSON.parse(await fs.readFile(join(broker.directory, 'config.json'), 'utf8'));
+          await fs.writeFile(
+            join(broker.directory, 'state.json'),
+            JSON.stringify({
+              version: 1,
+              sessionId: f.session.id,
+              incarnation: broker.incarnation,
+              pid: 701,
+              childPid: 702,
+              brokerStart: '123',
+              childStart: '124',
+              tainted: false,
+              rawGeneration: 0,
+              launchDigest: config.launchDigest,
+              homeDigest: config.homeDigest,
+              closed: true,
+              exitStatus: 9,
+              exitSignal: null,
+              counters: { 'owner-pty': 0, 'owner-key': 0, 'owner-mux': 0, auto: 0, probe: 0 },
+              receipts: [],
+              startup: { nonce: config.startup.nonce, status: 'started' },
+            }),
+            { mode: 0o600 }
+          );
+          proof = (await broker.prove(701))!;
+          expect(proof).toBeDefined();
+          expect(proof.incarnation).not.toBe(original!.inputProvenance!.incarnation);
+          Object.assign(Reflect.get(f.session, '_muxSession'), { pid: 701, recoveryInputBroker: broker.incarnation });
+          const mux = Reflect.get(f.session, '_mux');
+          vi.spyOn(mux, 'inspectCodexInputProvenance').mockImplementation(async (_id: string, pid: number) =>
+            broker.prove(pid)
+          );
+          vi.spyOn(mux, 'getCodexInputAuthority').mockImplementation((id: string, current: typeof proof) =>
+            id === f.session.id ? broker.authority(current) : undefined
+          );
+        }
+        vi.spyOn(f.session, 'inspectRecoveryPane').mockResolvedValue({
+          dead: true,
+          status: 9,
+          screen: null,
+          paneId: '%7',
+          panePid: 701,
+          inputProvenance: proof,
+        });
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 3000);
+        await f.controller.refresh();
+        expect(f.delivered).not.toHaveBeenCalled();
+        expect(f.controller.getStatus().attempts).toBe(0);
+        vi.setSystemTime(CHILD_NOW + 4000);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 5000);
+        await f.controller.refresh();
+        expect(f.delivered).toHaveBeenCalledTimes(owned ? 1 : 0);
+        if (!owned)
+          expect(await f.adapter.observe()).toMatchObject({
+            activity: 'unknown',
+            reason: 'pane-unverified',
+            safeToAct: false,
+          });
+      } finally {
+        await f.cleanup();
+      }
     }
-  });
+  );
   it.each(REACTIVATIONS.flatMap((type) => [false, true].map((storedExit) => ({ type, storedExit }))))(
     'never restarts a resumed child after two quiet-time probes ($type, watcher exit=$storedExit)',
     async ({ type, storedExit }) => {
       const f = await createChildLifecycleFixture(returnedChildTail(type), true, storedExit);
       try {
         expect(!!f.session.paneExit).toBe(storedExit);
-        expect(f.controller.getStatus().config).toMatchObject({ detectStalls: true, stalledAfterMs: 10_000 });
+        expect(f.controller.getStatus().config).toMatchObject({
+          detectStalls: true,
+          restartStalls: true,
+          stalledAfterMs: 10_000,
+        });
         expect(await f.adapter.observe()).toMatchObject({
           activity: 'watching',
           reason: 'background-work',
@@ -125,10 +255,12 @@ describe('actual local stall controller with an abnormally dead owned pane', () 
   );
 
   it.each([
-    { detectStalls: true, recoverCrashes: false },
-    { detectStalls: true, recoverCrashes: true },
-    { detectStalls: false, recoverCrashes: true },
-    { detectStalls: false, recoverCrashes: false },
+    { detectStalls: true, restartStalls: true, recoverCrashes: false },
+    { detectStalls: true, restartStalls: true, recoverCrashes: true },
+    { detectStalls: true, restartStalls: false, recoverCrashes: true },
+    { detectStalls: true, restartStalls: false, recoverCrashes: false },
+    { detectStalls: false, restartStalls: true, recoverCrashes: true },
+    { detectStalls: false, restartStalls: true, recoverCrashes: false },
   ])('honors independent stall/crash policies after the actual pane watcher records an exit: %j', async (policy) => {
     const f = await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), true, false);
     try {
@@ -141,13 +273,15 @@ describe('actual local stall controller with an abnormally dead owned pane', () 
         progressAt: CHILD_NOW - 25_000,
       });
       await f.controller.inspect();
-      expect(f.controller.getStatus().activity).toBe(policy.detectStalls ? 'working' : 'crashed');
+      expect(f.controller.getStatus().activity).toBe(
+        policy.detectStalls && policy.restartStalls ? 'working' : 'crashed'
+      );
       await f.controller.refresh();
       vi.setSystemTime(CHILD_NOW + 2000);
       await f.controller.refresh();
       vi.setSystemTime(CHILD_NOW + 3000);
       await f.controller.refresh();
-      if (!policy.detectStalls) {
+      if (!policy.detectStalls || !policy.restartStalls) {
         expect(f.delivered).toHaveBeenCalledTimes(policy.recoverCrashes ? 1 : 0);
         if (policy.recoverCrashes)
           expect(f.delivered.mock.calls[0][0]).toMatchObject({ action: 'restart', reason: 'process-crashed' });
@@ -196,8 +330,22 @@ describe('actual local stall controller with an abnormally dead owned pane', () 
       const f = await createChildLifecycleFixture(body, veto !== 'live', false);
       try {
         if (veto === 'clean') {
-          vi.spyOn(f.session, 'inspectRecoveryPane').mockResolvedValue({ dead: true, status: 0, screen: null });
+          const current = await f.session.inspectRecoveryPane();
+          const cleanProof = updateFakeInputProvenance(current!.inputProvenance!, { closed: true, exitStatus: 0 });
+          vi.spyOn(f.session, 'inspectRecoveryPane').mockResolvedValue({
+            dead: true,
+            status: 0,
+            screen: null,
+            paneId: '%7',
+            panePid: 700,
+            inputProvenance: cleanProof,
+          });
           f.session.setPaneExit({ at: CHILD_NOW - 1000, status: 0 });
+          expect(await f.adapter.observe()).toMatchObject({
+            activity: 'exited',
+            reason: 'clean-exit',
+            safeToAct: false,
+          });
         } else f.session.setPaneExit({ at: CHILD_NOW - 1000, status: 9 });
         if (veto === 'owner-stop') Object.assign(f.session, { _recoveryIntentionalStopAt: CHILD_NOW - 25_000 });
         await f.controller.updateConfig({ recoverCrashes: true });
@@ -307,14 +455,130 @@ async function remoteFixture(
       changedAt: CHILD_NOW - 1000,
     },
   };
+  // The remote worker is explicitly launch-owned. Use the real private cache,
+  // parser and retained signer while all worker/native/SSH effects stay fake.
+  const scope: OwnedRemoteBrokerScope = {
+    sessionId: f.session.id,
+    remote,
+    workingDir: remote.remotePath,
+    codexHome: f.session.getRecoveryContext().codexHome!,
+    owner: f.session.owner,
+  };
+  const cache = new OwnedRemoteBrokerCache(join(scope.codexHome, 'fixture-remote-cache'));
+  const record = Reflect.get(f.session, '_muxSession');
+  const mux = Reflect.get(f.session, '_mux');
+  let descriptor: NonNullable<Awaited<ReturnType<typeof cache.prepare>>>;
+  let registeredPid = 700;
+  let launch = 0;
+  let latestProof: CodexBrokerProof | undefined;
+  const rotateBroker = async (pid: number) => {
+    const material = CodexInputBroker.provisioningMaterial(
+      f.session.id,
+      buildCodexCommand(f.session.codexConfig),
+      scope.codexHome
+    );
+    const directory = `/fixture/private-brokers/${f.session.id}/${material.config.incarnation}`;
+    const next = await cache.prepare(scope, material, directory);
+    expect(next).toBeDefined();
+    expect(cache.activate(scope, next!.incarnation)).toBe(true);
+    descriptor = next!;
+    registeredPid = pid;
+    launch++;
+    latestProof = undefined;
+    Object.assign(record, { remote, recoveryInputBroker: descriptor.incarnation });
+  };
+  await rotateBroker(registeredPid);
+  Object.assign(mux, {
+    getOwnedRemoteInputBroker: vi.fn(async (id: string) =>
+      id === f.session.id ? cache.get(scope, descriptor.incarnation) : undefined
+    ),
+    observeOwnedRemoteInputBroker: vi.fn((id: string, serialized: string, witness: PrivateFileWitness, pid: number) => {
+      latestProof =
+        id === f.session.id ? cache.observe(scope, descriptor.incarnation, serialized, witness, pid) : undefined;
+      return latestProof;
+    }),
+    isOwnedRemoteInputBrokerProofCurrent: vi.fn(
+      (id: string, proof: CodexBrokerProof) =>
+        id === f.session.id &&
+        proof === latestProof &&
+        record.recoveryInputBroker === proof.incarnation &&
+        cache.signer(scope, descriptor.incarnation)?.authority(proof)?.proof === proof
+    ),
+  });
+  let explicitBroker = false;
+  let brokerOverride: unknown;
+  Object.defineProperty(evidence, 'inputBroker', {
+    enumerable: true,
+    configurable: true,
+    get: () => {
+      if (explicitBroker) return brokerOverride;
+      const closed = evidence.pane?.dead === true;
+      const state: CodexBrokerState = {
+        version: 1,
+        sessionId: f.session.id,
+        incarnation: descriptor.incarnation,
+        pid: registeredPid,
+        childPid: registeredPid + 1,
+        brokerStart: String(900 + launch * 10),
+        childStart: String(901 + launch * 10),
+        tainted: false,
+        rawGeneration: 0,
+        launchDigest: descriptor.launchDigest,
+        homeDigest: descriptor.homeDigest,
+        closed,
+        exitStatus: closed ? 9 : null,
+        exitSignal: null,
+        counters: { 'owner-pty': 0, 'owner-key': 0, 'owner-mux': 0, auto: 0, probe: 0 },
+        receipts: [],
+        startup: { nonce: descriptor.startupNonce, status: 'started' },
+      };
+      const serialized = JSON.stringify(state);
+      return {
+        serialized,
+        witness: {
+          path: descriptor.directory + '/state.json',
+          dev: 1,
+          ino: launch,
+          size: Buffer.byteLength(serialized),
+          mtimeMs: CHILD_NOW,
+          ctimeMs: CHILD_NOW,
+          hash: createHash('sha256').update(serialized).digest('hex'),
+          maxBytes: 98_304,
+        },
+      };
+    },
+    set: (value: unknown) => {
+      explicitBroker = true;
+      brokerOverride = value;
+    },
+  });
   const deps: CodexRecoveryAdapterDeps = {
     inspectRemote: vi.fn(async () => ({ ...evidence, clock: clockAt() })),
     restartRemote: vi.fn(async () => 'sent'),
     deliverRemote: vi.fn(async () => ({ status: 'sent', submittedAt: Date.now(), clock: clockAt() })),
   };
   const adapter = new CodexRecoveryAdapter(f.session, vi.fn(), deps);
+  if (preparedClock && offset === 0) {
+    // Negative cases must reach their named lifecycle or stall veto, rather
+    // than pass vacuously because their fake private ownership is incomplete.
+    const initial = await adapter.observe();
+    expect(initial.reason).not.toBe('identity-unverified');
+    if (status === 'running') expect(initial).toMatchObject({ activity: 'watching', reason: 'background-work' });
+    else if (unfinished)
+      expect(initial).toMatchObject(
+        dead ? { stallRestartable: true } : { activity: 'working', reason: 'turn-running' }
+      );
+    else expect(initial.safeToAct).toBe(true);
+  }
   const state = initialRecoveryState();
-  state.config = { ...state.config, enabled: true, detectStalls: true, stalledAfterMs: 40_000, retryDelayMs: 1000 };
+  state.config = {
+    ...state.config,
+    enabled: true,
+    detectStalls: true,
+    restartStalls: true,
+    stalledAfterMs: 40_000,
+    retryDelayMs: 1000,
+  };
   state.armedAt = CHILD_NOW - 60_000;
   const controller = new RecoveryController(
     {
@@ -330,6 +594,7 @@ async function remoteFixture(
     adapter,
     deps,
     evidence,
+    rotateBroker,
     controller,
     async cleanup() {
       controller.stop();
@@ -340,6 +605,60 @@ async function remoteFixture(
 }
 
 describe('actual remote adapter uses the same child lifecycle veto', () => {
+  it.each(['missing', 'malformed', 'tainted', 'incomplete-head', 'wrong-incarnation'] as const)(
+    'preserves an explicitly %s remote broker override as non-actionable',
+    async (fault) => {
+      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+      try {
+        vi.setSystemTime(CHILD_NOW + 15_000);
+        const baseline = await f.adapter.observe();
+        expect(baseline.stallRestartable).toBe(true);
+        const original = f.evidence.inputBroker!;
+        const state = JSON.parse(original.serialized) as CodexBrokerState;
+        if (fault === 'tainted') Object.assign(state, { tainted: true, rawGeneration: 1 });
+        if (fault === 'incomplete-head') state.counters.auto = 1;
+        if (fault === 'wrong-incarnation') state.incarnation = CHILD_ID;
+        const serialized = fault === 'malformed' ? '{truncated' : JSON.stringify(state);
+        const override =
+          fault === 'missing'
+            ? undefined
+            : {
+                ...original,
+                serialized,
+                witness: {
+                  ...original.witness,
+                  size: Buffer.byteLength(serialized),
+                  hash: createHash('sha256').update(serialized).digest('hex'),
+                },
+              };
+        f.evidence.inputBroker = override;
+        expect(f.evidence.inputBroker).toBe(override);
+        expect(await f.adapter.observe()).toMatchObject({
+          activity: 'unknown',
+          reason: 'identity-unverified',
+          safeToAct: false,
+        });
+        expect(f.adapter.getVerifiedTail(CHILD_THREAD)).toBeUndefined();
+        expect(
+          await f.adapter.act({
+            key: baseline.stallEvidenceKey!,
+            action: 'restart',
+            reason: 'stalled',
+            conversationId: CHILD_THREAD,
+            startedAt: Date.now(),
+            stallProgressAt: baseline.progressAt,
+            stallProgressEvidenceKey: baseline.progressEvidenceKey,
+            stallQuietPeriodMs: 40_000,
+          })
+        ).toBe('not-sent');
+        expect(f.deps.restartRemote).not.toHaveBeenCalled();
+        expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+        expect(f.delivered).not.toHaveBeenCalled();
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
   it('confirms and dispatches unchanged native progress across varying bounded SSH latency', async () => {
     const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
     let probes = 0;
@@ -536,6 +855,7 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
         }
         expect(f.deps.restartRemote).toHaveBeenCalledOnce();
         f.evidence.pane = { dead: false, paneId: '%7', panePid: 701, screen: CHILD_READY };
+        await f.rotateBroker(701);
         vi.setSystemTime(CHILD_NOW + 19_100);
         await f.controller.refresh();
         expect(f.store.get(f.session.id).inFlight).toBeUndefined();
@@ -615,10 +935,12 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
   });
 
   it.each([
-    { detectStalls: true, recoverCrashes: false },
-    { detectStalls: true, recoverCrashes: true },
-    { detectStalls: false, recoverCrashes: true },
-    { detectStalls: false, recoverCrashes: false },
+    { detectStalls: true, restartStalls: true, recoverCrashes: false },
+    { detectStalls: true, restartStalls: true, recoverCrashes: true },
+    { detectStalls: true, restartStalls: false, recoverCrashes: true },
+    { detectStalls: true, restartStalls: false, recoverCrashes: false },
+    { detectStalls: false, restartStalls: true, recoverCrashes: true },
+    { detectStalls: false, restartStalls: true, recoverCrashes: false },
   ])('honors independent remote stall/crash policies: %j', async (policy) => {
     const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
     try {
@@ -633,7 +955,7 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
       await f.controller.refresh();
       vi.setSystemTime(CHILD_NOW + 3000);
       await f.controller.refresh();
-      if (!policy.detectStalls) {
+      if (!policy.detectStalls || !policy.restartStalls) {
         expect(f.deps.restartRemote).toHaveBeenCalledTimes(policy.recoverCrashes ? 1 : 0);
         if (policy.recoverCrashes) expect(f.store.get(f.session.id).inFlight?.reason).toBe('process-crashed');
         expect(f.delivered).not.toHaveBeenCalled();
@@ -676,6 +998,10 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
             .map((line) => {
               const row = JSON.parse(line);
               row.timestamp = new Date(Date.parse(row.timestamp) + offset).toISOString();
+              // These timestamps are native to the same remote host as the row.
+              for (const key of ['started_at_ms', 'completed_at_ms', 'occurred_at_ms']) {
+                if (Number.isSafeInteger(row.payload[key])) row.payload[key] += offset;
+              }
               return JSON.stringify(row);
             })
             .join('\n') + '\n';
@@ -683,6 +1009,7 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
           ...f.evidence,
           clock: { ...clockAt(), remoteBefore: Date.now() + offset, remoteAfter: Date.now() + offset },
         }));
+        expect((await f.adapter.observe()).stallRestartable).toBe(true);
         vi.setSystemTime(CHILD_NOW + 15_000);
         await f.controller.refresh();
         vi.setSystemTime(CHILD_NOW + 17_000);
@@ -725,7 +1052,9 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
       }
       if (veto === 'changed-pane') f.evidence.pane!.panePid = 701;
       if (veto === 'new-progress')
-        f.evidence.identity.tail += childEvent({ type: 'exec_command_end', call_id: 'later' }, -16_000) + '\n';
+        f.evidence.identity.tail +=
+          childEvent({ type: 'agent_message', message: 'Fresh structured remote work before dispatch' }, -16_000) +
+          '\n';
       if (veto === 'transport')
         vi.mocked(f.deps.inspectRemote).mockResolvedValue({
           transport: 'unreachable',
@@ -735,8 +1064,7 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
       if (veto === 'clean-exit') f.evidence.pane!.status = 0;
       if (veto === 'child-running')
         f.evidence.identity.tail +=
-          childEvent({ type: 'collab_resume_end', receiver_thread_id: CHILD_THREAD, status: 'running' }, -16_000) +
-          '\n';
+          childEvent({ type: 'collab_resume_end', receiver_thread_id: CHILD_ID, status: 'running' }, -16_000) + '\n';
       if (veto === 'authentication')
         f.evidence.identity.tail +=
           childEvent(
@@ -771,15 +1099,18 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
     }
   });
 
-  it.each(['pane', 'progress', 'owner-input', 'grants', 'cancellation'] as const)(
+  it.each(['unchanged', 'pane', 'progress', 'owner-input', 'grants', 'cancellation'] as const)(
     'rechecks %s immediately before remote stalled dispatch',
     async (veto) => {
       const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
       try {
+        vi.setSystemTime(CHILD_NOW + 15_000);
         const observation = await f.adapter.observe();
+        expect(observation.stallRestartable).toBe(true);
         if (veto === 'pane') f.evidence.pane!.panePid = 701;
         if (veto === 'progress')
-          f.evidence.identity.tail += childEvent({ type: 'exec_command_end', call_id: 'later' }, 500) + '\n';
+          f.evidence.identity.tail +=
+            childEvent({ type: 'agent_message', message: 'Fresh structured remote work before dispatch' }, 500) + '\n';
         if (veto === 'owner-input') f.session.write('Owner changed intent\r', { fromUser: true });
         if (veto === 'grants')
           vi.mocked(clampExternalCliConfigsForOwner).mockResolvedValueOnce({
@@ -794,11 +1125,13 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
               conversationId: CHILD_THREAD,
               startedAt: Date.now(),
               stallProgressAt: observation.progressAt,
+              stallProgressEvidenceKey: observation.progressEvidenceKey,
+              stallQuietPeriodMs: 40_000,
             },
             () => veto !== 'cancellation'
           )
-        ).toBe('not-sent');
-        expect(f.deps.restartRemote).not.toHaveBeenCalled();
+        ).toBe(veto === 'unchanged' ? 'sent' : 'not-sent');
+        expect(f.deps.restartRemote).toHaveBeenCalledTimes(veto === 'unchanged' ? 1 : 0);
       } finally {
         await f.cleanup();
       }

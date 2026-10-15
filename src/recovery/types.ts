@@ -6,6 +6,8 @@ export interface RecoveryConfig {
   recoverInterrupted: boolean;
   recoverCrashes: boolean;
   detectStalls: boolean;
+  /** Separate owner consent; legacy stall detection only requested attention. */
+  restartStalls: boolean;
   maxRetries: number;
   retryDelayMs: number;
   maxRetryDelayMs: number;
@@ -18,6 +20,7 @@ export const DEFAULT_RECOVERY_CONFIG: RecoveryConfig = {
   recoverInterrupted: true,
   recoverCrashes: true,
   detectStalls: false,
+  restartStalls: false,
   maxRetries: 3,
   retryDelayMs: 15_000,
   maxRetryDelayMs: 120_000,
@@ -42,7 +45,10 @@ export type RecoveryAction = 'continue' | 'restart';
 /** Pure current owner authority plus a fresh issuer evidence check at each effect boundary. */
 export interface RecoveryEvidenceSource {
   sessionId: string;
+  inputBroker?: import('./codex-input-broker.js').BrokerAuthority;
   identity: CodexIdentityResult;
+  /** Related broker/grant evidence must share the rollout's final read barrier. */
+  files?: readonly import('./private-file-witness.js').PrivateFileWitness[];
   isCurrent(): boolean;
 }
 export function isRecoveryEvidenceSourceCurrent(source: RecoveryEvidenceSource): boolean {
@@ -62,6 +68,8 @@ export type RecoveryEvidenceGuard = (() => boolean | Promise<boolean>) & {
   getEvidenceSource?: () => RecoveryEvidenceSource | undefined;
 };
 export type RecoveryActionAuthority = (() => boolean) & {
+  getActionDeadline?: () => number;
+  getInputIssuer?: () => import('./codex-input-broker.js').BrokerAuthority | undefined;
   prepareEvidence?: (source?: RecoveryEvidenceSource) => Promise<boolean>;
 };
 

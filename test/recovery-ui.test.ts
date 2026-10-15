@@ -87,9 +87,28 @@ function enabledState(): RecoveryState {
 }
 
 describe('Recovery Session Options', () => {
+  it('keeps legacy stall detection visibly separate from new restart consent on desktop and mobile', async () => {
+    const state = initialRecoveryState();
+    state.config.detectStalls = true;
+    state.activity = 'working';
+    state.lastReason = 'turn-running';
+    const h = harness(state);
+    await h.open();
+    expect(h.input('recoveryStalls').checked).toBe(true);
+    expect(h.input('recoveryRestartStalls').checked).toBe(false);
+    expect(h.input('recoveryRestartStalls').getAttribute('aria-label')).toBe('Restart confirmed dead stalls');
+    expect(h.button('recoveryRetryBtn').disabled).toBe(true);
+    expect(h.get('recovery-tab').textContent).toContain('Requires stall detection and separate owner consent.');
+    expect(h.fetchMock).toHaveBeenCalledOnce();
+    h.dom.window.document.body.classList.add('mobile');
+    h.app._renderRecoveryStatus(true);
+    expect(h.input('recoveryRestartStalls').checked).toBe(false);
+    expect(h.button('recoveryRetryBtn').disabled).toBe(true);
+  });
   it('allows guarded manual stall retries while automatic recovery is off', async () => {
     const state = initialRecoveryState();
     state.config.detectStalls = true;
+    state.config.restartStalls = true;
     state.activity = 'working';
     state.lastReason = 'turn-running';
     const h = harness(state);
@@ -158,11 +177,15 @@ describe('Recovery Session Options', () => {
     await h.open();
     h.input('recoveryStalls').checked = true;
     await h.app.saveRecoverySetting('detectStalls', h.input('recoveryStalls'));
+    expect(h.input('recoveryRestartStalls').checked).toBe(false);
+    h.input('recoveryRestartStalls').checked = true;
+    await h.app.saveRecoverySetting('restartStalls', h.input('recoveryRestartStalls'));
     h.input('recoveryRetryDelay').value = '25';
     await h.app.saveRecoverySetting('retryDelayMs', h.input('recoveryRetryDelay'));
     const requests = h.fetchMock.mock.calls.slice(1);
     expect(requests.map(([url, options]) => [url, options?.method, JSON.parse(options?.body ?? '{}')])).toEqual([
       ['/api/sessions/session-a/recovery/config', 'PUT', { detectStalls: true }],
+      ['/api/sessions/session-a/recovery/config', 'PUT', { restartStalls: true }],
       ['/api/sessions/session-a/recovery/config', 'PUT', { retryDelayMs: 25_000 }],
     ]);
     expect(h.input('recoveryRetryDelay').value).toBe('25');

@@ -34,6 +34,16 @@ function context(patch: Partial<CodexClassificationContext> = {}): CodexClassifi
 }
 
 function line(payload: Payload, at = NOW - 10_000): string {
+  // These lifecycle positives model native timestamps and the exact sender;
+  // an explicit undefined override still models a missing evidence field.
+  if (typeof payload.type === 'string' && payload.type.startsWith('collab_')) {
+    payload = {
+      sender_thread_id: THREAD,
+      call_id: 'fixture-child-call',
+      [payload.type.endsWith('_begin') ? 'started_at_ms' : 'completed_at_ms']: at,
+      ...payload,
+    };
+  }
   return JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload });
 }
 
@@ -475,6 +485,36 @@ describe('background subagents', () => {
 });
 
 describe('unknown, corrupt and incomplete observations', () => {
+  it.each([
+    null,
+    [],
+    42,
+    true,
+    'text',
+    {},
+    { type: 42, payload: {} },
+    { type: '', payload: {} },
+    { type: 'event_msg' },
+    { type: 'event_msg', payload: [] },
+    { type: 'event_msg', payload: { type: '' } },
+    { type: 'response_item', payload: null },
+    { type: 'unsupported_variant', payload: {} },
+  ])('never borrows an earlier failure across a malformed JSON envelope %j', (entry) => {
+    const malformed = JSON.stringify(entry) + '\n';
+    for (const data of [failed() + malformed, malformed + failed()]) {
+      expect(classifyCodexTail(data, context())).toMatchObject({ activity: 'unknown', safeToAct: false });
+    }
+  });
+  it('retains complete supported non-event records beside a genuine terminal failure', () => {
+    const record =
+      JSON.stringify({
+        timestamp: new Date(NOW - 7000).toISOString(),
+        type: 'response_item',
+        payload: { type: 'message', role: 'assistant', content: [] },
+      }) + '\n';
+    expect(classifyCodexTail(failed() + record, context()).safeToAct).toBe(true);
+  });
+
   it('never acts on malformed JSON, a partial trailing row, an oversized tail or future events', () => {
     for (const data of [
       `${failed()}{broken}\n`,
@@ -566,7 +606,8 @@ describe('fresh uncertain control errors supersede failed-turn evidence', () => 
           ),
           context()
         )
-      ).toMatchObject({ activity: 'completed', safeToAct: false });
+        // A completed row is not clearance for the earlier uncertain control outcome.
+      ).toMatchObject({ activity: 'unknown', safeToAct: false });
     }
   );
 });

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import type { CodexIdentityResult } from './codex-identity.js';
+import type { PrivateFileWitness } from './private-file-witness.js';
 
 const pending = new Map<string, { key: string; paths: string[]; deadline: number; work: Promise<boolean> }>();
 const TIMEOUT_MS = 2_000;
@@ -12,10 +13,45 @@ export function checkCodexIdentityWitness(identity: CodexIdentityResult): Promis
   return checkCodexIdentityWitnesses([identity]);
 }
 
+export function checkPrivateFileWitnesses(files: readonly PrivateFileWitness[], deadline = Infinity): Promise<boolean> {
+  return checkCodexIdentityWitnesses([], files, deadline);
+}
+
 /** Read all participating domains before a common final path scan, under one deadline. */
-export async function checkCodexIdentityWitnesses(inputs: readonly CodexIdentityResult[]): Promise<boolean> {
-  if (!inputs.length || inputs.length > 2) return false;
-  const identities = inputs.map((identity) => ({
+export async function checkCodexIdentityWitnesses(
+  inputs: readonly CodexIdentityResult[],
+  additionalFiles: readonly PrivateFileWitness[] = [],
+  callerDeadline = Infinity
+): Promise<boolean> {
+  if (
+    !Array.isArray(inputs) ||
+    !Array.isArray(additionalFiles) ||
+    (!inputs.length && !additionalFiles.length) ||
+    inputs.length > 2 ||
+    additionalFiles.length > 8 ||
+    typeof callerDeadline !== 'number' ||
+    Number.isNaN(callerDeadline) ||
+    callerDeadline <= performance.now()
+  )
+    return false;
+  const files = additionalFiles.map((input: PrivateFileWitness) => ({ ...input }));
+  for (const input of files) {
+    if (
+      typeof input.path !== 'string' ||
+      !input.path ||
+      ![input.dev, input.ino, input.size, input.mtimeMs, input.ctimeMs, input.maxBytes].every(Number.isFinite) ||
+      !Number.isSafeInteger(input.size) ||
+      input.size < 0 ||
+      !Number.isSafeInteger(input.maxBytes) ||
+      input.maxBytes < 0 ||
+      input.maxBytes > 2_097_152 ||
+      input.size > input.maxBytes ||
+      typeof input.hash !== 'string' ||
+      !/^[a-f0-9]{64}$/.test(input.hash)
+    )
+      return false;
+  }
+  const identities = inputs.map((identity: CodexIdentityResult) => ({
     ...identity,
     witness: identity.witness && { paths: identity.witness.paths.map((input) => ({ ...input })) },
   }));
@@ -32,9 +68,9 @@ export async function checkCodexIdentityWitnesses(inputs: readonly CodexIdentity
     if (!leaf || leaf.size === undefined || leaf.mtimeMs === undefined || leaf.ctimeMs === undefined) return false;
   }
   const hashes = identities.map((identity) => createHash('sha256').update(identity.tail!).digest('hex'));
-  const paths = identities.map((identity) => identity.path!);
+  const paths = [...identities.map((identity) => identity.path!), ...files.map((input) => input.path)];
   const group = JSON.stringify(paths);
-  const key = JSON.stringify([identities.map((identity) => identity.witness!.paths), hashes]);
+  const key = JSON.stringify([identities.map((identity) => identity.witness!.paths), hashes, files]);
   let job = pending.get(group);
   if (job && job.key !== key) return false;
   if (!job) {
@@ -43,15 +79,15 @@ export async function checkCodexIdentityWitnesses(inputs: readonly CodexIdentity
       [...pending.values()].some((other) => paths.some((path) => other.paths.includes(path)))
     )
       return false;
-    const deadline = performance.now() + TIMEOUT_MS;
-    const work = verify(identities, deadline, hashes);
+    const deadline = Math.min(performance.now() + TIMEOUT_MS, callerDeadline);
+    const work = verify(identities, deadline, hashes, files);
     job = { key, paths, deadline, work };
     pending.set(group, job);
     void work.finally(() => {
       if (pending.get(group)?.work === work) pending.delete(group);
     });
   }
-  const remaining = job.deadline - performance.now();
+  const remaining = Math.min(job.deadline, callerDeadline) - performance.now();
   if (remaining <= 0) return false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {
@@ -61,7 +97,7 @@ export async function checkCodexIdentityWitnesses(inputs: readonly CodexIdentity
         timer = setTimeout(() => resolve(false), remaining);
       }),
     ]);
-    return confirmed === true && performance.now() < job.deadline;
+    return confirmed === true && performance.now() < Math.min(job.deadline, callerDeadline);
   } finally {
     if (timer) clearTimeout(timer);
   }
@@ -70,7 +106,8 @@ export async function checkCodexIdentityWitnesses(inputs: readonly CodexIdentity
 async function verify(
   identities: readonly CodexIdentityResult[],
   deadline: number,
-  hashes: readonly string[]
+  hashes: readonly string[],
+  files: readonly PrivateFileWitness[]
 ): Promise<boolean> {
   const check = () => {
     if (performance.now() >= deadline) throw new Error('Identity verification expired');
@@ -92,13 +129,33 @@ async function verify(
         )
           return false;
       }
+    for (const input of files) {
+      check();
+      const stat = await fs.lstat(input.path);
+      check();
+      if (
+        !stat.isFile() ||
+        stat.isSymbolicLink() ||
+        stat.dev !== input.dev ||
+        stat.ino !== input.ino ||
+        stat.size !== input.size ||
+        stat.mtimeMs !== input.mtimeMs ||
+        stat.ctimeMs !== input.ctimeMs
+      )
+        return false;
+    }
     return true;
   };
   let file: Awaited<ReturnType<typeof fs.open>> | undefined;
   try {
     if (!(await currentPaths())) return false;
-    for (const [index, identity] of identities.entries()) {
-      const leaf = identity.witness!.paths.find((input) => input.path === identity.path && input.kind === 'file')!;
+    const leaves = identities.map((identity, index) => ({
+      ...identity.witness!.paths.find((input) => input.path === identity.path && input.kind === 'file')!,
+      path: identity.path!,
+      hash: hashes[index],
+      maxBytes: 262_144,
+    }));
+    for (const leaf of [...leaves, ...files]) {
       const matchesLeaf = (stat: Stats) =>
         stat.isFile() &&
         stat.dev === leaf.dev &&
@@ -108,21 +165,18 @@ async function verify(
         stat.ctimeMs === leaf.ctimeMs;
       check();
       // A late open still reaches cleanup; no domain can authorize while another read is pending.
-      file = await fs.open(
-        identity.path!,
-        constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0)
-      );
+      file = await fs.open(leaf.path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
       check();
       const before = await file.stat();
       check();
-      if (!matchesLeaf(before) || before.size > 262_144) return false;
+      if (!matchesLeaf(before) || before.size > leaf.maxBytes) return false;
       const bytes = Buffer.alloc(before.size);
       const { bytesRead } = await file.read(bytes, 0, before.size, 0);
       check();
       if (bytesRead !== before.size) return false;
       const after = await file.stat();
       check();
-      if (!matchesLeaf(after) || createHash('sha256').update(bytes).digest('hex') !== hashes[index]) return false;
+      if (!matchesLeaf(after) || createHash('sha256').update(bytes).digest('hex') !== leaf.hash) return false;
       await file.close();
       file = undefined;
       check();

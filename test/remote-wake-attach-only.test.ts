@@ -56,6 +56,9 @@ function fixture(mode: 'codex' | 'claude', owned?: boolean, bound = true) {
     attached: true,
   } as MuxSession;
   Reflect.set(manager, 'sessions', new Map([[id, record]]));
+  Reflect.set(manager, 'inputBrokers', new Map());
+  Reflect.set(manager, 'inputBrokerLoads', new Map());
+  Reflect.set(manager, 'inputQueues', new Map());
   Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
   Reflect.set(manager, 'paneExits', new Map());
   Reflect.set(manager, 'paneExitGeneration', 0);

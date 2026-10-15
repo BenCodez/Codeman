@@ -21,6 +21,10 @@ import type { RecoverySubmission } from '../src/recovery/remote-clock.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 import { commandHash } from '../src/supervision/evidence.js';
 const clockAt = (at = Date.now()) => ({ localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at });
+import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
+import { CodexInputBroker, type CodexBrokerState, type CodexBrokerProof } from '../src/recovery/codex-input-broker.js';
+import type { PrivateFileWitness } from '../src/recovery/private-file-witness.js';
+import { OwnedRemoteBrokerCache, type OwnedRemoteBrokerScope } from '../src/recovery/remote-input-broker-cache.js';
 
 vi.mock('../src/recovery/codex-identity.js', () => ({ resolveCodexIdentity: vi.fn() }));
 vi.mock('../src/session-env-clamp.js', () => ({
@@ -50,7 +54,43 @@ type Pane = NonNullable<Awaited<ReturnType<Session['inspectRecoveryPane']>>>;
 type DeliveryResult = Awaited<ReturnType<Session['deliverRecovery']>>;
 
 function event(payload: Record<string, unknown>, at: number): string {
+  // These lifecycle positives model native timestamps and the exact sender;
+  // an explicit undefined override still models a missing evidence field.
+  if (typeof payload.type === 'string' && payload.type.startsWith('collab_')) {
+    payload = {
+      sender_thread_id: THREAD,
+      call_id: 'fixture-child-call',
+      [payload.type.endsWith('_begin') ? 'started_at_ms' : 'completed_at_ms']: at,
+      ...payload,
+    };
+  }
   return JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload });
+}
+
+function commandPair(call: string, turn: string, startedAt: number, completedAt: number): string[] {
+  const command = {
+    call_id: call,
+    turn_id: turn,
+    command: ['sh', '-c', 'npm test'],
+    cwd: '/fixture/workspace',
+    parsed_cmd: [{ type: 'unknown', cmd: 'npm test' }],
+    source: 'agent',
+  };
+  const durationMs = completedAt - startedAt;
+  return [
+    event({ ...command, type: 'exec_command_begin', started_at_ms: startedAt }, startedAt),
+    event(
+      {
+        ...command,
+        type: 'exec_command_end',
+        completed_at_ms: completedAt,
+        exit_code: 0,
+        status: 'completed',
+        duration: { secs: Math.floor(durationMs / 1000), nanos: (durationMs % 1000) * 1_000_000 },
+      },
+      completedAt
+    ),
+  ];
 }
 
 function failedTail(...during: string[]): string {
@@ -95,6 +135,7 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 function fixture() {
+  const inputProvenance = fakeInputProvenance({}, '/fixture/codex-home');
   const state = {
     context: {
       generation: 3,
@@ -102,13 +143,14 @@ function fixture() {
       noDaemon: true,
       intentionalStopAt: 0,
       switchPending: false,
+      inputBrokerPending: false,
       codexHome: '/fixture/codex-home' as string | undefined,
       submission: {
         at: NOW - 10_000,
         hash: createHash('sha256').update('Sanitized fixture request.').digest('hex'),
       } as RecoverySubmission | undefined,
     },
-    pane: { paneId: '%7', panePid: 700, dead: false, screen: READY } as Pane | null,
+    pane: { paneId: '%7', panePid: 700, dead: false, screen: READY, inputProvenance } as Pane | null,
     transportPane: { dead: true, status: 255, screen: null } as Pane | null,
     identity: {
       reason: 'verified',
@@ -135,7 +177,91 @@ function fixture() {
     } as RemoteCodexEvidence,
     remoteRestart: 'sent' as const as 'sent' | 'not-sent' | 'unknown',
     remoteDelivery: { status: 'sent', submittedAt: NOW } as RemoteCodexInputResult,
+    remoteBrokerAvailable: true,
   };
+  // This suite injects SSH effects; the private signer/parser is real. Derive
+  // native state from each fake pane observation, while keeping launch scope
+  // immutable. Explicit malformed broker evidence is never repaired here.
+  const material = CodexInputBroker.provisioningMaterial(SESSION, 'exec fixture-owned-worker', '/fixture/codex-home');
+  const directory = `/fixture/private-brokers/${SESSION}/${material.config.incarnation}`;
+  const digest = (text: string) => createHash('sha256').update(text).digest('hex');
+  const descriptor = {
+    directory,
+    incarnation: material.config.incarnation,
+    launchDigest: material.config.launchDigest,
+    homeDigest: material.config.homeDigest,
+    keyDigest: digest(material.config.secret),
+    helperDigest: digest(material.helper),
+    startupNonce: material.config.startup.nonce,
+  };
+  let signer: CodexInputBroker | undefined, latestProof: CodexBrokerProof | undefined;
+  const brokerState = (
+    evidence: Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>
+  ): CodexBrokerState => {
+    const pane = evidence.pane,
+      closed = evidence.session === 'present' && pane?.dead === true;
+    return {
+      version: 1,
+      sessionId: SESSION,
+      incarnation: descriptor.incarnation,
+      pid: pane?.panePid ?? 700,
+      childPid: (pane?.panePid ?? 700) + 1,
+      brokerStart: '101',
+      childStart: '102',
+      tainted: false,
+      rawGeneration: 0,
+      launchDigest: descriptor.launchDigest,
+      homeDigest: descriptor.homeDigest,
+      closed,
+      exitStatus: closed && !pane?.signal ? (pane?.status ?? null) : null,
+      exitSignal: closed ? (pane?.signal ?? null) : null,
+      counters: { 'owner-pty': 0, 'owner-key': 0, 'owner-mux': 0, auto: 0, probe: 0 },
+      receipts: [],
+      startup: { nonce: descriptor.startupNonce, status: 'started' },
+    };
+  };
+  const decorate = (evidence: RemoteCodexEvidence) => {
+    if (evidence.transport !== 'reachable' || evidence.session === 'unknown' || Object.hasOwn(evidence, 'inputBroker'))
+      return evidence;
+    let overridden = false,
+      override: unknown;
+    Object.defineProperty(evidence, 'inputBroker', {
+      configurable: true,
+      enumerable: true,
+      get: () => {
+        if (overridden) return override;
+        const serialized = JSON.stringify(brokerState(evidence));
+        return {
+          serialized,
+          witness: {
+            path: directory + '/state.json',
+            dev: 1,
+            ino: 2,
+            size: Buffer.byteLength(serialized),
+            mtimeMs: NOW,
+            ctimeMs: NOW,
+            hash: digest(serialized),
+            maxBytes: 98_304,
+          },
+          ...(evidence.session === 'missing' ? { historical: true } : {}),
+        };
+      },
+      set: (value) => {
+        overridden = true;
+        override = value;
+      },
+    });
+    return evidence;
+  };
+  let remoteEvidence = decorate(state.remoteEvidence);
+  Object.defineProperty(state, 'remoteEvidence', {
+    enumerable: true,
+    configurable: true,
+    get: () => remoteEvidence,
+    set: (value: RemoteCodexEvidence) => {
+      remoteEvidence = decorate(value);
+    },
+  });
   const session = {
     id: SESSION,
     workingDir: '/fixture/workspace',
@@ -151,7 +277,42 @@ function fixture() {
     remoteRecoveryConfiguration: vi.fn(() => JSON.stringify([session.remote, session.codexConfig, state.env])),
     confirmRemoteRecoveryAuthority: vi.fn(async () => true),
     isRemoteRecoveryAuthorityCurrent: vi.fn(() => true),
-    inspectRecoveryPane: vi.fn(async () => state.pane),
+    getOwnedRemoteInputBroker: vi.fn(async () => (state.remoteBrokerAvailable ? { ...descriptor } : undefined)),
+    observeOwnedRemoteInputBroker: vi.fn((serialized: string, witness: PrivateFileWitness, panePid: number) => {
+      try {
+        signer ??= CodexInputBroker.fromRemoteMaterial(directory, material, JSON.parse(serialized));
+        latestProof = signer?.observeRemote(serialized, witness, panePid);
+        return latestProof;
+      } catch {
+        latestProof = undefined;
+        return undefined;
+      }
+    }),
+    isOwnedRemoteInputBrokerProofCurrent: vi.fn(
+      (proof: CodexBrokerProof) =>
+        state.remoteBrokerAvailable && proof === latestProof && signer?.authority(proof)?.proof === proof
+    ),
+    inspectRecoveryPane: vi.fn(async () => {
+      if (state.pane) {
+        state.pane.inputProvenance = updateFakeInputProvenance(inputProvenance, {
+          brokerPid: state.pane.panePid ?? 700,
+          homeDigest: createHash('sha256')
+            .update(state.context.codexHome ?? '')
+            .digest('hex'),
+          closed: state.pane.dead,
+          exitStatus: state.pane.dead ? state.pane.status : undefined,
+          exitSignal: state.pane.dead ? state.pane.signal : undefined,
+        });
+      }
+      return state.pane;
+    }),
+    getRecoveryInputAuthority: (proof: typeof inputProvenance) => ({
+      sessionId: SESSION,
+      incarnation: proof.incarnation,
+      directory: '/fake-private-broker',
+      proof,
+    }),
+    inspectRecoveryInputProvenance: vi.fn(async () => state.pane?.inputProvenance),
     inspectRemoteTransportPane: vi.fn(async () => state.transportPane),
     isBusy: vi.fn(() => state.busy),
     pinRecoveryConversation: vi.fn((id: string) => {
@@ -293,6 +454,10 @@ async function withRollout(
   const home = await fs.mkdtemp(join(homedir(), 'codex-adapter-rollout-'));
   try {
     f.context.codexHome = home;
+    if (f.pane?.inputProvenance)
+      updateFakeInputProvenance(f.pane.inputProvenance, {
+        homeDigest: createHash('sha256').update(home).digest('hex'),
+      });
     f.session.workingDir = join(home, 'workspace');
     const directory = join(home, 'sessions');
     await fs.mkdir(directory);
@@ -917,7 +1082,13 @@ describe('authoritative agent exits and process readiness', () => {
       };
       let controller = new RecoveryController(dependencies);
       try {
-        await controller.updateConfig({ enabled: true, detectStalls: true, stalledAfterMs: 10_000, maxRetries: 2 });
+        await controller.updateConfig({
+          enabled: true,
+          detectStalls: true,
+          restartStalls: true,
+          stalledAfterMs: 10_000,
+          maxRetries: 2,
+        });
         await controller.retry();
         expect(f.session.deliverRecovery).not.toHaveBeenCalled();
         vi.setSystemTime(NOW + 10_000);
@@ -942,7 +1113,14 @@ describe('authoritative agent exits and process readiness', () => {
         expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
         const progress = NOW + 22_001;
         vi.setSystemTime(progress);
-        await writeBody(activeTail() + event({ type: 'exec_command_end', call_id: 'next-progress' }, progress) + '\n');
+        await writeBody(
+          activeTail() +
+            event(
+              { type: 'agent_message', message: 'Fresh structured progress in the same unfinished turn' },
+              progress
+            ) +
+            '\n'
+        );
         f.pane = { dead: false, screen: READY, paneId: '%7', panePid: 701 };
         await controller.inspect();
         // Structured progress legitimately exceeds the last activity transition.
@@ -1029,7 +1207,14 @@ describe('authoritative agent exits and process readiness', () => {
       expect.any(Function),
       CONTINUATION_PROMPT,
       expect.any(Function),
-      { paneId: '%7', panePid: 700, status: 1, signal: undefined, paneSignalToken: undefined }
+      {
+        paneId: '%7',
+        panePid: 700,
+        status: 1,
+        signal: undefined,
+        paneSignalToken: undefined,
+        inputProvenance: f.pane!.inputProvenance,
+      }
     );
   });
 
@@ -1060,7 +1245,8 @@ describe('authoritative agent exits and process readiness', () => {
     expect(await f.adapter.act(reserved)).toBe('not-sent');
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
     await f.adapter.observe();
-    f.identity.tail += event({ type: 'exec_command_end', call_id: 'new-progress' }, NOW - 500) + '\n';
+    f.identity.tail +=
+      event({ type: 'agent_message', message: 'Fresh structured progress before final dispatch' }, NOW - 500) + '\n';
     expect(await f.adapter.act(reserved)).toBe('not-sent');
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
@@ -1117,11 +1303,17 @@ describe('authoritative agent exits and process readiness', () => {
       const f = fixture();
       f.identity.tail =
         activeTail() +
-        JSON.stringify({
-          timestamp: new Date(NOW - 10_000).toISOString(),
-          type: 'event_msg',
-          payload: { type: 'collab_agent_spawn_end', new_thread_id: 'child-fixture' },
-        }) +
+        event(
+          {
+            type: 'collab_agent_spawn_end',
+            call_id: 'owned-child',
+            sender_thread_id: THREAD,
+            new_thread_id: OTHER,
+            status: 'running',
+            completed_at_ms: NOW - 10_000,
+          },
+          NOW - 10_000
+        ) +
         '\n';
       f.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
       f.session.paneExit = storedExit ? { at: NOW - 10_000, status: 9 } : undefined;
@@ -1206,7 +1398,10 @@ describe('authoritative agent exits and process readiness', () => {
           if (progressAge !== undefined) {
             await fs.appendFile(
               rollout,
-              event({ type: 'exec_command_end', call_id: 'fixture-exec' }, Date.now() - progressAge) + '\n'
+              event(
+                { type: 'agent_message', message: 'Fresh structured progress after durable reservation' },
+                Date.now() - progressAge
+              ) + '\n'
             );
           }
         }
@@ -1215,7 +1410,13 @@ describe('authoritative agent exits and process readiness', () => {
       now: () => Date.now(),
     });
     try {
-      await controller.updateConfig({ enabled: true, detectStalls: true, stalledAfterMs: 10_000, retryDelayMs: 1000 });
+      await controller.updateConfig({
+        enabled: true,
+        detectStalls: true,
+        restartStalls: true,
+        stalledAfterMs: 10_000,
+        retryDelayMs: 1000,
+      });
       await controller.refresh();
       expect(controller.getStatus().pending).toBeUndefined();
       vi.setSystemTime(NOW + 10_000);
@@ -1260,13 +1461,13 @@ describe('authoritative agent exits and process readiness', () => {
 
     const clean = fixture();
     clean.identity.tail = activeTail();
-    clean.pane = { dead: true, status: 0, screen: null };
+    clean.pane = { dead: true, status: 0, screen: null, paneId: '%7', panePid: 700 };
     clean.session.paneExit = { at: NOW - 1_000, status: 0 };
     expect(await clean.adapter.observe()).toMatchObject({ activity: 'exited', safeToAct: false });
 
     const stopped = fixture();
     stopped.identity.tail = activeTail();
-    stopped.pane = { dead: true, status: 9, screen: null };
+    stopped.pane = { dead: true, status: 9, screen: null, paneId: '%7', panePid: 700 };
     stopped.session.paneExit = undefined;
     stopped.context.intentionalStopAt = NOW - 19_000;
     expect(await stopped.adapter.observe()).toMatchObject({ reason: 'pane-unverified', safeToAct: false });
@@ -1324,6 +1525,224 @@ describe('owned remote evidence and mutation', () => {
     } as Session['remote'];
     return f;
   }
+
+  async function ownedStallFixture() {
+    const f = remoteFixture();
+    const root = await fs.mkdtemp(join(homedir(), 'codex-stall-owned-cache-'));
+    const cache = new OwnedRemoteBrokerCache(join(root, 'cache'));
+    const scope: OwnedRemoteBrokerScope = {
+      sessionId: SESSION,
+      remote: f.session.remote!,
+      owner: f.session.owner,
+      workingDir: f.session.remote!.remotePath,
+      codexHome: f.context.codexHome!,
+    };
+    let descriptor: NonNullable<Awaited<ReturnType<typeof cache.prepare>>>;
+    let latest: CodexBrokerProof | undefined;
+    let launch = 0;
+    const replace = async () => {
+      const material = CodexInputBroker.provisioningMaterial(SESSION, 'exec fixture-owned-worker', scope.codexHome);
+      const directory = `/fixture/remote-brokers/${SESSION}/${material.config.incarnation}`;
+      const next = await cache.prepare(scope, material, directory);
+      expect(next).toBeDefined();
+      expect(cache.activate(scope, next!.incarnation)).toBe(true);
+      descriptor = next!;
+      launch++;
+    };
+    await replace();
+    f.session.getOwnedRemoteInputBroker.mockImplementation(async () => cache.get(scope, descriptor.incarnation));
+    f.session.observeOwnedRemoteInputBroker.mockImplementation((serialized, witness, panePid) => {
+      latest = cache.observe(scope, descriptor.incarnation, serialized, witness, panePid);
+      return latest;
+    });
+    f.session.isOwnedRemoteInputBrokerProofCurrent.mockImplementation(
+      (proof) =>
+        proof === latest &&
+        proof.incarnation === descriptor.incarnation &&
+        cache.signer(scope, descriptor.incarnation)?.authority(proof)?.proof === proof
+    );
+    f.deps.inspectRemote = vi.fn(async () => {
+      const state: CodexBrokerState = {
+        version: 1,
+        sessionId: SESSION,
+        incarnation: descriptor.incarnation,
+        pid: 700,
+        childPid: 701,
+        brokerStart: String(100 + launch * 10),
+        childStart: String(101 + launch * 10),
+        tainted: false,
+        rawGeneration: 0,
+        launchDigest: descriptor.launchDigest,
+        homeDigest: descriptor.homeDigest,
+        closed: true,
+        exitStatus: 9,
+        exitSignal: null,
+        counters: { 'owner-pty': 0, 'owner-key': 0, 'owner-mux': 0, auto: 0, probe: 0 },
+        receipts: [],
+        startup: { nonce: descriptor.startupNonce, status: 'started' },
+      };
+      const serialized = JSON.stringify(state);
+      return {
+        transport: 'reachable',
+        session: 'present',
+        clock: clockAt(),
+        pane: { paneId: '%7', panePid: 700, dead: true, status: 9, screen: null },
+        identity: {
+          reason: 'verified',
+          conversationId: THREAD,
+          tail: activeTail(),
+          tailTruncated: false,
+          changedAt: NOW - 20_000,
+        },
+        inputBroker: {
+          serialized,
+          witness: {
+            path: descriptor.directory + '/state.json',
+            dev: 1,
+            ino: launch,
+            size: Buffer.byteLength(serialized),
+            mtimeMs: NOW,
+            ctimeMs: NOW,
+            hash: createHash('sha256').update(serialized).digest('hex'),
+            maxBytes: 98_304,
+          },
+        },
+      };
+    });
+    return { f, replace, dispose: () => safeRmHomeTree(root) };
+  }
+
+  it.each([false, true])(
+    'rechecks a known owned SSH broker replacement before stalled dispatch (%s)',
+    async (replace) => {
+      const owned = await ownedStallFixture();
+      try {
+        const { f } = owned;
+        const first = await f.adapter.observe();
+        expect(first.stallRestartable).toBe(true);
+        expect(first.processProofKey).toBeDefined();
+        const reservation: RecoveryFlight = {
+          key: first.stallEvidenceKey!,
+          conversationId: THREAD,
+          reason: 'stalled',
+          action: 'restart',
+          startedAt: NOW,
+          stallProgressAt: first.progressAt,
+          stallProgressEvidenceKey: first.progressEvidenceKey,
+          stallQuietPeriodMs: 10_000,
+        };
+        if (replace) await owned.replace();
+        expect(await f.adapter.act(reservation)).toBe(replace ? 'not-sent' : 'sent');
+        expect(f.deps.restartRemote).toHaveBeenCalledTimes(replace ? 0 : 1);
+        const current = await f.adapter.observe();
+        expect(current.stallEvidenceKey).toBe(first.stallEvidenceKey);
+        expect(current.progressEvidenceKey).toBe(first.progressEvidenceKey);
+        if (replace) expect(current.processProofKey).not.toBe(first.processProofKey);
+        else expect(current.processProofKey).toBe(first.processProofKey);
+      } finally {
+        await owned.dispose();
+      }
+    }
+  );
+
+  it.each([false, true])(
+    'requires fresh same-process SSH stall confirmations after owned replacement (%s)',
+    async (replace) => {
+      const owned = await ownedStallFixture();
+      const { f } = owned;
+      const controller = new RecoveryController({
+        observe: () => f.adapter.observe(),
+        act: (reservation, authority) => f.adapter.act(reservation, authority),
+        persist: async () => {},
+        changed: () => {},
+        now: () => Date.now(),
+      });
+      try {
+        await controller.updateConfig({
+          enabled: true,
+          detectStalls: true,
+          restartStalls: true,
+          recoverCrashes: false,
+          stalledAfterMs: 10_000,
+        });
+        vi.setSystemTime(NOW + 10_000);
+        await controller.retry();
+        expect(f.deps.restartRemote).not.toHaveBeenCalled();
+        if (replace) await owned.replace();
+        vi.setSystemTime(NOW + 12_000);
+        await controller.retry();
+        expect(f.deps.restartRemote).toHaveBeenCalledTimes(replace ? 0 : 1);
+        if (replace) {
+          vi.setSystemTime(NOW + 14_000);
+          await controller.retry();
+          expect(f.deps.restartRemote).toHaveBeenCalledOnce();
+        }
+      } finally {
+        controller.stop();
+        await owned.dispose();
+      }
+    }
+  );
+
+  it.each([
+    'healthy',
+    'unbrokered',
+    'missing-journal',
+    'malformed',
+    'tainted',
+    'reserved',
+    'wrong-incarnation',
+    'wrong-home',
+    'bad-birth',
+  ])('requires retained launch-owned remote input evidence: %s', async (fault) => {
+    const f = remoteFixture();
+    if (fault === 'unbrokered') f.remoteBrokerAvailable = false;
+    if (fault !== 'healthy' && fault !== 'unbrokered') {
+      const evidence = f.remoteEvidence as Extract<RemoteCodexEvidence, { session: 'present' | 'missing' }>;
+      const input = evidence.inputBroker!;
+      const state = JSON.parse(input.serialized) as CodexBrokerState;
+      if (fault === 'tainted') {
+        state.tainted = true;
+        state.rawGeneration = 1;
+      }
+      if (fault === 'wrong-incarnation') state.incarnation = OTHER;
+      if (fault === 'wrong-home') state.homeDigest = createHash('sha256').update('/fixture/foreign-home').digest('hex');
+      if (fault === 'bad-birth') state.childStart = 'not-a-birth';
+      if (fault === 'reserved') {
+        state.counters.auto = 1;
+        state.receipts.push({
+          channel: 'auto',
+          counter: 1,
+          nonce: OTHER,
+          conversationId: THREAD,
+          hash: createHash('sha256').update('uncertain').digest('hex'),
+          status: 'reserved',
+        });
+      }
+      const serialized = fault === 'malformed' ? '{truncated' : JSON.stringify(state);
+      evidence.inputBroker =
+        fault === 'missing-journal'
+          ? undefined
+          : {
+              ...input,
+              serialized,
+              witness: {
+                ...input.witness,
+                size: Buffer.byteLength(serialized),
+                hash: createHash('sha256').update(serialized).digest('hex'),
+              },
+            };
+    }
+    const observed = await f.adapter.observe();
+    expect(observed).toMatchObject(
+      fault === 'healthy'
+        ? { activity: 'interrupted', safeToAct: true }
+        : { activity: 'unknown', safeToAct: false, reason: 'identity-unverified' }
+    );
+    if (fault !== 'healthy') expect(f.adapter.getVerifiedTail(THREAD)).toBeUndefined();
+    expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+    expect(f.deps.restartRemote).not.toHaveBeenCalled();
+  });
 
   it.each(['authorized', 'issuer-refused', 'issuer-refused-after-clock', 'owner-changed', 'grant-changed'] as const)(
     'revalidates the local issuer at queued SSH dispatch boundaries: %s',
@@ -1471,11 +1890,7 @@ describe('owned remote evidence and mutation', () => {
       if (fault === 'changed-clock')
         evidence.clock = { ...clockAt(), remoteBefore: NOW + 60_000, remoteAfter: NOW + 60_000 };
       evidence.identity.tail =
-        completedTail() +
-        event({ type: 'exec_command_begin', call_id: 'proof', command: ['sh', '-c', 'npm test'] }, NOW - 2000) +
-        '\n' +
-        event({ type: 'exec_command_end', call_id: 'proof', exit_code: 0 }, NOW - 1000) +
-        '\n';
+        completedTail() + commandPair('proof', 'fixture-turn', NOW - 2000, NOW - 1000).join('\n') + '\n';
       expect(await f.adapter.observe()).toMatchObject({
         activity: 'unknown',
         reason: 'identity-unverified',
@@ -1504,11 +1919,7 @@ describe('owned remote evidence and mutation', () => {
       evidence.identity.tail =
         [
           event({ type: 'task_started', turn_id: 'native-turn' }, NOW - 10_000 + offset),
-          event(
-            { type: 'exec_command_begin', call_id: 'native-command', command: ['sh', '-c', 'npm test'] },
-            NOW - 8000 + offset
-          ),
-          event({ type: 'exec_command_end', call_id: 'native-command', exit_code: 0 }, NOW - 7000 + offset),
+          ...commandPair('native-command', 'native-turn', NOW - 8000 + offset, NOW - 7000 + offset),
           event(
             {
               type: 'agent_message',

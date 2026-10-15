@@ -2,7 +2,7 @@
 
 Session Options has a dedicated **Recovery** tab for Codex. Automatic recovery starts **off**, including after upgrading an existing installation.
 
-Recovery supports **Codeman-owned local and SSH tmux sessions launched with `--no-daemon`**. It can continue a confirmed failed model turn or resume the exact conversation after a confirmed process crash. With separate stall recovery enabled, it can also resume an unfinished turn whose local or owned SSH pane is repeatedly verified as abnormally dead. The controller stores its settings, retry budget, bounded history and pending delivery in the instance data directory.
+Recovery supports **Codeman-owned local and SSH tmux sessions launched with `--no-daemon`**. It can continue a confirmed failed model turn or resume the exact conversation after a confirmed process crash. With separately authorized stall restart enabled, it can also resume an unfinished turn whose local or owned SSH pane is repeatedly verified as abnormally dead. The controller stores its settings, retry budget, bounded history and pending delivery in the instance data directory.
 
 ## Launch an eligible session
 
@@ -25,15 +25,19 @@ The session-create API accepts these optional Codex launch settings:
 
 Send this to `POST /api/sessions`, then use the normal Run control. Replace the example path/model with your own. Omit fields to retain Codex's defaults. These launch options are also accepted by quick-start. `noDaemon` and `noAltScreen` require a Codex installation that supports those flags. Unsupported flags fail the launch; recovery never substitutes sandbox bypass or a fresh conversation.
 
+Live automatic input currently requires Linux process birth and ownership evidence. A recorded exit from the exact owned child remains valid evidence for a guarded restart on other supported Unix platforms. Ordinary owner controls remain available.
+
+Eligible new local and Codeman-owned SSH launches also use an input reliability guard built with the existing Python 3 standard library. Codeman does not install Python. If Python is unavailable, an ordinary owner launch remains usable with automatic recovery disabled. Existing unguarded panes are attention-only; attaching to one never installs or resets input provenance.
+
 Codeman records whether its actual local launch command disabled the daemon. An existing pane with only a newly edited setting cannot become eligible: use a newly launched session. A custom `CODEX_HOME` can be supplied through the existing `envOverrides` mechanism and remains subject to the owner's current privileges. The actual effective local home, including an inherited `CODEX_HOME` or the default home, is pinned at launch and privately persisted. Older panes without launch-home provenance remain ineligible until a separately authorized new launch. Only this non-secret path is persisted; Codex API-key overrides are not written to session state.
 
 ## Controls and status
 
-Open Session Options → **Recovery** to enable recovery and choose whether to recover interrupted responses, process crashes, or confirmed stalls. Stall recovery requires repeated structured evidence for the same unfinished turn and fresh probes showing that its local or owned SSH pane died abnormally. A live silent turn only requests attention; silence, an idle composer, or elapsed time never restarts or interrupts an agent.
+Open Session Options → **Recovery** to enable recovery and choose whether to recover interrupted responses, process crashes, or attention-only stall detection. **Restart confirmed dead stalls** is a separate opt-in, off by default. Existing saved stall-detection settings remain attention-only until the owner explicitly enables that new control. Both `detectStalls` and `restartStalls` must be true for a stall restart. Stall recovery requires repeated structured evidence for the same unfinished turn and fresh probes showing that its local or owned SSH pane died abnormally. A live silent turn only requests attention; silence, an idle composer, or elapsed time never restarts or interrupts an agent.
 
 Defaults are three attempts, a 15-second initial delay, exponential backoff capped at two minutes, and a 15-minute recovery window. Limits and history survive a Codeman restart. **Retry recovery** requests one guarded attempt even when automatic recovery is off. A tripped breaker needs an explicit **Reset limits** before another attempt. Reset sends no input and never starts a process.
 
-With stall detection selected, manual Retry is available during a working turn. It repeats the same guarded checks: a live pane never restarts, and an abnormal dead pane still needs two fresh same-turn probes at least two seconds apart after the configured threshold. Opening or refreshing Recovery preserves an unresolved stall warning until new progress resolves it. Enabling automatic recovery or stall detection starts a fresh quiet interval; historical silence cannot satisfy the configured threshold.
+With stall detection and separate stall restart consent selected, manual Retry is available during a working turn. It repeats the same guarded checks: a live pane never restarts, and an abnormal dead pane still needs two fresh same-turn probes at least two seconds apart after the configured threshold. Opening or refreshing Recovery preserves an unresolved stall warning until new progress resolves it. Enabling automatic recovery, stall detection or stall restart consent starts a fresh quiet interval; historical silence cannot satisfy the configured threshold.
 
 The status shows observed Codex activity separately from recovery-controller state, the abbreviated conversation ID, attempts, failed deliveries, reason, next retry, last accepted recovery and history. A successful Codex turn stops recovery; it is not evidence that the overall task meets its acceptance criteria.
 
@@ -45,7 +49,9 @@ The status shows observed Codex activity separately from recovery-controller sta
 - A failed turn needs current structured evidence, two observations, an idle screen and an empty composer. A newer prompt, background work, approval, usage limit, authentication problem or uncertain state prevents automatic input.
 - Recovery uses exact Codex UUIDs validated against rollout metadata. An exact prompt hash plus timestamp can link a submitted prompt to its history entry; timestamp or working-directory similarity alone cannot authorize recovery. The input model preserves simple text and multiline LF paste, and pauses when cursor edits, recalled history, completion, oversized input, or delivery normalization make the submitted bytes uncertain. Conversation switches invalidate pending authority.
 - Shared-daemon and Docker sessions pause because their identity cannot be isolated. Discovered remote sessions pause because Codeman does not own them. Owned SSH automation requires an explicit absolute per-session `CODEX_HOME` recorded at launch; ambient/default remote homes remain ineligible. Owned SSH sessions use remote rollout and remote tmux evidence; the local ssh-wrapper pane is transport state only.
-- A crash restart requires a fresh, explicit non-zero exit or signal and an exact conversation. Stall recovery adds a stable current-turn identity, a bounded sequence of fresh local or owned SSH probes and the configured no-progress threshold; it still requires an explicit non-zero exit or signal. The recovery primitive omits tmux's kill-live-pane flag, so a pane that became healthy cannot be killed by a stale observation. Clean exits are never revived.
+- App input retains its ordinary bytes and order. Direct terminal input is durably recorded before it reaches Codex and permanently disables automatic actions for that launch, including an unobserved `/resume`. App input cannot clear that record. Missing, replaced or uncertain guard journals require inspection.
+- A crash restart requires a fresh, explicit non-zero exit or signal and an exact conversation. Stall recovery adds a stable current-turn identity, a bounded sequence of fresh local or owned SSH probes and the configured no-progress threshold; it still requires an explicit non-zero exit or signal. The recovery primitive omits tmux's kill-live-pane flag, so a pane that became healthy cannot be killed by a stale observation. Clean exits are never revived. The guard must record the exact owned child exit; a dead wrapper without that receipt cannot authorize a restart.
+
 - Current owner grants are checked after asynchronous evidence reads and immediately before dispatch. Recovery preserves model, effort, directory, environment, sandbox, approvals and supported launch options.
 - Owned SSH submissions carry private clock evidence captured before owner Enter, or a native remote Enter receipt. Remote and local clocks may differ; bounded samples establish a common time domain without widening the existing two-second history match. Missing legacy provenance, slow or inconsistent samples, and clock changes leave automation paused until a new tracked owner submission establishes fresh evidence. Owner input can still be delivered when a read-only clock sample fails.
 - Remote evidence and input, restart and explicit restore share the bounded SSH queue. Current owner grants and cancellation are checked again after queue admission and clock sampling; a final synchronous session token guards dispatch. Remote wall-clock changes during pane checks veto effects, and uncertain started deliveries remain sealed against replay.
@@ -64,25 +70,29 @@ After a host reboot destroys the panes, Codeman can offer verified local Codex s
 
 Restoration verifies the exact conversation UUID using bounded rollout and history scans, then rechecks it before launch. It preserves the original managed session ID, launch configuration and captured effective Codex home, including an inherited or default home. Changed server defaults cannot move the conversation. Current owner grants must still authorize the saved settings and home. Missing provenance, ambiguous identity, pending child work, owner interruption, approval, authentication or uncertain evidence prevents launch. Restoration never falls back to a fresh conversation.
 
+For a previously guarded worker, restoration also requires its exact prior broker configuration and input journal. Direct terminal input, unresolved delivery, missing or malformed files, and a journal replaced after the offer prevent restoration. This lifetime input taint cannot be cleared by a later tracked submission. Legacy explicit restoration remains a separate owner-controlled launch.
+
+Restoration requires the existing Python 3 input guard; an unavailable guard refuses restoration before creating a worker. The new broker rechecks the captured grant, rollout, profile and fence proof before starting its child. Only an exact startup receipt certifies that no child was created; a lost receipt preserves the uncertain pane for inspection.
+
 The private offer and historical session record remain available until launch metadata and session state are durably committed. Existing recovery settings, retry budgets and unresolved reservations survive; pre-reboot pending actions are disarmed. **Dismiss** cancels a pending restore. If a worker may already have started, Codeman retains its exact pane for owner inspection and preserves historical state instead of replaying the launch. Inspect that pane before attempting another restoration. A restored pane has no previous terminal scrollback.
 
 ## API and events
 
 All routes use existing authentication and session ownership checks. `/api/v1` aliases are supported.
 
-| Method | Route | Behavior |
-| --- | --- | --- |
-| GET | `/api/sessions/:id/recovery` | Read fresh evidence without scheduling or dispatching recovery |
-| PUT | `/api/sessions/:id/recovery/config` | Update bounded settings; unknown fields are rejected |
-| POST | `/api/sessions/:id/recovery/retry` | Request one guarded attempt, with no caller-supplied prompt or thread |
-| POST | `/api/sessions/:id/recovery/reset` | Clear retry/circuit/uncertain-reservation state explicitly |
-| POST | `/api/sessions/:id/recovery/restore-remote` | Explicitly recreate a verified missing owned remote worker after a host reboot |
+| Method | Route                                       | Behavior                                                                       |
+| ------ | ------------------------------------------- | ------------------------------------------------------------------------------ |
+| GET    | `/api/sessions/:id/recovery`                | Read fresh evidence without scheduling or dispatching recovery                 |
+| PUT    | `/api/sessions/:id/recovery/config`         | Update bounded settings; unknown fields are rejected                           |
+| POST   | `/api/sessions/:id/recovery/retry`          | Request one guarded attempt, with no caller-supplied prompt or thread          |
+| POST   | `/api/sessions/:id/recovery/reset`          | Clear retry/circuit/uncertain-reservation state explicitly                     |
+| POST   | `/api/sessions/:id/recovery/restore-remote` | Explicitly recreate a verified missing owned remote worker after a host reboot |
 
 The API returns `{ "success": true, "data": ... }` or the existing error envelope. The owner-scoped SSE event `session:recovery` carries `{ sessionId, state }`. Attention events use the existing push/webhook integrations and sanitized reason codes; ordinary successful retries do not send notifications.
 
 ## Requirements and limits
 
-Remote recovery requires Node.js and tmux on the remote host for its bounded evidence probe. Stall recovery also supports eligible owned SSH workers; transport silence or an unreachable host cannot prove a dead worker. Recovery does not restart a live prolonged stall or repeatedly continue an ordinary completed/idle turn outside an explicitly configured task.
+Remote recovery requires Node.js, tmux, Python 3 and Linux process birth evidence on the remote host. Automatic authority also needs the exact private broker launch material retained by this Codeman instance. Reattaching keeps the existing incarnation and never installs a guard into an existing pane. Remote restart and explicit missing-worker restoration reserve a fresh incarnation before child launch; an unknown startup remains reserved for inspection. Manager-directed remote input holds a bounded source-host authority lease and binds each signed phase to the exact worker and deadline. Signing secrets and local manager paths never appear in public metadata or remote command arguments. Stall recovery also supports eligible owned SSH workers; transport silence or an unreachable host cannot prove a dead worker. Recovery does not restart a live prolonged stall or repeatedly continue an ordinary completed/idle turn outside an explicitly configured task.
 
 Codex event fixtures follow [`openai/codex` `rust-v0.162.1` protocol definitions](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/protocol/src/protocol.rs). Unsupported or incomplete event variants remain non-actionable. No live Codex service or private SSH host is needed by the automated recovery tests.
 

@@ -1,5 +1,6 @@
 /** @fileoverview Only bounded paired structured execution evidence proves command success. */
 import { createHash } from 'node:crypto';
+import { isCodexRolloutRecord } from '../recovery/codex-classifier.js';
 const SUPPORTED_POSIX_SHELLS = new Set([
   'bash',
   'sh',
@@ -35,13 +36,13 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
       return new Map();
     }
     if (!row || typeof row !== 'object' || Array.isArray(row)) return new Map();
-    const at = Date.parse(row.timestamp);
+    const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
     const p = row.payload;
+    if (!isCodexRolloutRecord(row)) return new Map();
     if (row.type !== 'event_msg') continue;
     if (
-      !p ||
-      typeof p !== 'object' ||
-      Array.isArray(p) ||
+      typeof p.type !== 'string' ||
+      !p.type ||
       typeof row.timestamp !== 'string' ||
       !Number.isFinite(at) ||
       at > now + 2000
@@ -133,10 +134,18 @@ export function latestProgressMarker(tail: string, since: number, now: number): 
       return uncertain(line);
     }
     if (!row || typeof row !== 'object' || Array.isArray(row)) return uncertain(line);
-    const at = Date.parse(row.timestamp);
+    const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
     const p = row.payload;
-    if (row.type !== 'event_msg' || !p || typeof p !== 'object') continue;
-    if (!Number.isFinite(at) || at > now + 2000) return uncertain(line);
+    if (!isCodexRolloutRecord(row)) return uncertain(line);
+    if (row.type !== 'event_msg') continue;
+    if (
+      typeof p.type !== 'string' ||
+      !p.type ||
+      typeof row.timestamp !== 'string' ||
+      !Number.isFinite(at) ||
+      at > now + 2000
+    )
+      return uncertain(line);
     if (p.type === 'user_message' || (p.type === 'item_completed' && p.item?.type === 'UserMessage')) {
       // Use the classifier's exact structured submission identity. Row order, not a timestamp,
       // prevents a future-dated prior turn marker from crossing a new user submission.
