@@ -5,6 +5,8 @@ import { RecoveryController } from '../src/recovery/controller.js';
 import { initialRecoveryState } from '../src/recovery/types.js';
 import type { TmuxManager as Manager } from '../src/tmux-manager.js';
 import type { RecoveryMuxDispatchGuard } from '../src/mux-interface.js';
+import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
+import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 
 const effects = vi.hoisted(() => ({ exec: vi.fn(), sync: vi.fn() }));
 vi.mock('node:child_process', async (original) => {
@@ -30,7 +32,6 @@ vi.mock('node:child_process', async (original) => {
 const PLACEHOLDER = 'Ask Codex to do anything';
 const THREAD = '11111111-2222-3333-4444-555555555555';
 const SID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
-const INC = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
 const NOW = Date.UTC(2026, 9, 15, 12);
 const screen = (text = '') => `› ${text}\n  fixture-model high · /fixture/work\n`;
 const body =
@@ -113,20 +114,41 @@ it.each(['', PLACEHOLDER])('manual Retry respects actual classified composer evi
 });
 function nativeFixture(initial: string, prompt = 'Authorized fixture continuation', lateDraft = false) {
   const manager = Object.create(TmuxManager.prototype) as Manager;
-  const record = { sessionId: SID, muxName: 'codeman-aaaaaaaa', pid: 700, recoveryInputBroker: INC };
+  const material = CodexInputBroker.provisioningMaterial(SID, 'Explicit fixture worker', '/fixture/home');
+  const proof = fakeInputProvenance({ incarnation: material.config.incarnation, brokerPid: 700, childPid: 701 });
+  const broker = CodexInputBroker.fromRemoteMaterial('/fixture/private-broker', material, {
+    version: 1,
+    sessionId: SID,
+    incarnation: material.config.incarnation,
+    pid: 700,
+    childPid: 701,
+    brokerStart: proof.brokerStart,
+    childStart: proof.childStart,
+    tainted: false,
+    rawGeneration: 0,
+    launchDigest: material.config.launchDigest,
+    homeDigest: material.config.homeDigest,
+    closed: false,
+    exitStatus: null,
+    exitSignal: null,
+    counters: { 'owner-pty': 0, 'owner-key': 0, 'owner-mux': 0, auto: 0, probe: 0 },
+    receipts: [],
+    startup: { nonce: material.config.startup.nonce, status: 'started' },
+  })!;
+  expect(broker).toBeDefined();
+  vi.spyOn(broker, 'prove').mockResolvedValue(proof);
+  vi.spyOn(broker, 'receipt').mockResolvedValue('sent');
+  const record = { sessionId: SID, muxName: 'codeman-aaaaaaaa', pid: 700, recoveryInputBroker: broker.incarnation };
   const accepted: string[] = [];
+  const buffers = new Map<string, string>();
   let current = screen(initial),
-    pending = '',
     preparations = 0;
-  const broker = {
-    incarnation: INC,
-    prove: async () => ({}),
-    frame: (_channel: string, text: string) => {
-      pending = text;
-      return { data: 'SIGNED_FIXTURE', receipt: {} };
-    },
-    receipt: async () => 'sent',
-  };
+  vi.spyOn(
+    manager as unknown as { loadBrokerInputBuffer(name: string, data: string): Promise<void> },
+    'loadBrokerInputBuffer'
+  ).mockImplementation(async (name, data) => {
+    buffers.set(name, data);
+  });
   for (const [name, value] of Object.entries({
     sessions: new Map([[SID, record]]),
     inputBrokers: new Map([[SID, broker]]),
@@ -141,7 +163,15 @@ function nativeFixture(initial: string, prompt = 'Authorized fixture continuatio
     throw Error('Unexpected native read');
   });
   effects.exec.mockImplementation(async (command: string) => {
-    if (!command.includes('if-shell') || !command.includes('send-keys')) throw Error('Unexpected native effect');
+    if (!command.includes('if-shell') || !command.includes('paste-buffer -r -d'))
+      throw Error('Unexpected native effect');
+    const name = command.match(/codeman-private-[a-f0-9-]+/)![0];
+    const wire = buffers.get(name)!;
+    expect(wire.startsWith('\x1eCODEMAN_INPUT_V1:')).toBe(true);
+    expect(command).not.toContain(wire);
+    const packet = JSON.parse(Buffer.from(wire.split(':')[1], 'base64').toString());
+    const pending = Buffer.from(packet.data, 'base64').toString();
+    buffers.delete(name);
     accepted.push(pending);
     current = pending === '\r' ? screen() : screen(pending);
     return { stdout: '', stderr: '' };
@@ -149,6 +179,7 @@ function nativeFixture(initial: string, prompt = 'Authorized fixture continuatio
   const guard: RecoveryMuxDispatchGuard = {
     conversationId: THREAD,
     expectedLivePane: { paneId: '%7', panePid: 700 },
+    inputProof: proof,
     confirm: () => true,
     prepareEvidence: async () => {
       if (++preparations === 2 && lateDraft) current = screen(PLACEHOLDER);
