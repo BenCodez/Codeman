@@ -1791,7 +1791,8 @@ describe('SupervisorController', () => {
     const task = buildSupervisorManagerTask(maximal.objective);
     expect(task.objective).toContain(maximal.objective);
     expect(task.objective?.length).toBeLessThanOrEqual(4000);
-    expect(task.objective).toContain('codeman agent supervisor workers');
+    expect(task.objective).toContain('supervisor_workers');
+    expect(task.objective).toContain('supervisor_assign');
   });
 
   describe('worker runtime authority', () => {

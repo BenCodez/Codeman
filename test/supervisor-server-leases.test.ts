@@ -85,6 +85,8 @@ async function session(id: string): Promise<Session> {
     muxSession,
     codexConfig: { noDaemon: true },
   });
+  // Lease reconciliation starts after a separately acknowledged restricted manager launch.
+  vi.spyOn(value, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
   expect(await value.ensureRecoveryIdentityFence()).toBe(true);
   return value;
 }

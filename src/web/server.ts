@@ -28,6 +28,7 @@
  */
 
 import Fastify, { FastifyInstance } from 'fastify';
+import { createHash } from 'node:crypto';
 import fastifyCompress from '@fastify/compress';
 import fastifyCookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
@@ -169,6 +170,8 @@ import { initialTaskState, TaskStateSchema, type TaskState } from '../supervisio
 import { CodexTaskAdapter } from '../supervision/adapter.js';
 import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
+import { ManagerCredentialRegistry } from '../supervisor/manager-credentials.js';
+import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
 import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
 import { SupervisorStore } from '../supervisor/store.js';
 import { SupervisorStateSchema } from '../supervisor/schema.js';
@@ -332,6 +335,8 @@ export class WebServer extends EventEmitter {
   private actionArbiters = new Map<string, SessionActionArbiter>();
   private taskStore = new TaskStore();
   private actionReservationStore = new TaskStore(dataPath('action-reservations.json'));
+  private supervisorManagerAuthReady = false;
+  private supervisorManagerCredentials = new ManagerCredentialRegistry();
   private supervisorControllers = new Map<string, SupervisorController>();
   private supervisorStore = new SupervisorStore();
   private supervisorLeaseQueue: Promise<unknown> = Promise.resolve();
@@ -793,6 +798,7 @@ export class WebServer extends EventEmitter {
       getRecoveryController: this.getRecoveryController.bind(this),
       getTaskController: this.getTaskController.bind(this),
       getSupervisorController: this.getSupervisorController.bind(this),
+      prepareSupervisorManager: this.prepareSupervisorManager.bind(this),
       // EventPort
       broadcast: this.broadcast.bind(this),
       sendPushNotifications: this.sendPushNotifications.bind(this),
@@ -918,7 +924,8 @@ export class WebServer extends EventEmitter {
     registerHostGuard(this.app, () => this.getHostPolicy(), this.basePath);
 
     // Auth middleware (Basic Auth + session cookies + rate limiting)
-    const authState = registerAuthMiddleware(this.app, this.https, this.basePath);
+    const authState = registerAuthMiddleware(this.app, this.https, this.basePath, this.supervisorManagerCredentials);
+    this.supervisorManagerAuthReady = authState.authSessions !== null;
     if (authState) {
       this.authSessions = authState.authSessions;
       this.authFailures = authState.authFailures;
@@ -1199,6 +1206,18 @@ export class WebServer extends EventEmitter {
     registerRecoveryRoutes(this.app, ctx);
     registerTaskRoutes(this.app, ctx);
     registerSupervisorRoutes(this.app, ctx);
+    registerSupervisorMcpRoutes(this.app, {
+      credentials: this.supervisorManagerCredentials,
+      resolveController: (scope) => {
+        const session = this.sessions.get(scope.sessionId);
+        return session &&
+          session.owner === scope.owner &&
+          session.isSupervisorManagerLaunchCurrent() &&
+          this.supervisorManagerCredentials.isCurrent(scope)
+          ? this.getSupervisorController(session)
+          : undefined;
+      },
+    });
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
     registerClipboardRoutes(this.app, ctx);
@@ -1485,6 +1504,7 @@ export class WebServer extends EventEmitter {
     // Guard against concurrent cleanup of the same session
     if (this.cleaningUp.has(sessionId)) return;
     this.cleaningUp.add(sessionId);
+    this.supervisorManagerCredentials.revokeSession(sessionId);
     if (killMux) this.killingSessions.add(sessionId);
     // Refuse a start or attach from here on (Ark0N/Codeman#446): a start that
     // raced this cleanup would launch a CLI in a tmux session whose record is
@@ -1695,6 +1715,22 @@ export class WebServer extends EventEmitter {
       }
       await session.stop(killMux);
       if (this.sessions.get(sessionId) !== session) return;
+      if (killMux) {
+        const before = this.store.getSessions()[sessionId],
+          beforeText = JSON.stringify(before),
+          owner = session.owner;
+        const current = () =>
+          this.sessions.get(sessionId) === session &&
+          session.owner === owner &&
+          this.store.getSessions()[sessionId] === before &&
+          JSON.stringify(before) === beforeText;
+        await ownedRemoteBrokerCache.stageFinalCleanup(
+          sessionId,
+          before?.pinned ? { ...before, status: 'stopped', pid: null } : undefined,
+          current
+        );
+        if (!current()) throw Error('Session changed while preparing final cleanup');
+      }
       this.sessions.delete(sessionId);
       // Only remove from state.json if we're also killing the mux session.
       // When killMux=false (server shutdown), preserve state for recovery.
@@ -1703,13 +1739,14 @@ export class WebServer extends EventEmitter {
         const retiredState = this.store.getSessions()[sessionId];
         const retiredStateText = JSON.stringify(retiredState);
         const retiredOwner = session.owner;
-        await ownedRemoteBrokerCache.retireAndDelete(
+        await ownedRemoteBrokerCache.finishFinalCleanup(
           sessionId,
           () =>
             !this.sessions.has(sessionId) &&
             session.owner === retiredOwner &&
             this.store.getSessions()[sessionId] === retiredState &&
-            JSON.stringify(retiredState) === retiredStateText
+            JSON.stringify(retiredState) === retiredStateText,
+          retiredState
         );
       }
     }
@@ -2516,6 +2553,197 @@ export class WebServer extends EventEmitter {
     return undefined;
   }
 
+  /** Explicit, authenticated conversion; a persisted role never grants a running CLI new API authority. */
+  private async prepareSupervisorManager(session: Session, callerCurrent: () => boolean): Promise<boolean> {
+    if (
+      !this.supervisorManagerAuthReady ||
+      (!isMultiUserMode() && !process.env.CODEMAN_PASSWORD) ||
+      this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
+      this.sessions.get(session.id) !== session
+    )
+      return false;
+    if (!(await session.ensureRecoveryIdentityFence())) return false;
+    const owner = session.owner;
+    const configuration = () =>
+      JSON.stringify([
+        session.owner,
+        session.mode,
+        session.workingDir,
+        session.codexConfig,
+        session.getEnvOverridesForPersist(),
+        session.remote,
+        session.docker,
+      ]);
+    const captured = configuration();
+    const authentication = JSON.stringify([
+      isMultiUserMode(),
+      process.env.CODEMAN_USERNAME,
+      process.env.CODEMAN_PASSWORD,
+    ]);
+    const clear = () =>
+      !this.taskStore.loadFailed &&
+      !this.recoveryStore.loadFailed &&
+      !this.supervisorStore.loadFailed &&
+      !this.controllerHasTaskFlight(session.id) &&
+      !this.controllerHasRecoveryFlight(session.id) &&
+      !this.supervisorControllers.get(session.id)?.getStatus().inFlight &&
+      !this.supervisorStore.get(session.id).inFlight &&
+      this.supervisorControllers.get(session.id)?.getStatus().phase !== 'active' &&
+      this.taskControllers.get(session.id)?.getStatus().phase !== 'watching';
+    const scopeCurrent = () => {
+      try {
+        return (
+          callerCurrent() === true &&
+          !this.recoveryStopping &&
+          !this.cleaningUp.has(session.id) &&
+          this.sessions.get(session.id) === session &&
+          configuration() === captured &&
+          authentication ===
+            JSON.stringify([isMultiUserMode(), process.env.CODEMAN_USERNAME, process.env.CODEMAN_PASSWORD])
+        );
+      } catch {
+        return false;
+      }
+    };
+    const current = () => scopeCurrent() && clear();
+    const context = session.getRecoveryContext();
+    if (
+      !current() ||
+      session.mode !== 'codex' ||
+      session.remote ||
+      session.docker ||
+      session.paneLifecycleInFlight ||
+      !context.managed ||
+      !context.noDaemon ||
+      context.switchPending ||
+      context.untrackedInput ||
+      context.inputBrokerPending ||
+      !session.codexConfig?.resumeSessionId ||
+      !context.codexHome
+    )
+      return false;
+    const grant = await clampRecoveryLaunchForOwner(
+      owner,
+      { codexConfig: session.codexConfig },
+      session.getEnvOverridesForPersist()
+    );
+    if (
+      !current() ||
+      !grant.isCurrent() ||
+      JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(session.codexConfig) ||
+      JSON.stringify(grant.env) !== JSON.stringify(session.getEnvOverridesForPersist())
+    )
+      return false;
+    const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+    const observation = await adapter.observe();
+    const idle =
+      observation.processReady === true &&
+      ['idle', 'completed'].includes(observation.activity) &&
+      observation.conversationId === session.codexConfig.resumeSessionId &&
+      !session.isBusy() &&
+      !session.watching;
+    const source = adapter.getLocalEvidenceSource(
+      session.codexConfig.resumeSessionId,
+      session.getRecoveryContext().generation
+    );
+    if (
+      !idle ||
+      !source ||
+      !current() ||
+      !grant.isCurrent() ||
+      !(await adapter.confirmLocalEvidence(
+        session.codexConfig.resumeSessionId,
+        session.getRecoveryContext().generation
+      )) ||
+      !current()
+    )
+      return false;
+    const leaf = source.identity.witness?.paths.find(
+      (value) => value.path === source.identity.path && value.kind === 'file'
+    );
+    if (
+      !leaf ||
+      leaf.size === undefined ||
+      leaf.mtimeMs === undefined ||
+      leaf.ctimeMs === undefined ||
+      source.identity.tail === undefined ||
+      !source.identity.path
+    )
+      return false;
+    const files = [
+      {
+        path: source.identity.path,
+        dev: leaf.dev,
+        ino: leaf.ino,
+        size: leaf.size,
+        mtimeMs: leaf.mtimeMs,
+        ctimeMs: leaf.ctimeMs,
+        hash: createHash('sha256').update(source.identity.tail).digest('hex'),
+        maxBytes: 262_144,
+      },
+    ];
+    const grantFile = grant.getFileWitness?.() ?? grant.fileWitness;
+    if (grantFile) files.push(grantFile);
+    let converting = true;
+    const credential = this.supervisorManagerCredentials.issue({
+      sessionId: session.id,
+      owner,
+      isCurrent: () =>
+        converting
+          ? current() && grant.isCurrent()
+          : scopeCurrent() &&
+            session.owner === owner &&
+            session.isSupervisorManagerLaunchCurrent() &&
+            grant.isCurrent(),
+    });
+    try {
+      const scheme = this.https ? 'https' : 'http';
+      const launchStartedAt = Date.now();
+      const prepared = await session.prepareSupervisorManager({
+        token: credential.token,
+        endpoint: `${scheme}://127.0.0.1:${this.port}${this.basePath}/api/supervisor-mcp`,
+        files,
+        isCurrent: () => (converting ? current() : scopeCurrent()) && grant.isCurrent(),
+      });
+      let ready = false;
+      const readyDeadline = performance.now() + 5_000;
+      while (
+        prepared &&
+        current() &&
+        grant.isCurrent() &&
+        session.isSupervisorManagerLaunchCurrent() &&
+        performance.now() < readyDeadline
+      ) {
+        const observed = await adapter.observe();
+        if (
+          current() &&
+          grant.isCurrent() &&
+          observed.conversationId === session.codexConfig?.resumeSessionId &&
+          ['idle', 'completed'].includes(observed.activity) &&
+          hasFreshProcessReady(observed, launchStartedAt, Date.now())
+        ) {
+          ready = true;
+          break;
+        }
+        if (!['unknown', 'idle', 'completed'].includes(observed.activity)) break;
+        const remaining = readyDeadline - performance.now();
+        if (remaining <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+      }
+      converting = false;
+      if (!ready || !session.isSupervisorManagerLaunchCurrent() || !current() || !grant.isCurrent()) {
+        credential.revoke();
+        return false;
+      }
+      return true;
+    } catch {
+      converting = false;
+      credential.revoke();
+      return false;
+    }
+  }
+
   private getSupervisorController(session: Session): SupervisorController | undefined {
     if (this.recoveryStopping || this.cleaningUp.has(session.id) || this.sessions.get(session.id) !== session)
       return undefined;
@@ -2560,6 +2788,7 @@ export class WebServer extends EventEmitter {
       const context = session.getRecoveryContext();
       if (
         !grant ||
+        !session.isSupervisorManagerLaunchCurrent() ||
         this.recoveryStopping ||
         this.cleaningUp.has(session.id) ||
         this.sessions.get(session.id) !== session ||
@@ -2803,7 +3032,8 @@ export class WebServer extends EventEmitter {
         startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
           managerGrant = undefined;
           managerEvidence = undefined;
-          if (!managerIsEligible()) throw new SupervisorValidationError('Manager launch is not currently eligible');
+          if (!managerIsEligible() || !session.isSupervisorManagerLaunchCurrent())
+            throw new SupervisorValidationError('Prepare a restricted manager launch before Start');
           const task = this.getTaskController(session);
           if (!task) throw new Error('Supervisor task controller is unavailable');
           const scope = managerScope();
@@ -2814,6 +3044,7 @@ export class WebServer extends EventEmitter {
             this.sessions.get(session.id) === session &&
             this.taskControllers.get(session.id) === task &&
             managerIsEligible() &&
+            session.isSupervisorManagerLaunchCurrent() &&
             managerScope() === scope;
           try {
             await task.update(buildSupervisorManagerTask(objective), current);
@@ -4955,6 +5186,7 @@ export class WebServer extends EventEmitter {
 
   async stop(): Promise<void> {
     this.recoveryStopping = true;
+    this.supervisorManagerCredentials.revokeAll();
     for (const controller of this.supervisorControllers.values()) controller.stop();
     for (const controller of this.recoveryControllers.values()) controller.stop();
     for (const controller of this.taskControllers.values()) controller.stop();

@@ -257,6 +257,8 @@ Object.assign(CodemanApp.prototype, {
       SUPERVISOR_UI_REASONS[state?.reason] ?? state?.reason ?? '—'
     );
     document.getElementById('supervisorSettings').disabled = !available;
+    document.getElementById('supervisorPrepareBtn').disabled =
+      !available || state.phase === 'active' || !!state.inFlight;
     document.getElementById('supervisorStartBtn').disabled =
       !available ||
       !state.enabled ||
@@ -405,6 +407,43 @@ Object.assign(CodemanApp.prototype, {
       enabled: document.getElementById('supervisorEnabled').checked,
       workers,
     });
+  },
+  async prepareSupervisorManager() {
+    const view = this._supervisorView;
+    if (!view?.state || view.busy || view.state.phase === 'active' || view.state.inFlight) return;
+    if (
+      !window.confirm(
+        supervisorUiTranslate(
+          'Prepare this session as a restricted manager? This restarts the manager session in place using its verified conversation and restricted supervisor tools. Active work or uncertain delivery will refuse preparation.'
+        )
+      ) ||
+      this._supervisorView !== view
+    )
+      return;
+    view.busy = true;
+    this._renderSupervisorStatus();
+    let prepared;
+    try {
+      prepared = await this._apiJson(`/api/sessions/${encodeURIComponent(view.sessionId)}/supervisor/prepare-manager`, {
+        method: 'POST',
+        body: { confirmRestrictedManager: true },
+      });
+    } catch {
+      prepared = null;
+    } finally {
+      view.busy = false;
+    }
+    if (this._supervisorView !== view) return;
+    if (prepared?.managerReady === true)
+      this.showToast(supervisorUiTranslate('Restricted manager prepared. Select Start manager to begin.'), 'success');
+    else
+      this.showToast(
+        supervisorUiTranslate(
+          'Manager preparation was refused or is uncertain. Check server authentication, session identity and idle state before trying again.'
+        ),
+        'error'
+      );
+    await this.loadSupervisorStatus();
   },
   async supervisorAction(action) {
     if (!['start', 'pause', 'reset'].includes(action)) return;

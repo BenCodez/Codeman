@@ -950,3 +950,78 @@ it('allows inspection-only attachment of a retained uncertain pane without anoth
     await session.stop(false);
   }
 });
+
+it.each(['started', 'not-sent', 'unknown', 'owner-draft'] as const)(
+  'requires the restricted manager broker receipt (%s) without any raw fallback',
+  async (receipt) => {
+    const { prepareSupervisorManagerLaunch } = await import('../src/supervisor/manager-launch.js');
+    const root = await fsPromises.mkdtemp(join(homedir(), 'restricted-native-launch-'));
+    const home = join(root, 'home'),
+      work = join(root, 'work');
+    await fsPromises.mkdir(home, { mode: 0o700 });
+    await fsPromises.mkdir(work);
+    let current = true;
+    const profile = await prepareSupervisorManagerLaunch({
+      home,
+      workingDir: work,
+      conversationId: options.codexConfig.resumeSessionId,
+      expectedPane: { paneId: '%7', panePid: 600 },
+      token: `codeman-manager-v1.${'a'.repeat(64)}`,
+      endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp',
+      bridgeCommand: 'codeman',
+      bridgeArgs: ['agent', 'supervisor-mcp'],
+      isCurrent: () => current,
+    });
+    expect(profile).toBeDefined();
+    registerOrdinary();
+    const broker = successfulBroker();
+    vi.mocked(broker.startupReceipt).mockResolvedValue(receipt === 'owner-draft' ? 'started' : receipt);
+    vi.spyOn(manager, 'inspectPaneForRecovery').mockResolvedValue({
+      dead: false,
+      paneId: '%7',
+      panePid: 600,
+      screen: receipt === 'owner-draft' ? '› Owner draft' : '› ',
+    } as never);
+    Reflect.set(
+      broker,
+      'setStartupAuthority',
+      vi.fn(async () => {})
+    );
+    vi.spyOn(CodexInputBroker, 'create').mockResolvedValue(broker);
+    try {
+      const result = await manager.respawnPane({
+        ...options,
+        workingDir: work,
+        envOverrides: { CODEX_HOME: home },
+        supervisorManager: profile,
+        ownerLaunchIsCurrent: () => current,
+      });
+      expect(receipt === 'started' ? result : result === null).toBe(receipt === 'started' ? 700 : true);
+      const starts = commands().filter((command) => command.includes('respawn-pane'));
+      expect(starts).toHaveLength(receipt === 'owner-draft' ? 0 : 1);
+      if (receipt === 'owner-draft') {
+        expect(manager.isSupervisorManagerLaunchCurrent(SID, profile!)).toBe(false);
+        return;
+      }
+      expect(starts[0]).toContain('#{==:#{pane_id},%7}');
+      expect(starts[0]).toContain('#{==:#{pane_pid},600}');
+      expect(starts[0]).toContain('#{==:#{pane_dead},0}');
+      expect(starts[0]).toContain('#{==:#{window_panes},1}');
+      expect(starts[0]).not.toContain('CODEMAN_OPTIONAL_FALLBACK_STARTED');
+      expect(broker.setStartupAuthority).toHaveBeenCalledWith(
+        profile!.files,
+        undefined,
+        undefined,
+        profile!.missing,
+        expect.any(Number)
+      );
+      expect(manager.isSupervisorManagerLaunchCurrent(SID, profile!)).toBe(receipt === 'started');
+      if (receipt === 'started') expect(manager.getSession(SID)?.recoveryIsolated).toBe(true);
+      current = false;
+      expect(manager.isSupervisorManagerLaunchCurrent(SID, profile!)).toBe(false);
+    } finally {
+      current = false;
+      await fsPromises.rm(root, { recursive: true, force: true });
+    }
+  }
+);

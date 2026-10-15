@@ -67,6 +67,7 @@ describe('Codex supervisor UI in Chromium', () => {
           handledRequestBindings: [],
           history: [],
         };
+        let managerReady = false;
         const calls: unknown[] = [];
         const app = new (window as any).CodemanApp();
         app.sessions = new Map([[sid, { mode: 'codex', codexConfig: {} }]]);
@@ -74,6 +75,10 @@ describe('Codex supervisor UI in Chromium', () => {
         app.showToast = () => undefined;
         app._apiJson = async (url: string, options?: any) => {
           calls.push({ url, options });
+          if (url.endsWith('/prepare-manager')) {
+            managerReady = options?.body?.confirmRestrictedManager === true;
+            return { managerReady };
+          }
           if (url.endsWith('/workers'))
             return current.workers.map((worker: any) => ({
               sessionId: worker.sessionId,
@@ -105,7 +110,10 @@ describe('Codex supervisor UI in Chromium', () => {
               phase: options.body.enabled ? 'ready' : 'disabled',
               reason: 'configured',
             };
-          if (url.endsWith('/start')) current = { ...current, phase: 'active', reason: 'owner-started' };
+          if (url.endsWith('/start')) {
+            if (!managerReady) return null;
+            current = { ...current, phase: 'active', reason: 'owner-started' };
+          }
           return current;
         };
         app.switchOptionsTab = (tab: string) => {
@@ -385,6 +393,17 @@ describe('Codex supervisor UI in Chromium', () => {
           ])
         );
         await page.getByRole('button', { name: 'Save supervisor configuration' }).click();
+        page.once('dialog', (dialog) => void dialog.dismiss());
+        await page.getByRole('button', { name: 'Prepare restricted manager' }).click();
+        expect(
+          await page.evaluate(() =>
+            (window as any).supervisorCalls.filter((call: any) => call.url.endsWith('/prepare-manager'))
+          )
+        ).toEqual([]);
+        page.once('dialog', (dialog) => void dialog.accept());
+        await page.getByRole('button', { name: 'Prepare restricted manager' }).click();
+        await page.waitForFunction(() => !(window as any).app._supervisorView.busy);
+        expect(await page.locator('#supervisorPhase').textContent()).toBe('Ready');
         await page.getByRole('button', { name: 'Start manager' }).click();
         await page.getByRole('button', { name: 'Assign task' }).click();
         await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);
@@ -395,6 +414,10 @@ describe('Codex supervisor UI in Chromium', () => {
             expect.objectContaining({
               url: `/api/sessions/${SID}/supervisor`,
               options: expect.objectContaining({ method: 'PUT' }),
+            }),
+            expect.objectContaining({
+              url: `/api/sessions/${SID}/supervisor/prepare-manager`,
+              options: { method: 'POST', body: { confirmRestrictedManager: true } },
             }),
             expect.objectContaining({
               url: `/api/sessions/${SID}/supervisor/start`,

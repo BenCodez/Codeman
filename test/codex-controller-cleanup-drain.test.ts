@@ -59,6 +59,7 @@ async function fixture(
     finish: ReturnType<typeof createDeferred<Outcome>>;
     pending: Promise<unknown>;
     paths: string[];
+    retainedListeners: { input: ReturnType<Session['listeners']>; identity: ReturnType<Session['listeners']> };
     rows: () => Promise<Record<string, unknown>[]>;
   }) => Promise<void>
 ): Promise<void> {
@@ -72,6 +73,10 @@ async function fixture(
   internals.actionReservationStore = new TaskStore(paths[2]);
   Reflect.set(server, 'supervisorStore', new SupervisorStore(join(root, 'supervisors.json')));
   const session = new Session({ id: ID, mode: 'codex', workingDir: root, useMux: false });
+  const retainedListeners = {
+    input: session.listeners('recoveryUserInput'),
+    identity: session.listeners('recoveryIdentityChanged'),
+  };
   internals.sessions.set(ID, session);
   for (const id of [ID, 'unrelated-retained']) {
     await internals.recoveryStore.save(id, initialRecoveryState());
@@ -153,6 +158,7 @@ async function fixture(
       finish,
       pending,
       paths,
+      retainedListeners,
       rows: () => Promise.all(paths.map(async (path) => JSON.parse(await fs.readFile(path, 'utf8')).sessions)),
     });
   } finally {
@@ -174,7 +180,7 @@ async function fixture(
 it.each(['recovery', 'task'] as const)(
   'stops both controllers synchronously before waiting for an active %s action',
   async (owner) => {
-    await fixture(owner, async ({ internals, recovery, task, finish, pending }) => {
+    await fixture(owner, async ({ internals, recovery, task, finish, pending, retainedListeners }) => {
       const recoveryStop = vi.spyOn(recovery, 'stop');
       const taskStop = vi.spyOn(task, 'stop');
       const recoveryDrain = vi.spyOn(recovery, 'drain');
@@ -189,8 +195,9 @@ it.each(['recovery', 'task'] as const)(
       finish.resolve('not-sent');
       await pending;
       await cleanup;
-      expect(internals.sessions.get(ID).listenerCount('recoveryUserInput')).toBe(0);
-      expect(internals.sessions.get(ID).listenerCount('recoveryIdentityChanged')).toBe(0);
+      // Controller teardown keeps Session's own launch-authority revocation listener.
+      expect(internals.sessions.get(ID).listeners('recoveryUserInput')).toEqual(retainedListeners.input);
+      expect(internals.sessions.get(ID).listeners('recoveryIdentityChanged')).toEqual(retainedListeners.identity);
     });
   }
 );

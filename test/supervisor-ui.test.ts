@@ -286,6 +286,75 @@ describe('Codex supervisor UI', () => {
     expect(read('index.html')).toMatch(/--no-daemon.*verified Codex identity/s);
   });
 
+  it('requires separate owner confirmation to prepare the exact manager without starting it', async () => {
+    const h = harness();
+    h.app.openSupervisorOptions(SID);
+    await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+    const confirm = vi.spyOn(h.dom.window, 'confirm').mockReturnValue(false);
+    h.app._apiJson.mockClear();
+    await h.app.prepareSupervisorManager();
+    expect(h.app._apiJson).not.toHaveBeenCalled();
+    confirm.mockReturnValue(true);
+    h.app._apiJson.mockImplementation(async (url: string) =>
+      url.endsWith('/prepare-manager') ? { managerReady: true } : state()
+    );
+    await h.app.prepareSupervisorManager();
+    expect(h.app._apiJson.mock.calls).toEqual([
+      [`/api/sessions/${SID}/supervisor/prepare-manager`, { method: 'POST', body: { confirmRestrictedManager: true } }],
+      [`/api/sessions/${SID}/supervisor`],
+    ]);
+    expect(h.app.showToast).toHaveBeenCalledWith(expect.stringContaining('prepared'), 'success');
+    expect(h.app._supervisorView.state.phase).toBe('disabled');
+  });
+
+  it.each([null, {}, { managerReady: false }])('never treats uncertain preparation %j as ready', async (result) => {
+    const h = harness();
+    h.app.openSupervisorOptions(SID);
+    await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+    vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
+    h.app._apiJson.mockClear();
+    h.app._apiJson.mockImplementation(async (url: string) => (url.endsWith('/prepare-manager') ? result : state()));
+    await h.app.prepareSupervisorManager();
+    expect(h.app.showToast).toHaveBeenCalledWith(expect.stringContaining('refused or is uncertain'), 'error');
+    expect(h.app.showToast).not.toHaveBeenCalledWith(expect.anything(), 'success');
+    expect(h.app._apiJson.mock.calls.some(([url]: [string]) => url.endsWith('/start'))).toBe(false);
+    expect(h.app._supervisorView.busy).toBe(false);
+  });
+
+  it.each([
+    { ...activeState() },
+    { ...state(), inFlight: { requestId: 'held-request', workerId: WID, action: 'assign', reservedAt: 1 } },
+  ])('refuses preparation while active or reserved', async (current) => {
+    const h = harness();
+    const confirm = vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
+    h.app._supervisorView = { sessionId: SID, state: current, busy: false, workerStatus: [] };
+    h.app._renderSupervisorStatus();
+    expect(h.get('supervisorPrepareBtn').disabled).toBe(true);
+    await h.app.prepareSupervisorManager();
+    expect(confirm).not.toHaveBeenCalled();
+    expect(h.app._apiJson).not.toHaveBeenCalled();
+  });
+
+  it('retains one held preparation and ignores its result after the dialog targets another session', async () => {
+    const h = harness();
+    h.app.openSupervisorOptions(SID);
+    await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+    vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
+    let release!: (result: unknown) => void;
+    h.app._apiJson.mockClear();
+    h.app._apiJson.mockImplementation(() => new Promise((resolve) => (release = resolve)));
+    const pending = h.app.prepareSupervisorManager();
+    await h.app.prepareSupervisorManager();
+    expect(h.app._apiJson).toHaveBeenCalledTimes(1);
+    const newer = { sessionId: WID, state: null, busy: false, workerStatus: [] };
+    h.app._supervisorView = newer;
+    release({ managerReady: true });
+    await pending;
+    expect(h.app._supervisorView).toBe(newer);
+    expect(h.app.showToast).not.toHaveBeenCalled();
+    expect(h.app._apiJson).toHaveBeenCalledTimes(1);
+  });
+
   it('inspects workers and assigns through the scoped controller route', async () => {
     const h = harness();
     const active = {

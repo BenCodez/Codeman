@@ -141,8 +141,19 @@ describe('task and recovery server action wiring', () => {
         expect(!!internals.actionReservationStore.get(id).inFlight).toBe(!fresh);
         expect(await recoveryDeps.act(flight, () => true)).toBe(fresh ? 'sent' : 'not-sent');
         expect(act).toHaveBeenCalledTimes(fresh ? 1 : 0);
+        if (fresh) await expect(recovery.reset()).resolves.toMatchObject({ lastReason: 'manual-reset' });
+        else {
+          const retained = recovery.getStatus();
+          const journal = internals.recoveryStore.get(id);
+          const reservation = internals.actionReservationStore.get(id);
+          await expect(recovery.reset()).rejects.toThrow('Recovery delivery is still unverified');
+          expect(recovery.getStatus()).toEqual(retained);
+          expect(internals.recoveryStore.get(id)).toEqual(journal);
+          expect(internals.actionReservationStore.get(id)).toEqual(reservation);
+          expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+          expect(act).not.toHaveBeenCalled();
+        }
       } finally {
-        await recovery.reset();
         observe.mockRestore();
         restore.mockRestore();
         act.mockRestore();
@@ -1238,7 +1249,7 @@ describe('task and recovery server action wiring', () => {
   });
 
   it('shares the recovery reservation and task phase guards for missing remote restoration', async () => {
-    vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockResolvedValue({
+    const observe = vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockResolvedValue({
       activity: 'unknown',
       reason: 'remote-session-missing',
       at: Date.now(),
@@ -1258,7 +1269,8 @@ describe('task and recovery server action wiring', () => {
     });
     const restore = vi.spyOn(CodexRecoveryAdapter.prototype, 'restoreMissingRemote').mockResolvedValue('unknown');
     const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
-    const { task, taskDeps, recovery } = controllers('remote-restore-action-boundary');
+    const id = 'remote-restore-action-boundary';
+    const { task, taskDeps, recovery } = controllers(id);
     await task.update({
       objective: 'Verify remote work',
       criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
@@ -1274,8 +1286,32 @@ describe('task and recovery server action wiring', () => {
     await task.reset();
     expect(await taskDeps.act('task-key', flight.conversationId, 'continue', () => true)).toBe('not-sent');
     expect(taskAct).not.toHaveBeenCalled();
-    await recovery.reset();
+    const retained = recovery.getStatus();
+    const journal = internals.recoveryStore.get(id);
+    const reservation = internals.actionReservationStore.get(id);
+    await expect(recovery.reset()).rejects.toThrow('Recovery delivery is still unverified');
+    expect(recovery.getStatus()).toEqual(retained);
+    expect(internals.recoveryStore.get(id)).toEqual(journal);
+    expect(internals.actionReservationStore.get(id)).toEqual(reservation);
+    expect(await taskDeps.act('task-key', flight.conversationId, 'continue', () => true)).toBe('not-sent');
+    expect(taskAct).not.toHaveBeenCalled();
+
+    observe.mockResolvedValue({
+      activity: 'idle',
+      reason: 'observing',
+      at: Date.now(),
+      conversationId: flight.conversationId,
+      processReady: true,
+      processReadyAt: Date.now(),
+      safeToAct: false,
+    });
+    await recovery.inspect();
+    expect(recovery.getStatus().inFlight).toBeUndefined();
+    expect(internals.actionReservationStore.get(id).inFlight).toBeUndefined();
+    await expect(recovery.reset()).resolves.toMatchObject({ lastReason: 'manual-reset' });
     expect(await taskDeps.act('task-key', flight.conversationId, 'continue', () => true)).toBe('sent');
+    expect(taskAct).toHaveBeenCalledOnce();
+    expect(restore).toHaveBeenCalledOnce();
   });
 
   it('allows recovery beside task supervision paused by a server restart', async () => {
@@ -1313,13 +1349,19 @@ describe('task and recovery server action wiring', () => {
     await persistLegacyReservation(id, { task: false, recovery: true });
     const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
     const { task, recovery, taskDeps } = controllers(id);
+    const retainedRecovery = recovery.getStatus();
+    const retainedJournal = internals.recoveryStore.get(id);
+    const retainedReservation = internals.actionReservationStore.get(id);
 
     await task.reset();
     expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('not-sent');
     expect(taskAct).not.toHaveBeenCalled();
-    await recovery.reset();
-    expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('sent');
-    expect(taskAct).toHaveBeenCalledOnce();
+    await expect(recovery.reset()).rejects.toThrow('Recovery delivery is still unverified');
+    expect(recovery.getStatus()).toEqual(retainedRecovery);
+    expect(internals.recoveryStore.get(id)).toEqual(retainedJournal);
+    expect(internals.actionReservationStore.get(id)).toEqual(retainedReservation);
+    expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('not-sent');
+    expect(taskAct).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -1367,7 +1409,13 @@ describe('task and recovery server action wiring', () => {
         const readable = failedOwner === 'task' ? recovery : task;
         const unreadable = failedOwner === 'task' ? task : recovery;
 
-        await readable.reset();
+        if (failedOwner === 'task' && oppositeFlight) {
+          const retained = recovery.getStatus();
+          const journal = internals.recoveryStore.get(id);
+          await expect(readable.reset()).rejects.toThrow('Recovery delivery is still unverified');
+          expect(recovery.getStatus()).toEqual(retained);
+          expect(internals.recoveryStore.get(id)).toEqual(journal);
+        } else await readable.reset();
         expect(internals.actionReservationStore.get(id).inFlight?.key).toBe('bare-legacy-reservation');
         await expect(unreadable.reset()).rejects.toThrow('could not be saved');
         expect(internals.actionReservationStore.get(id).inFlight?.key).toBe('bare-legacy-reservation');
@@ -1395,18 +1443,26 @@ describe('task and recovery server action wiring', () => {
     }
   );
 
-  it('clears an ambiguous restored bare reservation only after both flights are explicitly reset', async () => {
+  it('keeps an ambiguous restored bare reservation while recovery delivery remains unverified', async () => {
     const id = 'legacy-ambiguous-flights';
     await persistLegacyReservation(id, { task: true, recovery: true });
     const taskAct = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('sent');
     const { task, taskDeps, recovery } = controllers(id);
     internals.getActionArbiter(id);
+    const retainedRecovery = recovery.getStatus();
+    const retainedJournal = internals.recoveryStore.get(id);
+    const retainedReservation = internals.actionReservationStore.get(id);
 
-    await recovery.reset();
+    await expect(recovery.reset()).rejects.toThrow('Recovery delivery is still unverified');
     expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('not-sent');
     expect(taskAct).not.toHaveBeenCalled();
     await task.reset();
-    expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('sent');
-    expect(taskAct).toHaveBeenCalledOnce();
+    expect(task.getStatus().inFlight).toBeUndefined();
+    await expect(recovery.reset()).rejects.toThrow('Recovery delivery is still unverified');
+    expect(recovery.getStatus()).toEqual(retainedRecovery);
+    expect(internals.recoveryStore.get(id)).toEqual(retainedJournal);
+    expect(internals.actionReservationStore.get(id)).toEqual(retainedReservation);
+    expect(await taskDeps.act('new-task', flight.conversationId, 'continue', () => true)).toBe('not-sent');
+    expect(taskAct).not.toHaveBeenCalled();
   });
 });

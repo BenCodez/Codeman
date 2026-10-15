@@ -22,6 +22,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { supervisorManagerCommand, type SupervisorManagerLaunch } from './supervisor/manager-launch.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
 import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
@@ -44,7 +45,7 @@ import { writeFile, rename, mkdir, open, unlink, lstat } from 'node:fs/promises'
 import { dirname, join, isAbsolute, posix } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
-import { hasCodexComposerText } from './recovery/codex-classifier.js';
+import { hasCodexComposerText, hasEmptyCodexComposer } from './recovery/codex-classifier.js';
 import {
   dataPath,
   getDataDirPath,
@@ -1779,6 +1780,26 @@ function confirmRecoveryMuxDispatch(guard: RecoveryMuxDispatchGuard): boolean {
 }
 
 export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
+  private readonly supervisorManagerLaunches = new Map<
+    string,
+    { profile: SupervisorManagerLaunch; record: MuxSession; pid: number; incarnation: string }
+  >();
+
+  isSupervisorManagerLaunchCurrent(sessionId: string, profile: SupervisorManagerLaunch): boolean {
+    const proof = this.supervisorManagerLaunches?.get(sessionId);
+    const record = this.sessions.get(sessionId);
+    return (
+      !!proof &&
+      proof.profile === profile &&
+      proof.record === record &&
+      record.pid === proof.pid &&
+      record.recoveryInputBroker === proof.incarnation &&
+      record.recoveryInputBrokerPending === undefined &&
+      !record.codexRestoreUncertain &&
+      profile.isCurrent()
+    );
+  }
+
   readonly backend = 'tmux' as const;
   private sessions: Map<string, MuxSession> = new Map();
   private sessionSaves: Promise<void> = Promise.resolve();
@@ -4022,12 +4043,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     )
       return null;
     const canDispatch = () =>
-      !guard ||
-      (options.onlyIfDead === true &&
-        localCodex &&
-        this.sessions.get(sessionId) === session &&
-        session.muxName === muxName &&
-        confirmRecoveryMuxDispatch(guard));
+      (!options.supervisorManager ||
+        (options.supervisorManager.isCurrent() &&
+          this.sessions.get(sessionId) === session &&
+          options.ownerLaunchIsCurrent?.() === true)) &&
+      (!guard ||
+        (options.onlyIfDead === true &&
+          localCodex &&
+          this.sessions.get(sessionId) === session &&
+          session.muxName === muxName &&
+          confirmRecoveryMuxDispatch(guard)));
     if (!canDispatch()) return null;
 
     if (!isValidMuxName(muxName) || !isValidPath(workingDir)) return null;
@@ -4044,7 +4069,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : undefined;
     const userStatusLineCommand = statusLineCommand ? await findEffectiveUserStatusLineCommand(workingDir) : undefined;
 
-    const baseCmd = buildSpawnCommand({
+    const ordinaryCmd = buildSpawnCommand({
       mode,
       sessionId,
       model,
@@ -4064,6 +4089,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       statusLineCommand,
       sessionName: cliName,
     });
+    const managerProfile = options.supervisorManager;
+    if (
+      managerProfile &&
+      (remote || docker || options.onlyIfDead || guard || !localCodex || !(await managerProfile.confirm()))
+    )
+      return null;
+    const baseCmd = managerProfile ? supervisorManagerCommand(managerProfile, codexConfig) : ordinaryCmd;
     const config = niceConfig || DEFAULT_NICE_CONFIG;
     const cmd = wrapWithNice(baseCmd, config);
     const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
@@ -4086,9 +4118,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const originalLaunch = remote || docker ? fullCmd : `cd ${shellescape(workingDir)} && ${fullCmd}`;
     const inputBroker =
       localCodex && codexConfig?.noDaemon === true
-        ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!guard)
+        ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!guard || !!managerProfile)
         : undefined;
 
+    if (managerProfile && !inputBroker) return null;
     const nextRestoreConfig = inputBroker ? structuredClone(codexConfig) : undefined;
     const retiredBinding = session.codexRestoreStateBinding;
     const retiredConfig = session.codexRestoreConfig;
@@ -4188,11 +4221,44 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           return null;
         }
       }
+      if (managerProfile) {
+        if (!inputBroker || !(await managerProfile.confirm()) || !canDispatch()) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+        await inputBroker.setStartupAuthority(
+          managerProfile.files,
+          undefined,
+          undefined,
+          managerProfile.missing,
+          Number(process.hrtime.bigint() / 1_000_000n) + 2_000
+        );
+        if (!managerProfile.isCurrent() || !canDispatch()) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+      }
+      if (managerProfile) {
+        const pane = await this.inspectPaneForRecovery(muxName);
+        if (
+          !pane ||
+          pane.dead ||
+          pane.paneId !== managerProfile.expectedPane.paneId ||
+          pane.panePid !== managerProfile.expectedPane.panePid ||
+          !hasEmptyCodexComposer(pane.screen ?? '') ||
+          !canDispatch()
+        ) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+      }
       // Render only after startup authority is durably written; its exact bytes
       // are checked by Python before any child is created.
       const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
       guard?.noteDispatch();
-      const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${expected ? shellescape(expected.paneId) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
+      const managerPane = managerProfile?.expectedPane;
+      const targetPane = expected?.paneId ?? managerPane?.paneId;
+      const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${targetPane ? shellescape(targetPane) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
       const predicate = expected
         ? [
             `#{==:#{session_name},${muxName}}`,
@@ -4202,7 +4268,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             `#{==:#{pane_dead_status},${expected.status ?? ''}}`,
             `#{==:#{pane_dead_signal},${expected.paneSignalToken ?? ''}}`,
           ].reduce((all, term) => `#{&&:${all},${term}}`)
-        : undefined;
+        : managerPane
+          ? [
+              `#{==:#{session_name},${muxName}}`,
+              `#{==:#{pane_id},${managerPane.paneId}}`,
+              `#{==:#{pane_pid},${managerPane.panePid}}`,
+              '#{==:#{pane_dead},0}',
+              '#{==:#{window_panes},1}',
+              '#{==:#{session_windows},1}',
+            ].reduce((all, term) => `#{&&:${all},${term}}`)
+          : undefined;
       // The server evaluates this exact dead-process fence before queuing a no-k
       // respawn. A refused or lost response remains uncertainty-sealed by Session.
       const optionalDispatch = !!inputBroker && !guard && !options.onlyIfDead;
@@ -4215,12 +4290,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
       workerEffectMayHaveOccurred = true;
       const { stdout: spawnOutput } = await execAsync(
-        `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(expected!.paneId)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}${inputBroker && !guard && !options.onlyIfDead ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
+        `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(targetPane!)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}${inputBroker && !guard && !options.onlyIfDead ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
         {
           timeout: EXEC_TIMEOUT_MS,
         }
       );
-      if (expected && spawnOutput.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') {
+      if ((expected || managerProfile) && spawnOutput.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') {
         workerEffectMayHaveOccurred = false;
         await restoreRetiredProvenance();
         return null;
@@ -4250,7 +4325,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           const receipt = await inputBroker.startupReceipt(pid);
           if (receipt === 'not-sent') guard?.noteBrokerRefusal?.();
           if (receipt === 'started') guard?.noteBrokerSent?.();
-          if (receipt === 'not-sent' && !guard && !options.onlyIfDead) {
+          if (receipt === 'not-sent' && !guard && !options.onlyIfDead && !managerProfile) {
             const fallbackPid = await this.fallbackOptionalBroker(
               muxName,
               pid,
@@ -4277,6 +4352,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           }
         } else this.saveSessions();
       }
+      if (
+        managerProfile &&
+        pid &&
+        inputBroker &&
+        this.sessions.get(sessionId) === session &&
+        managerProfile.isCurrent()
+      )
+        this.supervisorManagerLaunches.set(sessionId, {
+          profile: managerProfile,
+          record: session,
+          pid,
+          incarnation: inputBroker.incarnation,
+        });
       return pid;
     } catch (err) {
       await restoreRetiredProvenance();
@@ -4548,6 +4636,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * In test mode: removes from memory only (no real kill).
    */
   async killSession(sessionId: string): Promise<boolean> {
+    this.supervisorManagerLaunches?.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) {
       return false;
@@ -5461,6 +5550,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   destroy(): void {
+    this.supervisorManagerLaunches?.clear();
     this.brokerCleanupProvider = undefined;
     if (this.brokerCleanupInterval) clearInterval(this.brokerCleanupInterval);
     this.brokerCleanupInterval = undefined;

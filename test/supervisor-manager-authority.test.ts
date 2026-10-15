@@ -55,6 +55,7 @@ interface Internals {
   taskStore: TaskStore;
   supervisorStore: SupervisorStore;
   getSupervisorController(session: Session): SupervisorController | undefined;
+  prepareSupervisorManager(session: Session, isCurrent: () => boolean): Promise<boolean>;
   getTaskController(session: Session): TaskController | undefined;
   getRecoveryController(session: Session): RecoveryController | undefined;
   stopRecoveryController(id: string, drop: boolean): Promise<void>;
@@ -115,6 +116,8 @@ async function fakeSession(id: string, conversationId: string): Promise<Session>
     muxSession,
     codexConfig: { noDaemon: true, resumeSessionId: conversationId },
   });
+  // This suite isolates Task/native issuer authority after the separate restricted launch boundary.
+  vi.spyOn(session, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
   constructedSessions.push(session);
   expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   inputProofs.set(session, inputProof);
@@ -185,10 +188,12 @@ describe('manager authority at the real server boundary', () => {
   let fixtureData: string;
   let previousData: string | undefined;
   let previousMode: string | undefined;
+  let previousPassword: string | undefined;
 
   beforeEach(async () => {
     previousData = process.env.CODEMAN_DATA_DIR;
     previousMode = process.env.CODEMAN_MULTIUSER;
+    previousPassword = process.env.CODEMAN_PASSWORD;
     grantDirectory = undefined;
     fixtureData = await mkdtemp(join(homedir(), 'manager-authority-state-'));
     process.env.CODEMAN_DATA_DIR = fixtureData;
@@ -364,6 +369,8 @@ describe('manager authority at the real server boundary', () => {
     else process.env.CODEMAN_DATA_DIR = previousData;
     if (previousMode === undefined) delete process.env.CODEMAN_MULTIUSER;
     else process.env.CODEMAN_MULTIUSER = previousMode;
+    if (previousPassword === undefined) delete process.env.CODEMAN_PASSWORD;
+    else process.env.CODEMAN_PASSWORD = previousPassword;
     invalidateUsersCache();
     if (grantDirectory) await rm(grantDirectory, { recursive: true, force: true });
     await rm(fixtureData, { recursive: true, force: true });
@@ -381,6 +388,87 @@ describe('manager authority at the real server boundary', () => {
       }) + '\n'
     );
   }
+
+  it('prepares only a verified idle manager with explicit request scope, retaining UUID and private startup evidence', async () => {
+    await manager.pause();
+    process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';
+    // Global HTTP authentication is independently exercised by the actual server auth suite.
+    Reflect.set(server, 'supervisorManagerAuthReady', true);
+    observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+    const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      expect(options.isCurrent()).toBe(true);
+      expect(options.token).toMatch(/^codeman-manager-v1\.[a-f0-9]{64}$/);
+      expect(options.files?.some((file) => file.path === rolloutPath)).toBe(true);
+      expect(managerSession.codexConfig?.resumeSessionId).toBe(MANAGER_THREAD);
+      return true;
+    });
+    expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+    expect(prepare).toHaveBeenCalledOnce();
+  });
+
+  it.each(['active', 'working', 'unknown'] as const)(
+    'does not interrupt a %s manager to convert its role',
+    async (kind) => {
+      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager');
+      if (kind !== 'active') await manager.pause();
+      observation = {
+        ...observation,
+        activity: kind === 'unknown' ? 'unknown' : 'working',
+        reason: kind === 'unknown' ? 'identity-unverified' : 'turn-running',
+        processReady: kind !== 'unknown',
+      };
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(false);
+      expect(prepare).not.toHaveBeenCalled();
+    }
+  );
+
+  it('does not acknowledge conversion after its owner request is cancelled during the final launch await', async () => {
+    await manager.pause();
+    process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';
+    // Global HTTP authentication is independently exercised by the actual server auth suite.
+    Reflect.set(server, 'supervisorManagerAuthReady', true);
+    observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+    const entered = createDeferred(),
+      release = createDeferred();
+    let current = true;
+    vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      expect(options.isCurrent()).toBe(true);
+      entered.resolve();
+      await release.promise;
+      return true;
+    });
+    const work = internals.prepareSupervisorManager(managerSession, () => current);
+    try {
+      await entered.promise;
+      current = false;
+      release.resolve();
+      expect(await work).toBe(false);
+    } finally {
+      release.resolve();
+      await work;
+    }
+  });
+
+  it('does not convert on an anonymous server or adopt an unscoped running CLI at Start', async () => {
+    await manager.pause();
+    const priorMode = process.env.CODEMAN_MULTIUSER,
+      priorPassword = process.env.CODEMAN_PASSWORD;
+    const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager');
+    try {
+      process.env.CODEMAN_MULTIUSER = '0';
+      delete process.env.CODEMAN_PASSWORD;
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(false);
+      expect(prepare).not.toHaveBeenCalled();
+    } finally {
+      if (priorMode === undefined) delete process.env.CODEMAN_MULTIUSER;
+      else process.env.CODEMAN_MULTIUSER = priorMode;
+      if (priorPassword === undefined) delete process.env.CODEMAN_PASSWORD;
+      else process.env.CODEMAN_PASSWORD = priorPassword;
+    }
+    vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockReturnValue(false);
+    await expect(manager.start()).rejects.toThrow(/restricted manager/);
+    expect(effects).not.toHaveBeenCalled();
+  });
 
   const unfinished = {
     outcome: 'unfinished',

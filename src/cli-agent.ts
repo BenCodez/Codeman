@@ -42,6 +42,7 @@ import { getCli } from './config/cli-registry/registry.js';
 import { GLYPH, palette, table } from './cli-style.js';
 import { getErrorMessage } from './types.js';
 import { stripAnsi as stripAnsiSequences } from './utils/regex-patterns.js';
+import { runSupervisorManagerMcp } from './supervisor/manager-mcp-stdio.js';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Context and guard
@@ -80,6 +81,11 @@ export function resolveAgentContext(
   env: NodeJS.ProcessEnv = process.env,
   envFile: () => Record<string, string> = readCodemanEnvFile
 ): AgentContext {
+  if (env.CODEMAN_SUPERVISOR_SCOPED === '1') {
+    throw new AgentGuardError(
+      'Restricted supervisor managers must use their scoped MCP tools; owner credentials are unavailable.'
+    );
+  }
   if (env.CODEMAN_MUX !== '1') {
     throw new AgentGuardError('Not inside a Codeman-managed session (CODEMAN_MUX is not 1); refusing to act.');
   }
@@ -864,6 +870,21 @@ export function registerAgentCommands(program: Command): Command {
   const agent = program
     .command('agent')
     .description('Talk to other sessions from inside one (any CLI mode): list, spawn, send, wait, read, interrupt, rm');
+
+  agent
+    .command('supervisor-mcp')
+    .description('Private stdio bridge for the launch-owned supervisor tool profile')
+    .requiredOption('--credential-file <path>', 'Private launch credential file')
+    .action(async (options: { credentialFile: string }) => {
+      try {
+        await runSupervisorManagerMcp(options.credentialFile);
+      } catch {
+        console.error(
+          'Supervisor bridge refused or disconnected; inspect status before reusing an operation requestId'
+        );
+        process.exitCode = EXIT.refused;
+      }
+    });
 
   agent
     .command('ls')

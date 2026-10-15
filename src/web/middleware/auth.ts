@@ -32,6 +32,8 @@ import {
   LOST_FRAME_PAGE_CSP,
 } from '../webview-proxy.js';
 import { ApiErrorCode, createErrorResponse, type AuthUser } from '../../types.js';
+import type { ManagerCredentialRegistry } from '../../supervisor/manager-credentials.js';
+import { isSupervisorManagerRequest, registerSupervisorManagerAuth } from './supervisor-manager-auth.js';
 
 // Request-scoped identity (multi-user). Single-user leaves it undefined and the
 // ownership helpers default to a synthetic admin (see route-helpers).
@@ -281,7 +283,12 @@ function matchesRegisteredRoute(req: FastifyRequest, url: string): boolean {
  *
  * @returns AuthState for lifecycle management (dispose on server stop)
  */
-export function registerAuthMiddleware(app: FastifyInstance, https: boolean, basePath = ''): AuthState {
+export function registerAuthMiddleware(
+  app: FastifyInstance,
+  https: boolean,
+  basePath = '',
+  managerCredentials?: ManagerCredentialRegistry
+): AuthState {
   const state: AuthState = {
     authSessions: null,
     authFailures: null,
@@ -293,6 +300,7 @@ export function registerAuthMiddleware(app: FastifyInstance, https: boolean, bas
   // Always declare req.authUser so downstream reads are safe (single-user leaves it
   // undefined; the ownership helpers then default to a synthetic admin).
   if (!app.hasRequestDecorator('authUser')) app.decorateRequest('authUser', undefined);
+  registerSupervisorManagerAuth(app, managerCredentials);
 
   const multiUser = isMultiUserMode();
   const authPassword = process.env.CODEMAN_PASSWORD;
@@ -350,6 +358,10 @@ export function registerAuthMiddleware(app: FastifyInstance, https: boolean, bas
   const expectedHeader = 'Basic ' + Buffer.from(`${authUsername}:${authPassword}`).toString('base64');
 
   app.addHook('onRequest', (req, reply, done) => {
+    if (isSupervisorManagerRequest(req)) {
+      done();
+      return;
+    }
     const bypass = checkHookSecretBypass(req, reply, hookSecretFailures);
     if (bypass === 'bypass') {
       done();
@@ -496,6 +508,7 @@ function registerMultiUserAuthHook(
   };
 
   app.addHook('onRequest', async (req, reply) => {
+    if (isSupervisorManagerRequest(req)) return;
     const bypass = checkHookSecretBypass(req, reply, hookSecretFailures);
     if (bypass === 'bypass' || bypass === 'rejected') return;
 

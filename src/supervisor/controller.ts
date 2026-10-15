@@ -440,7 +440,7 @@ export class SupervisorController {
                   : recovery.activity;
   }
 
-  assign(workerId: string, requestId: string): Promise<SupervisorState> {
+  assign(workerId: string, requestId: string, callerIsCurrent?: () => boolean): Promise<SupervisorState> {
     SupervisorRequestSchema.parse({ requestId });
     return this.operation(
       workerId,
@@ -527,7 +527,8 @@ export class SupervisorController {
         const outcome = classifyTaskKickoff(started);
         if (outcome === 'uncertain') throw new Error('Worker task delivery acceptance is uncertain');
         if (outcome === 'refused') throw new SupervisorOperationRefused('Worker was not ready for task kickoff');
-      }
+      },
+      callerIsCurrent
     );
   }
 
@@ -547,7 +548,7 @@ export class SupervisorController {
     );
   }
 
-  retry(workerId: string, requestId: string): Promise<SupervisorState> {
+  retry(workerId: string, requestId: string, callerIsCurrent?: () => boolean): Promise<SupervisorState> {
     SupervisorRequestSchema.parse({ requestId });
     let inspected: RecoveryState | undefined;
     return this.operation(
@@ -576,7 +577,8 @@ export class SupervisorController {
         if (outcome === 'uncertain') throw new Error('Worker recovery delivery acceptance is uncertain');
         if (!inspected || outcome === 'refused')
           throw new SupervisorOperationRefused('Recovery controller refused the retry');
-      }
+      },
+      callerIsCurrent
     );
   }
 
@@ -648,10 +650,19 @@ export class SupervisorController {
       configured: SupervisorState['workers'][number],
       isCurrent: RecoveryActionAuthority,
       runtimeStartedAt: number
-    ) => Promise<void>
+    ) => Promise<void>,
+    callerIsCurrent?: () => boolean
   ): Promise<SupervisorState> {
+    const callerCurrent = () => {
+      try {
+        return !callerIsCurrent || callerIsCurrent() === true;
+      } catch {
+        return false;
+      }
+    };
     const revision = this.revision;
     return this.enqueue(async () => {
+      if (!callerCurrent()) throw new SupervisorOperationRefused('Supervisor credential is no longer current');
       if (this.state.handledRequestIds.includes(requestId)) {
         const binding = this.state.handledRequestBindings.find((entry) => entry.requestId === requestId);
         if (!binding || binding.workerId !== workerId || binding.action !== action)
@@ -677,6 +688,7 @@ export class SupervisorController {
         this.hasRuntimeBudget(runtimeStartedAt, configured.maxRuntimeMs) &&
         this.hasRuntimeBudget(this.state.startedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS);
       const isCurrent: RecoveryActionAuthority = () =>
+        callerCurrent() &&
         !this.stopped &&
         this.revision === revision &&
         this.state.phase === 'active' &&

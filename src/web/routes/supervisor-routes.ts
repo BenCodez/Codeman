@@ -1,6 +1,6 @@
 /** @fileoverview Owner configuration and manager-scoped Codex supervisor operations. */
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
-import { ZodError } from 'zod';
+import { z, ZodError } from 'zod';
 import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { SupervisorActionSchema, SupervisorConfigSchema, SupervisorRequestSchema } from '../../supervisor/schema.js';
 import { SupervisorValidationError } from '../../supervisor/controller.js';
@@ -53,6 +53,35 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
       });
     return resolved.result;
   };
+
+  app.post('/api/sessions/:id/supervisor/prepare-manager', async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const session = findSessionOrFail(ctx, id, req);
+    parseBody(
+      z.object({ confirmRestrictedManager: z.literal(true) }).strict(),
+      req.body,
+      'Explicit restricted manager confirmation is required'
+    );
+    let cancelled = false;
+    req.raw.once('aborted', () => {
+      cancelled = true;
+    });
+    reply.raw.once('close', () => {
+      if (!reply.raw.writableFinished) cancelled = true;
+    });
+    const current = () => !cancelled && ctx.sessions.get(id) === session;
+    try {
+      if (!ctx.prepareSupervisorManager || !(await ctx.prepareSupervisorManager(session, current)) || !current())
+        throw new SupervisorValidationError('Restricted manager preparation was refused');
+      return { success: true, data: { managerReady: true } };
+    } catch (error) {
+      return operationFailure(
+        reply,
+        error,
+        'Restricted manager requires authentication and a verified idle conversation without unresolved work'
+      );
+    }
+  });
 
   app.get('/api/sessions/:id/supervisor', async (req) => ({ success: true, data: controller(req).result.getStatus() }));
   app.put('/api/sessions/:id/supervisor', async (req, reply) => {

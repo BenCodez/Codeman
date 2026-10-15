@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { prepareSupervisorManagerLaunch, type SupervisorManagerLaunch } from './supervisor/manager-launch.js';
 import { createHash } from 'node:crypto';
 import { getDataDirPath } from './config/instance.js';
 import { RetiredInputClients } from './input-client-retirement.js';
@@ -998,6 +999,9 @@ export class Session extends EventEmitter {
     if (restoredConversation) this._claudeSessionId = restoredConversation;
     this._mux = config.mux || null;
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
+    this.on('recoveryUserInput', () => {
+      this._supervisorManagerProfile = undefined;
+    });
     this._muxSession = config.muxSession || null;
     if (
       this._muxSession?.recoveryInputBroker !== undefined ||
@@ -2373,7 +2377,132 @@ export class Session extends EventEmitter {
    */
   async restartCli(): Promise<boolean> {
     if (this._inputDeliveryInFlight) return false;
+    this._supervisorManagerProfile = undefined;
     return this._withPaneLifecycle(() => this._doRestartCli());
+  }
+
+  /** Only a newly acknowledged restricted launch can acquire the manager role. Never hydrated from state. */
+  isSupervisorManagerLaunchCurrent(): boolean {
+    const profile = this._supervisorManagerProfile;
+    const context = this.getRecoveryContext();
+    return (
+      !!profile &&
+      profile.isCurrent() &&
+      !this._closing &&
+      !this._isStopped &&
+      context.managed &&
+      context.noDaemon &&
+      !context.switchPending &&
+      !context.untrackedInput &&
+      !context.inputBrokerPending &&
+      this._mux?.isSupervisorManagerLaunchCurrent?.(this.id, profile) === true
+    );
+  }
+
+  /** Explicit owner conversion of a separately verified idle pane; no create or fallback path. */
+  async prepareSupervisorManager(options: {
+    token: string;
+    endpoint: string;
+    files?: readonly import('./recovery/private-file-witness.js').PrivateFileWitness[];
+    isCurrent(): boolean;
+  }): Promise<boolean> {
+    const context = this.getRecoveryContext(),
+      mux = this._mux,
+      record = this._muxSession;
+    const conversationId = this._codexConfig?.resumeSessionId;
+    if (
+      this.mode !== 'codex' ||
+      this._remote ||
+      this._docker ||
+      !mux ||
+      !record ||
+      !this.paneExitApplies ||
+      this.paneLifecycleInFlight ||
+      this.recoveryInputReserved ||
+      !context.managed ||
+      !context.noDaemon ||
+      context.switchPending ||
+      context.untrackedInput ||
+      context.inputBrokerPending ||
+      !context.codexHome ||
+      !conversationId ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(conversationId) ||
+      options.isCurrent() !== true
+    )
+      return false;
+    const nativePane = await mux.inspectPaneForRecovery?.(record.muxName);
+    if (
+      !nativePane ||
+      nativePane.dead ||
+      nativePane.panePid !== record.pid ||
+      !nativePane.paneId ||
+      !hasEmptyCodexComposer(nativePane.screen ?? '') ||
+      options.isCurrent() !== true
+    )
+      return false;
+    this._supervisorManagerProfile = undefined;
+    const scope = () =>
+      JSON.stringify([
+        this.owner,
+        this.mode,
+        this.workingDir,
+        this._codexConfig,
+        this._envOverrides,
+        this._recoveryCodexHome,
+        record.recoveryCodexHome,
+      ]);
+    const snapshot = scope();
+    let profile: SupervisorManagerLaunch | undefined = undefined;
+    const current = () => {
+      try {
+        return (
+          options.isCurrent() === true &&
+          !this._closing &&
+          !this._isStopped &&
+          !this._remote &&
+          !this._docker &&
+          this._mux === mux &&
+          this._muxSession === record &&
+          scope() === snapshot &&
+          !this._recoveryUntrackedInput &&
+          !this._recoverySwitchPending &&
+          (!profile || this._supervisorManagerProfile === profile)
+        );
+      } catch {
+        return false;
+      }
+    };
+    profile = await prepareSupervisorManagerLaunch({
+      home: context.codexHome,
+      workingDir: this.workingDir,
+      expectedPane: { paneId: nativePane.paneId, panePid: nativePane.panePid },
+      additionalFiles: options.files,
+      conversationId,
+      token: options.token,
+      endpoint: options.endpoint,
+      bridgeCommand: 'codeman',
+      bridgeArgs: ['agent', 'supervisor-mcp'],
+      isCurrent: current,
+    });
+    if (!profile) return false;
+    this._supervisorManagerProfile = profile;
+    if (!current()) {
+      this._supervisorManagerProfile = undefined;
+      return false;
+    }
+    const ready = await this._withPaneLifecycle(async () => {
+      if (!current() || !(await profile!.confirm()) || !current()) return false;
+      const launch = this._buildRespawnPaneOptions();
+      launch.supervisorManager = profile;
+      const priorCurrent = launch.ownerLaunchIsCurrent;
+      launch.ownerLaunchIsCurrent = () => current() && priorCurrent?.() === true;
+      const pid = await mux.respawnPane(launch);
+      if (!pid || !current() || mux.isSupervisorManagerLaunchCurrent?.(this.id, profile!) !== true) return false;
+      this.clearPaneExitForNewPane();
+      return current();
+    });
+    if (!ready && this._supervisorManagerProfile === profile) this._supervisorManagerProfile = undefined;
+    return ready && this.isSupervisorManagerLaunchCurrent();
   }
 
   private _recoveryGeneration = 0;
@@ -2389,6 +2518,7 @@ export class Session extends EventEmitter {
     configuration: string;
     isCurrent: () => boolean;
   };
+  private _supervisorManagerProfile?: SupervisorManagerLaunch;
   private _remoteWakeReady?: () => boolean;
   private _remoteWakeReadinessWork?: Promise<boolean>;
   private _remoteWakeReadinessRevision = 0;
@@ -3836,6 +3966,7 @@ export class Session extends EventEmitter {
   private _buildRespawnPaneOptions(): import('./mux-interface.js').RespawnPaneOptions {
     const options: import('./mux-interface.js').RespawnPaneOptions = {
       ownerLaunchIsCurrent: this._captureOwnerLaunchAuthority('respawn'),
+      supervisorManager: this._supervisorManagerProfile,
       sessionId: this.id,
       workingDir: this.workingDir,
       mode: this.mode,

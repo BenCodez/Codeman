@@ -340,3 +340,38 @@ it('keeps an uncertain supervisor reservation for a persistence error despite la
     await f.cleanup();
   }
 });
+
+it('a revoked manager credential cannot commit a held real Task assignment or dispatch its input', async () => {
+  const f = await fixture();
+  let credentialCurrent = true;
+  const before = f.workerTask.getStatus(),
+    bytes = await readFile(f.path, 'utf8');
+  const work = f.supervisor.assign(WID, 'held-scoped-credential', () => credentialCurrent).catch((error) => error);
+  try {
+    await f.held;
+    credentialCurrent = false;
+    f.release();
+    expect(await work).toBeInstanceOf(Error);
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.workerTask.getStatus()).toEqual(before);
+    expect(await readFile(f.path, 'utf8')).toBe(bytes);
+    expect(f.supervisor.getStatus().inFlight).toBeUndefined();
+    expect(f.supervisor.getStatus().workers[0].assignments).toBe(0);
+  } finally {
+    f.release();
+    await work;
+    await f.cleanup();
+  }
+});
+it('expired manager credentials are refused before any new operation reservation', async () => {
+  const f = await fixture();
+  try {
+    const before = f.supervisor.getStatus();
+    await expect(f.supervisor.assign(WID, 'expired-scoped-assign', () => false)).rejects.toThrow('credential');
+    await expect(f.supervisor.retry(WID, 'expired-scoped-retry', () => false)).rejects.toThrow('credential');
+    expect(f.supervisor.getStatus()).toEqual(before);
+    expect(f.act).not.toHaveBeenCalled();
+  } finally {
+    await f.cleanup();
+  }
+});

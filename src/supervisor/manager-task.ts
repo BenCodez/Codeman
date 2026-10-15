@@ -42,7 +42,7 @@ export function managerProgressAllowsAction(
 
 export function buildSupervisorManagerTask(objective: string): TaskUpdate {
   return TaskUpdateSchema.parse({
-    objective: `Manage the selected workers for this objective: ${objective}\nUse only codeman agent supervisor commands. Run "codeman agent supervisor workers" to inspect the configured worker IDs. Assign with "codeman agent supervisor assign <worker-id> --request-id <durable-id>". Retry only a reported crash. Base status on checkpoints, verified criteria, and recovery health. Never send raw input, interrupt, kill, merge, deploy, change privileges, or claim manual acceptance. Stop for waiting-user, authentication, usage limits, unreachable or unknown state, clean exit, or uncertain delivery.`,
+    objective: `Manage the selected workers for this objective: ${objective}\nUse only the codeman_supervisor MCP tools. Call supervisor_workers to inspect the configured worker IDs. Assign with supervisor_assign using the exact workerId and a durable requestId; preserve that requestId after an uncertain response. Retry only a reported crash. Base status on checkpoints, verified criteria, and recovery health. Never send raw input, interrupt, kill, merge, deploy, change privileges, or claim manual acceptance. Stop for waiting-user, authentication, usage limits, unreachable or unknown state, clean exit, or uncertain delivery.`,
     criteria: [
       {
         id: 'owner-supervisor-acceptance',

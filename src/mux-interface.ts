@@ -218,6 +218,8 @@ export interface RecoveryPaneIdentity {
 }
 
 export interface RespawnPaneOptions {
+  /** Private fresh restricted manager launch; never restored or accepted from request JSON. */
+  supervisorManager?: import('./supervisor/manager-launch.js').SupervisorManagerLaunch;
   /** Current owner intent for a certified optional guard fallback; never automatic authority. */
   ownerLaunchIsCurrent?(): boolean;
   /** Automatic local recovery checks authority again immediately before its worker effect. */
@@ -320,6 +322,10 @@ export interface PaneCaptureOptions {
  * - `paneExitsUpdated` () - A pane read finished; ask `getPaneExit()` per session
  */
 export interface TerminalMultiplexer extends EventEmitter {
+  isSupervisorManagerLaunchCurrent?(
+    sessionId: string,
+    profile: import('./supervisor/manager-launch.js').SupervisorManagerLaunch
+  ): boolean;
   /** Optional private reference provider: unknown snapshots disable broker retirement. */
   setBrokerCleanupReferenceProvider?(
     provider: import('./recovery/codex-broker-cleanup.js').BrokerCleanupReferenceProvider
