@@ -36,9 +36,20 @@ const nativeRead = vi.hoisted(() =>
     throw new Error('A test runner must never read a real pane');
   })
 );
+const deniedChild = vi.hoisted(() =>
+  vi.fn(() => {
+    throw new Error('A task fixture must never execute a real child process');
+  })
+);
 vi.mock('node:child_process', async (original) => ({
   ...(await original<typeof import('node:child_process')>()),
   execSync: nativeRead,
+  exec: deniedChild,
+  execFile: deniedChild,
+  execFileSync: deniedChild,
+  spawn: deniedChild,
+  spawnSync: deniedChild,
+  fork: deniedChild,
 }));
 
 const THREAD = '11111111-2222-3333-4444-555555555555';
@@ -54,6 +65,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.useRealTimers();
   nativeRead.mockClear();
+  deniedChild.mockClear();
   for (const root of brokerRoots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
 const line = (at: number, payload: unknown) =>
@@ -443,7 +455,15 @@ describe('transport canonical task prompts', () => {
     }
   );
 
-  it('accepts both real kickoff and continuation bytes and processes subsequent structured progress', async () => {
+  it.each([
+    {
+      name: 'accepts both real kickoff and continuation bytes and processes subsequent structured progress',
+      kind: 'recorded-pipe',
+    },
+    { name: 'refuses canonical task delivery without an explicit private pipe fixture', kind: 'missing-pipe' },
+    { name: 'refuses controlled owner input without an injected native pane reader', kind: 'missing-owner-pane' },
+    { name: 'refuses controlled owner input with an invalid injected native pane reader', kind: 'invalid-owner-pane' },
+  ] as const)('$name', async ({ kind }) => {
     vi.spyOn(Date, 'now').mockReturnValue(10_000);
     const root = await fs.mkdtemp(join(homedir(), 'task-canonical-input-'));
     brokerRoots.push(root);
@@ -482,10 +502,20 @@ describe('transport canonical task prompts', () => {
     const screen = '›\n  example-model high · /tmp\n';
     let joinedScreen = screen;
     const captured: string[] = [];
+    const commands: string[] = [];
+    const buffers = new Map<string, string>();
+    const loadedFrames: string[] = [];
     const mux = new TmuxManager(
       async (command) => {
+        commands.push(command);
+        expect(command).not.toContain('CODEMAN_INPUT_V1');
         const tokens = shellWords(command);
         const conditional = tokens.indexOf('if-shell');
+        if (conditional < 0 && tokens.includes('delete-buffer')) {
+          expect(tokens.slice(-3, -1)).toEqual(['delete-buffer', '-b']);
+          buffers.delete(tokens.at(-1)!);
+          return { stdout: '' };
+        }
         expect(conditional).toBeGreaterThan(0);
         expect(tokens.slice(conditional + 1, conditional + 4)).toEqual(['-F', '-t', '%7']);
         const expected = {
@@ -500,10 +530,16 @@ describe('transport canonical task prompts', () => {
         expect(terms).toHaveLength(6);
         expect(terms.every((term) => expected[term[1] as keyof typeof expected] === term[2])).toBe(true);
         const send = shellWords(tokens[conditional + 5]);
-        expect(send.slice(0, 3)).toEqual(['send-keys', '-t', '%7']);
-        if (send[3] === '-l') {
-          expect(send).toHaveLength(5);
-          const match = send[4].match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):[a-f0-9]{64}/);
+        expect(send.slice(0, 4)).toEqual(['paste-buffer', '-r', '-d', '-b']);
+        expect(send).toHaveLength(7);
+        expect(send.slice(5)).toEqual(['-t', '%7']);
+        expect(send[4]).toMatch(/^codeman-private-[a-f0-9-]+$/);
+        const wire = buffers.get(send[4]);
+        expect(wire).toBeDefined();
+        expect(command).not.toContain(wire!);
+        buffers.delete(send[4]);
+        {
+          const match = wire!.match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):[a-f0-9]{64}/);
           expect(match).not.toBeNull();
           const packet = JSON.parse(Buffer.from(match![1], 'base64').toString());
           expect(packet.channel).toBe('auto');
@@ -516,11 +552,7 @@ describe('transport canonical task prompts', () => {
           }
           delivered.push(bytes);
           joinedScreen = `› ${delivered.at(-1)}\n  example-model high · /tmp\n`;
-        } else if (send[3] === 'Enter') {
-          expect(send).toHaveLength(4);
-          enters++;
-          joinedScreen = screen;
-        } else throw new Error('Unexpected fixture command');
+        }
         return { stdout: '' };
       },
       (muxName) => {
@@ -528,11 +560,26 @@ describe('transport canonical task prompts', () => {
         captured.push(joinedScreen);
         return joinedScreen;
       },
-      (muxName) => {
-        expect(muxName).toBe('codeman-aaaaaaaa');
-        return 'codeman-aaaaaaaa|%7|700|0||\n';
-      }
+      kind === 'missing-owner-pane'
+        ? undefined
+        : (muxName) => {
+            expect(muxName).toBe('codeman-aaaaaaaa');
+            return kind === 'invalid-owner-pane' ? 'codeman-aaaaaaaa|%7|701|0||\n' : 'codeman-aaaaaaaa|%7|700|0||\n';
+          }
     );
+    const pipe =
+      kind === 'missing-pipe'
+        ? undefined
+        : vi
+            .spyOn(
+              mux as unknown as { loadBrokerInputBuffer(name: string, data: string): Promise<void> },
+              'loadBrokerInputBuffer'
+            )
+            .mockImplementation(async (name, data) => {
+              expect(buffers.has(name)).toBe(false);
+              buffers.set(name, data);
+              loadedFrames.push(data);
+            });
     const muxSession = {
       sessionId: SESSION,
       muxName: 'codeman-aaaaaaaa',
@@ -547,6 +594,16 @@ describe('transport canonical task prompts', () => {
     } as MuxSession;
     mux.registerSession(muxSession);
     Reflect.get(mux, 'inputBrokers').set(SESSION, broker);
+    if (kind === 'missing-owner-pane' || kind === 'invalid-owner-pane') {
+      expect(await mux.sendInput(SESSION, 'Explicit owner prompt\r')).toBe(false);
+      expect(commands).toEqual([]);
+      expect(pipe).not.toHaveBeenCalled();
+      expect(delivered).toEqual([]);
+      expect(enters).toBe(0);
+      expect(nativeRead).not.toHaveBeenCalled();
+      expect(deniedChild).not.toHaveBeenCalled();
+      return;
+    }
     vi.spyOn(mux, 'inspectPaneForRecovery').mockResolvedValue({
       paneId: '%7',
       panePid: 700,
@@ -628,6 +685,20 @@ describe('transport canonical task prompts', () => {
         }),
     });
     await controller.resume();
+    if (kind === 'missing-pipe') {
+      expect(controller.getStatus()).toMatchObject({ phase: 'paused', continuations: 0 });
+      expect(controller.getStatus().kickoffAt).toBeUndefined();
+      expect(controller.getStatus().inFlight).toBeUndefined();
+      expect(delivered).toEqual([]);
+      expect(enters).toBe(0);
+      expect(loadedFrames).toEqual([]);
+      expect(commands).toHaveLength(1);
+      expect(commands[0]).toContain('delete-buffer -b');
+      expect(commands[0]).not.toContain('paste-buffer');
+      expect(nativeRead).not.toHaveBeenCalled();
+      expect(deniedChild).not.toHaveBeenCalled();
+      return;
+    }
     expect(delivered).toHaveLength(1);
     expect(delivered[0]).not.toMatch(/[\r\n]/);
     expect(delivered[0]).toContain("Fix the user's reported bug without duplicates");
@@ -698,13 +769,25 @@ describe('transport canonical task prompts', () => {
     expect(captured).toEqual([
       screen,
       screen,
+      screen,
+      `› ${delivered[0]}\n  example-model high · /tmp\n`,
       `› ${delivered[0]}\n  example-model high · /tmp\n`,
       `› ${delivered[0]}\n  example-model high · /tmp\n`,
       screen,
       screen,
+      screen,
+      `› ${delivered[1]}\n  example-model high · /tmp\n`,
       `› ${delivered[1]}\n  example-model high · /tmp\n`,
       `› ${delivered[1]}\n  example-model high · /tmp\n`,
     ]);
+    expect(loadedFrames).toHaveLength(4);
+    expect(buffers.size).toBe(0);
+    for (const wire of loadedFrames) {
+      expect(commands.join('\n')).not.toContain(wire);
+      expect(commands.join('\n')).not.toContain(wire.split(':')[1]);
+    }
+    expect(nativeRead).not.toHaveBeenCalled();
+    expect(deniedChild).not.toHaveBeenCalled();
     expect(kickoffFlight.promptHash).toBeDefined();
   });
 

@@ -15,6 +15,7 @@ import {
   restartRemoteCodexPane,
   restoreRemoteCodexWorker,
   type RemoteCodexInputRequest,
+  type RemoteCodexCommand,
 } from '../../src/recovery/remote-codex.js';
 import type { SessionRemote } from '../../src/types.js';
 import { guardedNativeTmuxFixture } from './remote-native-tmux.js';
@@ -188,9 +189,16 @@ if op=='capture-pane':
  chrome='Working (esc to interrupt)\n' if os.path.exists(root+'/busy') else ('Would you like to approve this?\n' if os.path.exists(root+'/approval') else '')
  if os.path.exists(root+'/tail-after') and text:open(os.environ['ROLLOUT'],'a').write(' ')
  sys.stdout.write(chrome+'› '+text+'\n  fixture-model default · /fixture/work\n');sys.exit(0)
-if op=='send-keys':
- assert a[3]=='-l' and a[4:6]==['-t','%7'] and len(a)==7
- data=a[6].encode('utf8');assert data.startswith(b'\x1eCODEMAN_INPUT_V1:') and data.endswith(b'\x1f')
+if op in ('paste-buffer','send-keys'):
+ if op=='paste-buffer':
+  assert a[3:6]==['-r','-d','-b'] and a[7:]==['-t','%7'] and len(a)==9
+  buffer_path=os.environ['EFFECT_LOG']+'.buffer-'+a[6]
+  data=open(buffer_path,'rb').read();os.unlink(buffer_path)
+ else:
+  # Retain the previous grammar to prove the argv privacy regression causally.
+  assert a[3:6]==['-l','-t','%7'] and len(a)==7
+  data=a[6].encode('utf8')
+ assert data.startswith(b'\x1eCODEMAN_INPUT_V1:') and data.endswith(b'\x1f')
  packet=json.loads(base64.b64decode(data.split(b':')[1]))
  expiry_event=None
  if packet['channel']=='auto' and base64.b64decode(packet['data'])==b'\r' and os.path.exists(root+'/expire-enter'):
@@ -228,6 +236,7 @@ if op=='send-keys':
   previous=open(target).read() if os.path.exists(target) else ''
   with open(temporary,'w') as f:f.write(previous+json.dumps(expiry_event)+'\n')
   os.replace(temporary,target)
+ if os.environ.get('PRIVATE_BUFFER_FAULT')=='paste-ack' and packet['channel']=='auto':sys.exit(1)
  sys.exit(0)
 raise AssertionError(op)
 `,
@@ -303,7 +312,9 @@ if op == 'if-shell':`
       clock: { localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at },
     },
   };
-  const run = async (command: string, input?: string) => {
+  const run = async (request: string | RemoteCodexCommand, input?: string | Buffer) => {
+    const command = typeof request === 'string' ? request : request.command;
+    if (typeof request !== 'string') input = request.input;
     if (
       env.PATH !== bin + ':/usr/bin:/bin' ||
       env.SHELL !== shim ||
@@ -382,8 +393,8 @@ if op == 'if-shell':`
         const now = Date.now();
         return { localBefore: now, localAfter: now, remoteBefore: now, remoteAfter: now };
       },
-      run: async (command: string) => {
-        const result = await run(command);
+      run: async (command: string, input: string) => {
+        const result = await run(command, input);
         if (result.failed) throw Error(result.error);
         return { stdout: result.stdout };
       },

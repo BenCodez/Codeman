@@ -12,9 +12,9 @@
  *   Entries held by an unfinished restore remain in the snapshot until resolved.
  *   Live-session checks prevent a crash after launch from duplicating a pane.
  * - No Session import: ownership and concurrency stay independent of launching.
- * - Spending is take-then-build: `take()` removes entries synchronously, before
- *   the route's first `await`, so a double-click or two devices cannot both
- *   reach the same entry and put two panes on one conversation.
+ * - An owner flight is reserved before the route first awaits. A failed journal
+ *   ACK requires explicit durable repair before `take()` removes entries, and
+ *   synchronous taking prevents two devices from building the same offer.
  * - One restore runs at a time per owner. `beginSpending()` single-flights the
  *   route, so two concurrent clicks cannot interleave pane creation for the same
  *   user, while two different users never block each other.
@@ -40,7 +40,12 @@ import type { RebootRestoreEntry } from '../reboot-restore.js';
 const PLAN_TTL_MS = 24 * 60 * 60 * 1000;
 
 type ParkedEntry = { entry: RebootRestoreEntry; spender: string | undefined };
-type SnapshotWriter = (path: string, text: string, isCurrent?: () => boolean) => void | Promise<void>;
+type SnapshotWriter = (
+  path: string,
+  text: string,
+  isCurrent?: () => boolean,
+  expectedPreviousText?: string
+) => void | Promise<void>;
 
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 
@@ -254,11 +259,18 @@ async function preserveUnacknowledgedPrimary(path: string, isCurrent: () => bool
   await syncSnapshotDirectory(path);
 }
 
-async function writeAtomicSnapshot(path: string, text: string, isCurrent: () => boolean = () => true): Promise<void> {
+async function writeAtomicSnapshot(
+  path: string,
+  text: string,
+  isCurrent: () => boolean = () => true,
+  expectedPreviousText?: string
+): Promise<void> {
   const shadowPath = `${path}.previous`;
   const shadow = await readSnapshot(shadowPath);
   const primary = shadow ? undefined : await readSnapshot(path);
   const previous = shadow?.text ?? primary?.text ?? JSON.stringify({ version: 1, builtAt: 0, entries: [] });
+  if (expectedPreviousText !== undefined && previous !== expectedPreviousText)
+    throw new Error('Restore offer journal no longer matches its acknowledged snapshot');
   if (shadow) await preserveUnacknowledgedPrimary(path, isCurrent);
   if (!isCurrent()) throw new Error('Restore offer transaction was cancelled');
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
@@ -341,6 +353,7 @@ export class RebootRestoreRegistry {
   private writes: Promise<unknown> = Promise.resolve();
   private readonly pendingWrites = new Set<symbol>();
   private persistenceWriteFailed = false;
+  private acknowledgedSnapshot?: string;
   private loading = false;
   private epoch = 0;
   private stateRevision = 0;
@@ -382,6 +395,7 @@ export class RebootRestoreRegistry {
     if (this.persistencePath === path) return this.configurationWork ?? Promise.resolve();
     this.epoch++;
     this.persistencePath = path;
+    this.acknowledgedSnapshot = undefined;
     this.persistenceLoadFailed = false;
     this.persistenceWriteFailed = false;
     this.loading = true;
@@ -398,6 +412,7 @@ export class RebootRestoreRegistry {
         if (this.epoch !== epoch) return;
         if (raw) {
           const saved = validateSnapshot(JSON.parse(raw.text));
+          this.acknowledgedSnapshot = raw.text;
           const entries = saved.entries;
           const eligible = planRebootRestore(
             entries.map((entry) => entry.sessionId),
@@ -415,6 +430,8 @@ export class RebootRestoreRegistry {
           );
           this.builtAt = saved.builtAt;
           this.stateRevision++;
+        } else {
+          this.acknowledgedSnapshot = JSON.stringify({ version: 1, builtAt: 0, entries: [] });
         }
       } catch {
         if (this.epoch !== epoch) return;
@@ -449,7 +466,8 @@ export class RebootRestoreRegistry {
   private async persistState(
     entries: ReadonlyMap<string, RebootRestoreEntry>,
     parked: ReadonlyMap<string, ParkedEntry>,
-    builtAt: number
+    builtAt: number,
+    expectedPreviousText?: string
   ): Promise<void> {
     if (this.persistenceLoadFailed) throw new Error('Restore offer journal could not be loaded; refusing overwrite');
     if (!this.persistencePath) return;
@@ -464,8 +482,9 @@ export class RebootRestoreRegistry {
       this.persistencePath === path &&
       JSON.stringify({ version: 1, builtAt, entries: outstanding }) === text;
     if (!current()) throw new Error('Restore offer transaction was superseded');
-    await this.snapshotWriter(path, text, current);
+    await this.snapshotWriter(path, text, current, expectedPreviousText);
     if (!current()) throw new Error('Restore offer transaction was superseded');
+    this.acknowledgedSnapshot = text;
     this.persistenceWriteFailed = false;
   }
 
@@ -712,6 +731,50 @@ export class RebootRestoreRegistry {
     return true;
   }
 
+  /** One owner click may retry a failed journal ACK; no automatic action retries it. */
+  async beginSpendingAfterRepair(owner?: string): Promise<boolean> {
+    this.dropIfExpired();
+    if (!this.persistenceWriteFailed) return this.beginSpending(owner);
+    if (
+      this.loading ||
+      this.expired ||
+      this.persistenceLoadFailed ||
+      !this.persistencePath ||
+      this.acknowledgedSnapshot === undefined ||
+      this.pendingWrites.size ||
+      this.spending.size ||
+      this.parked.size ||
+      this.failedReleases.size
+    )
+      return false;
+
+    // Reserve synchronously, before the repair's first await. Other owners also
+    // stay fenced until this single repair has a durable acknowledgement.
+    this.spending.add(owner);
+    const revision = this.stateRevision;
+    const epoch = this.epoch;
+    const expected = this.acknowledgedSnapshot;
+    let admitted = false;
+    try {
+      await this.enqueue(async () => {
+        await this.persistState(this.entries, this.parked, this.builtAt, expected);
+      });
+      this.dropIfExpired();
+      admitted =
+        !this.loading &&
+        !this.expired &&
+        !this.persistenceWriteFailed &&
+        this.pendingWrites.size === 0 &&
+        revision === this.stateRevision &&
+        this.spending.has(owner);
+      return admitted;
+    } catch {
+      return false;
+    } finally {
+      if (!admitted && this.epoch === epoch) this.spending.delete(owner);
+    }
+  }
+
   endSpending(owner?: string): void {
     this.spending.delete(owner);
     if (!this.failedReleases.delete(owner)) return;
@@ -720,6 +783,7 @@ export class RebootRestoreRegistry {
     // consume orphaned parks. Any actual/live worker still vetoes a new restore.
     for (const [id, held] of this.parked) {
       if (held.spender !== owner) continue;
+      this.revoked.add(held.entry);
       if (!this.expired) this.entries.set(id, held.entry);
       this.parked.delete(id);
     }
@@ -734,6 +798,7 @@ export class RebootRestoreRegistry {
     this.expired = false;
     this.expiryScheduled = false;
     this.configurationWork = undefined;
+    this.acknowledgedSnapshot = undefined;
     this.entries.clear();
     this.parked.clear();
     this.builtAt = 0;

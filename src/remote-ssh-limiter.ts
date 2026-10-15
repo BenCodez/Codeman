@@ -31,6 +31,7 @@
  *
  * NOT re-entrant: never acquire from inside a task already holding a slot.
  */
+import { performance } from 'node:perf_hooks';
 
 /**
  * Max remote probes/reads allowed to run concurrently across the whole process.
@@ -43,7 +44,39 @@ const MAX_CONCURRENT_REMOTE_SSH = (() => {
 })();
 
 let active = 0;
-const waiters: Array<() => void> = [];
+const waiters: Array<() => boolean> = [];
+
+/** Optional bounds for feature callers; ordinary remote-file callers retain their existing FIFO. */
+export interface RemoteSshAdmission {
+  deadline: number;
+  isCurrent?: () => boolean;
+}
+
+/** Only a refusal before its task starts certifies that no task effects occurred. */
+export class RemoteSshAdmissionError extends Error {
+  constructor(readonly reason: 'expired' | 'cancelled') {
+    super('Remote SSH admission ' + reason);
+    this.name = 'RemoteSshAdmissionError';
+  }
+}
+
+function admissionFailure(admission?: RemoteSshAdmission): RemoteSshAdmissionError | undefined {
+  if (!admission) return;
+  if (!Number.isFinite(admission.deadline) || performance.now() >= admission.deadline)
+    return new RemoteSshAdmissionError('expired');
+  if (admission.isCurrent) {
+    try {
+      const verdict: unknown = admission.isCurrent();
+      if (verdict instanceof Promise || (verdict && typeof (verdict as { then?: unknown }).then === 'function'))
+        void Promise.resolve(verdict).catch(() => {});
+      if (verdict === true) return;
+    } catch {
+      /* A throwing scope cannot admit work. */
+    }
+    return new RemoteSshAdmissionError('cancelled');
+  }
+  return undefined;
+}
 
 /** Test/diagnostic hook: remote calls currently holding a slot. */
 export function getActiveRemoteSshCount(): number {
@@ -60,30 +93,73 @@ export function getRemoteSshLimit(): number {
   return MAX_CONCURRENT_REMOTE_SSH;
 }
 
-function acquire(): Promise<void> {
+function acquire(admission?: RemoteSshAdmission): Promise<void> {
+  const failure = admissionFailure(admission);
+  if (failure) return Promise.reject(failure);
   if (active < MAX_CONCURRENT_REMOTE_SSH) {
     active++;
     return Promise.resolve();
   }
-  return new Promise<void>((resolve) => waiters.push(resolve));
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (failure?: RemoteSshAdmissionError) => {
+      settled = true;
+      if (timer) clearTimeout(timer);
+      const index = waiters.indexOf(grant);
+      if (index !== -1) waiters.splice(index, 1);
+      if (failure) reject(failure);
+      else resolve();
+    };
+    const grant = () => {
+      if (settled) return false;
+      const failure = admissionFailure(admission);
+      finish(failure);
+      return !failure;
+    };
+    const check = () => {
+      if (settled || !admission) return;
+      const failure = admissionFailure(admission);
+      if (failure) finish(failure);
+      else
+        timer = setTimeout(
+          check,
+          Math.min(admission.isCurrent ? 50 : Infinity, Math.ceil(admission.deadline - performance.now()))
+        );
+    };
+    waiters.push(grant);
+    if (admission) check();
+  });
 }
 
 function release(): void {
-  const next = waiters.shift();
-  if (next) {
+  let next: (() => boolean) | undefined;
+  while ((next = waiters.shift())) {
     // Hand the slot straight to the next waiter; `active` stays at the cap.
-    next();
-  } else {
-    active--;
+    if (next()) return;
   }
+  active--;
 }
 
-/** Run `task` once an ssh slot is free, releasing the slot afterward. */
-export async function runWithRemoteSshLimit<T>(task: () => Promise<T>): Promise<T> {
-  await acquire();
+/** A failed request may finish before its child closes; retain its slot until close. */
+export type RetainRemoteSshSlot = (closed: Promise<unknown>) => void;
+
+/** Run `task` once an ssh slot is free, retaining any registered child lifetimes. */
+export async function runWithRemoteSshLimit<T>(
+  task: (retain: RetainRemoteSshSlot) => Promise<T>,
+  admission?: RemoteSshAdmission
+): Promise<T> {
+  await acquire(admission);
+  const retained: Promise<unknown>[] = [];
+  const retain: RetainRemoteSshSlot = (closed) => {
+    retained.push(Promise.resolve(closed).catch(() => {}));
+  };
   try {
-    return await task();
+    const failure = admissionFailure(admission);
+    if (failure) throw failure;
+    return await task(retain);
   } finally {
-    release();
+    if (retained.length) void Promise.all(retained).then(release);
+    else release();
   }
 }

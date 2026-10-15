@@ -47,6 +47,7 @@ async function fixture(kind: Kind, jump: number, phase: Phase = 'pane') {
       preload,
       String.raw`
 const fs=require('fs'),cp=require('child_process'),real=Date.now.bind(Date),native=cp.execFileSync;
+const buffers=new Map;
 Date.now=()=>real()+Number(fs.readFileSync(process.env.CLOCK_OFFSET_FILE,'utf8'));
 cp.execFileSync=function(file,args,options){
  const armed=fs.existsSync(process.env.CLOCK_ARMED_FILE);
@@ -54,7 +55,10 @@ cp.execFileSync=function(file,args,options){
  if(armed && args[2]==='has-session') phase='pane';
  const command=args[2]==='if-shell'?args[7]:'';
  if(armed && command && command.includes('respawn-pane')) phase='effect';
- const match=command && command.match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):/);
+ if(args[2]==='load-buffer')buffers.set(args[4],String(options.input));
+ const name=command && command.match(/codeman-private-[a-f0-9-]{36}/);
+ const frame=name?buffers.get(name[0]):'';
+ const match=frame && frame.match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):/);
  if(armed && match){
   const packet=JSON.parse(Buffer.from(match[1],'base64').toString());
   if(packet.channel==='auto') phase=Buffer.from(packet.data,'base64').toString()==='\r'?'enter':'text';
@@ -79,9 +83,9 @@ cp.execFileSync=function(file,args,options){
     const arm = () => writeFile(armed, '1');
     let wireAction: ReturnType<typeof parseRemoteCodexAction>;
     const run = f.options.transport.run;
-    f.options.transport.run = async (command) => {
+    f.options.transport.run = async (command, input) => {
       await arm();
-      const result = await run(command);
+      const result = await run(command, input);
       wireAction = parseRemoteCodexAction(result.stdout);
       return result;
     };

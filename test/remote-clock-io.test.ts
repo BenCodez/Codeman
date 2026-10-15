@@ -118,7 +118,7 @@ function options(): RemoteCodexExecutionOptions {
     provisionTransport: { run: provision },
     transport: {
       clock: (host) => readOnlyIo(() => sampleRemoteCodexClock(host, false)),
-      run: (command) => fixture.exec(command),
+      run: (command, input) => fixture.exec(command, input),
     },
   };
 }
@@ -418,7 +418,7 @@ describe('clock sample transport separation', () => {
     'normalizes verified remote mtime while retaining native clock with %i ms skew',
     async (offset) => {
       validExec(offset);
-      const evidence = await readOnlyIo(() => inspectRemoteCodex(remote, request(offset)));
+      const evidence = await readOnlyIo(() => inspectRemoteCodex(remote, request(offset), options()));
       expect(evidence).toMatchObject({ transport: 'reachable', session: 'present', identity: { reason: 'verified' } });
       if (evidence.transport === 'reachable' && evidence.session !== 'unknown') {
         expect(evidence.identity.changedAt).toBeLessThanOrEqual(Date.now());
