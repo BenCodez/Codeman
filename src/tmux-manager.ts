@@ -25,7 +25,11 @@ import { EventEmitter } from 'node:events';
 import { createHash, randomUUID } from 'node:crypto';
 import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
 import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
-import { ownedRemoteBrokerCache, type OwnedRemoteBrokerScope } from './recovery/remote-input-broker-cache.js';
+import {
+  ownedRemoteBrokerCache,
+  type OwnedRemoteBrokerScope,
+  type OwnedRemoteBrokerDescriptor,
+} from './recovery/remote-input-broker-cache.js';
 import { provisionRemoteInputBroker } from './recovery/remote-input-broker.js';
 import { observeOwnedRemoteBroker } from './recovery/remote-broker-launch.js';
 import type { PrivateFileWitness } from './recovery/private-file-witness.js';
@@ -1782,6 +1786,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private readonly inputBrokers = new Map<string, CodexInputBroker>();
   private readonly inputBrokerLoads = new Map<string, Promise<CodexInputBroker | undefined>>();
   private readonly inputQueues = new Map<string, Promise<unknown>>();
+  private ownerBrokerHydrations = new Map<string, { binding: string; deadline: number; work: Promise<boolean> }>();
 
   private remoteBrokerScope(session: MuxSession): OwnedRemoteBrokerScope | undefined {
     return session.remote && session.remote.owned !== false && !session.docker && session.recoveryCodexHome
@@ -1895,6 +1900,105 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         ? ownedRemoteBrokerCache.signer(scope, session.recoveryInputBroker)
         : undefined
       : this.inputBrokers.get(session.sessionId);
+  }
+
+  /** Restore only retained source-host keys, then certify the surviving remote worker before owner bytes. */
+  async prepareCodexOwnerInput(
+    sessionId: string,
+    isCurrent: () => boolean,
+    expectedNative: MuxSession | null
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    const callerCurrent = () => {
+      try {
+        const verdict: unknown = isCurrent();
+        if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+          void Promise.resolve(verdict).catch(() => {});
+        return verdict === true;
+      } catch {
+        return false;
+      }
+    };
+    if (!session || !callerCurrent() || session.recoveryInputBrokerPending !== undefined) return false;
+    if (!session.remote || session.recoveryInputBroker === undefined) return true;
+    if (session !== expectedNative) return false;
+    const scope = this.remoteBrokerScope(session),
+      incarnation = session.recoveryInputBroker;
+    if (
+      !scope ||
+      session.mode !== 'codex' ||
+      session.recoveryIsolated !== true ||
+      (session.codexRestoreUncertain !== undefined && session.codexRestoreUncertain !== false)
+    )
+      return false;
+    const binding = JSON.stringify(session);
+    const current = () =>
+      this.sessions.get(sessionId) === session && JSON.stringify(session) === binding && callerCurrent();
+    const matches = (descriptor: OwnedRemoteBrokerDescriptor | undefined) =>
+      descriptor?.incarnation === incarnation &&
+      descriptor.homeDigest === createHash('sha256').update(scope.codexHome).digest('hex') &&
+      descriptor.launchDigest ===
+        createHash('sha256')
+          .update(
+            buildRemoteCodexPaneCommand({
+              sessionId,
+              remotePath: scope.remote.remotePath,
+              codexHome: scope.codexHome,
+              codexConfig: session.codexRestoreConfig,
+            })
+          )
+          .digest('hex');
+    if (matches(ownedRemoteBrokerCache.get(scope, incarnation)) && this.canDeliverCodexOwnerInput(sessionId))
+      return current();
+    this.ownerBrokerHydrations ??= new Map();
+    let job = this.ownerBrokerHydrations.get(sessionId);
+    if (job && job.binding !== binding) return false;
+    if (!job) {
+      const deadline = performance.now() + 2000;
+      const live = () => performance.now() < deadline && current();
+      const work = Promise.resolve()
+        .then(async () => {
+          const descriptor = await this.getOwnedRemoteInputBroker(sessionId);
+          if (!matches(descriptor) || !live()) return false;
+          const observed = await observeOwnedRemoteBroker(
+            scope.remote,
+            { sessionId, descriptor: descriptor!, inspect: true },
+            { prepare: async () => live(), isCurrent: live }
+          );
+          if (observed.status !== 'observed' || !live()) return false;
+          const proof = ownedRemoteBrokerCache.observe(
+            scope,
+            incarnation,
+            observed.serialized,
+            observed.witness,
+            observed.panePid
+          );
+          return !!proof && !proof.closed && this.canDeliverCodexOwnerInput(sessionId) && live();
+        })
+        .catch(() => false);
+      job = { binding, deadline, work };
+      this.ownerBrokerHydrations.set(sessionId, job);
+      void work.finally(() => {
+        if (this.ownerBrokerHydrations.get(sessionId)?.work === work) this.ownerBrokerHydrations.delete(sessionId);
+      });
+    }
+    const remaining = job.deadline - performance.now();
+    if (remaining <= 0) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return (
+        (await Promise.race([
+          job.work,
+          new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), remaining);
+          }),
+        ])) === true &&
+        current() &&
+        this.canDeliverCodexOwnerInput(sessionId)
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   canDeliverCodexOwnerInput(sessionId: string): boolean {

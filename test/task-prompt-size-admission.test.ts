@@ -286,9 +286,11 @@ it('keeps an overflowing agent progress marker attention-only without a continua
   const f = fixture();
   try {
     await f.controller.update({ ...boundary(LIMIT), config: { enabled: true } });
-    await f.controller.progress({ outcome: 'unknown' });
+    await f.controller.progress({ outcome: 'unfinished' });
     await f.controller.update({ config: { enabled: false } });
     await f.controller.update({ config: { enabled: true } });
+    expect(f.controller.getStatus().phase).toBe('watching');
+    expect(f.controller.getStatus().agentProgressVeto).toBeUndefined();
     f.observation.marker = {
       key: 'progress:oversized',
       at: 10_001,

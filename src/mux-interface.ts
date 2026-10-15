@@ -324,6 +324,12 @@ export interface TerminalMultiplexer extends EventEmitter {
   setBrokerCleanupReferenceProvider?(
     provider: import('./recovery/codex-broker-cleanup.js').BrokerCleanupReferenceProvider
   ): void;
+  /** Bounded read-only hydration before an owner input consumes its private fence receipt. */
+  prepareCodexOwnerInput?(
+    sessionId: string,
+    isCurrent: () => boolean,
+    expectedNative: MuxSession | null
+  ): Promise<boolean>;
   /** Pure preflight; refusal must not append a phantom owner submission. */
   canDeliverCodexOwnerInput?(sessionId: string): boolean;
   /** Bounded private broker journal read, scoped to the exact native pane process. */

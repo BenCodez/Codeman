@@ -103,6 +103,91 @@ describe('Task supervision UI', () => {
       );
     }
   );
+  it.each(
+    (['configuration', 'progress'] as const).flatMap((action) =>
+      (['network', '422', '500'] as const).map((failure) => ({ action, failure }))
+    )
+  )(
+    'preserves the full $action draft and focus after actual API $failure, then retries',
+    async ({ action, failure }) => {
+      const h = harness();
+      await h.open();
+      const previous = h.app._taskView.state;
+      const rows = [...h.get('taskCriteriaRows').children];
+      const command = rows[1].querySelector('[data-task-field="command"]') as HTMLTextAreaElement;
+      h.get('taskObjective').value = 'Unsaved owner objective';
+      rows[0].querySelector('textarea').value = 'Manual draft\n保留';
+      command.value = '  printf "你好"\nnext command  ';
+      h.get('taskCheckpoint').value = 'Unsaved checkpoint';
+      h.get('taskNextAction').value = 'Unsaved next action';
+      h.get('taskProgressOutcome').value = 'blocked';
+      h.get('taskCriteriaEvidence').querySelector('input').checked = true;
+      h.app.markTaskDraft();
+      const focused = action === 'configuration' ? command : h.get('taskCheckpoint');
+      focused.focus();
+      focused.setSelectionRange(2, 5);
+      const fetch = vi.fn(async () => {
+        if (failure === 'network') throw new Error('Fixture offline');
+        return new Response(
+          JSON.stringify({ success: false, error: failure === '500' ? 'Persistence failed' : 'Not sent' }),
+          { status: Number(failure) }
+        );
+      });
+      h.dom.window.fetch = fetch;
+      delete h.app._apiJson; // Exercise the actual API helper's non-2xx/network contract.
+      const save = () => (action === 'configuration' ? h.app.saveTaskConfiguration() : h.app.saveTaskProgress());
+      await save();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(h.app._taskView.state).toBe(previous);
+      expect(h.app._taskView.dirty).toBe(true);
+      expect(h.app._taskView.busy).toBe(false);
+      expect([...h.get('taskCriteriaRows').children]).toEqual(rows);
+      expect(h.get('taskObjective').value).toBe('Unsaved owner objective');
+      expect(command.value).toBe('  printf "你好"\nnext command  ');
+      expect(rows[0].querySelector('textarea').value).toBe('Manual draft\n保留');
+      expect(h.get('taskCheckpoint').value).toBe('Unsaved checkpoint');
+      expect(h.get('taskNextAction').value).toBe('Unsaved next action');
+      expect(h.get('taskProgressOutcome').value).toBe('blocked');
+      expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+      expect(h.dom.window.document.activeElement).toBe(focused);
+      expect([focused.selectionStart, focused.selectionEnd]).toEqual([2, 5]);
+      expect(h.get('taskSettings').disabled).toBe(false);
+      expect(h.get('taskProgress').disabled).toBe(false);
+      expect(h.app.showToast).toHaveBeenCalledWith('Task action failed. Refresh status before trying again.', 'error');
+      const accepted = { ...state(), objective: 'Server accepted objective', checkpoint: 'Server accepted checkpoint' };
+      fetch.mockResolvedValueOnce(new Response(JSON.stringify({ success: true, data: accepted }), { status: 200 }));
+      await save();
+      expect(fetch).toHaveBeenCalledTimes(2);
+      const firstBody = JSON.parse(fetch.mock.calls[0][1].body);
+      const retryBody = JSON.parse(fetch.mock.calls[1][1].body);
+      expect(retryBody).toEqual(firstBody);
+      expect(h.app._taskView.state).toEqual(accepted);
+      expect(h.app._taskView.dirty).toBe(false);
+      expect(h.get('taskObjective').value).toBe(accepted.objective);
+      expect(h.get('taskCheckpoint').value).toBe(accepted.checkpoint);
+    }
+  );
+
+  it.each([
+    ['local', {}, true],
+    ['docker', { docker: { containerId: 'fixture' } }, false],
+    ['owned SSH', { remote: { owned: true } }, true],
+    ['implicit owned SSH', { remote: {} }, true],
+    ['unowned SSH', { remote: { owned: false } }, false],
+  ] as const)(
+    'offers layer4 task controls only for local or owned SSH %s location',
+    async (_location, location, supported) => {
+      const h = harness();
+      h.app.sessions.set('a', { mode: 'codex', ...location });
+      expect(h.app.openTaskOptions('a')).toBe(supported);
+      if (supported) await vi.waitFor(() => expect(h.app._taskView.loading).toBe(false));
+      expect(h.app._apiJson).toHaveBeenCalledTimes(supported ? 1 : 0);
+      expect(h.dom.window.document.querySelector('#sessionOptionsModal [data-tab="task"]').style.display).toBe(
+        supported ? '' : 'none'
+      );
+      if (!supported) expect(h.app._taskView).toBeNull();
+    }
+  );
   it('is separately disabled by default and sends no activation request on open', async () => {
     const h = harness();
     await h.open();
@@ -449,8 +534,10 @@ describe('Task supervision UI', () => {
         await h.app.saveTaskProgress();
         expect(controller.getStatus()).toEqual(before);
         expect(controller.getStatus().criteria[0].verified).toBe(false);
-        expect(h.get('taskPhase').textContent).toBe('Unavailable');
-        expect(h.get('taskError').hidden).toBe(false);
+        expect(h.app._taskView.state).toEqual(before);
+        expect(h.get('taskPhase').textContent).toBe('Off');
+        expect(h.get('taskError').hidden).toBe(true);
+        expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
         expect(h.app.showToast).toHaveBeenCalledWith(
           'Task action failed. Refresh status before trying again.',
           'error'
