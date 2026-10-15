@@ -124,6 +124,25 @@ describe('POST /api/sessions/:id/input rollback wiring', () => {
   const post = (body: Record<string, unknown>, id = 'test-session-1') =>
     harness.app.inject({ method: 'POST', url: `/api/sessions/${id}/input`, payload: body });
 
+  it('refuses UTF-8 overflow permanently before claiming or dispatching its original identity', async () => {
+    const session = harness.ctx._session;
+    const defer = vi.spyOn(session, 'deferInputSeq');
+    const write = vi.spyOn(session, 'write');
+    const body = { input: '🧭'.repeat(16_385), clientId: 'unicode-client', seq: 8 };
+    expect(body.input.length).toBeLessThan(65_536);
+    const refused = await post(body);
+    expect(refused.statusCode).toBe(413);
+    expect(refused.json()).toMatchObject({ success: false, notSent: true });
+    expect(defer).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(session.hasAppliedInputSeq(body.clientId, body.seq)).toBe(false);
+    const exact = { ...body, input: '🧭'.repeat(16_384) };
+    expect((await post(exact)).statusCode).toBe(200);
+    expect(session.writeBuffer).toEqual([exact.input]);
+    expect((await post(exact)).statusCode).toBe(200);
+    expect(session.writeBuffer).toEqual([exact.input]);
+  });
+
   it('delivers the valid zero sequence once without mistaking its initial watermark for delivery', async () => {
     const session = harness.ctx.sessions.get('test-session-1')!;
     const body = { input: 'zero', clientId: 'zero', seq: 0 };

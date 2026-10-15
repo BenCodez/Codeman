@@ -722,6 +722,29 @@ describe('ws-routes', () => {
       }
     });
 
+    it('refuses UTF-8 byte overflow before admission and keeps exact-boundary input deduplicated', async () => {
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      try {
+        const session = ctx._session;
+        const defer = vi.spyOn(session, 'deferInputSeq');
+        const overflow = '🧭'.repeat(16_385);
+        expect(overflow.length).toBeLessThan(MAX_INPUT_LENGTH);
+        ws.send(JSON.stringify({ t: 'i', d: overflow, cid: 'unicode', seq: 2 }));
+        expect(await nextMessage(ws)).toEqual({ t: 'ia', seq: 2, err: 'too_large', max: MAX_INPUT_LENGTH });
+        expect(defer).not.toHaveBeenCalled();
+        expect(session.writeBuffer).toEqual([]);
+        const exact = '🧭'.repeat(16_384);
+        ws.send(JSON.stringify({ t: 'i', d: exact, cid: 'unicode', seq: 2 }));
+        expect(await nextMessage(ws)).toEqual({ t: 'ia', seq: 2 });
+        expect(session.writeBuffer).toEqual([exact]);
+        ws.send(JSON.stringify({ t: 'i', d: exact, cid: 'unicode', seq: 2 }));
+        expect(await nextMessage(ws)).toMatchObject({ t: 'ia', seq: 2, dup: true });
+        expect(session.writeBuffer).toEqual([exact]);
+      } finally {
+        ws.close();
+      }
+    });
+
     it('ignores malformed JSON messages', async () => {
       const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
       try {
