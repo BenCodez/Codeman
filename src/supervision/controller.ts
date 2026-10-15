@@ -170,10 +170,7 @@ export class TaskController {
   private arm(): void {
     if (this.timer) clearTimeout(this.timer);
     this.timer = undefined;
-    if (
-      !this.stopped &&
-      (this.state.inFlight?.accepted || (this.state.config.enabled && this.state.phase === 'watching'))
-    ) {
+    if (!this.stopped && (this.state.inFlight || (this.state.config.enabled && this.state.phase === 'watching'))) {
       this.timer = setTimeout(() => {
         this.timer = undefined;
         void this.refresh()
@@ -735,11 +732,13 @@ export class TaskController {
         await this.settleAcceptedFlight();
         return this.getStatus();
       }
-      if (this.stopped || !this.state.config.enabled || this.state.phase !== 'watching') return this.getStatus();
+      const receiptOnly = !this.state.config.enabled || this.state.phase !== 'watching';
+      if (receiptOnly && (!this.state.inFlight || !this.state.conversationId)) return this.getStatus();
       const revision = this.revision;
       const { observation: o, commands, marker } = await this.deps.observe();
       if (this.stopped || revision !== this.revision) return this.getStatus();
       if (this.state.conversationId && o.conversationId !== this.state.conversationId) {
+        if (receiptOnly) return this.getStatus();
         this.state.phase = 'blocked';
         return this.save('identity-changed');
       }
@@ -750,11 +749,16 @@ export class TaskController {
           await this.save('continuation-accepted');
           if (!(await this.settleAcceptedFlight()) || this.stopped || revision !== this.revision)
             return this.getStatus();
-        } else if (['paused', 'blocked', 'unknown'].includes(o.activity) || this.now() - flight.startedAt >= 60000) {
+        } else if (receiptOnly) return this.getStatus();
+        else if (['paused', 'blocked', 'unknown'].includes(o.activity) || this.now() - flight.startedAt >= 60000) {
           this.state.phase = o.activity === 'blocked' ? 'blocked' : 'paused';
           return this.save('acceptance-unverified');
         } else return this.getStatus();
       }
+      // A pending receipt keeps observation alive after owner completion, pause,
+      // disable or reload. It grants only exact cleanup, never another action or
+      // progress update, and must preserve the owner's terminal phase and vetoes.
+      if (receiptOnly) return this.getStatus();
       this.invalidateCommandCriteria(this.state, commands);
       if (
         marker &&

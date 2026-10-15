@@ -2912,6 +2912,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     let certifiedNoChild = false;
     let reservedRestoreRecord: MuxSession | undefined;
     const priorCreateRecord = this.sessions.get(sessionId);
+    let inputBroker: CodexInputBroker | undefined;
+    let brokerDispatchStarted = false;
     try {
       // Build the full command to run inside tmux
       const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
@@ -2921,7 +2923,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
           : localFullCmd;
       const originalLaunch = remote || docker ? fullCmd : `cd ${shellescape(workingDir)} && ${fullCmd}`;
-      const inputBroker =
+      inputBroker =
         localCodex && codexConfig?.noDaemon === true
           ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!options.codexRestoreGuard)
           : undefined;
@@ -3114,6 +3116,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         throw new Error('Reboot restoration authority changed');
       launchedRestoreWorker = !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard;
       options.restoreGuard?.noteDispatch?.();
+      brokerDispatchStarted = true;
       const spawned = execSync(
         `${this.tmux()} ${restorePane ? `if-shell -F -t ${shellescape(restorePane.paneId)} ${shellescape(restorePredicate!)} ${shellescape(dispatchCommand)} ${shellescape('display-message -p CODEMAN_REBOOT_LAUNCH_REFUSED')}` : spawnCommand}`,
         { timeout: EXEC_TIMEOUT_MS, stdio: restorePane ? ['ignore', 'pipe', 'ignore'] : 'ignore', encoding: 'utf8' }
@@ -3332,6 +3335,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         options.restoreGuard?.noteCleanupUncertain?.();
       }
       throw new Error(`Failed to create tmux session: ${getErrorMessage(err)}`);
+    } finally {
+      if (!brokerDispatchStarted) await inputBroker?.rollbackUnlaunchedProvisioning?.();
     }
   }
 
@@ -3481,13 +3486,29 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         !((expected.status ?? 0) > 0 || (expected.signal ?? 0) > 0))
     )
       return null;
-    const canDispatch = () =>
-      !guard ||
-      (options.onlyIfDead === true &&
-        localCodex &&
-        this.sessions.get(sessionId) === session &&
-        session.muxName === muxName &&
-        confirmRecoveryMuxDispatch(guard));
+    const canDispatch = () => {
+      let accepted = false;
+      try {
+        if (this.sessions.get(sessionId) !== session) return false;
+        const owner: unknown = options.ownerLaunchIsCurrent === undefined ? true : options.ownerLaunchIsCurrent();
+        if (owner && typeof (owner as { then?: unknown }).then === 'function')
+          void Promise.resolve(owner).catch(() => {});
+        accepted =
+          owner === true &&
+          (!guard ||
+            (options.onlyIfDead === true &&
+              localCodex &&
+              session.muxName === muxName &&
+              confirmRecoveryMuxDispatch(guard)));
+        return accepted;
+      } catch {
+        return false;
+      } finally {
+        // These checks precede native dispatch. Preserve that certified refusal
+        // even when owner admission short-circuits the recovery guard's confirm.
+        if (!accepted) guard?.noteRefusal?.();
+      }
+    };
     if (!canDispatch()) return null;
 
     if (!isValidMuxName(muxName) || !isValidPath(workingDir)) return null;
@@ -3571,6 +3592,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         }
       }
     };
+    let brokerDispatchStarted = false;
     try {
       if (!canDispatch()) return null;
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
@@ -3663,6 +3685,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         this.saveSessions();
       }
       workerEffectMayHaveOccurred = true;
+      brokerDispatchStarted = true;
       const { stdout: spawnOutput } = await execAsync(
         `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(expected!.paneId)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}${inputBroker && !guard && !options.onlyIfDead ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
         {
@@ -3731,6 +3754,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       await restoreRetiredProvenance();
       console.error('[TmuxManager] Failed to respawn pane:', err);
       return null;
+    } finally {
+      if (!brokerDispatchStarted) await inputBroker?.rollbackUnlaunchedProvisioning?.();
     }
   }
 
