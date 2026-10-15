@@ -309,8 +309,10 @@ export function hasCodexComposerText(screen: string, expected?: string): boolean
   if (index < 0) return false;
   const composer = tail[index];
   const text = composer.replace(/^\s*› ?/u, '');
-  if (expected !== undefined ? text !== expected : text.trim() !== '' && text.trim() !== 'Ask Codex to do anything')
-    return false;
+  // Plain native capture drops placeholder styling and cursor state. Its default
+  // hint is indistinguishable from an identical owner draft, so only genuinely
+  // blank text can authorize input. Exact text still acknowledges our own write.
+  if (expected !== undefined ? text !== expected : text.trim() !== '') return false;
   // A blank first row can still contain a multiline draft. Every subsequent row must be
   // known footer chrome; unknown rows (including a changed TUI layout) veto delivery.
   const after = tail.slice(index + 1);
