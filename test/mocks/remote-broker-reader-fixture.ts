@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import { CodexInputBroker } from '../../src/recovery/codex-input-broker.js';
 import { OwnedRemoteBrokerCache } from '../../src/recovery/remote-input-broker-cache.js';
 import {
@@ -388,9 +389,34 @@ if op == 'if-shell':`
     modify?.(q);
     return q;
   };
-  const input = async (prompt: string, modify?: (request: RemoteCodexInputRequest) => void) => {
+  const input = async (
+    prompt: string,
+    modify?: (request: RemoteCodexInputRequest) => void,
+    healthyReaderBudgetMs?: number
+  ) => {
     const q = await inputRequest(prompt, modify);
-    const result = await run(buildRemoteCodexInputCommand(remote, q));
+    const command = buildRemoteCodexInputCommand(remote, q);
+    if (healthyReaderBudgetMs !== undefined) {
+      if (!Number.isSafeInteger(healthyReaderBudgetMs) || healthyReaderBudgetMs < 1800 || healthyReaderBudgetMs > 5000)
+        throw Error('Invalid disposable reader budget');
+      // Only the maximum-payload healthy transport test opts in. Starting a new
+      // Python fake tmux process for every query is fixture overhead, unlike a
+      // real existing tmux server. All normal and expiry/partial-delivery cases
+      // execute the unchanged generated reader's original 1.8-second budget.
+      const encoded = command.command.match(/[A-Za-z0-9+/]{100,}={0,2}/g);
+      if (encoded?.length !== 1) throw Error('Disposable command must contain exactly one static reader');
+      const source = inflateRawSync(Buffer.from(encoded[0], 'base64')).toString('utf8');
+      const check = 'elapsed>1800||monotonic>1800';
+      const deadline = 'wall-now>2000';
+      if (!source.includes(check) || !source.includes(deadline) || !source.includes('started+1800'))
+        throw Error('Disposable reader budget seam no longer matches the generated source');
+      const adjusted = source
+        .replace(check, `elapsed>${healthyReaderBudgetMs}||monotonic>${healthyReaderBudgetMs}`)
+        .replaceAll('started+1800', `started+${healthyReaderBudgetMs}`)
+        .replace(deadline, `wall-now>${healthyReaderBudgetMs + 200}`);
+      command.command = command.command.replace(encoded[0], deflateRawSync(Buffer.from(adjusted)).toString('base64'));
+    }
+    const result = await run(command);
     return { ...result, result: parseRemoteCodexInputResult(result.stdout), q };
   };
   const options = {

@@ -5,6 +5,7 @@ import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:f
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
+import { deflateRawSync, inflateRawSync } from 'node:zlib';
 import type { SessionRemote } from '../../src/types.js';
 import { legacyOwnedBroker } from './legacy-owned-broker.js';
 import {
@@ -68,6 +69,7 @@ export async function fixture(
     repaintVeto?: 'owner' | 'busy' | 'approval' | 'tail' | 'expired' | 'native';
     workingDir?: string;
     childSignal?: number;
+    healthyReaderBudgetMs?: number;
   }
 ) {
   const root = await mkdtemp(join(tmpdir(), 'codeman-remote-witness-'));
@@ -301,7 +303,35 @@ fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return 
     const executableHashes = await Promise.all(executablePaths.map(async (path) => sha(await readFile(path, 'utf8'))));
     let refused = false;
     const run = async (request: RemoteCodexCommand, change = mutation) => {
-      const { command: cmd, input } = request;
+      let cmd = request.command;
+      const { input } = request;
+      const healthyBudget = correlation?.healthyReaderBudgetMs;
+      if (healthyBudget !== undefined) {
+        if (
+          kind !== 'input' ||
+          change !== 'none' ||
+          Buffer.byteLength(correlation?.prompt ?? '', 'utf8') !== 65536 ||
+          correlation?.repaintVeto !== undefined ||
+          !Number.isSafeInteger(healthyBudget) ||
+          healthyBudget < 1800 ||
+          healthyBudget > 5000
+        )
+          throw Error('Invalid healthy maximum-payload fixture budget');
+        // Only the healthy 64 KiB case compensates for disposable fake tmux
+        // process startup. Production and expiry/veto cases keep their budget.
+        const encoded = cmd.match(/[A-Za-z0-9+/]{100,}={0,2}/g);
+        if (encoded?.length !== 1) throw Error('Expected one static generated reader');
+        const source = inflateRawSync(Buffer.from(encoded[0], 'base64')).toString('utf8');
+        const check = 'elapsed>1800||monotonic>1800';
+        const deadline = 'wall-now>2000';
+        if (!source.includes(check) || !source.includes(deadline) || !source.includes('started+1800'))
+          throw Error('Healthy reader budget seam no longer matches generated source');
+        const adjusted = source
+          .replace(check, `elapsed>${healthyBudget}||monotonic>${healthyBudget}`)
+          .replaceAll('started+1800', `started+${healthyBudget}`)
+          .replace(deadline, `wall-now>${healthyBudget + 200}`);
+        cmd = cmd.replace(encoded[0], deflateRawSync(Buffer.from(adjusted)).toString('base64'));
+      }
       if (
         env.PATH !== bin + ':/usr/bin:/bin' ||
         env.SHELL !== join(bin, 'login-shell') ||

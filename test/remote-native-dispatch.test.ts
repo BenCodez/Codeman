@@ -74,7 +74,11 @@ describe('remote worker effects bind the final native pane incarnation', () => {
   it.each(["quoted ' \\ ; $HOME #{pane_pid}\n\t\r\u001b\u007f 😀", '😀'.repeat(MAX_REMOTE_CODEX_PROMPT_BYTES / 4)])(
     'preserves exact bounded input bytes through the generated tmux command grammar',
     async (prompt) => {
-      const result = await fixture('input', 'none', false, { prompt });
+      const result = await fixture('input', 'none', false, {
+        prompt,
+        // Disposable fake process startup is outside this healthy byte-order proof.
+        ...(Buffer.byteLength(prompt, 'utf8') === MAX_REMOTE_CODEX_PROMPT_BYTES ? { healthyReaderBudgetMs: 5000 } : {}),
+      });
       expect(result.status).toBe('sent');
       const chunks = result.commands?.slice(0, -1).map((command) => {
         expect(command.slice(0, 4)).toEqual(['send-keys', '-l', '-t', '%7']);

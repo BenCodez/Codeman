@@ -1,6 +1,6 @@
 /** Private source-host material for controlled owned-SSH launches; never remote adoption. */
 import { createHash, randomUUID } from 'node:crypto';
-import { constants, type Stats } from 'node:fs';
+import { constants, lstatSync, type Dir, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { join, posix } from 'node:path';
 import { getDataDirPath } from '../config/instance.js';
@@ -34,6 +34,15 @@ type Entry = {
   signer?: CodexInputBroker;
 };
 type CacheEpoch = { id: string; pending: number };
+type CleanupIntent = {
+  version: 1;
+  sessionId: string;
+  retiredHash: string;
+  rootDev: number;
+  rootIno: number;
+  sessionDev: number;
+  sessionIno: number;
+};
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const MAX_BYTES = 524_288;
 const digest = (input: string) => createHash('sha256').update(input).digest('hex');
@@ -214,6 +223,265 @@ export class OwnedRemoteBrokerCache {
       this.entries.delete(key);
     }
   }
+  private cleanupPath(sessionId: string): string {
+    return join(this.root, sessionId + '.cleanup.json');
+  }
+  private async readCleanupIntent(sessionId: string) {
+    const result = await bounded('intent-read:' + this.cleanupPath(sessionId), async () => {
+      try {
+        return await this.readCleanupIntentNow(sessionId);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+        throw error;
+      }
+    });
+    if (!result) {
+      const error = new Error('Private cleanup intent unavailable') as NodeJS.ErrnoException;
+      if (result === null) error.code = 'ENOENT';
+      throw error;
+    }
+    return result;
+  }
+  private async readCleanupIntentNow(sessionId: string) {
+    const path = this.cleanupPath(sessionId);
+    const parent = await fs.lstat(this.root);
+    if (!privateStat(parent, true)) throw Error('Unknown cleanup directory');
+    const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    let before: Stats, bytes: Buffer;
+    try {
+      before = await file.stat();
+      if (!privateStat(before) || before.size > 1024) throw Error('Unknown cleanup intent');
+      bytes = Buffer.alloc(before.size + 1);
+      const read = await file.read(bytes, 0, bytes.length, 0);
+      if (read.bytesRead !== before.size || !same(before, await file.stat())) throw Error('Changed cleanup intent');
+      bytes = bytes.subarray(0, read.bytesRead);
+    } finally {
+      await file.close();
+    }
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    const value = JSON.parse(text) as CleanupIntent;
+    if (
+      !value ||
+      Object.keys(value).sort().join(',') !== 'retiredHash,rootDev,rootIno,sessionDev,sessionId,sessionIno,version' ||
+      value.version !== 1 ||
+      value.sessionId !== sessionId ||
+      !/^[a-f0-9]{64}$/.test(value.retiredHash) ||
+      ![value.rootDev, value.rootIno, value.sessionDev, value.sessionIno].every(
+        (number) => Number.isSafeInteger(number) && number >= 0
+      )
+    )
+      throw Error('Unknown cleanup intent');
+    const [after, current] = await Promise.all([fs.lstat(this.root), fs.lstat(path)]);
+    if (!privateStat(after, true) || !same(parent, after) || !privateStat(current) || !same(before, current))
+      throw Error('Replaced cleanup intent');
+    return { value, text, stat: current };
+  }
+  /** Acknowledge retirement before removing the last owner-visible session record. */
+  async stageFinalCleanup(sessionId: string, retiredState: unknown, isCurrent: () => boolean): Promise<void> {
+    if (!UUID.test(sessionId)) return;
+    const deadline = performance.now() + 2000,
+      current = () => performance.now() < deadline && isCurrent() === true;
+    const sessionRoot = join(this.root, sessionId);
+    const prior = [...pending]
+      .filter(([key]) => ['write:', 'read:'].some((prefix) => key.startsWith(prefix + sessionRoot + '/')))
+      .map(([, job]) => job.work);
+    // Optional cache cleanup must not block unrelated session deletion merely
+    // because the shared cache I/O slots are busy.
+    if (!prior.length) {
+      try {
+        await fs.lstat(sessionRoot);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' && current()) return;
+        throw error;
+      }
+    }
+    const result = await bounded('intent:' + this.root + ':' + sessionId, async () => {
+      await Promise.all(prior);
+      if (!current()) throw Error('Cancelled cleanup');
+      let parents: Stats[];
+      try {
+        parents = await Promise.all([fs.lstat(this.root), fs.lstat(join(this.root, sessionId))]);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT' && current()) return true;
+        throw error;
+      }
+      if (parents.some((parent) => !privateStat(parent, true))) throw Error('Unknown cleanup parents');
+      const value: CleanupIntent = {
+        version: 1,
+        sessionId,
+        retiredHash: digest(JSON.stringify(retiredState ?? null)),
+        rootDev: parents[0].dev,
+        rootIno: parents[0].ino,
+        sessionDev: parents[1].dev,
+        sessionIno: parents[1].ino,
+      };
+      const text = JSON.stringify(value),
+        path = this.cleanupPath(sessionId);
+      let existing: Awaited<ReturnType<OwnedRemoteBrokerCache['readCleanupIntent']>> | undefined;
+      try {
+        existing = await this.readCleanupIntent(sessionId);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      if (!current()) throw Error('Cancelled cleanup');
+      if (existing && existing.text !== text) throw Error('Different cleanup intent retained');
+      const file = await fs.open(
+        path,
+        existing
+          ? constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+          : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+        0o600
+      );
+      let written: Stats;
+      try {
+        written = await file.stat();
+        if (!privateStat(written) || (existing && !same(written, existing.stat)))
+          throw Error('Replaced cleanup intent');
+        if (!existing) await file.writeFile(text);
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+      const parent = await fs.open(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try {
+        await parent.sync();
+      } finally {
+        await parent.close();
+      }
+      const acknowledged = await this.readCleanupIntent(sessionId);
+      const now = await fs.lstat(join(this.root, sessionId));
+      if (
+        !current() ||
+        acknowledged.text !== text ||
+        acknowledged.stat.dev !== written.dev ||
+        acknowledged.stat.ino !== written.ino ||
+        !privateStat(now, true) ||
+        now.dev !== value.sessionDev ||
+        now.ino !== value.sessionIno ||
+        lstatSync(this.root).dev !== value.rootDev ||
+        lstatSync(this.root).ino !== value.rootIno
+      )
+        throw Error('Cleanup acknowledgement changed');
+      return true;
+    });
+    if (result !== true) throw Error('Private broker cleanup intent could not be saved; retry deletion');
+  }
+  /** A false bounded verdict retains the durable intent for later passes and boots. */
+  async finishFinalCleanup(sessionId: string, isCurrent: () => boolean, retiredState?: unknown): Promise<boolean> {
+    if (!UUID.test(sessionId)) return true;
+    if (isCurrent() !== true) return false;
+    this.retire(sessionId);
+    const deadline = performance.now() + 2000,
+      expectedHash = digest(JSON.stringify(retiredState ?? null));
+    return (
+      (await bounded('intent-finish:' + this.root + ':' + sessionId, () =>
+        this.finishFinalCleanupNow(sessionId, () => performance.now() < deadline && isCurrent() === true, expectedHash)
+      )) === true
+    );
+  }
+  private async finishFinalCleanupNow(
+    sessionId: string,
+    isCurrent: () => boolean,
+    expectedHash: string
+  ): Promise<boolean> {
+    let intent: Awaited<ReturnType<OwnedRemoteBrokerCache['readCleanupIntent']>>;
+    try {
+      intent = await this.readCleanupIntent(sessionId);
+    } catch {
+      return false;
+    }
+    if (intent.value.retiredHash !== expectedHash) return false;
+    const current = () => {
+      try {
+        const root = lstatSync(this.root),
+          session = lstatSync(join(this.root, sessionId)),
+          marker = lstatSync(this.cleanupPath(sessionId));
+        return (
+          isCurrent() === true &&
+          privateStat(root, true) &&
+          root.dev === intent.value.rootDev &&
+          root.ino === intent.value.rootIno &&
+          privateStat(session, true) &&
+          session.dev === intent.value.sessionDev &&
+          session.ino === intent.value.sessionIno &&
+          privateStat(marker) &&
+          same(marker, intent.stat)
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!(await this.retireAndDelete(sessionId, current))) return false;
+    const acknowledged = await this.readCleanupIntent(sessionId);
+    if (!current() || !same(acknowledged.stat, intent.stat) || acknowledged.text !== intent.text) return false;
+    await fs.unlink(this.cleanupPath(sessionId));
+    const parent = await fs.open(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      await parent.sync();
+    } finally {
+      await parent.close();
+    }
+    return true;
+  }
+  /** Local private-file work only. Each pass is bounded and retains its directory cursor. */
+  startFinalCleanupRetries(read: (id: string) => { live: boolean; state?: unknown }): () => Promise<void> {
+    let stopped = false,
+      scan: Dir | undefined,
+      work: Promise<void> | undefined;
+    const run = () => {
+      if (stopped || work) return;
+      const deadline = performance.now() + 2000,
+        current = () => !stopped && performance.now() < deadline;
+      work = (async () => {
+        try {
+          if (!scan) scan = await fs.opendir(this.root);
+          for (let count = 0; count < 128 && current(); count++) {
+            const item = await scan.read();
+            if (!item) {
+              await scan.close();
+              scan = undefined;
+              break;
+            }
+            const id = item.name.replace(/\.cleanup\.json$/, '');
+            if (!item.name.endsWith('.cleanup.json') || !UUID.test(id) || !item.isFile() || item.isSymbolicLink())
+              continue;
+            try {
+              const intent = await this.readCleanupIntent(id);
+              await this.finishFinalCleanup(
+                id,
+                () => {
+                  const now = read(id);
+                  return (
+                    current() &&
+                    now.live === false &&
+                    digest(JSON.stringify(now.state ?? null)) === intent.value.retiredHash
+                  );
+                },
+                read(id).state
+              );
+            } catch {
+              // Unknown/changed authority or material remains private for another pass.
+            }
+          }
+        } catch {
+          await scan?.close().catch(() => {});
+          scan = undefined;
+        }
+      })().finally(() => {
+        work = undefined;
+      });
+    };
+    const timer = setInterval(run, 15_000);
+    timer.unref();
+    run();
+    return async () => {
+      stopped = true;
+      clearInterval(timer);
+      await work;
+      await scan?.close().catch(() => {});
+      scan = undefined;
+    };
+  }
   /** Final owner deletion only. Unknown files remain private and are never recursively removed. */
   async retireAndDelete(sessionId: string, isCurrent: () => boolean): Promise<boolean> {
     const callerCurrent = () => {
@@ -329,6 +597,15 @@ export class OwnedRemoteBrokerCache {
                   )
                     return false;
                   await fs.rmdir(dirs[2]);
+                  const sessionParent = await fs.open(
+                    sessionRoot,
+                    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+                  );
+                  try {
+                    await sessionParent.sync();
+                  } finally {
+                    await sessionParent.close();
+                  }
                   const nextParents = await Promise.all(dirs.slice(0, 2).map((path) => fs.lstat(path)));
                   if (
                     !current() ||

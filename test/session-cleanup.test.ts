@@ -38,7 +38,9 @@ describe('Session Cleanup', () => {
     for (const sessionId of createdSessions) {
       try {
         await fetch(`${baseUrl}/api/sessions/${sessionId}`, { method: 'DELETE' });
-      } catch {}
+      } catch {
+        // The test may already have deleted this disposable session.
+      }
     }
     await server.stop();
     rmSync(testWorkingDir, { recursive: true, force: true });
@@ -61,7 +63,7 @@ describe('Session Cleanup', () => {
           markRestorationSkipped(): void;
           deps: { readWebviews: () => Promise<unknown> };
         };
-        sessions: Map<string, { mode: string; listenerCount(event: string): number }>;
+        sessions: Map<string, { mode: string; listeners(event: string): unknown[] }>;
         getRecoveryController(session: { mode: string }): {
           getStatus(): unknown;
           updateConfig(patch: { maxRetries: number }): Promise<unknown>;
@@ -83,8 +85,10 @@ describe('Session Cleanup', () => {
       const inputListener = internals.recoveryInputListeners.get(id);
       const recoveryState = controller?.getStatus();
       const storedRecoveryState = internals.recoveryStore.get(id);
+      const inputListeners = liveSession.listeners('recoveryUserInput');
       expect(controller).toBeDefined();
       expect(inputListener).toBeDefined();
+      expect(inputListeners).toContain(inputListener);
       expect(recoveryState).toMatchObject({ config: { maxRetries: 2 } });
       expect(storedRecoveryState).toEqual(recoveryState);
 
@@ -94,15 +98,17 @@ describe('Session Cleanup', () => {
         .mockRejectedValueOnce(new Error('layout prune unavailable'));
       try {
         const deleteRes = await fetch(`${baseUrl}/api/sessions/${id}`, { method: 'DELETE' });
-        const getRes = await fetch(`${baseUrl}/api/sessions/${id}`);
 
         expect(deleteRes.status).toBe(500);
-        expect(getRes.status).toBe(200);
         expect(internals.recoveryControllers.get(id)).toBe(controller);
         expect(internals.recoveryInputListeners.get(id)).toBe(inputListener);
-        expect(internals.sessions.get(id)?.listenerCount('recoveryUserInput')).toBe(1);
+        // Session-owned listeners and the recovery controller's exact callback
+        // all survive rejected deletion.
+        expect(internals.sessions.get(id)?.listeners('recoveryUserInput')).toEqual(inputListeners);
         expect(controller?.getStatus()).toEqual(recoveryState);
         expect(internals.recoveryStore.get(id)).toEqual(storedRecoveryState);
+        const getRes = await fetch(`${baseUrl}/api/sessions/${id}`);
+        expect(getRes.status).toBe(200);
       } finally {
         preparationSpy.mockRestore();
         internals.tabLayouts.markRestorationSkipped();

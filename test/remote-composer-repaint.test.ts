@@ -12,27 +12,37 @@ describe('remote composer repaint admission', () => {
       prefix: 'Ask Codex ',
     },
     { label: 'every chunk', prompt: '😀'.repeat(4096), prefix: '' },
-    { label: 'full 64KiB Unicode before Enter', prompt: '😀'.repeat(16384), prefix: '', repaintAt: 'final' as const },
-  ])('waits for exact own cumulative text after $label without replay', async ({ prompt, prefix, repaintAt }) => {
-    const result = await fixture('input', 'none', false, {
-      prompt,
-      repaintCaptures: 2,
-      repaintPrefix: prefix,
-      repaintAt,
-    });
-    expect(result.status).toBe('sent');
-    expect(
-      result.commands
-        ?.slice(0, -1)
-        .map((command) => command[4])
-        .join('')
-    ).toBe(prompt);
-    expect(result.commands?.at(-1)).toEqual(['send-keys', '-t', '%7', 'Enter']);
-    expect(result.commands).toHaveLength(Math.ceil(Buffer.byteLength(prompt, 'utf8') / 8192) + 1);
-    expect(result.captures?.filter((screen) => screen === REMOTE_READY_SCREEN).length).toBeGreaterThanOrEqual(
-      prefix || repaintAt ? 2 : 4
-    );
-  });
+    {
+      label: 'full 64KiB Unicode before Enter',
+      prompt: '😀'.repeat(16384),
+      prefix: '',
+      repaintAt: 'final' as const,
+      healthyReaderBudgetMs: 5000,
+    },
+  ])(
+    'waits for exact own cumulative text after $label without replay',
+    async ({ prompt, prefix, repaintAt, healthyReaderBudgetMs }) => {
+      const result = await fixture('input', 'none', false, {
+        prompt,
+        repaintCaptures: 2,
+        repaintPrefix: prefix,
+        repaintAt,
+        healthyReaderBudgetMs,
+      });
+      expect(result.status).toBe('sent');
+      expect(
+        result.commands
+          ?.slice(0, -1)
+          .map((command) => command[4])
+          .join('')
+      ).toBe(prompt);
+      expect(result.commands?.at(-1)).toEqual(['send-keys', '-t', '%7', 'Enter']);
+      expect(result.commands).toHaveLength(Math.ceil(Buffer.byteLength(prompt, 'utf8') / 8192) + 1);
+      expect(result.captures?.filter((screen) => screen === REMOTE_READY_SCREEN).length).toBeGreaterThanOrEqual(
+        prefix || repaintAt ? 2 : 4
+      );
+    }
+  );
 
   it('preserves ambiguous placeholder text initially and after a known literal starts repainting', async () => {
     const prompt = 'Authorized continuation';

@@ -77,7 +77,9 @@ it('probes the actual child and delivers literal text plus actual child Enter on
 it('retains the exact 64 KiB Unicode prompt and ordered broker phases', async () => {
   const f = await fixture(),
     prompt = '😀'.repeat(16384);
-  const result = await f.input(prompt);
+  // Nine broker phases still prove exact bytes, ordering, and actual child
+  // Enter; only disposable per-query process overhead gets extra test time.
+  const result = await f.input(prompt, undefined, 5000);
   expect(
     result.result,
     ('error' in result ? String(result.error).slice(-1500) : '') + ' bytes=' + (await f.bytes()).length

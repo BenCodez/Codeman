@@ -1,5 +1,6 @@
 /** Generated SSH reader uses only executable temporary native fakes. */
 import { describe, expect, it } from 'vitest';
+import { MAX_REMOTE_CODEX_PROMPT_BYTES } from '../src/recovery/remote-codex.js';
 import { fixture, REMOTE_READY_SCREEN } from './mocks/remote-reader-fixture.js';
 
 const footer = '  fixture-model default · /fixture/work\n';
@@ -107,8 +108,12 @@ describe('remote automatic input retains exact live composer authority', () => {
       'Would you like to approve this?',
       '😀'.repeat(16_384),
     ].map((prompt) => ({ prompt, bytes: Buffer.byteLength(prompt, 'utf8') }))
-  )('accepts the exact cumulative joined composer ($bytes UTF8 bytes)', async ({ prompt }) => {
-    const result = await fixture('input', 'none', false, { prompt });
+  )('accepts the exact cumulative joined composer ($bytes UTF8 bytes)', async ({ prompt, bytes }) => {
+    const result = await fixture('input', 'none', false, {
+      prompt,
+      // Keep the same explicit fake-process allowance as the other healthy max-payload cases.
+      ...(bytes === MAX_REMOTE_CODEX_PROMPT_BYTES ? { healthyReaderBudgetMs: 5000 } : {}),
+    });
     expect(result.status).toBe('sent');
     expect(
       result.commands

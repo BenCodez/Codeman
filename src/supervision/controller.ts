@@ -200,6 +200,15 @@ export class TaskController {
       evidence.completedAt <= this.now() + 2000
     );
   }
+  private invalidateCommandCriteria(state: TaskState, commands: Map<string, CommandSuccessEvidence>): void {
+    for (const criterion of state.criteria) {
+      if (criterion.kind !== 'command' || !criterion.verified) continue;
+      const evidence = criterion.command ? commands.get(commandHash(criterion.command)) : undefined;
+      if (this.commandEvidenceIsCurrent(evidence)) continue;
+      criterion.verified = false;
+      delete criterion.evidence;
+    }
+  }
   private evidenceBoundary(): number {
     return Math.max(this.evidenceFreshnessFloor, this.state.configuredAt ?? this.state.startedAt ?? this.now());
   }
@@ -459,6 +468,7 @@ export class TaskController {
       // Progress and command evidence belong to the first observed conversation, even before kickoff.
       candidate.conversationId ??= observation.conversationId;
       this.reconcileAcceptedFlight(candidate, observation);
+      this.invalidateCommandCriteria(candidate, commands);
       for (const id of patch.verifiedCriteria ?? []) {
         const c = candidate.criteria.find((c) => c.id === id);
         if (!c) throw new TaskValidationError('Unknown criterion');
@@ -748,6 +758,7 @@ export class TaskController {
           return this.save('acceptance-unverified');
         } else return this.getStatus();
       }
+      this.invalidateCommandCriteria(this.state, commands);
       const markerIsCurrent =
         marker &&
         !!marker.submissionKey &&
