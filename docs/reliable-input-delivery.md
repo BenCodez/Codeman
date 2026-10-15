@@ -23,28 +23,48 @@ explained below.
 
 ### Client (`app.js`)
 
-- A stable **`clientId`** (`localStorage['codeman:clientId']`) identifies this
-  browser to the server's dedup across reconnects and reloads.
-- Each input frame gets a **monotonic per-session `seq`**. Frame records
-  (`{seq,data,useMux,ts,tries,sentAt}`) live in `_pendingDeliveries`
-  (`Map<sessionId, record[]>`), persisted synchronously before each attempt to
-  `localStorage['codeman:pendingInput']`, with ACK cleanup debounced and flushed
-  on `pagehide`/`visibilitychange`. The snapshot includes its client identity,
-  attempt counts, and named-key barriers. Restored frames retain their exact
-  identities and cannot use first-attempt sequence repair, even if a failed
-  attempt write left `tries:0`. A missing or mismatched saved client identity
-  refuses replay with feedback. Unsupported explicit snapshot versions refuse
-  replay too; empty non-key records retain a refusal boundary for dependent text.
-  Persisted counters must be nonnegative safe integers so new WebSocket frames
-  cannot accidentally become unsequenced legacy writes. An exhausted counter
-  refuses new delivery or sequence repair with feedback; it never resets or
-  reuses an identity. The seq counters persist too, so seqs stay monotonic across reloads (never reset — a reset would
-  let the server treat fresh input as an already-applied duplicate).
+- Every document creates a fresh **`clientId`**, even after reload or duplicating
+  a window whose `sessionStorage` was copied. Its per-session sequences start at
+  one. New input never borrows another window's sequence counter.
+- Each frame keeps its original `(clientId, sessionId, seq)` in an **immutable
+  localStorage record**. A window appends only its own new records and removes
+  only an exact acknowledged occurrence or a deliberately cancelled suffix.
+  Pagehide never replaces a browser-wide snapshot, so one window cannot erase
+  another window's pending input or resurrect its acknowledged records.
+- On reload, recovery reads pending records from **all windows**, retaining each
+  original identity and sequence order. Another live window may still retry the
+  same occurrence; server deduplication prevents another application. Recovered
+  identities use serialized HTTP, whose response identifies the exact request.
+  WebSocket ACKs contain only a sequence, so that socket carries only the current
+  document's identity. Recovered frames always remain uncertain and cannot be
+  assigned fresh replay identities.
+- New records name their pending predecessor, separately from wall-clock timestamps.
+  Recovery preserves those causal edges and each original CID sequence; a missing
+  legacy timestamp or backwards clock cannot move a suffix before its prefix.
+  A quarantined predecessor never counts as an acknowledged occurrence.
+- Named newline keys are never replayed after reload. Their saved barriers, or
+  malformed records, refuse dependent suffixes and other imported partitions
+  for that same session. Other sessions remain recoverable. Recovery bounds
+  storage enumeration to 8192 keys, 4096 frames and the 256 KiB backlog, checks
+  the index repeatedly, and verifies captured bytes before publishing a queue.
+  A changing or unverifiable snapshot refuses replay and leaves its bytes intact.
+- Verified session removal forgets only exact loaded occurrences. Quarantined
+  key/suffix or unreadable evidence remains intact rather than allowing partial
+  deletion to release a dependent suffix. These records can consume the bounded
+  browser recovery capacity; they are never automatically replayed as new input.
+- Legacy whole-map snapshots are read-only. Verified legacy identities retain
+  their original bytes and use bounded, exact-occurrence ACK markers (at most 4096) so another window cannot recreate acknowledged legacy input. Uncertain
+  key barriers are retained. Missing/mismatched identities or unsupported
+  snapshot versions refuse replay with feedback.
+- Disabled/full storage keeps in-memory delivery available and reports that the
+  window must remain open. No durable suffix is written behind a failed prefix.
+  Existing records belonging to other windows are retained. Sequence exhaustion
+  still refuses new frames and sequence repair without resetting an identity.
 - **Delivery** (`_drainSession`):
-  - **WS path** — when the socket is `OPEN` for the session, send each not-yet-sent
+  - **WS path** — when the socket is `OPEN` for the session and its current-document CID owns the head, send each not-yet-sent
     record (`sentAt === 0`) in seq order over the single ordered stream. Records
     stay pending until the server's `{t:'ia',seq}` ACK removes them.
-  - **POST path** — when no WS, POST records in order, awaiting each (the HTTP 2xx
+  - **POST path** — when no WS or a recovered CID owns the head, POST records in order, awaiting each (the HTTP 2xx
     _is_ the ACK). A 404/410 (session gone) drops the record rather than retry
     forever.
 - **Half-open recovery** (`_redeliverSweep`, every 2s): if the active WS session's
@@ -79,7 +99,7 @@ explained below.
   persisted counter write came back counting BELOW the server's watermark, and every
   later keystroke was dropped-but-ACKed: a silently dead terminal a reload could not
   fix, since the stale counter was restored from localStorage too. The client now
-  persists the counter synchronously on every send for the same reason. Untagged
+  retains each original replay identity and starts a fresh document CID for new input. Untagged
   frames apply unconditionally (no behavior change).
 - **POST route** (`/api/sessions/:id/input`) — optional `seq`/`clientId` in
   `SessionInputWithLimitSchema`; a deduped duplicate returns 200 without writing
@@ -127,15 +147,21 @@ later text waits. Only a recovery reservation's `422` response with
 30 seconds, with a 1-second minimum retry delay). Key requests have a 10-second
 deadline. A permanent refusal, expired retry budget, or unknown key outcome
 refuses the dependent suffix with feedback; it cannot join text from opposite
-sides of the missing newline. Explicit terminal teardown may release ordinary
-text behind a never-attempted or certified-not-sent key, but an in-flight key
-with an uncertain outcome also refuses its suffix. Snapshots preserve named-key
+sides of the missing newline. Explicit terminal teardown also refuses the dependent suffix when cancelling a
+never-attempted or certified-not-sent key; an in-flight key with an uncertain
+outcome remains sealed with its suffix. Snapshots preserve named-key
 ordering markers. Reload never replays a key: it refuses that barrier and its
 dependent suffix with a warning while preserving preceding ordinary text and
 sequence counters. Legacy snapshots omitted keys, so only their contiguous
 prefix beginning at sequence 1 proves the absence of a missing key. Disabled or
 full browser storage and backlogs over 256 KiB can lose cross-reload durability;
 the live queue remains available.
+
+Each live Session retains at most 256 client ledgers. Evicted committed identities
+remain in a fixed 16 KiB rejection-only filter: a possible collision refuses input
+rather than reopening an old receipt. Existing live clients continue normally, and
+abandoned identities that never dispatched input can be reclaimed. This rejection
+history has the same live-Session lifetime as the original counters.
 
 Dedup state is in-memory on the server. A **server restart** between a write and
 the client's redelivery of that same seq could re-apply it (a rare duplicate).

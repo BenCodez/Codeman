@@ -60,7 +60,7 @@ describe('joint reboot launch evidence', () => {
         },
       ])
     );
-    const env = await rebuildPersistedCustomModelEnv('codex', ID, saved);
+    const env = await rebuildPersistedCustomModelEnv('codex', ID, saved, process.cwd());
     expect(env).toBeDefined();
     config = join(customModelConfigDir(ID), 'config.toml');
     rollout = join(customModelConfigDir(ID), 'rollout.jsonl');

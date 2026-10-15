@@ -1325,7 +1325,7 @@ export class WebServer extends EventEmitter {
     saved: CustomModelBookkeeping
   ): Promise<Record<string, string> | undefined> {
     try {
-      const env = await rebuildPersistedCustomModelEnv(session.mode, session.id, saved);
+      const env = await rebuildPersistedCustomModelEnv(session.mode, session.id, saved, session.workingDir);
       if (!env) console.warn('[WebServer] custom-model endpoint is unavailable; selection kept for clearing');
       return env;
     } catch (err) {
