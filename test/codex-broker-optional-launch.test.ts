@@ -1,9 +1,22 @@
 /** Optional guard setup may fail before a fake native launch; every process API is sealed. */
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
 import * as fsPromises from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import { dataPath } from '../src/config/instance.js';
 import type { TmuxManager as Manager } from '../src/tmux-manager.js';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
+
+vi.mock('../src/recovery/codex-broker-cleanup.js', async (original) => {
+  const actual = await original<typeof import('../src/recovery/codex-broker-cleanup.js')>();
+  const { spawn } = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+  return {
+    ...actual,
+    rollbackCodexBrokerProvisioning: (
+      receipt: import('../src/recovery/codex-broker-cleanup.js').BrokerProvisioningRollback
+    ) => actual.rollbackCodexBrokerProvisioning(receipt, spawn),
+  };
+});
 
 const effects = vi.hoisted(() => ({
   sync: vi.fn(),
@@ -51,6 +64,7 @@ vi.mock('node:child_process', async (original) => {
 });
 let TmuxManager: typeof import('../src/tmux-manager.js').TmuxManager;
 let manager: Manager;
+const provisioningRoots: string[] = [];
 const SID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const options = {
   sessionId: SID,
@@ -92,9 +106,10 @@ beforeEach(() => {
   vi.spyOn(internal, 'saveSessions').mockImplementation(() => {});
   effects.sync.mockClear();
 });
-afterEach(() => {
+afterEach(async () => {
   manager.destroy();
   vi.restoreAllMocks();
+  for (const root of provisioningRoots.splice(0)) await fsPromises.rm(root, { recursive: true, force: true });
 });
 afterAll(() => {
   vi.restoreAllMocks();
@@ -115,6 +130,71 @@ function successfulBroker() {
     startupReceipt: vi.fn(async () => 'started' as const),
   } as unknown as CodexInputBroker;
 }
+
+it.each(['create', 'ordinary-respawn'] as const)(
+  'removes an actual provisioned broker when owner authority is revoked before %s dispatch',
+  async (kind) => {
+    if (kind === 'ordinary-respawn') registerOrdinary();
+    const original = CodexInputBroker.create;
+    let current = true;
+    let provisioned: CodexInputBroker | undefined;
+    vi.spyOn(CodexInputBroker, 'create').mockImplementation(async (...args) => {
+      const root = await fsPromises.mkdtemp(join(homedir(), 'unlaunched-native-'));
+      provisioningRoots.push(root);
+      provisioned = await original(join(root, 'control'), args[1], args[2], args[3], root);
+      current = false;
+      return provisioned;
+    });
+    const launch = { ...options, ownerLaunchIsCurrent: () => current };
+    if (kind === 'create')
+      await expect(manager.createSession(launch)).rejects.toThrow('Owner launch authority changed');
+    else expect(await manager.respawnPane(launch)).toBeNull();
+    expect(provisioned).toBeDefined();
+    expect(await fsPromises.readdir(dirname(provisioned!.directory))).toEqual([]);
+    expect(
+      commands().filter((command) => command.includes(' new-session ') || command.includes('respawn-pane'))
+    ).toEqual([]);
+  }
+);
+
+it.each(['healthy', 'lost-dispatch-reply', 'cancelled-after-placeholder', 'replaced-file'] as const)(
+  'keeps prelaunch rollback bounded to its exact provably unlaunched files (%s)',
+  async (change) => {
+    const original = CodexInputBroker.create;
+    let current = true;
+    let provisioned: CodexInputBroker | undefined;
+    vi.spyOn(CodexInputBroker, 'create').mockImplementation(async (...args) => {
+      const root = await fsPromises.mkdtemp(join(homedir(), 'unlaunched-native-'));
+      provisioningRoots.push(root);
+      provisioned = await original(join(root, 'control'), args[1], args[2], args[3], root);
+      vi.spyOn(provisioned, 'startupReceipt').mockResolvedValue('started');
+      if (change === 'replaced-file') {
+        const path = join(provisioned.directory, 'config.json');
+        await fsPromises.writeFile(path + '.owner', await fsPromises.readFile(path), { mode: 0o600 });
+        await fsPromises.rename(path + '.owner', path);
+        current = false;
+      }
+      return provisioned;
+    });
+    const effect = effects.sync.getMockImplementation()!;
+    effects.sync.mockImplementation((command: string) => {
+      if (change === 'cancelled-after-placeholder' && command.includes(' remain-on-exit ')) current = false;
+      if (change === 'lost-dispatch-reply' && command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED'))
+        throw Error('Fixture native acknowledgement lost');
+      return effect(command);
+    });
+    const launch = { ...options, ownerLaunchIsCurrent: () => current };
+    if (change === 'healthy') await manager.createSession(launch);
+    else await expect(manager.createSession(launch)).rejects.toThrow();
+    expect(provisioned).toBeDefined();
+    if (change === 'cancelled-after-placeholder')
+      expect(await fsPromises.readdir(dirname(provisioned!.directory))).toEqual([]);
+    else expect(await fsPromises.readdir(provisioned!.directory)).toEqual(['broker.py', 'config.json', 'lock']);
+    expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(
+      change === 'healthy' || change === 'lost-dispatch-reply' ? 1 : 0
+    );
+  }
+);
 
 it.each([
   ['create', false],

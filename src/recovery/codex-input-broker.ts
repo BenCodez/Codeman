@@ -333,6 +333,7 @@ export class CodexInputBroker {
   };
   private ready = false;
   private ownerCursorUncertain = false;
+  private unlaunchedRollback?: BrokerProvisioningRollback;
   private constructor(
     readonly directory: string,
     private readonly config: BrokerConfig,
@@ -487,7 +488,15 @@ export class CodexInputBroker {
       await rollbackCodexBrokerProvisioning(rollback).catch(() => {});
       throw error;
     }
-    return new CodexInputBroker(directory, config);
+    const broker = new CodexInputBroker(directory, config);
+    broker.unlaunchedRollback = rollback;
+    return broker;
+  }
+  /** Caller must certify that no native broker dispatch was attempted. */
+  async rollbackUnlaunchedProvisioning(): Promise<void> {
+    const receipt = this.unlaunchedRollback;
+    this.unlaunchedRollback = undefined;
+    if (receipt) await rollbackCodexBrokerProvisioning(receipt).catch(() => {});
   }
   static async load(directory: string, sessionId: string): Promise<CodexInputBroker | undefined> {
     try {
@@ -588,7 +597,9 @@ export class CodexInputBroker {
     const path = join(this.directory, 'config.json');
     await fs.writeFile(`${path}.next`, data, { mode: 0o600, flag: 'wx' });
     const handle = await fs.open(`${path}.next`, constants.O_RDONLY | constants.O_NOFOLLOW);
+    let replacement: Stats;
     try {
+      replacement = await handle.stat();
       await handle.sync();
     } finally {
       await handle.close();
@@ -602,6 +613,17 @@ export class CodexInputBroker {
     }
     Object.assign(this.config, planned);
     this.startupConfigurationDigest = createHash('sha256').update(data).digest('hex');
+    if (this.unlaunchedRollback && privateFile(replacement) && replacement.size === Buffer.byteLength(data)) {
+      const previous = this.unlaunchedRollback.files.findIndex((file) => file.name === 'config.json');
+      if (previous >= 0)
+        this.unlaunchedRollback.files[previous] = {
+          name: 'config.json',
+          dev: replacement.dev,
+          ino: replacement.ino,
+          size: replacement.size,
+          hash: this.startupConfigurationDigest,
+        };
+    }
   }
   async startupReceipt(panePid: number): Promise<'started' | 'not-sent' | 'unknown'> {
     const deadline = performance.now() + 2_000;

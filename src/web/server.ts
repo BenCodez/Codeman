@@ -54,6 +54,7 @@ import { GLYPH, palette } from '../cli-style.js';
 import { getHookSecret } from '../config/hook-secret.js';
 import { EventEmitter } from 'node:events';
 import { Session, isExternalCliMode, type BackgroundTask } from '../session.js';
+import { normalizedCodexHome } from '../recovery/codex-home.js';
 import type { ClaudeMode, SessionAttachmentHistoryItem, SessionState, WorkflowRunInfo } from '../types.js';
 import { RespawnController, RespawnConfig } from '../respawn-controller.js';
 import type { TerminalMultiplexer } from '../mux-interface.js';
@@ -3672,7 +3673,21 @@ export class WebServer extends EventEmitter {
               allowedTools: recoveryClaudeMode.allowedTools,
               openCodeConfig: muxSession.mode === 'opencode' ? savedState?.openCodeConfig : undefined,
               codexConfig: muxSession.mode === 'codex' ? savedState?.codexConfig : undefined,
-              preserveExitedPane: getCli(muxSession.mode)?.capabilities.recovery === 'codex-rollout',
+              preserveExitedPane:
+                getCli(muxSession.mode)?.capabilities.recovery === 'codex-rollout' &&
+                !muxSession.remote &&
+                !savedState?.remote &&
+                !muxSession.docker &&
+                !savedState?.docker &&
+                !muxSession.discovered &&
+                muxSession.recoveryIsolated === true &&
+                savedState?.codexConfig?.noDaemon === true &&
+                /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(muxSession.recoveryInputBroker ?? '') &&
+                normalizedCodexHome(muxSession.recoveryCodexHome) !== undefined &&
+                (savedEnvOverrides?.CODEX_HOME === undefined ||
+                  savedEnvOverrides.CODEX_HOME === '' ||
+                  normalizedCodexHome(savedEnvOverrides.CODEX_HOME) ===
+                    normalizedCodexHome(muxSession.recoveryCodexHome)),
               geminiConfig: muxSession.mode === 'gemini' ? savedState?.geminiConfig : undefined,
               antigravityConfig: muxSession.mode === 'antigravity' ? savedState?.antigravityConfig : undefined,
               piConfig: muxSession.mode === 'pi' ? savedState?.piConfig : undefined,

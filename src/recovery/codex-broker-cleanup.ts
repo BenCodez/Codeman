@@ -116,7 +116,7 @@ export async function pruneCodexInputBrokers(
   );
 }
 
-/** Only create() supplies this private receipt, before it has returned any launch authority. */
+/** Captured only by create(); rollback callers must certify no native dispatch was attempted. */
 export interface BrokerProvisioningRollback {
   root: string;
   sessionId: string;
