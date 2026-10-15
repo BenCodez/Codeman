@@ -497,6 +497,8 @@ export async function canUsernameRunPrivilegedCommands(username: string | undefi
 /** Private bounded owner evidence; final dispatch joins this file with its other FD witnesses. */
 export interface RecoveryPrivilegeGrant {
   privileged: boolean;
+  /** Role from the same bounded/current owner snapshot; bypass permission is not an admin role. */
+  readonly role?: UserRole;
   isCurrent(): boolean;
   readonly fileWitness?: Readonly<PrivateFileWitness>;
   getFileWitness(): PrivateFileWitness | undefined;
@@ -650,7 +652,13 @@ export async function prepareRecoveryPrivilegeGrant(username: string | undefined
   };
   if (!isMultiUserMode()) {
     const isCurrent = () => scopeCurrent() && !isMultiUserMode();
-    return { privileged: true, isCurrent, getFileWitness: () => undefined, verifyCurrent: async () => isCurrent() };
+    return {
+      privileged: true,
+      role: 'admin',
+      isCurrent,
+      getFileWitness: () => undefined,
+      verifyCurrent: async () => isCurrent(),
+    };
   }
   if (!username) return denied;
   const norm = normalizeUsername(username);
@@ -710,6 +718,7 @@ export async function prepareRecoveryPrivilegeGrant(username: string | undefined
   const getFileWitness = () => ({ ...witness });
   return {
     privileged: canRunPrivilegedCommands(user!),
+    role: user!.role,
     isCurrent,
     fileWitness: witness,
     getFileWitness,

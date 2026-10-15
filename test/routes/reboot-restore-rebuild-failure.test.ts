@@ -30,10 +30,15 @@ import { customModelConfigDir } from '../../src/custom-model-injection-apply.js'
 import { createUser, deleteUser, updateUser, findUser, invalidateUsersCache } from '../../src/user-store.js';
 
 const syncProfileProbe = vi.hoisted(() => ({ path: '', calls: 0 }));
+const syncWorkspaceProbe = vi.hoisted(() => ({ path: '', calls: 0 }));
 vi.mock('node:fs', async (original) => {
   const actual = await original<typeof import('node:fs')>();
   return {
     ...actual,
+    realpathSync: (...args: Parameters<typeof actual.realpathSync>) => {
+      if (String(args[0]) === syncWorkspaceProbe.path) syncWorkspaceProbe.calls++;
+      return actual.realpathSync(...args);
+    },
     existsSync: (path: Parameters<typeof actual.existsSync>[0]) => {
       if (String(path) === syncProfileProbe.path) syncProfileProbe.calls++;
       return actual.existsSync(path);
@@ -173,6 +178,8 @@ async function createHarness(ctx: ReturnType<typeof createMockRouteContext>): Pr
 }
 
 beforeEach(() => {
+  syncWorkspaceProbe.path = '';
+  syncWorkspaceProbe.calls = 0;
   syncProfileProbe.path = '';
   syncProfileProbe.calls = 0;
   startShouldThrow = false;
@@ -662,6 +669,106 @@ describe('Codex reboot launch and cancellation', () => {
   }
   it.each(
     ['codex', 'claude'].flatMap((mode) =>
+      ['healthy', 'cancelled', 'unreadable', 'timeout'].map((outcome) => ({ mode, outcome }))
+    )
+  )('bounds the actual final workspace probe for $mode/$outcome before dispatch', async ({ mode, outcome }) => {
+    const priorMode = process.env.CODEMAN_MULTIUSER,
+      priorSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+    const spaces = join(homedir(), 'async-final-confinement');
+    process.env.CODEMAN_MULTIUSER = '1';
+    process.env.CODEMAN_USER_SPACES_DIR = spaces;
+    writeFileSync(dataPath('users.json'), JSON.stringify({ version: 1, users: [] }));
+    invalidateUsersCache();
+    await createUser({ username: 'alice', role: 'user', password: 'fixture-password' });
+    const workspace = join(spaces, 'alice', 'cases', 'project');
+    mkdirSync(workspace, { recursive: true });
+    const entry = mode === 'codex' ? codexOffer() : offerEntry('generic-async-workspace', 'alice');
+    entry.owner = entry.state.owner = 'alice';
+    entry.workingDir = entry.state.workingDir = workspace;
+    if (mode === 'codex') {
+      const home = join(homedir(), '.codex');
+      mkdirSync(join(home, 'sessions'), { recursive: true });
+      writeFileSync(
+        join(home, 'sessions', `rollout-confinement-${uuid}.jsonl`),
+        JSON.stringify({
+          type: 'session_meta',
+          payload: {
+            id: uuid,
+            cwd: workspace,
+            timestamp: '2026-10-13T15:00:00Z',
+            originator: 'codeman_codex-original',
+          },
+        }) + '\n'
+      );
+      (entry.state as unknown as Record<string, unknown>).__envOverrides = { CODEX_OTHER: 'keep' };
+      (entry.state as unknown as Record<string, unknown>).__codexRecoveryHome = home;
+    }
+    const historical = structuredClone(entry.state);
+    let entered!: () => void,
+      release!: () => void,
+      held = false;
+    const at = new Promise<void>((resolve) => {
+        entered = resolve;
+      }),
+      barrier = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+    const realpath = fs.realpath.bind(fs);
+    let spy: ReturnType<typeof vi.spyOn> | undefined;
+    afterGuardPrepare = async () => {
+      syncWorkspaceProbe.path = workspace;
+      spy = vi.spyOn(fs, 'realpath').mockImplementation(async (path, ...options) => {
+        if (!held && String(path) === workspace) {
+          held = true;
+          entered();
+          await barrier;
+          if (outcome === 'unreadable') throw Object.assign(Error('Workspace unavailable'), { code: 'EACCES' });
+        }
+        return realpath(path, ...options);
+      });
+    };
+    await rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false }),
+      app = await createHarness(ctx);
+    try {
+      const response = app
+        .inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })
+        .then((value) => value);
+      await Promise.race([
+        at,
+        response.then(() => {
+          throw Error('Launch bypassed the asynchronous final workspace probe');
+        }),
+      ]);
+      expect(syncWorkspaceProbe.calls).toBe(0);
+      expect(callOrder).not.toContain('launchAccepted');
+      if (outcome === 'cancelled') await rebootRestoreRegistry.clear(() => true);
+      if (outcome === 'timeout') {
+        const result = (await response).json().data;
+        expect(result.restored).toEqual([]);
+        expect(callOrder).not.toContain('launchAccepted');
+        release();
+      } else {
+        release();
+        const result = (await response).json().data;
+        expect(result.restored).toHaveLength(outcome === 'healthy' ? 1 : 0);
+        expect(callOrder.filter((value) => value === 'launchAccepted')).toHaveLength(outcome === 'healthy' ? 1 : 0);
+      }
+      expect(entry.state).toEqual(historical);
+      if (outcome !== 'healthy') expect(ctx.persistRebootRestoreDurably).not.toHaveBeenCalled();
+    } finally {
+      release();
+      spy?.mockRestore();
+      await app.close();
+      invalidateUsersCache();
+      if (priorMode === undefined) delete process.env.CODEMAN_MULTIUSER;
+      else process.env.CODEMAN_MULTIUSER = priorMode;
+      if (priorSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+      else process.env.CODEMAN_USER_SPACES_DIR = priorSpaces;
+    }
+  });
+  it.each(
+    ['codex', 'claude'].flatMap((mode) =>
       ['setup', 'after-prepare', 'after-confirm'].flatMap((stage) =>
         [
           'downgrade',
@@ -893,9 +1000,9 @@ describe('Codex reboot launch and cancellation', () => {
           });
         } else {
           expect(result.restored).toEqual([]);
-          expect(result.skipped).toEqual([{ sessionId: 'codex-original', reason: 'rebuild-failed' }]);
-          // The async profile preflight now refuses a missing grant before any
-          // profile writes or tentative Session construction.
+          expect(result.skipped).toEqual([{ sessionId: 'codex-original', reason: 'workspace-forbidden' }]);
+          // The bounded role/confinement preflight refuses the missing owner
+          // before profile writes or tentative Session construction.
           expect(launchConfigs).toEqual([]);
           expect(ctx.addSession).not.toHaveBeenCalled();
           expect(ctx.discardPartiallyBuiltSession).not.toHaveBeenCalled();
