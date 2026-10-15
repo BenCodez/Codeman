@@ -21,6 +21,18 @@ describe('remote worker effects bind the final native pane incarnation', () => {
     expect(result).toMatchObject({ status: 'not-sent', effects: '', commands: [] });
   });
 
+  it('retains the exact raw native token when empty and zero both decode as no signal', async () => {
+    const result = await fixture('restart', 'none', false, { beforeEffect: 'no-signal-alias' });
+    expect(result).toMatchObject({
+      status: 'not-sent',
+      identityReason: 'verified',
+      nativeRefusalObserved: true,
+      workerStarted: false,
+      effects: '',
+      commands: [],
+    });
+  });
+
   it.each(['pid', 'pane-id', 'dead', 'status', 'signal', 'session'] as const)(
     'delivers zero input bytes after native %s changes before the first paste',
     async (beforeEffect) => {
@@ -33,9 +45,9 @@ describe('remote worker effects bind the final native pane incarnation', () => {
     'does not launch Codex in a changed restore placeholder: %s',
     async (beforeEffect) => {
       const result = await fixture('restore', 'none', false, { beforeEffect });
-      // Creating/configuring/releasing the inert wait has already happened, so
-      // this failure stays unknown rather than authorizing replay of restore.
-      expect(result).toMatchObject({ status: 'unknown', effects: '', commands: [] });
+      // This reader receives a separately provisioned inert pane. Its exact
+      // native refusal certifies no child start; the public lost-ACK path remains sealed.
+      expect(result).toMatchObject({ status: 'not-sent', effects: '', commands: [], workerStarted: false });
     }
   );
 
@@ -80,8 +92,10 @@ describe('remote worker effects bind the final native pane incarnation', () => {
       const workingDir = '/fixture/work space\n\r\t;$HOME\\literal';
       const result = await fixture(kind, 'none', false, { prompt: 'capture native commands', workingDir });
       expect(result.status).toBe('sent');
-      expect(result.commands?.[0]?.slice(0, 3)).toEqual(['respawn-pane', '-c', workingDir]);
-      expect(result.commands?.[0]?.at(-1)).toContain(workingDir);
+      expect(result.commands?.[0]?.slice(0, 3)).toEqual(['respawn-pane', '-c', result.workingDir]);
+      expect(result.workingDir?.endsWith(workingDir)).toBe(true);
+      expect(result.workerCommand).toContain(result.workingDir);
+      expect(result.commands?.[0]?.at(-1)).toMatch(/^[a-f0-9]{64}$/);
       expect(result.commands).toHaveLength(1);
     }
   );

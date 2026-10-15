@@ -362,7 +362,7 @@ describe('task and recovery server action wiring', () => {
         if (owner === 'paused') await task.pause();
         expect(task.getStatus().phase).toBe(owner === 'paused' ? 'paused' : 'watching');
         expect(!!task.getStatus().inFlight).toBe(owner === 'in-flight');
-        await recovery.updateConfig({ detectStalls: true, stalledAfterMs: 10_000, maxRetries: 1 });
+        await recovery.updateConfig({ detectStalls: true, restartStalls: true, stalledAfterMs: 10_000, maxRetries: 1 });
 
         await recovery.retry();
         expect(recoveryAct).not.toHaveBeenCalled();

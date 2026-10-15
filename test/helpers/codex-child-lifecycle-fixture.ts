@@ -1,14 +1,16 @@
 /** Real Session, resolver, adapter, controller and journal; pane/process effects are fakes. */
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fakeInputProvenance } from './codex-input-provenance.js';
+import type { CodexBrokerProof } from '../../src/recovery/codex-input-broker.js';
 import { expect, vi } from 'vitest';
 import { Session } from '../../src/session.js';
 import type { TerminalMultiplexer, MuxSession } from '../../src/mux-interface.js';
 import { CodexRecoveryAdapter } from '../../src/recovery/codex-adapter.js';
 import { RecoveryController } from '../../src/recovery/controller.js';
 import { RecoveryStore } from '../../src/recovery/store.js';
-import { initialRecoveryState } from '../../src/recovery/types.js';
+import { initialRecoveryState, type RecoveryConfig } from '../../src/recovery/types.js';
 
 export const CHILD_NOW = Date.UTC(2026, 9, 13, 12);
 export const CHILD_THREAD = '019a5aa0-1111-7111-8111-111111111111';
@@ -18,6 +20,16 @@ export const CHILD_READY = '› \n  fixture-model default · /fixture/workspace\
 export const CHILD_ERROR = { message: 'Conversation interrupted.', codex_error_info: null };
 
 export function childEvent(payload: Record<string, unknown>, age: number): string {
+  // These lifecycle positives model native timestamps and the exact sender;
+  // an explicit undefined override still models a missing evidence field.
+  if (typeof payload.type === 'string' && payload.type.startsWith('collab_')) {
+    payload = {
+      sender_thread_id: CHILD_THREAD,
+      call_id: 'fixture-child-call',
+      [payload.type.endsWith('_begin') ? 'started_at_ms' : 'completed_at_ms']: CHILD_NOW - age,
+      ...payload,
+    };
+  }
   return JSON.stringify({ timestamp: new Date(CHILD_NOW - age).toISOString(), type: 'event_msg', payload });
 }
 
@@ -44,7 +56,8 @@ export async function createChildLifecycleFixture(
   body: string,
   dead: boolean,
   storedExit = dead,
-  trackedSubmission = true
+  trackedSubmission = true,
+  config: Partial<RecoveryConfig> = {}
 ) {
   const root = await fs.mkdtemp(join(homedir(), 'codex-child-lifecycle-'));
   const workspace = join(root, 'workspace');
@@ -57,8 +70,32 @@ export async function createChildLifecycleFixture(
     type: 'session_meta',
     payload: { id: CHILD_THREAD, cwd: workspace, originator: `codeman_${CHILD_SESSION}` },
   });
-  const pane = { paneId: '%7', panePid: 700, dead, ...(dead ? { status: 9 } : {}), screen: dead ? null : CHILD_READY };
-  const mux = { inspectPaneForRecovery: vi.fn(async () => pane) };
+  const inputProof = fakeInputProvenance(
+    { brokerPid: 700, childPid: 701, closed: dead, ...(dead ? { exitStatus: 9 } : {}) },
+    codexHome
+  );
+  const pane = {
+    inputProvenance: inputProof,
+    paneId: '%7',
+    panePid: 700,
+    dead,
+    ...(dead ? { status: 9 } : {}),
+    screen: dead ? null : CHILD_READY,
+  };
+  const mux = {
+    inspectPaneForRecovery: vi.fn(async () => pane),
+    inspectCodexInputProvenance: vi.fn(async () => structuredClone(inputProof)),
+    getCodexInputAuthority: (sessionId: string, proof: CodexBrokerProof) =>
+      sessionId === CHILD_SESSION
+        ? {
+            sessionId,
+            incarnation: proof.incarnation,
+            directory: dirname(proof.fileWitness!.path),
+            proof,
+            files: [proof.fileWitness!],
+          }
+        : undefined,
+  };
   const session = new Session({
     id: CHILD_SESSION,
     workingDir: workspace,
@@ -68,6 +105,7 @@ export async function createChildLifecycleFixture(
     mux: mux as unknown as TerminalMultiplexer,
     muxSession: {
       muxName: 'codeman-child-fixture',
+      pid: 700,
       recoveryIsolated: true,
       recoveryCodexHome: codexHome,
     } as MuxSession,
@@ -101,7 +139,14 @@ export async function createChildLifecycleFixture(
   const adapter = new CodexRecoveryAdapter(session, vi.fn());
   const store = new RecoveryStore(join(root, 'recovery.json'));
   const state = initialRecoveryState();
-  state.config = { ...state.config, enabled: true, detectStalls: true, stalledAfterMs: 10_000, retryDelayMs: 1000 };
+  state.config = {
+    ...state.config,
+    enabled: true,
+    detectStalls: true,
+    stalledAfterMs: 10_000,
+    retryDelayMs: 1000,
+    ...config,
+  };
   state.armedAt = CHILD_NOW - 60_000;
   const controller = new RecoveryController(
     {

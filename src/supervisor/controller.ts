@@ -61,6 +61,8 @@ export interface SupervisorDependencies {
   hasManagerAuthority(): boolean;
   /** Fresh bounded private proof immediately before each worker native effect. */
   prepareManagerAuthority(workerId: string, source?: RecoveryEvidenceSource): Promise<boolean>;
+  /** Private launch-owned manager input scope, available only after fresh verification. */
+  getInputIssuer?(): ReturnType<NonNullable<RecoveryActionAuthority['getInputIssuer']>>;
   /** Read-only native manager revalidation; never refresh/dispatch its Task controller here. */
   validateManagerAuthority(): Promise<boolean>;
   startManager(
@@ -619,8 +621,15 @@ export class SupervisorController {
         hasBudget() &&
         !!worker &&
         this.workerAllowsAction(worker, configured, action, false);
+      isCurrent.getActionDeadline = () =>
+        Math.min(
+          runtimeStartedAt + configured.maxRuntimeMs,
+          (this.state.startedAt ?? NaN) + SUPERVISOR_MANAGER_MAX_RUNTIME_MS
+        );
       isCurrent.prepareEvidence = async (source) =>
         isCurrent() && (await this.deps.prepareManagerAuthority(workerId, source)) === true && isCurrent();
+      if (this.deps.getInputIssuer)
+        isCurrent.getInputIssuer = () => (isCurrent() ? this.deps.getInputIssuer!() : undefined);
       const requireCurrent = () => {
         if (!hasBudget()) throw new SupervisorOperationRefused('Worker assignment budget exhausted');
         if (!isCurrent()) throw new SupervisorOperationRefused('Supervisor operation was cancelled');

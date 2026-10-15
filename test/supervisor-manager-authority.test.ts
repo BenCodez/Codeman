@@ -5,7 +5,7 @@ import fs from 'node:fs/promises';
 import { lstatSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { invalidateUsersCache, findUser } from '../src/user-store.js';
 import { clampRecoveryLaunchForOwner } from '../src/session-env-clamp.js';
 import { dataPath } from '../src/config/instance.js';
@@ -26,6 +26,8 @@ import { RecoveryController, type RecoveryDependencies } from '../src/recovery/c
 import { SupervisorController, type SupervisorDependencies } from '../src/supervisor/controller.js';
 import type { SupervisorStore } from '../src/supervisor/store.js';
 import { createDeferred } from './mocks/index.js';
+import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
+import type { CodexBrokerProof } from '../src/recovery/codex-input-broker.js';
 
 const MANAGER = '11111111-1111-4111-8111-111111111111';
 const WORKER = '22222222-2222-4222-8222-222222222222';
@@ -66,6 +68,7 @@ function expectManagerEvidenceUnchanged(actual: TaskState, before: TaskState, pa
     : before;
   expect(actual).toEqual(expected);
 }
+const inputProofs = new WeakMap<Session, CodexBrokerProof>();
 function fakeSession(id: string, conversationId: string): Session {
   const muxSession = {
     sessionId: id,
@@ -78,16 +81,38 @@ function fakeSession(id: string, conversationId: string): Session {
     pid: 99999,
     createdAt: Date.now(),
   } as MuxSession;
+  const inputProof = fakeInputProvenance({ brokerPid: 99999, childPid: 100000 }, muxSession.recoveryCodexHome);
+  let probeSequence = 0;
   const session = new Session({
     id,
     owner: 'alice',
     mode: 'codex',
     workingDir: process.cwd(),
     useMux: true,
-    mux: { isAvailable: () => true } as unknown as TerminalMultiplexer,
+    mux: {
+      isAvailable: () => true,
+      inspectCodexInputProvenance: async (sessionId: string, panePid: number) => {
+        if (sessionId !== id || panePid !== 99999) return undefined;
+        // Every real zero-child probe commits a fresh private receipt. Keep that
+        // file change in this fake so a stale self-witness cannot pass unnoticed.
+        updateFakeInputProvenance(inputProof, {}, (proof) => ({ ...proof, probeSequence: ++probeSequence }));
+        return structuredClone(inputProof);
+      },
+      getCodexInputAuthority: (sessionId: string, proof: CodexBrokerProof) =>
+        sessionId === id && proof.incarnation === inputProof.incarnation && proof.rawGeneration === 0
+          ? {
+              sessionId: id,
+              incarnation: proof.incarnation,
+              directory: dirname(proof.fileWitness!.path),
+              proof,
+              files: [proof.fileWitness!],
+            }
+          : undefined,
+    } as unknown as TerminalMultiplexer,
     muxSession,
     codexConfig: { noDaemon: true, resumeSessionId: conversationId },
   });
+  inputProofs.set(session, inputProof);
   session.trackUserInput('Exact initial owner fixture prompt\r');
   return session;
 }
@@ -105,6 +130,8 @@ function privateEvidenceSource(session: Session, path: string, conversationId: s
   const snapshot = scope();
   return {
     sessionId: session.id,
+    files: [inputProofs.get(session)!.fileWitness!],
+    inputBroker: session.getRecoveryInputAuthority(inputProofs.get(session)!),
     identity: {
       reason: 'verified',
       conversationId,
@@ -193,6 +220,7 @@ describe('manager authority at the real server boundary', () => {
         const source = privateEvidenceSource(session, workerRolloutPath, WORKER_THREAD);
         Reflect.set(Reflect.get(this, 'recovery'), 'verifiedTail', {
           ...source.identity,
+          inputProof: inputProofs.get(session),
           config: JSON.stringify(session.codexConfig),
           env: JSON.stringify(session.getEnvOverridesForPersist()),
         });
@@ -216,6 +244,7 @@ describe('manager authority at the real server boundary', () => {
       if (session.id !== MANAGER) return workerObservation;
       const stat = lstatSync(rolloutPath);
       Reflect.set(this, 'verifiedTail', {
+        inputProof: inputProofs.get(session),
         conversationId: observation.conversationId,
         path: rolloutPath,
         tail: readFileSync(rolloutPath, 'utf8'),
@@ -338,7 +367,7 @@ describe('manager authority at the real server boundary', () => {
   it.each(
     (['assign', 'retry'] as const).flatMap((action) =>
       [false, true].flatMap((busy) =>
-        ['spawn-begin', 'running', 'completed', 'shutdown'].map((child) => ({ action, busy, child }))
+        ['spawn-begin', 'running', 'completed', 'shutdown', 'missing-fields'].map((child) => ({ action, busy, child }))
       )
     )
   )(
@@ -347,11 +376,17 @@ describe('manager authority at the real server boundary', () => {
       const childId = '66666666-6666-4666-8666-666666666666';
       const payload =
         child === 'spawn-begin'
-          ? { type: 'collab_agent_spawn_begin', call_id: 'actual-manager-child' }
+          ? {
+              type: 'collab_agent_spawn_begin',
+              call_id: 'actual-manager-child',
+              sender_thread_id: MANAGER_THREAD,
+              started_at_ms: Date.now(),
+            }
           : {
               type: 'collab_agent_spawn_end',
               call_id: 'actual-manager-child',
               new_thread_id: childId,
+              ...(child === 'missing-fields' ? {} : { sender_thread_id: MANAGER_THREAD, completed_at_ms: Date.now() }),
               status: child === 'completed' ? { completed: null } : child === 'shutdown' ? { shutdown: null } : child,
             };
       await appendFile(
@@ -374,6 +409,7 @@ describe('manager authority at the real server boundary', () => {
           watching: false,
           tailTruncated: false,
         });
+        expect(classified.activity === 'unknown').toBe(child === 'missing-fields');
         return {
           ...classified,
           processReady:
@@ -1052,13 +1088,20 @@ describe('manager authority at the real server boundary', () => {
       }
       taskAct.mockRestore();
       Reflect.set(worker, '_mux', {
+        ...Reflect.get(worker, '_mux'),
         isAvailable: () => true,
         inspectPaneForRecovery: async () => {
           if (boundary === 'pane') {
             reached.resolve();
             await release.promise;
           }
-          return { paneId: '%7', panePid: 700, dead: false, screen: '›\n  fixture-model high · /tmp\n' };
+          return {
+            paneId: '%7',
+            panePid: 99999,
+            inputProvenance: inputProofs.get(worker),
+            dead: false,
+            screen: '›\n  fixture-model high · /tmp\n',
+          };
         },
         sendInput: async (_id: string, _input: string, guard: RecoveryMuxDispatchGuard) => {
           if (!guard.prepareEvidence || !(await guard.prepareEvidence())) return false;
@@ -1142,6 +1185,29 @@ describe('manager authority at the real server boundary', () => {
     }
   });
 
+  it.each(['healthy', 'manager', 'worker'] as const)(
+    'couples both private broker journals with the final manager/worker evidence (%s)',
+    async (kind) => {
+      expect(await managerDeps.validateManagerAuthority()).toBe(true);
+      const worker = internals.sessions.get(WORKER)!;
+      const source = privateEvidenceSource(worker, workerRolloutPath, WORKER_THREAD);
+      if (kind !== 'healthy') {
+        const proof = inputProofs.get(kind === 'manager' ? managerSession : worker)!;
+        // Replace after observation without refreshing the captured witness.
+        if (kind === 'manager') updateFakeInputProvenance(proof, { rawGeneration: 1 });
+        else await writeFile(proof.fileWitness!.path, '{"unobservedRawInput":true}');
+      }
+      expect(await managerDeps.prepareManagerAuthority(WORKER, source)).toBe(kind === 'healthy');
+      if (kind === 'healthy') {
+        const issuer = managerDeps.getInputIssuer?.();
+        expect(issuer?.sessionId).toBe(MANAGER);
+        expect(issuer?.proof.incarnation).toBe(inputProofs.get(managerSession)!.incarnation);
+        expect(issuer?.files?.map((file) => file.path)).toContain(inputProofs.get(managerSession)!.fileWitness!.path);
+      }
+      expect(effects).not.toHaveBeenCalled();
+    }
+  );
+
   it('refuses a fulfilled false private-proof Promise before worker dispatch', async () => {
     vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockImplementationOnce(async () => false);
     await expect(manager.assign(WORKER, 'false-manager-proof')).rejects.toThrow(/owner Start/);
@@ -1208,6 +1274,14 @@ describe('manager authority at the real server boundary', () => {
         owned,
       });
       Reflect.set(worker, '_envOverrides', { CODEX_HOME: managerSession.getRecoveryContext().codexHome });
+      const record = Reflect.get(worker, '_muxSession') as MuxSession;
+      if (owned) {
+        expect(() => managerDeps.validateWorkers([WORKER])).toThrow(/eligible/);
+        expect(await managerDeps.prepareManagerAuthority(WORKER)).toBe(false);
+      }
+      record.remote = worker.remote;
+      record.recoveryCodexHome = managerSession.getRecoveryContext().codexHome;
+
       if (owned) expect(() => managerDeps.validateWorkers([WORKER])).not.toThrow();
       else expect(() => managerDeps.validateWorkers([WORKER])).toThrow(/eligible/);
       expect(await managerDeps.prepareManagerAuthority(WORKER)).toBe(owned);
@@ -1228,10 +1302,12 @@ describe('manager authority at the real server boundary', () => {
     });
     taskAct.mockRestore();
     Reflect.set(worker, '_mux', {
+      ...Reflect.get(worker, '_mux'),
       isAvailable: () => true,
       inspectPaneForRecovery: async () => ({
         paneId: '%7',
-        panePid: 700,
+        panePid: 99999,
+        inputProvenance: inputProofs.get(worker),
         dead: false,
         screen: '›\n  fixture-model high · /tmp\n',
       }),

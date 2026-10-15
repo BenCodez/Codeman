@@ -540,6 +540,16 @@ describe('recovery journal durability', () => {
           expect(act).not.toHaveBeenCalled();
           now += 1;
           await controller.retry();
+          // The old detection policy never consented to restarting this pane.
+          expect(act).not.toHaveBeenCalled();
+          expect(controller.getStatus().attempts).toBe(1);
+          await controller.updateConfig({ restartStalls: true });
+          await controller.retry();
+          expect(act).not.toHaveBeenCalled();
+          now += 10_000;
+          await controller.retry();
+          now += 2000;
+          await controller.retry();
           expect(act).toHaveBeenCalledOnce();
           expect(controller.getStatus().attempts).toBe(2);
         }

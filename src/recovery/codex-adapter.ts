@@ -7,6 +7,8 @@ import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../s
 import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
 import { checkCodexIdentityWitnesses } from './codex-witness-check.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './codex-home.js';
+import type { CodexBrokerProof } from './codex-input-broker.js';
+import type { OwnedRemoteBrokerDescriptor } from './remote-input-broker-cache.js';
 import { classifyCodexTail, hasEmptyCodexComposer } from './codex-classifier.js';
 import {
   validRemoteClock,
@@ -81,10 +83,11 @@ const remoteDeadPaneFirstSeenBySession = new WeakMap<Session, RemoteDeadPaneFirs
 
 function remotePaneEvidenceKey(
   conversationId: string,
-  pane: Pick<RemoteCodexRestartRequest['expectedPane'], 'paneId' | 'panePid' | 'status' | 'signal'>
+  pane: Pick<RemoteCodexRestartRequest['expectedPane'], 'paneId' | 'panePid' | 'status' | 'signal'>,
+  processKey: string
 ): string {
   const digest = createHash('sha256')
-    .update(JSON.stringify([pane.paneId, pane.panePid, pane.status ?? null, pane.signal ?? null]), 'utf8')
+    .update(JSON.stringify([pane.paneId, pane.panePid, pane.status ?? null, pane.signal ?? null, processKey]), 'utf8')
     .digest('hex');
   return `${conversationId}:remote-pane:${digest}`;
 }
@@ -121,6 +124,7 @@ export class CodexRecoveryAdapter {
         live.scope === this.liveProofScope() &&
         !!pane &&
         this.proof?.generation === live.generation &&
+        this.proof.processProofKey === live.processKey &&
         pane.conversationId === live.conversationId &&
         pane.tailHash === live.tailHash &&
         pane.paneId === live.paneId &&
@@ -157,6 +161,7 @@ export class CodexRecoveryAdapter {
     conversationId: string;
     expected: RemoteCodexInputRequest['expected'];
     submission: NonNullable<RemoteCodexEvidenceRequest['submission']>;
+    inputBroker: OwnedRemoteBrokerDescriptor;
   };
   private missingProof?: { generation: number; conversationId: string; tailHash: string };
   private verifiedTail?: {
@@ -165,8 +170,9 @@ export class CodexRecoveryAdapter {
     tailTruncated?: boolean;
     path?: string;
     witness?: CodexIdentityWitness;
-    config?: string;
-    env?: string;
+    config: string;
+    env: string;
+    inputProof?: CodexBrokerProof;
     clock?: RemoteClockWitness;
   };
   private remotePaneContinuity?: {
@@ -175,6 +181,7 @@ export class CodexRecoveryAdapter {
     tailHash: string;
     paneId: string;
     panePid: number;
+    processKey: string;
     liveObservedAt: number;
     scope: string;
     deadObservedAt?: number;
@@ -205,7 +212,7 @@ export class CodexRecoveryAdapter {
     // explicitly persisted absolute home pins the worker's exact configuration.
     if (session.remote && normalizedCodexHome(context.codexHome) === undefined) return unknown('identity-unverified');
     if (!context.noDaemon) return unknown('managed-daemon');
-    if (context.switchPending || context.untrackedInput || session.paneLifecycleInFlight)
+    if (context.switchPending || context.untrackedInput || context.inputBrokerPending || session.paneLifecycleInFlight)
       return unknown('identity-unverified');
     // A launch seed cannot witness an untracked direct-TUI /resume.
     // Effects require an exact owner submission and its current history identity.
@@ -226,12 +233,15 @@ export class CodexRecoveryAdapter {
       return { ...unknown('approval-required'), activity: 'blocked' };
     }
     if (session.remote) {
+      const inputBroker = await session.getOwnedRemoteInputBroker();
+      if (session.getRecoveryContext().generation !== context.generation) return unknown('user-input');
       const evidence = await this.deps.inspectRemote(session.remote, {
         sessionId: session.id,
-        workingDir: session.workingDir,
+        workingDir: session.remote.remotePath,
         codexHome: context.codexHome,
         resumeId: session.codexConfig?.resumeSessionId,
         submission: context.submission,
+        inputBroker,
       });
       const afterInspect = session.getRecoveryContext();
       if (afterInspect.generation !== context.generation || afterInspect.switchPending || afterInspect.untrackedInput)
@@ -270,12 +280,6 @@ export class CodexRecoveryAdapter {
       const remoteTail = evidence.identity.tail;
       const remoteTailTruncated = evidence.identity.tailTruncated;
       const remoteClock = evidence.clock;
-      this.verifiedTail = {
-        conversationId,
-        tail: evidence.identity.tail,
-        tailTruncated: evidence.identity.tailTruncated,
-        clock: evidence.clock,
-      };
       const classifyRemoteTail = (screen: string | null, busy: boolean): RecoveryObservation => {
         const clock = remoteClock;
         const result = classifyCodexTail(remoteTail, {
@@ -308,11 +312,59 @@ export class CodexRecoveryAdapter {
         }
         return result;
       };
+      let brokerPanePid: number;
+      try {
+        brokerPanePid = evidence.pane?.panePid ?? JSON.parse(evidence.inputBroker?.serialized ?? 'null')?.pid;
+      } catch {
+        return unknown('identity-unverified');
+      }
+      if (evidence.session === 'missing' && evidence.inputBroker?.historical !== true)
+        return unknown('identity-unverified');
+      if (!inputBroker || !evidence.inputBroker) return unknown('identity-unverified');
+      const inputProof = session.observeOwnedRemoteInputBroker(
+        evidence.inputBroker.serialized,
+        evidence.inputBroker.witness,
+        brokerPanePid
+      );
+      if (
+        !inputProof ||
+        !session.isOwnedRemoteInputBrokerProofCurrent(inputProof) ||
+        inputProof.incarnation !== inputBroker.incarnation ||
+        (evidence.session === 'present' && inputProof.closed !== evidence.pane?.dead) ||
+        inputProof.homeDigest !== createHash('sha256').update(context.codexHome!).digest('hex')
+      ) {
+        this.verifiedTail = undefined;
+        return unknown('identity-unverified');
+      }
+      this.verifiedTail = {
+        conversationId,
+        tail: evidence.identity.tail,
+        tailTruncated: evidence.identity.tailTruncated,
+        clock: evidence.clock,
+        config: JSON.stringify(this.session.codexConfig),
+        env: JSON.stringify(this.session.getEnvOverridesForPersist()),
+      };
       if (session.codexConfig?.resumeSessionId !== conversationId) {
         session.pinRecoveryConversation(conversationId);
         this.persistSession();
       }
+      if (this.verifiedTail) this.verifiedTail.inputProof = inputProof;
+      const remoteProcessKey = JSON.stringify([
+        inputProof.incarnation,
+        inputProof.brokerPid,
+        inputProof.childPid,
+        inputProof.brokerStart,
+        inputProof.childStart,
+      ]);
       if (evidence.session === 'missing') {
+        if (inputProof.closed && inputProof.exitStatus === 0 && !inputProof.exitSignal)
+          return {
+            activity: 'exited',
+            reason: 'clean-exit',
+            at: evidence.identity.changedAt ?? Date.now(),
+            conversationId,
+            safeToAct: false,
+          };
         // A clean remote `/exit` removes a `remain-on-exit failed` tmux session and
         // lets ssh exit 0. The local wrapper is transport evidence only, but that
         // clean status is the necessary veto against presenting host-reboot restore.
@@ -365,7 +417,7 @@ export class CodexRecoveryAdapter {
           };
         } else if ((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0) {
           const detectedAt = Date.now();
-          const evidenceKey = remotePaneEvidenceKey(conversationId, pane);
+          const evidenceKey = remotePaneEvidenceKey(conversationId, pane, remoteProcessKey);
           const priorDeadPane = remoteDeadPaneFirstSeenBySession.get(session);
           const firstDeadObservedAt =
             priorDeadPane?.generation === context.generation && priorDeadPane.evidenceKey === evidenceKey
@@ -384,6 +436,7 @@ export class CodexRecoveryAdapter {
             continuity.tailHash === tailHash &&
             continuity.paneId === pane.paneId &&
             continuity.panePid === pane.panePid &&
+            continuity.processKey === remoteProcessKey &&
             (continuity.deadObservedAt !== undefined ||
               detectedAt - continuity.liveObservedAt <= REMOTE_LIVE_PROOF_MAX_AGE_MS)
               ? continuity
@@ -443,6 +496,7 @@ export class CodexRecoveryAdapter {
                 tailHash,
                 paneId: pane.paneId,
                 panePid: pane.panePid,
+                processKey: remoteProcessKey,
                 liveObservedAt: observedAt,
                 scope: this.liveProofScope(),
               }
@@ -459,17 +513,20 @@ export class CodexRecoveryAdapter {
             generation: context.generation,
             conversationId,
             submission: context.submission,
+            inputBroker,
             expected: {
               conversationId,
               tailHash,
               paneId: pane.paneId,
               panePid: pane.panePid,
               screenHash: createHash('sha256').update(pane.screen, 'utf8').digest('hex'),
+              inputProof,
             },
           };
         }
       }
       observation.conversationId = conversationId;
+      observation.processProofKey = remoteProcessKey;
       const proofKey = observation.safeToAct
         ? observation.evidenceKey
         : observation.stallRestartable
@@ -480,6 +537,7 @@ export class CodexRecoveryAdapter {
           key: proofKey,
           generation: context.generation,
           conversationId,
+          processProofKey: remoteProcessKey,
           ...(observation.stallRestartable
             ? {
                 stallEvidenceKey: observation.stallEvidenceKey,
@@ -543,6 +601,20 @@ export class CodexRecoveryAdapter {
     if (!pane) return unknown('pane-unverified');
     if (!pane.dead && (pane.status !== undefined || pane.signal !== undefined || !!pane.paneSignalToken))
       return unknown('pane-unverified');
+    // History identifies submitted input, not an unobserved direct /resume.
+    // Only a launch-owned input broker can exclude that unseen input path.
+    const inputProof = pane.inputProvenance;
+    if (!inputProof || !inputProof.fileWitness) return unknown('identity-unverified');
+    if (!context.codexHome || inputProof.homeDigest !== createHash('sha256').update(context.codexHome).digest('hex'))
+      return unknown('identity-unverified');
+    if (
+      inputProof.brokerPid !== pane.panePid ||
+      inputProof.closed !== pane.dead ||
+      !Number.isSafeInteger(inputProof.childPid) ||
+      inputProof.childPid <= 0
+    )
+      return unknown('pane-unverified');
+    if (this.verifiedTail) this.verifiedTail.inputProof = inputProof;
     if (session.codexConfig?.resumeSessionId !== identity.conversationId) {
       session.pinRecoveryConversation(identity.conversationId);
       this.persistSession();
@@ -559,7 +631,7 @@ export class CodexRecoveryAdapter {
         tailTruncated: identity.tailTruncated,
         lastIntentionalStopAt: context.intentionalStopAt,
       });
-      if (pane.status === 0 && !pane.signal) {
+      if (inputProof.exitStatus === 0 && !inputProof.exitSignal) {
         observation = { activity: 'exited', reason: 'clean-exit', at: exit?.at ?? Date.now(), safeToAct: false };
       } else if (classified.activity === 'watching' || classified.activity === 'unknown') {
         observation = classified;
@@ -567,6 +639,7 @@ export class CodexRecoveryAdapter {
         exit &&
         pane.status === exit.status &&
         pane.signal === exit.signal &&
+        ((inputProof.exitStatus ?? 0) > 0 || (inputProof.exitSignal ?? 0) > 0) &&
         ((pane.status !== undefined && pane.status > 0) || (pane.signal ?? 0) > 0)
       ) {
         if (!Number.isFinite(exit.at) || exit.at <= 0 || exit.at > Number.MAX_SAFE_INTEGER || exit.at > Date.now())
@@ -646,6 +719,7 @@ export class CodexRecoveryAdapter {
             status: pane.status,
             signal: pane.signal,
             paneSignalToken: pane.paneSignalToken,
+            inputProvenance: inputProof,
           }
         : undefined;
     if (nativePane) observation.processProofKey = createHash('sha256').update(JSON.stringify(nativePane)).digest('hex');
@@ -726,6 +800,11 @@ export class CodexRecoveryAdapter {
     isCurrent: import('./types.js').RecoveryActionAuthority
   ) {
     const expected = this.session.remoteRecoveryConfiguration();
+    const inputProof = this.verifiedTail?.inputProof;
+    const current = () =>
+      !!inputProof &&
+      this.session.isOwnedRemoteInputBrokerProofCurrent(inputProof) &&
+      this.session.isRemoteRecoveryAuthorityCurrent(conversationId, generation, isCurrent, expected);
     return {
       check: async () => {
         if (!(await this.session.confirmRemoteRecoveryAuthority(conversationId, generation, isCurrent, expected)))
@@ -733,9 +812,14 @@ export class CodexRecoveryAdapter {
         // The shared SSH slot and clock sampling can wait. Revalidate the local
         // issuer after those waits before the remote reader performs its own private checks.
         if (isCurrent.prepareEvidence && (await isCurrent.prepareEvidence()) !== true) return false;
-        return this.session.isRemoteRecoveryAuthorityCurrent(conversationId, generation, isCurrent, expected);
+        return current();
       },
-      isCurrent: () => this.session.isRemoteRecoveryAuthorityCurrent(conversationId, generation, isCurrent, expected),
+      isCurrent: current,
+      ...(isCurrent.getInputIssuer ? { getInputIssuer: () => isCurrent.getInputIssuer!() } : {}),
+      ...(isCurrent.getActionDeadline ? { getActionDeadline: () => isCurrent.getActionDeadline!() } : {}),
+      reserveInputBroker: (oldInc: string, newInc: string) =>
+        this.session.reserveOwnedRemoteInputBroker(oldInc, newInc),
+      commitInputBroker: (oldInc: string, newInc: string) => this.session.commitOwnedRemoteInputBroker(oldInc, newInc),
     };
   }
 
@@ -751,6 +835,7 @@ export class CodexRecoveryAdapter {
       expected?.conversationId !== conversationId ||
       !expected.path ||
       !expected.witness ||
+      !expected.inputProof?.fileWitness ||
       context.generation !== generation ||
       expected.config !== JSON.stringify(this.session.codexConfig) ||
       expected.env !== JSON.stringify(this.session.getEnvOverridesForPersist())
@@ -766,8 +851,28 @@ export class CodexRecoveryAdapter {
         this.session.remote,
       ]);
     const snapshot = scope();
+    const authority = this.session.getRecoveryInputAuthority(expected.inputProof);
+    const leaf = expected.witness.paths.find((path) => path.path === expected.path && path.kind === 'file');
+    if (!authority || !leaf || leaf.size === undefined || leaf.mtimeMs === undefined || leaf.ctimeMs === undefined)
+      return undefined;
+    authority.files = [
+      ...(authority.files ?? []),
+      {
+        path: expected.path,
+        dev: leaf.dev,
+        ino: leaf.ino,
+        size: leaf.size,
+        mtimeMs: leaf.mtimeMs,
+        ctimeMs: leaf.ctimeMs,
+        hash: createHash('sha256').update(expected.tail).digest('hex'),
+        maxBytes: 262_144,
+      },
+    ];
+    authority.paths = expected.witness.paths.map((path) => ({ ...path }));
     return {
       sessionId: this.session.id,
+      inputBroker: authority,
+      files: authority.files,
       identity: {
         reason: 'verified',
         conversationId,
@@ -777,6 +882,7 @@ export class CodexRecoveryAdapter {
         witness: expected.witness,
       },
       isCurrent: () =>
+        !!this.session.getRecoveryInputAuthority(expected.inputProof!) &&
         this.verifiedTail === expected &&
         scope() === snapshot &&
         this.session.getRecoveryContext().generation === generation,
@@ -789,6 +895,27 @@ export class CodexRecoveryAdapter {
     generation: number,
     otherSource?: import('./types.js').RecoveryEvidenceSource
   ): Promise<boolean> {
+    const expected = this.verifiedTail?.inputProof;
+    if (!expected) return false;
+    const fresh = await this.session.inspectRecoveryInputProvenance(expected.brokerPid);
+    if (
+      !fresh ||
+      fresh.incarnation !== expected.incarnation ||
+      fresh.brokerPid !== expected.brokerPid ||
+      fresh.childPid !== expected.childPid ||
+      fresh.brokerStart !== expected.brokerStart ||
+      fresh.childStart !== expected.childStart ||
+      fresh.closed !== expected.closed ||
+      fresh.exitStatus !== expected.exitStatus ||
+      fresh.exitSignal !== expected.exitSignal ||
+      fresh.rawGeneration !== expected.rawGeneration ||
+      fresh.launchDigest !== expected.launchDigest ||
+      fresh.homeDigest !== expected.homeDigest ||
+      JSON.stringify(fresh.ownerCounters) !== JSON.stringify(expected.ownerCounters) ||
+      !fresh.fileWitness
+    )
+      return false;
+    if (this.verifiedTail) this.verifiedTail.inputProof = fresh;
     const source = this.getLocalEvidenceSource(conversationId, generation);
     if (
       !source ||
@@ -797,7 +924,10 @@ export class CodexRecoveryAdapter {
     )
       return false;
     return (
-      (await checkCodexIdentityWitnesses([source.identity, ...(otherSource ? [otherSource.identity] : [])])) &&
+      (await checkCodexIdentityWitnesses(
+        [source.identity, ...(otherSource ? [otherSource.identity] : [])],
+        [...(source.files ?? []), ...(otherSource?.files ?? [])]
+      )) &&
       isRecoveryEvidenceSourceCurrent(source) &&
       (!otherSource || isRecoveryEvidenceSourceCurrent(otherSource))
     );
@@ -842,7 +972,8 @@ export class CodexRecoveryAdapter {
     if (
       flight.reason === 'stalled' &&
       previous.remotePane &&
-      JSON.stringify(this.proof?.remotePane) !== JSON.stringify(previous.remotePane)
+      (JSON.stringify(this.proof?.remotePane) !== JSON.stringify(previous.remotePane) ||
+        previous.processProofKey !== this.proof?.processProofKey)
     )
       return 'not-sent';
     if (
@@ -864,7 +995,7 @@ export class CodexRecoveryAdapter {
           flight.conversationId,
           this.proof.generation,
           isCurrent,
-          () =>
+          async () =>
             this.deps.restartRemote(
               this.session.remote!,
               {
@@ -880,6 +1011,9 @@ export class CodexRecoveryAdapter {
                 },
                 codexConfig: { ...this.session.codexConfig!, resumeSessionId: flight.conversationId },
                 codexHome: context.codexHome,
+                inputBroker: await this.session.getOwnedRemoteInputBroker(),
+                expectedInputProof: this.verifiedTail?.inputProof,
+                owner: this.session.owner,
               },
               authority
             )
@@ -942,12 +1076,13 @@ export class CodexRecoveryAdapter {
           remote,
           {
             sessionId: this.session.id,
-            workingDir: this.session.workingDir,
+            workingDir: remote.remotePath,
             codexHome: context.codexHome,
             resumeId: conversationId,
             submission: proof.submission,
             expected: proof.expected,
             prompt,
+            inputBroker: proof.inputBroker,
           },
           authority
         ),
@@ -986,7 +1121,7 @@ export class CodexRecoveryAdapter {
       proof.conversationId,
       proof.generation,
       isCurrent,
-      () =>
+      async () =>
         this.deps.restoreRemote!(
           this.session.remote!,
           {
@@ -996,6 +1131,9 @@ export class CodexRecoveryAdapter {
             expectedIdentity: { conversationId: proof.conversationId, tailHash: proof.tailHash },
             codexConfig: { ...this.session.codexConfig!, resumeSessionId: proof.conversationId },
             codexHome: context.codexHome,
+            inputBroker: await this.session.getOwnedRemoteInputBroker(),
+            expectedInputProof: this.verifiedTail?.inputProof,
+            owner: this.session.owner,
           },
           authority
         )

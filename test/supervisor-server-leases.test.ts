@@ -1,5 +1,6 @@
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 /** @fileoverview Supervisor leases follow surviving/restorable manager identities after boot. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WebServer } from '../src/web/server.js';
@@ -238,6 +239,30 @@ describe('server supervisor lease reconciliation', () => {
     internals.sessions.get(NEXT)!.pinRecoveryConversation('44444444-4444-4444-8444-444444444444');
     internals.sessions.get(NEXT)!.trackUserInput('Initial owner prompt in the selected manager thread\r');
     vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence').mockResolvedValue(true);
+    // This lease test stubs identity verification above; supply its explicit
+    // private issuer scope too. Native delivery stays mocked by `act`.
+    const proof = fakeInputProvenance(
+      { brokerPid: 99999 },
+      internals.sessions.get(NEXT)!.getRecoveryContext().codexHome
+    );
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'getLocalEvidenceSource').mockImplementation(
+      function (conversationId, generation) {
+        const selected = Reflect.get(this, 'session') as Session;
+        return {
+          sessionId: selected.id,
+          identity: { reason: 'verified', conversationId },
+          inputBroker: {
+            sessionId: selected.id,
+            incarnation: proof.incarnation,
+            directory: dirname(proof.fileWitness!.path),
+            proof,
+            files: [proof.fileWitness!],
+          },
+          isCurrent: () =>
+            internals.sessions.get(selected.id) === selected && selected.getRecoveryContext().generation === generation,
+        };
+      }
+    );
     vi.spyOn(CodexRecoveryAdapter.prototype, 'getVerifiedTail').mockReturnValue('');
     vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => ({
       activity: 'working',

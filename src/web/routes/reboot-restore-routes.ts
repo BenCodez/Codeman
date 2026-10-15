@@ -24,6 +24,7 @@
  */
 
 import { FastifyInstance } from 'fastify';
+import type { PrivateFileWitness } from '../../recovery/private-file-witness.js';
 import { existsSync } from 'node:fs';
 import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
 import { RebootRestoreRequestSchema } from '../schemas.js';
@@ -59,7 +60,12 @@ import type { CodexConfig, CustomModelBookkeeping, SessionAttachmentHistoryItem 
 import { rebuildPersistedCustomModelEnv, captureCustomModelRecoveryWitness } from '../../custom-model-recovery.js';
 import { customModelConfigDir, removeConfigDir } from '../../custom-model-injection-apply.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
-import { checkCodexIdentityWitness } from '../../recovery/codex-witness-check.js';
+import {
+  captureRebootIdentityFenceWitness,
+  captureRebootLaunchWitness,
+  type RebootFenceReceipt,
+  type RebootLaunchWitness,
+} from '../../recovery/reboot-launch-witness.js';
 import { currentLocalCodexHome, normalizedCodexHome } from '../../recovery/codex-home.js';
 import { isCodexRestoreConfig } from '../../recovery/reboot-state-binding.js';
 import type { SessionPort, EventPort, ConfigPort, InfraPort } from '../ports/index.js';
@@ -229,7 +235,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             (saved as { __envOverrides?: Record<string, string> }).__envOverrides
           );
           const savedCustomModel = (saved as { __customModel?: CustomModelBookkeeping }).__customModel;
-          let customModelIsCurrent = () => true;
+          let customModelIsCurrent: RebootLaunchWitness = Object.assign(async () => true, {
+            getStartupEvidence: () => undefined,
+          });
+          let rebootFence: RebootFenceReceipt | undefined;
           if (savedCustomModel) {
             // A custom-model Codex session keeps its rollouts/history under this
             // isolated home. Snapshot ownership BEFORE re-derivation writes its
@@ -252,7 +261,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               continue;
             }
             if (usesCodexRecovery) {
-              const witness = captureCustomModelRecoveryWitness(
+              const witness = await captureCustomModelRecoveryWitness(
                 saved.mode ?? 'claude',
                 saved.id,
                 savedCustomModel,
@@ -281,15 +290,31 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             return authorized?.CODEX_HOME === recoveryHome;
           };
           if (usesCodexRecovery) {
+            rebootFence = await captureRebootIdentityFenceWitness(saved.id);
+            if (!rebootFence) {
+              failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+              continue;
+            }
+            if (!savedCustomModel) {
+              const witness = await captureRebootLaunchWitness(saved.mode ?? 'claude', saved.id, undefined, {});
+              if (!witness) {
+                failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
+                continue;
+              }
+              customModelIsCurrent = witness;
+            }
             if (!(await homeCurrentlyAuthorized())) {
               failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
               continue;
             }
             // Validate the actual launch home AFTER applying current owner grants.
-            const verified = await verifyCodexRebootIdentity({
-              ...saved,
-              __envOverrides: envOverrides,
-            } as typeof saved);
+            const verified = await verifyCodexRebootIdentity(
+              {
+                ...saved,
+                __envOverrides: envOverrides,
+              } as typeof saved,
+              rebootFence
+            );
             if (verified !== entry.resumeConversationId) {
               failures.push({ sessionId: entry.sessionId, reason: 'identity-unverified' });
               continue;
@@ -398,11 +423,15 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           if (usesCodexRecovery) {
             // Startup preparation awaits owner settings/listeners. Re-read complete
             // lifecycle evidence and current launch grants at the final boundary.
-            const fence = JSON.stringify(readRebootIdentityFence(session.id));
-            const finalEvidence = await verifyCodexRebootEvidence({
-              ...saved,
-              __envOverrides: envOverrides,
-            } as typeof saved);
+            const fence = rebootFence!;
+            const generation = session.getRecoveryContext().generation;
+            const finalEvidence = await verifyCodexRebootEvidence(
+              {
+                ...saved,
+                __envOverrides: envOverrides,
+              } as typeof saved,
+              fence
+            );
             const finalConfig = await clampExternalCliConfigsForOwner(saved.owner, { codexConfig });
             if (
               finalEvidence?.conversationId !== entry.resumeConversationId ||
@@ -430,37 +459,47 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 : ownerEnv;
             let granted = false;
             let grantIsCurrent = () => false;
+            let grantFiles: readonly PrivateFileWitness[] = [];
+            const authorityIsCurrent = () => {
+              const peers = [...ctx.sessions.values()].filter((other) => other !== session);
+              return (
+                granted &&
+                grantIsCurrent() === true &&
+                rebootRestoreRegistry.isHeld(entry, owner) &&
+                ctx.sessions.get(session.id) === session &&
+                session.owner === saved.owner &&
+                session.getRecoveryContext().generation === generation &&
+                !session.getRecoveryContext().switchPending &&
+                !session.getRecoveryContext().untrackedInput &&
+                rejectAlreadyLive(
+                  [entry],
+                  new Set(peers.map((other) => other.id)),
+                  new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
+                ).skipped.length === 0
+              );
+            };
             session.setCodexRestoreLaunchGuard({
               prepare: async () => {
                 granted = false;
                 grantIsCurrent = () => false;
+                grantFiles = [];
                 const current = await clampRecoveryLaunchForOwner(saved.owner, { codexConfig }, envToAuthorize);
                 grantIsCurrent = current.isCurrent;
+                const grantFile = current.getFileWitness();
+                grantFiles = grantFile ? [grantFile] : [];
                 granted =
                   grantIsCurrent() === true &&
-                  customModelIsCurrent() === true &&
+                  (await customModelIsCurrent(undefined, undefined, grantFiles)) === true &&
                   sameCodexLaunchConfig(current.configs.codexConfig as CodexConfig | undefined, codexConfig!) &&
                   JSON.stringify(current.env) === JSON.stringify(envToAuthorize);
               },
+              getStartupEvidence: () => (authorityIsCurrent() ? customModelIsCurrent.getStartupEvidence() : undefined),
+              isCurrent: authorityIsCurrent,
               confirm: async () => {
-                const authorityIsCurrent = () => {
-                  const peers = [...ctx.sessions.values()].filter((other) => other !== session);
-                  return (
-                    granted &&
-                    customModelIsCurrent() === true &&
-                    grantIsCurrent() === true &&
-                    rebootRestoreRegistry.isHeld(entry, owner) &&
-                    ctx.sessions.get(session.id) === session &&
-                    JSON.stringify(readRebootIdentityFence(session.id)) === fence &&
-                    rejectAlreadyLive(
-                      [entry],
-                      new Set(peers.map((other) => other.id)),
-                      new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
-                    ).skipped.length === 0
-                  );
-                };
                 return (
-                  authorityIsCurrent() && (await checkCodexIdentityWitness(finalEvidence!)) && authorityIsCurrent()
+                  authorityIsCurrent() &&
+                  (await customModelIsCurrent(finalEvidence!, fence, grantFiles)) === true &&
+                  authorityIsCurrent()
                 );
               },
             });

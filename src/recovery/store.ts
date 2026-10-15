@@ -68,7 +68,9 @@ const Pending = z
 const StateSchema = z
   .object({
     version: z.literal(1),
-    config: RecoveryConfigSchema.refine((c) => Object.keys(c).length === 9),
+    config: RecoveryConfigSchema.refine(
+      (c) => Object.keys(c).filter((key) => key !== 'restartStalls').length === 9
+    ).transform((config) => ({ ...config, restartStalls: config.restartStalls ?? false })),
     activity: z.enum([
       'unknown',
       'idle',

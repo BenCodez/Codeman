@@ -1,7 +1,9 @@
 /** Real local Session and rollout reads, fake pane effects; never a live worker. */
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
+import type { CodexBrokerProof } from '../src/recovery/codex-input-broker.js';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { Session } from '../src/session.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
@@ -36,7 +38,9 @@ it.each([
   await fs.mkdir(work);
   await fs.mkdir(join(home, 'sessions'));
   const path = join(home, 'sessions', `rollout-2026-10-13T12-00-00-${THREAD}.jsonl`);
+  const inputProof = fakeInputProvenance({ brokerPid: 700, childPid: 701 }, home);
   const pane = {
+    inputProvenance: inputProof,
     paneId: '%7',
     panePid: 700,
     dead: false,
@@ -47,6 +51,17 @@ it.each([
   let reads = 0;
   const mux = {
     isAvailable: () => true,
+    inspectCodexInputProvenance: async () => structuredClone(inputProof),
+    getCodexInputAuthority: (id: string, proof: CodexBrokerProof) =>
+      id === SESSION
+        ? {
+            sessionId: id,
+            incarnation: proof.incarnation,
+            directory: dirname(proof.fileWitness!.path),
+            proof,
+            files: [proof.fileWitness!],
+          }
+        : undefined,
     inspectPaneForRecovery: vi.fn(async () => {
       if (++reads === 3 && !['unchanged', 'missing-native-id', 'missing-native-pid'].includes(change)) {
         const additions: Record<string, string> = {
@@ -88,8 +103,8 @@ it.each([
         } else await fs.appendFile(path, additions[change]);
       }
       const current = { ...pane };
-      if (change === 'missing-native-id') Reflect.deleteProperty(current, 'paneId');
-      if (change === 'missing-native-pid') Reflect.deleteProperty(current, 'panePid');
+      if (reads >= 3 && change === 'missing-native-id') Reflect.deleteProperty(current, 'paneId');
+      if (reads >= 3 && change === 'missing-native-pid') Reflect.deleteProperty(current, 'panePid');
       return current;
     }),
     sendInput: vi.fn(async () => true),
@@ -99,7 +114,7 @@ it.each([
   const muxSession: MuxSession = {
     sessionId: SESSION,
     muxName: 'codeman-aaaaaaaa',
-    pid: 99999,
+    pid: 700,
     createdAt: NOW,
     workingDir: work,
     mode: 'codex',

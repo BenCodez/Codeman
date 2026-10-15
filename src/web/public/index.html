@@ -1568,8 +1568,12 @@
                       <label class="switch switch-sm"><input type="checkbox" id="recoveryCrashes" checked aria-label="Recover crashes" onchange="app.saveRecoverySetting('recoverCrashes', this)"><span class="slider"></span></label>
                     </div>
                     <div class="set-row">
-                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Recover confirmed stalls</label><span class="set-row-desc">Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local or owned SSH pane died abnormally. Live silence and transport failures only ask for attention.</span></div>
-                      <label class="switch switch-sm"><input type="checkbox" id="recoveryStalls" aria-label="Recover confirmed stalls" onchange="app.saveRecoverySetting('detectStalls', this)"><span class="slider"></span></label>
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Detect stalls (alert only)</label><span class="set-row-desc">Raise an alert for stalled work. Silence alone never triggers recovery.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryStalls" aria-label="Detect stalls (alert only)" onchange="app.saveRecoverySetting('detectStalls', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryRestartStalls">Restart confirmed dead stalls</label><span class="set-row-desc">Requires stall detection and separate owner consent. Restart only after repeated fresh observations confirm an abnormal dead local or owned SSH pane. Live silence and transport failures only ask for attention.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryRestartStalls" aria-label="Restart confirmed dead stalls" onchange="app.saveRecoverySetting('restartStalls', this)"><span class="slider"></span></label>
                     </div>
                   </div>
                 </div>

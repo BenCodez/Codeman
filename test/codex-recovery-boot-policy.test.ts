@@ -103,7 +103,7 @@ async function attachSavedPane(config: Partial<CodexConfig> = {}, env?: Record<s
     mux,
     sessions: new Map<string, Session>(),
     respawnControllers: new Map(),
-    store: { getSession: vi.fn(() => saved) },
+    store: { getSession: vi.fn(() => saved), getSessions: vi.fn(() => ({ [SESSION]: saved })) },
     planRebootRestoreOffer: vi.fn(),
     getClaudeModeConfig: vi.fn(async () => ({ claudeMode: 'auto' as const })),
     setupSessionListeners: vi.fn(async () => {}),
@@ -116,6 +116,8 @@ async function attachSavedPane(config: Partial<CodexConfig> = {}, env?: Record<s
   const session = context.sessions.get(SESSION)!;
   sessions.push(session);
   expect(attach).toHaveBeenCalledExactlyOnceWith();
+  expect(context.store.getSessions).toHaveBeenCalled();
+  expect(context.store.getSessions.mock.invocationCallOrder[0]).toBeLessThan(attach.mock.invocationCallOrder[0]);
   expect(context.persistSessionState).toHaveBeenCalledWith(session);
   return { session, saved, codexConfig, envOverrides };
 }

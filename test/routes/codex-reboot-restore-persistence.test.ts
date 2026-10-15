@@ -3,6 +3,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
 import { createHash } from 'node:crypto';
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -11,7 +12,6 @@ import { userCasesDir } from '../../src/config/multiuser.js';
 import { writeCustomModelHosts } from '../../src/custom-model-hosts.js';
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
 import { planVerifiedRebootRestore, verifyCodexRebootIdentity } from '../../src/reboot-restore.js';
-import * as identityWitness from '../../src/recovery/codex-witness-check.js';
 import { hashCodexPrompt, resolveCodexIdentity } from '../../src/recovery/codex-identity.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../src/recovery/reboot-identity-fence.js';
 import { rebootStateBinding } from '../../src/recovery/reboot-state-binding.js';
@@ -466,7 +466,7 @@ describe('durable Codex reboot completion', () => {
       const username = `final-grant-${stage}`;
       await createUser({ username, role: 'user', password: 'fixture-password', canBypassPermissions: true });
       const id = `${hashCodexPrompt(stage).slice(0, 8)}-3333-2222-3333-444444444444`;
-      const { state } = fixture(id, join(homedir(), '.codex'), join(userCasesDir(username), 'project'));
+      const { state, rollout } = fixture(id, join(homedir(), '.codex'), join(userCasesDir(username), 'project'));
       state.owner = username;
       state.codexConfig = {
         noDaemon: true,
@@ -508,11 +508,17 @@ describe('durable Codex reboot completion', () => {
           return result;
         });
         if (stage === 'final-witness') {
-          const confirm = identityWitness.checkCodexIdentityWitness;
-          vi.spyOn(identityWitness, 'checkCodexIdentityWitness').mockImplementation(async (...args) => {
-            const result = await confirm(...args);
-            if (prepared && !revoked) revoke();
-            return result;
+          const open = fs.open.bind(fs);
+          vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+            const file = await open(...args);
+            if (args[0] !== rollout) return file;
+            const read = file.read.bind(file);
+            vi.spyOn(file, 'read').mockImplementation(async (...readArgs) => {
+              const result = await Reflect.apply(read, file, readArgs);
+              if (prepared && !revoked) revoke();
+              return result;
+            });
+            return file;
           });
         }
       }
@@ -963,6 +969,100 @@ describe('deleted custom endpoint on reboot', () => {
     });
     expect(readFileSync(rollout, 'utf8')).toContain(UUID);
   });
+
+  it.each([
+    { held: 'profile', changed: 'grant' },
+    { held: 'rollout', changed: 'grant' },
+    { held: 'fence', changed: 'grant' },
+    { held: 'grant', changed: 'profile' },
+    { held: 'grant', changed: 'rollout' },
+    { held: 'grant', changed: 'fence' },
+    { held: 'grant', changed: 'none' },
+  ] as const)(
+    'uses one final private proof when $changed changes during the $held FD read',
+    async ({ held, changed }) => {
+      process.env.CODEMAN_MULTIUSER = '1';
+      invalidateUsersCache();
+      const username = `joint-${held}-${changed}`;
+      await createUser({ username, role: 'user', password: 'fixture-password', canBypassPermissions: true });
+      const id = `${hashCodexPrompt(username).slice(0, 8)}-1111-2222-3333-444444444444`;
+      const home = customModelConfigDir(id);
+      const { state, rollout } = fixture(id, home, join(userCasesDir(username), 'project'));
+      state.owner = username;
+      state.codexConfig = {
+        noDaemon: true,
+        resumeSessionId: UUID,
+        sandbox: 'danger-full-access',
+        approvalPolicy: 'never',
+        dangerouslyBypassApprovals: true,
+      };
+      Object.assign(state, {
+        __envOverrides: { CODEX_HOME: home },
+        __customModel: {
+          endpointId: 'joint-endpoint',
+          modelId: 'custom-model',
+          envKeys: ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'],
+          configDir: home,
+        },
+      });
+      await writeCustomModelHosts(getDataDir(), [
+        { id: 'joint-endpoint', label: 'joint', baseUrl: 'http://127.0.0.1:8080', apiKey: 'joint-fixture-key' },
+      ]);
+      writeRebootIdentityFence(id, { switchPending: false, resumeSessionId: UUID });
+      await offer(state);
+      const { server, app, ctx, store } = await harness();
+      store.setSession(id, state);
+      const paths = {
+        profile: join(home, 'config.toml'),
+        rollout,
+        fence: dataPath('reboot-identities', `${id}.json`),
+        grant: dataPath('users.json'),
+      };
+      let prepared = false,
+        inspected = false;
+      const clamp = launchGrants.clampRecoveryLaunchForOwner;
+      vi.spyOn(launchGrants, 'clampRecoveryLaunchForOwner').mockImplementation(async (...args) => {
+        const result = await clamp(...args);
+        prepared = true;
+        return result;
+      });
+      const open = fs.open.bind(fs);
+      vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const file = await open(...args);
+        if (args[0] !== paths[held]) return file;
+        const read = file.read.bind(file);
+        vi.spyOn(file, 'read').mockImplementation(async (...readArgs) => {
+          const result = await Reflect.apply(read, file, readArgs);
+          if (prepared && !inspected) {
+            inspected = true;
+            if (changed === 'grant') {
+              const users = JSON.parse(readFileSync(paths.grant, 'utf8'));
+              users.users.find((user: { username: string }) => user.username === username).canBypassPermissions = false;
+              writeFileSync(paths.grant, JSON.stringify(users));
+            } else if (changed === 'fence')
+              writeFileSync(paths.fence, JSON.stringify({ version: 1, switchPending: true }));
+            else if (changed !== 'none') appendFileSync(paths[changed], '\n');
+          }
+          return result;
+        });
+        return file;
+      });
+      const create = vi.spyOn(ctx.mux, 'createSession');
+      const result = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
+      expect(inspected).toBe(true);
+      if (changed === 'none') {
+        expect(result.restored).toHaveLength(1);
+        expect(create).toHaveBeenCalledOnce();
+        expect(sessionMap(server).has(id)).toBe(true);
+      } else {
+        expect(result.restored).toEqual([]);
+        expect(create).not.toHaveBeenCalled();
+        expect(sessionMap(server).has(id)).toBe(false);
+        expect(store.getSession(id)).toEqual(state);
+        expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([id]);
+      }
+    }
+  );
 
   it.each(['single-user', 'privileged-owner'] as const)('refuses stale saved config for %s', async (kind) => {
     const id = `${kind === 'single-user' ? 'eeeeeeee' : 'ffffffff'}-1111-2222-3333-444444444444`;

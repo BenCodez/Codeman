@@ -137,9 +137,12 @@
     'Recover crashes': '恢复崩溃',
     'Resume the same verified conversation after an unexpected process exit.':
       '进程意外退出后，恢复同一个已验证的对话。',
-    'Recover confirmed stalls': '恢复已确认的停滞',
-    'Restart only when repeated structured evidence identifies the same unfinished turn and fresh probes confirm its local or owned SSH pane died abnormally. Live silence and transport failures only ask for attention.':
-      '仅当重复的结构化证据指向同一未完成轮次，且新探测确认其本地或归属的 SSH 窗格异常退出时才重启。运行中的静默和传输故障只会请求处理。',
+    'Detect stalls (alert only)': '检测停滞（仅提醒）',
+    'Raise an alert for stalled work. Silence alone never triggers recovery.':
+      '工作停滞时发出提醒。仅凭静默不会触发恢复。',
+    'Restart confirmed dead stalls': '重启已确认异常退出的停滞会话',
+    'Requires stall detection and separate owner consent. Restart only after repeated fresh observations confirm an abnormal dead local or owned SSH pane. Live silence and transport failures only ask for attention.':
+      '需要启用停滞检测并获得所有者单独授权。仅在重复的新观察确认本地或归属的 SSH 窗格异常退出后重启。运行中的静默和传输故障只会请求处理。',
     'Retry limits': '重试限制',
     'Maximum retries': '最大重试次数',
     'Stop automatic attempts when this limit is reached.': '达到此限制时停止自动尝试。',
