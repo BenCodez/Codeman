@@ -55,6 +55,7 @@ let previousData: string | undefined;
 let previousMode: string | undefined;
 const workers: SessionType[] = [];
 const acceptedPackets = new Map<string, 'sent' | 'not-sent'>();
+const loadedFrames = new Map<string, string>();
 beforeAll(async () => {
   // Enable the real command branches only after every child API is mocked.
   const vitest = process.env.VITEST;
@@ -68,6 +69,7 @@ beforeAll(async () => {
 });
 beforeEach(() => {
   acceptedPackets.clear();
+  loadedFrames.clear();
   directory = mkdtempSync(join(homedir(), 'native-recovery-'));
   previousData = process.env.CODEMAN_DATA_DIR;
   previousMode = process.env.CODEMAN_MULTIUSER;
@@ -157,6 +159,13 @@ async function fixture(action: 'continue' | 'restart', prompt = 'Authorized fixt
   vi.spyOn(inputBroker, 'startupReceipt').mockResolvedValue('started');
   // Bypass constructor/background discovery; use the real effect methods with a single owned registry entry.
   const manager = bareManager();
+  vi.spyOn(
+    manager as unknown as { loadBrokerInputBuffer(name: string, data: string): Promise<void> },
+    'loadBrokerInputBuffer'
+  ).mockImplementation(async (name, data) => {
+    expect(name).toMatch(/^codeman-private-[a-f0-9-]+$/);
+    loadedFrames.set(name, data);
+  });
   const record = {
     sessionId: id,
     muxName: 'codeman-aaaaaaaa',
@@ -194,7 +203,7 @@ async function fixture(action: 'continue' | 'restart', prompt = 'Authorized fixt
         stdout: `codeman-aaaaaaaa|${pane.paneId}|${pane.panePid}|${pane.dead ? 1 : 0}|${pane.status ?? ''}|\n`,
         stderr: '',
       };
-    if (command.includes('if-shell') && command.includes('send-keys')) {
+    if (command.includes('if-shell') && isInputCommand(command)) {
       const expected = {
         session_name: 'codeman-aaaaaaaa',
         pane_id: pane.paneId,
@@ -296,6 +305,7 @@ async function fixture(action: 'continue' | 'restart', prompt = 'Authorized fixt
   };
 }
 function acceptInput(command: string): void {
+  if (!isInputCommand(command)) return;
   const packet = inputPacket(command);
   if (!packet) return;
   const accepted = packet.privateFiles.every((file) => {
@@ -319,14 +329,17 @@ function childCommands(): string[] {
   return commands().filter((command) => {
     const packet = inputPacket(command);
     return packet
-      ? packet.channel !== 'probe' && acceptedPackets.get(packet.nonce) === 'sent'
-      : !command.includes('send-keys');
+      ? isInputCommand(command) && packet.channel !== 'probe' && acceptedPackets.get(packet.nonce) === 'sent'
+      : !isInputCommand(command);
   });
+}
+function isInputCommand(command: string): boolean {
+  return command.includes('send-keys') || command.includes('paste-buffer');
 }
 function isEnter(command: string) {
   return (
     inputData(command) === '\r' ||
-    (command.includes('send-keys') && !command.includes(' -l ') && / Enter(?:'|$)/.test(command))
+    (isInputCommand(command) && !command.includes(' -l ') && / Enter(?:'|$)/.test(command))
   );
 }
 function inputPacket(command: string):
@@ -337,7 +350,9 @@ function inputPacket(command: string):
       privateFiles: import('../src/recovery/private-file-witness.js').PrivateFileWitness[];
     }
   | undefined {
-  const encoded = command.match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):[a-f0-9]{64}/)?.[1];
+  const name = command.match(/codeman-private-[a-f0-9-]+/)?.[0];
+  const frame = name ? loadedFrames.get(name) : command;
+  const encoded = frame?.match(/CODEMAN_INPUT_V1:([A-Za-z0-9+/=]+):[a-f0-9]{64}/)?.[1];
   return encoded ? JSON.parse(Buffer.from(encoded, 'base64').toString()) : undefined;
 }
 function inputData(command: string): string | undefined {
@@ -346,8 +361,8 @@ function inputData(command: string): string | undefined {
 }
 function isLiteral(command: string): boolean {
   return (
-    command.includes('send-keys') &&
-    command.includes(' -l ') &&
+    isInputCommand(command) &&
+    (command.includes('paste-buffer') || command.includes(' -l ')) &&
     inputPacket(command)?.channel !== 'probe' &&
     !isEnter(command)
   );
@@ -568,7 +583,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
     issuer.prepareEvidence = async () => true;
     const delivery = f.deliver(() => true, issuer);
     await entered;
-    expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(holdAt === 1 ? 0 : 1);
+    expect(childCommands().filter((command) => isInputCommand(command))).toHaveLength(holdAt === 1 ? 0 : 1);
     if (change === 'draft') f.pane.screen = '› Direct TUI edit during private proof\n  fixture-model high · /tmp\n';
     if (change === 'busy') f.pane.screen = 'Working (esc to interrupt)\n' + f.pane.screen;
     if (change === 'approval') f.pane.screen = 'Would you like to approve this?\n' + f.pane.screen;
@@ -610,7 +625,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       );
     }
     expect(await f.deliver()).toBe('not-sent');
-    expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(0);
+    expect(childCommands().filter((command) => isInputCommand(command))).toHaveLength(0);
   });
 
   it.each(
@@ -625,13 +640,13 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       let entered = 0,
         workerEffects = 0;
       effects.exec.mockImplementation(async (command: string) => {
-        if (command.includes('send-keys') && ++entered === (afterLiteral ? 2 : 1)) {
+        if (isInputCommand(command) && ++entered === (afterLiteral ? 2 : 1)) {
           if (change === 'native-pid') f.pane.panePid = 701;
           if (change === 'native-id') f.pane.paneId = '%8';
           if (change === 'native-dead') f.pane.dead = true;
         }
         const result = await send(command);
-        if (command.includes('send-keys') && result.stdout !== 'CODEMAN_RECOVERY_PANE_REFUSED\n') workerEffects++;
+        if (isInputCommand(command) && result.stdout !== 'CODEMAN_RECOVERY_PANE_REFUSED\n') workerEffects++;
         return result;
       });
       expect(await f.deliver()).toBe('unknown');
@@ -643,7 +658,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
           : '›\n  fixture-model high · /tmp\n'
       );
       expect(
-        commands().every((command) => !command.includes('send-keys') || /if-shell -F -t (?:'%7'|%7) /.test(command))
+        commands().every((command) => !isInputCommand(command) || /if-shell -F -t (?:'%7'|%7) /.test(command))
       ).toBe(true);
     }
   );
@@ -657,9 +672,9 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       issuer.prepareEvidence = async () => ++checks < 2;
       expect(await f.deliver(async () => true, issuer)).toBe('not-sent');
       expect(checks).toBe(2);
-      expect(
-        commands().filter((command) => command.includes('send-keys') || command.includes('respawn-pane'))
-      ).toHaveLength(0);
+      expect(commands().filter((command) => isInputCommand(command) || command.includes('respawn-pane'))).toHaveLength(
+        0
+      );
     }
   );
   it.each(['unchanged', 'draft'] as const)(
@@ -695,15 +710,21 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
   );
 
   it.each([1, 2].flatMap((capture) => (['grant', 'evidence'] as const).map((change) => ({ capture, change }))))(
-    'rechecks $change after composer capture $capture, immediately before native effect',
+    'rechecks $change at composer phase $capture, immediately before native effect',
     async ({ capture, change }) => {
       const f = await fixture('continue');
       const read = effects.sync.getMockImplementation()!;
-      let captures = 0;
+      let changed = false;
       effects.sync.mockImplementation((command: string) => {
         const screen = read(command);
-        // Each effect now compares two captures around a fresh async witness.
-        if (command.includes('capture-pane') && ++captures === (capture === 1 ? 1 : 3)) {
+        // The second phase begins only after the real fake literal effect;
+        // extra private-buffer checks cannot move this mutation into phase 1.
+        if (
+          command.includes('capture-pane') &&
+          !changed &&
+          (capture === 1 || childCommands().filter(isLiteral).length === 1)
+        ) {
+          changed = true;
           if (change === 'grant') setGrant(false);
           else f.invalidate();
         }
@@ -745,9 +766,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       expect(f.worker.getRecoveryContext().generation).toBe(generation);
       release();
       expect(await delivery).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
-      expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(
-        change === 'unchanged' ? 2 : 0
-      );
+      expect(childCommands().filter((command) => isInputCommand(command))).toHaveLength(change === 'unchanged' ? 2 : 0);
     }
   );
 
@@ -764,9 +783,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
         return nativeSend(...args);
       });
       expect(await f.deliver()).toBe(change === 'unchanged' ? 'sent' : 'not-sent');
-      expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(
-        change === 'unchanged' ? 2 : 0
-      );
+      expect(childCommands().filter((command) => isInputCommand(command))).toHaveLength(change === 'unchanged' ? 2 : 0);
     }
   );
 
@@ -807,7 +824,7 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
     const captures = effects.sync.mock.calls
       .map(([command]) => String(command))
       .filter((command) => command.includes('capture-pane'));
-    expect(captures).toHaveLength(4);
+    expect(captures).toHaveLength(6);
     expect(captures.every((command) => command.includes(' -J '))).toBe(true);
     expect(childCommands().filter(isEnter)).toHaveLength(1);
   });
@@ -972,7 +989,7 @@ describe('current native identity after direct TUI resume', () => {
     );
     if (change.startsWith('held-issuer-')) {
       await entered;
-      expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(0);
+      expect(childCommands().filter((command) => isInputCommand(command))).toHaveLength(0);
       if (change === 'held-issuer-history-change') appendResume();
       if (change === 'held-issuer-rollout-change')
         appendFileSync(
@@ -983,7 +1000,7 @@ describe('current native identity after direct TUI resume', () => {
     }
     const healthy = change === 'unchanged' || change === 'held-issuer-unchanged';
     expect(await delivery).toBe(healthy ? 'sent' : 'not-sent');
-    expect(childCommands().filter((command) => command.includes('send-keys'))).toHaveLength(healthy ? 2 : 0);
+    expect(childCommands().filter((command) => isInputCommand(command))).toHaveLength(healthy ? 2 : 0);
   });
 });
 

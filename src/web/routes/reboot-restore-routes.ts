@@ -119,10 +119,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
     const canAccess = accessorFor(req);
     const owner = ownerFor(req);
 
-    // Take BEFORE the first await: a second click must find nothing to spend.
+    // Reserve BEFORE the first await, including a retry of a failed journal ACK.
     // The flight is per owner, because `take()` already guarantees two callers
     // never receive the same entry, so one user's restore need not block another's.
-    if (!rebootRestoreRegistry.beginSpending(owner)) {
+    if (!(await rebootRestoreRegistry.beginSpendingAfterRepair(owner))) {
       return reply.code(409).send(createErrorResponse(ApiErrorCode.CONFLICT, 'A reboot restore is already running'));
     }
     // Entries nothing built a pane for, returned to the plan on every exit path

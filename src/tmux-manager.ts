@@ -22,6 +22,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { randomUUID } from 'node:crypto';
 import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
 import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
 import { collectDescendants } from './proc-tree.js';
@@ -1785,16 +1786,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           '#{==:#{pane_dead_status},}',
           '#{==:#{pane_dead_signal},}',
         ].reduce((all, term) => `#{&&:${all},${term}}`);
-        const send = `send-keys -t ${shellescape(fields[1])} -l ${shellescape(packet.data)}`;
-        const result = await execAsync(
-          `${this.tmux()} if-shell -F -t ${shellescape(fields[1])} ${shellescape(predicate)} ${shellescape(send)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}`,
-          { timeout: remaining() }
+        const sent = await this.pasteBrokerInput(
+          packet.data,
+          fields[1],
+          predicate,
+          Number(process.hrtime.bigint() / 1_000_000n) + Math.max(0, Math.floor(deadline - performance.now())),
+          () =>
+            performance.now() < deadline &&
+            this.sessions.get(sessionId) === session &&
+            session.muxName === fields[0] &&
+            session.pid === panePid &&
+            session.recoveryInputBroker === broker!.incarnation
         );
-        if (
-          result.stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED' ||
-          performance.now() >= deadline ||
-          (await broker!.receipt(packet.receipt, deadline)) !== 'sent'
-        )
+        if (!sent || performance.now() >= deadline || (await broker!.receipt(packet.receipt, deadline)) !== 'sent')
           return undefined;
         proof = await broker!.prove(panePid, deadline);
       } catch {
@@ -1807,6 +1811,130 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       session.recoveryInputBroker === proof?.incarnation
       ? proof
       : undefined;
+  }
+
+  /** Load private signed input over a pipe; argv contains only an invocation-local buffer name. */
+  private loadBrokerInputBuffer(name: string, data: string, timeout: number): Promise<void> {
+    if (IS_TEST_MODE) throw new Error('Private mux input requires an explicit pipe fixture');
+    return new Promise((resolve, reject) => {
+      let pipeError: Error | undefined;
+      const child = execFile(
+        'tmux',
+        ['-L', this.tmuxSocket, 'load-buffer', '-b', name, '-'],
+        { timeout, maxBuffer: 16_384 },
+        (error, stdout) => {
+          if (pipeError || error) reject(pipeError ?? error);
+          else if (stdout !== '') reject(new Error('Private mux input load was not acknowledged'));
+          else resolve();
+        }
+      );
+      if (!child.stdin) {
+        pipeError = new Error('Private mux input pipe is unavailable');
+        child.kill();
+        return;
+      }
+      const failed = (error: Error) => {
+        pipeError = error;
+        child.kill();
+      };
+      child.stdin.once('error', failed);
+      try {
+        child.stdin.end(data);
+      } catch (error) {
+        failed(error instanceof Error ? error : new Error('Private mux input pipe failed'));
+      }
+      // Settle only when execFile's callback confirms the child has closed;
+      // cleanup must not race a late load from the same client.
+    });
+  }
+
+  private async runBrokerBufferCommand(
+    command: string,
+    timeout: number,
+    maxBuffer: number
+  ): Promise<{ stdout: string }> {
+    if (IS_TEST_MODE) {
+      const result = await this.inputCommandRunner?.(command);
+      if (!result) throw new Error('Private mux input requires an acknowledged fixture command');
+      return result;
+    }
+    return execAsync(command, { timeout, maxBuffer });
+  }
+
+  /** Paste a single signed frame without exposing its prompt or witnesses in process arguments. */
+  private async pasteBrokerInput(
+    data: string,
+    target: string,
+    predicate: string,
+    expiry: number,
+    isCurrent: () => boolean,
+    noteDispatch?: () => void,
+    noteRefusal?: () => void,
+    beforePaste?: () => boolean
+  ): Promise<boolean> {
+    const started = Number(process.hrtime.bigint() / 1_000_000n);
+    const wall = Date.now();
+    const originalRemaining = expiry - started;
+    const remaining = () =>
+      Date.now() < wall
+        ? 0
+        : Math.min(expiry - Number(process.hrtime.bigint() / 1_000_000n), originalRemaining - (Date.now() - wall));
+    const name = `codeman-private-${randomUUID()}`;
+    let attempted = false;
+    let consumed = false;
+    try {
+      if (
+        Buffer.byteLength(data) > 122_880 ||
+        data[0] !== '\x1e' ||
+        data.at(-1) !== '\x1f' ||
+        /^CODEMAN_INPUT_V1:[A-Za-z0-9+/=]+:[a-f0-9]{64}$/.exec(data.slice(1, -1))?.[0] !== data.slice(1, -1) ||
+        remaining() <= 0 ||
+        !isCurrent()
+      ) {
+        noteRefusal?.();
+        return false;
+      }
+      await this.loadBrokerInputBuffer(name, data, Math.max(1, Math.min(EXEC_TIMEOUT_MS, remaining())));
+      // Loading a server buffer is not pane input. Repeat pure authority and
+      // composer checks after that await, within the original frame deadline.
+      if (remaining() <= 0 || !isCurrent() || (beforePaste && !beforePaste()) || remaining() <= 0 || !isCurrent()) {
+        noteRefusal?.();
+        return false;
+      }
+      const remove = `delete-buffer -b ${shellescape(name)}`;
+      const paste = `paste-buffer -r -d -b ${shellescape(name)} -t ${shellescape(target)}`;
+      attempted = true;
+      noteDispatch?.();
+      const { stdout } = await this.runBrokerBufferCommand(
+        `${this.tmux()} if-shell -F -t ${shellescape(target)} ${shellescape(predicate)} ${shellescape(paste)} ${shellescape(`${remove} ; display-message -p CODEMAN_RECOVERY_PANE_REFUSED`)}`,
+        Math.max(1, Math.min(EXEC_TIMEOUT_MS, remaining())),
+        16_384
+      );
+      // Both successful native branches consume only this invocation's buffer.
+      if (stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') {
+        consumed = true;
+        noteRefusal?.();
+        return false;
+      }
+      if (stdout !== '') throw new Error('Private mux input paste was not acknowledged');
+      consumed = true;
+      return true;
+    } catch (error) {
+      if (!attempted) noteRefusal?.();
+      throw error;
+    } finally {
+      if (!consumed) {
+        // A lost load/paste reply never grants permission to replay. Cleanup
+        // can only address the unique buffer allocated by this invocation.
+        // Retirement changes no pane input and cannot renew action authority.
+        // Named buffers have no automatic TTL, even when the frame expired.
+        await this.runBrokerBufferCommand(
+          `${this.tmux()} delete-buffer -b ${shellescape(name)}`,
+          Math.max(1, Math.min(150, remaining() > 0 ? remaining() : 150)),
+          1_024
+        ).catch(() => {});
+      }
+    }
   }
 
   wrapCodexOwnerInput(
@@ -4946,7 +5074,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           ? `${this.tmux()} if-shell -F -t ${shellescape(livePane!.paneId)} ${shellescape(nativePredicate)} ${shellescape(send)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}`
           : `${this.tmux()} ${send}`;
       };
-      const dispatchInput = async (keys: string, data: string, expiry: number): Promise<boolean> => {
+      const dispatchInput = async (
+        keys: string,
+        data: string,
+        expiry: number,
+        finalCurrent: () => boolean
+      ): Promise<boolean> => {
         const actionExpiry =
           recoveryGuard?.actionDeadline === undefined
             ? expiry
@@ -4974,16 +5107,80 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           recoveryGuard?.noteRefusal?.();
           return false;
         }
-        if (frame) keys = `-l ${shellescape(frame.data)}`;
-        recoveryGuard?.noteDispatch();
-        const result = IS_TEST_MODE
-          ? await this.inputCommandRunner!(inputCommand(keys))
-          : await execAsync(inputCommand(keys), { timeout: EXEC_TIMEOUT_MS });
-        if (nativePredicate && (!result || result.stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED')) {
-          recoveryGuard?.noteRefusal?.();
-          return false;
+        if (!frame || !inputBroker) {
+          recoveryGuard?.noteDispatch();
+          const result = IS_TEST_MODE
+            ? await this.inputCommandRunner!(inputCommand(keys))
+            : await execAsync(inputCommand(keys), { timeout: EXEC_TIMEOUT_MS });
+          if (nativePredicate && (!result || result.stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED')) {
+            recoveryGuard?.noteRefusal?.();
+            return false;
+          }
+          return true;
         }
-        if (!frame || !inputBroker) return true;
+        const brokerPid = session.pid;
+        const brokerCurrent = () =>
+          this.sessions.get(sessionId) === session &&
+          session.muxName === muxName &&
+          session.pid === brokerPid &&
+          session.recoveryInputBroker === inputBroker.incarnation &&
+          canDispatch();
+        let target = livePane?.paneId;
+        let predicate = nativePredicate;
+        if (!target || !predicate) {
+          // Ordinary controlled owner input has no automatic recovery pane
+          // proof. Pin its actual native destination before the buffer await.
+          const stdout = IS_TEST_MODE
+            ? this.inputPaneReader?.(muxName)
+            : (
+                await execAsync(
+                  `${this.tmux()} display-message -p -t ${shellescape(muxName)} '#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}'`,
+                  {
+                    timeout: Math.max(
+                      1,
+                      Math.min(EXEC_TIMEOUT_MS, actionExpiry - Number(process.hrtime.bigint() / 1_000_000n))
+                    ),
+                    maxBuffer: 16_384,
+                  }
+                )
+              ).stdout;
+          const fields = typeof stdout === 'string' && stdout.endsWith('\n') ? stdout.slice(0, -1).split('|') : [];
+          if (
+            fields.length !== 6 ||
+            fields[0] !== muxName ||
+            !/^%(?:0|[1-9]\d{0,9})$/.test(fields[1]) ||
+            fields[2] !== String(brokerPid) ||
+            fields[3] !== '0' ||
+            fields[4] !== '' ||
+            fields[5] !== '' ||
+            !brokerCurrent()
+          ) {
+            recoveryGuard?.noteRefusal?.();
+            return false;
+          }
+          target = fields[1];
+          predicate = [
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${target}}`,
+            `#{==:#{pane_pid},${brokerPid}}`,
+            '#{==:#{pane_dead},0}',
+            '#{==:#{pane_dead_status},}',
+            '#{==:#{pane_dead_signal},}',
+          ].reduce((all, term) => `#{&&:${all},${term}}`);
+        }
+        if (
+          !(await this.pasteBrokerInput(
+            frame.data,
+            target,
+            predicate,
+            actionExpiry,
+            brokerCurrent,
+            () => recoveryGuard?.noteDispatch(),
+            () => recoveryGuard?.noteRefusal?.(),
+            finalCurrent
+          ))
+        )
+          return false;
         const receipt = await inputBroker.receipt(frame.receipt);
         if (receipt === 'not-sent') recoveryGuard?.noteBrokerRefusal?.();
         if (receipt === 'sent') recoveryGuard?.noteBrokerSent?.();
@@ -5070,21 +5267,34 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // character in the input buffer rather than as form submission.
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
-        if (!(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry))) return false;
+        if (
+          !(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry, () =>
+            confirmDispatch(admission)
+          ))
+        )
+          return false;
         await new Promise((resolve) => setTimeout(resolve, 50));
         const enterAdmission = await prepareDispatch(textPart);
         if (!confirmDispatch(enterAdmission, textPart) || !canDispatch()) return false;
-        if (!(await dispatchInput('Enter', '\r', enterAdmission!.expiry))) return false;
+        if (
+          !(await dispatchInput('Enter', '\r', enterAdmission!.expiry, () => confirmDispatch(enterAdmission, textPart)))
+        )
+          return false;
       } else if (textPart) {
         // Text only, no Enter
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
-        if (!(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry))) return false;
+        if (
+          !(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry, () =>
+            confirmDispatch(admission)
+          ))
+        )
+          return false;
       } else if (hasCarriageReturn) {
         // Enter only
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
-        if (!(await dispatchInput('Enter', '\r', admission!.expiry))) return false;
+        if (!(await dispatchInput('Enter', '\r', admission!.expiry, () => confirmDispatch(admission)))) return false;
       }
 
       return true;
