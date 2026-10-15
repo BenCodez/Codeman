@@ -678,6 +678,79 @@ describe('Codex reboot launch and cancellation', () => {
     }
   );
   it.each(
+    ['reapply', 'setup'].flatMap((stage) =>
+      ['removed', 'url', 'key', 'models', 'unchanged', 'unrelated'].map((change) => ({ stage, change }))
+    )
+  )('rechecks an env-injected Claude profile changed by $change during $stage', async ({ stage, change }) => {
+    const endpoint: CustomModelHost = {
+      id: 'claude-admin-endpoint',
+      label: 'Claude endpoint fixture',
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'fixture-key',
+      models: ['fixture-model'],
+    };
+    await writeCustomModelHosts(getDataDir(), [endpoint]);
+    const entry = offerEntry('claude-custom-profile');
+    const profileDir = customModelConfigDir(entry.sessionId);
+    mkdirSync(profileDir, { recursive: true });
+    (entry.state as unknown as Record<string, unknown>).__customModel = {
+      endpointId: endpoint.id,
+      modelId: 'fixture-model',
+      envKeys: [
+        'ANTHROPIC_BASE_URL',
+        'ANTHROPIC_API_KEY',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        'CLAUDE_CONFIG_DIR',
+      ],
+      configDir: profileDir,
+    };
+    const historical = structuredClone(entry.state);
+    const mutate = async () => {
+      if (change === 'removed') await writeCustomModelHosts(getDataDir(), []);
+      if (change === 'url')
+        await writeCustomModelHosts(getDataDir(), [{ ...endpoint, baseUrl: 'http://127.0.0.1:8081' }]);
+      if (change === 'key') await writeCustomModelHosts(getDataDir(), [{ ...endpoint, apiKey: 'changed-fixture-key' }]);
+      if (change === 'models') await writeCustomModelHosts(getDataDir(), [{ ...endpoint, models: [] }]);
+      if (change === 'unrelated')
+        await writeCustomModelHosts(getDataDir(), [endpoint, { ...endpoint, id: 'other-endpoint' }]);
+    };
+    rebootRestoreRegistry.set([entry]);
+    const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
+    if (stage === 'setup') ctx.setupSessionListeners.mockImplementation(mutate);
+    else ctx.reapplyPersistedSessionState.mockImplementation(mutate);
+    const app = await createHarness(ctx);
+    try {
+      const response = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+      const result = response.json().data;
+      const allowed = change === 'unchanged' || change === 'unrelated';
+      expect(result.restored).toHaveLength(allowed ? 1 : 0);
+      expect(entry.state).toEqual(historical);
+      expect(callOrder.includes('startInteractive')).toBe(allowed);
+      if (!allowed) {
+        expect(result.skipped).toEqual([{ sessionId: entry.sessionId, reason: 'rebuild-failed' }]);
+        expect(ctx.sessions.has(entry.sessionId)).toBe(false);
+        expect(rebootRestoreRegistry.list(() => true)).toEqual([entry]);
+        expect(ctx.persistRebootRestoreDurably).not.toHaveBeenCalled();
+        expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith(entry.sessionId, expect.anything(), {
+          preserveCustomModelConfigDir: true,
+        });
+      } else {
+        expect(launchConfigs[0].envOverrides).toMatchObject({
+          ANTHROPIC_BASE_URL: endpoint.baseUrl,
+          ANTHROPIC_API_KEY: endpoint.apiKey,
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'fixture-model',
+          ANTHROPIC_DEFAULT_HAIKU_MODEL: 'fixture-model',
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'fixture-model',
+          CLAUDE_CONFIG_DIR: profileDir,
+        });
+      }
+    } finally {
+      await app.close();
+    }
+  });
+  it.each(
     ['setup', 'final-confirm'].flatMap((stage) =>
       [
         'removed',

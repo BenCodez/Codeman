@@ -81,18 +81,28 @@ export class TaskStore {
     if (!/^[\w-]{1,100}$/.test(id)) return Promise.reject(new Error('Invalid session identity'));
     TaskStateSchema.parse(state);
     const copy = structuredClone(state);
+    // Certify only this save's own pure precommit guard rejection. A caller
+    // may reuse an Error object, and I/O failures must never gain that proof.
+    let certifiedCancellation: Error | undefined;
+    const guarded = authority && {
+      isCurrent: () => authority.isCurrent(),
+      commit: () => authority.commit(),
+      cancelled: () => (certifiedCancellation = authority.cancelled()),
+    };
     this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
       if (this.writeUncertain) throw new Error('Task journal durability is uncertain');
-      if (authority && !authority.isCurrent()) throw authority.cancelled();
+      if (guarded && !guarded.isCurrent()) throw guarded.cancelled();
       const next = { ...this.records, [id]: copy };
       if (Object.keys(next).length > 200) throw new Error('Recovery journal is over capacity');
-      await this.write(next, authority);
+      await this.write(next, guarded, () => {
+        certifiedCancellation = undefined;
+      });
       this.records = next;
     });
     const tracked = result
       .catch((error: unknown) => {
-        this.cleanupWriteFailed = true;
+        if (error !== certifiedCancellation || certifiedCancellation === undefined) this.cleanupWriteFailed = true;
         throw error;
       })
       .finally(() => {
@@ -159,7 +169,11 @@ export class TaskStore {
     return tracked;
   }
 
-  private async write(records: Record<string, TaskState>, authority?: TaskSaveAuthority): Promise<void> {
+  private async write(
+    records: Record<string, TaskState>,
+    authority?: TaskSaveAuthority,
+    cleanupFailed?: () => void
+  ): Promise<void> {
     const serialized = JSON.stringify({ version: 1, sessions: records });
     if (Buffer.byteLength(serialized, 'utf8') > MAX_JOURNAL_BYTES)
       throw new Error('Task journal is over byte capacity');
@@ -183,7 +197,10 @@ export class TaskStore {
         renameSync(temp, this.path);
         this.records = records;
         authority.commit();
-      } else await rename(temp, this.path);
+      } else {
+        commitAttempted = true;
+        await rename(temp, this.path);
+      }
       const directory = await open(dirname(this.path), 'r');
       try {
         await directory.sync();
@@ -194,7 +211,9 @@ export class TaskStore {
       if (commitAttempted) this.writeUncertain = true;
       throw error;
     } finally {
-      await unlink(temp).catch(() => {});
+      await unlink(temp).catch(() => {
+        cleanupFailed?.();
+      });
     }
   }
 

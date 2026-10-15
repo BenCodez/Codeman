@@ -17,8 +17,12 @@ export const TaskConfigSchema = z
   })
   .strict();
 const CriterionId = z.string().regex(/^[\w-]{1,80}$/);
-const CriterionDescription = PromptTextSchema.min(1).max(1000);
-const CriterionCommand = PromptTextSchema.min(1).max(1000);
+const CriterionDescription = PromptTextSchema.min(1)
+  .max(1000)
+  .refine((value) => value.trim().length > 0, 'Criterion description must contain non-whitespace text');
+const CriterionCommand = PromptTextSchema.min(1)
+  .max(1000)
+  .refine((value) => value.trim().length > 0, 'Criterion command must contain non-whitespace text');
 export const CriterionSchema = z.discriminatedUnion('kind', [
   z.object({ id: CriterionId, description: CriterionDescription, kind: z.literal('manual') }).strict(),
   z
@@ -37,7 +41,9 @@ const Criteria = z
   .refine((c) => new Set(c.map((x) => x.id)).size === c.length);
 export const TaskUpdateSchema = z
   .object({
-    objective: Text.min(1).optional(),
+    objective: Text.min(1)
+      .refine((value) => value.trim().length > 0, 'Task objective must contain non-whitespace text')
+      .optional(),
     criteria: Criteria.optional(),
     config: TaskConfigSchema.partial().optional(),
   })
