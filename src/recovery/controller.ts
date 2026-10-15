@@ -51,6 +51,14 @@ export class RecoveryController {
     processKey?: string;
     observedAt?: number;
   };
+  // Pending intentions are discarded on reload. Keep their native proof private
+  // as well: a stable turn key cannot lend an old delay to a replacement worker.
+  private pendingStallProof?: {
+    pending: NonNullable<RecoveryState['pending']>;
+    processKey?: string;
+    progressAt?: number;
+    progressEvidenceKey?: string;
+  };
   private legacyStallAlert?: { conversationId: string; at: number };
   private restoredFlight: boolean;
   private flightObservationComplete = false;
@@ -448,6 +456,7 @@ export class RecoveryController {
         const flightObservationComplete = this.flightObservationComplete;
         const before = JSON.stringify(retained);
         this.invalidateConfirmation(observation);
+        this.invalidatePendingStall(observation);
         const unchangedStall = this.retainStallAlert(observation);
         this.state.activity = observation.activity;
         if (!this.state.inFlight?.accepted) this.state.conversationId = observation.conversationId;
@@ -594,6 +603,29 @@ export class RecoveryController {
     }
   }
 
+  private invalidatePendingStall(observation: RecoveryObservation): boolean {
+    const pending = this.state.pending;
+    if (!pending || pending.reason !== 'stalled') {
+      this.pendingStallProof = undefined;
+      return false;
+    }
+    const proof = this.pendingStallProof;
+    if (
+      proof?.pending === pending &&
+      this.detectsStall(observation) &&
+      observation.stallRestartable === true &&
+      pending.key === observation.stallEvidenceKey &&
+      pending.conversationId === observation.conversationId &&
+      proof.processKey === (observation.processProofKey ?? observation.evidenceKey) &&
+      this.sameStallProgress(proof, observation)
+    )
+      return false;
+    this.pendingStallProof = undefined;
+    this.state.pending = undefined;
+    this.state.nextRetryAt = undefined;
+    return true;
+  }
+
   private stallObservationCanOwnAttention(observation: RecoveryObservation): boolean {
     return observation.activity === 'working' && observation.reason === 'turn-running';
   }
@@ -728,6 +760,10 @@ export class RecoveryController {
     }
     if (!isCurrent()) return;
     this.invalidateConfirmation(observation);
+    if (this.invalidatePendingStall(observation)) {
+      await this.save();
+      if (this.stopped || revision !== this.revision) return;
+    }
     const unchangedStallAlert = this.retainStallAlert(observation);
     this.state.activity = observation.activity;
     if (!this.state.inFlight?.accepted) this.state.conversationId = observation.conversationId;
@@ -925,6 +961,14 @@ export class RecoveryController {
         conversationId: observation.conversationId!,
         reason: actionReason,
       };
+      this.pendingStallProof = restartableStall
+        ? {
+            pending: this.state.pending,
+            processKey,
+            progressAt: observation.progressAt,
+            progressEvidenceKey: observation.progressEvidenceKey,
+          }
+        : undefined;
       const delay = Math.min(
         this.state.config.maxRetryDelayMs,
         this.state.config.retryDelayMs * 2 ** this.state.attempts
