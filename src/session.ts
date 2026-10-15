@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { RetiredInputClients } from './input-client-retirement.js';
 import { basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { v4 as uuidv4 } from 'uuid';
@@ -5015,6 +5016,7 @@ export class Session extends EventEmitter {
     string,
     { last?: number; pending: Set<number>; waiting: Set<number>; deferredAt: number }
   >();
+  private readonly _retiredInputClients = new RetiredInputClients();
   private static readonly MAX_INPUT_DEDUP_CLIENTS = 256;
   private static readonly MAX_PENDING_INPUT_SEQS = 4096;
   private static readonly INPUT_DEFERRED_LEASE_MS = 60_000;
@@ -5072,12 +5074,16 @@ export class Session extends EventEmitter {
     if (state && (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq))) return true;
     if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) return false;
     if (!state) {
+      // Evicted committed receipts remain sealed. Unknown old sequences cannot
+      // become fresh bytes merely because many browser documents used this pane.
+      if (this._retiredInputClients.has(clientId)) return false;
       if (this._appliedInputSeq.size >= Session.MAX_INPUT_DEDUP_CLIENTS) {
         // Never evict an in-flight identity: its retry could apply twice.
         let idle: string | undefined;
         for (const [id, entry] of this._appliedInputSeq) {
           this.expireDeferredInputSeq(id, now);
           if (entry.waiting.size === 0 && entry.pending.size === 0) {
+            if (entry.last !== undefined) this._retiredInputClients.add(id);
             idle = id;
             break;
           }
