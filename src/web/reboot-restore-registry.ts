@@ -25,20 +25,8 @@
  * @module web/reboot-restore-registry
  */
 
-import {
-  chmodSync,
-  closeSync,
-  constants,
-  fstatSync,
-  readSync,
-  fsyncSync,
-  lstatSync,
-  mkdirSync,
-  openSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { constants, type Stats } from 'node:fs';
+import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { getCli } from '../config/cli-registry/registry.js';
 import { planRebootRestore } from '../reboot-restore.js';
@@ -52,7 +40,7 @@ import type { RebootRestoreEntry } from '../reboot-restore.js';
 const PLAN_TTL_MS = 24 * 60 * 60 * 1000;
 
 type ParkedEntry = { entry: RebootRestoreEntry; spender: string | undefined };
-type SnapshotWriter = (path: string, text: string) => void;
+type SnapshotWriter = (path: string, text: string, isCurrent?: () => boolean) => void | Promise<void>;
 
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 
@@ -98,158 +86,250 @@ function validateSnapshot(value: unknown): { builtAt: number; entries: RebootRes
   return saved;
 }
 
-/** Preserve unreadable, malformed and replaced journals instead of overwriting them. */
-function readSnapshotBytes(path: string): string | undefined {
-  let stat;
+/** Every private descriptor closes before its final pathname verdict. */
+type SnapshotFile = { text: string; stat: Stats };
+type WrittenSnapshot = { text: string; dev: number; ino: number };
+const sameSnapshotStat = (a: Stats, b: Stats) =>
+  ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'mode'].every((key) => a[key as keyof Stats] === b[key as keyof Stats]);
+
+async function readSnapshot(path: string, validate = true): Promise<SnapshotFile | undefined> {
+  let before: Stats;
   try {
-    stat = lstatSync(path);
+    before = await lstat(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
     throw error;
   }
-  if (!stat.isFile() || stat.isSymbolicLink() || stat.size > MAX_SNAPSHOT_BYTES)
+  if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_SNAPSHOT_BYTES)
     throw new Error('Restore offer journal is unreadable');
-  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  let text: string;
   try {
-    const before = fstatSync(fd);
-    const matches = (current: typeof before) =>
-      current.isFile() &&
-      !current.isSymbolicLink() &&
-      current.dev === stat.dev &&
-      current.ino === stat.ino &&
-      current.size === stat.size &&
-      current.mtimeMs === stat.mtimeMs &&
-      current.ctimeMs === stat.ctimeMs;
-    if (!matches(before)) throw new Error('Restore offer journal changed');
-    const bytes = Buffer.alloc(before.size);
+    if (!sameSnapshotStat(before, await file.stat())) throw new Error('Restore offer journal changed');
+    const bytes = Buffer.alloc(before.size + 1);
+    let size = 0;
+    while (size < bytes.length) {
+      const next = await file.read(bytes, size, bytes.length - size, size);
+      if (!next.bytesRead) break;
+      size += next.bytesRead;
+    }
+    if (size !== before.size || !sameSnapshotStat(before, await file.stat()))
+      throw new Error('Restore offer journal changed');
+    text = bytes.subarray(0, size).toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(bytes.subarray(0, size)))
+      throw new Error('Restore offer journal is malformed');
+  } finally {
+    await file.close();
+  }
+  if (!sameSnapshotStat(before, await lstat(path))) throw new Error('Restore offer journal changed');
+  if (validate) validateSnapshot(JSON.parse(text));
+  return { text, stat: before };
+}
+
+async function matchesSnapshot(path: string, expected: SnapshotFile | undefined): Promise<boolean> {
+  const current = await readSnapshot(path, false);
+  return expected === undefined
+    ? current === undefined
+    : !!current && sameSnapshotStat(expected.stat, current.stat) && current.text === expected.text;
+}
+async function ownsSnapshot(path: string, expected: WrittenSnapshot | undefined): Promise<boolean> {
+  if (!expected) return false;
+  const current = await readSnapshot(path, false);
+  return (
+    !!current &&
+    current.stat.dev === expected.dev &&
+    current.stat.ino === expected.ino &&
+    current.text === expected.text
+  );
+}
+async function syncSnapshotDirectory(path: string): Promise<void> {
+  const directory = await open(dirname(path), 'r');
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
+async function replaceSnapshot(
+  path: string,
+  text: string,
+  mayReplace: () => Promise<boolean>,
+  attempted: (candidate: WrittenSnapshot) => void,
+  isCurrent: () => boolean = () => true
+): Promise<void> {
+  const temporary = `${path}.tmp-${randomUUID()}`;
+  let temporaryOwner: { dev: number; ino: number } | undefined;
+  try {
+    const file = await open(temporary, 'wx', 0o600);
+    let candidate: WrittenSnapshot;
+    try {
+      const opened = await file.stat();
+      temporaryOwner = { dev: opened.dev, ino: opened.ino };
+      await file.writeFile(text);
+      await file.sync();
+      const stat = await file.stat();
+      candidate = { text, dev: stat.dev, ino: stat.ino };
+    } finally {
+      await file.close();
+    }
+    const prepared = await readSnapshot(temporary, false);
     if (
-      readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length ||
-      !matches(fstatSync(fd)) ||
-      !matches(lstatSync(path))
+      !prepared ||
+      prepared.stat.dev !== candidate.dev ||
+      prepared.stat.ino !== candidate.ino ||
+      prepared.text !== candidate.text ||
+      !(await mayReplace()) ||
+      !sameSnapshotStat(prepared.stat, await lstat(temporary)) ||
+      !isCurrent()
     )
       throw new Error('Restore offer journal changed');
-    const text = bytes.toString('utf8');
-    if (!Buffer.from(text, 'utf8').equals(bytes)) throw new Error('Restore offer journal is malformed');
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(text);
-    } catch {
-      throw new Error('Restore offer journal is malformed');
-    }
-    validateSnapshot(parsed);
-    return text;
+    attempted(candidate);
+    await rename(temporary, path);
+    await syncSnapshotDirectory(path);
   } finally {
-    closeSync(fd);
-  }
-}
-
-function syncSnapshotDirectory(path: string): void {
-  const directory = openSync(dirname(path), 'r');
-  try {
-    fsyncSync(directory);
-  } finally {
-    closeSync(directory);
-  }
-}
-
-function replaceSnapshot(path: string, text: string): void {
-  const temporary = `${path}.tmp-${randomUUID()}`;
-  try {
-    const fd = openSync(temporary, 'wx', 0o600);
-    try {
-      writeFileSync(fd, text);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
-    renameSync(temporary, path);
-    syncSnapshotDirectory(path);
-  } finally {
-    try {
-      unlinkSync(temporary);
-    } catch {
-      /* already renamed */
+    // A failed exclusive open never owns a pre-existing path. A replacement
+    // likewise belongs to somebody else, even when its bytes happen to match.
+    if (temporaryOwner) {
+      const current = await lstat(temporary).catch(() => undefined);
+      if (
+        current?.isFile() &&
+        !current.isSymbolicLink() &&
+        current.dev === temporaryOwner.dev &&
+        current.ino === temporaryOwner.ino
+      )
+        await unlink(temporary).catch(() => {});
     }
   }
 }
 
-/** Preserve an unacknowledged primary without parsing or opening potentially damaged bytes. */
-function preserveUnacknowledgedPrimary(path: string): void {
-  let original;
+/** Archive only the exact unacknowledged primary; damaged bytes are never parsed. */
+async function preserveUnacknowledgedPrimary(path: string, isCurrent: () => boolean): Promise<void> {
+  let original: Stats;
   try {
-    original = lstatSync(path);
+    original = await lstat(path);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
     throw error;
   }
   if (!original.isFile() || original.isSymbolicLink()) throw new Error('Restore offer journal is unreadable');
-  // An exclusive private directory gives rename an absent destination. The
-  // artifact is deliberately retained for owner inspection, including on error.
   const directory = `${path}.unacknowledged-${randomUUID()}`;
-  mkdirSync(directory, { mode: 0o700 });
-  syncSnapshotDirectory(path);
-  const matches = (current: typeof original) =>
-    current.isFile() &&
-    !current.isSymbolicLink() &&
-    current.dev === original.dev &&
-    current.ino === original.ino &&
-    current.size === original.size &&
-    current.mtimeMs === original.mtimeMs &&
-    current.mode === original.mode;
-  const before = lstatSync(path);
-  if (!matches(before) || before.ctimeMs !== original.ctimeMs) throw new Error('Restore offer journal changed');
+  await mkdir(directory, { mode: 0o700 });
+  await syncSnapshotDirectory(path);
+  if (!sameSnapshotStat(original, await lstat(path)) || !isCurrent()) throw new Error('Restore offer journal changed');
   const preserved = join(directory, 'primary');
-  renameSync(path, preserved);
-  const moved = lstatSync(preserved);
-  // Our rename can advance ctime; it cannot change the file identity or bytes.
-  if (!matches(moved) || moved.ctimeMs < original.ctimeMs) throw new Error('Restore offer journal changed');
-  chmodSync(preserved, 0o600);
-  syncSnapshotDirectory(preserved);
-  syncSnapshotDirectory(path);
+  await rename(path, preserved);
+  const moved = await lstat(preserved);
+  if (
+    !moved.isFile() ||
+    moved.isSymbolicLink() ||
+    moved.dev !== original.dev ||
+    moved.ino !== original.ino ||
+    moved.size !== original.size ||
+    moved.mtimeMs !== original.mtimeMs ||
+    moved.mode !== original.mode ||
+    moved.ctimeMs < original.ctimeMs
+  )
+    throw new Error('Restore offer journal changed');
+  const file = await open(preserved, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!sameSnapshotStat(moved, await file.stat())) throw new Error('Restore offer journal changed');
+    await file.chmod(0o600);
+  } finally {
+    await file.close();
+  }
+  const final = await lstat(preserved);
+  if (
+    !final.isFile() ||
+    final.isSymbolicLink() ||
+    final.dev !== moved.dev ||
+    final.ino !== moved.ino ||
+    final.size !== moved.size ||
+    final.mtimeMs !== moved.mtimeMs ||
+    final.ctimeMs < moved.ctimeMs ||
+    (final.mode & 0o777) !== 0o600
+  )
+    throw new Error('Restore offer journal changed');
+  await syncSnapshotDirectory(preserved);
+  await syncSnapshotDirectory(path);
 }
 
-function writeAtomicSnapshot(path: string, text: string): void {
-  // A surviving shadow marks an earlier unacknowledged replacement. It remains
-  // authoritative until a retry commits; current pathname contents alone cannot.
+async function writeAtomicSnapshot(path: string, text: string, isCurrent: () => boolean = () => true): Promise<void> {
   const shadowPath = `${path}.previous`;
-  const shadow = readSnapshotBytes(shadowPath);
-  const previous = shadow ?? readSnapshotBytes(path) ?? JSON.stringify({ version: 1, builtAt: 0, entries: [] });
-  if (shadow !== undefined) preserveUnacknowledgedPrimary(path);
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  replaceSnapshot(shadowPath, previous);
+  const shadow = await readSnapshot(shadowPath);
+  const primary = shadow ? undefined : await readSnapshot(path);
+  const previous = shadow?.text ?? primary?.text ?? JSON.stringify({ version: 1, builtAt: 0, entries: [] });
+  if (shadow) await preserveUnacknowledgedPrimary(path, isCurrent);
+  if (!isCurrent()) throw new Error('Restore offer transaction was cancelled');
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  let shadowCandidate: WrittenSnapshot | undefined, primaryCandidate: WrittenSnapshot | undefined;
+  await replaceSnapshot(
+    shadowPath,
+    previous,
+    () => matchesSnapshot(shadowPath, shadow),
+    (candidate) => {
+      shadowCandidate = candidate;
+    },
+    isCurrent
+  );
   try {
-    replaceSnapshot(path, text);
+    await replaceSnapshot(
+      path,
+      text,
+      () => matchesSnapshot(path, primary),
+      (candidate) => {
+        primaryCandidate = candidate;
+      },
+      isCurrent
+    );
   } catch (error) {
-    // The rename may have succeeded before directory acknowledgement failed.
-    // Keep the durable shadow even if this bounded rollback also cannot fsync.
     try {
-      replaceSnapshot(path, previous);
+      await replaceSnapshot(
+        path,
+        previous,
+        () => ownsSnapshot(path, primaryCandidate),
+        () => {}
+      );
     } catch {
-      /* shadow still preserves the old snapshot */
+      /* The durable shadow retains the acknowledged previous snapshot. */
     }
     throw error;
   }
-  // The shadow is authoritative on reload, so its removal is part of the
-  // transaction. Acknowledge only once that removal is durable too.
   try {
-    try {
-      unlinkSync(shadowPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
-    syncSnapshotDirectory(path);
+    if (!(await ownsSnapshot(shadowPath, shadowCandidate)) || !isCurrent())
+      throw new Error('Restore offer journal changed');
+    await unlink(shadowPath);
+    await syncSnapshotDirectory(path);
+    if (!isCurrent() || !(await ownsSnapshot(path, primaryCandidate))) throw new Error('Restore offer journal changed');
   } catch (error) {
-    // An unacknowledged unlink may survive or disappear after a crash. Restore
-    // both prior views before reporting failure; memory retains the old offer.
     try {
-      replaceSnapshot(shadowPath, previous);
+      await replaceSnapshot(
+        shadowPath,
+        previous,
+        async () => {
+          const current = await readSnapshot(shadowPath, false);
+          return (
+            current === undefined ||
+            (!!shadowCandidate &&
+              current.stat.dev === shadowCandidate.dev &&
+              current.stat.ino === shadowCandidate.ino &&
+              current.text === shadowCandidate.text)
+          );
+        },
+        () => {}
+      );
     } catch {
-      /* still attempt to restore the primary if shadow acknowledgement failed */
+      /* Still attempt to restore only this invocation's primary. */
     }
     try {
-      replaceSnapshot(path, previous);
+      await replaceSnapshot(
+        path,
+        previous,
+        () => ownsSnapshot(path, primaryCandidate),
+        () => {}
+      );
     } catch {
-      /* a surviving shadow retains the prior snapshot on uncertain rollback */
+      /* A surviving shadow retains the prior snapshot on uncertain rollback. */
     }
     throw error;
   }
@@ -258,65 +338,119 @@ function writeAtomicSnapshot(path: string, text: string): void {
 export class RebootRestoreRegistry {
   private persistencePath?: string;
   private persistenceLoadFailed = false;
+  private writes: Promise<unknown> = Promise.resolve();
+  private readonly pendingWrites = new Set<symbol>();
+  private persistenceWriteFailed = false;
+  private loading = false;
+  private epoch = 0;
+  private stateRevision = 0;
+  private expired = false;
+  private expiryScheduled = false;
+  private revoked = new WeakSet<RebootRestoreEntry>();
+  private configurationWork?: Promise<void>;
+
+  private enqueue<T>(action: () => Promise<T>): Promise<T> {
+    const epoch = this.epoch,
+      token = Symbol();
+    this.pendingWrites.add(token);
+    const result = this.writes.then(async () => {
+      if (this.epoch !== epoch) throw new Error('Restore offer transaction was superseded');
+      const value = await action();
+      if (this.epoch !== epoch) throw new Error('Restore offer transaction was superseded');
+      return value;
+    });
+    const tracked = result
+      .catch((error: unknown) => {
+        if (this.epoch === epoch) this.persistenceWriteFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.pendingWrites.delete(token);
+      });
+    this.writes = tracked.catch(() => {});
+    return tracked;
+  }
+
+  async flush(): Promise<void> {
+    while (this.pendingWrites.size) await this.writes;
+  }
 
   constructor(private readonly snapshotWriter: SnapshotWriter = writeAtomicSnapshot) {}
 
   /** Load the durable offer before pruning stale records. Bounded, private and versioned. */
-  configurePersistence(path: string): void {
-    if (this.persistencePath === path) return;
+  configurePersistence(path: string): Promise<void> {
+    if (this.persistencePath === path) return this.configurationWork ?? Promise.resolve();
+    this.epoch++;
     this.persistencePath = path;
     this.persistenceLoadFailed = false;
+    this.persistenceWriteFailed = false;
+    this.loading = true;
+    for (const held of this.parked.values()) this.revoked.add(held.entry);
     this.entries.clear();
     this.parked.clear();
     this.failedReleases.clear();
     this.builtAt = 0;
-    try {
-      const raw = readSnapshotBytes(`${path}.previous`) ?? readSnapshotBytes(path);
-      if (raw === undefined) return;
-      const saved = validateSnapshot(JSON.parse(raw));
-      const entries = saved.entries;
-      const eligible = planRebootRestore(
-        entries.map((entry) => entry.sessionId),
-        Object.fromEntries(entries.map((entry) => [entry.sessionId, entry.state])),
-        () => true,
-        new Map(
-          entries
-            .filter((entry) => getCli(entry.mode)?.capabilities.recovery === 'codex-rollout')
-            .map((entry) => [entry.sessionId, entry.resumeConversationId])
-        )
-      );
-      const ids = new Set(eligible.restore.map((entry) => entry.sessionId));
-      this.entries = new Map(
-        entries.filter((entry) => ids.has(entry.sessionId)).map((entry) => [entry.sessionId, entry])
-      );
-      this.builtAt = saved.builtAt;
-    } catch {
-      this.persistenceLoadFailed = true;
-      this.entries.clear();
-      this.parked.clear();
-      this.builtAt = 0;
-      // Unreadable/corrupt originals remain available for owner inspection.
-      return;
-    }
-    try {
-      this.dropIfExpired();
-    } catch {
-      /* Retain the acknowledged snapshot; a later expiry read retries without granting it. */
-    }
+    this.expired = false;
+    const epoch = this.epoch;
+    const work = this.enqueue(async () => {
+      try {
+        const raw = (await readSnapshot(`${path}.previous`)) ?? (await readSnapshot(path));
+        if (this.epoch !== epoch) return;
+        if (raw) {
+          const saved = validateSnapshot(JSON.parse(raw.text));
+          const entries = saved.entries;
+          const eligible = planRebootRestore(
+            entries.map((entry) => entry.sessionId),
+            Object.fromEntries(entries.map((entry) => [entry.sessionId, entry.state])),
+            () => true,
+            new Map(
+              entries
+                .filter((entry) => getCli(entry.mode)?.capabilities.recovery === 'codex-rollout')
+                .map((entry) => [entry.sessionId, entry.resumeConversationId])
+            )
+          );
+          const ids = new Set(eligible.restore.map((entry) => entry.sessionId));
+          this.entries = new Map(
+            entries.filter((entry) => ids.has(entry.sessionId)).map((entry) => [entry.sessionId, entry])
+          );
+          this.builtAt = saved.builtAt;
+          this.stateRevision++;
+        }
+      } catch {
+        if (this.epoch !== epoch) return;
+        this.persistenceLoadFailed = true;
+        this.entries.clear();
+        this.parked.clear();
+        this.builtAt = 0;
+      } finally {
+        if (this.epoch === epoch) this.loading = false;
+      }
+    });
+    this.configurationWork = work;
+    return work.then(() => {
+      if (this.epoch === epoch) this.dropIfExpired();
+    });
   }
 
   /** A dismiss/expiry supersedes even an entry already held by a restore. */
   isHeld(entry: RebootRestoreEntry, spender: string | undefined): boolean {
     this.dropIfExpired();
     const held = this.parked.get(entry.sessionId);
-    return held?.entry === entry && held.spender === spender;
+    return (
+      !this.loading &&
+      !this.expired &&
+      !this.persistenceWriteFailed &&
+      !this.revoked.has(entry) &&
+      held?.entry === entry &&
+      held.spender === spender
+    );
   }
 
-  private persistState(
+  private async persistState(
     entries: ReadonlyMap<string, RebootRestoreEntry>,
     parked: ReadonlyMap<string, ParkedEntry>,
     builtAt: number
-  ): void {
+  ): Promise<void> {
     if (this.persistenceLoadFailed) throw new Error('Restore offer journal could not be loaded; refusing overwrite');
     if (!this.persistencePath) return;
     const path = this.persistencePath;
@@ -324,7 +458,15 @@ export class RebootRestoreRegistry {
     if (outstanding.length > 1000) throw new Error('Restore offer exceeds entry budget');
     const text = JSON.stringify({ version: 1, builtAt, entries: outstanding });
     if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('Restore offer exceeds storage budget');
-    this.snapshotWriter(path, text);
+    const epoch = this.epoch;
+    const current = () =>
+      this.epoch === epoch &&
+      this.persistencePath === path &&
+      JSON.stringify({ version: 1, builtAt, entries: outstanding }) === text;
+    if (!current()) throw new Error('Restore offer transaction was superseded');
+    await this.snapshotWriter(path, text, current);
+    if (!current()) throw new Error('Restore offer transaction was superseded');
+    this.persistenceWriteFailed = false;
   }
 
   /** Keyed by session id, in the order the boot pass found them. */
@@ -355,20 +497,49 @@ export class RebootRestoreRegistry {
 
   /** Pure private ownership snapshot: cleanup must never expire or spend an offer. */
   getBrokerCleanupState(): { entries: RebootRestoreEntry[]; parked: ParkedEntry[] } | undefined {
-    if (this.persistenceLoadFailed || this.spending.size > 0 || this.failedReleases.size > 0) return undefined;
+    if (
+      this.persistenceLoadFailed ||
+      this.persistenceWriteFailed ||
+      this.loading ||
+      this.pendingWrites.size > 0 ||
+      this.spending.size > 0 ||
+      this.failedReleases.size > 0
+    )
+      return undefined;
     return structuredClone({ entries: [...this.entries.values()], parked: [...this.parked.values()] });
   }
 
   /** Replace the plan with what the boot pass found. An empty list clears it. */
-  set(entries: readonly RebootRestoreEntry[]): void {
+  set(entries: readonly RebootRestoreEntry[]): Promise<void> {
     const nextEntries = new Map(entries.map((entry) => [entry.sessionId, entry]));
     const nextBuiltAt = entries.length > 0 ? Date.now() : 0;
-    this.persistState(nextEntries, new Map(), nextBuiltAt);
-    this.entries = nextEntries;
-    this.builtAt = nextBuiltAt;
-    // Acknowledged fresh plans supersede old held work.
-    this.parked.clear();
-    this.failedReleases.clear();
+    try {
+      if (nextEntries.size > 1000) throw new Error('Restore offer exceeds entry budget');
+      if (
+        Buffer.byteLength(JSON.stringify({ version: 1, builtAt: nextBuiltAt, entries: [...nextEntries.values()] })) >
+        MAX_SNAPSHOT_BYTES
+      )
+        throw new Error('Restore offer exceeds storage budget');
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    for (const held of this.parked.values()) this.revoked.add(held.entry);
+    const publish = () => {
+      this.entries = nextEntries;
+      this.builtAt = nextBuiltAt;
+      this.parked.clear();
+      this.failedReleases.clear();
+      this.expired = false;
+      this.stateRevision++;
+    };
+    if (!this.persistencePath) {
+      publish();
+      return Promise.resolve();
+    }
+    return this.enqueue(async () => {
+      await this.persistState(nextEntries, new Map(), nextBuiltAt);
+      publish();
+    });
   }
 
   /**
@@ -380,7 +551,7 @@ export class RebootRestoreRegistry {
    */
   list(canAccess: (owner: string | undefined) => boolean): RebootRestoreEntry[] {
     this.dropIfExpired();
-    return [...this.entries.values()].filter((entry) => canAccess(entry.owner));
+    return this.expired || this.loading ? [] : [...this.entries.values()].filter((entry) => canAccess(entry.owner));
   }
 
   /** Include a restore already in flight when retaining an absent session's role. */
@@ -404,6 +575,7 @@ export class RebootRestoreRegistry {
     spender: string | undefined
   ): RebootRestoreEntry[] {
     this.dropIfExpired();
+    if (this.loading || this.expired || this.persistenceWriteFailed || this.pendingWrites.size) return [];
     const wanted = sessionIds ? new Set(sessionIds) : undefined;
     const taken: RebootRestoreEntry[] = [];
     for (const entry of [...this.entries.values()]) {
@@ -412,8 +584,11 @@ export class RebootRestoreRegistry {
       this.entries.delete(entry.sessionId);
       // Parked rather than forgotten: until this restore resolves the entry, a
       // dismiss still has to be able to reach and cancel it.
-      this.parked.set(entry.sessionId, { entry, spender });
-      taken.push(entry);
+      // A fresh explicit click gets a fresh identity after an earlier cancelled
+      // flight. Its old held callback can never regain authority.
+      const heldEntry = this.revoked.has(entry) ? structuredClone(entry) : entry;
+      this.parked.set(entry.sessionId, { entry: heldEntry, spender });
+      taken.push(heldEntry);
     }
     // Parking leaves the durable outstanding offer unchanged until the flight resolves.
     return taken;
@@ -428,56 +603,94 @@ export class RebootRestoreRegistry {
    * hand is NOT put back, because that one cannot stop being true, and an entry
    * the banner keeps re-offering forever is noise only Dismiss can clear.
    */
-  releaseFlight(spender: string | undefined, keep: readonly RebootRestoreEntry[]): void {
+  releaseFlight(spender: string | undefined, keep: readonly RebootRestoreEntry[]): Promise<void> {
+    const captured = new Map([...this.parked].filter(([, held]) => held.spender === spender));
     const wanted = new Set(keep.map((entry) => entry.sessionId));
-    const nextEntries = new Map(this.entries);
-    const nextParked = new Map(this.parked);
-    let added = 0;
-    for (const [sessionId, held] of nextParked) {
-      if (held.spender !== spender) continue;
-      nextParked.delete(sessionId);
-      if (wanted.has(sessionId)) {
-        nextEntries.set(sessionId, held.entry);
-        added++;
+    const transition = () => {
+      const nextEntries = new Map(this.entries),
+        nextParked = new Map(this.parked);
+      for (const [id, held] of captured) {
+        if (nextParked.get(id) !== held) continue;
+        nextParked.delete(id);
+        if (!this.expired && wanted.has(id)) nextEntries.set(id, held.entry);
       }
+      return { nextEntries, nextParked };
+    };
+    const publish = (next: ReturnType<typeof transition>) => {
+      this.entries = next.nextEntries;
+      this.parked = next.nextParked;
+      if (!this.entries.size && !this.parked.size) this.builtAt = 0;
+      this.failedReleases.delete(spender);
+      this.stateRevision++;
+    };
+    if (!this.persistencePath) {
+      publish(transition());
+      return Promise.resolve();
     }
-    const nextBuiltAt = added > 0 && this.builtAt === 0 ? Date.now() : this.builtAt;
-    try {
-      this.persistState(nextEntries, nextParked, nextBuiltAt);
-    } catch (error) {
-      this.failedReleases.add(spender);
-      throw error;
-    }
-    this.failedReleases.delete(spender);
-    this.entries = nextEntries;
-    this.parked = nextParked;
-    this.builtAt = nextBuiltAt;
+    return this.enqueue(async () => {
+      const next = transition();
+      try {
+        await this.persistState(next.nextEntries, next.nextParked, this.builtAt);
+      } catch (error) {
+        this.failedReleases.add(spender);
+        throw error;
+      }
+      publish(next);
+    });
   }
 
   /** Drop the entries a viewer can see. Returns how many went. */
-  clear(canAccess: (owner: string | undefined) => boolean): number {
-    const nextEntries = new Map(this.entries);
-    const nextParked = new Map(this.parked);
-    const removable = [...nextEntries.values()].filter((entry) => canAccess(entry.owner));
-    for (const entry of removable) nextEntries.delete(entry.sessionId);
-    // Entries a restore is holding are dismissed by the same rule, so a dismiss
-    // that lands mid-restore wins. Judged on the ENTRY's owner, exactly as above,
-    // rather than on who happens to be restoring it.
-    let parkedRemoved = 0;
-    for (const [sessionId, held] of [...nextParked]) {
-      if (!canAccess(held.entry.owner)) continue;
-      nextParked.delete(sessionId);
-      parkedRemoved += 1;
-    }
-    const nextBuiltAt = nextEntries.size === 0 && nextParked.size === 0 ? 0 : this.builtAt;
-    // A dismiss is one transaction: the durable snapshot must commit before
-    // isHeld() can begin cancelling a concurrent restore. If storage fails,
-    // both the on-disk offer and all in-memory active/parked entries survive.
-    this.persistState(nextEntries, nextParked, nextBuiltAt);
-    this.entries = nextEntries;
-    this.parked = nextParked;
-    this.builtAt = nextBuiltAt;
-    return removable.length + parkedRemoved;
+  clear(canAccess: (owner: string | undefined) => boolean): Promise<number> {
+    const captured = new Set([
+      ...[...this.entries.values()].filter((entry) => canAccess(entry.owner)),
+      ...[...this.parked.values()].filter((held) => canAccess(held.entry.owner)).map((held) => held.entry),
+    ]);
+    // Owner intent is immediate even while fsync is held. A failed acknowledgement
+    // retains the old journal, never revives that already-withdrawn launch authority.
+    for (const entry of captured) this.revoked.add(entry);
+    const transition = () => {
+      const nextEntries = new Map(this.entries),
+        nextParked = new Map(this.parked);
+      let removed = 0;
+      const removedSpenders = new Set<string | undefined>();
+      for (const [id, entry] of nextEntries)
+        if (captured.has(entry)) {
+          nextEntries.delete(id);
+          removed++;
+        }
+      for (const [id, held] of nextParked)
+        if (captured.has(held.entry)) {
+          nextParked.delete(id);
+          removedSpenders.add(held.spender);
+          removed++;
+        }
+      return {
+        nextEntries,
+        nextParked,
+        removed,
+        removedSpenders,
+        builtAt: nextEntries.size || nextParked.size ? this.builtAt : 0,
+      };
+    };
+    const publish = (next: ReturnType<typeof transition>) => {
+      this.entries = next.nextEntries;
+      this.parked = next.nextParked;
+      this.builtAt = next.builtAt;
+      // This acknowledged snapshot has removed all held entries for these
+      // spenders. Keep unrelated failed flights until their own complete ACK.
+      for (const spender of next.removedSpenders) {
+        if (![...next.nextParked.values()].some((held) => held.spender === spender))
+          this.failedReleases.delete(spender);
+      }
+      this.stateRevision++;
+      return next.removed;
+    };
+    if (!this.persistencePath) return Promise.resolve(publish(transition()));
+    return this.enqueue(async () => {
+      const next = transition();
+      await this.persistState(next.nextEntries, next.nextParked, next.builtAt);
+      return publish(next);
+    });
   }
 
   /**
@@ -486,7 +699,15 @@ export class RebootRestoreRegistry {
    * `finally` with the same owner.
    */
   beginSpending(owner?: string): boolean {
-    if (this.spending.has(owner)) return false;
+    this.dropIfExpired();
+    if (
+      this.spending.has(owner) ||
+      this.loading ||
+      this.expired ||
+      this.persistenceWriteFailed ||
+      this.pendingWrites.size
+    )
+      return false;
     this.spending.add(owner);
     return true;
   }
@@ -499,13 +720,20 @@ export class RebootRestoreRegistry {
     // consume orphaned parks. Any actual/live worker still vetoes a new restore.
     for (const [id, held] of this.parked) {
       if (held.spender !== owner) continue;
-      this.entries.set(id, held.entry);
+      if (!this.expired) this.entries.set(id, held.entry);
       this.parked.delete(id);
     }
   }
 
   /** Test hook: forget everything, including the single-flight claim. */
   reset(): void {
+    this.epoch++;
+    this.revoked = new WeakSet();
+    this.persistenceWriteFailed = false;
+    this.loading = false;
+    this.expired = false;
+    this.expiryScheduled = false;
+    this.configurationWork = undefined;
     this.entries.clear();
     this.parked.clear();
     this.builtAt = 0;
@@ -516,14 +744,34 @@ export class RebootRestoreRegistry {
   }
 
   private dropIfExpired(): void {
-    if (this.builtAt > 0 && Date.now() - this.builtAt > PLAN_TTL_MS) {
-      // A restore that took entries just before the expiry must not hand them
-      // back afterwards and give an expired plan another full day of life.
-      this.persistState(new Map(), new Map(), 0);
-      this.parked.clear();
+    if (!(this.builtAt > 0 && Date.now() - this.builtAt > PLAN_TTL_MS)) return;
+    this.expired = true;
+    for (const held of this.parked.values()) this.revoked.add(held.entry);
+    if (this.expiryScheduled) return;
+    const revision = this.stateRevision;
+    const publish = () => {
       this.entries.clear();
+      this.parked.clear();
       this.builtAt = 0;
+      this.expired = false;
+      this.stateRevision++;
+    };
+    if (!this.persistencePath) {
+      publish();
+      return;
     }
+    this.expiryScheduled = true;
+    void this.enqueue(async () => {
+      if (revision !== this.stateRevision) return;
+      await this.persistState(new Map(), new Map(), 0);
+      if (revision === this.stateRevision) publish();
+    })
+      .catch(() => {
+        /* Old bytes remain evidence; expiry never grants authority. */
+      })
+      .finally(() => {
+        this.expiryScheduled = false;
+      });
   }
 }
 

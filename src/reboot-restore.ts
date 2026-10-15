@@ -317,14 +317,15 @@ interface CodexRebootIdentityCandidate {
 }
 
 /** Build only from an exact saved UUID or an exact durable ordinary-submission proof. */
-function codexRebootIdentityCandidate(
+async function codexRebootIdentityCandidate(
   state: SessionState,
-  fence?: RebootFenceReceipt
-): CodexRebootIdentityCandidate | undefined {
+  fence?: RebootFenceReceipt,
+  deadline?: number
+): Promise<CodexRebootIdentityCandidate | undefined> {
   if (getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' || state.remote || state.docker)
     return undefined;
   if (!isCodexRestoreConfig(state.codexConfig)) return undefined;
-  const durableProof = fence ? fence.value : readRebootIdentityFence(state.id);
+  const durableProof = fence ? fence.value : await readRebootIdentityFence(state.id, deadline);
   const proof =
     durableProof ??
     (
@@ -460,7 +461,7 @@ export async function verifyCodexRebootEvidence(
     return undefined;
   const bindings = await captureRebootBrokerBindings({ [state.id]: state });
   if (!bindings?.has(state.id)) return undefined;
-  const candidate = codexRebootIdentityCandidate(state, fence);
+  const candidate = await codexRebootIdentityCandidate(state, fence);
   if (!candidate) return undefined;
   // A shared home's later prompt is not this pane's thread switch. Opt in only
   // for an actual durable clean submission and a known owned incarnation; the
@@ -488,6 +489,7 @@ export async function planVerifiedRebootRestore(
       bindings?.has(id) ? { ...state, __codexPriorInputBroker: bindings.get(id) } : state,
     ])
   );
+  const deadline = performance.now() + 2000;
   const verified = new Map<string, string>();
   const candidates: Array<{ sessionId: string; identity: CodexRebootIdentityCandidate }> = [];
   for (const sessionId of deadSessionIds) {
@@ -506,14 +508,18 @@ export async function planVerifiedRebootRestore(
       !workspaceExists(state.workingDir)
     )
       continue;
-    const identity = codexRebootIdentityCandidate(state);
+    if (performance.now() >= deadline) break;
+    const identity = await codexRebootIdentityCandidate(state, undefined, deadline);
     if (identity) {
       if (identity.trackedSubmission && typeof bindings.get(sessionId) === 'string')
         identity.request.historyScope = 'tracked-reboot-session';
       candidates.push({ sessionId, identity });
     }
   }
-  const resolutions = await resolveCodexIdentities(candidates.map((candidate) => candidate.identity.request));
+  const resolutions = await resolveCodexIdentities(
+    candidates.map((candidate) => candidate.identity.request),
+    deadline
+  );
   for (const [index, resolution] of resolutions.entries()) {
     const candidate = candidates[index];
     const id = resolution.conversationId;

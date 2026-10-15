@@ -96,10 +96,10 @@ it('refuses to export a startup proof after newer owner input', async () => {
   expect(await guard.confirm()).toBe(false);
 });
 
-it('keeps the pure startup scope bound to the exact guard and newer owner intent', () => {
+it('keeps the pure startup scope bound to the exact guard and newer owner intent', async () => {
   const { session, guard } = fixture();
   expect(guard.isCurrent!()).toBe(true);
-  session.fenceUntrackedInput();
+  await session.fenceUntrackedInput();
   expect(guard.isCurrent!()).toBe(false);
   session.setCodexRestoreLaunchGuard({ prepare: async () => {}, confirm: () => true, isCurrent: () => true });
   expect(guard.isCurrent!()).toBe(false);

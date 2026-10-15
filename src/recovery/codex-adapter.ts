@@ -200,8 +200,9 @@ export class CodexRecoveryAdapter {
     prompt: string,
     authority: import('./types.js').RecoveryActionAuthority
   ): Promise<{ observation: RecoveryObservation; tail: string; clock: RemoteClockWitness } | undefined> {
-    const session = this.session,
-      context = session.getRecoveryContext();
+    const session = this.session;
+    if (session.ensureRecoveryIdentityFence && !(await session.ensureRecoveryIdentityFence())) return undefined;
+    const context = session.getRecoveryContext();
     if (
       !session.remote ||
       session.remote.owned === false ||
@@ -321,7 +322,6 @@ export class CodexRecoveryAdapter {
   async observe(): Promise<RecoveryObservation> {
     this.latestLiveProofAt = undefined;
     const session = this.session;
-    const context = session.getRecoveryContext();
     const unknown = (reason: RecoveryObservation['reason']): RecoveryObservation => {
       this.livePaneProof = undefined;
       this.remotePaneContinuity = undefined;
@@ -331,6 +331,9 @@ export class CodexRecoveryAdapter {
     this.missingProof = undefined;
     this.verifiedTail = undefined;
     this.remotePromptProof = undefined;
+    if (session.ensureRecoveryIdentityFence && !(await session.ensureRecoveryIdentityFence()))
+      return unknown('identity-unverified');
+    const context = session.getRecoveryContext();
     if (session.docker) return unknown('unsupported-location');
     if (session.remote?.owned === false) return unknown('unowned-session');
     if (!context.managed) return unknown('unowned-session');

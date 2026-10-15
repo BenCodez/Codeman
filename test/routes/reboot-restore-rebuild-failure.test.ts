@@ -178,7 +178,7 @@ afterEach(async () => {
 
 describe('a rebuild that fails after the session is registered', () => {
   it('restores Claude without depending on the Codex recovery journal', async () => {
-    rebootRestoreRegistry.set([offerEntry('claude-with-full-codex-journal')]);
+    await rebootRestoreRegistry.set([offerEntry('claude-with-full-codex-journal')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const prepare = vi.fn(async () => {
       throw new Error('Codex journal is over capacity');
@@ -195,7 +195,7 @@ describe('a rebuild that fails after the session is registered', () => {
     }
   });
   it('releases the owner lock even when final offer persistence fails', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
     const release = vi.spyOn(rebootRestoreRegistry, 'releaseFlight').mockImplementationOnce(() => {
@@ -213,7 +213,7 @@ describe('a rebuild that fails after the session is registered', () => {
   });
   it('reports why it failed rather than blaming the workspace', async () => {
     startShouldThrow = true;
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
 
@@ -226,7 +226,7 @@ describe('a rebuild that fails after the session is registered', () => {
 
   it('does not leave a registered session with no pane behind it', async () => {
     startShouldThrow = true;
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
 
@@ -245,7 +245,7 @@ describe('a rebuild that fails after the session is registered', () => {
 
   it('keeps the entry on offer, so the user can fix the PATH and click again', async () => {
     startShouldThrow = true;
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
 
@@ -258,7 +258,7 @@ describe('a rebuild that fails after the session is registered', () => {
 
 describe('a rebuild that succeeds', () => {
   it('re-applies the persisted state before the record is written again', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
 
@@ -275,7 +275,7 @@ describe('a rebuild that succeeds', () => {
   });
 
   it('shapes the pane before it spawns, and restores the history after', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     (ctx.reapplyPersistedSessionState as ReturnType<typeof vi.fn>).mockImplementation(
       async (_s: unknown, _saved: unknown, phase: string) => {
@@ -304,7 +304,7 @@ describe('a rebuild that succeeds', () => {
   });
 
   it('tells every other board about the rebuilt session', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
 
@@ -314,7 +314,7 @@ describe('a rebuild that succeeds', () => {
   });
 
   it('spends the entry, so it is no longer on offer', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
 
@@ -327,7 +327,7 @@ describe('a rebuild that succeeds', () => {
 
 describe('the session caps', () => {
   it('counts the sessions it is itself creating, not just the ones it started with', async () => {
-    rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
+    await rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     // One seat short of the documented maximum of 50, counting the session the
     // mock context seeds. A check that ran once before the loop would restore
@@ -348,7 +348,7 @@ describe('the session caps', () => {
   });
 
   it('refuses every entry when the board is already at the cap', async () => {
-    rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
+    await rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     for (let i = 0; i < 50; i += 1) {
       ctx.sessions.set(`filler-${i}`, { id: `filler-${i}`, owner: undefined } as never);
@@ -364,7 +364,7 @@ describe('the session caps', () => {
 
 describe('a failure before any entry is considered', () => {
   it('returns the whole plan rather than spending it', async () => {
-    rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
+    await rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     (ctx.getWorkspaceHooksEnabled as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('settings unreadable'));
     const app = await createHarness(ctx);
@@ -380,7 +380,7 @@ describe('a failure before any entry is considered', () => {
   });
 
   it('releases the single flight, so the next click is not refused', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     (ctx.getWorkspaceHooksEnabled as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('settings unreadable'));
     const app = await createHarness(ctx);
@@ -394,7 +394,7 @@ describe('a failure before any entry is considered', () => {
 
 describe('a dismiss that lands while a restore is running', () => {
   it('cancels and discards the exact tentative session when launch finishes after dismissal', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     let releaseStart!: () => void;
     startBarrier = new Promise<void>((resolve) => {
@@ -426,7 +426,7 @@ describe('a dismiss that lands while a restore is running', () => {
   });
 
   it('cancels while post-start state restoration is still finishing', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     let releaseAfterSpawn!: () => void;
     const afterSpawnBarrier = new Promise<void>((resolve) => {
@@ -465,7 +465,7 @@ describe('a dismiss that lands while a restore is running', () => {
 
   it('wins when an admin is restoring the entries and their owner dismisses', async () => {
     const theirs = offerEntry('theirs', 'bob');
-    rebootRestoreRegistry.set([theirs]);
+    await rebootRestoreRegistry.set([theirs]);
     // An admin may spend another user's entries, so the caller doing the restore
     // and the owner of what is being restored are different people.
     const taken = rebootRestoreRegistry.take(() => true, undefined, 'admin');
@@ -473,30 +473,30 @@ describe('a dismiss that lands while a restore is running', () => {
 
     // Bob dismisses his own banner. Nothing of his is in the plan any more, and
     // the restore is running under a different name than his.
-    rebootRestoreRegistry.clear((owner) => owner === 'bob');
-    rebootRestoreRegistry.releaseFlight('admin', taken);
+    await rebootRestoreRegistry.clear((owner) => owner === 'bob');
+    await rebootRestoreRegistry.releaseFlight('admin', taken);
 
     expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
   });
 
   it('wins when an admin dismisses everything mid-restore', async () => {
-    rebootRestoreRegistry.set([offerEntry('theirs', 'bob')]);
+    await rebootRestoreRegistry.set([offerEntry('theirs', 'bob')]);
     const taken = rebootRestoreRegistry.take(() => true, undefined, 'admin');
 
-    rebootRestoreRegistry.clear(() => true);
-    rebootRestoreRegistry.releaseFlight('admin', taken);
+    await rebootRestoreRegistry.clear(() => true);
+    await rebootRestoreRegistry.releaseFlight('admin', taken);
 
     expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
   });
 
   it('wins, rather than being undone when the route hands its entries back', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     // The user clicks Dismiss while the restore is between its take and its
     // return. Driven through the ROUTE, so removing the generation argument from
     // the route would make this fail.
     (ctx.getWorkspaceHooksEnabled as ReturnType<typeof vi.fn>).mockImplementation(async () => {
-      rebootRestoreRegistry.clear(() => true);
+      await rebootRestoreRegistry.clear(() => true);
       throw new Error('settings unreadable');
     });
     const app = await createHarness(ctx);
@@ -510,14 +510,14 @@ describe('a dismiss that lands while a restore is running', () => {
 
   it('reaches an in-flight restore the dismisser can see, even once its entries are taken', async () => {
     const mine = offerEntry('mine', 'alice');
-    rebootRestoreRegistry.set([mine]);
+    await rebootRestoreRegistry.set([mine]);
     const taken = rebootRestoreRegistry.take((owner) => owner === 'alice', undefined, 'alice');
     expect(taken).toHaveLength(1);
 
     // The plan is empty now, so the dismiss has nothing of Alice's left in the
     // plan; it has to reach the entry the restore is holding.
-    rebootRestoreRegistry.clear((owner) => owner === 'alice');
-    rebootRestoreRegistry.releaseFlight('alice', taken);
+    await rebootRestoreRegistry.clear((owner) => owner === 'alice');
+    await rebootRestoreRegistry.releaseFlight('alice', taken);
 
     expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
   });
@@ -525,18 +525,18 @@ describe('a dismiss that lands while a restore is running', () => {
   it('does not reach another owner, whose unspent entries still come back', async () => {
     const mine = offerEntry('mine', 'alice');
     const theirs = offerEntry('theirs', 'bob');
-    rebootRestoreRegistry.set([mine, theirs]);
+    await rebootRestoreRegistry.set([mine, theirs]);
 
     // Bob is mid-restore, holding his own entry.
     const bobsTaken = rebootRestoreRegistry.take((owner) => owner === 'bob', undefined, 'bob');
     expect(bobsTaken.map((e) => e.sessionId)).toEqual(['theirs']);
 
     // Alice dismisses her own banner meanwhile.
-    rebootRestoreRegistry.clear((owner) => owner === 'alice');
+    await rebootRestoreRegistry.clear((owner) => owner === 'alice');
 
     // Bob's restore finishes and hands his entry back. Alice's dismiss covered
     // her entries, not his, so his offer survives.
-    rebootRestoreRegistry.releaseFlight('bob', bobsTaken);
+    await rebootRestoreRegistry.releaseFlight('bob', bobsTaken);
     expect(rebootRestoreRegistry.list(() => true).map((e) => e.sessionId)).toEqual(['theirs']);
   });
 });
@@ -656,7 +656,7 @@ describe('Codex reboot launch and cancellation', () => {
           expect((await findUser('alice'))?.role).toBe('admin');
         } else expect((await findUser('alice'))?.role).toBe(change === 'confined' ? 'user' : 'admin');
       };
-      rebootRestoreRegistry.set([entry]);
+      await rebootRestoreRegistry.set([entry]);
       const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
       if (stage === 'setup') ctx.setupSessionListeners.mockImplementation(mutate);
       else if (stage === 'after-prepare') afterGuardPrepare = mutate;
@@ -701,7 +701,7 @@ describe('Codex reboot launch and cancellation', () => {
   );
   it('launches original UUID with supported settings and preserves the original journal key', async () => {
     const entry = codexOffer();
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const prepare = vi.fn(async (_id: string) => {
       callOrder.push('prepareRecovery');
@@ -728,7 +728,7 @@ describe('Codex reboot launch and cancellation', () => {
     const entry = codexOffer();
     entry.state.workingDir = WORKSPACE;
     entry.state.codexConfig!.resumeSessionId = '99999999-1234-1234-1234-123456789abc';
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
     const res = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;
@@ -790,7 +790,7 @@ describe('Codex reboot launch and cancellation', () => {
         CODEMAN_CUSTOM_MODEL_API_KEY: 'attacker-secret',
         CODEX_OTHER: 'keep',
       };
-      rebootRestoreRegistry.set([entry]);
+      await rebootRestoreRegistry.set([entry]);
       const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
       const app = await createHarness(ctx);
       try {
@@ -878,7 +878,7 @@ describe('Codex reboot launch and cancellation', () => {
           return handle;
         });
       };
-      rebootRestoreRegistry.set([entry]);
+      await rebootRestoreRegistry.set([entry]);
       const ctx = createMockRouteContext({ workspaceHooksEnabled: false }),
         app = await createHarness(ctx);
       try {
@@ -959,7 +959,7 @@ describe('Codex reboot launch and cancellation', () => {
       if (change === 'unrelated')
         await writeCustomModelHosts(getDataDir(), [endpoint, { ...endpoint, id: 'other-endpoint' }]);
     };
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     if (stage === 'setup') ctx.setupSessionListeners.mockImplementation(mutate);
     else ctx.reapplyPersistedSessionState.mockImplementation(mutate);
@@ -1066,7 +1066,7 @@ describe('Codex reboot launch and cancellation', () => {
         if (change === 'unrelated')
           await writeCustomModelHosts(getDataDir(), [endpoint, { ...endpoint, id: 'other-endpoint' }]);
       };
-      rebootRestoreRegistry.set([entry]);
+      await rebootRestoreRegistry.set([entry]);
       const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
       if (stage === 'setup') ctx.setupSessionListeners.mockImplementation(mutate);
       else afterGuardPrepare = mutate;
@@ -1127,7 +1127,7 @@ describe('Codex reboot launch and cancellation', () => {
       modelId: 'custom-model',
       envKeys: ['CODEX_HOME'],
     };
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     const app = await createHarness(ctx);
     try {
@@ -1151,7 +1151,7 @@ describe('Codex reboot launch and cancellation', () => {
     { type: 'error', message: 'Sanitized authentication fixture.', codex_error_info: 'unauthorized' },
   ])('rechecks a newly appended $type veto after startup preparation', async (payload) => {
     const entry = codexOffer();
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     ctx.setupSessionListeners.mockImplementation(async () => {
       const home = (entry.state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome;
@@ -1171,10 +1171,10 @@ describe('Codex reboot launch and cancellation', () => {
 
   it('dismissal during pre-spawn preparation prevents launching and releases partial registration', async () => {
     const entry = codexOffer();
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
     ctx.reapplyPersistedSessionState.mockImplementation(async (_session, _saved, phase) => {
-      if (phase === 'before-spawn') rebootRestoreRegistry.clear(() => true);
+      if (phase === 'before-spawn') await rebootRestoreRegistry.clear(() => true);
     });
     const app = await createHarness(ctx);
     const res = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;

@@ -253,9 +253,13 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               try {
                 const writeOptions = {
                   fromUser: true,
+                  isCurrent: () =>
+                    socket.readyState === 1 &&
+                    ctx.sessions.get(id) === session &&
+                    canAccessOwned(getAuthUser(req), session.owner),
                   ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
                 };
-                if (session.requiresRemoteInputClock?.(msg.d, writeOptions)) {
+                if (!session.writeAsync && session.requiresRemoteInputClock?.(msg.d, writeOptions)) {
                   const admission = await session.prepareUserInputClock(msg.d, writeOptions);
                   delivered =
                     socket.readyState === 1 &&
@@ -264,7 +268,10 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
                     !!admission &&
                     admission() === true &&
                     session.write(msg.d, writeOptions);
-                } else delivered = session.write(msg.d, writeOptions);
+                } else
+                  delivered = await (session.writeAsync
+                    ? session.writeAsync(msg.d, writeOptions)
+                    : session.write(msg.d, writeOptions));
               } catch (err) {
                 if (cid && seq !== null) session.forgetInputSeq(cid, seq);
                 throw err;

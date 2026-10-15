@@ -196,6 +196,7 @@ it.each(
       codexConfig,
     });
     sessions.push(session);
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     expect(session.getRecoveryContext()).toMatchObject({ managed: true, noDaemon: true });
     if (grant === 'revoked') user(false);
     const result = await session.deliverRecovery(

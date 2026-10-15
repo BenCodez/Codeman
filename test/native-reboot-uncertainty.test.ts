@@ -170,6 +170,35 @@ function healthyGuard(): CodexRestoreLaunchGuard {
 }
 
 describe('native uncertain Codex reboot ownership', () => {
+  it('does not durably reserve or dispatch a worker when asynchronous confirmation lacks a pure current guard', async () => {
+    const { manager, home } = fixture();
+    const confirm = vi.fn(async () => true);
+    const guard = healthyGuard();
+    delete guard.isCurrent;
+    guard.confirm = confirm;
+    const acknowledgedSnapshots: string[] = [];
+    const flush = manager.flushSessionsDurably.bind(manager);
+    vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async (...args) => {
+      await flush(...args);
+      acknowledgedSnapshots.push(readFileSync(metadata, 'utf8'));
+    });
+    writeFileSync(metadata, '[]');
+    const original = readFileSync(metadata, 'utf8');
+    await expect(
+      manager.createSession({
+        sessionId: ID,
+        workingDir: root,
+        mode: 'codex',
+        codexConfig: config,
+        recoveryCodexHome: home,
+        codexRestoreGuard: guard,
+      })
+    ).rejects.toThrow();
+    expect(readFileSync(metadata, 'utf8')).toBe(original);
+    expect(acknowledgedSnapshots.every((snapshot) => !snapshot.includes(ID))).toBe(true);
+    expect(effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane '))).toBe(false);
+  });
+
   it.each(['before-dispatch', 'no-child-receipt', 'unproven-creation', 'create-ack-lost'] as const)(
     'the actual restore route preserves history and inspection after uncertain native cleanup: %s',
     async (phase) => {
@@ -202,7 +231,7 @@ describe('native uncertain Codex reboot ownership', () => {
         const original = broker.setStartupAuthority.bind(broker);
         vi.spyOn(broker, 'setStartupAuthority').mockImplementation(async (...args) => {
           await original(...args);
-          board.get(ID)!.fenceUntrackedInput();
+          await board.get(ID)!.fenceUntrackedInput();
           nativeCurrent = false;
         });
       } else if (phase === 'no-child-receipt')
@@ -236,7 +265,7 @@ describe('native uncertain Codex reboot ownership', () => {
       const historical = structuredClone(store.getSession(ID));
       const plan = await planVerifiedRebootRestore([ID], { [ID]: state }, () => true);
       expect(plan.skipped).toEqual([]);
-      rebootRestoreRegistry.set(plan.restore);
+      await rebootRestoreRegistry.set(plan.restore);
       const ctx = Reflect.get(server, 'createRouteContext').call(server) as Parameters<
         typeof registerRebootRestoreRoutes
       >[1];
@@ -528,7 +557,7 @@ describe('native uncertain Codex reboot ownership', () => {
     if (closed) await closed;
     expect(savedAuthority).toHaveBeenCalledOnce();
     expect(savedAuthority.mock.calls[0].slice(0, 4)).toEqual([files, undefined, paths, [fence]]);
-    expect(confirm).toHaveBeenCalledTimes(3); // No new FD/probe observation after config persistence.
+    expect(confirm).toHaveBeenCalledTimes(5); // The queued metadata commit adds checks before and after its async I/O; none follow startup config persistence.
     expect(dispatch).toHaveBeenCalledTimes(['scope-changed', 'deadline-expired'].includes(outcome) ? 0 : 1);
     expect(refused).toHaveBeenCalledTimes(
       ['healthy', 'scope-changed', 'deadline-expired', 'config-replaced'].includes(outcome) ? 0 : 1
@@ -771,7 +800,7 @@ describe('native uncertain Codex reboot ownership', () => {
     );
     try {
       await vi.waitFor(() => expect(proof).toHaveBeenCalledOnce());
-      session.fenceUntrackedInput();
+      await session.fenceUntrackedInput();
       finish(true);
       expect(await launch).toBeInstanceOf(Error);
       expect(create).not.toHaveBeenCalled();
@@ -1714,7 +1743,7 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
           configDir: customModelConfigDir(ID),
         },
       });
-    rebootRestoreRegistry.set([
+    await rebootRestoreRegistry.set([
       {
         sessionId: ID,
         mode: 'claude',
@@ -1784,7 +1813,7 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
       const start = Session.prototype.startInteractive;
       vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(async function () {
         await start.call(this);
-        rebootRestoreRegistry.clear(() => true);
+        await rebootRestoreRegistry.clear(() => true);
         if (kind === 'cancelled-lost-ack') throw Error('Worker startup ACK lost after cancellation');
       });
     }
@@ -1795,7 +1824,7 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
         await persist(...args);
         expect(manager.getSession(ID)).not.toHaveProperty('restoreUncertain');
         committed = structuredClone(store.getSession(ID)!);
-        rebootRestoreRegistry.clear(() => true);
+        await rebootRestoreRegistry.clear(() => true);
         const sync = effects.sync.getMockImplementation()!;
         effects.sync.mockImplementation((command: string) => {
           if (command.includes('CODEMAN_REBOOT_CANCEL_REFUSED')) {
@@ -1844,7 +1873,7 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
       if (kind === 'owner-downgrade') await updateUser('worker', { role: 'user' });
       if (kind === 'changed-profile')
         await writeCustomModelHosts(root, [{ ...endpoint, apiKey: 'replacement-secret' }]);
-      if (kind === 'cancelled') rebootRestoreRegistry.clear(() => true);
+      if (kind === 'cancelled') await rebootRestoreRegistry.clear(() => true);
       if (kind === 'changed-session') board.get(ID)!.owner = 'different-owner';
       release();
       const result = (await pending).json();

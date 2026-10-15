@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 /** @fileoverview Named keys own the actual Session input boundary throughout async dispatch. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Session } from '../src/session.js';
@@ -6,10 +7,10 @@ import type { RecoveryFlight } from '../src/recovery/types.js';
 import { createDeferred } from './mocks/index.js';
 
 const THREAD = '11111111-2222-3333-4444-555555555555';
-const SID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const sessions: Session[] = [];
 
 function fixture() {
+  const SID = randomUUID();
   const mux = {
     isAvailable: () => true,
     inspectPaneForRecovery: vi.fn(async () => ({ dead: true, status: 1, screen: null })),
@@ -63,7 +64,7 @@ describe('named-key input reservation', () => {
       const options = { fromUser: true, inputSeq: { clientId: 'fixture-client', seq: 1 } };
       const delivered =
         transport === 'pty'
-          ? f.session.write(data, options)
+          ? await f.session.writeAsync(data, options)
           : transport === 'mux'
             ? await f.session.writeViaMux(data, options)
             : await f.session.sendNamedKey(data, dispatch);
@@ -87,7 +88,7 @@ describe('named-key input reservation', () => {
     const intent = vi.fn();
     f.session.on('recoveryUserInput', intent);
     Object.assign(f.session, { _paneLifecycleOps: 1 });
-    expect(f.session.write('programmatic\r')).toBe(false);
+    expect(await f.session.writeAsync('programmatic\r')).toBe(false);
     expect(await f.session.writeViaMux('programmatic\r')).toBe(false);
     expect(intent).not.toHaveBeenCalled();
     expect(f.session.getRecoveryContext().generation).toBe(before);
@@ -97,17 +98,18 @@ describe('named-key input reservation', () => {
 
   it('cancels old authority before dispatch and excludes recovery, another key, and text until completion', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const done = createDeferred<void>();
     const before = f.session.getRecoveryContext().generation;
     const dispatch = vi.fn(() => done.promise);
     const key = f.session.sendNamedKey('\n', dispatch);
-    expect(dispatch).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
     expect(f.session.getRecoveryContext().generation).toBeGreaterThan(before);
     expect(f.session.recoveryInputReserved).toBe(true);
     expect(f.session.paneLifecycleInFlight).toBe(true);
     expect(await f.session.deliverRecovery(f.flight, f.session.getRecoveryContext().generation)).toBe('not-sent');
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
-    expect(f.session.write('following text', { fromUser: true })).toBe(false);
+    expect(await f.session.writeAsync('following text', { fromUser: true })).toBe(false);
     expect(await f.session.writeViaMux('following text', { fromUser: true })).toBe(false);
     const second = vi.fn(async () => {});
     expect(await f.session.sendNamedKey('\n', second)).toBe(false);
@@ -120,6 +122,7 @@ describe('named-key input reservation', () => {
 
   it('certifies rejection without dispatch or generation changes when recovery already owns the pane', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const restarted = createDeferred<number>();
     f.mux.respawnPane.mockReturnValueOnce(restarted.promise);
     const recovery = f.session.deliverRecovery(f.flight, 0);
@@ -136,6 +139,7 @@ describe('named-key input reservation', () => {
 
   it('releases the slot and invalidates proof when dispatched delivery fails ambiguously', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     await expect(
       f.session.sendNamedKey('\n', async () => {
         throw new Error('unknown delivery');
@@ -150,6 +154,7 @@ describe('named-key input reservation', () => {
 
   it('aborts a pending child when the owner stops the session', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     let childSignal: AbortSignal | undefined;
     const key = f.session.sendNamedKey('\n', (signal) => {
       childSignal = signal;
@@ -158,6 +163,7 @@ describe('named-key input reservation', () => {
       );
     });
     const rejected = expect(key).rejects.toThrow('child aborted');
+    await vi.waitFor(() => expect(childSignal).toBeDefined());
     await f.session.stop(false);
     await rejected;
     expect(childSignal?.aborted).toBe(true);
@@ -169,6 +175,7 @@ describe('named-key input reservation', () => {
 
   it('does not let a key overtake ordinary mux input still in flight', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const written = createDeferred<boolean>();
     f.mux.sendInput.mockReturnValueOnce(written.promise);
     const input = f.session.writeViaMux('preceding text', { fromUser: true });
@@ -179,6 +186,6 @@ describe('named-key input reservation', () => {
     written.resolve(true);
     expect(await input).toBe(true);
     expect(await f.session.sendNamedKey('\n', dispatch)).toBe(true);
-    expect(dispatch).toHaveBeenCalledOnce();
+    await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
   });
 });
