@@ -381,7 +381,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
           }
           const cid = typeof msg.cid === 'string' ? msg.cid : null;
           const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
-          if (!canQueueInputDispatch(session, msg.d.length)) {
+          if (!canQueueInputDispatch(session, Buffer.byteLength(msg.d, 'utf8'))) {
             // Capacity can recover. Leave reliable frames unacknowledged so
             // reconnect/HTTP retry keeps their exact durable FIFO identities.
             if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
@@ -395,7 +395,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
           }
           const paneStartedAt = session.paneStartedAt;
           noteLifecycleOwnerIntent(msg);
-          void queueInputDispatch(session, msg.d.length, async () => {
+          void queueInputDispatch(session, Buffer.byteLength(msg.d, 'utf8'), async () => {
             if (session.paneStartedAt !== paneStartedAt) {
               rejectLegacyInput(msg);
               return;
