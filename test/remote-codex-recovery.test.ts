@@ -1,14 +1,12 @@
-/** @fileoverview Pure SSH command/protocol tests. No remote process, socket or tmux is touched. */
+/** @fileoverview SSH protocol and disposable broker tests; checked fake native transport only. */
 import { describe, expect, it } from 'vitest';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, readFile, rm, writeFile } from 'node:fs/promises';
+import { rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 import type { SessionRemote } from '../src/types.js';
 import { buildRemoteLaunchCommand } from '../src/tmux-manager.js';
-import { guardedNativeTmuxFixture } from './mocks/remote-native-tmux.js';
+import { remoteBrokerReaderFixture } from './mocks/remote-broker-reader-fixture.js';
 import { TaskController } from '../src/supervision/controller.js';
 import {
   buildRemoteCodexEvidenceCommand,
@@ -24,8 +22,6 @@ import {
   MAX_REMOTE_CODEX_PROMPT_BYTES,
   type RemoteCodexEvidenceRequest,
 } from '../src/recovery/remote-codex.js';
-
-const execFileAsync = promisify(execFile);
 
 const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const THREAD = '11111111-2222-3333-4444-555555555555';
@@ -218,188 +214,160 @@ describe('remote Codex evidence protocol', () => {
   });
 
   it('executes the generated bounded reader against fixtures and follows exact current submission history', async () => {
-    const root = await mkdtemp(join(tmpdir(), 'codeman-remote-proof-'));
+    const sha = (value: string) => createHash('sha256').update(value, 'utf8').digest('hex');
+    const controlled = async () => {
+      const f = await remoteBrokerReaderFixture();
+      try {
+        const preload = join(f.root, 'native-events.cjs');
+        await writeFile(join(f.root, 'native-events'), '');
+        // Instrument only the checked temporary transport. The delegate still
+        // evaluates the actual native predicate and writes authenticated frames
+        // through the real disposable broker before the fake child sees bytes.
+        await writeFile(
+          preload,
+          String.raw`
+const fs=require('fs'),cp=require('child_process'),native=cp.execFileSync;
+cp.execFileSync=function(file,args,options){
+ const root=process.env.FAKE_BROKER_ROOT,scenario=process.env.FIXTURE_SCENARIO,op=args[2];
+ fs.appendFileSync(root+'/native-events',JSON.stringify(args)+'\n');
+ if(op==='has-session' && fs.existsSync(root+'/append-armed')){
+  fs.unlinkSync(root+'/append-armed');fs.appendFileSync(process.env.ROLLOUT,process.env.FIXTURE_APPEND_ROW+'\n');
+ }
+ if(op==='new-session' && scenario==='creation-race')throw Error('Fixture existing session won race');
+ if(op==='set-option' && scenario==='configuration-failed')throw Error('Fixture configuration failure');
+ const result=native.call(this,file,args,options);
+ if(op==='if-shell' && args[7].includes('respawn-pane') && scenario==='fast-child-exit'){
+  fs.writeFileSync(root+'/exit-status','17');fs.writeFileSync(root+'/stop','');
+  const end=performance.now()+1000;
+  while(performance.now()<end){
+   try{const directory=fs.readFileSync(root+'/new-directory','utf8');if(JSON.parse(fs.readFileSync(directory+'/state.json','utf8')).closed)break;}catch{}
+   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,10);
+  }
+ }
+ if(op==='set-option' && scenario==='late-configuration')fs.appendFileSync(process.env.ROLLOUT,JSON.stringify({type:'event_msg',payload:{type:'task_started'}})+'\n');
+ if(op==='wait-for'){
+  if(scenario==='hold-release')fs.writeFileSync(root+'/pane','0|||%7|9009\n');
+  if(scenario==='replacement')fs.writeFileSync(root+'/pane','1|1||%7|9008\n');
+  if(scenario==='bad-stub-exit')fs.writeFileSync(root+'/pane','1|0||%7|9009\n');
+ }
+ if(op==='list-panes' && scenario==='server-restart' && fs.existsSync(root+'/missing')===false && fs.readFileSync(root+'/pane','utf8').includes('9009'))return String(result).replace(/17000/g,'17001');
+ if(op==='capture-pane' && process.env.FIXTURE_SCREEN_PREFIX)return process.env.FIXTURE_SCREEN_PREFIX+result;
+ return result;
+};
+`
+        );
+        f.env.NODE_OPTIONS = `--require=${preload}`;
+        return f;
+      } catch (error) {
+        await f.close();
+        throw error;
+      }
+    };
+    const f = await controlled();
     try {
-      const home = join(root, 'codex-home Ω');
-      const sessions = join(home, 'sessions', '2026', '10', '13');
-      const bin = join(root, 'bin');
-      await mkdir(sessions, { recursive: true });
-      await mkdir(bin);
-      const older = THREAD;
       const resumed = '66666666-7777-8888-9999-aaaaaaaaaaaa';
-      const rollout = async (id: string, originator: string, timestamp: string) => {
-        const header = {
-          timestamp,
-          type: 'session_meta',
-          payload: { id, timestamp, cwd: remote.remotePath, originator },
-        };
-        const text = `${JSON.stringify(header)}\n${JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } })}\n`;
-        const file = join(sessions, `rollout-${timestamp}-${id}.jsonl`);
-        await writeFile(file, text);
-        return { file, text };
-      };
-      await rollout(older, `codeman_${SESSION}`, '2026-10-13T10:00:00.000Z');
-      const resumedRollout = await rollout(resumed, 'codex-tui', '2026-10-13T10:01:00.000Z');
-      const submittedAt = Date.parse('2026-10-13T10:02:00.000Z');
+      const submittedAt = Date.now() - 100;
       const prompt = 'exact fixture prompt\nwith preserved whitespace';
-      const hash = createHash('sha256').update(prompt, 'utf8').digest('hex');
-      await writeFile(
-        join(home, 'history.jsonl'),
-        `${JSON.stringify({ session_id: resumed, ts: submittedAt / 1000, text: prompt })}\n`
-      );
-      const fakeTmux = join(bin, 'tmux');
-      const fakeSsh = join(bin, 'ssh');
-      const fakeLoginShell = join(bin, 'login-shell');
-      const paneFile = join(root, 'pane');
-      const screenFile = join(root, 'screen');
-      const actionLog = join(root, 'actions');
-      const promptFile = join(root, 'last-prompt');
-      const restoreStateFile = join(root, 'restore-state.json');
-      await writeFile(paneFile, '0|||%7|4242\n');
-      await writeFile(screenFile, '›\n  fixture-model default · /fixture/work\n');
-      await writeFile(actionLog, '');
-      await writeFile(
-        `${fakeTmux}-base`,
-        `#!/bin/sh\ncase "$*" in\n  *has-session*)\n    [ -n "$FIXTURE_PROBE_APPEND_FILE" ] && printf '%s\\n' "$FIXTURE_PROBE_APPEND_ROW" >> "$FIXTURE_PROBE_APPEND_FILE"\n    [ "$FIXTURE_SESSION_MISSING" = "1" ] && exit 1\n    exit 0 ;;\n  *list-panes*)\n    if [ "$5" = '$17' ]; then\n      node -e 'const fs=require("fs"),s=JSON.parse(fs.readFileSync(process.env.FIXTURE_RESTORE_STATE_FILE,"utf8"));console.log((s.released?"1":"0")+"|%9|"+(process.env.FIXTURE_RESTORE_REPLACEMENT?9008:9009)+"|"+(s.released?(process.env.FIXTURE_STUB_BAD_EXIT?"0":"1"):"")+"|"+"|"+(process.env.FIXTURE_RESTORE_SERVER_RESTART?17001:17000))'\n    else cat "$FIXTURE_PANE_FILE"; fi ;;\n  *capture-pane*) cat "$FIXTURE_SCREEN_FILE" ;;\n  *send-keys*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    for arg do last="$arg"; done\n    if [ "$4" = "-l" ]; then\n      [ -n "$FIXTURE_LITERAL_DELAY" ] && sleep "$FIXTURE_LITERAL_DELAY"\n      node -e 'const fs=require("fs");fs.appendFileSync(process.env.FIXTURE_PROMPT_FILE,process.argv[1]);fs.writeFileSync(process.env.FIXTURE_SCREEN_FILE,"› "+fs.readFileSync(process.env.FIXTURE_PROMPT_FILE,"utf8")+"\\n  fixture-model default · /fixture/work\\n")' "$last"\n    elif [ "$last" = "Enter" ] && [ "$FIXTURE_APPEND_HISTORY" = "1" ]; then\n      node -e 'const fs=require("fs");fs.appendFileSync(process.env.FIXTURE_HISTORY_FILE,JSON.stringify({session_id:process.env.FIXTURE_HISTORY_SESSION,ts:Date.now()/1000,text:fs.readFileSync(process.env.FIXTURE_PROMPT_FILE,"utf8")})+"\\n")'\n    fi\n    [ "$last" != "Enter" ] || printf '›\\n  fixture-model default · /fixture/work\\n' > "$FIXTURE_SCREEN_FILE"\n    ;;\n  *new-session*)\n    [ "$FIXTURE_RESTORE_RACE" = "1" ] && exit 1\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    node -e 'require("fs").writeFileSync(process.env.FIXTURE_RESTORE_STATE_FILE,JSON.stringify({createdArgs:process.argv.slice(1),released:false,configured:false,workerStarted:false}))' -- "$@"\n    printf '%s\\n' '$17|%9|9009|17000' ;;\n  *set-option*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    [ "$FIXTURE_CONFIG_FAILURE" = "1" ] && exit 1\n    node -e 'const fs=require("fs"),p=process.env.FIXTURE_RESTORE_STATE_FILE,s=JSON.parse(fs.readFileSync(p,"utf8"));s.configured=true;s.configArgs=process.argv.slice(1);fs.writeFileSync(p,JSON.stringify(s));if(process.env.FIXTURE_RESTORE_CONFIG_APPEND_FILE)fs.appendFileSync(process.env.FIXTURE_RESTORE_CONFIG_APPEND_FILE,process.env.FIXTURE_RESTORE_CONFIG_APPEND_ROW+"\\n")' -- "$@" ;;\n  *wait-for*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    node -e 'const fs=require("fs"),p=process.env.FIXTURE_RESTORE_STATE_FILE,s=JSON.parse(fs.readFileSync(p,"utf8"));if(!s.configured)process.exit(2);s.released=!process.env.FIXTURE_HOLD_RELEASE;fs.writeFileSync(p,JSON.stringify(s))' ;;\n  *respawn-pane*)\n    printf '%s\\n' "$*" >> "$FIXTURE_ACTION_LOG"\n    if [ "$7" = '%9' ]; then\n      node -e 'const fs=require("fs"),p=process.env.FIXTURE_RESTORE_STATE_FILE,s=JSON.parse(fs.readFileSync(p,"utf8"));if(!s.released||!s.configured||process.env.FIXTURE_LIVE_BEFORE_RESPAWN)process.exit(2);s.workerStarted=true;s.workerArgs=process.argv.slice(1);s.workerDead=process.env.FIXTURE_FAST_CODEX_FAILURE==="1";s.workerStatus=s.workerDead?17:undefined;s.workerScreen=s.workerDead?"Authentication failed fixture":undefined;fs.writeFileSync(p,JSON.stringify(s))' -- "$@"\n    fi ;;\n  *) exit 2 ;;\nesac\n`
-      );
-      await chmod(`${fakeTmux}-base`, 0o755);
-      await writeFile(fakeTmux, guardedNativeTmuxFixture(`${fakeTmux}-base`));
-      await chmod(fakeTmux, 0o755);
-      await writeFile(
-        fakeSsh,
-        '#!/bin/sh\nfor arg do last="$arg"; done\nif [ -n "$FIXTURE_SSH_ACK_DELAY" ]; then\n  output=$(/bin/sh -c "$last")\n  status=$?\n  sleep "$FIXTURE_SSH_ACK_DELAY"\n  printf \'%s\\n\' "$output"\n  exit "$status"\nfi\nexec /bin/sh -c "$last"\n'
-      );
-      await writeFile(
-        fakeLoginShell,
-        '#!/bin/sh\n[ "$1" = -i ] && [ "$2" = -l ] && [ "$3" = -c ]\nexec /bin/sh -c "$4"\n'
-      );
-      await Promise.all([chmod(fakeSsh, 0o755), chmod(fakeLoginShell, 0o755)]);
-      const request = {
-        sessionId: SESSION,
-        workingDir: remote.remotePath,
-        codexHome: home,
-        resumeId: older,
-        submission: { at: submittedAt, hash },
-      };
-      const run = async (value: RemoteCodexEvidenceRequest, ambientCodexHome = home) => {
-        const command = buildRemoteCodexEvidenceCommand(remote, value);
-        const { stdout } = await execFileAsync('/bin/sh', ['-c', command], {
-          env: {
-            ...process.env,
-            CODEX_HOME: ambientCodexHome,
-            PATH: `${bin}:${process.env.PATH}`,
-            SHELL: fakeLoginShell,
-            FIXTURE_PANE_FILE: paneFile,
-            FIXTURE_SCREEN_FILE: screenFile,
-            FIXTURE_ACTION_LOG: actionLog,
-            FIXTURE_PROMPT_FILE: promptFile,
-            FIXTURE_RESTORE_STATE_FILE: restoreStateFile,
+      const resumedFile = join(f.home, 'sessions', `rollout-resumed-${resumed}.jsonl`);
+      const resumedTail =
+        JSON.stringify({
+          type: 'session_meta',
+          payload: {
+            id: resumed,
+            cwd: f.root,
+            originator: 'codex-tui',
+            timestamp: new Date(submittedAt - 1000).toISOString(),
           },
-          timeout: 5_000,
-          maxBuffer: 768 * 1024,
-        });
-        return parseRemoteCodexEvidence(stdout);
+        }) +
+        '\n' +
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }) +
+        '\n';
+      await writeFile(resumedFile, resumedTail);
+      await writeFile(
+        join(f.home, 'history.jsonl'),
+        JSON.stringify({ session_id: resumed, ts: submittedAt / 1000, text: prompt }) + '\n'
+      );
+      f.request.submission = { ...f.request.submission, at: submittedAt, hash: sha(prompt) };
+      const request = { ...f.request, resumeId: THREAD };
+      const evidence = async (value: RemoteCodexEvidenceRequest = request) => {
+        const result = await f.run(buildRemoteCodexEvidenceCommand(f.remote, value));
+        return { ...result, evidence: parseRemoteCodexEvidence(result.stdout) };
       };
-
-      await expect(run({ ...request, codexHome: undefined })).rejects.toThrow('unverified');
-      expect(await run(request, 'relative/ignored-because-explicit')).toMatchObject({
+      expect((await evidence({ ...request, codexHome: undefined })).failed).toBe(true);
+      expect((await evidence({ ...request, codexHome: 'relative/home' })).failed).toBe(true);
+      expect((await evidence({ ...request, codexHome: `/${'x'.repeat(4097)}` })).failed).toBe(true);
+      expect((await evidence()).evidence).toMatchObject({
         transport: 'reachable',
         identity: { reason: 'verified', conversationId: resumed },
       });
-      await expect(run({ ...request, codexHome: undefined }, 'relative/codex-home')).rejects.toThrow('unverified');
-      await expect(run({ ...request, codexHome: undefined }, `/${'x'.repeat(4097)}`)).rejects.toThrow('unverified');
-      expect(await run({ ...request, submission: { ...request.submission, hash: '0'.repeat(64) } })).toMatchObject({
-        identity: { reason: 'unverified' },
-      });
-      await expect(run({ ...request, submission: undefined })).rejects.toThrow('unverified');
-
-      const runCommand = async (command: string, ambientCodexHome = home, extraEnv: Record<string, string> = {}) => {
-        const { stdout } = await execFileAsync('/bin/sh', ['-c', command], {
-          env: {
-            ...process.env,
-            CODEX_HOME: ambientCodexHome,
-            PATH: `${bin}:${process.env.PATH}`,
-            SHELL: fakeLoginShell,
-            FIXTURE_PANE_FILE: paneFile,
-            FIXTURE_SCREEN_FILE: screenFile,
-            FIXTURE_ACTION_LOG: actionLog,
-            FIXTURE_PROMPT_FILE: promptFile,
-            FIXTURE_RESTORE_STATE_FILE: restoreStateFile,
-            ...extraEnv,
-          },
-          timeout: 10_000,
-          maxBuffer: 768 * 1024,
+      expect(
+        (await evidence({ ...request, submission: { ...request.submission, hash: '0'.repeat(64) } })).evidence
+      ).toMatchObject({ identity: { reason: 'unverified' } });
+      expect((await evidence({ ...request, submission: undefined })).failed).toBe(true);
+      const inputRequest = async (text: string) =>
+        f.inputRequest(text, (q) => {
+          q.resumeId = resumed;
+          q.expected.conversationId = resumed;
+          q.expected.tailHash = sha(resumedTail);
         });
-        return stdout;
+      const input = async (text: string) => {
+        const q = await inputRequest(text);
+        const result = await f.run(buildRemoteCodexInputCommand(f.remote, q));
+        return parseRemoteCodexInputResult(result.stdout);
       };
-      const runAction = async (command: string, ambientCodexHome = home) =>
-        parseRemoteCodexAction(await runCommand(command, ambientCodexHome));
-      const runInput = async (command: string, extraEnv: Record<string, string> = {}) =>
-        parseRemoteCodexInputResult(await runCommand(command, home, extraEnv));
-      const expectedIdentity = {
-        conversationId: resumed,
-        tailHash: createHash('sha256').update(resumedRollout.text, 'utf8').digest('hex'),
-      };
-      const inputRequest = {
-        ...request,
-        resumeId: resumed,
-        expected: {
-          ...expectedIdentity,
-          paneId: '%7',
-          panePid: 4242,
-          screenHash: createHash('sha256').update('›\n  fixture-model default · /fixture/work\n', 'utf8').digest('hex'),
-        },
-        prompt: 'Continue the sanitized fixture task.',
-      };
-      await expect(
-        runInput(buildRemoteCodexInputCommand(remote, { ...inputRequest, codexHome: undefined }))
-      ).rejects.toThrow('unverified');
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-      expect(
-        parseRemoteCodexInputResult(
-          await runCommand(buildRemoteCodexInputCommand(remote, inputRequest), 'relative/ignored-because-explicit')
-        )
-      ).toMatchObject({ status: 'sent', submittedAt: expect.any(Number) });
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toContain(
-        'Continue the sanitized fixture task.'
-      );
-      await writeFile(actionLog, '');
+      const q = await inputRequest('Continue the sanitized fixture task.');
+      expect((await f.run(buildRemoteCodexInputCommand(f.remote, { ...q, codexHome: undefined }))).failed).toBe(true);
+      expect(await f.bytes()).toHaveLength(0);
+      expect(await input(q.prompt)).toMatchObject({ status: 'sent', submittedAt: expect.any(Number) });
+      expect((await f.bytes()).toString()).toBe(q.prompt + '\r');
+      await f.marker('bytes', '');
       const delayedPrompt = 'Record the remote send instant before this delayed acknowledgement.';
-      const delayedHash = createHash('sha256').update(delayedPrompt, 'utf8').digest('hex');
-      const delayedReceipt = await runInput(
-        buildRemoteCodexInputCommand(remote, { ...inputRequest, prompt: delayedPrompt }),
-        {
-          FIXTURE_APPEND_HISTORY: '1',
-          FIXTURE_HISTORY_FILE: join(home, 'history.jsonl'),
-          FIXTURE_HISTORY_SESSION: resumed,
-          FIXTURE_LITERAL_DELAY: '0.75',
-          FIXTURE_SSH_ACK_DELAY: '3',
-        }
-      );
+      await f.marker('enter-delay', '0.4');
+      const delayedReceipt = await input(delayedPrompt).then(async (receipt) => {
+        const historyAt = Date.now();
+        if (!receipt || receipt.status !== 'sent') throw Error('Missing actual broker sent receipt');
+        expect(Math.abs(historyAt - receipt.submittedAt)).toBeLessThan(500);
+        await writeFile(
+          join(f.home, 'history.jsonl'),
+          JSON.stringify({ session_id: resumed, ts: historyAt / 1000, text: delayedPrompt }) + '\n'
+        );
+        // Hold only the transport acknowledgement after actual Enter delivery.
+        await new Promise((resolve) => setTimeout(resolve, 2600));
+        return receipt;
+      });
+      await rm(join(f.root, 'enter-delay'));
       expect(delayedReceipt).toMatchObject({ status: 'sent', submittedAt: expect.any(Number) });
-      if (!delayedReceipt || delayedReceipt.status !== 'sent') throw new Error('expected a sent remote input receipt');
+      if (!delayedReceipt || delayedReceipt.status !== 'sent') throw Error('Missing actual broker sent receipt');
+      expect((await f.bytes()).toString()).toBe(delayedPrompt + '\r');
+      // The receipt records actual Enter delivery, not an arbitrarily delayed
+      // transport acknowledgement. Exact history remains bound to that instant.
       const acknowledgedAt = Date.now();
-      expect(acknowledgedAt - delayedReceipt.submittedAt).toBeGreaterThanOrEqual(2_500);
-      const delayedHistory = (await (await import('node:fs/promises')).readFile(join(home, 'history.jsonl'), 'utf8'))
-        .trim()
-        .split('\n')
-        .map((line) => JSON.parse(line) as { ts: number; text: string })
-        .at(-1);
-      expect(delayedHistory?.text).toBe(delayedPrompt);
-      expect(Math.abs((delayedHistory?.ts ?? 0) * 1000 - delayedReceipt.submittedAt)).toBeLessThan(500);
+      expect(acknowledgedAt - delayedReceipt.submittedAt).toBeGreaterThanOrEqual(2500);
       expect(
-        await run({
-          ...request,
-          resumeId: resumed,
-          submission: { at: delayedReceipt.submittedAt, hash: delayedHash },
-        })
+        (
+          await evidence({
+            ...request,
+            resumeId: resumed,
+            submission: { at: delayedReceipt.submittedAt, hash: sha(delayedPrompt) },
+          })
+        ).evidence
       ).toMatchObject({ identity: { reason: 'verified', conversationId: resumed } });
       expect(
-        await run({ ...request, resumeId: resumed, submission: { at: acknowledgedAt, hash: delayedHash } })
+        (
+          await evidence({
+            ...request,
+            resumeId: resumed,
+            submission: { at: acknowledgedAt, hash: sha(delayedPrompt) },
+          })
+        ).evidence
       ).toMatchObject({ identity: { reason: 'unverified' } });
-      await writeFile(actionLog, '');
-      const injectionMarker = join(root, 'must-not-exist');
-      const injection = `$(touch ${injectionMarker})`;
+      await writeFile(
+        join(f.home, 'history.jsonl'),
+        JSON.stringify({ session_id: resumed, ts: submittedAt / 1000, text: prompt }) + '\n'
+      );
+      await f.marker('bytes', '');
+      const injectionMarker = join(f.root, 'must-not-exist'),
+        injection = `$(touch ${injectionMarker})`;
       let largePrompt = '';
       const task = new TaskController({
         persist: async () => {},
@@ -416,366 +384,318 @@ describe('remote Codex evidence protocol', () => {
           },
           commands: new Map(),
         }),
-        act: async (_key, _conversationId, prompt) => {
-          largePrompt = prompt;
+        act: async (_key, _id, text) => {
+          largePrompt = text;
           return 'sent';
         },
       });
-      await task.update({
-        objective: 'Complete the bounded remote fixture task with safe Unicode Ω 😀 and multiline\ntext.',
-        criteria: Array.from({ length: 9 }, (_, index) => ({
-          id: `criterion-${index}`,
-          description: 'd'.repeat(1000),
-          kind: 'command' as const,
-          command: index === 0 ? `${'c'.repeat(1000 - injection.length)}${injection}` : 'c'.repeat(1000),
-        })),
-      });
-      await task.resume();
-      task.stop();
-      expect(Buffer.byteLength(largePrompt, 'utf8')).toBeGreaterThan(16 * 1024);
-      expect(
-        await runInput(buildRemoteCodexInputCommand(remote, { ...inputRequest, prompt: largePrompt }))
-      ).toMatchObject({ status: 'sent', submittedAt: expect.any(Number) });
-      await expect(access(injectionMarker)).rejects.toThrow();
-      await writeFile(actionLog, '');
-      await writeFile(screenFile, '› owner draft\n');
-      expect(await runInput(buildRemoteCodexInputCommand(remote, inputRequest))).toEqual({ status: 'not-sent' });
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-      await writeFile(screenFile, '›\n  fixture-model default · /fixture/work\n');
-      await writeFile(
-        resumedRollout.file,
-        `${resumedRollout.text}${JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } })}\n`
-      );
-      expect(await runInput(buildRemoteCodexInputCommand(remote, inputRequest))).toEqual({ status: 'not-sent' });
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-      await writeFile(resumedRollout.file, resumedRollout.text);
-      await writeFile(paneFile, '1|17||%7|4242\n');
-      const restartRequest = {
-        sessionId: SESSION,
-        resumeId: resumed,
-        submission: request.submission,
-        expectedIdentity,
-        expectedPane: { paneId: '%7', panePid: 4242, status: 17 },
-        codexConfig: { noDaemon: true, resumeSessionId: resumed, model: 'fixture-model' },
-        codexHome: home,
-      };
-      expect(
-        await runAction(buildRemoteCodexRestartCommand(remote, restartRequest), join(root, 'missing ambient home'))
-      ).toBe('sent');
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toContain('respawn-pane');
-      await writeFile(actionLog, '');
-      await writeFile(paneFile, '0|||%7|4242\n');
-      expect(await runAction(buildRemoteCodexRestartCommand(remote, restartRequest))).toBe('not-sent');
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-
-      const restoreRequest = {
-        sessionId: SESSION,
-        resumeId: resumed,
-        submission: request.submission,
-        expectedIdentity,
-        codexConfig: restartRequest.codexConfig,
-        codexHome: home,
-      };
-      expect(() => buildRemoteCodexRestoreCommand(remote, { ...restoreRequest, codexHome: undefined })).toThrow(
-        'exact isolated conversation'
-      );
-      expect(() => buildRemoteCodexRestoreCommand(remote, { ...restoreRequest, resumeId: older })).toThrow(
-        'exact isolated conversation'
-      );
-      const restoreCommand = buildRemoteCodexRestoreCommand(remote, restoreRequest);
-      expect(await runAction(restoreCommand)).toBe('not-sent');
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-      expect(
-        parseRemoteCodexAction(
-          await runCommand(restoreCommand, join(root, 'different ambient home'), {
-            FIXTURE_SESSION_MISSING: '1',
-          })
-        )
-      ).toBe('sent');
-      const restoredArgs = await (await import('node:fs/promises')).readFile(actionLog, 'utf8');
-      expect(restoredArgs).toContain('new-session -d -P -F');
-      expect(restoredArgs).toContain(`resume ${resumed}`);
-      expect(restoredArgs).toContain(home);
-      expect(restoredArgs).not.toMatch(/(?:^|\s)-(?:A|k)(?:\s|$)/);
-      const restoredState = JSON.parse(await readFile(restoreStateFile, 'utf8'));
-      expect(restoredState.createdArgs.slice(-3)).toEqual([
-        '/bin/sh',
-        '-c',
-        expect.stringMatching(/^tmux -L codeman-remote wait-for codeman-restore-[a-f0-9]{32}; exit 1$/),
-      ]);
-      expect(restoredState.createdArgs.join(' ')).not.toContain(`resume ${resumed}`);
-      expect(restoredState.configArgs).toEqual([
-        '-L',
-        'codeman-remote',
-        'set-option',
-        '-t',
-        '$17',
-        'status',
-        'off',
-        ';',
-        'set-option',
-        '-t',
-        '$17',
-        'mouse',
-        'off',
-        ';',
-        'set-option',
-        '-t',
-        '$17',
-        'prefix',
-        'C-q',
-        ';',
-        'set-option',
-        '-s',
-        'escape-time',
-        '0',
-        ';',
-        'set-option',
-        '-t',
-        '$17',
-        'window-size',
-        'latest',
-        ';',
-        'set-option',
-        '-t',
-        '$17',
-        'remain-on-exit',
-        'failed',
-      ]);
-      const normalLaunch = buildRemoteLaunchCommand({ remote, mode: 'codex', sessionId: SESSION });
-      for (const setting of [
-        'status off',
-        'mouse off',
-        'prefix C-q',
-        'escape-time 0',
-        'window-size latest',
-        'remain-on-exit failed',
-      ])
-        expect(normalLaunch).toContain(setting);
-      const restoreLines = restoredArgs.trim().split('\n');
-      expect(restoreLines).toHaveLength(4);
-      expect(restoreLines[0]).toContain('new-session');
-      expect(restoreLines[1]).toContain('remain-on-exit failed');
-      expect(restoreLines[2]).toContain('wait-for -S');
-      expect(restoreLines[3]).toContain('respawn-pane');
-      expect(restoredState).toMatchObject({ configured: true, released: true, workerStarted: true });
-      // The fake actual command executor fails Codex immediately on dispatch.
-      // The configuration must already retain its diagnostic pane at that point.
-      await writeFile(actionLog, '');
-      expect(
-        parseRemoteCodexAction(
-          await runCommand(restoreCommand, home, {
-            FIXTURE_SESSION_MISSING: '1',
-            FIXTURE_FAST_CODEX_FAILURE: '1',
-          })
-        )
-      ).toBe('sent');
-      expect(JSON.parse(await readFile(restoreStateFile, 'utf8'))).toMatchObject({
-        configured: true,
-        released: true,
-        workerStarted: true,
-        workerDead: true,
-        workerStatus: 17,
-        workerScreen: 'Authentication failed fixture',
-      });
-      for (const refusal of [
-        'FIXTURE_CONFIG_FAILURE',
-        'FIXTURE_HOLD_RELEASE',
-        'FIXTURE_RESTORE_REPLACEMENT',
-        'FIXTURE_LIVE_BEFORE_RESPAWN',
-        'FIXTURE_STUB_BAD_EXIT',
-        'FIXTURE_RESTORE_SERVER_RESTART',
-      ]) {
-        await writeFile(actionLog, '');
-        await expect(
-          runCommand(restoreCommand, home, {
-            FIXTURE_SESSION_MISSING: '1',
-            [refusal]: '1',
-          })
-        ).rejects.toThrow();
-        const refusedState = JSON.parse(await readFile(restoreStateFile, 'utf8'));
-        expect(refusedState.workerStarted).toBe(false);
-        expect(await readFile(actionLog, 'utf8')).not.toMatch(/(?:^|\s)-(?:A|k)(?:\s|$)/);
+      try {
+        await task.update({
+          objective: 'Complete the bounded remote fixture task with safe Unicode Ω 😀 and multiline\ntext.',
+          criteria: Array.from({ length: 9 }, (_, index) => ({
+            id: `criterion-${index}`,
+            description: 'd'.repeat(1000),
+            kind: 'command' as const,
+            command: index === 0 ? 'c'.repeat(1000 - injection.length) + injection : 'c'.repeat(1000),
+          })),
+        });
+        await task.resume();
+      } finally {
+        task.stop();
       }
-
-      // New evidence during inert-pane setup must veto the final real worker dispatch.
-      await writeFile(actionLog, '');
-      await expect(
-        runCommand(restoreCommand, home, {
-          FIXTURE_SESSION_MISSING: '1',
-          FIXTURE_RESTORE_CONFIG_APPEND_FILE: resumedRollout.file,
-          FIXTURE_RESTORE_CONFIG_APPEND_ROW: JSON.stringify({
-            type: 'event_msg',
-            payload: { type: 'task_started', turn_id: 'new-owner-turn' },
-          }),
-        })
-      ).rejects.toThrow();
-      expect(JSON.parse(await readFile(restoreStateFile, 'utf8')).workerStarted).toBe(false);
-      expect(await readFile(actionLog, 'utf8')).not.toContain('respawn-pane');
-      await writeFile(resumedRollout.file, resumedRollout.text);
-      await writeFile(actionLog, '');
-      await expect(
-        runCommand(restoreCommand, home, {
-          FIXTURE_SESSION_MISSING: '1',
-          FIXTURE_RESTORE_RACE: '1',
-        })
-      ).rejects.toThrow();
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-
-      // A tmux probe is a separate process: work can change after the initial
-      // profile read, while the final missing/live/dead pane query is in flight.
-      for (const row of [
+      expect(Buffer.byteLength(largePrompt)).toBeGreaterThan(16 * 1024);
+      expect(await input(largePrompt)).toMatchObject({ status: 'sent' });
+      expect((await f.bytes()).toString()).toBe(largePrompt + '\r');
+      await expect(access(injectionMarker)).rejects.toThrow();
+      await f.marker('bytes', '');
+      await f.marker('draft');
+      expect(await input(q.prompt)).toEqual({ status: 'not-sent' });
+      expect(await f.bytes()).toHaveLength(0);
+      await rm(join(f.root, 'draft'));
+      const stale = await inputRequest(q.prompt);
+      await writeFile(
+        resumedFile,
+        resumedTail + JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }) + '\n'
+      );
+      expect(parseRemoteCodexInputResult((await f.run(buildRemoteCodexInputCommand(f.remote, stale))).stdout)).toEqual({
+        status: 'not-sent',
+      });
+      expect(await f.bytes()).toHaveLength(0);
+      await writeFile(resumedFile, resumedTail);
+      const emptyEvent =
+        JSON.stringify({ type: 'event_msg', payload: { type: 'fixture_near_limit', detail: '' } }) + '\n';
+      const nearLimit =
+        resumedTail +
+        JSON.stringify({
+          type: 'event_msg',
+          payload: {
+            type: 'fixture_near_limit',
+            detail: 'x'.repeat(262131 - Buffer.byteLength(resumedTail + emptyEvent)),
+          },
+        }) +
+        '\n';
+      await writeFile(resumedFile, nearLimit);
+      const baseline = (await evidence()).evidence;
+      if (!baseline || !('pane' in baseline) || !baseline.pane?.screen) throw Error('Missing native screen');
+      f.env.FIXTURE_SCREEN_PREFIX = 's'.repeat(65535 - Buffer.byteLength(baseline.pane.screen) - 1) + '\n';
+      const nearEvidence = (await evidence()).evidence;
+      expect(nearEvidence).toMatchObject({
+        identity: { reason: 'verified', conversationId: resumed, tail: nearLimit, tailTruncated: false },
+      });
+      if (!nearEvidence || !('pane' in nearEvidence)) throw Error('Missing near-limit native screen');
+      expect(Buffer.byteLength(nearEvidence.pane!.screen!)).toBe(65535);
+      const nearQ = await inputRequest('Acknowledge the near-limit bounded protocol fixture.');
+      nearQ.expected.tailHash = sha(nearLimit);
+      expect(
+        parseRemoteCodexInputResult((await f.run(buildRemoteCodexInputCommand(f.remote, nearQ))).stdout)
+      ).toMatchObject({ status: 'sent' });
+      expect((await f.bytes()).toString()).toBe(nearQ.prompt + '\r');
+      await f.marker('bytes', '');
+      const hiddenChild =
         JSON.stringify({
           type: 'event_msg',
           payload: {
             type: 'collab_agent_spawn_end',
-            call_id: 'late-spawn',
+            call_id: 'hidden-spawn',
             new_thread_id: '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
             status: 'running',
           },
-        }),
-        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'late-owner-turn' } }),
-        JSON.stringify({
-          type: 'event_msg',
-          payload: { type: 'agent_message', message: 'CODEMAN_TASK_BLOCKED: owner permission needed' },
-        }),
-        '{malformed-final-checkpoint',
-      ]) {
-        for (const kind of ['input', 'restart', 'restore'] as const) {
-          await writeFile(resumedRollout.file, resumedRollout.text);
-          await writeFile(paneFile, kind === 'restart' ? '1|17||%7|4242\n' : '0|||%7|4242\n');
-          await writeFile(actionLog, '');
-          const command =
-            kind === 'input'
-              ? buildRemoteCodexInputCommand(remote, inputRequest)
-              : kind === 'restart'
-                ? buildRemoteCodexRestartCommand(remote, restartRequest)
-                : restoreCommand;
-          expect(
-            parseRemoteCodexAction(
-              await runCommand(command, home, {
-                FIXTURE_SESSION_MISSING: kind === 'restore' ? '1' : '0',
-                FIXTURE_PROBE_APPEND_FILE: resumedRollout.file,
-                FIXTURE_PROBE_APPEND_ROW: row,
+        }) + '\n';
+      const suffix =
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'after-truncation' } }) +
+        '\n' +
+        JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete', turn_id: 'after-truncation' } }) +
+        '\n';
+      await writeFile(
+        resumedFile,
+        resumedTail +
+          hiddenChild +
+          JSON.stringify({ type: 'event_msg', payload: { type: 'fixture_padding', detail: 'x'.repeat(270000) } }) +
+          '\n' +
+          suffix
+      );
+      const truncated = (await evidence()).evidence;
+      expect(truncated).toMatchObject({
+        identity: { reason: 'verified', conversationId: resumed, tailTruncated: true, tail: suffix },
+      });
+      const truncatedQ = await inputRequest(q.prompt);
+      truncatedQ.expected.tailHash = sha(suffix);
+      expect(
+        parseRemoteCodexInputResult((await f.run(buildRemoteCodexInputCommand(f.remote, truncatedQ))).stdout)
+      ).toEqual({ status: 'not-sent' });
+      expect(await f.bytes()).toHaveLength(0);
+      // An unprovisioned direct restart never falls back to a fresh worker.
+      await f.marker('pane', `1|17||%7|${f.worker.pid}\n`);
+      expect(
+        parseRemoteCodexAction(
+          (
+            await f.run(
+              buildRemoteCodexRestartCommand(f.remote, {
+                sessionId: SESSION,
+                resumeId: resumed,
+                submission: request.submission,
+                expectedIdentity: { conversationId: resumed, tailHash: sha(suffix) },
+                expectedPane: { paneId: '%7', panePid: f.worker.pid!, status: 17 },
+                codexConfig: { noDaemon: true, resumeSessionId: resumed },
+                codexHome: f.home,
               })
-            ),
-            `${kind}: ${row}`
-          ).toBe('not-sent');
-          expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
+            )
+          ).stdout
+        )
+      ).toBe('not-sent');
+      expect(await f.starts()).toBe(1);
+    } finally {
+      await f.close();
+    }
+
+    for (const kind of ['restart', 'restore'] as const) {
+      const r = await controlled();
+      try {
+        expect((await r.rotate(kind)).result).toBe('sent');
+        expect(await r.starts()).toBe(2);
+        const events = (await readFile(join(r.root, 'native-events'), 'utf8'))
+          .trim()
+          .split('\n')
+          .map((line) => JSON.parse(line) as string[]);
+        const effect = events.findIndex((a) => a[2] === 'if-shell' && a[7].includes('respawn-pane'));
+        expect(effect).toBeGreaterThan(0);
+        expect(events[effect][7]).not.toMatch(/(?:^|\s)-(?:A|k)(?:\s|$)/);
+        // Automatic provisioning changes only this worker's session options.
+        // Server-global escape-time remains an explicit owner-launch setting.
+        for (const settings of events.filter((args) => args[2] === 'set-option')) {
+          expect(settings).not.toContain('-s');
+          expect(settings).not.toContain('-g');
+          expect(settings).not.toContain('escape-time');
         }
+        const directory = await readFile(join(r.root, 'new-directory'), 'utf8');
+        const config = JSON.parse(await readFile(join(directory, 'config.json'), 'utf8'));
+        expect(config.command).toContain(`resume ${THREAD}`);
+        expect(config.homeDigest).toBe(sha(r.home));
+        expect(config.startup).toBeDefined();
+        if (kind === 'restore') {
+          const created = events.findIndex((a) => a[2] === 'new-session'),
+            configured = events.findIndex((a) => a[2] === 'set-option'),
+            released = events.findIndex((a) => a[2] === 'wait-for');
+          expect(created).toBeGreaterThanOrEqual(0);
+          expect(configured).toBeGreaterThan(created);
+          expect(released).toBeGreaterThan(configured);
+          expect(effect).toBeGreaterThan(released);
+          expect(events[created].slice(-3)).toEqual([
+            '/bin/sh',
+            '-c',
+            expect.stringMatching(/^tmux -L codeman-remote wait-for codeman-broker-[a-f0-9]+; exit 1$/),
+          ]);
+          expect(events[created].join(' ')).not.toContain('resume');
+          for (const setting of [
+            'status off',
+            'mouse off',
+            'prefix C-q',
+            'window-size latest',
+            'remain-on-exit failed',
+          ])
+            expect(events[configured].join(' ')).toContain(setting);
+        }
+      } finally {
+        await r.close();
       }
-      await writeFile(resumedRollout.file, resumedRollout.text);
-      await writeFile(paneFile, '0|||%7|4242\n');
-
-      const emptyLargeEvent = `${JSON.stringify({
-        type: 'event_msg',
-        payload: { type: 'fixture_near_limit', detail: '' },
-      })}\n`;
-      const targetTailBytes = 262_131;
-      const paddingBytes = targetTailBytes - Buffer.byteLength(resumedRollout.text + emptyLargeEvent, 'utf8');
-      const nearLimitTail = `${resumedRollout.text}${JSON.stringify({
-        type: 'event_msg',
-        payload: { type: 'fixture_near_limit', detail: 'x'.repeat(paddingBytes) },
-      })}\n`;
-      const nearLimitComposer = '›\n  fixture-model default · /fixture/work\n';
-      const nearLimitScreen = `${'s'.repeat(65_534 - Buffer.byteLength(nearLimitComposer, 'utf8'))}\n${nearLimitComposer}`;
-      expect(Buffer.byteLength(nearLimitTail, 'utf8')).toBe(targetTailBytes);
-      expect(Buffer.byteLength(nearLimitScreen, 'utf8')).toBe(65_535);
-      await writeFile(resumedRollout.file, nearLimitTail);
-      await writeFile(screenFile, nearLimitScreen);
-      const nearLimitEvidence = await run(request);
-      expect(nearLimitEvidence).toMatchObject({
-        identity: { reason: 'verified', conversationId: resumed, tail: nearLimitTail, tailTruncated: false },
-        pane: { dead: false, screen: nearLimitScreen },
+    }
+    for (const kind of ['restart', 'restore'] as const) {
+      const existing = await controlled();
+      try {
+        const result = await existing.rotate(kind, () => {
+          if (kind === 'restart') writeFileSync(join(existing.root, 'pane'), `0|||%7|${existing.worker.pid}\n`);
+          else rmSync(join(existing.root, 'missing'));
+        });
+        expect(result.result).toBe('not-sent');
+        expect(result.pending).toBeUndefined();
+        expect(await existing.starts()).toBe(1);
+        expect(await existing.bytes()).toHaveLength(0);
+        expect(await readFile(join(existing.root, 'native-events'), 'utf8')).not.toContain('respawn-pane');
+      } finally {
+        await existing.close();
+      }
+      const canceled = await controlled();
+      try {
+        let current = true;
+        const provision = canceled.options.provisionTransport.run;
+        canceled.options.provisionTransport.run = async (...args) => {
+          const result = await provision(...args);
+          current = false; // Owner cancellation while provision acknowledgement was held.
+          return result;
+        };
+        const result = await canceled.rotate(kind, (authority) => {
+          authority.check = async () => current;
+          authority.isCurrent = () => current;
+        });
+        expect(result.result).toBe('unknown');
+        expect(result.pending).toBeUndefined();
+        expect(await canceled.starts()).toBe(1);
+        expect(await canceled.bytes()).toHaveLength(0);
+        expect(await readFile(join(canceled.root, 'native-events'), 'utf8')).not.toContain('respawn-pane');
+      } finally {
+        await canceled.close();
+      }
+    }
+    const failed = await controlled();
+    try {
+      failed.env.FIXTURE_SCENARIO = 'fast-child-exit';
+      expect((await failed.rotate('restore')).result).toBe('unknown');
+      expect(await failed.starts()).toBe(2);
+      const directory = await readFile(join(failed.root, 'new-directory'), 'utf8');
+      expect(JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'))).toMatchObject({
+        closed: true,
+        exitStatus: 17,
       });
-      const nearLimitInput = {
-        ...inputRequest,
-        expected: {
-          ...inputRequest.expected,
-          tailHash: createHash('sha256').update(nearLimitTail, 'utf8').digest('hex'),
-          screenHash: createHash('sha256').update(nearLimitScreen, 'utf8').digest('hex'),
-        },
-        prompt: 'Acknowledge the near-limit bounded protocol fixture.',
-      };
-      expect(await runInput(buildRemoteCodexInputCommand(remote, nearLimitInput))).toMatchObject({
-        status: 'sent',
-        submittedAt: expect.any(Number),
-      });
-
-      const hiddenChild = `${JSON.stringify({
-        timestamp: '2026-10-13T10:03:00.000Z',
+      const events = await readFile(join(failed.root, 'native-events'), 'utf8');
+      expect(events.indexOf('remain-on-exit')).toBeLessThan(events.indexOf('respawn-pane'));
+      expect(events).not.toContain('kill-session');
+    } finally {
+      await failed.close();
+    }
+    for (const scenario of [
+      'configuration-failed',
+      'hold-release',
+      'replacement',
+      'bad-stub-exit',
+      'server-restart',
+      'creation-race',
+      'late-configuration',
+      'live-before-effect',
+    ]) {
+      const r = await controlled();
+      try {
+        r.env.FIXTURE_SCENARIO = scenario;
+        if (scenario === 'live-before-effect') r.env.NATIVE_BEFORE_EFFECT = 'dead';
+        expect((await r.rotate('restore')).result, scenario).not.toBe('sent');
+        expect(await r.starts(), scenario).toBe(1);
+        expect(await r.bytes(), scenario).toHaveLength(0);
+        expect(await readFile(join(r.root, 'native-events'), 'utf8')).not.toMatch(/respawn-pane.*(?: -k | -A )/);
+      } finally {
+        await r.close();
+      }
+    }
+    for (const row of [
+      JSON.stringify({
         type: 'event_msg',
         payload: {
           type: 'collab_agent_spawn_end',
-          call_id: 'fixture-spawn',
+          call_id: 'late-spawn',
           new_thread_id: '77777777-8888-4999-8aaa-bbbbbbbbbbbb',
           status: 'running',
         },
-      })}\n`;
-      const oversizedMiddle = `${JSON.stringify({
-        timestamp: '2026-10-13T10:03:01.000Z',
+      }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', turn_id: 'late-owner-turn' } }),
+      JSON.stringify({
         type: 'event_msg',
-        payload: { type: 'fixture_padding', detail: 'x'.repeat(270_000) },
-      })}\n`;
-      const apparentlyCompleteSuffix =
-        `${JSON.stringify({
-          timestamp: '2026-10-13T10:03:02.000Z',
-          type: 'event_msg',
-          payload: { type: 'task_started', turn_id: 'fixture-after-truncation' },
-        })}\n` +
-        `${JSON.stringify({
-          timestamp: '2026-10-13T10:03:03.000Z',
-          type: 'event_msg',
-          payload: { type: 'task_complete', turn_id: 'fixture-after-truncation' },
-        })}\n`;
-      await writeFile(
-        resumedRollout.file,
-        `${resumedRollout.text}${hiddenChild}${oversizedMiddle}${apparentlyCompleteSuffix}`
-      );
-      const truncatedEvidence = await run(request);
-      expect(truncatedEvidence).toMatchObject({
-        identity: {
-          reason: 'verified',
-          conversationId: resumed,
-          tailTruncated: true,
-          tail: apparentlyCompleteSuffix,
-        },
-      });
-      if (
-        !truncatedEvidence ||
-        truncatedEvidence.transport !== 'reachable' ||
-        truncatedEvidence.identity.reason !== 'verified' ||
-        truncatedEvidence.identity.tail === undefined
-      ) {
-        throw new Error('expected verified truncated remote evidence');
+        payload: { type: 'agent_message', message: 'CODEMAN_TASK_BLOCKED: owner permission needed' },
+      }),
+      '{malformed-final-checkpoint',
+    ])
+      for (const kind of ['input', 'restart', 'restore'] as const) {
+        const r = await controlled();
+        try {
+          r.env.FIXTURE_APPEND_ROW = row;
+          if (kind === 'input') {
+            const q = await r.inputRequest('Must not cross late evidence');
+            await r.marker('append-armed');
+            expect(
+              parseRemoteCodexInputResult((await r.run(buildRemoteCodexInputCommand(r.remote, q))).stdout)
+            ).toEqual({ status: 'not-sent' });
+          } else
+            expect((await r.rotate(kind, () => writeFileSync(join(r.root, 'append-armed'), '1'))).result).not.toBe(
+              'sent'
+            );
+          expect(await r.bytes(), `${kind}: ${row}`).toHaveLength(0);
+          expect(await r.starts()).toBe(1);
+        } finally {
+          await r.close();
+        }
       }
-      const truncatedTailHash = createHash('sha256').update(truncatedEvidence.identity.tail, 'utf8').digest('hex');
-      const truncatedInput = {
-        ...inputRequest,
-        expected: {
-          ...inputRequest.expected,
-          tailHash: truncatedTailHash,
-          screenHash: createHash('sha256').update(nearLimitScreen, 'utf8').digest('hex'),
-        },
-      };
-      await writeFile(actionLog, '');
-      expect(await runInput(buildRemoteCodexInputCommand(remote, truncatedInput))).toEqual({ status: 'not-sent' });
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-
-      await writeFile(paneFile, '1|17||%7|4242\n');
-      expect(
-        await runAction(
-          buildRemoteCodexRestartCommand(remote, {
-            ...restartRequest,
-            expectedIdentity: { conversationId: resumed, tailHash: truncatedTailHash },
-          })
-        )
-      ).toBe('not-sent');
-      expect(await (await import('node:fs/promises')).readFile(actionLog, 'utf8')).toBe('');
-    } finally {
-      await rm(root, { recursive: true, force: true });
-    }
-  });
+    const restore = {
+      sessionId: SESSION,
+      resumeId: THREAD,
+      submission: { at: Date.now(), hash: 'a'.repeat(64) },
+      expectedIdentity: { conversationId: THREAD, tailHash: 'b'.repeat(64) },
+      codexConfig: { noDaemon: true, resumeSessionId: THREAD },
+      codexHome: '/fixture/home',
+    };
+    expect(() => buildRemoteCodexRestoreCommand(remote, { ...restore, codexHome: undefined })).toThrow(
+      'exact isolated conversation'
+    );
+    expect(() =>
+      buildRemoteCodexRestoreCommand(remote, { ...restore, resumeId: '66666666-7777-8888-9999-aaaaaaaaaaaa' })
+    ).toThrow('exact isolated conversation');
+    const normalLaunch = buildRemoteLaunchCommand({ remote, mode: 'codex', sessionId: SESSION });
+    for (const setting of [
+      'status off',
+      'mouse off',
+      'prefix C-q',
+      'escape-time 0',
+      'window-size latest',
+      'remain-on-exit failed',
+    ])
+      expect(normalLaunch).toContain(setting);
+  }, 120000);
 
   it('throws before real SSH IO under vitest', async () => {
     await expect(

@@ -228,3 +228,33 @@ describe('real owned local recovery lifecycle', () => {
     }
   });
 });
+
+it.each(
+  [false, true].flatMap((dead) =>
+    [
+      null,
+      [],
+      42,
+      {},
+      { type: 'event_msg', payload: [] },
+      { type: 'response_item', payload: null },
+      { type: 'unsupported_variant', payload: {} },
+    ].map((entry) => ({
+      dead,
+      entry,
+    }))
+  )
+)('malformed rollout envelope vetoes actual owned recovery (dead=$dead, entry=$entry)', async ({ dead, entry }) => {
+  const f = await createChildLifecycleFixture(
+    returnedChildTail('collab_resume_end', { completed: null }, true) + JSON.stringify(entry) + '\n',
+    dead
+  );
+  try {
+    expect(await f.adapter.observe()).toMatchObject({ activity: 'unknown', safeToAct: false });
+    await f.controller.retry();
+    expect(f.delivered).not.toHaveBeenCalled();
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+  } finally {
+    await f.cleanup();
+  }
+});

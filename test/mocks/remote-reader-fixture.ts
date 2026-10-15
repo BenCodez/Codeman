@@ -1,12 +1,12 @@
 /** Shared generated-reader fixture; all SSH/tmux effects are temporary fake commands. */
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import type { SessionRemote } from '../../src/types.js';
-import { guardedNativeTmuxFixture } from './remote-native-tmux.js';
+import { legacyOwnedBroker } from './legacy-owned-broker.js';
 import {
   buildRemoteCodexEvidenceCommand,
   buildRemoteCodexInputCommand,
@@ -53,13 +53,20 @@ export async function fixture(
       | 'server'
       | 'pid-after-input'
       | 'pane-id'
-      | 'signal-alias';
+      | 'signal-alias'
+      | 'no-signal-alias';
     prompt?: string;
     composerAt?: 'before-input' | 'after-first-chunk' | 'before-enter';
     composerScreen?: string;
     initialScreen?: string;
     witnessAt?: 'first-check' | 'final-check';
+    repaintCaptures?: number;
+    repaintMs?: number;
+    repaintAt?: 'first' | 'final';
+    repaintPrefix?: string;
+    repaintVeto?: 'owner' | 'busy' | 'approval' | 'tail' | 'expired' | 'native';
     workingDir?: string;
+    childSignal?: number;
   }
 ) {
   const root = await mkdtemp(join(tmpdir(), 'codeman-remote-witness-'));
@@ -68,18 +75,22 @@ export async function fixture(
   const sessions = join(home, 'sessions', 'year');
   const bin = join(root, 'bin');
   const log = join(root, 'effects');
+  const workingDir = join(root, correlation?.workingDir?.replace(/^\/+/, '') ?? 'workspace');
+  let owned: Awaited<ReturnType<typeof legacyOwnedBroker>> | undefined;
   const remote: SessionRemote = {
     hostId: 'fixture-host',
     label: 'Fixture',
     host: 'worker.invalid',
     username: 'runner',
     port: 22,
-    remotePath: correlation?.workingDir ?? '/fixture/work',
+    remotePath: workingDir,
     owned: true,
   };
   try {
     await mkdir(sessions, { recursive: true });
     await mkdir(bin);
+    await mkdir(workingDir, { recursive: true });
+    await writeFile(log + '.delivered', '');
     await writeFile(log, '');
     await writeFile(log + '.commands', '');
     const initialScreen = correlation?.initialScreen ?? REMOTE_READY_SCREEN;
@@ -89,28 +100,7 @@ export async function fixture(
       correlation?.composerScreen ?? '› Unsent owner draft\n  fixture-model default · /fixture/work\n'
     );
     await writeFile(log + '.requested', correlation?.prompt ?? 'fixture continuation');
-    const composer = join(root, 'composer.cjs');
-    await writeFile(
-      composer,
-      String.raw`
-const fs=require('fs'),base=process.env.EFFECT_LOG,screen=base+'.screen';
-const read=(name,fallback)=>{try{return fs.readFileSync(base+name,'utf8')}catch{return fallback}};
-const change=()=>fs.writeFileSync(screen,fs.readFileSync(base+'.change','utf8'));
-if(process.argv[2]==='capture'){
- const current=fs.readFileSync(screen,'utf8'),count=Number(read('.captures','0'))+1;
- fs.writeFileSync(base+'.captures',String(count));process.stdout.write(current);
- if(process.env.COMPOSER_AT==='before-input'&&count===1)change();
- const pasted=JSON.parse(read('.pasted','""'));
- if((process.env.WITNESS_AT==='first-check'&&count===2)||(process.env.WITNESS_AT==='final-check'&&pasted&&pasted===read('.requested','')))
-  fs.appendFileSync(process.env.SELECTED_ROLLOUT,' ');
-}else{
- const pasted=JSON.parse(read('.pasted','""'))+process.argv[3],count=Number(read('.pastes','0'))+1;
- fs.writeFileSync(base+'.pasted',JSON.stringify(pasted));fs.writeFileSync(base+'.pastes',String(count));
- fs.writeFileSync(screen,'› '+pasted+'\n  fixture-model default · /fixture/work\n');
- if((process.env.COMPOSER_AT==='after-first-chunk'&&count===1)||(process.env.COMPOSER_AT==='before-enter'&&pasted===read('.requested','')))change();
-}
-`
-    );
+    await writeFile(log + '.repaint-prefix', correlation?.repaintPrefix ?? '');
     const at = Date.now() - 60_000;
     const prompt = 'fixture owner input';
     const header = (id: string, createdAt: number, cwd = remote.remotePath, originator = `codeman_${SESSION}`) =>
@@ -168,35 +158,26 @@ if(process.argv[2]==='capture'){
       join(bin, 'tmux-base'),
       String.raw`#!/bin/sh
 case "$*" in
-*has-session*) node "$MUTATE_SCRIPT" || exit 2; [ "$KIND" = restore ] && exit 1; exit 0;;
-*list-panes*)
-  if [ -n "$PANE_ROW" ]; then printf '%s\n' "$PANE_ROW"; exit 0; fi
-  if [ "$5" = '$17' ]; then
-    [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
-    printf '1|%%9|9009|1||17000\n'
-  elif [ "$KIND" = restart ]; then printf '1|1||%%7|4242\n'; else printf '0|||%%7|4242\n'; fi;;
-*capture-pane*) node "$COMPOSER_SCRIPT" capture;;
-*new-session*)
-  [ "$KIND" = restore ] || exit 2
-  printf created > "$RESTORE_STAGE_FILE"
-  printf '%s\n' '$17|%9|9009|17000';;
-*set-option*)
-  [ "$(cat "$RESTORE_STAGE_FILE")" = created ] || exit 2
-  printf configured > "$RESTORE_STAGE_FILE";;
-*wait-for*)
-  [ "$(cat "$RESTORE_STAGE_FILE")" = configured ] || exit 2
-  printf released > "$RESTORE_STAGE_FILE";;
-*respawn-pane*)
-  if [ "$KIND" = restore ]; then
-    [ "$7" = '%9' ] && [ "$(cat "$RESTORE_STAGE_FILE")" = released ] || exit 2
-  fi
-  printf '%s\n' "$*" >> "$EFFECT_LOG";;
-*send-keys*) printf '%s\n' "$*" >> "$EFFECT_LOG"; [ "$4" != -l ] || node "$COMPOSER_SCRIPT" paste "$7";;
-*) exit 2;;
+*has-session*) /usr/bin/node "$MUTATE_SCRIPT" || exit 2; [ "$KIND" = restore ] && exit 1; exit 0;;
+*) exit 91;;
 esac
 `
     );
-    await writeFile(join(bin, 'tmux'), guardedNativeTmuxFixture(join(bin, 'tmux-base')));
+    const rowStatus = Number(correlation?.paneRow?.split('|')[1] ?? 1);
+    owned = await legacyOwnedBroker(
+      root,
+      home,
+      workingDir,
+      kind === 'input' || kind === 'inspect',
+      Number.isSafeInteger(rowStatus) && rowStatus >= 0 && rowStatus <= 255 ? rowStatus : 1,
+      correlation?.childSignal
+    );
+    const paneRow =
+      correlation?.paneRow ??
+      (kind === 'restore' ? '1|1||%9|9009' : (kind === 'restart' ? '1|1||%7|' : '0|||%7|') + owned.pid);
+    await writeFile(log + '.pane', paneRow + '\n');
+    await writeFile(join(bin, 'tmux'), owned.wrapper);
+    if (kind === 'restore') await writeFile(join(root, 'restore-stage'), 'released');
     await writeFile(join(bin, 'ssh'), '#!/bin/sh\nfor arg do last="$arg"; done\nexec /bin/sh -c "$last"\n');
     await writeFile(join(bin, 'login-shell'), '#!/bin/sh\nexec /bin/sh -c "$4"\n');
     await Promise.all(['tmux', 'tmux-base', 'ssh', 'login-shell'].map((name) => chmod(join(bin, name), 0o755)));
@@ -204,6 +185,7 @@ esac
       sessionId: SESSION,
       workingDir: remote.remotePath,
       codexHome: home,
+      inputBroker: owned.descriptor,
       resumeId: THREAD,
       submission: {
         at,
@@ -215,6 +197,16 @@ esac
     const workerRequest = {
       ...request,
       expectedIdentity,
+      expectedInputProof: owned.proof,
+      newInputBroker: {
+        descriptor: owned.nextDescriptor,
+        pane: {
+          sessionId: '$17',
+          paneId: kind === 'restore' ? '%9' : '%7',
+          panePid: kind === 'restore' ? 9009 : owned.pid,
+          serverPid: 17000,
+        },
+      },
       codexConfig: { noDaemon: true, resumeSessionId: THREAD, model: 'fixture-model' },
     };
     const command =
@@ -223,29 +215,46 @@ esac
         : kind === 'input'
           ? buildRemoteCodexInputCommand(remote, {
               ...request,
-              expected: { ...expectedIdentity, paneId: '%7', panePid: 4242, screenHash: sha(initialScreen) },
+              expected: {
+                ...expectedIdentity,
+                paneId: '%7',
+                panePid: owned.pid,
+                screenHash: sha(initialScreen),
+                inputProof: owned.proof,
+              },
               prompt: correlation?.prompt ?? 'fixture continuation',
             })
           : kind === 'restart'
             ? buildRemoteCodexRestartCommand(remote, {
                 ...workerRequest,
-                expectedPane: correlation?.expectedPane ?? { paneId: '%7', panePid: 4242, status: 1 },
+                expectedPane: correlation?.expectedPane ?? { paneId: '%7', panePid: owned.pid, status: 1 },
               })
             : buildRemoteCodexRestoreCommand(remote, workerRequest);
     const env = {
-      ...process.env,
-      PATH: `${bin}:${process.env.PATH}`,
+      HOME: root,
+      LANG: 'C.UTF-8',
+      PATH: `${bin}:/usr/bin:/bin`,
       SHELL: join(bin, 'login-shell'),
       KIND: kind,
+      OWNED_FIXTURE_ROOT: root,
+      OWNED_BROKER_DIRECTORY: owned.broker.directory,
+      OWNED_CODEX_HOME: home,
+      OWNED_WORKING_DIR: workingDir,
+      OWNED_LEGACY_NATIVE: join(bin, 'tmux-base'),
+      FIXTURE_PANE_FILE: log + '.pane',
+      FIXTURE_PANE_PID: String(owned.pid),
       PANE_ROW: correlation?.paneRow ?? '',
       NATIVE_BEFORE_EFFECT: correlation?.beforeEffect ?? '',
       NATIVE_COMMAND_LOG: log + '.commands',
       MUTATION: mutation,
       MUTATE_SCRIPT: mutate,
       EFFECT_LOG: log,
-      COMPOSER_SCRIPT: composer,
       COMPOSER_AT: correlation?.composerAt ?? '',
       WITNESS_AT: correlation?.witnessAt ?? '',
+      REPAINT_CAPTURES: correlation?.repaintCaptures?.toString() ?? '',
+      REPAINT_MS: correlation?.repaintMs?.toString() ?? '',
+      REPAINT_AT: correlation?.repaintAt ?? '',
+      REPAINT_VETO: correlation?.repaintVeto ?? '',
       SELECTED_ROLLOUT: join(sessions, `rollout-selected-${THREAD}.jsonl`),
       RESTORE_STAGE_FILE: join(root, 'restore-stage'),
       SIBLING: sibling,
@@ -254,6 +263,18 @@ esac
       ANCESTOR: ancestor,
       SESSIONS: sessions,
     };
+    if (correlation?.repaintVeto === 'native') {
+      Object.assign(env, { FIXTURE_PANE_FILE: log + '.pane' });
+      await writeFile(log + '.pane', '0|||%7|' + owned.pid + '\n');
+    }
+    if (correlation?.repaintVeto === 'expired') {
+      const clock = join(root, 'clock-preload.cjs');
+      await writeFile(
+        clock,
+        `const fs=require('node:fs'),now=Date.now.bind(Date);Date.now=()=>now()+(fs.existsSync(${JSON.stringify(log + '.expired')})?2000:0);`
+      );
+      Object.assign(env, { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${JSON.stringify(clock)}` });
+    }
     if (correlation?.fifoOn) {
       const fifo = join(root, 'fifo-preload.cjs');
       const target =
@@ -273,8 +294,25 @@ fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return 
       );
       Object.assign(env, { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ''} --require ${JSON.stringify(fifo)}` });
     }
+    const executablePaths = ['tmux', 'tmux-base', 'owned-tmux', 'ssh', 'login-shell', 'codex'].map((name) =>
+      join(bin, name)
+    );
+    const executableHashes = await Promise.all(executablePaths.map(async (path) => sha(await readFile(path, 'utf8'))));
     let refused = false;
     const run = async (cmd: string, change = mutation) => {
+      if (
+        env.PATH !== bin + ':/usr/bin:/bin' ||
+        env.SHELL !== join(bin, 'login-shell') ||
+        (
+          await Promise.all(
+            executablePaths.map(
+              async (path, index) =>
+                (await realpath(path)) === path && sha(await readFile(path, 'utf8')) === executableHashes[index]
+            )
+          )
+        ).some((valid) => !valid)
+      )
+        throw Error('Fixture refused unverified executable environment');
       try {
         return (
           await execFileAsync('/bin/sh', ['-c', cmd], {
@@ -288,16 +326,38 @@ fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return 
           correlation?.paneRow === undefined &&
           correlation?.beforeEffect === undefined &&
           correlation?.composerAt === undefined &&
-          correlation?.witnessAt === undefined
+          correlation?.witnessAt === undefined &&
+          correlation?.repaintCaptures === undefined
         )
-          throw error;
+          throw new Error(
+            'Generated private fixture failed: ' + String((error as { stderr?: string }).stderr ?? error).slice(-1400)
+          );
         refused = true;
         return typeof (error as { stdout?: unknown }).stdout === 'string' ? (error as { stdout: string }).stdout : '';
       }
     };
+    const runStarted = Date.now();
     const stdout = await run(command);
+    const durationMs = Date.now() - runStarted;
     const status = parseRemoteCodexAction(stdout) ?? (refused ? 'unknown' : undefined);
     const effects = await readFile(log, 'utf8');
+    if (kind === 'input') {
+      const delivered = (await readFile(log + '.delivered', 'utf8'))
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line) as string[]);
+      const expected = Buffer.from(
+        delivered.map((command) => (command.at(-1) === 'Enter' ? '\r' : command[4])).join('')
+      );
+      const end = performance.now() + 300;
+      let actual = Buffer.alloc(0);
+      do {
+        actual = await readFile(join(root, 'child-bytes')).catch(() => Buffer.alloc(0));
+        if (actual.equals(expected)) break;
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      } while (performance.now() < end);
+      if (!actual.equals(expected)) throw Error('Acknowledged worker phases differ from actual disposable child bytes');
+    }
     // Prove the newly introduced conflict is a refusal under the actual resolver,
     // rather than simply requiring every unrelated session to have this identity.
     const laterReason =
@@ -307,13 +367,30 @@ fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return 
     return {
       status,
       effects,
+      ...(correlation?.repaintCaptures !== undefined
+        ? {
+            durationMs,
+            captures: (await readFile(log + '.screens', 'utf8'))
+              .trim()
+              .split('\n')
+              .map((line) => JSON.parse(line) as string),
+          }
+        : {}),
       ...(correlation?.fifoOn ? { fifoReads: await readFile(log + '.fifo', 'utf8') } : {}),
       ...(correlation?.beforeEffect || correlation?.prompt !== undefined
         ? {
-            commands: (await readFile(log + '.commands', 'utf8'))
+            commands: (await readFile(log + '.delivered', 'utf8'))
               .split('\n')
               .filter(Boolean)
               .map((line) => JSON.parse(line) as string[]),
+          }
+        : {}),
+      ...(correlation?.childSignal ? { closedWorkerSignal: owned.proof.exitSignal } : {}),
+      ...(correlation?.workingDir ? { workingDir, workerCommand: owned.workerCommand } : {}),
+      ...(correlation?.beforeEffect
+        ? {
+            workerStarted: !!(await readFile(join(root, 'child-ready')).catch(() => undefined)),
+            nativeRefusalObserved: !!(await readFile(log + '.refused').catch(() => undefined)),
           }
         : {}),
       laterReason,
@@ -323,6 +400,7 @@ fs.closeSync=(fd)=>{if(fds.delete(fd))fs.appendFileSync(log,'closed\\n');return 
         : {}),
     };
   } finally {
+    await owned?.close();
     await rm(root, { recursive: true, force: true });
   }
 }

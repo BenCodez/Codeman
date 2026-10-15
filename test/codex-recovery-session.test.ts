@@ -2,6 +2,7 @@ vi.mock('../src/recovery/remote-clock.js', async (original) => ({
   ...(await original<typeof import('../src/recovery/remote-clock.js')>()),
   sampleRemoteCodexClock: vi.fn(async () => clockAt()),
 }));
+import { installOwnedRemoteBrokerFixture } from './helpers/owned-remote-broker.js';
 import { sampleRemoteCodexClock } from '../src/recovery/remote-clock.js';
 /** Recovery uses the real Session boundary with an isolated fake mux; never a live agent or tmux socket. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -820,19 +821,33 @@ describe('the actual owned remote Session boundary', () => {
         creations++;
         return 'sent' as const;
       });
+      Object.assign(f.mux, {
+        getOwnedRemoteInputBroker: vi.fn(),
+        observeOwnedRemoteInputBroker: vi.fn(),
+        isOwnedRemoteInputBrokerProofCurrent: vi.fn(),
+      });
+      const decorate = installOwnedRemoteBrokerFixture(
+        f.mux as unknown as TmuxManager,
+        f.muxSession,
+        ownedRemote,
+        '/srv/example/codex-home',
+        { panePid: 700, status: 1 }
+      );
       const deps: CodexRecoveryAdapterDeps = {
-        inspectRemote: vi.fn(async () => ({
-          transport: 'reachable',
-          session: 'missing',
-          clock: clockAt(),
-          identity: {
-            reason: 'verified',
-            conversationId: THREAD,
-            tail: baseTail,
-            tailTruncated: false,
-            changedAt: now - 1000,
-          },
-        })),
+        inspectRemote: vi.fn(async () =>
+          decorate({
+            transport: 'reachable',
+            session: 'missing',
+            clock: clockAt(),
+            identity: {
+              reason: 'verified',
+              conversationId: THREAD,
+              tail: baseTail,
+              tailTruncated: false,
+              changedAt: now - 1000,
+            },
+          })
+        ),
         restoreRemote,
         restartRemote: vi.fn(async () => 'not-sent'),
         deliverRemote: vi.fn(async () => ({ status: 'not-sent' })),

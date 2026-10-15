@@ -145,7 +145,9 @@ import { legacyConfigForMode, buildSpawnCommandFromRegistry } from './session-cl
 import { hashCodexPrompt } from './recovery/codex-identity.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './recovery/codex-home.js';
 import { CodexInputProofTracker, type CodexInputProof } from './recovery/codex-input-proof.js';
-import { CONTINUATION_PROMPT, type RecoveryFlight } from './recovery/types.js';
+import { CONTINUATION_PROMPT, isRecoveryEvidenceSourceCurrent, type RecoveryFlight } from './recovery/types.js';
+import { checkCodexIdentityWitnesses, checkPrivateFileWitnesses } from './recovery/codex-witness-check.js';
+import type { PrivateFileWitness } from './recovery/private-file-witness.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
 import { readRebootIdentityFence, RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
 import {
@@ -678,6 +680,7 @@ export class Session extends EventEmitter {
   private _recoveryCodexHome?: string;
   private _codexRestoreGuard?: CodexRestoreLaunchGuard;
   private _codexRestoreWorkerMayExist = false;
+  private _codexRestoreDispatchSerial = 0;
   private _useMux: boolean = false;
   /**
    * The agent in this session's local tmux pane has exited (Ark0N/Codeman#446).
@@ -977,7 +980,11 @@ export class Session extends EventEmitter {
     this._mux = config.mux || null;
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this._muxSession = config.muxSession || null;
-    this._codexRestoreWorkerMayExist = this._muxSession?.codexRestoreUncertain === true;
+    this._codexRestoreWorkerMayExist =
+      this._muxSession?.codexRestoreUncertain === true ||
+      (!!config.remote &&
+        getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
+        this._muxSession?.recoveryInputBrokerPending !== undefined);
     this._preserveExitedPane = (config.preserveExitedPane ?? false) || this._codexRestoreWorkerMayExist;
     this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
     this._recoveryUntrackedInput =
@@ -2339,7 +2346,11 @@ export class Session extends EventEmitter {
    * false certifies rejection before dispatch, while a dispatched failure throws
    * because bytes may have reached the pane. Raw input is tracked exactly once.
    */
-  async sendNamedKey(data: string, dispatch: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
+  async sendNamedKey(
+    data: string,
+    dispatch: (signal: AbortSignal) => Promise<void>,
+    prepare?: () => boolean
+  ): Promise<boolean> {
     if (this._inputDeliveryInFlight || this._paneLifecycleOps > 0 || this._closing || this._isStopped) {
       this._rejectLifecycleOwnerInput(data, { fromUser: true });
       return false;
@@ -2352,6 +2363,21 @@ export class Session extends EventEmitter {
       if (this.requiresRemoteInputClock(data, { fromUser: true })) {
         const admission = await this.prepareUserInputClock(data, { fromUser: true });
         if (!admission || admission() !== true) return false;
+      }
+      if (prepare) {
+        let admitted = false;
+        try {
+          const result = prepare();
+          if (result && typeof (result as unknown as { then?: unknown }).then === 'function')
+            void Promise.resolve(result).catch(() => {});
+          admitted = result === true;
+        } catch {
+          // Preparation has not dispatched bytes or changed the plaintext draft.
+        }
+        if (!admitted) {
+          this._noteRejectedOwnedInput();
+          return false;
+        }
       }
       const submitted = this._trackSubmit(data, { fromUser: true });
       if (abort.signal.aborted) return false;
@@ -2389,6 +2415,7 @@ export class Session extends EventEmitter {
       !this._respawnBlocked;
     return {
       generation: this._recoveryGeneration,
+      inputBrokerPending: this._muxSession?.recoveryInputBrokerPending !== undefined,
       submission: this._recoverySubmission,
       intentionalStopAt: this._recoveryIntentionalStopAt,
       // Direct tmux handoff is a permanent authority veto for this pane. Keep
@@ -2404,7 +2431,9 @@ export class Session extends EventEmitter {
       noDaemon:
         this._muxSession?.recoveryIsolated === true &&
         (this._remote
-          ? normalizedCodexHome(this._envOverrides?.CODEX_HOME) !== undefined
+          ? normalizedCodexHome(this._envOverrides?.CODEX_HOME) !== undefined &&
+            normalizedCodexHome(this._envOverrides?.CODEX_HOME) ===
+              normalizedCodexHome(this._muxSession.recoveryCodexHome)
           : normalizedCodexHome(this._muxSession.recoveryCodexHome) !== undefined &&
             (this._envOverrides?.CODEX_HOME === undefined ||
               this._envOverrides.CODEX_HOME === '' ||
@@ -2448,6 +2477,7 @@ export class Session extends EventEmitter {
     expectedConfiguration: string
   ): Promise<boolean> {
     this._remoteRecoveryGrantToken = undefined;
+    const deadline = performance.now() + 2000;
     if (!this._remoteRecoveryContextCurrent(conversationId, generation, isCurrent, expectedConfiguration)) return false;
     const launch = await clampRecoveryLaunchForOwner(
       this.owner,
@@ -2455,7 +2485,17 @@ export class Session extends EventEmitter {
       this._envOverrides
     );
     const grantCurrent = launch.isCurrent;
+    const grantFile = launch.getFileWitness?.() ?? launch.fileWitness;
+    if (
+      performance.now() >= deadline ||
+      typeof grantCurrent !== 'function' ||
+      grantCurrent() !== true ||
+      !this._remoteRecoveryContextCurrent(conversationId, generation, isCurrent, expectedConfiguration)
+    )
+      return false;
+    if (grantFile && !(await checkPrivateFileWitnesses([grantFile], deadline))) return false;
     const accepted =
+      performance.now() < deadline &&
       typeof grantCurrent === 'function' &&
       grantCurrent() === true &&
       this._remoteRecoveryContextCurrent(conversationId, generation, isCurrent, expectedConfiguration) &&
@@ -2817,6 +2857,120 @@ export class Session extends EventEmitter {
     }
   }
 
+  /** Private launch input proof for the exact native broker process. */
+  async getOwnedRemoteInputBroker() {
+    const mux = this._mux,
+      registered = this._muxSession;
+    if (!this._remote || this._remote.owned === false || this._docker || !registered || !mux?.getOwnedRemoteInputBroker)
+      return undefined;
+    const descriptor = await mux.getOwnedRemoteInputBroker(this.id);
+    return this._mux === mux &&
+      this._muxSession === registered &&
+      registered.recoveryInputBroker === descriptor?.incarnation
+      ? descriptor
+      : undefined;
+  }
+
+  observeOwnedRemoteInputBroker(serialized: string, witness: PrivateFileWitness, panePid: number) {
+    if (!this._remote || this._remote.owned === false || this._docker || !this._muxSession) return undefined;
+    return this._mux?.observeOwnedRemoteInputBroker?.(this.id, serialized, witness, panePid);
+  }
+
+  isOwnedRemoteInputBrokerProofCurrent(proof: import('./recovery/codex-input-broker.js').CodexBrokerProof): boolean {
+    try {
+      return (
+        !!this._remote &&
+        this._remote.owned !== false &&
+        !this._docker &&
+        !!this._muxSession &&
+        this._muxSession.recoveryInputBroker === proof.incarnation &&
+        this._mux?.isOwnedRemoteInputBrokerProofCurrent?.(this.id, proof) === true
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  async reserveOwnedRemoteInputBroker(expectedOldInc: string | undefined, newInc: string): Promise<boolean> {
+    const mux = this._mux,
+      registered = this._muxSession;
+    if (
+      !this._remote ||
+      this._remote.owned === false ||
+      this._docker ||
+      !registered ||
+      registered.recoveryInputBroker !== expectedOldInc ||
+      !mux?.reserveOwnedRemoteInputBroker
+    )
+      return false;
+    const result = await mux.reserveOwnedRemoteInputBroker(this.id, expectedOldInc, newInc);
+    return (
+      result === true &&
+      this._mux === mux &&
+      this._muxSession === registered &&
+      registered.recoveryInputBrokerPending === newInc
+    );
+  }
+
+  async commitOwnedRemoteInputBroker(expectedOldInc: string | undefined, newInc: string): Promise<boolean> {
+    const mux = this._mux,
+      registered = this._muxSession;
+    if (
+      !this._remote ||
+      this._remote.owned === false ||
+      this._docker ||
+      !registered ||
+      registered.recoveryInputBroker !== expectedOldInc ||
+      !mux?.commitOwnedRemoteInputBroker
+    )
+      return false;
+    const result = await mux.commitOwnedRemoteInputBroker(this.id, expectedOldInc, newInc);
+    return (
+      result === true &&
+      this._mux === mux &&
+      this._muxSession === registered &&
+      registered.recoveryInputBroker === newInc &&
+      registered.recoveryInputBrokerPending === undefined
+    );
+  }
+
+  async inspectRecoveryInputProvenance(
+    panePid: number
+  ): Promise<import('./recovery/codex-input-broker.js').CodexBrokerProof | undefined> {
+    const mux = this._mux;
+    const registered = this._muxSession;
+    if (!mux?.inspectCodexInputProvenance || !registered || !this.paneExitApplies) return undefined;
+    const proof = await mux.inspectCodexInputProvenance(this.id, panePid);
+    return this._mux === mux && this._muxSession === registered && proof?.brokerPid === panePid ? proof : undefined;
+  }
+
+  /** Private cached input signer scope for this exact registered incarnation. */
+  getRecoveryInputAuthority(
+    proof: import('./recovery/codex-input-broker.js').CodexBrokerProof
+  ): import('./recovery/codex-input-broker.js').BrokerAuthority | undefined {
+    const mux = this._mux;
+    const registered = this._muxSession;
+    if (!mux?.getCodexInputAuthority || !registered || registered.pid !== proof.brokerPid || !this.paneExitApplies)
+      return undefined;
+    try {
+      const authority = mux.getCodexInputAuthority(this.id, proof);
+      if (authority instanceof Promise || (authority && typeof (authority as { then?: unknown }).then === 'function')) {
+        void Promise.resolve(authority).catch(() => {});
+        return undefined;
+      }
+      return this._mux === mux &&
+        this._muxSession === registered &&
+        registered.pid === proof.brokerPid &&
+        authority?.sessionId === this.id &&
+        authority.incarnation === proof.incarnation &&
+        authority.proof === proof
+        ? authority
+        : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
   /** Revalidate under the lifecycle guard, and never kill a live pane as crash recovery. */
   async deliverRecovery(
     flight: RecoveryFlight,
@@ -2911,6 +3065,7 @@ export class Session extends EventEmitter {
         )
           return 'not-sent';
         let dispatched = false;
+        let childDispatched = false;
         let refusedBeforeDispatch = false;
         const contextCurrent = (): boolean => {
           const current = this.getRecoveryContext();
@@ -2932,6 +3087,12 @@ export class Session extends EventEmitter {
           );
         };
         const recoveryGuard = {
+          conversationId: flight.conversationId,
+          privateFiles: [] as PrivateFileWitness[],
+          privatePaths: [] as import('./recovery/codex-identity.js').CodexIdentityWitness['paths'],
+          inputProof: undefined as import('./recovery/codex-input-broker.js').CodexBrokerProof | undefined,
+          inputIssuer: undefined as import('./recovery/codex-input-broker.js').BrokerAuthority | undefined,
+          actionDeadline: undefined as number | undefined,
           ...(flight.action === 'continue'
             ? { expectedLivePane: { paneId: pane.paneId!, panePid: pane.panePid! } }
             : {}),
@@ -2948,6 +3109,19 @@ export class Session extends EventEmitter {
           noteDispatch: () => {
             dispatched = true;
           },
+          noteBrokerSent: () => {
+            childDispatched = true;
+            dispatched = true;
+          },
+          noteBrokerRefusal: () => {
+            if (!childDispatched) {
+              // A matching durable broker receipt can certify that a delivered
+              // control frame forwarded no child bytes. Earlier sent phases
+              // and reserved/lost receipts remain sealed against replay.
+              dispatched = false;
+              refusedBeforeDispatch = true;
+            }
+          },
           noteRefusal: () => {
             if (!dispatched) refusedBeforeDispatch = true;
           },
@@ -2956,17 +3130,65 @@ export class Session extends EventEmitter {
             try {
               accepted = recoveryGuard.confirm();
               if (accepted && confirmEvidence) accepted = (await confirmEvidence()) === true;
+              if (accepted && isCurrent.getActionDeadline) {
+                const deadline: unknown = isCurrent.getActionDeadline();
+                if (
+                  deadline instanceof Promise ||
+                  (deadline && typeof (deadline as { then?: unknown }).then === 'function')
+                ) {
+                  void Promise.resolve(deadline).catch(() => {});
+                  accepted = false;
+                }
+                if (typeof deadline !== 'number' || !Number.isFinite(deadline) || deadline <= Date.now())
+                  accepted = false;
+                recoveryGuard.actionDeadline = typeof deadline === 'number' ? deadline : undefined;
+              } else recoveryGuard.actionDeadline = undefined;
               accepted = accepted && recoveryGuard.confirm();
+              const source = confirmEvidence?.getEvidenceSource?.();
+              if (confirmEvidence?.getEvidenceSource && (!source || source.sessionId !== this.id)) accepted = false;
+              if (source && !isRecoveryEvidenceSourceCurrent(source)) accepted = false;
+              recoveryGuard.inputProof = source?.inputBroker?.proof;
+              const grantFile = granted.getFileWitness?.() ?? granted.fileWitness;
+              recoveryGuard.privateFiles = [...(source?.files ?? []), ...(grantFile ? [grantFile] : [])];
+              recoveryGuard.privatePaths = source?.identity.witness?.paths.map((path) => ({ ...path })) ?? [];
+              const coupledSource = source && { ...source, files: recoveryGuard.privateFiles };
+              // Include disk grants in the worker proof before an issuer's final
+              // combined check. A later standalone grant read must not leave the
+              // already verified issuer stale during another filesystem wait.
+              if (accepted && grantFile) {
+                accepted = coupledSource
+                  ? (await checkCodexIdentityWitnesses([coupledSource.identity], coupledSource.files)) &&
+                    isRecoveryEvidenceSourceCurrent(coupledSource)
+                  : !!granted.verifyCurrent && (await granted.verifyCurrent()) === true;
+                accepted = accepted && recoveryGuard.confirm();
+              }
               if (accepted && isCurrent.prepareEvidence) {
-                const source = confirmEvidence?.getEvidenceSource?.();
-                if (confirmEvidence?.getEvidenceSource && (!source || source.sessionId !== this.id)) accepted = false;
-                if (accepted) accepted = (await isCurrent.prepareEvidence(source)) === true;
+                if (accepted) accepted = (await isCurrent.prepareEvidence(coupledSource)) === true;
                 accepted = accepted && recoveryGuard.confirm();
                 // Real issuer verification shares a final witness scan with the
                 // worker. Legacy standalone guards have no witness to combine.
                 if (accepted && confirmEvidence && !confirmEvidence.getEvidenceSource)
                   accepted = (await confirmEvidence()) === true;
               }
+              if (accepted && isCurrent.getInputIssuer) {
+                const issuer = isCurrent.getInputIssuer();
+                // A configured issuer must supply its freshly verified private
+                // broker scope. Its absence cannot silently become worker-only
+                // authority after an asynchronous manager check.
+                if (
+                  issuer instanceof Promise ||
+                  (issuer && typeof (issuer as { then?: unknown }).then === 'function')
+                ) {
+                  void Promise.resolve(issuer).catch(() => {});
+                  accepted = false;
+                }
+                if (!issuer || issuer.sessionId === this.id) accepted = false;
+                recoveryGuard.inputIssuer = issuer;
+                if (issuer?.files?.length)
+                  recoveryGuard.privateFiles = [...recoveryGuard.privateFiles, ...issuer.files];
+                if (issuer?.paths?.length)
+                  recoveryGuard.privatePaths = [...recoveryGuard.privatePaths, ...issuer.paths];
+              } else recoveryGuard.inputIssuer = undefined;
               accepted = accepted && recoveryGuard.confirm();
             } catch {
               accepted = false;
@@ -2987,7 +3209,16 @@ export class Session extends EventEmitter {
           const pid = await this._mux!.respawnPane({
             ...this._buildRespawnPaneOptions(),
             onlyIfDead: true,
-            ...(expectedRecoveryPane ? { expectedRecoveryPane: { ...expectedRecoveryPane } } : {}),
+            expectedRecoveryPane: expectedRecoveryPane
+              ? { ...expectedRecoveryPane }
+              : {
+                  paneId: pane.paneId!,
+                  panePid: pane.panePid!,
+                  status: pane.status,
+                  signal: pane.signal,
+                  paneSignalToken: pane.paneSignalToken,
+                  inputProvenance: pane.inputProvenance,
+                },
             recoveryDispatchGuard: recoveryGuard,
           });
           if (!pid) return refusedBeforeDispatch && !dispatched ? 'not-sent' : 'unknown';
@@ -3436,22 +3667,56 @@ export class Session extends EventEmitter {
     const generation = this._recoveryGeneration;
     const config = JSON.stringify(this._codexConfig);
     const env = JSON.stringify(this._envOverrides);
-    this._codexRestoreGuard = guard
+    let dispatches = 0;
+    let priorUncertainty = false;
+    let dispatchedSerial = 0;
+    let ownedGuard: CodexRestoreLaunchGuard | undefined;
+    const current = () =>
+      this._codexRestoreGuard === ownedGuard &&
+      !this._closing &&
+      !this._isStopped &&
+      !this._recoverySwitchPending &&
+      !this._recoveryUntrackedInput &&
+      generation === this._recoveryGeneration &&
+      config === JSON.stringify(this._codexConfig) &&
+      env === JSON.stringify(this._envOverrides);
+    this._codexRestoreGuard = ownedGuard = guard
       ? {
-          prepare: () => guard.prepare(),
+          prepare: async () => {
+            if (!current()) throw new Error('Reboot restoration authority changed');
+            await guard.prepare();
+            if (!current()) throw new Error('Reboot restoration authority changed');
+          },
           noteDispatch: () => {
+            dispatches++;
+            if (dispatches === 1) priorUncertainty = this._codexRestoreWorkerMayExist;
+            dispatchedSerial = ++this._codexRestoreDispatchSerial;
             this._codexRestoreWorkerMayExist = true;
             guard.noteDispatch?.();
           },
+          getStartupEvidence: () => (current() ? guard.getStartupEvidence?.() : undefined),
+          isCurrent: () => current() && guard.isCurrent?.() === true,
+          noteCleanupUncertain: () => {
+            this._codexRestoreWorkerMayExist = true;
+            ++this._codexRestoreDispatchSerial;
+            // A stale startup may still leave native work. Its callback only
+            // adds a veto; it cannot release another guard's launch.
+            if (this._codexRestoreGuard === ownedGuard) guard.noteCleanupUncertain?.();
+          },
+          noteBrokerRefusal: () => {
+            // This receipt belongs to one startup. It cannot release a prior
+            // launch whose receipt was lost if a caller attempted twice.
+            if (
+              this._codexRestoreGuard === ownedGuard &&
+              !priorUncertainty &&
+              dispatches === 1 &&
+              dispatchedSerial === this._codexRestoreDispatchSerial
+            ) {
+              this._codexRestoreWorkerMayExist = false;
+              guard.noteBrokerRefusal?.();
+            }
+          },
           confirm: async () => {
-            const current = () =>
-              !this._closing &&
-              !this._isStopped &&
-              !this._recoverySwitchPending &&
-              !this._recoveryUntrackedInput &&
-              generation === this._recoveryGeneration &&
-              config === JSON.stringify(this._codexConfig) &&
-              env === JSON.stringify(this._envOverrides);
             return current() && (await guard.confirm()) === true && current();
           },
         }
@@ -3637,6 +3902,35 @@ export class Session extends EventEmitter {
     // straight back to the launch id.
     let restoredConversation: string | undefined;
 
+    const remoteLaunchConfiguration = this.remoteRecoveryConfiguration(),
+      remoteLaunchGeneration = this._recoveryGeneration;
+    let remoteLaunchGrantCurrent: (() => boolean) | undefined;
+    const remoteLaunchCurrent = () =>
+      !this._closing &&
+      !this._isStopped &&
+      !this._respawnBlocked &&
+      this._recoveryGeneration === remoteLaunchGeneration &&
+      this.remoteRecoveryConfiguration() === remoteLaunchConfiguration &&
+      (!remoteLaunchGrantCurrent || remoteLaunchGrantCurrent() === true);
+    const remoteLaunchPrepare = async () => {
+      if (!remoteLaunchCurrent()) return false;
+      const launch = await clampRecoveryLaunchForOwner(
+        this.owner,
+        { codexConfig: this._codexConfig },
+        this._envOverrides
+      );
+      if (
+        !remoteLaunchCurrent() ||
+        typeof launch.isCurrent !== 'function' ||
+        launch.isCurrent() !== true ||
+        JSON.stringify(launch.configs.codexConfig) !== JSON.stringify(this._codexConfig) ||
+        JSON.stringify(launch.env) !== JSON.stringify(this._envOverrides)
+      )
+        return false;
+      remoteLaunchGrantCurrent = launch.isCurrent;
+      return remoteLaunchCurrent();
+    };
+
     // If mux wrapping is enabled, create or attach to a mux session
     if (this._useMux && this._mux) {
       try {
@@ -3670,6 +3964,8 @@ export class Session extends EventEmitter {
             remote: this._remote,
             docker: this._docker,
             owner: this._owner,
+            remoteLaunchCurrent,
+            remoteLaunchPrepare,
           },
           spawnErrLabel: 'mux attachment',
         });
@@ -3753,6 +4049,46 @@ export class Session extends EventEmitter {
           this._armPaneSettle(true);
         }
       } catch (err) {
+        if (
+          this._remote &&
+          this._remote.owned !== false &&
+          !this._docker &&
+          this._mux &&
+          getCli(this.mode)?.capabilities.recovery === 'codex-rollout'
+        ) {
+          const record = this._mux.getSession(this.id);
+          if (
+            record &&
+            record.sessionId === this.id &&
+            record.mode === this.mode &&
+            record.owner === this.owner &&
+            record.workingDir === this.workingDir &&
+            JSON.stringify(record.remote) === JSON.stringify(this._remote) &&
+            record.recoveryCodexHome === normalizedCodexHome(this._envOverrides?.CODEX_HOME) &&
+            JSON.stringify(record.codexRestoreConfig) === JSON.stringify(this._codexConfig) &&
+            (record.recoveryInputBroker !== undefined || record.recoveryInputBrokerPending !== undefined)
+          ) {
+            this._muxSession = record;
+            this._codexRestoreWorkerMayExist = true;
+            this._preserveExitedPane = true;
+            record.codexRestoreUncertain = true;
+          }
+        }
+        const pending = this._mux?.getSession(this.id);
+        if (
+          !this._codexRestoreGuard &&
+          pending?.codexRestoreUncertain === true &&
+          pending.recoveryInputBrokerPending &&
+          pending.mode === 'codex' &&
+          !pending.remote &&
+          !pending.docker &&
+          pending.sessionId === this.id &&
+          pending.owner === this.owner &&
+          pending.workingDir === this.workingDir
+        ) {
+          this._codexRestoreWorkerMayExist = true;
+          this.adoptUncertainCodexRestore();
+        }
         if (this._codexRestoreGuard || this._codexRestoreWorkerMayExist) throw err;
         console.error('[Session] Failed to create mux session, falling back to direct PTY:', err);
         this._useMux = false;
@@ -5231,10 +5567,18 @@ export class Session extends EventEmitter {
     }
     this._ordinaryInputWrites++;
     try {
+      if (!this.ptyProcess) {
+        this._noteRejectedOwnedInput();
+        return false;
+      }
+      const input = this._wrapOwnedPtyInput(data);
+      if (input === undefined) {
+        this._noteRejectedOwnedInput();
+        return false;
+      }
       const submittedPrompt = this._trackSubmit(data, options);
-      if (!this.ptyProcess) return false;
       try {
-        this.ptyProcess.write(data);
+        this.ptyProcess.write(input);
       } finally {
         // A PTY exception may follow a partial write. Keep the identity sealed
         // before any submission listener can throw; only no-PTY is known unsent.
@@ -5265,6 +5609,33 @@ export class Session extends EventEmitter {
       return;
     this._recoveryGeneration++;
     this._recoveryInputProofTracker.invalidate();
+    this._invalidateRecoverySubmission();
+    this.emit('recoveryUserInput');
+  }
+
+  /** Frame app-owned input without changing the prompt tracked by the session. */
+  private _wrapOwnedPtyInput(data: string): string | undefined {
+    try {
+      if (!this._mux?.wrapCodexOwnerInput) return data;
+      const result = this._mux.wrapCodexOwnerInput(this.id, data);
+      if (result && typeof (result as unknown as { then?: unknown }).then === 'function') {
+        void Promise.resolve(result).catch(() => {});
+        return undefined;
+      }
+      if (result?.status === 'passthrough') return data;
+      if (result?.status === 'framed' && typeof result.data === 'string' && result.data.length > 0) return result.data;
+    } catch {
+      // The formatter cannot have dispatched PTY bytes.
+    }
+    // Missing keys, malformed receipts, and incomplete broker setup are known
+    // pre-delivery refusals. The caller retains the input's original FIFO slot.
+    return undefined;
+  }
+
+  /** Rejected owner input still cancels automation, without inventing delivered text. */
+  private _noteRejectedOwnedInput(): void {
+    if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return;
+    this._recoveryGeneration++;
     this._invalidateRecoverySubmission();
     this.emit('recoveryUserInput');
   }
@@ -5587,11 +5958,36 @@ export class Session extends EventEmitter {
   }
 
   private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
+    const viaMux = !!(this._mux && this._muxSession);
+    if (!viaMux && !this.ptyProcess) {
+      this._noteRejectedOwnedInput();
+      return false;
+    }
+    if (viaMux && this._mux?.canDeliverCodexOwnerInput) {
+      let admitted = false;
+      try {
+        const result = this._mux.canDeliverCodexOwnerInput(this.id);
+        if (result && typeof (result as unknown as { then?: unknown }).then === 'function')
+          void Promise.resolve(result).catch(() => {});
+        admitted = result === true;
+      } catch {
+        // A cache/readiness failure is a known pre-delivery refusal.
+      }
+      if (!admitted) {
+        this._noteRejectedOwnedInput();
+        return false;
+      }
+    }
     if (this.requiresRemoteInputClock(data, options)) {
       const admission = await this.prepareUserInputClock(data, options);
       if (!admission || admission() !== true) throw new Error('Owner input admission changed before dispatch');
     }
-    const submittedPrompt = this._trackSubmit(data, options, !!(this._mux && this._muxSession));
+    const input = !viaMux && this.ptyProcess ? this._wrapOwnedPtyInput(data) : data;
+    if (input === undefined) {
+      this._noteRejectedOwnedInput();
+      return false;
+    }
+    const submittedPrompt = this._trackSubmit(data, options, viaMux);
     if (this._mux && this._muxSession) {
       let sent: boolean;
       try {
@@ -5616,7 +6012,7 @@ export class Session extends EventEmitter {
     // Fallback to PTY write
     if (this.ptyProcess) {
       try {
-        this.ptyProcess.write(data);
+        this.ptyProcess.write(input);
       } finally {
         this._commitWriteInput(options);
       }

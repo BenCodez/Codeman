@@ -142,11 +142,11 @@ the session's previous reboot-recovery identity. The endpoint uses the normal
 owner-scoped session lookup and must succeed before tmux starts. This also covers
 remote Codex sessions if direct attach is enabled for them later.
 
-Attaching with a manually constructed `tmux attach-session` command bypasses the
-Codeman client and server entirely, so Codeman cannot observe or fence input from
-that path. Sessions driven that way may therefore be refused exact reboot restore
-until a later submission through a tracked Codeman input path establishes fresh
-identity evidence.
+A manually constructed `tmux attach-session` bypasses the Codeman handoff. A
+launch-owned input guard observes raw terminal bytes and durably taints that
+worker before forwarding them. Later tracked submissions cannot clear that
+lifetime taint, so exact recovery and reboot restoration remain refused for
+that incarnation. Legacy panes without an input guard remain attention-only.
 
 ### A client of the server, not a second brain
 
