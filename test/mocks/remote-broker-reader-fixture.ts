@@ -152,8 +152,8 @@ sys.exit(int(open(root+'/exit-status').read()) if os.path.exists(root+'/exit-sta
   await fs.writeFile(ssh, '#!/bin/sh\nfor arg do :; done\nexec /bin/sh -c "$arg"\n', { mode: 0o700 });
   await fs.writeFile(
     delegate,
-    String.raw`#!/usr/bin/python3
-import json,os,select,sys,time,subprocess,hashlib,shlex,base64
+    String.raw`#!/usr/bin/python3 -S
+import json,os,sys
 a=sys.argv[1:];assert a[:2]==['-L','codeman-remote'];op=a[2];root=os.environ['FAKE_BROKER_ROOT'];pid=os.environ['FIXTURE_PANE_PID']
 assert root.startswith(os.environ['HOME']+'/') or root==os.environ['HOME']
 if op=='has-session':sys.exit(1 if os.path.exists(root+'/missing') else 0)
@@ -168,6 +168,7 @@ if op=='list-panes':
  fmt=a[-1];names=re.findall(r'#\{([a-z_]+)\}',fmt);assert names
  sys.stdout.write('|'.join(state[n] for n in names)+'\n');sys.exit(0)
 if op=='respawn-pane':
+ import subprocess,hashlib,shlex
  assert a[3:7]==['-c',root,'-t','%7'] and a[7:10]==['env','CODEX_HOME='+os.environ['FAKE_CODEX_HOME'],'python3']
  directory=a[11];assert a[10]==directory+'/broker.py' and directory.startswith(root+'/') and len(a)==13 and len(a[12])==64
  fd=os.open(root+'/input',os.O_RDWR|os.O_NONBLOCK);log=os.open(root+'/new-broker.log',os.O_WRONLY|os.O_CREAT|os.O_APPEND,0o600)
@@ -178,6 +179,7 @@ if op=='respawn-pane':
  p=subprocess.Popen(['/usr/bin/python3',a[10],directory,a[12]],stdin=fd,stdout=log,stderr=log,env=env,close_fds=True)
  open(root+'/new-directory','w').write(directory);open(root+'/pane','w').write('0|||%7|'+str(p.pid)+'\n');os.close(fd);os.close(log);sys.exit(0)
 if op=='capture-pane':
+ import time
  assert '-p' in a
  text=open(root+'/bytes','rb').read().decode('utf8')
  if os.path.exists(root+'/draft') or (os.path.exists(root+'/draft-after') and text):text='Unsent owner draft'
@@ -190,6 +192,7 @@ if op=='capture-pane':
  if os.path.exists(root+'/tail-after') and text:open(os.environ['ROLLOUT'],'a').write(' ')
  sys.stdout.write(chrome+'› '+text+'\n  fixture-model default · /fixture/work\n');sys.exit(0)
 if op in ('paste-buffer','send-keys'):
+ import base64,hashlib,select,time
  if op=='paste-buffer':
   assert a[3:6]==['-r','-d','-b'] and a[7:]==['-t','%7'] and len(a)==9
   buffer_path=os.environ['EFFECT_LOG']+'.buffer-'+a[6]
@@ -245,6 +248,10 @@ raise AssertionError(op)
   await fs.writeFile(
     native,
     guardedNativeTmuxFixture(delegate)
+      // A real tmux query uses its existing server. These disposable Python
+      // executables need only stdlib; site setup and unrelated launch imports
+      // on every read are fixture overhead inside the unchanged action budget.
+      .replace('#!/usr/bin/env python3', '#!/usr/bin/python3 -S')
       .replace(
         "if op == 'if-shell':",
         String.raw`if op == 'if-shell' and args[7]=='display-message -p CODEMAN_BROKER_OWNED':

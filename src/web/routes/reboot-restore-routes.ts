@@ -266,7 +266,8 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             const trustedCustomModelEnv = await rebuildPersistedCustomModelEnv(
               saved.mode ?? 'claude',
               saved.id,
-              savedCustomModel
+              savedCustomModel,
+              saved.workingDir
             );
             if (!trustedCustomModelEnv) {
               failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });

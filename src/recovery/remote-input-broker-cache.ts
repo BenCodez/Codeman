@@ -38,7 +38,11 @@ const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const MAX_BYTES = 524_288;
 const digest = (input: string) => createHash('sha256').update(input).digest('hex');
 const pending = new Map<string, { deadline: number; work: Promise<unknown> }>();
-async function bounded<T>(key: string, operation: () => Promise<T>): Promise<T | undefined> {
+async function bounded<T>(
+  key: string,
+  operation: () => Promise<T>,
+  retained?: (work: Promise<unknown>) => void
+): Promise<T | undefined> {
   let job = pending.get(key);
   if (!job) {
     if (pending.size >= 2) return undefined;
@@ -51,6 +55,7 @@ async function bounded<T>(key: string, operation: () => Promise<T>): Promise<T |
       if (pending.get(key)?.work === work) pending.delete(key);
     });
   }
+  retained?.(job.work);
   const budget = job.deadline - performance.now();
   if (budget <= 0) return undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -98,7 +103,7 @@ function same(a: Stats, b: Stats): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 }
 function descriptor(
-  scope: OwnedRemoteBrokerScope,
+  scope: { sessionId: string; codexHome?: string },
   material: BrokerProvisioningMaterial,
   directory: string
 ): OwnedRemoteBrokerDescriptor | undefined {
@@ -156,7 +161,8 @@ function descriptor(
       !UUID.test(config.incarnation) ||
       !/^[a-f0-9]{64}$/.test(config.secret) ||
       config.launchDigest !== digest(config.command) ||
-      config.homeDigest !== digest(scope.codexHome) ||
+      !/^[a-f0-9]{64}$/.test(config.homeDigest) ||
+      (scope.codexHome !== undefined && config.homeDigest !== digest(scope.codexHome)) ||
       !posix.isAbsolute(directory) ||
       posix.normalize(directory) !== directory ||
       Buffer.byteLength(directory) > 4096 ||
@@ -182,6 +188,7 @@ export class OwnedRemoteBrokerCache {
   private readonly entries = new Map<string, Entry>();
   private readonly scopes = new Map<string, string>();
   private readonly epochs = new Map<string, CacheEpoch>();
+  private readonly deletions = new Map<string, object>();
   constructor(private readonly root = join(getDataDirPath(), 'remote-input-brokers')) {}
   private begin(sessionId: string): CacheEpoch {
     let epoch = this.epochs.get(sessionId);
@@ -197,7 +204,7 @@ export class OwnedRemoteBrokerCache {
     if (this.epochs.get(sessionId) === epoch && epoch.pending === 0 && !this.scopes.has(sessionId))
       this.epochs.delete(sessionId);
   }
-  /** Final application deletion only. Private launch provenance stays on disk for verified restoration. */
+  /** Revoke memory immediately; detach/restorable callers must not retire authority. */
   retire(sessionId: string): void {
     this.epochs.delete(sessionId);
     this.scopes.delete(sessionId);
@@ -205,6 +212,126 @@ export class OwnedRemoteBrokerCache {
       if (!key.startsWith(sessionId + ':')) continue;
       entry.signer?.retire();
       this.entries.delete(key);
+    }
+  }
+  /** Final owner deletion only. Unknown files remain private and are never recursively removed. */
+  async retireAndDelete(sessionId: string, isCurrent: () => boolean): Promise<boolean> {
+    const callerCurrent = () => {
+      try {
+        const verdict: unknown = isCurrent();
+        if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+          void Promise.resolve(verdict).catch(() => {});
+        return verdict === true;
+      } catch {
+        return false;
+      }
+    };
+    if (!UUID.test(sessionId) || !callerCurrent() || this.deletions.has(sessionId)) return false;
+    this.retire(sessionId);
+    const token = {};
+    this.deletions.set(sessionId, token);
+    const deadline = performance.now() + 2000;
+    const current = () => performance.now() < deadline && this.deletions.get(sessionId) === token && callerCurrent();
+    const sessionRoot = join(this.root, sessionId);
+    // A timed-out write still owns its filesystem slot. Wait its actual close,
+    // rather than deleting before a late write can publish the secret again.
+    const prior = [...pending]
+      .filter(([key]) => ['write:', 'read:'].some((prefix) => key.startsWith(prefix + sessionRoot + '/')))
+      .map(([, job]) => job.work);
+    let retained = false;
+    try {
+      return (
+        (await bounded(
+          'delete:' + sessionRoot + ':' + randomUUID(),
+          async () => {
+            await Promise.all(prior);
+            if (!current()) return false;
+            const parents = [await fs.lstat(this.root), await fs.lstat(sessionRoot)];
+            if (parents.some((stat) => !privateStat(stat, true))) return false;
+            const directory = await fs.opendir(sessionRoot);
+            let complete = true,
+              count = 0;
+            try {
+              for await (const item of directory) {
+                if (++count > 128) return false;
+                if (!current()) return false;
+                if (!UUID.test(item.name) || !item.isDirectory() || item.isSymbolicLink()) {
+                  complete = false;
+                  continue;
+                }
+                const dirs = this.directories(sessionId, item.name);
+                const path = join(dirs[2], 'private.json');
+                try {
+                  const beforeParents = await Promise.all(dirs.map((path) => fs.lstat(path)));
+                  if (
+                    beforeParents.some((stat) => !privateStat(stat, true)) ||
+                    beforeParents.slice(0, 2).some((stat, index) => !same(stat, parents[index]))
+                  )
+                    return false;
+                  const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+                  let before: Stats, bytes: Buffer;
+                  try {
+                    before = await file.stat();
+                    if (!privateStat(before) || before.size > MAX_BYTES) throw Error('Unknown private material');
+                    bytes = Buffer.alloc(before.size + 1);
+                    const read = await file.read(bytes, 0, bytes.length, 0);
+                    if (read.bytesRead !== before.size || !same(before, await file.stat()))
+                      throw Error('Changed private material');
+                    bytes = bytes.subarray(0, read.bytesRead);
+                  } finally {
+                    await file.close();
+                  }
+                  const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+                  if (
+                    !value ||
+                    Object.keys(value).sort().join(',') !== 'directory,material,scope,version' ||
+                    value.version !== 1 ||
+                    !/^[a-f0-9]{64}$/.test(value.scope) ||
+                    descriptor({ sessionId }, value.material, value.directory)?.incarnation !== item.name
+                  )
+                    throw Error('Unknown private material');
+                  // All proof handles have closed before this common final scan.
+                  const after = await Promise.all([...dirs, path].map((path) => fs.lstat(path)));
+                  if (
+                    !current() ||
+                    after
+                      .slice(0, 3)
+                      .some((stat, index) => !privateStat(stat, true) || !same(stat, beforeParents[index])) ||
+                    !privateStat(after[3]) ||
+                    !same(before, after[3])
+                  )
+                    return false;
+                  await fs.unlink(path);
+                  const parent = await fs.open(
+                    dirs[2],
+                    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+                  );
+                  try {
+                    await parent.sync();
+                  } finally {
+                    await parent.close();
+                  }
+                } catch (error) {
+                  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') complete = false;
+                }
+              }
+            } finally {
+              await directory.close().catch((error: NodeJS.ErrnoException) => {
+                if (error.code !== 'ERR_DIR_CLOSED') throw error;
+              });
+            }
+            return current() && complete;
+          },
+          (work) => {
+            retained = true;
+            void work.finally(() => {
+              if (this.deletions.get(sessionId) === token) this.deletions.delete(sessionId);
+            });
+          }
+        )) === true
+      );
+    } finally {
+      if (!retained && this.deletions.get(sessionId) === token) this.deletions.delete(sessionId);
     }
   }
   private directories(sessionId: string, incarnation: string): string[] {
@@ -217,6 +344,7 @@ export class OwnedRemoteBrokerCache {
     directory: string
   ): Promise<OwnedRemoteBrokerDescriptor | undefined> {
     const key = scopeKey(scope);
+    if (this.deletions.has(scope.sessionId)) return undefined;
     const proof = descriptor(scope, material, directory);
     if (!key || !proof) return undefined;
     let copied: BrokerProvisioningMaterial, bytes: Buffer;
@@ -288,6 +416,7 @@ export class OwnedRemoteBrokerCache {
   }
   /** Reads only locally retained launch material; an existing remote pane cannot create this record. */
   async load(scope: OwnedRemoteBrokerScope, incarnation: string): Promise<OwnedRemoteBrokerDescriptor | undefined> {
+    if (this.deletions.has(scope.sessionId)) return undefined;
     const key = scopeKey(scope);
     if (!key || !UUID.test(incarnation)) return undefined;
     if (this.scopes.has(scope.sessionId) && this.scopes.get(scope.sessionId) !== key) return undefined;

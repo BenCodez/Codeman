@@ -298,3 +298,56 @@ describe('Session.lastInputSeq (the watermark a stuck client needs)', () => {
     expect(apply(s, 'c-1', 5)).toBe(true);
   });
 });
+
+describe('retired input client receipts', () => {
+  it('never re-applies a stale occurrence after committed client churn exceeds the live ledger', () => {
+    const s = makeSession();
+    expect(apply(s, 'old-document', 1)).toBe(true);
+    for (let i = 0; i < 400; i++) expect(apply(s, `new-document-${i}`, 1)).toBe(true);
+    // A lost ACK or undeletable browser record retains this exact original CID.
+    expect(s.deferInputSeq('old-document', 1)).toBe(false);
+    expect(s.shouldApplyInput('old-document', 1)).toBe(false);
+    expect(s.shouldApplyInput('old-document', 2)).toBe(false);
+    expect(s.hasAppliedInputSeq('old-document', 1)).toBe(false);
+    expect(apply(s, 'healthy-current-document', 1)).toBe(true);
+    expect(apply(s, 'healthy-current-document', 2)).toBe(true);
+  });
+
+  it('retains an evicted zero-sequence receipt without claiming an unknown sequence was applied', () => {
+    const s = makeSession();
+    expect(apply(s, 'zero-document', 0)).toBe(true);
+    for (let i = 0; i < 256; i++) expect(apply(s, `zero-churn-${i}`, 1)).toBe(true);
+    expect(s.shouldApplyInput('zero-document', 0)).toBe(false);
+    expect(s.hasAppliedInputSeq('zero-document', 0)).toBe(false);
+    expect(s.deferInputSeq('zero-document', 100)).toBe(false);
+  });
+
+  it('does not permanently retire certified never-dispatched admission after reclaiming its lease', () => {
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const s = makeSession();
+    expect(s.deferInputSeq('abandoned-original', 1)).toBe(true);
+    for (let i = 0; i < 255; i++) expect(s.deferInputSeq(`abandoned-other-${i}`, 1)).toBe(true);
+    now = 60000;
+    expect(apply(s, 'owner-current', 1)).toBe(true);
+    expect(apply(s, 'abandoned-original', 1)).toBe(true);
+    expect(apply(s, 'abandoned-original', 1)).toBe(false);
+  });
+
+  it('uses a fixed lazy rejection filter and never clears earlier retirement evidence', () => {
+    const s = makeSession();
+    const filter = Reflect.get(s, '_retiredInputClients');
+    expect(Reflect.get(filter, 'bits')).toBeUndefined();
+    expect(apply(s, 'oldest-document', 1)).toBe(true);
+    for (let i = 0; i < 600; i++) expect(apply(s, `bounded-churn-${i}`, 1)).toBe(true);
+    const bits = Reflect.get(filter, 'bits') as Uint8Array;
+    expect(bits.byteLength).toBe(16384);
+    expect(s.deferInputSeq('oldest-document', 1)).toBe(false);
+    // A saturated filter can only refuse unknown identities. Existing live
+    // receipts and their future new input still use exact ledger evidence.
+    bits.fill(255);
+    expect(s.deferInputSeq('unknown-after-saturation', 1)).toBe(false);
+    expect(apply(s, 'bounded-churn-599', 2)).toBe(true);
+    expect(Reflect.get(filter, 'bits')).toBe(bits);
+  });
+});

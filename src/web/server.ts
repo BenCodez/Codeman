@@ -1326,7 +1326,7 @@ export class WebServer extends EventEmitter {
     saved: CustomModelBookkeeping
   ): Promise<Record<string, string> | undefined> {
     try {
-      const env = await rebuildPersistedCustomModelEnv(session.mode, session.id, saved);
+      const env = await rebuildPersistedCustomModelEnv(session.mode, session.id, saved, session.workingDir);
       if (!env) console.warn('[WebServer] custom-model endpoint is unavailable; selection kept for clearing');
       return env;
     } catch (err) {
@@ -1685,7 +1685,17 @@ export class WebServer extends EventEmitter {
       // When killMux=false (server shutdown), preserve state for recovery.
       if (killMux) {
         this.store.demoteOrRemoveSession(sessionId);
-        ownedRemoteBrokerCache.retire(sessionId);
+        const retiredState = this.store.getSessions()[sessionId];
+        const retiredStateText = JSON.stringify(retiredState);
+        const retiredOwner = session.owner;
+        await ownedRemoteBrokerCache.retireAndDelete(
+          sessionId,
+          () =>
+            !this.sessions.has(sessionId) &&
+            session.owner === retiredOwner &&
+            this.store.getSessions()[sessionId] === retiredState &&
+            JSON.stringify(retiredState) === retiredStateText
+        );
       }
     }
 

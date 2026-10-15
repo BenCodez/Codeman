@@ -35,6 +35,8 @@ async function fixture(
   }) => Promise<void>
 ) {
   const root = await fs.mkdtemp(join(homedir(), 'remote-cache-cleanup-'));
+  const previousCacheRoot = Reflect.get(cache, 'root');
+  Reflect.set(cache, 'root', join(root, 'private-brokers'));
   const server = new WebServer(0, false, true),
     internal = server as unknown as Internal;
   internal.store = new StateStore(join(root, 'state.json'));
@@ -84,6 +86,7 @@ async function fixture(
     internal.sessions.clear();
     await session.stop(false);
     cache.retire(session.id);
+    Reflect.set(cache, 'root', previousCacheRoot);
     await server.stop();
     internal.store.flushAll();
     await fs.rm(root, { recursive: true, force: true });
@@ -91,7 +94,7 @@ async function fixture(
 }
 
 it.each([false, true])(
-  'retires final deleted/demoted Session cache (pinned=%s) without deleting private provenance',
+  'retires final deleted/demoted Session cache and private provenance (pinned=%s)',
   async (pinned) =>
     fixture(async ({ internal, session, kill, scope, material }) => {
       session.setPinned(pinned);
@@ -101,8 +104,7 @@ it.each([false, true])(
       expect(internal.sessions.has(session.id)).toBe(false);
       expect(internal.store.getSession(session.id)?.status).toBe(pinned ? 'stopped' : undefined);
       expect(cache.get(scope, material.config.incarnation)).toBeUndefined();
-      // Verified same-scope rehydration remains possible after a later owner operation.
-      expect(await cache.load(scope, material.config.incarnation)).toBeDefined();
+      expect(await cache.load(scope, material.config.incarnation)).toBeUndefined();
     })
 );
 
@@ -191,7 +193,7 @@ it.each(['delete', 'detach', 'foreign', 'missing', 'state-error'] as const)(
         if (kind === 'delete') expect(cache.get(scope, material.config.incarnation)).toBeUndefined();
         else expect(cache.get(scope, material.config.incarnation)).toBeDefined();
         if (kind === 'foreign' || kind === 'state-error') expect(internal.store.getSession(session.id)).toBeDefined();
-        if (kind === 'delete') expect(await cache.load(scope, material.config.incarnation)).toBeDefined();
+        if (kind === 'delete') expect(await cache.load(scope, material.config.incarnation)).toBeUndefined();
       } finally {
         wake.stop();
         await app.close();

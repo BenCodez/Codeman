@@ -256,14 +256,15 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('taskRefreshBtn').disabled = view.loading || view.busy;
     const budget =
       !!state &&
-      (!(state.kickoffAt || state.continuations > 0) || state.continuations < state.config.maxContinuations) &&
+      (state.kickoffAt !== undefined ||
+        state.continuations === 0 ||
+        state.continuations < state.config.maxContinuations) &&
       (!state.startedAt || Date.now() - state.startedAt < state.config.maxRuntimeMs);
     document.getElementById('taskResumeBtn').disabled =
       !available ||
       !budget ||
       !!state?.inFlight ||
       state?.outcome === 'completed' ||
-      state?.outcome === 'blocked' ||
       !state?.objective ||
       !state?.criteria.length;
     document.getElementById('taskPauseBtn').disabled = !available || !state?.config.enabled;

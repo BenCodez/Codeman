@@ -4,7 +4,7 @@ import { promisify } from 'node:util';
 import { performance } from 'node:perf_hooks';
 import type { SessionRemote } from '../types.js';
 import { buildSshConnectionArgs, remoteLoginShellCommand, remoteSshTarget, shellescape } from '../remote-hosts.js';
-import { runWithRemoteSshLimit } from '../remote-ssh-limiter.js';
+import { runWithRemoteSshLimit, RemoteSshAdmissionError } from '../remote-ssh-limiter.js';
 
 const execAsync = promisify(exec);
 const CLOCK_MARKER = 'CODEMAN_REMOTE_CLOCK_V1:';
@@ -156,5 +156,10 @@ export async function sampleRemoteCodexClock(
       return undefined;
     }
   };
-  return limited ? runWithRemoteSshLimit(sample) : sample();
+  return limited
+    ? runWithRemoteSshLimit(sample, { deadline: performance.now() + 15_000 }).catch((error: unknown) => {
+        if (error instanceof RemoteSshAdmissionError) return undefined;
+        throw error;
+      })
+    : sample();
 }
