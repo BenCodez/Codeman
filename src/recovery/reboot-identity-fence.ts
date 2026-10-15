@@ -1,16 +1,18 @@
 /** @fileoverview Private synchronous identity fence committed before a thread-changing input is dispatched. */
 import {
   closeSync,
-  existsSync,
+  constants,
+  fstatSync,
   fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
+  readSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
+import type { Stats } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { getDataDirPath } from '../config/instance.js';
@@ -35,7 +37,42 @@ export function rebootIdentityFencePath(id: string): string {
 }
 // Repeated edits of an already-fenced draft need no additional synchronous fsync.
 // Cache only a completed durable veto, and invalidate it BEFORE any replacement attempt.
-const committedVetoes = new Map<string, 'pending' | 'untracked'>();
+type FenceFile = Pick<Stats, 'dev' | 'ino' | 'size' | 'mtimeMs' | 'ctimeMs'>;
+const committedVetoes = new Map<string, { veto: 'pending' | 'untracked'; file: FenceFile }>();
+const sameFenceFile = (before: FenceFile, after: FenceFile) =>
+  (['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'] as const).every((key) => before[key] === after[key]);
+
+function readFenceSnapshot(path: string): { value: RebootIdentityFence; text: string; file: FenceFile } | undefined {
+  let before: Stats;
+  try {
+    before = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if (!before.isFile() || before.isSymbolicLink() || before.size > 1024) throw new Error('Invalid fence');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || !sameFenceFile(before, opened)) throw new Error('Fence changed');
+    const bytes = Buffer.alloc(1025);
+    let size = 0;
+    while (size < bytes.length) {
+      const count = readSync(fd, bytes, size, bytes.length - size, size);
+      if (!count) break;
+      size += count;
+    }
+    if (size > 1024 || size !== opened.size || !sameFenceFile(opened, fstatSync(fd))) throw new Error('Fence changed');
+    const after = lstatSync(path);
+    if (!after.isFile() || after.isSymbolicLink() || !sameFenceFile(opened, after)) throw new Error('Fence changed');
+    const data = bytes.subarray(0, size);
+    const text = data.toString('utf8');
+    if (!Buffer.from(text, 'utf8').equals(data)) throw new Error('Invalid fence');
+    return { value: parseRebootIdentityFence(text), text, file: after };
+  } finally {
+    closeSync(fd);
+  }
+}
 
 export function writeRebootIdentityFence(id: string, identity: RebootIdentityFence): void {
   const path = rebootIdentityFencePath(id);
@@ -44,16 +81,31 @@ export function writeRebootIdentityFence(id: string, identity: RebootIdentityFen
   // input and therefore cannot clear the handoff taint. Only deleting/replacing
   // this private identity file as part of a separately proven new-pane lifecycle
   // may establish a fresh identity boundary.
-  const untrackedInput = identity.untrackedInput === true || readRebootIdentityFence(id)?.untrackedInput === true;
+  const cached = committedVetoes.get(path);
+  let existing: ReturnType<typeof readFenceSnapshot>;
+  try {
+    existing = readFenceSnapshot(path);
+  } catch {
+    // A damaged/replaced fence cannot qualify for the cache shortcut.
+  }
+  const untrackedInput =
+    identity.untrackedInput === true || existing?.value.untrackedInput === true || cached?.veto === 'untracked';
   const durableIdentity = untrackedInput ? { ...identity, untrackedInput: true } : identity;
   const veto: 'pending' | 'untracked' | undefined = untrackedInput
     ? 'untracked'
     : identity.switchPending && identity.submission === undefined
       ? 'pending'
       : undefined;
-  if (veto && committedVetoes.get(path) === veto && existsSync(path)) return;
+  const existingVeto = existing?.value.untrackedInput
+    ? 'untracked'
+    : existing?.value.switchPending && existing.value.submission === undefined
+      ? 'pending'
+      : undefined;
+  if (veto && cached?.veto === veto && existingVeto === veto && existing && sameFenceFile(cached.file, existing.file))
+    return;
   committedVetoes.delete(path);
   const temporary = `${path}.${randomUUID()}.tmp`;
+  const text = JSON.stringify({ version: 1, ...durableIdentity });
   try {
     const fenceDirectory = dirname(path);
     mkdirSync(fenceDirectory, { recursive: true, mode: 0o700 });
@@ -67,9 +119,15 @@ export function writeRebootIdentityFence(id: string, identity: RebootIdentityFen
       closeSync(parent);
     }
     const fd = openSync(temporary, 'wx', 0o600);
+    let owned: FenceFile | undefined;
     try {
-      writeFileSync(fd, JSON.stringify({ version: 1, ...durableIdentity }));
+      writeFileSync(fd, text);
       fsyncSync(fd);
+      try {
+        owned = fstatSync(fd);
+      } catch {
+        // Metadata is only a cache optimization, not part of the durable write.
+      }
     } finally {
       closeSync(fd);
     }
@@ -81,8 +139,23 @@ export function writeRebootIdentityFence(id: string, identity: RebootIdentityFen
       closeSync(directory);
     }
     if (veto) {
-      if (committedVetoes.size >= 256) committedVetoes.clear();
-      committedVetoes.set(path, veto);
+      try {
+        const acknowledged = readFenceSnapshot(path);
+        if (
+          acknowledged &&
+          owned &&
+          acknowledged.file.dev === owned.dev &&
+          acknowledged.file.ino === owned.ino &&
+          acknowledged.file.size === owned.size &&
+          acknowledged.file.mtimeMs === owned.mtimeMs &&
+          acknowledged.text === text
+        ) {
+          if (committedVetoes.size >= 256) committedVetoes.clear();
+          committedVetoes.set(path, { veto, file: acknowledged.file });
+        }
+      } catch {
+        // The write was durable; inability to pin its exact inode only disables reuse.
+      }
     }
   } catch {
     throw new RebootIdentityFenceError();
@@ -98,11 +171,7 @@ export function writeRebootIdentityFence(id: string, identity: RebootIdentityFen
 /** Missing means a legacy session. Corruption always leaves restoration fenced. */
 export function readRebootIdentityFence(id: string): RebootIdentityFence | undefined {
   try {
-    const path = rebootIdentityFencePath(id);
-    if (!existsSync(path)) return undefined;
-    const info = lstatSync(path);
-    if (!info.isFile() || info.isSymbolicLink() || info.size > 1024) throw new Error('Invalid fence');
-    return parseRebootIdentityFence(readFileSync(path, 'utf8'));
+    return readFenceSnapshot(rebootIdentityFencePath(id))?.value;
   } catch {
     return { switchPending: true };
   }

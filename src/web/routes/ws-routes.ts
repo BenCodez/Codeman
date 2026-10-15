@@ -175,12 +175,20 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
         try {
           const msg = JSON.parse(String(raw));
           if (msg.t === 'i' && typeof msg.d === 'string') {
+            // Reject supplied malformed delivery tags before retaining a FIFO identity
+            // or ACKing an oversized frame. Never reinterpret them as legacy raw input.
+            if (
+              (msg.cid !== undefined &&
+                (typeof msg.cid !== 'string' || msg.cid.length === 0 || msg.cid.length > 128)) ||
+              (msg.seq !== undefined && (!Number.isSafeInteger(msg.seq) || msg.seq < 0))
+            )
+              return;
             if (msg.d.length > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame
               // unACKed and the client redelivered it every few seconds forever
               // (issue #484). A client that predates `err` reads this as a plain
               // ACK and drops the frame, which is also the right outcome.
-              if (Number.isInteger(msg.seq) && socket.readyState === 1) {
+              if (Number.isSafeInteger(msg.seq) && socket.readyState === 1) {
                 socket.send(`{"t":"ia","seq":${msg.seq as number},"err":"too_large","max":${MAX_INPUT_LENGTH}}`);
               }
               return;
@@ -190,7 +198,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             // the client can drop it from its durable queue. Frames without seq
             // (legacy/other tools) are applied as-is — no behavior change.
             const cid = typeof msg.cid === 'string' ? msg.cid : null;
-            const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
+            const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
             if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
               if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
               return;
