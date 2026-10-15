@@ -2160,6 +2160,7 @@ export class Session extends EventEmitter {
           this._resumeSessionId = pinned;
         }
       }
+      options.createSessionOptions.ownerLaunchIsCurrent = this._captureOwnerLaunchAuthority();
       this._muxSession = await mux.createSession(options.createSessionOptions);
       console.log('[Session] Created mux session:', this._muxSession.muxName);
       // No extra sleep — createSession() already waits for tmux readiness
@@ -2722,6 +2723,30 @@ export class Session extends EventEmitter {
     return true;
   }
 
+  /** A refused optional guard cannot revive an owner launch canceled while it was awaited. */
+  private _captureOwnerLaunchAuthority(): () => boolean {
+    const generation = this._recoveryGeneration;
+    const scope = () =>
+      JSON.stringify([
+        this.mode,
+        this.workingDir,
+        this.owner,
+        this._codexConfig,
+        this._envOverrides,
+        this._niceConfig,
+        this._model,
+        this._effort,
+        this._advisorModel,
+        this._resumeSessionId,
+        this._customModel,
+        this._muxSession?.recoveryCodexHome ?? this._recoveryCodexHome,
+        this._remote,
+        this._docker,
+      ]);
+    const captured = scope();
+    return () => !this._isStopped && !this._closing && generation === this._recoveryGeneration && scope() === captured;
+  }
+
   /**
    * Assemble the {@link RespawnPaneOptions} for this session. Single source of
    * truth shared by interactive start, shell start (via their inline copies),
@@ -2730,6 +2755,7 @@ export class Session extends EventEmitter {
    */
   private _buildRespawnPaneOptions(): import('./mux-interface.js').RespawnPaneOptions {
     const options: import('./mux-interface.js').RespawnPaneOptions = {
+      ownerLaunchIsCurrent: this._captureOwnerLaunchAuthority(),
       sessionId: this.id,
       workingDir: this.workingDir,
       mode: this.mode,

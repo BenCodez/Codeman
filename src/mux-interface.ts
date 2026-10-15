@@ -94,6 +94,8 @@ export interface MuxSessionWithStats extends MuxSession {
 
 /** Options for creating a new multiplexer session. */
 export interface CreateSessionOptions {
+  /** Current owner intent for a certified optional guard fallback; never automatic authority. */
+  ownerLaunchIsCurrent?(): boolean;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;
@@ -174,6 +176,8 @@ export interface RecoveryPaneIdentity {
 }
 
 export interface RespawnPaneOptions {
+  /** Current owner intent for a certified optional guard fallback; never automatic authority. */
+  ownerLaunchIsCurrent?(): boolean;
   /** Automatic local recovery checks authority again immediately before its worker effect. */
   recoveryDispatchGuard?: RecoveryMuxDispatchGuard;
   /** Recovery refuses a pane that became live by omitting tmux's kill-live-pane flag. Local only. */

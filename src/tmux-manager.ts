@@ -1876,6 +1876,80 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private brokerCommand(broker: CodexInputBroker): string {
     return `exec python3 ${shellescape(`${broker.directory}/broker.py`)} ${shellescape(broker.directory)} ${shellescape(broker.configurationDigest)}`;
   }
+  /** A certified no-child refusal can fall back only in the same now-dead native pane. */
+  private async fallbackOptionalBroker(
+    muxName: string,
+    brokerPid: number,
+    originalLaunch: string,
+    isCurrent: () => boolean
+  ): Promise<number | null> {
+    const deadline = performance.now() + 2_000;
+    let fields: string[] | undefined;
+    let tuple: string | undefined;
+    for (let reads = 0; reads < 50 && performance.now() < deadline; reads++) {
+      if (!isCurrent()) return null;
+      const { stdout } = await execAsync(
+        `${this.tmux()} list-panes -s -t ${shellescape(muxName)} -F '#{session_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pid}'`,
+        { timeout: Math.max(1, Math.ceil(deadline - performance.now())), maxBuffer: 16_384 }
+      );
+      if (performance.now() >= deadline) return null;
+      const row = stdout.endsWith('\n') ? stdout.slice(0, -1) : undefined;
+      if (!row || /[\r\n]/.test(row)) return null;
+      fields = row.split('|');
+      if (fields.length !== 5) return null;
+      const [sessionId, paneId, rawPid, dead, serverPid] = fields;
+      const positivePid = (value: string) => /^[1-9]\d{0,9}$/.test(value) && Number.isSafeInteger(Number(value));
+      if (
+        !/^\$(?:0|[1-9]\d{0,9})$/.test(sessionId) ||
+        !/^%(?:0|[1-9]\d{0,9})$/.test(paneId) ||
+        !positivePid(rawPid) ||
+        Number(rawPid) !== brokerPid ||
+        !/^[01]$/.test(dead) ||
+        !positivePid(serverPid)
+      )
+        return null;
+      const currentTuple = [sessionId, paneId, rawPid, serverPid].join('|');
+      if (tuple !== undefined && tuple !== currentTuple) return null;
+      tuple = currentTuple;
+      if (dead === '1') break;
+      fields = undefined;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!fields || performance.now() >= deadline) return null;
+    const [sessionId, paneId, rawPid, , serverPid] = fields;
+    const predicate = [
+      `#{==:#{session_name},${muxName}}`,
+      `#{==:#{session_id},${sessionId}}`,
+      `#{==:#{pane_id},${paneId}}`,
+      `#{==:#{pane_pid},${rawPid}}`,
+      '#{==:#{pane_dead},1}',
+      `#{==:#{pid},${serverPid}}`,
+      '#{==:#{session_windows},1}',
+      '#{==:#{window_panes},1}',
+    ].reduce((all, term) => `#{&&:${all},${term}}`);
+    const spawn = `respawn-pane -c ${TMUX_LAUNCH_CWD} -t ${shellescape(paneId)} bash -c ${shellescape(originalLaunch)}`;
+    if (!isCurrent()) return null;
+    const acknowledgement = `display-message -p -t ${shellescape(paneId)} 'CODEMAN_OPTIONAL_FALLBACK_STARTED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'`;
+    const { stdout: result } = await execAsync(
+      `${this.tmux()} if-shell -F -t ${shellescape(paneId)} ${shellescape(predicate)} ${shellescape(`${spawn} ; ${acknowledgement}`)} ${shellescape('display-message -p CODEMAN_OPTIONAL_FALLBACK_REFUSED')}`,
+      { timeout: Math.max(1, Math.ceil(deadline - performance.now())), maxBuffer: 1_024 }
+    );
+    if (performance.now() >= deadline) return null;
+    if (!isCurrent()) return null;
+    const ack = result.endsWith('\n') ? result.slice(0, -1).split('|') : [];
+    if (
+      ack.length !== 5 ||
+      ack[0] !== 'CODEMAN_OPTIONAL_FALLBACK_STARTED' ||
+      ack[1] !== sessionId ||
+      ack[2] !== paneId ||
+      ack[4] !== serverPid ||
+      !/^[1-9]\d{0,9}$/.test(ack[3]) ||
+      !Number.isSafeInteger(Number(ack[3])) ||
+      Number(ack[3]) === brokerPid
+    )
+      return null;
+    return Number(ack[3]);
+  }
   private readonly tmuxSocket = resolveConfiguredTmuxSocket();
   private statsInterval: NodeJS.Timeout | null = null;
   private mouseSyncInterval: NodeJS.Timeout | null = null;
@@ -2329,6 +2403,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       owner,
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
+    const priorRegistration = this.sessions.get(sessionId);
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
     const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
     const recoveryCodexHome = localCodex
@@ -2554,12 +2629,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         throw new Error('Failed to get tmux pane PID');
       }
 
+      let activeBroker = inputBroker;
+      if (inputBroker && (await inputBroker.startupReceipt(pid)) === 'not-sent') {
+        const fallbackPid = await this.fallbackOptionalBroker(
+          muxName,
+          pid,
+          originalLaunch,
+          () =>
+            this.sessions.get(sessionId) === priorRegistration &&
+            (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true)
+        );
+        if (!fallbackPid) throw new Error('Optional input guard refusal could not safely fall back');
+        pid = fallbackPid;
+        activeBroker = undefined;
+      }
       const session: MuxSession = {
         sessionId,
         muxName,
         pid,
         recoveryCodexHome,
-        recoveryInputBroker: inputBroker?.incarnation,
+        recoveryInputBroker: activeBroker?.incarnation,
         recoveryIsolated:
           !remote &&
           !docker &&
@@ -2574,10 +2663,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         attached: false,
         name,
       };
-      if (inputBroker) {
-        this.inputBrokers.set(sessionId, inputBroker);
-        await inputBroker.startupReceipt(pid);
-      }
+      if (activeBroker) this.inputBrokers.set(sessionId, activeBroker);
 
       this.sessions.set(sessionId, session);
       this.saveSessions();
@@ -2861,11 +2947,36 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // poll also invalidates any read already in flight, which would otherwise
       // write the old death back over the pane that just replaced it.
       this.clearPaneExit(muxName);
-      const pid = this.getPanePid(muxName);
+      let pid = this.getPanePid(muxName);
+      let activeBroker = inputBroker;
+      // A native dispatch may already have started this incarnation. Retain it
+      // before awaiting the receipt so a lost reply cannot restore old authority.
+      if (pid && inputBroker) {
+        session.pid = pid;
+        session.recoveryInputBroker = inputBroker.incarnation;
+        this.inputBrokers.set(sessionId, inputBroker);
+        this.saveSessions();
+      }
+      if (pid && inputBroker && !guard && !options.onlyIfDead) {
+        if ((await inputBroker.startupReceipt(pid)) === 'not-sent') {
+          if (this.sessions.get(sessionId) !== session) return null;
+          const fallbackPid = await this.fallbackOptionalBroker(
+            muxName,
+            pid,
+            originalLaunch,
+            () =>
+              this.sessions.get(sessionId) === session &&
+              (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true)
+          );
+          if (!fallbackPid || this.sessions.get(sessionId) !== session) return null;
+          pid = fallbackPid;
+          activeBroker = undefined;
+        }
+      }
       if (pid) {
         session.pid = pid;
-        session.recoveryInputBroker = inputBroker?.incarnation;
-        if (inputBroker) this.inputBrokers.set(sessionId, inputBroker);
+        session.recoveryInputBroker = activeBroker?.incarnation;
+        if (activeBroker) this.inputBrokers.set(sessionId, activeBroker);
         else this.inputBrokers.delete(sessionId);
         session.recoveryCodexHome = recoveryCodexHome;
         session.recoveryIsolated =
