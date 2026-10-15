@@ -213,4 +213,94 @@ describe('Session Options responsive layout in Chromium', () => {
       expect(await rows.count()).toBe(0);
     }
   );
+  it.each([390, 1280])(
+    'preserves focused task drafts after failed saves and allows exact retry at %spx',
+    async (width) => {
+      await page.close();
+      page = await browser.newPage();
+      await renderAt(width);
+      await page.addScriptTag({ content: 'window.CodemanApp = class {};' });
+      for (const file of ['api-client.js', 'recovery-ui.js', 'supervision-ui.js'])
+        await page.addScriptTag({ content: readFileSync(resolve(publicDir, file), 'utf8') });
+      await page.evaluate(async () => {
+        const w = window as any;
+        document.getElementById('context-tab')!.classList.add('hidden');
+        document.getElementById('task-tab')!.classList.remove('hidden');
+        w.__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
+        w.app = new w.CodemanApp();
+        w.app.sessions = new Map([['a', { mode: 'codex' }]]);
+        w.app.editingSessionId = 'a';
+        w.app.showToast = (message: string) => (w.lastTaskError = message);
+        w.taskState = {
+          version: 1,
+          objective: 'Stored objective',
+          criteria: [
+            { id: 'exact', kind: 'command', description: 'Existing label', command: 'old command', verified: false },
+          ],
+          config: { enabled: false, maxContinuations: 3, maxRuntimeMs: 900000 },
+          phase: 'disabled',
+          outcome: 'unknown',
+          reason: 'disabled',
+          continuations: 0,
+          checkpoint: '',
+          nextAction: '',
+          history: [],
+        };
+        w.taskRequests = [];
+        w.taskFailure = true;
+        w.fetch = async (_url: string, options?: { method?: string; body?: string }) => {
+          if (options?.method !== 'GET') {
+            w.taskRequests.push(JSON.parse(options!.body!));
+            if (w.taskFailure) return new Response(JSON.stringify({ success: false }), { status: 500 });
+          }
+          return new Response(JSON.stringify({ success: true, data: w.taskState }), { status: 200 });
+        };
+        w.app.openTaskOptions('a');
+        await w.app.loadTaskStatus();
+      });
+      const command = page.locator('#taskCriteriaRows [data-task-field="command"]');
+      await page.locator('#taskObjective').fill('Draft objective');
+      await command.fill('  printf "界"\nnext line  ');
+      await page.locator('#taskCheckpoint').fill('Draft checkpoint');
+      await page.locator('#taskNextAction').fill('Draft next action');
+      await page.locator('#taskProgressOutcome').selectOption('blocked');
+      await page.locator('#taskCriteriaEvidence input').check();
+      for (const action of ['saveTaskConfiguration', 'saveTaskProgress']) {
+        await command.focus();
+        await command.evaluate((node) => (node as HTMLTextAreaElement).setSelectionRange(2, 5));
+        const retained = await page.evaluate(async (method) => {
+          const app = (window as any).app,
+            input = document.activeElement,
+            state = app._taskView.state;
+          await app[method]();
+          const textarea = input as HTMLTextAreaElement;
+          return {
+            sameNode: input?.isConnected && document.activeElement === input,
+            sameState: app._taskView.state === state,
+            selection: [textarea.selectionStart, textarea.selectionEnd],
+            dirty: app._taskView.dirty,
+            busy: app._taskView.busy,
+          };
+        }, action);
+        expect(retained).toEqual({ sameNode: true, sameState: true, selection: [2, 5], dirty: true, busy: false });
+        expect(await page.locator('#taskObjective').inputValue()).toBe('Draft objective');
+        expect(await command.inputValue()).toBe('  printf "界"\nnext line  ');
+        expect(await page.locator('#taskCheckpoint').inputValue()).toBe('Draft checkpoint');
+        expect(await page.locator('#taskNextAction').inputValue()).toBe('Draft next action');
+        expect(await page.locator('#taskCriteriaEvidence input').isChecked()).toBe(true);
+        expect(await page.locator('#taskSettings').isEnabled()).toBe(true);
+        expect(await page.evaluate(() => (window as any).lastTaskError)).toContain('Task action failed');
+      }
+      await page.evaluate(async () => {
+        const w = window as any;
+        w.taskFailure = false;
+        await w.app.saveTaskProgress();
+      });
+      const requests = await page.evaluate(() => (window as any).taskRequests);
+      expect(requests[2]).toEqual(requests[1]);
+      expect(await page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
+      expect(await page.locator('#taskObjective').inputValue()).toBe('Stored objective');
+      await page.evaluate(() => (window as any).app.closeTaskOptions());
+    }
+  );
 });

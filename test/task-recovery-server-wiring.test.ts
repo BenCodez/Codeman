@@ -106,6 +106,21 @@ afterAll(async () => {
 });
 
 describe('task and recovery server action wiring', () => {
+  it.each([
+    ['local', {}, true],
+    ['docker', { docker: { containerId: 'fixture' } }, false],
+    ['owned SSH', { remote: { owned: true, host: 'fixture.invalid', remotePath: '/fixture' } }, false],
+    ['unowned SSH', { remote: { owned: false, host: 'fixture.invalid', remotePath: '/fixture' } }, false],
+  ] as const)('does not create unsupported layer3 task workflows for %s', (_kind, location, supported) => {
+    const id = `task-location-${_kind.replaceAll(' ', '-')}`;
+    ids.add(id);
+    const session = new Session({ id, mode: 'codex', workingDir: process.cwd(), useMux: false, ...location });
+    internals.sessions.set(id, session);
+    const controller = internals.getTaskController(session);
+    expect(controller !== undefined).toBe(supported);
+    if (!supported) expect(internals.taskStore.get(id)).toEqual(initialTaskState());
+  });
+
   it.each([false, true])(
     'forwards delegated configuration authority to the real journal (current=%s)',
     async (currentAtCommit) => {

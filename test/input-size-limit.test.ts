@@ -21,7 +21,12 @@ import { SessionInputWithLimitSchema } from '../src/web/schemas.js';
 const pub = (f: string) => readFileSync(resolve(import.meta.dirname, '../src/web/public', f), 'utf8');
 const appSource = pub('app.js');
 
-type InputLimit = { FRAME_MAX_CHARS: number; PASTE_MAX_CHARS: number; split: (d: string, max?: number) => string[] };
+type InputLimit = {
+  FRAME_MAX_CHARS: number;
+  PASTE_MAX_CHARS: number;
+  bytes: (d: string) => number;
+  split: (d: string, max?: number) => string[];
+};
 
 function loadLimit(): InputLimit {
   const context = vm.createContext({ window: {}, globalThis: {} });
@@ -63,6 +68,14 @@ describe('splitInputFrames', () => {
     expect(frames.join('')).toBe(paste);
   });
 
+  it.each(['🧭', '€', 'é', 'a'])('splits %s by exact UTF-8 bytes without changing a paste', (char) => {
+    const paste = char.repeat(MAX_INPUT_LENGTH) + '\r';
+    const frames = split(paste);
+    expect(frames.join('')).toBe(paste);
+    for (const frame of frames) expect(Buffer.byteLength(frame)).toBeLessThanOrEqual(MAX_INPUT_LENGTH);
+    expect(Buffer.byteLength(frames[0])).toBeGreaterThan(MAX_INPUT_LENGTH - 4);
+  });
+
   it('never cuts a surrogate pair in half', () => {
     const paste = 'a' + '😀'.repeat(10); // pairs start at odd offsets
     const frames = split(paste, 4);
@@ -84,8 +97,34 @@ describe('the client never queues or keeps an undeliverable frame', () => {
 
   it('splits an oversized paste, and refuses an oversized mux write or giant paste with a toast', () => {
     expect(sendAsync).toContain('limit.split(input)');
-    expect(sendAsync).toMatch(/useMux \|\| input\.length > limit\.PASTE_MAX_CHARS/);
+    expect(sendAsync).toMatch(/useMux \|\| inputBytes > limit\.PASTE_MAX_CHARS/);
     expect(sendAsync).toContain('showToast');
+  });
+
+  it('actual browser admission splits a multibyte paste but refuses a line-oriented oversized mux request', () => {
+    const method = sendAsync.slice(0, sendAsync.indexOf('\n  }') + 4);
+    const limit = loadLimit();
+    const sent: [string, string, boolean][] = [],
+      refused: unknown[] = [];
+    const context = vm.createContext({ window: { CodemanInputLimit: limit } });
+    const send = vm.runInContext(`({${method}})._sendInputAsync`, context) as (
+      sid: string,
+      data: string,
+      options?: object
+    ) => void;
+    const app = {
+      _reliableSend: (...args: [string, string, boolean]) => sent.push(args),
+      showToast: (...args: unknown[]) => refused.push(args),
+    };
+    const paste = '🧭'.repeat(16_385);
+    send.call(app, 'session', paste);
+    expect(sent).toHaveLength(2);
+    expect(sent.map((frame) => frame[1]).join('')).toBe(paste);
+    expect(sent.every((frame) => Buffer.byteLength(frame[1]) <= MAX_INPUT_LENGTH && frame[2] === false)).toBe(true);
+    sent.length = 0;
+    send.call(app, 'session', paste, { useMux: true });
+    expect(sent).toEqual([]);
+    expect(refused).toHaveLength(1);
   });
 
   it('drops a POST the server refused as invalid instead of retrying it forever', () => {

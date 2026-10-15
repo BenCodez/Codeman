@@ -184,7 +184,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               (msg.seq !== undefined && (!Number.isSafeInteger(msg.seq) || msg.seq < 0))
             )
               return;
-            if (msg.d.length > MAX_INPUT_LENGTH) {
+            if (Buffer.byteLength(msg.d, 'utf8') > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame
               // unACKed and the client redelivered it every few seconds forever
               // (issue #484). A client that predates `err` reads this as a plain

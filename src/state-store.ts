@@ -78,6 +78,9 @@ const SAVE_DEBOUNCE_MS = 500;
  */
 /** Maximum consecutive save failures before circuit breaker opens */
 const MAX_CONSECUTIVE_FAILURES = 3;
+const MAX_REBOOT_SNAPSHOT_ATTEMPTS = 3;
+/** Only a verified concurrent snapshot change permits restaging, never an I/O error. */
+class RebootSnapshotChanged extends Error {}
 
 export class StateStore {
   private state: AppState;
@@ -242,6 +245,39 @@ export class StateStore {
     session: AppState['sessions'][string] | (() => AppState['sessions'][string]),
     isCurrent: () => boolean
   ): Promise<void> {
+    const originalState = this.state;
+    const originalSession = this.state.sessions[id];
+    const originalSessionJson = JSON.stringify(originalSession);
+    const currentRecord = () => (typeof session === 'function' ? session() : session);
+    const recordJson = JSON.stringify(currentRecord());
+    const current = () =>
+      isCurrent() === true &&
+      this.state === originalState &&
+      this.state.sessions[id] === originalSession &&
+      JSON.stringify(originalSession) === originalSessionJson &&
+      JSON.stringify(currentRecord()) === recordJson;
+    // Keep one save lease across a bounded number of restages. Ordinary writers
+    // cannot overtake the restore, while unrelated owner edits remain in memory.
+    for (let attempt = 0; attempt < MAX_REBOOT_SNAPSHOT_ATTEMPTS; attempt++) {
+      try {
+        await this._persistSessionSnapshotDurably(id, session, current);
+        return;
+      } catch (error) {
+        if (
+          !(error instanceof RebootSnapshotChanged) ||
+          this.circuitBreakerOpen ||
+          attempt === MAX_REBOOT_SNAPSHOT_ATTEMPTS - 1
+        )
+          throw error;
+      }
+    }
+  }
+
+  private async _persistSessionSnapshotDurably(
+    id: string,
+    session: AppState['sessions'][string] | (() => AppState['sessions'][string]),
+    isCurrent: () => boolean
+  ): Promise<void> {
     if (this.circuitBreakerOpen) throw new Error('State persistence circuit breaker is open');
     const originalState = this.state;
     const originalSession = this.state.sessions[id];
@@ -259,6 +295,11 @@ export class StateStore {
         JSON.stringify(currentRecord()) !== recordJson
       )
         throw new Error('Reboot restoration was cancelled before durable commit');
+    };
+    const assertSnapshotCurrent = () => {
+      assertCurrent();
+      if (JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } }) !== json)
+        throw new RebootSnapshotChanged('Concurrent state edit requires a fresh durable restore snapshot');
     };
     assertCurrent();
     const temporary = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.reboot.tmp`;
@@ -371,7 +412,7 @@ export class StateStore {
         if (candidate) assertCurrent();
         await file.sync();
         if (candidate) {
-          assertCurrent();
+          assertSnapshotCurrent();
           const info = await file.stat();
           candidateInode = { dev: info.dev, ino: info.ino };
         }
@@ -401,7 +442,7 @@ export class StateStore {
       }
       if (!verifiedTemporary || !sameMetadata(verifiedTemporary, staged)) throw new Error('State staged file changed');
       if (candidate) {
-        assertCurrent();
+        assertSnapshotCurrent();
         commitAttempted = true;
       }
       await rename(temporary, this.filePath);
@@ -429,12 +470,13 @@ export class StateStore {
       assertCurrent();
       await write(json, true);
       await cleanupTemporary();
-      assertCurrent();
+      assertSnapshotCurrent();
       this.state.sessions[id] = record;
       this.cachedSessionJsons.clear();
       this._resetCircuitBreaker();
       published = true;
     } catch (error) {
+      let rollbackAcknowledged = !commitAttempted;
       if (commitAttempted) {
         try {
           if (!(await ownsCandidate())) throw new Error('State rollback target changed');
@@ -442,6 +484,7 @@ export class StateStore {
             await unlink(this.filePath);
             await syncDirectory();
           } else await write(previous, false);
+          rollbackAcknowledged = true;
         } catch {
           // Refuse subsequent automatic writes if the tentative bytes survived
           // or another writer replaced them; preserve that uncertainty for repair.
@@ -456,6 +499,8 @@ export class StateStore {
       }
       this.cachedSessionJsons.clear();
       this.dirty = true;
+      if (error instanceof RebootSnapshotChanged && !rollbackAcknowledged)
+        throw new Error('Concurrent state edit encountered an uncertain durable commit', { cause: error });
       throw error;
     } finally {
       if (!published) await cleanupTemporary();

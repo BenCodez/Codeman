@@ -25,7 +25,6 @@
 
 import { FastifyInstance } from 'fastify';
 import type { PrivateFileWitness } from '../../recovery/private-file-witness.js';
-import { existsSync } from 'node:fs';
 import { ApiErrorCode, createErrorResponse, getErrorMessage } from '../../types.js';
 import { RebootRestoreRequestSchema } from '../schemas.js';
 import {
@@ -57,8 +56,14 @@ import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import { STATS_COLLECTION_INTERVAL_MS } from '../../config/server-timing.js';
 import { SseEvent } from '../sse-events.js';
 import type { CodexConfig, CustomModelBookkeeping, SessionAttachmentHistoryItem } from '../../types.js';
-import { rebuildPersistedCustomModelEnv, captureCustomModelRecoveryWitness } from '../../custom-model-recovery.js';
-import { customModelConfigDir, removeConfigDir } from '../../custom-model-injection-apply.js';
+import {
+  rebuildPersistedCustomModelEnv,
+  captureCustomModelRecoveryWitness,
+  probeRecoveryDirectory,
+  removeCreatedRecoveryProfile,
+  type CreatedRecoveryProfile,
+} from '../../custom-model-recovery.js';
+import { customModelConfigDir } from '../../custom-model-injection-apply.js';
 import { readRebootIdentityFence, writeRebootIdentityFence } from '../../recovery/reboot-identity-fence.js';
 import {
   captureRebootIdentityFenceWitness,
@@ -159,7 +164,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
 
       for (const entry of restore) {
         let builtSession: Session | undefined;
-        let newlyCreatedCustomModelConfigDir: string | undefined;
+        let newlyCreatedCustomModelConfigDir: CreatedRecoveryProfile | undefined;
         let preserveCustomModelConfigDir = false;
         let restoreCompleted = false;
         let launchAcknowledged = false;
@@ -206,8 +211,16 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           continue;
         }
         // A repo can be deleted between the boot that planned this and the click.
-        if (!existsSync(entry.workingDir)) {
-          failures.push({ sessionId: entry.sessionId, reason: 'workspace-missing' });
+        const workspace = await probeRecoveryDirectory(
+          entry.workingDir,
+          () => rebootRestoreRegistry.isHeld(entry, owner),
+          true
+        );
+        if (workspace.status !== 'present') {
+          failures.push({
+            sessionId: entry.sessionId,
+            reason: workspace.status === 'absent' ? 'workspace-missing' : 'rebuild-failed',
+          });
           continue;
         }
         // Multi-user workspace separation: the create route confines a non-admin's
@@ -257,8 +270,22 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             // config file: cleanup may remove a directory this attempt created,
             // but must never recursively delete the original conversation home.
             const trustedConfigDir = customModelConfigDir(saved.id);
-            preserveCustomModelConfigDir = existsSync(trustedConfigDir);
-            if (!preserveCustomModelConfigDir) newlyCreatedCustomModelConfigDir = trustedConfigDir;
+            const initialProfileGrant = await clampRecoveryLaunchForOwner(saved.owner, {}, undefined);
+            const savedScope = JSON.stringify(saved);
+            const profileIsCurrent = () =>
+              rebootRestoreRegistry.isHeld(entry, owner) &&
+              !ctx.sessions.has(entry.sessionId) &&
+              initialProfileGrant.isCurrent() &&
+              JSON.stringify(saved) === savedScope;
+            const profileDeadline = performance.now() + 2000;
+            const directory = await probeRecoveryDirectory(trustedConfigDir, profileIsCurrent, false, profileDeadline);
+            if (directory.status === 'unknown') {
+              failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
+              continue;
+            }
+            // This attempt owns cleanup only after an acknowledged mkdir. The
+            // generic discard path must never race retained asynchronous writes.
+            preserveCustomModelConfigDir = true;
             // Re-add only values derived from the CURRENT
             // admin-owned endpoint store and the deterministic per-session config
             // directory. A privileged owner's clamp retains saved values, so a
@@ -267,7 +294,15 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               saved.mode ?? 'claude',
               saved.id,
               savedCustomModel,
-              saved.workingDir
+              saved.workingDir,
+              {
+                isCurrent: profileIsCurrent,
+                directory,
+                deadline: profileDeadline,
+                onCreated: (profile) => {
+                  newlyCreatedCustomModelConfigDir = profile;
+                },
+              }
             );
             if (!trustedCustomModelEnv) {
               failures.push({ sessionId: entry.sessionId, reason: 'rebuild-failed' });
@@ -749,7 +784,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             !builtSession?.codexRestoreWorkerMayExist &&
             !builtSession?.restoreLaunchMayExist
           ) {
-            removeConfigDir(newlyCreatedCustomModelConfigDir);
+            await removeCreatedRecoveryProfile(
+              newlyCreatedCustomModelConfigDir,
+              () => !ctx.sessions.has(entry.sessionId)
+            );
           }
         }
         unspent.delete(entry);
