@@ -11,7 +11,11 @@ import { checkPrivateFileWitnesses } from '../recovery/codex-witness-check.js';
 const MAX_FILE = 65_536;
 const issued = new WeakSet<SupervisorManagerLaunch>();
 const pending = new Set<string>();
-const same = (a: Stats, b: Stats) =>
+const pendingWork = new Map<string, Promise<unknown>>();
+const retirements = new Map<string, Promise<boolean>>();
+let retirementWork: Promise<unknown> = Promise.resolve();
+type FileIdentity = Pick<Stats, 'dev' | 'ino' | 'size' | 'mtimeMs' | 'ctimeMs'>;
+const same = (a: FileIdentity, b: FileIdentity) =>
   a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const quote = (text: string) => (/^[A-Za-z0-9_./:=@%+,-]+$/.test(text) ? text : `'${text.replace(/'/g, `'\\''`)}'`);
@@ -26,6 +30,8 @@ export interface SupervisorManagerLaunch {
   readonly missing: readonly string[];
   isCurrent(): boolean;
   confirm(): Promise<boolean>;
+  /** Revoke immediately, then remove only this invocation's verified private artifacts. */
+  revoke(): Promise<boolean>;
 }
 
 /** A restricted manager never inherits ordinary shell, patch, app, plugin or subagent tools. */
@@ -39,7 +45,6 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
   for (const feature of [
     'shell_tool',
     'apply_patch_freeform',
-    'view_image',
     'apps',
     'multi_agent',
     'plugins',
@@ -49,7 +54,16 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
     'code_mode',
   ])
     args.push('--disable', feature);
-  args.push('--config', 'web_search="disabled"', '--profile', profile.name, 'resume', profile.conversationId);
+  args.push(
+    '--config',
+    'tools.view_image=false',
+    '--config',
+    'web_search="disabled"',
+    '--profile',
+    profile.name,
+    'resume',
+    profile.conversationId
+  );
   // Unset after tmux's normal exports: neither inherited server credentials nor
   // hooks are available to this restricted process or its one trusted bridge.
   return `env -u CODEMAN_PASSWORD -u CODEMAN_USERNAME -u CODEMAN_HOOK_SECRET -u CODEMAN_HOOK_SECRET_FILE -u CODEMAN_QR_TOKEN CODEMAN_SUPERVISOR_SCOPED=1 ${args.map(quote).join(' ')}`;
@@ -77,7 +91,8 @@ export async function prepareSupervisorManagerLaunch(options: {
     resolve(home) !== home ||
     !options.isCurrent() ||
     pending.has(home) ||
-    pending.size >= 2
+    retirements.has(home) ||
+    pending.size + retirements.size >= 2
   )
     return undefined;
   const deadline = performance.now() + 2_000;
@@ -132,10 +147,12 @@ export async function prepareSupervisorManagerLaunch(options: {
       return bytes.toString('utf8');
     };
     try {
+      const homeOwned = await fs.lstat(home);
       if (
         (await fs.realpath(home)) !== home ||
         (await fs.realpath(workingDir)) !== resolve(workingDir) ||
-        !(await fs.lstat(home)).isDirectory() ||
+        !homeOwned.isDirectory() ||
+        homeOwned.isSymbolicLink() ||
         !current()
       )
         return undefined;
@@ -193,7 +210,6 @@ export async function prepareSupervisorManagerLaunch(options: {
         features: {
           shell_tool: false,
           apply_patch_freeform: false,
-          view_image: false,
           apps: false,
           multi_agent: false,
           plugins: false,
@@ -201,6 +217,7 @@ export async function prepareSupervisorManagerLaunch(options: {
           remote_plugin: false,
         },
         web_search: 'disabled',
+        tools: { view_image: false },
         mcp_servers: {
           codeman_supervisor: {
             command: options.bridgeCommand,
@@ -230,7 +247,22 @@ export async function prepareSupervisorManagerLaunch(options: {
         await directoryFd.close();
       }
       await read(file);
+      const privateOwned = await fs.lstat(privateDirectory);
+      const artifactFiles = files.filter((value) => value.path === file || value.path === credentialFile);
+      if (
+        !owned ||
+        !credentialOwned ||
+        !directoryOwned ||
+        privateOwned.dev !== directoryOwned.dev ||
+        privateOwned.ino !== directoryOwned.ino ||
+        artifactFiles.some((value) => {
+          const created = value.path === file ? owned! : credentialOwned!;
+          return value.dev !== created.dev || value.ino !== created.ino;
+        })
+      )
+        return undefined;
       let revoked = false;
+      let retirement: Promise<boolean> | undefined;
       const permanentCurrent = () => !revoked && options.isCurrent() === true;
       const result: SupervisorManagerLaunch = Object.freeze({
         expectedPane: Object.freeze({ ...options.expectedPane }),
@@ -241,8 +273,74 @@ export async function prepareSupervisorManagerLaunch(options: {
         files: Object.freeze(files.map((value) => Object.freeze(value))),
         missing: Object.freeze(missing),
         isCurrent: permanentCurrent,
+        revoke: () => {
+          revoked = true;
+          if (retirement) return retirement;
+          const limit = performance.now() + 2_000;
+          const before = Promise.allSettled([retirements.get(home) ?? pendingWork.get(home), retirementWork]);
+          const cleanup = before
+            .then(async () => {
+              const current = () => performance.now() < limit;
+              const directories = [
+                [home, homeOwned],
+                [privateDirectory, privateOwned],
+              ] as const;
+              const directoriesCurrent = async () => {
+                for (const [path, owned] of directories) {
+                  const now = await fs.lstat(path);
+                  if (!now.isDirectory() || now.isSymbolicLink() || now.dev !== owned.dev || now.ino !== owned.ino)
+                    return false;
+                }
+                return current();
+              };
+              try {
+                if (!current() || artifactFiles.length !== 2 || !(await directoriesCurrent())) return false;
+                if (!(await checkPrivateFileWitnesses(artifactFiles, limit))) return false;
+                if (!(await directoriesCurrent())) return false;
+                // All file proof descriptors have closed. Recheck both leaves in a
+                // common final scan before removing anything; replacements survive.
+                for (const witness of artifactFiles) {
+                  const now = await fs.lstat(witness.path);
+                  if (!same(now, witness) || now.isSymbolicLink() || !now.isFile()) return false;
+                }
+                if (!current()) return false;
+                for (const path of [credentialFile, file]) {
+                  if (!(await directoriesCurrent())) return false;
+                  const witness = artifactFiles.find((value) => value.path === path)!;
+                  const now = await fs.lstat(path);
+                  if (!same(now, witness) || !now.isFile() || now.isSymbolicLink() || !current()) return false;
+                  await fs.unlink(path);
+                }
+                if (!(await directoriesCurrent())) return false;
+                await fs.rmdir(privateDirectory); // Never recurse into unknown entries.
+                return current();
+              } catch {
+                return false; // Uncertain IO and foreign material remain untouched.
+              }
+            })
+            .finally(() => {
+              if (retirements.get(home) === cleanup) retirements.delete(home);
+            });
+          retirements.set(home, cleanup);
+          retirementWork = cleanup;
+          retirement = (async () => {
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            try {
+              return await Promise.race([
+                cleanup,
+                new Promise<false>((resolve) => {
+                  timer = setTimeout(() => resolve(false), Math.max(0, limit - performance.now()));
+                }),
+              ]);
+            } finally {
+              if (timer) clearTimeout(timer);
+            }
+          })();
+          return retirement;
+        },
         confirm: async () => {
-          if (!permanentCurrent() || pending.has(home) || pending.size >= 2) return false;
+          if (!permanentCurrent() || pending.has(home) || retirements.has(home) || pending.size + retirements.size >= 2)
+            return false;
           const limit = performance.now() + 2_000;
           pending.add(home);
           const verify = (async () => {
@@ -264,6 +362,10 @@ export async function prepareSupervisorManagerLaunch(options: {
               pending.delete(home);
             }
           })();
+          pendingWork.set(home, verify);
+          void verify.finally(() => {
+            if (pendingWork.get(home) === verify) pendingWork.delete(home);
+          });
           let timeout: ReturnType<typeof setTimeout> | undefined;
           try {
             const verified = await Promise.race([
@@ -278,7 +380,9 @@ export async function prepareSupervisorManagerLaunch(options: {
                 );
               }),
             ]);
-            return verified && performance.now() < limit && permanentCurrent();
+            const accepted = verified && performance.now() < limit && permanentCurrent();
+            if (!accepted) void result.revoke();
+            return accepted;
           } finally {
             if (timeout) clearTimeout(timeout);
           }
@@ -313,6 +417,10 @@ export async function prepareSupervisorManagerLaunch(options: {
       }
     }
   })();
+  pendingWork.set(home, work);
+  void work.finally(() => {
+    if (pendingWork.get(home) === work) pendingWork.delete(home);
+  });
   void work.finally(() => pending.delete(home));
   let timer: ReturnType<typeof setTimeout> | undefined;
   try {

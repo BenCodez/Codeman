@@ -389,6 +389,35 @@ describe('manager authority at the real server boundary', () => {
     );
   }
 
+  it('owner reset revokes the manager credential and launch artifacts before awaiting its journal', async () => {
+    const registry = Reflect.get(
+      server,
+      'supervisorManagerCredentials'
+    ) as import('../src/supervisor/manager-credentials.js').ManagerCredentialRegistry;
+    const credential = registry.issue({ sessionId: MANAGER, owner: 'alice', isCurrent: () => true });
+    expect(registry.resolve(credential.token)).toBeDefined();
+    const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
+    const entered = createDeferred(),
+      release = createDeferred();
+    const save = internals.supervisorStore.save.bind(internals.supervisorStore);
+    vi.spyOn(internals.supervisorStore, 'save').mockImplementation(async (...args) => {
+      entered.resolve();
+      await release.promise;
+      await save(...args);
+    });
+    const resetting = manager.reset();
+    expect(revoke).toHaveBeenCalledOnce();
+    expect(registry.resolve(credential.token)).toBeUndefined();
+    try {
+      await entered.promise;
+    } finally {
+      release.resolve();
+    }
+    await resetting;
+    expect(revoke).toHaveBeenCalledTimes(2);
+    expect(effects).not.toHaveBeenCalled();
+  });
+
   it('prepares only a verified idle manager with explicit request scope, retaining UUID and private startup evidence', async () => {
     await manager.pause();
     process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';

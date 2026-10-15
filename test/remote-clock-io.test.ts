@@ -2,6 +2,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { constants } from 'node:fs';
+import fs from 'node:fs/promises';
 import { chmod, mkdtemp, realpath, readFile, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -480,4 +482,109 @@ describe('clock sample transport separation', () => {
       await rm(temp, { recursive: true, force: true });
     }
   });
+});
+
+describe('known-unsent broker preparation cancellation', () => {
+  const rotate = (kind: 'restart' | 'restore', current: () => boolean) =>
+    (kind === 'restart' ? restartRemoteCodexPane : restoreRemoteCodexWorker)(
+      remote,
+      request(60_000, kind),
+      scopedAuthority({ check: async () => current(), isCurrent: current }),
+      options()
+    );
+  it.each(['restart', 'restore'] as const)(
+    'releases canceled %s preparations and permits retry across a fresh cache',
+    async (kind) => {
+      let current = true;
+      const canceled: Array<{ file: string; incarnation: string }> = [],
+        open = fs.open.bind(fs),
+        retained = cache.get(scope(), material.config.incarnation);
+      const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await open(...args);
+        if (
+          typeof args[0] === 'string' &&
+          args[0].endsWith('/private.json') &&
+          typeof args[1] === 'number' &&
+          args[1] & constants.O_CREAT
+        ) {
+          const file = args[0],
+            close = handle.close.bind(handle);
+          handle.close = async () => {
+            await close();
+            canceled.push({ file, incarnation: file.split('/').at(-2)! });
+            current = false; // Real durable file creation completed while prepare awaited.
+          };
+        }
+        return handle;
+      });
+      for (let attempt = 0; attempt < 3; attempt++) {
+        current = true;
+        expect(await rotate(kind, () => current)).toBe('not-sent');
+        expect(canceled).toHaveLength(attempt + 1);
+        await expect(fs.lstat(canceled[attempt].file)).rejects.toMatchObject({ code: 'ENOENT' });
+        expect(cache.get(scope(), material.config.incarnation)).toEqual(retained);
+        expect(reserve).not.toHaveBeenCalled();
+        expect(provision).not.toHaveBeenCalled();
+        expect(fixture.exec).not.toHaveBeenCalled();
+      }
+      spy.mockRestore();
+      cache = new OwnedRemoteBrokerCache(join(root, 'cache'));
+      expect(await cache.load(scope(), material.config.incarnation)).toEqual(retained);
+      for (const entry of canceled) expect(await cache.load(scope(), entry.incarnation)).toBeUndefined();
+      current = true;
+      // The mock's successful remote action deliberately lacks a new-broker receipt,
+      // so it stays uncertain; reaching provisioning proves cancellation did not wedge admission.
+      expect(await rotate(kind, () => current)).toBe('unknown');
+      expect(reserve).toHaveBeenCalledTimes(1);
+      expect(provision).toHaveBeenCalledTimes(1);
+      const pending = reserve.mock.calls[0][1];
+      expect(cache.get(scope(), pending)).toBeDefined();
+      expect((await fs.lstat(join(root, 'cache', SID, pending, 'private.json'))).isFile()).toBe(true);
+    }
+  );
+
+  it.each(['restart', 'restore'] as const)(
+    'keeps the %s pair after reservation cancellation or lost provisioning ACK',
+    async (kind) => {
+      for (const stage of ['reservation', 'provision'] as const) {
+        let current = true;
+        const prepared = cache.prepare.bind(cache);
+        let pending: string | undefined;
+        const spy = vi.spyOn(cache, 'prepare').mockImplementation(async (...args) => {
+          const result = await prepared(...args);
+          pending = result?.incarnation;
+          return result;
+        });
+        if (stage === 'reservation')
+          reserve.mockImplementationOnce(async () => {
+            current = false;
+            return true;
+          });
+        else
+          provision.mockImplementationOnce(async () => {
+            throw Error('Lost provisioning acknowledgement');
+          });
+        expect(await rotate(kind, () => current)).toBe('unknown');
+        expect(pending).toBeDefined();
+        expect(cache.get(scope(), pending!)).toBeDefined();
+        const file = join(root, 'cache', SID, pending!, 'private.json'),
+          bytes = await fs.readFile(file);
+        const restarted = new OwnedRemoteBrokerCache(join(root, 'cache'));
+        expect(await restarted.load(scope(), material.config.incarnation)).toBeDefined();
+        expect(await restarted.load(scope(), pending!)).toBeDefined();
+        const third = CodexInputBroker.provisioningMaterial(SID, 'exec another', scope().codexHome);
+        expect(
+          await restarted.prepare(scope(), third, '/fixture/private/' + SID + '/' + third.config.incarnation)
+        ).toBeUndefined();
+        expect(await fs.readFile(file)).toEqual(bytes);
+        spy.mockRestore();
+        // Each independent uncertain scenario starts from its own retained old scope.
+        cache.retire(SID);
+        await fs.rm(join(root, 'cache'), { recursive: true, force: true });
+        cache = new OwnedRemoteBrokerCache(join(root, 'cache'));
+        const old = privateProof().descriptor;
+        expect(await cache.prepare(scope(), material, old.directory)).toEqual(old);
+      }
+    }
+  );
 });

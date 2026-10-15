@@ -1000,7 +1000,7 @@ export class Session extends EventEmitter {
     this._mux = config.mux || null;
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
     this.on('recoveryUserInput', () => {
-      this._supervisorManagerProfile = undefined;
+      void this.revokeSupervisorManagerLaunch();
     });
     this._muxSession = config.muxSession || null;
     if (
@@ -2377,17 +2377,29 @@ export class Session extends EventEmitter {
    */
   async restartCli(): Promise<boolean> {
     if (this._inputDeliveryInFlight) return false;
-    this._supervisorManagerProfile = undefined;
+    await this.revokeSupervisorManagerLaunch();
     return this._withPaneLifecycle(() => this._doRestartCli());
+  }
+
+  /** Memory authority is withdrawn before any asynchronous private artifact cleanup. */
+  revokeSupervisorManagerLaunch(): Promise<void> {
+    const profile = this._supervisorManagerProfile;
+    this._supervisorManagerProfile = undefined;
+    if (profile) {
+      const prior = this._supervisorManagerRetirement;
+      this._supervisorManagerRetirement = Promise.all([prior, profile.revoke()]).then(() => {});
+    }
+    return this._supervisorManagerRetirement;
   }
 
   /** Only a newly acknowledged restricted launch can acquire the manager role. Never hydrated from state. */
   isSupervisorManagerLaunchCurrent(): boolean {
     const profile = this._supervisorManagerProfile;
     const context = this.getRecoveryContext();
-    return (
+    const profileCurrent = profile?.isCurrent() === true;
+    const current =
       !!profile &&
-      profile.isCurrent() &&
+      profileCurrent &&
       !this._closing &&
       !this._isStopped &&
       context.managed &&
@@ -2395,8 +2407,9 @@ export class Session extends EventEmitter {
       !context.switchPending &&
       !context.untrackedInput &&
       !context.inputBrokerPending &&
-      this._mux?.isSupervisorManagerLaunchCurrent?.(this.id, profile) === true
-    );
+      this._mux?.isSupervisorManagerLaunchCurrent?.(this.id, profile) === true;
+    if (profile && !profileCurrent) void this.revokeSupervisorManagerLaunch();
+    return current;
   }
 
   /** Explicit owner conversion of a separately verified idle pane; no create or fallback path. */
@@ -2440,7 +2453,7 @@ export class Session extends EventEmitter {
       options.isCurrent() !== true
     )
       return false;
-    this._supervisorManagerProfile = undefined;
+    const retirement = this.revokeSupervisorManagerLaunch();
     const scope = () =>
       JSON.stringify([
         this.owner,
@@ -2472,6 +2485,8 @@ export class Session extends EventEmitter {
         return false;
       }
     };
+    await retirement;
+    if (!current()) return false;
     profile = await prepareSupervisorManagerLaunch({
       home: context.codexHome,
       workingDir: this.workingDir,
@@ -2487,21 +2502,25 @@ export class Session extends EventEmitter {
     if (!profile) return false;
     this._supervisorManagerProfile = profile;
     if (!current()) {
-      this._supervisorManagerProfile = undefined;
+      await this.revokeSupervisorManagerLaunch();
       return false;
     }
-    const ready = await this._withPaneLifecycle(async () => {
-      if (!current() || !(await profile!.confirm()) || !current()) return false;
-      const launch = this._buildRespawnPaneOptions();
-      launch.supervisorManager = profile;
-      const priorCurrent = launch.ownerLaunchIsCurrent;
-      launch.ownerLaunchIsCurrent = () => current() && priorCurrent?.() === true;
-      const pid = await mux.respawnPane(launch);
-      if (!pid || !current() || mux.isSupervisorManagerLaunchCurrent?.(this.id, profile!) !== true) return false;
-      this.clearPaneExitForNewPane();
-      return current();
-    });
-    if (!ready && this._supervisorManagerProfile === profile) this._supervisorManagerProfile = undefined;
+    let ready = false;
+    try {
+      ready = await this._withPaneLifecycle(async () => {
+        if (!current() || !(await profile!.confirm()) || !current()) return false;
+        const launch = this._buildRespawnPaneOptions();
+        launch.supervisorManager = profile;
+        const priorCurrent = launch.ownerLaunchIsCurrent;
+        launch.ownerLaunchIsCurrent = () => current() && priorCurrent?.() === true;
+        const pid = await mux.respawnPane(launch);
+        if (!pid || !current() || mux.isSupervisorManagerLaunchCurrent?.(this.id, profile!) !== true) return false;
+        this.clearPaneExitForNewPane();
+        return current();
+      });
+    } finally {
+      if (!ready && this._supervisorManagerProfile === profile) await this.revokeSupervisorManagerLaunch();
+    }
     return ready && this.isSupervisorManagerLaunchCurrent();
   }
 
@@ -2519,6 +2538,7 @@ export class Session extends EventEmitter {
     isCurrent: () => boolean;
   };
   private _supervisorManagerProfile?: SupervisorManagerLaunch;
+  private _supervisorManagerRetirement: Promise<void> = Promise.resolve();
   private _remoteWakeReady?: () => boolean;
   private _remoteWakeReadinessWork?: Promise<boolean>;
   private _remoteWakeReadinessRevision = 0;
@@ -6774,7 +6794,7 @@ export class Session extends EventEmitter {
   private static readonly MAX_PENDING_INPUT_SEQS = 4096;
   private static readonly INPUT_DEFERRED_LEASE_MS = 60_000;
 
-  /** Reclaim only abandoned, certified-unsent tails; never erase delivery proof or sparse holes. */
+  /** Reclaim abandoned unsent input; stale sparse identities remain rejection-sealed. */
   private expireDeferredInputSeq(clientId: string, now: number): void {
     const state = this._appliedInputSeq.get(clientId);
     if (
@@ -6785,7 +6805,13 @@ export class Session extends EventEmitter {
       now - state.deferredAt < Session.INPUT_DEFERRED_LEASE_MS
     )
       return;
-    // A retained sparse hole must not trigger another full scan on each refused frame.
+    if (state.last !== undefined && [...state.waiting].some((seq) => seq <= state.last!)) {
+      // A higher committed frame prevents safely treating the lower hole as
+      // applied. Retire the entire identity instead of pinning its slot forever.
+      this._retiredInputClients.add(clientId);
+      this._appliedInputSeq.delete(clientId);
+      return;
+    }
     state.deferredAt = now;
     for (const seq of state.waiting) {
       // An earlier known-unsent hole still outranks a higher committed watermark.
@@ -6821,7 +6847,10 @@ export class Session extends EventEmitter {
   deferInputSeq(clientId: string, seq: number): boolean {
     const now = performance.now();
     let state = this._appliedInputSeq.get(clientId);
-    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) this.expireDeferredInputSeq(clientId, now);
+    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) {
+      this.expireDeferredInputSeq(clientId, now);
+      state = this._appliedInputSeq.get(clientId);
+    }
     // Active retries renew the lease without relying on adjustable wall time.
     if (state && now >= state.deferredAt) state.deferredAt = now;
     if (state && (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq))) return true;
@@ -6835,6 +6864,10 @@ export class Session extends EventEmitter {
         let idle: string | undefined;
         for (const [id, entry] of this._appliedInputSeq) {
           this.expireDeferredInputSeq(id, now);
+          if (!this._appliedInputSeq.has(id)) {
+            idle = id;
+            break;
+          }
           if (entry.waiting.size === 0 && entry.pending.size === 0) {
             if (entry.last !== undefined) this._retiredInputClients.add(id);
             idle = id;
@@ -7260,6 +7293,7 @@ export class Session extends EventEmitter {
   async stop(killMux: boolean = true): Promise<void> {
     // Set stopped flag first to prevent new timers from being created
     this._isStopped = true;
+    const managerRetirement = this.revokeSupervisorManagerLaunch();
     this._namedKeyAbort?.abort();
     // A pane that is gone is watching nothing. Nothing probes a stopped session, so
     // without this the last chip it drew would ride along on its row forever.
@@ -7350,6 +7384,7 @@ export class Session extends EventEmitter {
       console.log('[Session] Keeping mux session alive:', this._muxSession.muxName);
       this._muxSession = null; // Detach but don't kill
     }
+    await managerRetirement;
   }
 
   assignTask(taskId: string): void {

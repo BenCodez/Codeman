@@ -77,6 +77,7 @@ export interface SupervisorDependencies {
   ): Promise<boolean>;
   pauseManager(): Promise<void>;
   resetManager(): Promise<void>;
+  revokeManager?(): void;
   changed(state: SupervisorState): void;
   now?: () => number;
   inspectionTimeoutMs?: number;
@@ -274,6 +275,7 @@ export class SupervisorController {
 
   reset(): Promise<SupervisorState> {
     this.revision++;
+    this.deps.revokeManager?.();
     void this.suspendManager();
     return this.enqueue(async () => {
       const id = this.state.supervisorSessionId;

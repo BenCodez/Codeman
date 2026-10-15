@@ -2,6 +2,8 @@
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { afterEach, expect, it, vi } from 'vitest';
 import { parse } from 'smol-toml';
 import { Session } from '../src/session.js';
@@ -99,13 +101,169 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
   expect(command).toContain(`--profile ${prepared!.name} resume ${CID}`);
   expect(command).toContain('--sandbox read-only');
   expect(command).not.toContain('dangerously-bypass');
-  for (const feature of ['shell_tool', 'apply_patch_freeform', 'apps', 'multi_agent', 'plugins', 'hooks', 'view_image'])
+  for (const feature of ['shell_tool', 'apply_patch_freeform', 'apps', 'multi_agent', 'plugins', 'hooks'])
     expect(command).toContain(`--disable ${feature}`);
+  expect(command).not.toContain('--disable view_image');
+  expect(command).toContain('--config tools.view_image=false');
+  expect(parsed.tools).toEqual({ view_image: false });
   expect(command).toContain('-u CODEMAN_PASSWORD');
   expect(command).toContain('-u CODEMAN_HOOK_SECRET_FILE');
   expect(command).toContain('CODEMAN_SUPERVISOR_SCOPED=1');
   expect(command).not.toContain(TOKEN);
   expect(await fs.readFile(join(p.home, 'config.toml'), 'utf8')).toBe(base);
+});
+
+it('the emitted command passes a fake CLI with the registered feature inventory and disables the image tool separately', async () => {
+  const p = await profile();
+  const bin = join(p.root, 'bin');
+  await fs.mkdir(bin);
+  await fs.writeFile(
+    join(bin, 'codex'),
+    `#!${process.execPath}\nconst a=process.argv.slice(2);\nconst known=new Set(['shell_tool','apply_patch_freeform','apps','multi_agent','plugins','hooks','remote_plugin','skill_mcp_dependency_install','code_mode']);\nfor(let i=0;i<a.length;i++) if(a[i]==='--disable'&&!known.has(a[++i])) { console.error('Unknown feature flag: '+a[i]); process.exit(2); }\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='tools.view_image=false'))process.exit(3);\nif(!a.includes('${CID}'))process.exit(4);\n`,
+    { mode: 0o700 }
+  );
+  const command = supervisorManagerCommand(p.profile, { noDaemon: true, resumeSessionId: CID });
+  await expect(
+    promisify(execFile)('/bin/sh', ['-c', command], {
+      cwd: p.work,
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CODEX_HOME: p.home, HOME: p.root },
+      timeout: 2000,
+    })
+  ).resolves.toMatchObject({ stdout: '', stderr: '' });
+  await expect(
+    promisify(execFile)(join(bin, 'codex'), ['--disable', 'view_image'], { timeout: 2000 })
+  ).rejects.toMatchObject({ code: 2 });
+});
+
+it('revokes immediately and retires exactly the issued profile and credential directory, retaining owner files', async () => {
+  const p = await profile();
+  const ownerFile = join(p.home, 'owner.txt');
+  await fs.writeFile(ownerFile, 'owner configuration');
+  expect(await p.profile.confirm()).toBe(true);
+  const retiring = p.profile.revoke();
+  expect(p.profile.isCurrent()).toBe(false);
+  expect(await retiring).toBe(true);
+  expect(await p.profile.revoke()).toBe(true);
+  expect(await fs.readdir(p.home)).toEqual(['owner.txt']);
+  expect(await fs.readFile(ownerFile, 'utf8')).toBe('owner configuration');
+});
+
+it.each(['profile-replacement', 'credential-symlink', 'directory-replacement'] as const)(
+  'preserves unknown artifacts on %s instead of unlinking foreign material',
+  async (kind) => {
+    const p = await profile();
+    const privateDir = join(p.home, `.${p.profile.name}`),
+      credential = join(privateDir, 'credential.json');
+    const profileBytes = await fs.readFile(p.profile.file),
+      credentialBytes = await fs.readFile(credential);
+    if (kind === 'profile-replacement') {
+      await fs.rename(p.profile.file, p.profile.file + '.original');
+      await fs.writeFile(p.profile.file, profileBytes, { mode: 0o600 });
+    } else if (kind === 'credential-symlink') {
+      const foreign = join(p.home, 'foreign.json');
+      await fs.writeFile(foreign, credentialBytes, { mode: 0o600 });
+      await fs.unlink(credential);
+      await fs.symlink(foreign, credential);
+    } else {
+      await fs.rename(privateDir, privateDir + '.original');
+      await fs.mkdir(privateDir, { mode: 0o700 });
+      await fs.writeFile(credential, credentialBytes, { mode: 0o600 });
+    }
+    expect(await p.profile.revoke()).toBe(false);
+    expect(p.profile.isCurrent()).toBe(false);
+    expect(await fs.readFile(p.profile.file)).toEqual(profileBytes);
+    expect(await fs.readFile(credential)).toEqual(credentialBytes);
+    if (kind === 'credential-symlink') expect((await fs.lstat(credential)).isSymbolicLink()).toBe(true);
+  }
+);
+
+it('waits for an actual held confirmation before cleanup and never lends the revoked profile again', async () => {
+  const p = await profile(),
+    entered = createDeferred(),
+    release = createDeferred();
+  const original = fs.open.bind(fs);
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const fd = await original(...args);
+    if (String(args[0]) === p.profile.file) {
+      const close = fd.close.bind(fd);
+      vi.spyOn(fd, 'close').mockImplementation(async () => {
+        entered.resolve();
+        await release.promise;
+        await close();
+      });
+    }
+    return fd;
+  });
+  const confirm = p.profile.confirm();
+  await entered.promise;
+  const unlink = vi.spyOn(fs, 'unlink');
+  const retiring = p.profile.revoke();
+  expect(p.profile.isCurrent()).toBe(false);
+  expect(unlink).not.toHaveBeenCalled();
+  release.resolve();
+  expect(await confirm).toBe(false);
+  expect(await retiring).toBe(true);
+  expect(await fs.readdir(p.home)).toEqual([]);
+});
+
+it('leaves unexpected private-directory entries untouched without recursive deletion', async () => {
+  const p = await profile();
+  const directory = join(p.home, `.${p.profile.name}`),
+    foreign = join(directory, 'owner-file');
+  await fs.writeFile(foreign, 'keep');
+  expect(await p.profile.revoke()).toBe(false);
+  expect(await fs.readFile(foreign, 'utf8')).toBe('keep');
+  expect(await fs.readdir(directory)).toEqual(['owner-file']);
+  await expect(fs.lstat(p.profile.file)).rejects.toMatchObject({ code: 'ENOENT' });
+});
+
+it('bounds a held cleanup, retains its actual-work fence, and preserves artifacts after deadline expiry', async () => {
+  const p = await profile(),
+    entered = createDeferred(),
+    release = createDeferred(),
+    completed = createDeferred();
+  const original = fs.lstat.bind(fs);
+  const now = performance.now();
+  vi.spyOn(performance, 'now').mockReturnValue(now);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  let held = false;
+  vi.spyOn(fs, 'lstat').mockImplementation(async (...args) => {
+    if (String(args[0]) === p.home && !held) {
+      held = true;
+      entered.resolve();
+      await release.promise;
+      const value = await original(...args);
+      completed.resolve();
+      return value;
+    }
+    return original(...args);
+  });
+  const retiring = p.profile.revoke();
+  try {
+    await entered.promise;
+    vi.mocked(performance.now).mockReturnValue(now + 2001);
+    await vi.advanceTimersByTimeAsync(2001);
+    expect(await retiring).toBe(false);
+    expect(
+      await prepareSupervisorManagerLaunch({
+        home: p.home,
+        workingDir: p.work,
+        expectedPane: { paneId: '%7', panePid: 600 },
+        conversationId: CID,
+        token: TOKEN,
+        endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp',
+        bridgeCommand: 'codeman',
+        bridgeArgs: [],
+        isCurrent: () => true,
+      })
+    ).toBeUndefined();
+  } finally {
+    release.resolve();
+    await completed.promise;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    vi.useRealTimers();
+  }
+  expect(await fs.readFile(p.profile.file, 'utf8')).toContain('[mcp_servers.codeman_supervisor]');
 });
 
 it.each(['mcp_servers', 'plugins', 'apps', 'hooks', 'notify', 'profiles', 'profile'])(
@@ -136,6 +294,7 @@ it('refuses project configuration and a catalog that appears after the initial p
   await fs.mkdir(join(p.work, '.codex'));
   await fs.writeFile(join(p.work, '.codex', 'config.toml'), '[mcp_servers.extra]\ncommand="untrusted"\n');
   expect(await p.profile.confirm()).toBe(false);
+  await p.profile.revoke();
   expect(
     await prepareSupervisorManagerLaunch({
       home: p.home,
@@ -156,6 +315,7 @@ it('rejects same-byte profile replacement instead of authorizing its inode', asy
   await fs.rename(p.profile.file, p.profile.file + '.old');
   await fs.writeFile(p.profile.file, bytes, { mode: 0o600 });
   expect(await p.profile.confirm()).toBe(false);
+  await p.profile.revoke();
 });
 
 async function fixture() {
@@ -225,13 +385,46 @@ it('ordinary restored Session cannot adopt a manager role; exact acknowledged re
   f.session.trackUserInput('Owner takes over\r');
   await Reflect.get(f.session, '_recoveryFencePublication');
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
+  await f.session.revokeSupervisorManagerLaunch();
+  expect(await fs.readdir(f.home)).toEqual([]);
 });
+
+it('retires an older conversion before issuing the replacement and retains the new exact artifacts', async () => {
+  const f = await fixture();
+  expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+  const prior = Reflect.get(f.session, '_supervisorManagerProfile') as SupervisorManagerLaunch;
+  expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+  const next = Reflect.get(f.session, '_supervisorManagerProfile') as SupervisorManagerLaunch;
+  expect(next).not.toBe(prior);
+  expect(prior.isCurrent()).toBe(false);
+  await expect(fs.lstat(prior.file)).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await next.confirm()).toBe(true);
+  expect(await fs.readdir(f.home)).toEqual([`.${next.name}`, `${next.name}.config.toml`].sort());
+});
+
+it.each(['stop', 'restart'] as const)(
+  'retires the private artifacts on ordinary %s without starting a manager',
+  async (kind) => {
+    const f = await fixture();
+    expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+    f.respawn.mockClear();
+    if (kind === 'stop') await f.session.stop(false);
+    else {
+      vi.spyOn(f.session as unknown as { _doRestartCli(): Promise<boolean> }, '_doRestartCli').mockResolvedValue(false);
+      expect(await f.session.restartCli()).toBe(false);
+    }
+    expect(f.respawn).not.toHaveBeenCalled();
+    expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
+    expect(await fs.readdir(f.home)).toEqual([]);
+  }
+);
 it.each(['refused', 'unknown'] as const)('never creates a new worker after %s conversion receipt', async () => {
   const f = await fixture();
   f.respawn.mockResolvedValue(null);
   expect(await f.session.prepareSupervisorManager(f.options)).toBe(false);
   expect(f.respawn).toHaveBeenCalledOnce();
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
+  expect(await fs.readdir(f.home)).toEqual([]);
 });
 it('revocation while private profile sync is held prevents native restart', async () => {
   const f = await fixture(),
