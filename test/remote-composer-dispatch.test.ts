@@ -13,17 +13,17 @@ describe('remote automatic input retains exact live composer authority', () => {
     }
   );
 
-  it('accepts the recognized placeholder without treating it as an owner draft', async () => {
+  it('refuses ambiguous placeholder text even when the initial screen hash matches', async () => {
     const result = await fixture('input', 'none', false, {
       initialScreen: `› Ask Codex to do anything\n${footer}`,
       prompt: 'Authorized continuation',
     });
-    expect(result.status).toBe('sent');
-    expect(result.commands?.at(-1)).toEqual(['send-keys', '-t', '%7', 'Enter']);
+    expect(result).toMatchObject({ status: 'not-sent', effects: '', commands: [] });
   });
 
   it.each([
     `› Unsent owner draft\n${footer}`,
+    `› Ask Codex to do anything\n${footer}`,
     `›\n  Multiline owner draft\n${footer}`,
     `Working (esc to interrupt)\n${REMOTE_READY_SCREEN}`,
     `Would you like to approve this?\n${REMOTE_READY_SCREEN}`,
@@ -49,6 +49,22 @@ describe('remote automatic input retains exact live composer authority', () => {
       expect(result.status).toBe('unknown');
       expect(result.commands).toHaveLength(1);
       expect(result.commands?.[0].slice(0, 4)).toEqual(['send-keys', '-l', '-t', '%7']);
+      expect(result.commands?.[0][4]).toBe(composerAt === 'after-first-chunk' ? '😀'.repeat(2048) : prompt);
+      expect(result.effects).not.toContain('Enter');
+    }
+  );
+
+  it.each(['after-first-chunk', 'before-enter'] as const)(
+    'never overwrites a literal placeholder draft %s after its own first bytes',
+    async (composerAt) => {
+      const prompt = composerAt === 'after-first-chunk' ? '😀'.repeat(4096) : 'Authorized continuation';
+      const result = await fixture('input', 'none', false, {
+        composerAt,
+        composerScreen: `› Ask Codex to do anything\n${footer}`,
+        prompt,
+      });
+      expect(result.status).toBe('unknown');
+      expect(result.commands).toHaveLength(1);
       expect(result.commands?.[0][4]).toBe(composerAt === 'after-first-chunk' ? '😀'.repeat(2048) : prompt);
       expect(result.effects).not.toContain('Enter');
     }
@@ -84,6 +100,7 @@ describe('remote automatic input retains exact live composer authority', () => {
   it.each(
     [
       'Healthy café 🧭 漢字',
+      'Ask Codex to do anything',
       JSON.stringify({ objective: 'First line\nSecond line', checkpoint: 'Step\nNext step' }),
       "Quoted ' \\ ; $HOME #{pane_pid}\n\t\r\u001b\u007f 😀",
       'Authentication failed',

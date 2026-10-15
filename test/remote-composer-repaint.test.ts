@@ -6,6 +6,11 @@ describe('remote composer repaint admission', () => {
   it.each([
     { label: 'single paste', prompt: 'Authorized café 🧭 continuation', prefix: '' },
     { label: 'partial Unicode repaint', prompt: 'Authorized café 🧭 continuation', prefix: 'Authorized café ' },
+    {
+      label: 'known literal placeholder text after an empty composer',
+      prompt: 'Ask Codex to do anything',
+      prefix: 'Ask Codex ',
+    },
     { label: 'every chunk', prompt: '😀'.repeat(4096), prefix: '' },
     { label: 'full 64KiB Unicode before Enter', prompt: '😀'.repeat(16384), prefix: '', repaintAt: 'final' as const },
   ])('waits for exact own cumulative text after $label without replay', async ({ prompt, prefix, repaintAt }) => {
@@ -29,15 +34,11 @@ describe('remote composer repaint admission', () => {
     );
   });
 
-  it('waits for the original observed placeholder to repaint without treating a new one as its own prefix', async () => {
+  it('preserves ambiguous placeholder text initially and after a known literal starts repainting', async () => {
     const prompt = 'Authorized continuation';
     const initialScreen = '› Ask Codex to do anything\n  fixture-model default · /fixture/work\n';
-    const healthy = await fixture('input', 'none', false, { prompt, initialScreen, repaintCaptures: 2 });
-    expect(healthy.status).toBe('sent');
-    expect(healthy.commands).toEqual([
-      ['send-keys', '-l', '-t', '%7', prompt],
-      ['send-keys', '-t', '%7', 'Enter'],
-    ]);
+    const initial = await fixture('input', 'none', false, { prompt, initialScreen, repaintCaptures: 2 });
+    expect(initial).toMatchObject({ status: 'not-sent', effects: '', commands: [] });
     const foreign = await fixture('input', 'none', false, {
       prompt,
       repaintCaptures: 2,

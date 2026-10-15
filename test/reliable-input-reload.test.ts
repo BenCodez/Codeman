@@ -548,4 +548,33 @@ describe('non-deduplicated newline boundaries survive as refusal barriers', () =
     expect(app._pendingDeliveries.size).toBe(0);
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
   });
+
+  it('persists certified-unsent teardown cancellation before reload without releasing dependent text', async () => {
+    const h = harness();
+    const app = h.load();
+    const owner = {};
+    const requests: string[] = [];
+    h.transport(
+      vi.fn(async (url) => {
+        requests.push(String(url));
+        return String(url).endsWith('/send-key')
+          ? new Response(JSON.stringify({ success: false, retryable: true, notSent: true }), { status: 422 })
+          : new Response('{}', { status: 200 });
+      })
+    );
+    app._sendNamedKey(session, 'C-Enter', owner);
+    app._sendInputAsync(session, 'dependent');
+    await settle(app);
+    expect(app._pendingDeliveries.get(session)?.map((rec) => rec.key || rec.data)).toEqual(['C-Enter', 'dependent']);
+    app._cancelPendingKeys(owner);
+    await settle(app);
+    const restored = h.load();
+    restored._drainSession(session);
+    await settle(restored);
+    expect(requests).toEqual([`/api/sessions/${session}/send-key`]);
+    expect(app._pendingDeliveries.size).toBe(0);
+    expect(restored._pendingDeliveries.size).toBe(0);
+    expect(restored._seqCounters.get(session)).toBe(2);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
+  });
 });

@@ -109,6 +109,8 @@ afterAll(() => {
 
 function nativeOutput(command: string): string {
   if (command.includes(' new-session ')) return '$1|%7|99999|88\n';
+  if (command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED'))
+    return 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|$1|%7|99999|88\n';
   if (command.includes('respawn-pane ') || command.includes('kill-pane ')) return '';
   return '99999\n';
 }
@@ -167,7 +169,7 @@ function healthyGuard(): CodexRestoreLaunchGuard {
 }
 
 describe('native uncertain Codex reboot ownership', () => {
-  it.each(['before-dispatch', 'no-child-receipt', 'unproven-creation'] as const)(
+  it.each(['before-dispatch', 'no-child-receipt', 'unproven-creation', 'create-ack-lost'] as const)(
     'the actual restore route preserves history and inspection after uncertain native cleanup: %s',
     async (phase) => {
       const { manager, home, getBroker } = fixture();
@@ -208,6 +210,7 @@ describe('native uncertain Codex reboot ownership', () => {
           return 'not-sent';
         });
       effects.sync.mockImplementation((command: string) => {
+        if (phase === 'create-ack-lost' && command.includes(' new-session ')) throw Error('Inert pane create ACK lost');
         if (phase === 'unproven-creation' && command.includes(' new-session ')) return 'incomplete native tuple';
         if (command.includes('kill-pane ')) {
           expect(nativeCurrent).toBe(false);
@@ -1602,4 +1605,524 @@ describe('native uncertain Codex reboot ownership', () => {
     expect(effects.sync).not.toHaveBeenCalled();
     expect(effects.attach).not.toHaveBeenCalled();
   });
+});
+
+describe('non-Codex custom profile at the actual native launch boundary', () => {
+  it.each([
+    'healthy',
+    'changed-profile',
+    'cancelled',
+    'changed-session',
+    'changed-after-inert',
+    'changed-native-cleanup',
+    'worker-lost-ack',
+    'create-lost-ack',
+    'cancelled-after-launch',
+    'cancelled-lost-ack',
+    'cancel-after-commit-lost-ack',
+  ] as const)('checks the route profile after internal telemetry awaits: %s', async (kind) => {
+    const hooks = await import('../src/hooks-config.js');
+    const { writeCustomModelHosts } = await import('../src/custom-model-hosts.js');
+    const { customModelHostsPath } = await import('../src/custom-model-hosts.js');
+    const { customModelConfigDir } = await import('../src/custom-model-injection-apply.js');
+    // Each case starts without a profile, so uncertainty preservation cannot
+    // pass only because a prior case owned the directory.
+    rmSync(customModelConfigDir(ID), { recursive: true, force: true });
+    const endpoint = {
+      id: 'native-profile',
+      label: 'fixture',
+      baseUrl: 'http://127.0.0.1:12345',
+      apiKey: 'fixture-secret',
+      models: ['fixture-model'],
+    };
+    await writeCustomModelHosts(root, [endpoint]);
+    const { manager } = fixture();
+    vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+    const server = new WebServer(0, false, true);
+    servers.push(server);
+    Reflect.set(server, 'mux', manager);
+    for (const method of [
+      'startStatsCollection',
+      'startMouseModeSync',
+      'startPaneExitWatcher',
+      'startRemoteReconnectWatcher',
+      'destroy',
+    ] as const)
+      vi.spyOn(manager, method).mockImplementation(() => {});
+    const board = Reflect.get(server, 'sessions') as Map<string, SessionType>;
+    const state: SessionState = {
+      id: ID,
+      mode: 'claude',
+      pid: 1234,
+      status: 'idle',
+      workingDir: root,
+      currentTaskId: null,
+      createdAt: Date.now() - 60000,
+    };
+    Object.assign(state, {
+      __customModel: {
+        endpointId: endpoint.id,
+        modelId: 'fixture-model',
+        envKeys: [],
+        configDir: customModelConfigDir(ID),
+      },
+    });
+    rebootRestoreRegistry.set([
+      { sessionId: ID, mode: 'claude', name: 'fixture', workingDir: root, resumeConversationId: THREAD, state },
+    ]);
+    const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+    store.setSession(ID, state);
+    store.flush();
+    const historical = structuredClone(store.getSession(ID));
+    const ctx = Reflect.get(server, 'createRouteContext').call(server) as Parameters<
+      typeof registerRebootRestoreRoutes
+    >[1];
+    ctx.getWorkspaceHooksEnabled = async () => false;
+    ctx.getAgentSkillEnabled = async () => false;
+    const app = Fastify({ logger: false });
+    await app.register(fastifyCookie);
+    registerRebootRestoreRoutes(app, ctx);
+    installRouteErrorHandler(app);
+    await app.ready();
+    let entered!: () => void, release!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(hooks, 'readPlanUsageTelemetryEnabled').mockImplementation(async () => {
+      entered();
+      await held;
+      return false;
+    });
+    vi.spyOn(hooks, 'resolveStatusLineCliCommand').mockResolvedValue(undefined);
+    if (kind === 'worker-lost-ack' || kind === 'changed-native-cleanup' || kind === 'create-lost-ack') {
+      effects.sync.mockImplementation((command: string) => {
+        if (kind === 'create-lost-ack' && command.includes(' new-session ')) {
+          expect(command).toContain('/bin/sleep 86400');
+          throw Error('Inert native pane may exist; create ACK lost');
+        }
+        if (kind === 'changed-native-cleanup' && command.includes('kill-pane '))
+          return 'CODEMAN_REBOOT_CLEANUP_REFUSED\n';
+        if (kind === 'worker-lost-ack' && command.includes('respawn-pane ')) throw Error('Worker may have started');
+        return nativeOutput(command);
+      });
+    }
+    if (kind === 'changed-after-inert' || kind === 'changed-native-cleanup') {
+      vi.mocked(Reflect.get(manager, '_configureCliEnv')).mockImplementation(() => {
+        writeFileSync(customModelHostsPath(root), JSON.stringify([{ ...endpoint, apiKey: 'replacement-secret' }]));
+      });
+    }
+    if (kind === 'cancelled-after-launch' || kind === 'cancelled-lost-ack') {
+      const start = Session.prototype.startInteractive;
+      vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(async function () {
+        await start.call(this);
+        rebootRestoreRegistry.clear(() => true);
+        if (kind === 'cancelled-lost-ack') throw Error('Worker startup ACK lost after cancellation');
+      });
+    }
+    let committed: SessionState | undefined;
+    if (kind === 'cancel-after-commit-lost-ack') {
+      const persist = ctx.persistRebootRestoreDurably!.bind(ctx);
+      ctx.persistRebootRestoreDurably = async (...args) => {
+        await persist(...args);
+        expect(manager.getSession(ID)).not.toHaveProperty('restoreUncertain');
+        committed = structuredClone(store.getSession(ID)!);
+        rebootRestoreRegistry.clear(() => true);
+        const sync = effects.sync.getMockImplementation()!;
+        effects.sync.mockImplementation((command: string) => {
+          if (command.includes('CODEMAN_REBOOT_CANCEL_REFUSED')) {
+            expect(
+              JSON.parse(readFileSync(metadata, 'utf8')).find((entry: MuxSession) => entry.sessionId === ID)
+                .restoreUncertain
+            ).toBe(true);
+            throw Error('Native cancellation ACK lost');
+          }
+          return sync(command);
+        });
+      };
+    }
+    const complete = manager.completeAcknowledgedRebootLaunch.bind(manager);
+    vi.spyOn(manager, 'completeAcknowledgedRebootLaunch').mockImplementation(async (...args) => {
+      // The durable main-state write must precede the marker clear.
+      const persisted = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID];
+      expect(persisted.pid).toBe(board.get(ID)!.pid);
+      expect(persisted.pid).not.toBe(historical!.pid);
+      expect(args[0].restoreUncertain).toBe(true);
+      return complete(...args);
+    });
+    const sync = effects.sync.getMockImplementation()!;
+    effects.sync.mockImplementation((command: string) => {
+      if (command.includes('respawn-pane ')) {
+        const reservation = JSON.parse(readFileSync(metadata, 'utf8')).find(
+          (entry: MuxSession) => entry.sessionId === ID
+        );
+        expect(reservation).toMatchObject({ restoreUncertain: true, pid: 0 });
+        expect(reservation.codexRestoreUncertain).toBeUndefined();
+      }
+      return sync(command);
+    });
+    const legacyKill = vi.spyOn(manager, 'killSession');
+    try {
+      const pending = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+      await reached;
+      expect(effects.sync.mock.calls.some(([command]) => command.includes(' new-session '))).toBe(false);
+      if (kind === 'changed-profile')
+        await writeCustomModelHosts(root, [{ ...endpoint, apiKey: 'replacement-secret' }]);
+      if (kind === 'cancelled') rebootRestoreRegistry.clear(() => true);
+      if (kind === 'changed-session') board.get(ID)!.owner = 'different-owner';
+      release();
+      const result = (await pending).json();
+      const launched = effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '));
+      expect(launched).toHaveLength(
+        [
+          'healthy',
+          'worker-lost-ack',
+          'cancelled-after-launch',
+          'cancelled-lost-ack',
+          'cancel-after-commit-lost-ack',
+        ].includes(kind)
+          ? 1
+          : 0
+      );
+      expect(effects.attach).toHaveBeenCalledTimes(
+        ['healthy', 'cancelled-after-launch', 'cancelled-lost-ack', 'cancel-after-commit-lost-ack'].includes(kind)
+          ? 1
+          : 0
+      );
+      expect(result.restored).toHaveLength(kind === 'healthy' ? 1 : 0);
+      if (kind === 'healthy') {
+        const session = board.get(ID)!;
+        sessions.push(session);
+        expect(Reflect.get(session, '_restoreLaunchGuard')).toBeUndefined();
+        expect(session.restoreLaunchMayExist).toBe(false);
+        expect(manager.getSession(ID)).not.toHaveProperty('restoreUncertain');
+        expect(
+          JSON.parse(readFileSync(metadata, 'utf8')).find((entry: MuxSession) => entry.sessionId === ID)
+        ).not.toHaveProperty('restoreUncertain');
+        expect(launched[0][0]).toContain(`#{==:#{pane_pid},99999}`);
+        expect(launched[0][0]).toContain('--resume');
+      } else if (kind === 'cancelled-after-launch') {
+        expect(result.skipped).toEqual([{ sessionId: ID, reason: 'restore-cancelled' }]);
+        expect(legacyKill).not.toHaveBeenCalled();
+        expect(manager.getSession(ID)).toBeUndefined();
+        expect(board.has(ID)).toBe(false);
+        expect(
+          effects.sync.mock.calls.filter(([command]) => command.includes('CODEMAN_REBOOT_CANCEL_REFUSED'))
+        ).toHaveLength(1);
+      } else if (
+        kind === 'changed-native-cleanup' ||
+        kind === 'worker-lost-ack' ||
+        kind === 'create-lost-ack' ||
+        kind === 'cancelled-lost-ack' ||
+        kind === 'cancel-after-commit-lost-ack'
+      ) {
+        expect(result.skipped).toEqual([{ sessionId: ID, reason: 'restore-uncertain' }]);
+        expect(legacyKill).not.toHaveBeenCalled();
+        expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
+        expect(statSync(customModelConfigDir(ID)).isDirectory()).toBe(true);
+        expect(store.getSession(ID)).toEqual(committed ?? historical);
+        store.flush();
+        expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID]).toEqual(
+          committed ?? historical
+        );
+        if (kind === 'cancel-after-commit-lost-ack') {
+          expect(manager.getSession(ID)?.restoreUncertain).toBe(true);
+          expect(
+            JSON.parse(readFileSync(metadata, 'utf8')).find((entry: MuxSession) => entry.sessionId === ID)
+              .restoreUncertain
+          ).toBe(true);
+        }
+      } else if (kind === 'changed-after-inert') {
+        const cleanup = effects.sync.mock.calls.filter(([command]) => command.includes('kill-pane '));
+        expect(cleanup).toHaveLength(1);
+        expect(cleanup[0][0]).toContain(`#{==:#{pane_pid},99999}`);
+      }
+    } finally {
+      release();
+      await app.close();
+    }
+  });
+
+  it.each(['healthy', 'prepare-microtask', 'confirm-microtask'] as const)(
+    'rechecks pure native authority after the last asynchronous %s',
+    async (kind) => {
+      const hooks = await import('../src/hooks-config.js');
+      vi.spyOn(hooks, 'readPlanUsageTelemetryEnabled').mockResolvedValue(false);
+      vi.spyOn(hooks, 'resolveStatusLineCliCommand').mockResolvedValue(undefined);
+      const { manager } = fixture();
+      let current = true;
+      const pending = manager.createSession({
+        sessionId: ID,
+        mode: 'claude',
+        workingDir: root,
+        restoreGuard: {
+          prepare: async () => {
+            if (kind === 'prepare-microtask')
+              queueMicrotask(() => {
+                current = false;
+              });
+          },
+          confirm: async () => {
+            if (kind === 'confirm-microtask')
+              queueMicrotask(() => {
+                current = false;
+              });
+            return true;
+          },
+          isCurrent: () => current,
+        },
+      });
+      if (kind === 'healthy') await pending;
+      else await expect(pending).rejects.toThrow('authority changed');
+      expect(effects.sync.mock.calls.some(([command]) => command.includes(' new-session '))).toBe(kind === 'healthy');
+      expect(effects.sync.mock.calls.some(([command]) => command.includes('respawn-pane '))).toBe(kind === 'healthy');
+    }
+  );
+});
+
+describe('acknowledged reboot launch cancellation native scope', () => {
+  it.each([
+    'healthy',
+    'native-replaced',
+    'record-replaced',
+    'unacknowledged-clone',
+    'owner-changed',
+    'configuration-changed',
+    'malformed-marker',
+    'lost-removal-ack',
+    'changed-during-removal',
+  ] as const)('cancels only a freshly acknowledged exact worker: %s', async (kind) => {
+    const { manager } = fixture();
+    let record = await manager.createSession({
+      sessionId: ID,
+      mode: 'codex',
+      workingDir: root,
+      owner: 'fixture-owner',
+      codexConfig: config,
+      codexRestoreGuard: healthyGuard(),
+    });
+    let current = true,
+      nativeKills = 0;
+    effects.sync.mockImplementation((command: string) => {
+      if (command.includes('CODEMAN_REBOOT_CANCEL_REFUSED')) {
+        expect(command).toContain('#{==:#{pid},88}');
+        expect(command).toContain('#{==:#{session_id},$1}');
+        expect(command).toContain('#{==:#{pane_id},%7}');
+        expect(command).toContain('#{==:#{pane_pid},99999}');
+        if (kind === 'native-replaced') return 'CODEMAN_REBOOT_CANCEL_REFUSED\n';
+        nativeKills++;
+        return '';
+      }
+      return nativeOutput(command);
+    });
+    if (kind === 'record-replaced') Reflect.get(manager, 'sessions').set(ID, { ...record });
+    if (kind === 'unacknowledged-clone') {
+      record = { ...record };
+      Reflect.get(manager, 'sessions').set(ID, record);
+    }
+    if (kind === 'owner-changed') record.owner = 'other-owner';
+    if (kind === 'malformed-marker') record.restoreUncertain = null as never;
+    if (kind === 'configuration-changed') record.codexRestoreConfig = { ...config, model: 'different-model' };
+    if (kind === 'lost-removal-ack')
+      vi.spyOn(manager, 'flushSessionsDurably').mockRejectedValue(Error('Lost metadata ACK after native kill'));
+    if (kind === 'changed-during-removal')
+      vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async () => {
+        current = false;
+      });
+    const killed = await manager.cancelAcknowledgedRebootLaunch(record, () => current);
+    expect(killed).toBe(kind === 'healthy');
+    expect(nativeKills).toBe(['healthy', 'lost-removal-ack', 'changed-during-removal'].includes(kind) ? 1 : 0);
+    expect(manager.getSession(ID) === undefined).toBe(kind === 'healthy');
+    if (kind === 'lost-removal-ack' || kind === 'changed-during-removal') expect(manager.getSession(ID)).toBe(record);
+    expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
+  });
+});
+
+describe('custom-profile startup refusal ownership', () => {
+  it.each(['sole-refusal', 'replaced-guard', 'later-dispatch', 'old-cleanup-uncertain'] as const)(
+    'releases only the exact sole certified startup: %s',
+    async (kind) => {
+      const { manager } = fixture();
+      const session = new Session({ id: ID, mode: 'claude', workingDir: root, useMux: true, mux: manager });
+      sessions.push(session);
+      const cleanup = vi.fn();
+      const guard = {
+        prepare: async () => {},
+        confirm: () => true,
+        isCurrent: () => true,
+        noteCleanupUncertain: cleanup,
+      };
+      session.setRestoreLaunchGuard(guard);
+      const old = Reflect.get(session, '_restoreLaunchGuard') as import('../src/mux-interface.js').RestoreLaunchGuard;
+      if (kind !== 'old-cleanup-uncertain') old.noteDispatch!();
+      let refusal = old;
+      if (kind === 'later-dispatch') old.noteDispatch!();
+      if (kind === 'replaced-guard' || kind === 'old-cleanup-uncertain') {
+        session.setRestoreLaunchGuard(guard);
+        const replacement = Reflect.get(
+          session,
+          '_restoreLaunchGuard'
+        ) as import('../src/mux-interface.js').RestoreLaunchGuard;
+        replacement.noteDispatch!();
+        if (kind === 'old-cleanup-uncertain') {
+          old.noteCleanupUncertain!();
+          refusal = replacement;
+        }
+      }
+      refusal.noteBrokerRefusal!();
+      expect(session.restoreLaunchMayExist).toBe(kind !== 'sole-refusal');
+      expect(cleanup).not.toHaveBeenCalled();
+      expect(effects.sync).not.toHaveBeenCalled();
+    }
+  );
+});
+
+describe('durable generic restore marker completion', () => {
+  it.each(['healthy', 'unacknowledged-clone', 'lost-ack', 'scope-changed'] as const)(
+    'clears only a fully acknowledged exact private launch: %s',
+    async (kind) => {
+      const hooks = await import('../src/hooks-config.js');
+      vi.spyOn(hooks, 'readPlanUsageTelemetryEnabled').mockResolvedValue(false);
+      vi.spyOn(hooks, 'resolveStatusLineCliCommand').mockResolvedValue(undefined);
+      const { manager } = fixture();
+      let record = await manager.createSession({
+        sessionId: ID,
+        mode: 'claude',
+        workingDir: root,
+        restoreGuard: { prepare: async () => {}, confirm: () => true, isCurrent: () => true },
+      });
+      expect(JSON.parse(readFileSync(metadata, 'utf8'))[0].restoreUncertain).toBe(true);
+      if (kind === 'unacknowledged-clone') {
+        record = { ...record };
+        Reflect.get(manager, 'sessions').set(ID, record);
+      }
+      let current = true;
+      if (kind === 'lost-ack')
+        vi.spyOn(manager, 'flushSessionsDurably').mockRejectedValue(Error('Marker clear ACK lost'));
+      if (kind === 'scope-changed')
+        vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async () => {
+          current = false;
+        });
+      expect(await manager.completeAcknowledgedRebootLaunch(record, () => current)).toBe(kind === 'healthy');
+      expect(record.restoreUncertain).toBe(kind === 'healthy' ? undefined : true);
+      if (kind === 'healthy') {
+        expect(JSON.parse(readFileSync(metadata, 'utf8'))[0]).not.toHaveProperty('restoreUncertain');
+        // A late owner Dismiss still targets the acknowledged, legitimately cleared record.
+        expect(await manager.cancelAcknowledgedRebootLaunch(record, () => true)).toBe(true);
+      }
+    }
+  );
+});
+
+describe('boot inspection does not restart uncertain automation', () => {
+  it.each(['uncertain', 'discovered', 'legacy'] as const)(
+    'restores historical display but withholds launch automation and profile writes: %s',
+    async (kind) => {
+      const { manager } = fixture();
+      const record: MuxSession = {
+        sessionId: ID,
+        muxName: 'codeman-aaaaaaaa',
+        pid: 700,
+        createdAt: Date.now() - 60000,
+        workingDir: root,
+        mode: 'claude',
+        attached: false,
+        ...(kind === 'uncertain' ? { restoreUncertain: true } : {}),
+        ...(kind === 'discovered' ? { discovered: true } : {}),
+        respawnConfig: { enabled: true } as MuxSession['respawnConfig'],
+      };
+      manager.registerSession(record);
+      await manager.flushSessionsDurably();
+      vi.spyOn(manager, 'reconcileSessions').mockResolvedValue({
+        alive: kind === 'legacy' ? [ID] : [],
+        dead: [],
+        discovered: kind === 'discovered' ? [ID] : [],
+      });
+      vi.spyOn(manager, 'muxSessionExists').mockReturnValue(true);
+      vi.spyOn(manager, 'isPaneDead').mockReturnValue(false);
+      vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+      const server = new WebServer(0, false, true);
+      servers.push(server);
+      Reflect.set(server, 'mux', manager);
+      for (const method of [
+        'startStatsCollection',
+        'startMouseModeSync',
+        'startPaneExitWatcher',
+        'startRemoteReconnectWatcher',
+        'destroy',
+      ] as const)
+        vi.spyOn(manager, method).mockImplementation(() => {});
+      const profile = vi
+        .spyOn(
+          server as unknown as { _rebuildCustomModelEnv(): Promise<Record<string, string>> },
+          '_rebuildCustomModelEnv'
+        )
+        .mockResolvedValue({ ANTHROPIC_API_KEY: 'new-fixture-secret' });
+      const respawn = vi
+        .spyOn(server as unknown as { restoreRespawnController(): void }, 'restoreRespawnController')
+        .mockImplementation(() => {});
+      const resume = vi.spyOn(Session.prototype, 'restoreAutoResume').mockImplementation(() => {});
+      const { RalphTracker } = await import('../src/ralph-tracker.js');
+      const ralph = vi.spyOn(RalphTracker.prototype, 'enable').mockImplementation(() => {});
+      vi.spyOn(RalphTracker.prototype, 'startLoop').mockImplementation(() => {});
+      vi.spyOn(
+        server as unknown as { getWorkspaceHooksEnabled(): Promise<boolean> },
+        'getWorkspaceHooksEnabled'
+      ).mockResolvedValue(false);
+      const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+      const state: SessionState = {
+        id: ID,
+        mode: 'claude',
+        pid: 700,
+        status: 'idle',
+        workingDir: root,
+        currentTaskId: null,
+        createdAt: record.createdAt,
+        autoResumeEnabled: true,
+        autoResumeAt: Date.now() - 1000,
+        autoClearEnabled: true,
+        autoCompactEnabled: true,
+        ralphEnabled: true,
+        ralphAutoEnableDisabled: false,
+        inputTokens: 123,
+        totalCost: 1.25,
+        respawnEnabled: true,
+        respawnConfig: { enabled: true } as SessionState['respawnConfig'],
+      };
+      Object.assign(state, {
+        __customModel: { endpointId: 'fixture', modelId: 'fixture-model', envKeys: ['ANTHROPIC_API_KEY'] },
+      });
+      store.setSession(ID, state);
+      store.flush();
+      const historical = structuredClone(store.getSession(ID));
+      expect(await Reflect.get(server, 'restoreMuxSessions').call(server)).toBe(true);
+      const session = Reflect.get(server, 'sessions').get(ID) as SessionType;
+      sessions.push(session);
+      expect(session).toBeDefined();
+      expect(effects.attach).toHaveBeenCalledTimes(1);
+      expect(profile).toHaveBeenCalledTimes(kind === 'legacy' ? 1 : 0);
+      expect(respawn).toHaveBeenCalledTimes(kind === 'legacy' ? 2 : 0);
+      expect(resume).toHaveBeenCalledTimes(kind === 'legacy' ? 1 : 0);
+      expect(ralph).toHaveBeenCalledTimes(kind === 'legacy' ? 1 : 0);
+      if (kind !== 'legacy') expect(session.ralphTracker.autoEnableDisabled).toBe(true);
+      expect(session.toState()).toMatchObject({
+        inputTokens: 123,
+        totalCost: 1.25,
+        autoClearEnabled: kind === 'legacy',
+        autoCompactEnabled: kind === 'legacy',
+      });
+      if (kind !== 'legacy') {
+        Reflect.get(server, '_persistSessionStateNow').call(server, session);
+        expect(store.getSession(ID)).toEqual(historical);
+        expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID]).toEqual(historical);
+      }
+      expect(
+        effects.sync.mock.calls.some(
+          ([command]) => command.includes('new-session ') || command.includes('respawn-pane ')
+        )
+      ).toBe(false);
+    }
+  );
 });

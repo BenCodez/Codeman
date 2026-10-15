@@ -45,6 +45,10 @@ vi.mock('../../src/session.js', () => ({
     owner?: string;
     claudeSessionId: string | null = null;
     restoreGuard?: import('../../src/mux-interface.js').CodexRestoreLaunchGuard;
+    profileGuard?: import('../../src/mux-interface.js').RestoreLaunchGuard;
+    setRestoreLaunchGuard(guard: import('../../src/mux-interface.js').RestoreLaunchGuard | undefined) {
+      this.profileGuard = guard;
+    }
     codexRestoreWorkerMayExist = false;
     commitCodexRestoreLaunch() {
       this.codexRestoreWorkerMayExist = false;
@@ -67,6 +71,11 @@ vi.mock('../../src/session.js', () => ({
         await this.restoreGuard.prepare();
         await afterGuardPrepare?.();
         if ((await this.restoreGuard.confirm()) !== true) throw new Error('Reboot restoration authority changed');
+      }
+      if (this.profileGuard) {
+        await this.profileGuard.prepare();
+        if ((await this.profileGuard.confirm()) !== true || !this.profileGuard.isCurrent())
+          throw new Error('Custom profile authority changed');
       }
       if (startShouldThrow) throw new Error('spawn claude ENOENT');
       if (this.restoreGuard) {

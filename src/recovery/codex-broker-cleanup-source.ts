@@ -381,6 +381,34 @@ def retire(rootfd, datafd, sid, name, refs, data_path):
         if fd is not None: os.close(fd)
         os.close(sessionfd)
 
+def retire_empty_session(rootfd, datafd, sessionfd, sid, data_path):
+    # Empty containers hold no broker identity or private files. Still require
+    # the same fresh reference handshake and exact private pathname ownership.
+    try:
+        before=signature(os.fstat(sessionfd))
+        if not private(os.fstat(sessionfd),True) or namesat(sessionfd,0): return False
+        reference_files=metadata(datafd,'')
+        def current():
+            if not same_metadata(datafd,reference_files) or namesat(sessionfd,0): return False
+            parent=os.stat(sid,dir_fd=rootfd,follow_symlinks=False)
+            if not private(parent,True) or signature(parent)!=before or signature(os.fstat(sessionfd))!=before: return False
+            top=os.stat('codex-input-brokers',dir_fd=datafd,follow_symlinks=False)
+            if not private(top,True) or (top.st_dev,top.st_ino)!=(os.fstat(rootfd).st_dev,os.fstat(rootfd).st_ino): return False
+            base=os.stat(data_path,follow_symlinks=False)
+            if not stat.S_ISDIR(base.st_mode) or base.st_uid!=os.getuid() or base.st_mode & 0o022 or (base.st_dev,base.st_ino)!=(os.fstat(datafd).st_dev,os.fstat(datafd).st_ino): return False
+            check()
+            return True
+        if not current(): return False
+        print(json.dumps({'empty':sid}),flush=True)
+        check()
+        if not select.select([sys.stdin],[],[],max(0,DEADLINE-time.monotonic()))[0] or sys.stdin.readline()!='ACK\n': return False
+        if not current(): return False
+        # rmdir is non-recursive and atomically refuses a newly created child.
+        os.rmdir(sid,dir_fd=rootfd)
+        os.fsync(rootfd)
+        return True
+    except (OSError,ValueError,TypeError,KeyError): return False
+
 def main():
     if not sys.platform.startswith('linux'): return
     request=strict_json(sys.stdin.readline(2097153))
@@ -409,6 +437,7 @@ def main():
                             if scanned>512: return
                             if count>128: return
                             if child.is_dir(follow_symlinks=False): retire(rootfd,datafd,entry.name,child.name,set(refs),data)
+                    retire_empty_session(rootfd,datafd,sfd,entry.name,data)
                 finally: os.close(sfd)
     finally:
         if rootfd is not None: os.close(rootfd)

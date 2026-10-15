@@ -141,6 +141,18 @@ export async function pruneCodexInputBrokers(
         output = output.slice(at + 1);
         try {
           const value = JSON.parse(line);
+          if (Object.keys(value).join(',') === 'empty') {
+            if (
+              typeof value.empty !== 'string' ||
+              !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value.empty) ||
+              !current()
+            ) {
+              child.kill('SIGKILL');
+              return;
+            }
+            child.stdin.write('ACK\n');
+            continue;
+          }
           const [sid, inc, extra] = typeof value.ready === 'string' ? value.ready.split('/') : [];
           if (
             Object.keys(value).join(',') !== 'ready' ||

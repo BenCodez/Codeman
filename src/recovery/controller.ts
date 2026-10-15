@@ -215,10 +215,8 @@ export class RecoveryController {
         this.state.needsAttention = false;
         this.state.phase = config.enabled ? 'watching' : 'idle';
       }
-      this.event(
-        'state',
-        hadStall && config.enabled && config.detectStalls ? 'stalled' : config.enabled ? 'observing' : 'disabled'
-      );
+      // Settings neither observe new evidence nor acknowledge an existing warning.
+      if (!this.state.needsAttention) this.event('state', config.enabled ? 'observing' : 'disabled');
       await this.save();
       this.arm();
       return this.getStatus();

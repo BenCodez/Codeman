@@ -32,10 +32,11 @@
  */
 
 import { canUsernameRunPrivilegedCommands, prepareRecoveryPrivilegeGrant } from './user-store.js';
-import { enabledClis } from './config/cli-registry/registry.js';
+import { listClis } from './config/cli-registry/registry.js';
 
 /**
  * Clamp per-CLI configs at launch or recovery using the owner's CURRENT grant.
+ * Disabled entries still govern existing sessions and persisted launch settings.
  * Conditional clamps preserve safe explicit choices and never invent absent values.
  */
 export async function clampExternalCliConfigsForOwner(
@@ -49,7 +50,7 @@ function clampConfigsWithGrant(configs: Record<string, unknown>, privileged: boo
   if (privileged) return configs;
 
   const out = { ...configs };
-  for (const entry of enabledClis()) {
+  for (const entry of listClis()) {
     const field = entry.launch.legacyConfigField;
     if (!field) continue;
     // Clamp names use the registry-param namespace; the wire config may alias them
@@ -102,7 +103,7 @@ function clampConfigsWithGrant(configs: Record<string, unknown>, privileged: boo
  *   already allowlisted for pi and not addressed here — see resolveOmpHome()).
  */
 export function ownerClampedEnvKeys(): string[] {
-  return enabledClis().flatMap((entry) => entry.capabilities.privilegedEnvKeys);
+  return listClis().flatMap((entry) => entry.capabilities.privilegedEnvKeys);
 }
 
 /**

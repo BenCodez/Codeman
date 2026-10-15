@@ -162,6 +162,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         let newlyCreatedCustomModelConfigDir: string | undefined;
         let preserveCustomModelConfigDir = false;
         let restoreCompleted = false;
+        let launchAcknowledged = false;
         const discardTentativeSession = (session: Session): Promise<void> => {
           if (session.codexRestoreWorkerMayExist) {
             writeRebootIdentityFence(session.id, {
@@ -175,6 +176,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               retainForInspection: true,
             });
           }
+          if (session.restoreLaunchMayExist)
+            return ctx.discardPartiallyBuiltSession(entry.sessionId, session, {
+              preserveCustomModelConfigDir: true,
+              preserveMuxPane: true,
+            });
           return preserveCustomModelConfigDir
             ? ctx.discardPartiallyBuiltSession(entry.sessionId, session, { preserveCustomModelConfigDir: true })
             : ctx.discardPartiallyBuiltSession(entry.sessionId, session);
@@ -394,11 +400,30 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // custom-model environment and the nice priority shape the process.
           await ctx.reapplyPersistedSessionState(session, saved, 'before-spawn');
           await ctx.setupSessionListeners(session);
+          let cancellationIsCurrent = () => false;
           const discardCancelledRestore = async (): Promise<void> => {
-            await discardTentativeSession(session);
+            if (
+              launchAcknowledged &&
+              (session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist) &&
+              (await session.cancelAcknowledgedRestoreLaunch(
+                saved.owner,
+                () =>
+                  cancellationIsCurrent() && ctx.sessions.get(session.id) === session && session.owner === saved.owner
+              ))
+            ) {
+              // The exact worker is already stopped. Detach without a later
+              // ID-based kill that could target a replacement.
+              await ctx.discardPartiallyBuiltSession(entry.sessionId, session, {
+                preserveCustomModelConfigDir,
+                preserveMuxPane: true,
+              });
+            } else await discardTentativeSession(session);
             failures.push({
               sessionId: entry.sessionId,
-              reason: session.codexRestoreWorkerMayExist ? 'restore-uncertain' : 'restore-cancelled',
+              reason:
+                session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist
+                  ? 'restore-uncertain'
+                  : 'restore-cancelled',
             });
             unspent.delete(entry);
           };
@@ -458,12 +483,11 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             let granted = false;
             let grantIsCurrent = () => false;
             let grantFiles: readonly PrivateFileWitness[] = [];
-            const authorityIsCurrent = () => {
+            const launchScopeIsCurrent = () => {
               const peers = [...ctx.sessions.values()].filter((other) => other !== session);
               return (
                 granted &&
                 grantIsCurrent() === true &&
-                rebootRestoreRegistry.isHeld(entry, owner) &&
                 ctx.sessions.get(session.id) === session &&
                 session.owner === saved.owner &&
                 session.getRecoveryContext().generation === generation &&
@@ -476,6 +500,8 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
                 ).skipped.length === 0
               );
             };
+            cancellationIsCurrent = launchScopeIsCurrent;
+            const authorityIsCurrent = () => rebootRestoreRegistry.isHeld(entry, owner) && launchScopeIsCurrent();
             session.setCodexRestoreLaunchGuard({
               prepare: async () => {
                 granted = false;
@@ -503,27 +529,34 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             });
           }
           if (!usesCodexRecovery && savedCustomModel) {
-            // Non-Codex restores do not enter the Codex launch guard. Their
-            // constructor environment must still match the same current admin
-            // recipe after all asynchronous session preparation has completed.
             if (!(await customModelIsCurrent())) throw new Error('Custom model profile changed before restore');
             if (!rebootRestoreRegistry.isHeld(entry, owner)) {
               await discardCancelledRestore();
               continue;
             }
-            const peers = [...ctx.sessions.values()].filter((other) => other !== session);
-            if (
-              ctx.sessions.get(session.id) !== session ||
-              session.owner !== saved.owner ||
-              rejectAlreadyLive(
-                [entry],
-                new Set(peers.map((other) => other.id)),
-                new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
-              ).skipped.length
-            )
-              throw new Error('Restore session authority changed');
+            const launchScopeIsCurrent = () => {
+              const peers = [...ctx.sessions.values()].filter((other) => other !== session);
+              return (
+                ctx.sessions.get(session.id) === session &&
+                session.owner === saved.owner &&
+                rejectAlreadyLive(
+                  [entry],
+                  new Set(peers.map((other) => other.id)),
+                  new Set(peers.map((other) => other.claudeSessionId).filter((id): id is string => !!id))
+                ).skipped.length === 0
+              );
+            };
+            cancellationIsCurrent = launchScopeIsCurrent;
+            const authorityIsCurrent = () => rebootRestoreRegistry.isHeld(entry, owner) && launchScopeIsCurrent();
+            session.setRestoreLaunchGuard({
+              prepare: async () => {},
+              isCurrent: authorityIsCurrent,
+              confirm: async () =>
+                authorityIsCurrent() && (await customModelIsCurrent()) === true && authorityIsCurrent(),
+            });
           }
           await session.startInteractive();
+          launchAcknowledged = true;
           // Launch is a real await: Dismiss can remove this parked offer while
           // tmux/CLI startup is still in progress. Tear down only this tentative
           // instance before any restored state is persisted or success broadcast.
@@ -640,17 +673,26 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           }
           failures.push({
             sessionId: entry.sessionId,
-            reason: builtSession?.codexRestoreWorkerMayExist ? 'restore-uncertain' : 'rebuild-failed',
+            reason:
+              builtSession?.codexRestoreWorkerMayExist || builtSession?.restoreLaunchMayExist
+                ? 'restore-uncertain'
+                : 'rebuild-failed',
           });
           // Left on offer: the user can put the binary back and click again.
           continue;
         } finally {
           builtSession?.setCodexRestoreLaunchGuard(undefined);
+          builtSession?.setRestoreLaunchGuard(undefined);
           // Identity rejection or cancellation can happen before the tentative
           // Session is registered, when discardPartiallyBuiltSession() has
           // nothing to own. Remove only a profile proven absent before this
           // attempt; a pre-existing tree may contain the original conversation.
-          if (!restoreCompleted && newlyCreatedCustomModelConfigDir && !builtSession?.codexRestoreWorkerMayExist) {
+          if (
+            !restoreCompleted &&
+            newlyCreatedCustomModelConfigDir &&
+            !builtSession?.codexRestoreWorkerMayExist &&
+            !builtSession?.restoreLaunchMayExist
+          ) {
             removeConfigDir(newlyCreatedCustomModelConfigDir);
           }
         }
