@@ -162,18 +162,104 @@ it.each(STALL_POLICY_SETTINGS)(
 
 it.each(
   [false, true].flatMap((remote) =>
-    (['unrelated', ...STALL_POLICY_SETTINGS] as const).map((setting) => ({ remote, setting }))
+    (['unrelated', 'stalledAfterMs', ...STALL_POLICY_SETTINGS] as const).map((setting) => ({ remote, setting }))
   )
 )('preserves current confirmation for an unchanged policy ($setting SSH=$remote)', async ({ remote, setting }) => {
   const f = await fixture(remote, true);
   await f.controller.retry();
   expect(f.effects).not.toHaveBeenCalled();
-  await f.controller.updateConfig(setting === 'unrelated' ? { maxRetries: 4 } : { [setting]: true });
+  await f.controller.updateConfig(
+    setting === 'unrelated'
+      ? { maxRetries: 4 }
+      : setting === 'stalledAfterMs'
+        ? { stalledAfterMs: 10_000 }
+        : { [setting]: true }
+  );
   expect(f.controller.getStatus().config.restartStalls).toBe(true);
   vi.setSystemTime(NOW + 2000);
   await f.controller.retry();
   expect(f.effects).toHaveBeenCalledOnce();
 });
+
+it.each(
+  [false, true].flatMap((remote) =>
+    [false, true].flatMap((restartable) =>
+      [
+        { direction: 'increase', initial: 10_000, next: 25_000, oldProgress: 20_000, firstFresh: 5000 },
+        { direction: 'decrease', initial: 30_000, next: 10_000, oldProgress: 40_000, firstFresh: 2000 },
+      ].map((threshold) => ({ remote, restartable, ...threshold }))
+    )
+  )
+)(
+  'requires two newly qualifying probes after a threshold $direction (SSH=$remote restartable=$restartable)',
+  async ({ remote, restartable, initial, next, oldProgress, firstFresh }) => {
+    const f = await fixture(remote, true, false);
+    Object.assign(f.observation, {
+      at: NOW - oldProgress,
+      progressAt: NOW - oldProgress,
+      stallRestartable: restartable,
+      ...(remote ? { progressLowerBound: NOW - oldProgress - 1 } : {}),
+    });
+    await f.controller.updateConfig({ stalledAfterMs: initial });
+    await f.controller.retry();
+    const before = f.controller.getStatus();
+    expect(before.pending).toBeUndefined();
+    expect(before.inFlight).toBeUndefined();
+    expect(before.needsAttention).toBe(false);
+    vi.setSystemTime(NOW + 1000);
+    await f.controller.updateConfig({ stalledAfterMs: next });
+    expect(f.controller.getStatus().armedAt).toBe(before.armedAt);
+    // The first post-edit observation qualifies under the new threshold and
+    // still lies within the old confirmation's 15s lifetime.
+    vi.setSystemTime(NOW + firstFresh);
+    await f.controller.retry();
+    expect(f.effects).not.toHaveBeenCalled();
+    expect(f.controller.getStatus()).toMatchObject({ needsAttention: false, attempts: 0 });
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    vi.setSystemTime(NOW + firstFresh + 1999);
+    await f.controller.retry();
+    expect(f.effects).not.toHaveBeenCalled();
+    expect(f.controller.getStatus().needsAttention).toBe(false);
+    vi.setSystemTime(NOW + firstFresh + 2000);
+    await f.controller.retry();
+    if (restartable) {
+      expect(f.effects).toHaveBeenCalledOnce();
+      expect(f.effects.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
+    } else {
+      expect(f.effects).not.toHaveBeenCalled();
+      expect(f.controller.getStatus()).toMatchObject({
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+        attempts: 0,
+      });
+    }
+  }
+);
+
+it.each([false, true])(
+  'reconfirms a pending stall after a threshold edit before its scheduled dispatch (SSH=%s)',
+  async (remote) => {
+    const f = await fixture(remote, true, false);
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 2000);
+    await f.controller.refresh();
+    const before = f.controller.getStatus();
+    expect(before.pending).toMatchObject({ action: 'restart', reason: 'stalled' });
+    expect(before.nextRetryAt).toBe(NOW + 3000);
+    await f.controller.updateConfig({ stalledAfterMs: 15_000 });
+    expect(f.controller.getStatus().pending).toEqual(before.pending);
+    vi.setSystemTime(NOW + 3000);
+    await f.controller.refresh();
+    expect(f.effects).not.toHaveBeenCalled();
+    expect(f.controller.getStatus().attempts).toBe(0);
+    vi.setSystemTime(NOW + 4999);
+    await f.controller.refresh();
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 5000);
+    await f.controller.refresh();
+    expect(f.effects).toHaveBeenCalledOnce();
+  }
+);
 
 it.each(
   [false, true].flatMap((remote) =>
@@ -215,54 +301,60 @@ it.each(
   }
 );
 
-it.each(STALL_POLICY_SETTINGS.flatMap((setting) => ['accepted', 'uncertain'].map((phase) => ({ setting, phase }))))(
-  'retains $phase delivery history through $setting off/on without replay',
-  async ({ setting, phase }) => {
-    const f = await fixture(true, true);
-    f.effects.mockResolvedValueOnce(phase === 'uncertain' ? 'unknown' : 'sent');
-    await f.controller.retry();
-    vi.setSystemTime(NOW + 2000);
-    await f.controller.retry();
-    expect(f.effects).toHaveBeenCalledOnce();
-    if (phase === 'accepted') {
-      vi.setSystemTime(NOW + 3000);
-      Object.assign(f.observation, {
-        activity: 'completed',
-        reason: 'turn-completed',
-        stallRestartable: false,
-        processReady: true,
-        processReadyAt: Date.now(),
-      });
-      await f.controller.inspect();
-      expect(f.controller.getStatus().inFlight).toBeUndefined();
-      expect(f.controller.getStatus().handledEvidence).toHaveLength(1);
-      Object.assign(f.observation, {
-        activity: 'working',
-        reason: 'turn-running',
-        stallRestartable: true,
-        processReady: false,
-      });
-    }
-    const before = f.controller.getStatus();
+it.each(
+  [...STALL_POLICY_SETTINGS, 'stalledAfterMs' as const].flatMap((setting) =>
+    ['accepted', 'uncertain'].map((phase) => ({ setting, phase }))
+  )
+)('retains $phase delivery history through $setting changes without replay', async ({ setting, phase }) => {
+  const f = await fixture(true, true);
+  f.effects.mockResolvedValueOnce(phase === 'uncertain' ? 'unknown' : 'sent');
+  await f.controller.retry();
+  vi.setSystemTime(NOW + 2000);
+  await f.controller.retry();
+  expect(f.effects).toHaveBeenCalledOnce();
+  if (phase === 'accepted') {
+    vi.setSystemTime(NOW + 3000);
+    Object.assign(f.observation, {
+      activity: 'completed',
+      reason: 'turn-completed',
+      stallRestartable: false,
+      processReady: true,
+      processReadyAt: Date.now(),
+    });
+    await f.controller.inspect();
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.controller.getStatus().handledEvidence).toHaveLength(1);
+    Object.assign(f.observation, {
+      activity: 'working',
+      reason: 'turn-running',
+      stallRestartable: true,
+      processReady: false,
+    });
+  }
+  const before = f.controller.getStatus();
+  if (setting === 'stalledAfterMs') {
+    await f.controller.updateConfig({ stalledAfterMs: 25_000 });
+    await f.controller.updateConfig({ stalledAfterMs: 10_000 });
+  } else {
     await f.controller.updateConfig({ [setting]: false });
     await f.controller.updateConfig({ [setting]: true });
-    vi.setSystemTime(Date.now() + 10_000);
-    await f.controller.retry();
-    vi.setSystemTime(Date.now() + 2000);
-    await f.controller.retry();
-    expect(f.effects).toHaveBeenCalledOnce();
-    const after = new RecoveryStore(f.path).get('worker');
-    expect(after.attempts).toBe(before.attempts);
-    expect(after.failedAttempts).toBe(before.failedAttempts);
-    expect(after.windowStartedAt).toBe(before.windowStartedAt);
-    expect(after.lastSuccessfulRecovery).toBe(before.lastSuccessfulRecovery);
-    expect(after.inFlight).toEqual(before.inFlight);
-    expect(after.handledEvidence).toEqual(before.handledEvidence);
-    expect(after.history.filter((event) => event.kind === 'accepted')).toEqual(
-      before.history.filter((event) => event.kind === 'accepted')
-    );
   }
-);
+  vi.setSystemTime(Date.now() + 10_000);
+  await f.controller.retry();
+  vi.setSystemTime(Date.now() + 2000);
+  await f.controller.retry();
+  expect(f.effects).toHaveBeenCalledOnce();
+  const after = new RecoveryStore(f.path).get('worker');
+  expect(after.attempts).toBe(before.attempts);
+  expect(after.failedAttempts).toBe(before.failedAttempts);
+  expect(after.windowStartedAt).toBe(before.windowStartedAt);
+  expect(after.lastSuccessfulRecovery).toBe(before.lastSuccessfulRecovery);
+  expect(after.inFlight).toEqual(before.inFlight);
+  expect(after.handledEvidence).toEqual(before.handledEvidence);
+  expect(after.history.filter((event) => event.kind === 'accepted')).toEqual(
+    before.history.filter((event) => event.kind === 'accepted')
+  );
+});
 
 it.each(STALL_POLICY_SETTINGS)(
   'durably cancels a scheduled stall action immediately when %s is withdrawn',

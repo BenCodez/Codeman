@@ -1,5 +1,5 @@
 /**
- * Rebuild the secret-bearing environment for a persisted custom-model selection.
+ * @fileoverview Rebuild the secret-bearing environment for a persisted custom-model selection.
  *
  * Persisted session records contain only endpoint/model ids and injected key names.
  * Values are always re-derived from the current admin-owned endpoint store. This is
@@ -19,7 +19,8 @@ export { captureRebootLaunchWitness as captureCustomModelRecoveryWitness } from 
 export async function rebuildPersistedCustomModelEnv(
   mode: string,
   sessionId: string,
-  saved: CustomModelBookkeeping
+  saved: CustomModelBookkeeping,
+  workingDir: string
 ): Promise<Record<string, string> | undefined> {
   try {
     const entry = getCli(mode);
@@ -31,7 +32,8 @@ export async function rebuildPersistedCustomModelEnv(
       endpoint,
       saved.modelId,
       sessionId,
-      endpoint.modelContextLengths?.[saved.modelId]
+      endpoint.modelContextLengths?.[saved.modelId],
+      workingDir
     )?.envOverrides;
   } catch {
     // Fail closed without logging endpoint credentials or secret-bearing env.

@@ -83,6 +83,18 @@ it('retains the exact 64 KiB Unicode prompt and ordered broker phases', async ()
     ('error' in result ? String(result.error).slice(-1500) : '') + ' bytes=' + (await f.bytes()).length
   ).toMatchObject({ status: 'sent' });
   expect(await f.bytes()).toEqual(Buffer.from(prompt + '\r'));
+  const state = await f.broker.readState();
+  const phases = state?.receipts.filter((receipt) => receipt.channel === 'auto');
+  expect(state?.counters.auto).toBe(9);
+  expect(phases?.map(({ counter, status, hash }) => ({ counter, status, hash }))).toEqual(
+    Array.from({ length: 9 }, (_, index) => ({
+      counter: index + 1,
+      status: 'sent',
+      hash: createHash('sha256')
+        .update(index < 8 ? '😀'.repeat(2048) : '\r')
+        .digest('hex'),
+    }))
+  );
 });
 
 it('waits for delayed healthy repaint without resending a literal phase', async () => {

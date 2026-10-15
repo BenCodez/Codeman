@@ -326,7 +326,7 @@ describe('Task supervision UI', () => {
     h.app.closeTaskOptions();
     expect(h.get('taskCriteriaRows').children).toHaveLength(0);
   });
-  it('submits owner verification only and guards exhausted, blocked and completed actions', async () => {
+  it('submits owner verification only and guards unstarted exhausted and completed actions', async () => {
     const h = harness();
     await h.open();
     const inputs = h.get('taskCriteriaEvidence').querySelectorAll('input');
@@ -335,10 +335,8 @@ describe('Task supervision UI', () => {
     h.get('taskProgressOutcome').value = 'completed';
     await h.app.saveTaskProgress();
     expect(h.app._apiJson.mock.calls[1][1].body.verifiedCriteria).toEqual(['manual-a']);
-    for (const outcome of ['completed', 'blocked']) {
-      h.app._onSessionTask({ sessionId: 'a', state: { ...state(), outcome } });
-      expect(h.get('taskResumeBtn').disabled).toBe(true);
-    }
+    h.app._onSessionTask({ sessionId: 'a', state: { ...state(), outcome: 'completed' } });
+    expect(h.get('taskResumeBtn').disabled).toBe(true);
     h.app._onSessionTask({ sessionId: 'a', state: { ...state(), continuations: 3 } });
     await h.app.taskAction('resume');
     expect(h.app._apiJson).toHaveBeenCalledTimes(2);
@@ -528,17 +526,85 @@ describe('Task supervision UI', () => {
     expect(read('app.js')).toContain('if (this._taskView) void this.loadTaskStatus?.();');
     expect(read('respawn-ui.js')).toContain('this.closeTaskOptions?.();');
   });
-  it('allows a zero-continuation initial kickoff, then guards the spent continuation budget', async () => {
+  it('allows a zero-continuation initial kickoff and observation-only resume afterwards', async () => {
     const initial = state();
     initial.config.maxContinuations = 0;
     const h = harness(initial);
     await h.open();
     expect(h.get('taskResumeBtn').disabled).toBe(false);
     h.app._onSessionTask({ sessionId: 'a', state: { ...initial, kickoffAt: Date.now() } });
-    expect(h.get('taskResumeBtn').disabled).toBe(true);
+    expect(h.get('taskResumeBtn').disabled).toBe(false);
     h.app._onSessionTask({ sessionId: 'a', state: { ...state(), reason: 'continuation-accepted' } });
     expect(h.get('taskInputEvidence').textContent).toBe('Structured input acceptance verified');
   });
+  it.each([
+    [0, 'restart'],
+    [3, 'restart'],
+    [0, 'owner-input'],
+    [3, 'owner-input'],
+    [0, 'blocked'],
+    [3, 'blocked'],
+  ] as const)(
+    'resumes observation after %i spent continuations and %s without dispatching input',
+    async (limit, cause) => {
+      const now = Date.now();
+      const restored = initialTaskState();
+      Object.assign(restored, {
+        objective: 'Observe the accepted task',
+        criteria: [{ id: 'owner', description: 'Owner certifies completion', kind: 'manual', verified: false }],
+        startedAt: now - 500,
+        kickoffAt: 0,
+        continuations: limit,
+        outcome: cause === 'blocked' ? 'blocked' : 'unfinished',
+        agentProgressVeto: cause === 'blocked',
+      });
+      restored.config = { enabled: true, maxContinuations: limit, maxRuntimeMs: 900000 };
+      const observe = vi.fn(async () => {
+        throw new Error('Observation-only resume must not inspect or dispatch');
+      });
+      const act = vi.fn(async () => 'sent' as const);
+      const controller = new TaskController({ observe, act, persist: async () => {}, changed: () => {} }, restored);
+      try {
+        if (cause === 'owner-input') {
+          controller.noteUserInput();
+          await controller.pause();
+        }
+        const h = harness(controller.getStatus());
+        h.app._apiJson = vi.fn(async (_url, options) =>
+          options?.method === 'POST' ? controller.resume() : controller.getStatus()
+        );
+        await h.open();
+        expect(h.get('taskResumeBtn').disabled).toBe(false);
+        await h.app.taskAction('resume');
+        expect(h.app._apiJson.mock.calls[1][0]).toBe('/api/sessions/a/task/resume');
+        expect(controller.getStatus()).toMatchObject({ phase: 'watching', continuations: limit, kickoffAt: 0 });
+        expect(controller.getStatus().agentProgressVeto).toBeUndefined();
+        expect(observe).not.toHaveBeenCalled();
+        expect(act).not.toHaveBeenCalled();
+        expect(controller.getStatus().criteria[0].verified).toBe(false);
+      } finally {
+        controller.stop();
+      }
+    }
+  );
+  it.each(['runtime', 'in-flight', 'completed'] as const)(
+    'refuses observation-only resume with %s veto',
+    async (veto) => {
+      const initial = {
+        ...state(),
+        kickoffAt: 0,
+        continuations: 3,
+        ...(veto === 'runtime' ? { startedAt: Date.now() - 900001 } : {}),
+        ...(veto === 'in-flight' ? { inFlight: { key: 'pending', startedAt: Date.now() } } : {}),
+        ...(veto === 'completed' ? { outcome: 'completed' } : {}),
+      };
+      const h = harness(initial);
+      await h.open();
+      expect(h.get('taskResumeBtn').disabled).toBe(true);
+      await h.app.taskAction('resume');
+      expect(h.app._apiJson).toHaveBeenCalledOnce();
+    }
+  );
   it('translates task labels and explanatory copy while leaving user input untouched', () => {
     const h = harness();
     vm.runInContext(read('i18n.js'), h.dom.getInternalVMContext());

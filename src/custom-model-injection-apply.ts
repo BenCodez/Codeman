@@ -247,8 +247,8 @@ export function applyCustomModelInjection(
   contextLength?: number,
   /**
    * The session's own working directory — only used for `skipFirstRunPrompts`'s per-project
-   * trust-dialog seed, and only when provided (boot recovery, which has no reason to
-   * re-answer a dialog that already fired once, omits it rather than re-deriving it).
+   * trust-dialog seed. Recovery also supplies it so a missing isolated profile regains
+   * the same onboarding and project trust as the original launch.
    */
   workingDir?: string
 ): AppliedCustomModel | undefined {

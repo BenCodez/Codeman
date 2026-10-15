@@ -97,12 +97,14 @@ describe('the client never queues or keeps an undeliverable frame', () => {
   });
 
   it('drops a frame the WebSocket refused with an error ACK', () => {
-    const handler = appSource.slice(appSource.indexOf('_onWsInputAck(seq, msg, sessionId = this._wsSessionId) {'));
+    const handler = appSource.slice(
+      appSource.indexOf('_onWsInputAck(seq, msg, sessionId = this._wsSessionId, cid = this._clientId) {')
+    );
     expect(handler.slice(0, 600)).toMatch(/if \(msg && msg\.err\)/);
   });
 
   it('prunes oversized frames persisted by an older build on load', () => {
     const load = appSource.slice(appSource.indexOf('_loadReliableState() {'));
-    expect(load.slice(0, 3000)).toMatch(/r\.data\.length <= frameMax/);
+    expect(load.slice(0, 4000)).toMatch(/rec\.data\.length > \(window\.CodemanInputLimit\?\.FRAME_MAX_CHARS/);
   });
 });

@@ -257,7 +257,7 @@ export class RecoveryController {
       const stallEnabledNow = config.detectStalls && !this.state.config.detectStalls;
       const stallRestartEnabledNow = config.restartStalls && !this.state.config.restartStalls;
       const confirmationPolicyChanged = (
-        ['enabled', 'recoverCrashes', 'recoverInterrupted', 'detectStalls', 'restartStalls'] as const
+        ['enabled', 'recoverCrashes', 'recoverInterrupted', 'detectStalls', 'restartStalls', 'stalledAfterMs'] as const
       ).some((key) => config[key] !== this.state.config[key]);
       // A newly consented policy needs its own fresh observations, even when
       // the old confirmation had not yet scheduled an action.
