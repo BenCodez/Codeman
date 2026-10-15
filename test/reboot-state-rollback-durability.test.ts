@@ -14,36 +14,42 @@ const io = vi.hoisted(() => ({
   original: new Error('Fixture commit directory acknowledgement failed'),
   paths: new Map<number, string>(),
 }));
-vi.mock('node:fs', async (original) => {
-  const real = await original<typeof import('node:fs')>();
-  const openSync = (...args: Parameters<typeof real.openSync>) => {
-    const fd = real.openSync(...args);
-    io.paths.set(fd, String(args[0]));
-    return fd;
+vi.mock('node:fs/promises', async (original) => {
+  const real = await original<typeof import('node:fs/promises')>();
+  return {
+    ...real,
+    open: async (...args: Parameters<typeof real.open>) => {
+      const file = await real.open(...args);
+      return new Proxy(file, {
+        get(target, key) {
+          if (key === 'sync')
+            return async () => {
+              if (io.armed) {
+                const directory = (await target.stat()).isDirectory();
+                io.phases.push(directory ? 'directory' : 'file');
+                if (directory) {
+                  io.directoryCalls++;
+                  if (io.directoryCalls === 1 && io.fail) throw io.original;
+                  if (io.directoryCalls === 2 && io.fail === 'rollback-directory')
+                    throw Error('Fixture rollback directory acknowledgement failed');
+                } else if (io.fail === 'file') throw io.original;
+              }
+              await target.sync();
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+    rename: async (...args: Parameters<typeof real.rename>) => {
+      if (io.armed) io.phases.push('rename');
+      return real.rename(...args);
+    },
+    unlink: async (...args: Parameters<typeof real.unlink>) => {
+      if (io.armed) io.phases.push(String(args[0]).endsWith('state.json') ? 'rollback-unlink' : 'temporary-unlink');
+      return real.unlink(...args);
+    },
   };
-  const fsyncSync = (fd: number) => {
-    if (io.armed) {
-      const directory = real.fstatSync(fd).isDirectory();
-      io.phases.push(directory ? 'directory' : 'file');
-      if (directory) {
-        io.directoryCalls++;
-        if (io.directoryCalls === 1 && io.fail) throw io.original;
-        if (io.directoryCalls === 2 && io.fail === 'rollback-directory')
-          throw Error('Fixture rollback directory acknowledgement failed');
-      } else if (io.fail === 'file') throw io.original;
-    }
-    real.fsyncSync(fd);
-  };
-  const renameSync = (...args: Parameters<typeof real.renameSync>) => {
-    if (io.armed) io.phases.push('rename');
-    return real.renameSync(...args);
-  };
-  const unlinkSync = (...args: Parameters<typeof real.unlinkSync>) => {
-    if (io.armed) io.phases.push(String(args[0]).endsWith('state.json') ? 'rollback-unlink' : 'temporary-unlink');
-    return real.unlinkSync(...args);
-  };
-  const changed = { openSync, fsyncSync, renameSync, unlinkSync };
-  return { ...real, ...changed, default: { ...real, ...changed } };
 });
 let root: string;
 let statePath: string;
