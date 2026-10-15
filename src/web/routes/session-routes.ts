@@ -1843,7 +1843,11 @@ export function registerSessionRoutes(
     // skip the write. Untagged requests (curl/legacy) always apply.
     const tagged = typeof clientId === 'string' && typeof seq === 'number';
     if (tagged && !session.deferInputSeq(clientId as string, seq as number)) {
-      return createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Input backlog is full; this frame was not sent');
+      return {
+        ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input backlog is full; retry the input'),
+        retryable: true,
+        notSent: true,
+      };
     }
     if (session.recoveryInputReserved) {
       return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');

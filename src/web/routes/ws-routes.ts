@@ -200,7 +200,9 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             const cid = typeof msg.cid === 'string' ? msg.cid : null;
             const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
             if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
-              if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));
+              // Capacity is temporary: an error ACK would permanently discard
+              // the browser's durable input. Reconnect retries the same identity.
+              if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
               return;
             }
             // A rejected frame must not claim a delivery identity. Otherwise a
