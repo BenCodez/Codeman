@@ -44,21 +44,26 @@ function frame(value: object): string {
 }
 
 describe('remote Codex evidence protocol', () => {
-  it('preserves every SSH connection option and sends request data as one encoded token', () => {
+  it('preserves every SSH connection option and sends private request data only through stdin', () => {
     const command = buildRemoteCodexEvidenceCommand(remote, {
       sessionId: SESSION,
       workingDir: remote.remotePath,
       codexHome: '/srv/custom codex',
       resumeId: THREAD,
     });
-    expect(command).toContain('-p 2207');
-    expect(command).toContain("-i '/keys/fixture identity'");
-    expect(command).toContain("-J 'jump.invalid:2222'");
-    expect(command).toContain('ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p');
-    expect(command).toContain("-o 'StrictHostKeyChecking=yes'");
-    expect(command).toContain('runner@worker.invalid');
-    expect(command).not.toContain('/srv/custom codex');
-    expect(command).not.toContain(THREAD);
+    expect(command.command).toContain('-p 2207');
+    expect(command.command).toContain("-i '/keys/fixture identity'");
+    expect(command.command).toContain("-J 'jump.invalid:2222'");
+    expect(command.command).toContain('ProxyCommand=nc -X 5 -x 127.0.0.1:1080 %h %p');
+    expect(command.command).toContain("-o 'StrictHostKeyChecking=yes'");
+    expect(command.command).toContain('runner@worker.invalid');
+    expect(command.command).not.toContain('/srv/custom codex');
+    expect(command.command).not.toContain(THREAD);
+    expect(JSON.parse(command.input)).toMatchObject({
+      sessionId: SESSION,
+      resumeId: THREAD,
+      codexHome: '/srv/custom codex',
+    });
   });
 
   it('parses one bounded marked result and ignores an untrusted login banner', () => {
@@ -748,7 +753,7 @@ cp.execFileSync=function(file,args,options){
     };
     const exactLimit = '😀'.repeat(MAX_REMOTE_CODEX_PROMPT_BYTES / 4);
     expect(Buffer.byteLength(exactLimit, 'utf8')).toBe(MAX_REMOTE_CODEX_PROMPT_BYTES);
-    expect(buildRemoteCodexInputCommand(remote, { ...base, prompt: exactLimit })).not.toContain(exactLimit);
+    expect(buildRemoteCodexInputCommand(remote, { ...base, prompt: exactLimit }).command).not.toContain(exactLimit);
     const oversized = { ...base, prompt: `${'x'.repeat(MAX_REMOTE_CODEX_PROMPT_BYTES)}😀` };
     expect(() => buildRemoteCodexInputCommand(remote, oversized)).toThrow(RangeError);
     await expect(deliverRemoteCodexInput(remote, oversized)).resolves.toEqual({ status: 'not-sent' });
@@ -825,11 +830,11 @@ describe('remote Codex launch and exact dead-pane replacement', () => {
       codexConfig: { noDaemon: true, resumeSessionId: THREAD, model: 'fixture-model' },
       codexHome: '/srv/custom codex',
     });
-    expect(command).toContain('-p 2207');
-    expect(command).toContain("-J 'jump.invalid:2222'");
-    expect(command).not.toContain('1|17||%8|808');
-    expect(command).not.toMatch(/respawn-pane\s+-k/);
-    expect(command).not.toContain(THREAD);
-    expect(command).not.toContain('/srv/custom codex');
+    expect(command.command).toContain('-p 2207');
+    expect(command.command).toContain("-J 'jump.invalid:2222'");
+    expect(command.command).not.toContain('1|17||%8|808');
+    expect(command.command).not.toMatch(/respawn-pane\s+-k/);
+    expect(command.command).not.toContain(THREAD);
+    expect(command.command).not.toContain('/srv/custom codex');
   });
 });

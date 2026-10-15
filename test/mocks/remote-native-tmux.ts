@@ -7,6 +7,41 @@ args = sys.argv[1:]
 assert args[:2] == ['-L', 'codeman-remote']
 op = args[2]
 counter = (os.environ.get('EFFECT_LOG') or os.environ.get('FIXTURE_ACTION_LOG')) + '.native-guards'
+buffer_root = (os.environ.get('EFFECT_LOG') or os.environ.get('FIXTURE_ACTION_LOG')) + '.buffer-'
+argv_log = os.environ.get('PRIVATE_ARGV_LOG')
+if argv_log:
+    with open(argv_log, 'a') as f: f.write(json.dumps(args) + '\n')
+if op in ('load-buffer', 'delete-buffer'):
+    assert args[3] == '-b' and re.fullmatch(r'codeman-private-[a-f0-9-]{36}', args[4])
+    buffer_path = buffer_root + args[4]
+    if op == 'delete-buffer':
+        assert len(args) == 5
+        try: os.unlink(buffer_path)
+        except FileNotFoundError: pass
+        sys.exit(0)
+    assert args[5:] == ['-']
+    data = sys.stdin.buffer.read(122881)
+    assert 0 < len(data) <= 122880 and data.startswith(b'\x1eCODEMAN_INPUT_V1:') and data.endswith(b'\x1f')
+    with open(buffer_path, 'xb') as f: f.write(data)
+    import base64, hashlib
+    packet = json.loads(base64.b64decode(data.split(b':')[1]))
+    if argv_log:
+        with open(argv_log + '.stdin', 'a') as f: f.write(json.dumps({'name': args[4], 'bytes': len(data), 'hash': hashlib.sha256(data).hexdigest(), 'channel': packet['channel'], 'counter': packet['counter']}) + '\n')
+    fault = os.environ.get('PRIVATE_BUFFER_FAULT', '') if packet['channel'] == 'auto' else ''
+    if fault == 'expired-load':
+        import time
+        before = time.monotonic() * 1000
+        assert before < packet['monotonicDeadline']
+        with open(argv_log + '.expiry', 'w') as f: f.write(json.dumps({'before': before, 'deadline': packet['monotonicDeadline']}))
+        time.sleep((packet['monotonicDeadline'] - before) / 1000 + .02)
+    if fault == 'load-ack': sys.exit(1)
+    if fault == 'composer' or fault == 'composer-enter' and base64.b64decode(packet['data']) == b'\r':
+        with open(os.environ['FAKE_BROKER_ROOT'] + '/draft', 'w') as f: f.write('owner draft')
+    if fault == 'witness':
+        with open(os.environ['ROLLOUT'], 'a') as f: f.write(' ')
+    if fault == 'native':
+        with open(buffer_root + 'native-veto', 'w') as f: f.write('1')
+    sys.exit(0)
 if op == 'has-session':
     try: os.unlink(counter)
     except FileNotFoundError: pass
@@ -41,6 +76,7 @@ if op == 'if-shell':
         with open(counter) as f: count = int(f.read())
     except FileNotFoundError: count = 0
     change = os.environ.get('NATIVE_BEFORE_EFFECT', '')
+    if os.path.exists(buffer_root + 'native-veto'): change = 'pid'
     if change == 'pid' or (change == 'pid-after-input' and count): state['pane_pid'] = str(int(state['pane_pid']) + 1)
     if change == 'pane-id': state['pane_id'] = '%8'
     if change == 'signal-alias': state['pane_dead_signal'] = 'KILL'
@@ -80,7 +116,7 @@ if op == 'if-shell':
             active = True
         else: raise AssertionError('Unexpected unquoted tmux syntax')
     if active: command.append(token)
-    assert command[0] in ('send-keys', 'respawn-pane')
+    assert command[0] in ('send-keys', 'paste-buffer', 'respawn-pane')
     assert command[0] != 'respawn-pane' or '-k' not in command[1:]
     if command[:2] == ['send-keys', '-l'] and not count:
         prompt_file = os.environ.get('FIXTURE_PROMPT_FILE')

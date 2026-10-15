@@ -147,8 +147,8 @@ it.each(['restart', 'restore'] as const)(
   async (kind) => {
     const f = await fixture(),
       run = f.options.transport.run;
-    f.options.transport.run = async (command) => {
-      await run(command);
+    f.options.transport.run = async (command, input) => {
+      await run(command, input);
       return { stdout: '' };
     };
     const result = await f.rotate(kind);
@@ -285,7 +285,7 @@ it.each(['healthy', 'manager-journal', 'worker-progress', 'owner-input', 'native
         issuerLeaseTransport: manager.transport,
         transport: {
           ...f.options.transport,
-          run: async (command: string) => {
+          run: async (command: string, input: string) => {
             wireCalls++;
             expect(command).not.toContain(manager.broker.directory);
             if (change === 'worker-progress') await fs.appendFile(f.rollout, ' ');
@@ -300,7 +300,7 @@ it.each(['healthy', 'manager-journal', 'worker-progress', 'owner-input', 'native
                 );
               });
             }
-            return run(command);
+            return run(command, input);
           },
         },
       };

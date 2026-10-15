@@ -1,6 +1,5 @@
 /** @fileoverview Bounded, fail-closed Codex evidence and mutation over the configured SSH transport. */
-import { exec } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
 import { isAbsolute, posix } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { deflateRawSync } from 'node:zlib';
@@ -8,7 +7,7 @@ import { createHash } from 'node:crypto';
 import type { CodexConfig, SessionRemote } from '../types.js';
 import { CODEX_REASONING_EFFORTS } from '../types/session.js';
 import { buildSshConnectionArgs, remoteLoginShellCommand, remoteSshTarget, shellescape } from '../remote-hosts.js';
-import { runWithRemoteSshLimit } from '../remote-ssh-limiter.js';
+import { runWithRemoteSshLimit, RemoteSshAdmissionError, type RetainRemoteSshSlot } from '../remote-ssh-limiter.js';
 import { buildRemoteCodexPaneCommand, remoteTmuxSessionName } from '../tmux-manager.js';
 import { CodexInputBroker, type CodexBrokerProof } from './codex-input-broker.js';
 import { CODEX_INPUT_BROKER_SOURCE } from './codex-input-broker-source.js';
@@ -40,7 +39,6 @@ import {
   type RemoteClockWitness,
 } from './remote-clock.js';
 
-const execAsync = promisify(exec);
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const MARKER = 'CODEMAN_REMOTE_CODEX_V1:';
 const MAX_REMOTE_CODEX_RECORD_BYTES = 512 * 1024;
@@ -147,7 +145,7 @@ export type RemoteCodexActionAuthority =
 export interface RemoteCodexExecutionOptions {
   transport?: {
     clock(remote: SessionRemote): Promise<RemoteClockWitness | undefined>;
-    run(command: string): Promise<{ stdout: string }>;
+    run(command: string, input: string): Promise<{ stdout: string }>;
   };
   provisionTransport?: RemoteBrokerTransport;
   issuerLeaseTransport?: SourceHostLeaseTransport;
@@ -169,6 +167,104 @@ function currentRemoteAuthority(authority: RemoteCodexActionAuthority): boolean 
 
 export const MAX_REMOTE_CODEX_PROMPT_BYTES = 64 * 1024;
 const MAX_REMOTE_CODEX_COMMAND_BYTES = 120 * 1024;
+export const MAX_REMOTE_CODEX_REQUEST_BYTES = 120 * 1024;
+
+/** Private request bytes must be written only to the transport's stdin. */
+export interface RemoteCodexCommand {
+  command: string;
+  input: string;
+}
+
+function requestCommand(remote: SessionRemote, request: unknown): RemoteCodexCommand {
+  const input = JSON.stringify(request);
+  if (Buffer.byteLength(input, 'utf8') > MAX_REMOTE_CODEX_REQUEST_BYTES)
+    throw new RangeError('Remote Codex request exceeds its bounded stdin limit');
+  const command = remoteCommand(remote, remoteLoginShellCommand(`node -e ${shellescape(REMOTE_CODEX_READER_SOURCE)}`));
+  if (Buffer.byteLength(command, 'utf8') > MAX_REMOTE_CODEX_COMMAND_BYTES)
+    throw new RangeError('Remote Codex command exceeds the safe shell argument bound');
+  return { command, input };
+}
+
+export function runRemoteCodexStdin(
+  command: string,
+  input: string,
+  retain?: RetainRemoteSshSlot
+): Promise<{ stdout: string }> {
+  if (
+    Buffer.byteLength(input, 'utf8') > MAX_REMOTE_CODEX_REQUEST_BYTES ||
+    Buffer.byteLength(command, 'utf8') > MAX_REMOTE_CODEX_COMMAND_BYTES
+  )
+    return Promise.reject(new RangeError('Remote Codex transport input exceeds its bounded limit'));
+  if (process.env.VITEST) throw new Error('Remote Codex IO requires an injected fixture under VITEST');
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, { shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    let closed!: () => void;
+    retain?.(
+      new Promise<void>((resolve) => {
+        closed = resolve;
+      })
+    );
+    const stdout: Buffer[] = [],
+      stderr: Buffer[] = [];
+    let stdoutBytes = 0,
+      stderrBytes = 0,
+      settled = false;
+    const diagnostics = () => Buffer.concat(stderr).toString('utf8');
+    const done = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (error) {
+        try {
+          child.kill();
+        } catch {
+          /* Transport uncertainty remains sealed. */
+        }
+        reject(error);
+      } else resolve({ stdout: Buffer.concat(stdout).toString('utf8') });
+    };
+    const timer = setTimeout(
+      () =>
+        done(
+          Object.assign(new Error('Remote Codex transport expired'), {
+            code: 'ETIMEDOUT',
+            killed: true,
+            stderr: diagnostics(),
+          })
+        ),
+      15_000
+    );
+    child.stdout.on('data', (data: Buffer) => {
+      if (settled) return;
+      stdoutBytes += data.length;
+      if (stdoutBytes > MAX_REMOTE_CODEX_STDOUT_BYTES) done(new Error('Remote Codex response oversized'));
+      else stdout.push(Buffer.from(data));
+    });
+    child.stderr.on('data', (data: Buffer) => {
+      if (settled) return;
+      stderrBytes += data.length;
+      if (stderrBytes > MAX_REMOTE_CODEX_STDOUT_BYTES) done(new Error('Remote Codex diagnostics oversized'));
+      else stderr.push(Buffer.from(data));
+    });
+    child.stdout.on('error', done);
+    child.stderr.on('error', done);
+    child.on('error', done);
+    child.stdin.on('error', done);
+    child.on('close', (code) => {
+      closed?.();
+      done(
+        code === 0
+          ? undefined
+          : Object.assign(new Error('Remote Codex transport failed'), { code, stderr: diagnostics() })
+      );
+    });
+    try {
+      child.stdin.end(input);
+    } catch (error) {
+      done(error as Error);
+    }
+  });
+}
 
 /** The source lease and target reader use identical Unicode-safe literal phases. */
 export function remoteInputPhases(prompt: string): string[] {
@@ -276,7 +372,7 @@ const composerState=(target,expected,settling=false)=>{try{check();const screen=
 // the original clock/private witness/native fences and deadline never reset.
 let composerPolls=0;const composerSettled=(target,expected,fields)=>{for(;composerPolls<128;){composerPolls++;confirmWitness();check();const state=composerState(target,expected,true);confirmWitness();check();if(state==="current")return true;if(state!=="pending")return false;const format="#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}|#{pane_pid}",row=cp.execFileSync("tmux",["-L","codeman-remote","list-panes","-t",target,"-F",format],{encoding:"utf8",timeout:1500,maxBuffer:16384});check();if(row!==[fields.pane_dead,fields.pane_dead_status,fields.pane_dead_signal,fields.pane_id,fields.pane_pid].join("|")+"\n")return false;Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20)}return false};
 
-const req=JSON.parse(Buffer.from(process.argv[1]||'','base64').toString('utf8'));
+const requestBuffer=Buffer.alloc(${MAX_REMOTE_CODEX_REQUEST_BYTES + 1});let requestBytes=0;for(;;){const n=fs.readSync(0,requestBuffer,requestBytes,requestBuffer.length-requestBytes,null);if(n===0)break;requestBytes+=n;if(requestBytes>${MAX_REMOTE_CODEX_REQUEST_BYTES})throw Error('Oversized private request')}const requestData=requestBuffer.subarray(0,requestBytes),requestText=requestData.toString('utf8');if(!Buffer.from(requestText,'utf8').equals(requestData))throw Error('Invalid private request encoding');let req;try{req=JSON.parse(requestText)}catch{throw Error('Invalid private request')};
 const uuid=/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
 const refusal=r=>{throw Object.assign(new Error(r),{reason:r})};
 const started=Date.now(),monotonicStarted=performance.now(),check=()=>{const elapsed=Date.now()-started,monotonic=performance.now()-monotonicStarted;if(elapsed<0||elapsed>1800||monotonic>1800||Math.abs(elapsed-monotonic)>100||(req.actionDeadline!==undefined&&Date.now()>=req.actionDeadline))refusal('unreadable')};
@@ -305,12 +401,12 @@ let frameAdmission;const preview=req.frameAdmission;if(preview!==undefined&&(!br
 let brokerVerified=false;try{if(req.inputBroker&&(session==='missing'||pane)){brokerOpen();if(req.action){const expected=req.action.expected.inputProof;if(!expected||expected.incarnation!==brokerDescriptor.incarnation||expected.brokerPid!==brokerState.pid||expected.childPid!==brokerState.childPid||expected.brokerStart!==brokerState.brokerStart||expected.childStart!==brokerState.childStart||expected.closed!==brokerState.closed||expected.rawGeneration!==0||expected.launchDigest!==brokerState.launchDigest||expected.homeDigest!==brokerState.homeDigest||!brokerExact(expected.ownerCounters,brokerOwners)||!brokerOwners.every(k=>expected.ownerCounters[k]===brokerState.counters[k])||!expected.fileWitness||JSON.stringify(expected.fileWitness)!==JSON.stringify(brokerSnapshot.witness))refusal('unverified')}if(!preview)brokerProbe();brokerVerified=true}}catch(e){identity={reason:e&&e.reason||'unreadable'}}
 if(!req.action&&identity.reason==='verified'){try{confirmWitness();if(brokerVerified)brokerCurrent()}catch(e){identity={reason:e&&e.reason||'unreadable'}}}
 if(preview&&brokerVerified&&session==='present'&&pane&&!pane.dead&&identity.reason==='verified'&&identity.tailTruncated===false){const proof=brokerWitnesses();brokerCurrent();brokerNative();const packet={version:1,sessionId:req.sessionId,incarnation:brokerDescriptor.incarnation,channel:'auto',counter:Number.MAX_SAFE_INTEGER,nonce:'ffffffff-ffff-ffff-ffff-ffffffffffff',conversationId:identity.conversationId,expectedOwners:Object.fromEntries(brokerOwners.map(k=>[k,brokerState.counters[k]])),monotonicDeadline:Number.MAX_SAFE_INTEGER,issuer:null,privateFiles:proof.files,privatePaths:proof.paths,missingPaths:[],data:'A'.repeat(4*Math.ceil(preview.maxPhaseBytes/3))};const bytes=Buffer.byteLength(JSON.stringify(packet))+(preview.issuerLeaseBytes?Buffer.byteLength(',\"issuerLease\":')+preview.issuerLeaseBytes:0);frameAdmission={...preview,fits:4*Math.ceil(bytes/3)+84<=122880};}
-let action,actionAt;if(req.action){action='not-sent';const a=req.action,e=a.expected;let identityMatch=brokerVerified&&!(brokerState.closed&&brokerState.exitStatus===0&&!brokerState.exitSignal)&&identity.reason==='verified'&&identity.tailTruncated===false&&identity.conversationId===e.conversationId&&identityTailHash===e.tailHash;const paneMatch=session==='present'&&pane&&pane.paneId===e.paneId&&pane.panePid===e.panePid;if(identityMatch){try{const h=header(identityProof.p),t=read(identityProof.p,262144,true),matched=history();confirmWitness();identityMatch=!!matched&&matched.id===identityProof.id&&h.id===identityProof.id&&h.cwd===identityProof.cwd&&h.origin===identityProof.origin&&h.createdAt===identityProof.createdAt&&!h.sub&&!t.truncated&&t.text.endsWith('\n')&&crypto.createHash('sha256').update(t.text,'utf8').digest('hex')===e.tailHash}catch{identityMatch=false}}if(a.kind==='input'&&identityMatch&&paneMatch&&!pane.dead&&crypto.createHash('sha256').update(screenText,'utf8').digest('hex')===e.screenHash){let pasted=false,pastedText="",chunk="",bytes=0,phase=0;const paste=()=>{brokerCurrent();if(pasted){if(!composerSettled(pane.paneId,pastedText,nativeFields))refusal("unverified")}else{const state=composerState(pane.paneId,undefined);if(state!=="current")return false}brokerCurrent();const r=brokerSend(brokerPacket('auto',chunk,phase++));if(r==='not-sent'||r.status!=='sent'){if(pasted||r!=='not-sent'&&r.status!=='not-sent')refusal('unverified');return false}pasted=true;pastedText+=chunk;return true};let current=true;for(const point of actionPrompt){const n=Buffer.byteLength(point,"utf8");if(bytes+n>8192){if(!paste()){current=false;break}chunk="";bytes=0}chunk+=point;bytes+=n}if(current&&(chunk||!pasted))current=paste();if(current){brokerCurrent();if(!composerSettled(pane.paneId,pastedText,nativeFields))refusal("unverified");brokerCurrent();check();const r=brokerSend(brokerPacket('auto','\r',phase),true);if(r==='not-sent'||r.status!=='sent')refusal('unverified');const at=r.deliveredAt;if(!brokerExact(at,['wallBefore','wallAfter','monoBefore','monoAfter'])||!Object.values(at).every(x=>Number.isSafeInteger(x)&&x>0)||at.wallBefore<started||at.wallAfter<at.wallBefore||at.wallAfter>Date.now()||at.wallAfter-at.wallBefore>500||at.monoAfter<at.monoBefore||Math.abs(at.wallAfter-at.wallBefore-at.monoAfter+at.monoBefore)>100)refusal('unverified');actionAt=at.wallBefore;action="sent"}}else if(a.kind==='restart'&&identityMatch&&paneMatch&&pane.dead&&pane.status===e.status&&pane.signal===e.signal&&req.newInputBroker){if(brokerRelaunch(a))action='sent'}else if(a.kind==='restore'&&identityMatch&&brokerHistorical&&req.newInputBroker){if(brokerRelaunch(a))action='sent'}}
+let action,actionAt;if(req.action){action='not-sent';const a=req.action,e=a.expected;let identityMatch=brokerVerified&&!(brokerState.closed&&brokerState.exitStatus===0&&!brokerState.exitSignal)&&identity.reason==='verified'&&identity.tailTruncated===false&&identity.conversationId===e.conversationId&&identityTailHash===e.tailHash;const paneMatch=session==='present'&&pane&&pane.paneId===e.paneId&&pane.panePid===e.panePid;if(identityMatch){try{const h=header(identityProof.p),t=read(identityProof.p,262144,true),matched=history();confirmWitness();identityMatch=!!matched&&matched.id===identityProof.id&&h.id===identityProof.id&&h.cwd===identityProof.cwd&&h.origin===identityProof.origin&&h.createdAt===identityProof.createdAt&&!h.sub&&!t.truncated&&t.text.endsWith('\n')&&crypto.createHash('sha256').update(t.text,'utf8').digest('hex')===e.tailHash}catch{identityMatch=false}}if(a.kind==='input'&&identityMatch&&paneMatch&&!pane.dead&&crypto.createHash('sha256').update(screenText,'utf8').digest('hex')===e.screenHash){let pasted=false,pastedText="",chunk="",bytes=0,phase=0;const paste=()=>{brokerCurrent();if(pasted){if(!composerSettled(pane.paneId,pastedText,nativeFields))refusal("unverified")}else{const state=composerState(pane.paneId,undefined);if(state!=="current")return false}brokerCurrent();const r=brokerSend(brokerPacket('auto',chunk,phase++),false,pastedText);if(r==='not-sent'||r.status!=='sent'){if(pasted||r!=='not-sent'&&r.status!=='not-sent')refusal('unverified');return false}pasted=true;pastedText+=chunk;return true};let current=true;for(const point of actionPrompt){const n=Buffer.byteLength(point,"utf8");if(bytes+n>8192){if(!paste()){current=false;break}chunk="";bytes=0}chunk+=point;bytes+=n}if(current&&(chunk||!pasted))current=paste();if(current){brokerCurrent();if(!composerSettled(pane.paneId,pastedText,nativeFields))refusal("unverified");brokerCurrent();check();const r=brokerSend(brokerPacket('auto','\r',phase),true,pastedText);if(r==='not-sent'||r.status!=='sent')refusal('unverified');const at=r.deliveredAt;if(!brokerExact(at,['wallBefore','wallAfter','monoBefore','monoAfter'])||!Object.values(at).every(x=>Number.isSafeInteger(x)&&x>0)||at.wallBefore<started||at.wallAfter<at.wallBefore||at.wallAfter>Date.now()||at.wallAfter-at.wallBefore>500||at.monoAfter<at.monoBefore||Math.abs(at.wallAfter-at.wallBefore-at.monoAfter+at.monoBefore)>100)refusal('unverified');actionAt=at.wallBefore;action="sent"}}else if(a.kind==='restart'&&identityMatch&&paneMatch&&pane.dead&&pane.status===e.status&&pane.signal===e.signal&&req.newInputBroker){if(brokerRelaunch(a))action='sent'}else if(a.kind==='restore'&&identityMatch&&brokerHistorical&&req.newInputBroker){if(brokerRelaunch(a))action='sent'}}
 out({v:1,session,pane,identity,action,actionAt,frameAdmission,inputBroker:brokerVerified?brokerEvidence():undefined,newInputBroker:newBrokerEvidence,clock:{remoteBefore:started,remoteAfter:Date.now()}});
 `;
 
-// Encoding only the static reader avoids expanding its quotes at every nested
-// shell layer, retaining the bounded 64 KiB prompt inside the 120 KiB command cap.
+// Encode only the static reader across nested shell layers. Request bytes use
+// independently bounded private stdin and never contribute to command arguments.
 const REMOTE_CODEX_READER_SOURCE = `eval(require("zlib").inflateRawSync(Buffer.from(${JSON.stringify(
   deflateRawSync(Buffer.from(REMOTE_CODEX_INSPECT_SCRIPT.replace(/^\/\/[^\n]*\n/gm, ''))).toString('base64')
 )},"base64")).toString("utf8"))`;
@@ -349,7 +445,7 @@ function responseClock(stdout: string, localBefore: number, monotonicBefore: num
 async function runRemoteCodexMutation<T extends { submission?: RecoverySubmission }>(
   remote: SessionRemote,
   request: T,
-  build: (remote: SessionRemote, request: T) => string,
+  build: (remote: SessionRemote, request: T) => RemoteCodexCommand,
   isCurrent: RemoteCodexActionAuthority,
   options: RemoteCodexExecutionOptions = {}
 ): Promise<{ stdout: string; clock: RemoteClockWitness } | 'not-sent' | 'unknown'> {
@@ -360,141 +456,143 @@ async function runRemoteCodexMutation<T extends { submission?: RecoverySubmissio
   const synchronouslyCurrent = (): boolean => {
     return currentRemoteAuthority(isCurrent);
   };
-  return runWithRemoteSshLimit(async () => {
-    let dispatched = false;
-    try {
-      // Bare callbacks must be synchronous. Async grants require a separate final token.
-      if (
-        !owned() ||
-        (typeof isCurrent === 'function' && !synchronouslyCurrent()) ||
-        (await authorityCheck()) !== true ||
-        !synchronouslyCurrent()
-      )
-        return 'not-sent';
-      const clock = await (options.transport?.clock(remote) ?? sampleRemoteCodexClock(remote, false));
-      if (!clock) return 'not-sent';
-      const normalized = clockedRequest(request, clock);
-      if (!normalized || (await authorityCheck()) !== true) return 'not-sent';
-      if (Date.now() < clock.localAfter || Date.now() - clock.localAfter > 2000) return 'not-sent';
-      const deadline: unknown = typeof isCurrent === 'function' ? undefined : isCurrent.getActionDeadline?.();
-      if (deadline instanceof Promise) void deadline.catch(() => {});
-      if (
-        deadline !== undefined &&
-        (typeof deadline !== 'number' || !Number.isFinite(deadline) || deadline <= Date.now())
-      )
-        return 'not-sent';
-      normalized.actionDeadline = typeof deadline === 'number' ? deadline + remoteClockOffset(clock).min : undefined;
-      delete normalized.issuerLease;
-      let localBefore = 0;
-      let monotonicBefore = 0;
-      const dispatch = async (claim?: Readonly<RemoteWorkerLeaseClaim>) => {
-        normalized.dispatchClock!.localAt = Date.now();
-        if (Date.now() < clock.localAfter || Date.now() - clock.localAfter > 2000) throw new Error('Expired clock');
-        normalized.issuerLease = claim;
-        const command = build(remote, normalized);
-        localBefore = Date.now();
-        monotonicBefore = performance.now();
-        if (!owned() || !synchronouslyCurrent() || (typeof deadline === 'number' && deadline <= Date.now()))
-          throw new Error('Expired authority');
-        dispatched = true;
-        return (
-          options.transport?.run(command) ??
-          execAsync(command, { timeout: 15_000, maxBuffer: MAX_REMOTE_CODEX_STDOUT_BYTES })
-        );
-      };
-      let output: { stdout: string } | 'not-sent' | 'unknown';
-      if (typeof isCurrent !== 'function' && isCurrent.getInputIssuer) {
-        const issuer = isCurrent.getInputIssuer();
-        const input = normalized as unknown as RemoteCodexInputRequest;
-        const rotation = normalized.newInputBroker;
-        const proof = input.expected?.inputProof;
-        let binding: import('./remote-input-broker.js').RemoteWorkerLeaseBinding;
-        if (rotation) {
-          const restart = normalized as unknown as RemoteCodexRestartRequest;
-          binding = {
-            sessionId: restart.sessionId,
-            incarnation: rotation.descriptor.incarnation,
-            conversationId: restart.expectedIdentity.conversationId,
-            action: 'expectedPane' in restart ? 'restart' : 'restore',
-            fullPayloadHash: rotation.descriptor.launchDigest,
-            allowedPhaseHashes: [rotation.descriptor.launchDigest],
-            native: {
-              kind: 'startup',
-              muxSessionId: rotation.pane.sessionId,
-              paneId: rotation.pane.paneId,
-              panePid: rotation.pane.panePid,
-              serverPid: rotation.pane.serverPid,
-            },
-          };
-        } else {
-          if (
-            !input.inputBroker ||
-            !proof ||
-            proof.closed ||
-            !proof.brokerStart ||
-            !proof.childStart ||
-            typeof input.prompt !== 'string'
-          )
-            return 'not-sent';
-          binding = {
-            sessionId: input.sessionId,
-            incarnation: input.inputBroker.incarnation,
-            conversationId: input.expected.conversationId,
-            action: 'input',
-            fullPayloadHash: createHash('sha256').update(input.prompt).digest('hex'),
-            allowedPhaseHashes: remoteInputPhases(input.prompt).map((phase) =>
-              createHash('sha256').update(phase).digest('hex')
-            ),
-            native: {
-              kind: 'input',
-              paneId: input.expected.paneId,
-              brokerPid: proof.brokerPid,
-              childPid: proof.childPid,
-              brokerStart: proof.brokerStart,
-              childStart: proof.childStart,
-            },
-          };
-        }
-        if (!issuer) return 'not-sent';
-        output = await withRemoteBrokerIssuerLease(
-          issuer,
-          binding,
-          { prepare: async () => (await authorityCheck()) === true, isCurrent: synchronouslyCurrent },
-          dispatch,
-          {
-            helper: CODEX_INPUT_BROKER_SOURCE,
-            transport: options.issuerLeaseTransport,
-            durationMs: Math.min(1800, typeof deadline === 'number' ? Math.floor(deadline - Date.now()) : 1800),
+  return runWithRemoteSshLimit(
+    async (retain) => {
+      let dispatched = false;
+      try {
+        // Bare callbacks must be synchronous. Async grants require a separate final token.
+        if (
+          !owned() ||
+          (typeof isCurrent === 'function' && !synchronouslyCurrent()) ||
+          (await authorityCheck()) !== true ||
+          !synchronouslyCurrent()
+        )
+          return 'not-sent';
+        const clock = await (options.transport?.clock(remote) ?? sampleRemoteCodexClock(remote, false));
+        if (!clock) return 'not-sent';
+        const normalized = clockedRequest(request, clock);
+        if (!normalized || (await authorityCheck()) !== true) return 'not-sent';
+        if (Date.now() < clock.localAfter || Date.now() - clock.localAfter > 2000) return 'not-sent';
+        const deadline: unknown = typeof isCurrent === 'function' ? undefined : isCurrent.getActionDeadline?.();
+        if (deadline instanceof Promise) void deadline.catch(() => {});
+        if (
+          deadline !== undefined &&
+          (typeof deadline !== 'number' || !Number.isFinite(deadline) || deadline <= Date.now())
+        )
+          return 'not-sent';
+        normalized.actionDeadline = typeof deadline === 'number' ? deadline + remoteClockOffset(clock).min : undefined;
+        delete normalized.issuerLease;
+        let localBefore = 0;
+        let monotonicBefore = 0;
+        const dispatch = async (claim?: Readonly<RemoteWorkerLeaseClaim>) => {
+          normalized.dispatchClock!.localAt = Date.now();
+          if (Date.now() < clock.localAfter || Date.now() - clock.localAfter > 2000) throw new Error('Expired clock');
+          normalized.issuerLease = claim;
+          const { command, input } = build(remote, normalized);
+          localBefore = Date.now();
+          monotonicBefore = performance.now();
+          if (!owned() || !synchronouslyCurrent() || (typeof deadline === 'number' && deadline <= Date.now()))
+            throw new Error('Expired authority');
+          dispatched = true;
+          return options.transport?.run(command, input) ?? runRemoteCodexStdin(command, input, retain);
+        };
+        let output: { stdout: string } | 'not-sent' | 'unknown';
+        if (typeof isCurrent !== 'function' && isCurrent.getInputIssuer) {
+          const issuer = isCurrent.getInputIssuer();
+          const input = normalized as unknown as RemoteCodexInputRequest;
+          const rotation = normalized.newInputBroker;
+          const proof = input.expected?.inputProof;
+          let binding: import('./remote-input-broker.js').RemoteWorkerLeaseBinding;
+          if (rotation) {
+            const restart = normalized as unknown as RemoteCodexRestartRequest;
+            binding = {
+              sessionId: restart.sessionId,
+              incarnation: rotation.descriptor.incarnation,
+              conversationId: restart.expectedIdentity.conversationId,
+              action: 'expectedPane' in restart ? 'restart' : 'restore',
+              fullPayloadHash: rotation.descriptor.launchDigest,
+              allowedPhaseHashes: [rotation.descriptor.launchDigest],
+              native: {
+                kind: 'startup',
+                muxSessionId: rotation.pane.sessionId,
+                paneId: rotation.pane.paneId,
+                panePid: rotation.pane.panePid,
+                serverPid: rotation.pane.serverPid,
+              },
+            };
+          } else {
+            if (
+              !input.inputBroker ||
+              !proof ||
+              proof.closed ||
+              !proof.brokerStart ||
+              !proof.childStart ||
+              typeof input.prompt !== 'string'
+            )
+              return 'not-sent';
+            binding = {
+              sessionId: input.sessionId,
+              incarnation: input.inputBroker.incarnation,
+              conversationId: input.expected.conversationId,
+              action: 'input',
+              fullPayloadHash: createHash('sha256').update(input.prompt).digest('hex'),
+              allowedPhaseHashes: remoteInputPhases(input.prompt).map((phase) =>
+                createHash('sha256').update(phase).digest('hex')
+              ),
+              native: {
+                kind: 'input',
+                paneId: input.expected.paneId,
+                brokerPid: proof.brokerPid,
+                childPid: proof.childPid,
+                brokerStart: proof.brokerStart,
+                childStart: proof.childStart,
+              },
+            };
           }
-        );
-      } else output = await dispatch();
-      if (typeof output === 'string') return output;
-      const { stdout } = output;
-      const settled = responseClock(stdout, localBefore, monotonicBefore);
-      if (
-        !settled ||
-        !consistentRemoteClock(clock, settled) ||
-        !request.submission?.clock ||
-        !consistentRemoteClock(request.submission.clock, settled)
-      )
-        return 'unknown';
-      return { stdout, clock: settled };
-    } catch {
-      // Clock/grant/build refusal before the mutation child starts certifies no delivery.
-      // A started child can already have typed, restarted or created the exact worker.
-      return dispatched ? 'unknown' : 'not-sent';
+          if (!issuer) return 'not-sent';
+          output = await withRemoteBrokerIssuerLease(
+            issuer,
+            binding,
+            { prepare: async () => (await authorityCheck()) === true, isCurrent: synchronouslyCurrent },
+            dispatch,
+            {
+              helper: CODEX_INPUT_BROKER_SOURCE,
+              transport: options.issuerLeaseTransport,
+              durationMs: Math.min(1800, typeof deadline === 'number' ? Math.floor(deadline - Date.now()) : 1800),
+            }
+          );
+        } else output = await dispatch();
+        if (typeof output === 'string') return output;
+        const { stdout } = output;
+        const settled = responseClock(stdout, localBefore, monotonicBefore);
+        if (
+          !settled ||
+          !consistentRemoteClock(clock, settled) ||
+          !request.submission?.clock ||
+          !consistentRemoteClock(request.submission.clock, settled)
+        )
+          return 'unknown';
+        return { stdout, clock: settled };
+      } catch {
+        // Clock/grant/build refusal before the mutation child starts certifies no delivery.
+        // A started child can already have typed, restarted or created the exact worker.
+        return dispatched ? 'unknown' : 'not-sent';
+      }
+    },
+    {
+      deadline: performance.now() + 15_000,
+      // Object authority tokens may be unset until their first awaited check.
+      // Bare callbacks are already pure and can cancel an unadmitted waiter.
+      ...(typeof isCurrent === 'function' ? { isCurrent: synchronouslyCurrent } : {}),
     }
-  });
+  ).catch((error): 'not-sent' | 'unknown' => (error instanceof RemoteSshAdmissionError ? 'not-sent' : 'unknown'));
 }
 
-export function buildRemoteCodexEvidenceCommand(remote: SessionRemote, request: RemoteCodexEvidenceRequest): string {
-  const payload = Buffer.from(
-    JSON.stringify({ ...request, remoteSessionName: remoteTmuxSessionName(request.sessionId) })
-  ).toString('base64');
-  return remoteCommand(
-    remote,
-    remoteLoginShellCommand(`node -e ${shellescape(REMOTE_CODEX_READER_SOURCE)} ${payload}`)
-  );
+export function buildRemoteCodexEvidenceCommand(
+  remote: SessionRemote,
+  request: RemoteCodexEvidenceRequest
+): RemoteCodexCommand {
+  return requestCommand(remote, { ...request, remoteSessionName: remoteTmuxSessionName(request.sessionId) });
 }
 
 function decodeBoundedBase64(value: unknown, maxBytes: number): Buffer | undefined {
@@ -647,38 +745,42 @@ export function classifyRemoteCodexExecFailure(failure: {
 
 export async function inspectRemoteCodex(
   remote: SessionRemote,
-  request: RemoteCodexEvidenceRequest
+  request: RemoteCodexEvidenceRequest,
+  options: RemoteCodexExecutionOptions = {}
 ): Promise<RemoteCodexEvidence> {
-  if (process.env.VITEST) throw new Error('Remote Codex IO requires an injected fixture under VITEST');
+  if (process.env.VITEST && !options.transport)
+    throw new Error('Remote Codex IO requires an injected fixture under VITEST');
   try {
-    return await runWithRemoteSshLimit(async () => {
-      const clock = await sampleRemoteCodexClock(remote, false);
-      const normalized = clock && clockedRequest(request, clock);
-      if (!normalized) return { transport: 'reachable', session: 'unknown', identity: { reason: 'unreadable' } };
-      const localBefore = Date.now();
-      const monotonicBefore = performance.now();
-      const { stdout } = await execAsync(buildRemoteCodexEvidenceCommand(remote, normalized), {
-        timeout: 15_000,
-        maxBuffer: MAX_REMOTE_CODEX_STDOUT_BYTES,
-      });
-      const settled = responseClock(stdout, localBefore, monotonicBefore);
-      const evidence = parseRemoteCodexEvidence(stdout);
-      if (
-        !settled ||
-        !consistentRemoteClock(clock!, settled) ||
-        !request.submission?.clock ||
-        !consistentRemoteClock(request.submission.clock, settled) ||
-        !evidence
-      )
-        return { transport: 'reachable', session: 'unknown', identity: { reason: 'unreadable' } };
-      if (evidence.transport === 'reachable' && ['missing', 'present'].includes(evidence.session)) {
-        const result = evidence as Extract<RemoteCodexEvidence, { session: 'missing' | 'present' }>;
-        result.clock = settled;
-        if (result.identity.changedAt !== undefined)
-          result.identity.changedAt = remoteToLocal(result.identity.changedAt, settled);
-      }
-      return evidence;
-    });
+    return await runWithRemoteSshLimit(
+      async (retain) => {
+        const clock = await (options.transport?.clock(remote) ?? sampleRemoteCodexClock(remote, false));
+        const normalized = clock && clockedRequest(request, clock);
+        if (!normalized) return { transport: 'reachable', session: 'unknown', identity: { reason: 'unreadable' } };
+        const localBefore = Date.now();
+        const monotonicBefore = performance.now();
+        const { command, input } = buildRemoteCodexEvidenceCommand(remote, normalized);
+        const { stdout } = await (options.transport?.run(command, input) ??
+          runRemoteCodexStdin(command, input, retain));
+        const settled = responseClock(stdout, localBefore, monotonicBefore);
+        const evidence = parseRemoteCodexEvidence(stdout);
+        if (
+          !settled ||
+          !consistentRemoteClock(clock!, settled) ||
+          !request.submission?.clock ||
+          !consistentRemoteClock(request.submission.clock, settled) ||
+          !evidence
+        )
+          return { transport: 'reachable', session: 'unknown', identity: { reason: 'unreadable' } };
+        if (evidence.transport === 'reachable' && ['missing', 'present'].includes(evidence.session)) {
+          const result = evidence as Extract<RemoteCodexEvidence, { session: 'missing' | 'present' }>;
+          result.clock = settled;
+          if (result.identity.changedAt !== undefined)
+            result.identity.changedAt = remoteToLocal(result.identity.changedAt, settled);
+        }
+        return evidence;
+      },
+      { deadline: performance.now() + 15_000 }
+    );
   } catch (error) {
     return classifyRemoteCodexExecFailure(error as { code?: unknown; killed?: boolean; stderr?: unknown });
   }
@@ -710,17 +812,14 @@ function buildRemoteCodexActionCommand(
   remote: SessionRemote,
   request: RemoteCodexEvidenceRequest,
   action: Record<string, unknown>
-): string {
-  const payload = Buffer.from(
-    JSON.stringify({ ...request, remoteSessionName: remoteTmuxSessionName(request.sessionId), action })
-  ).toString('base64');
-  return remoteCommand(
-    remote,
-    remoteLoginShellCommand(`node -e ${shellescape(REMOTE_CODEX_READER_SOURCE)} ${payload}`)
-  );
+): RemoteCodexCommand {
+  return requestCommand(remote, { ...request, remoteSessionName: remoteTmuxSessionName(request.sessionId), action });
 }
 
-export function buildRemoteCodexInputCommand(remote: SessionRemote, request: RemoteCodexInputRequest): string {
+export function buildRemoteCodexInputCommand(
+  remote: SessionRemote,
+  request: RemoteCodexInputRequest
+): RemoteCodexCommand {
   const { expected, prompt, ...evidence } = request;
   const bytes = Buffer.from(prompt, 'utf8');
   if (bytes.length > MAX_REMOTE_CODEX_PROMPT_BYTES || bytes.includes(0) || bytes.toString('utf8') !== prompt) {
@@ -731,9 +830,6 @@ export function buildRemoteCodexInputCommand(remote: SessionRemote, request: Rem
     expected,
     prompt,
   });
-  if (Buffer.byteLength(command, 'utf8') > MAX_REMOTE_CODEX_COMMAND_BYTES) {
-    throw new RangeError('Remote Codex command exceeds the safe shell argument bound');
-  }
   return command;
 }
 
@@ -981,7 +1077,10 @@ function assertExactRemoteResume(request: RemoteCodexRestoreRequest): void {
 }
 
 /** Recreate only the verified missing owned worker, never attach to a concurrent session. */
-export function buildRemoteCodexRestoreCommand(remote: SessionRemote, request: RemoteCodexRestoreRequest): string {
+export function buildRemoteCodexRestoreCommand(
+  remote: SessionRemote,
+  request: RemoteCodexRestoreRequest
+): RemoteCodexCommand {
   assertExactRemoteResume(request);
   const command = buildRemoteCodexPaneCommand({
     remotePath: remote.remotePath,
@@ -1016,7 +1115,10 @@ export async function restoreRemoteCodexWorker(
   return rotateRemoteCodexBroker(remote, request, isCurrent, 'restore', options);
 }
 
-export function buildRemoteCodexRestartCommand(remote: SessionRemote, request: RemoteCodexRestartRequest): string {
+export function buildRemoteCodexRestartCommand(
+  remote: SessionRemote,
+  request: RemoteCodexRestartRequest
+): RemoteCodexCommand {
   assertExactRemoteResume(request);
   const paneCommand = buildRemoteCodexPaneCommand({
     remotePath: remote.remotePath,
