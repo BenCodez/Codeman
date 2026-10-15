@@ -211,7 +211,7 @@ export class SupervisorController {
     return this.enqueue(() =>
       this.deps.withLeases(async () => {
         if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
-        if (!this.state.enabled || !this.state.objective || !this.state.workers.length)
+        if (!this.state.enabled || !this.state.objective.trim() || !this.state.workers.length)
           throw new SupervisorValidationError('Supervisor is not configured');
         if (this.state.phase === 'active') throw new SupervisorValidationError('Supervisor is already active');
         if (this.state.inFlight)
@@ -518,12 +518,18 @@ export class SupervisorController {
       'retry',
       async (worker) => {
         inspected = await worker.recovery.inspect();
-        if (!['crashed', 'interrupted'].includes(inspected.activity) || inspected.circuitOpen || inspected.inFlight)
+        if (inspected.activity !== 'crashed' || inspected.circuitOpen || inspected.inFlight)
           throw new SupervisorValidationError('Worker has no validated retryable crash');
       },
       async (worker, _configured, isCurrent) => {
         if (!isCurrent()) throw new SupervisorOperationRefused('Worker retry was cancelled');
-        const retried = await worker.recovery.retry(isCurrent);
+        // Recovery performs another fresh observation. An interruption there
+        // must not turn the manager's crash retry into a manual continuation.
+        const crashCurrent = Object.assign(
+          () => isCurrent() && worker.recovery.getStatus().activity === 'crashed',
+          isCurrent
+        );
+        const retried = await worker.recovery.retry(crashCurrent);
         if (!isCurrent()) {
           if (retried.inFlight) throw new Error('Worker recovery may have started before cancellation');
           throw new SupervisorOperationRefused('Worker retry was cancelled');

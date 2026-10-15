@@ -84,6 +84,66 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
 
 describe('SupervisorController', () => {
   it.each(
+    ['objective', 'task'].flatMap((field) => [' ', '\r\n ', '\u00a0\u2028\u3000'].map((blank) => ({ field, blank })))
+  )('rejects blank required supervisor $field before mutation or reservation: $blank', async ({ field, blank }) => {
+    const h = harness();
+    await h.controller.configure(config);
+    const before = h.controller.getStatus();
+    vi.mocked(h.deps.persist).mockClear();
+    vi.mocked(h.deps.pauseManager).mockClear();
+    const changed = structuredClone(config);
+    if (field === 'objective') changed.objective = blank;
+    else changed.workers[0].task = blank;
+    expect(() => h.controller.configure(changed)).toThrow();
+    expect(h.controller.getStatus()).toEqual(before);
+    expect(h.controller.getStatus().inFlight).toBeUndefined();
+    expect(h.deps.persist).not.toHaveBeenCalled();
+    expect(h.deps.startManager).not.toHaveBeenCalled();
+    expect(h.deps.pauseManager).not.toHaveBeenCalled();
+    expect(h.worker.task.update).not.toHaveBeenCalled();
+    expect(h.worker.task.resume).not.toHaveBeenCalled();
+  });
+
+  it.each([' ', '\r\n ', '\u00a0\u2028\u3000'])(
+    'refuses a legacy blank manager objective before launch or reservation: %j',
+    async (objective) => {
+      const h = harness();
+      await h.controller.configure(config);
+      const controller = new SupervisorController(h.deps, SUPERVISOR, { ...h.controller.getStatus(), objective });
+      const before = controller.getStatus();
+      vi.mocked(h.deps.persist).mockClear();
+      vi.mocked(h.deps.pauseManager).mockClear();
+      await expect(controller.start()).rejects.toThrow(/not configured/);
+      expect(controller.getStatus()).toEqual(before);
+      expect(controller.getStatus().inFlight).toBeUndefined();
+      expect(h.deps.persist).not.toHaveBeenCalled();
+      expect(h.deps.startManager).not.toHaveBeenCalled();
+      expect(h.deps.pauseManager).not.toHaveBeenCalled();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+    }
+  );
+
+  it('preserves meaningful multiline Unicode supervisor and worker text bytes', async () => {
+    const h = harness();
+    const meaningful = structuredClone(config);
+    meaningful.objective = '  日本語 objective\r\n Preserve 🐈 spacing  ';
+    meaningful.workers[0].task = '  日本語 task\n Keep lines  ';
+    await h.controller.configure(meaningful);
+    expect(h.controller.getStatus()).toMatchObject({
+      objective: meaningful.objective,
+      workers: [{ task: meaningful.workers[0].task }],
+    });
+    await h.controller.start();
+    expect(h.deps.startManager).toHaveBeenCalledWith(
+      meaningful.objective,
+      expect.arrayContaining([expect.objectContaining({ task: meaningful.workers[0].task })]),
+      expect.any(Function),
+      10_000
+    );
+  });
+
+  it.each(
     ['objective', 'task'].flatMap((field) => ['\0', '\x1b', '\x7f', '\x9b'].map((control) => ({ field, control })))
   )(
     'rejects terminal controls in manager $field before changing ownership or dispatching work',
@@ -923,6 +983,79 @@ describe('SupervisorController', () => {
         }
       } finally {
         await pausing;
+        controller.stop();
+        recovery.stop();
+      }
+    }
+  );
+
+  it.each(['interrupted', 'crashed', 'crash-to-interrupted'] as const)(
+    'admits only a reported crash through real manual recovery with automation disabled (%s)',
+    async (activity) => {
+      const act = vi.fn(async (_flight: { action: 'continue' | 'restart' }) => 'sent' as const);
+      let observations = 0;
+      const recovery = new RecoveryController({
+        now: () => 10_000,
+        observe: async () => {
+          const freshActivity =
+            activity === 'crash-to-interrupted' ? (++observations === 1 ? 'crashed' : 'interrupted') : activity;
+          return {
+            activity: freshActivity,
+            reason: freshActivity === 'crashed' ? 'process-crashed' : 'turn-interrupted',
+            at: 10_000,
+            conversationId: WORKER,
+            evidenceKey: `reported-${freshActivity}`,
+            safeToAct: true,
+          };
+        },
+        act,
+        persist: async () => {},
+        changed: () => {},
+      });
+      const base = harness();
+      const controller = new SupervisorController(
+        { ...base.deps, worker: () => ({ ...base.worker, recovery }) },
+        SUPERVISOR
+      );
+      try {
+        await controller.configure(config);
+        await controller.start();
+        const before = controller.getStatus();
+        base.saved.length = 0;
+        const requestId = `request-reported-${activity}`;
+        const retrying = controller.retry(WORKER, requestId);
+        if (activity !== 'crashed') {
+          await expect(retrying).rejects.toThrow(/retryable crash|cancelled|refused/);
+          if (activity === 'interrupted') {
+            expect(controller.getStatus()).toEqual(before);
+            expect(base.saved).toEqual([]);
+          } else {
+            expect(observations).toBe(2);
+            expect(controller.getStatus().workers[0].assignments).toBe(0);
+            expect(controller.getStatus().inFlight).toBeUndefined();
+            expect(controller.getStatus().handledRequestIds).toEqual([]);
+          }
+          expect(recovery.getStatus()).toMatchObject({
+            activity: 'interrupted',
+            attempts: 0,
+            failedAttempts: 0,
+            config: { enabled: false },
+          });
+          expect(recovery.getStatus().pending).toBeUndefined();
+          expect(recovery.getStatus().inFlight).toBeUndefined();
+          expect(act).not.toHaveBeenCalled();
+        } else {
+          await retrying;
+          expect(act).toHaveBeenCalledOnce();
+          expect(act.mock.calls[0][0]).toMatchObject({ action: 'restart' });
+          expect(recovery.getStatus()).toMatchObject({ attempts: 1, config: { enabled: false } });
+          expect(controller.getStatus()).toMatchObject({
+            workers: [{ assignments: 1 }],
+            handledRequestIds: [requestId],
+          });
+          expect(base.saved.some((state) => state.inFlight?.requestId === requestId)).toBe(true);
+        }
+      } finally {
         controller.stop();
         recovery.stop();
       }

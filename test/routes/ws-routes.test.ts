@@ -115,6 +115,10 @@ function isolatedRemoteWsSession() {
   });
   const written = vi.fn();
   Object.assign(session, { ptyProcess: { write: written, resize: vi.fn() } });
+  // These route tests isolate input admission and actual pane lifecycle/epoch
+  // transitions. Native ownership/readiness proof has its own Session suite.
+  vi.spyOn(session, 'confirmRemoteWakeReady').mockResolvedValue(true);
+  vi.spyOn(session, 'isRemoteWakeReadyCurrent').mockReturnValue(true);
   return { session, written };
 }
 function currentClockWitness(): remoteClock.RemoteClockWitness {
@@ -420,6 +424,7 @@ describe('ws-routes', () => {
         session.on('recoveryUserInput', ownerIntent);
         const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
         try {
+          expect(session.inputDispatchAllowed).toBe(false);
           if (transport === 'ws') {
             ws.send(JSON.stringify({ t: 'i', d: 'duplicate', cid: 'applied', seq: 1 }));
             await inputReceived(ws);

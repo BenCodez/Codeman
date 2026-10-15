@@ -1,7 +1,7 @@
 /** @fileoverview Bounded, fail-closed Codex evidence and mutation over the configured SSH transport. */
 import { exec } from 'node:child_process';
 import { promisify } from 'node:util';
-import { isAbsolute } from 'node:path';
+import { isAbsolute, posix } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { deflateRawSync } from 'node:zlib';
 import { createHash } from 'node:crypto';
@@ -701,7 +701,7 @@ async function rotateRemoteCodexBroker(
   };
   const oldInc = request.inputBroker.incarnation;
   const cache = options.cache ?? ownedRemoteBrokerCache;
-  let reserved = false;
+  let reservationAttempted = false;
   try {
     assertExactRemoteResume(request);
     if (!currentRemoteAuthority(authority)) return 'not-sent';
@@ -711,7 +711,26 @@ async function rotateRemoteCodexBroker(
       codexConfig: request.codexConfig,
       codexHome: request.codexHome,
     });
+    const retained = cache.get(sourceScope, oldInc);
+    if (
+      !retained ||
+      Object.keys(retained).length !== Object.keys(request.inputBroker).length ||
+      Object.keys(retained).some(
+        (key) =>
+          retained[key as keyof OwnedRemoteBrokerDescriptor] !==
+          request.inputBroker![key as keyof OwnedRemoteBrokerDescriptor]
+      )
+    )
+      return 'not-sent';
     const material = CodexInputBroker.provisioningMaterial(request.sessionId, command, request.codexHome);
+    // The retained old incarnation pins the exact remote private session root.
+    // A cache failure or cancellation must occur before creating an inert pane.
+    const directory = posix.join(posix.dirname(retained.directory), material.config.incarnation);
+    const descriptor = await cache.prepare(sourceScope, material, directory);
+    if (!descriptor || !currentRemoteAuthority(authority)) return 'not-sent';
+    reservationAttempted = true;
+    if (!(await authority.reserveInputBroker(oldInc, descriptor.incarnation)) || !currentRemoteAuthority(authority))
+      return 'unknown';
     const prepared = await provisionRemoteInputBroker(
       remote,
       {
@@ -722,15 +741,18 @@ async function rotateRemoteCodexBroker(
       },
       { prepare: async () => (await authority.check()) === true, isCurrent: () => currentRemoteAuthority(authority) },
       {
+        root: posix.dirname(posix.dirname(directory)),
         expectedPane: kind === 'restart' ? (request as RemoteCodexRestartRequest).expectedPane : undefined,
         transport: options.provisionTransport,
       }
     );
     if (prepared.status !== 'provisioned') return prepared.status === 'unknown' ? 'unknown' : 'not-sent';
-    const descriptor = await cache.prepare(sourceScope, material, prepared.directory);
-    if (!descriptor || !currentRemoteAuthority(authority)) return 'not-sent';
-    reserved = await authority.reserveInputBroker(oldInc, descriptor.incarnation);
-    if (!reserved || !currentRemoteAuthority(authority)) return 'unknown';
+    if (
+      prepared.directory !== descriptor.directory ||
+      prepared.incarnation !== descriptor.incarnation ||
+      !currentRemoteAuthority(authority)
+    )
+      return 'unknown';
     const finalRequest = { ...request, newInputBroker: { descriptor, pane: prepared.pane } };
     const build = kind === 'restart' ? buildRemoteCodexRestartCommand : buildRemoteCodexRestoreCommand;
     const result = await runRemoteCodexMutation(
@@ -758,7 +780,7 @@ async function rotateRemoteCodexBroker(
       return 'unknown';
     return 'sent';
   } catch {
-    return reserved ? 'unknown' : 'not-sent';
+    return reservationAttempted ? 'unknown' : 'not-sent';
   }
 }
 

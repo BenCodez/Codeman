@@ -12,7 +12,9 @@ const RequestId = z.string().regex(/^[\w:.-]{8,120}$/);
 export const SupervisorWorkerSchema = z
   .object({
     sessionId: SessionId,
-    task: PromptTextSchema.min(1).max(4000),
+    task: PromptTextSchema.min(1)
+      .max(4000)
+      .refine((value) => value.trim().length > 0, 'Worker task must contain non-whitespace text'),
     criteria: CriteriaSchema,
     maxAssignments: z.number().int().min(1).max(10),
     maxRuntimeMs: z.number().int().min(1000).max(86_400_000),
@@ -24,7 +26,9 @@ export const SupervisorWorkerSchema = z
 
 export const SupervisorConfigSchema = z
   .object({
-    objective: PromptTextSchema.min(1).max(3000),
+    objective: PromptTextSchema.min(1)
+      .max(3000)
+      .refine((value) => value.trim().length > 0, 'Supervisor objective must contain non-whitespace text'),
     enabled: z.boolean(),
     workers: z
       .array(SupervisorWorkerSchema.omit({ assignments: true, startedAt: true, lastRequestId: true }))

@@ -230,7 +230,7 @@ describe('owned SSH private broker provisioning', () => {
     'refuses native replacement %s before creating private files',
     async (opponent) => {
       environment.OPPONENT = opponent;
-      expect((await provision()).status).toBe(opponent === 'create-race' ? 'not-sent' : 'unknown');
+      expect((await provision()).status).toBe('unknown');
       await expect(fs.stat(privateRoot)).rejects.toMatchObject({ code: 'ENOENT' });
     }
   );
@@ -591,21 +591,52 @@ assert request['issuer']['directory']==sys.argv[2]
 fd=os.open(os.path.join(sys.argv[2],'lock'),os.O_RDWR|os.O_NOFOLLOW)
 fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
 deadline=time.monotonic()+request['durationMs']/1000
-print(json.dumps({'status':'ready','nonce':request['nonce'],'wallDeadline':int(time.time()*1000+request['durationMs'])}),flush=True)
+assert sys.stdin.buffer.read(1)==b''
+eof_at=time.monotonic()
+# Linux flock locks belong to open file descriptions: a separate open in this
+# process must conflict too, without starting a probe process inside the lease.
+probe_fd=os.open(os.path.join(sys.argv[2],'lock'),os.O_RDWR|os.O_NOFOLLOW)
+blocked=False
+try:
+ try:fcntl.flock(probe_fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+ except BlockingIOError:blocked=True
+finally:os.close(probe_fd)
+blocked_at=time.monotonic()
+assert blocked and eof_at<=blocked_at<deadline
+def trace(name,value):
+ path=os.path.join(sys.argv[2],name)
+ with open(path+'.pending','w') as output:json.dump(value,output)
+ os.replace(path+'.pending',path)
+trace('held',{'eof':True,'blocked':blocked,'eofAt':eof_at,'blockedAt':blocked_at,'deadline':deadline,'durationMs':request['durationMs']})
+print(json.dumps({'status':'ready','nonce':request['nonce'],'wallDeadline':int(time.time()*1000+(deadline-time.monotonic())*1000)}),flush=True)
 while time.monotonic()<deadline:time.sleep(.005)
 os.close(fd)
+trace('released',{'at':time.monotonic(),'deadline':deadline})
 `;
       const environment = { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C.UTF-8' };
-      let finished!: Promise<void>;
-      const transport = createSourceHostLeaseTransport((source, directory) => {
+      let finished: Promise<{ code: number | null; signal: NodeJS.Signals | null }> | undefined;
+      const realTransport = createSourceHostLeaseTransport((source, directory) => {
         if (source !== helper || directory !== root) throw new Error('Fake lease isolation mismatch');
         const child = spawn('/usr/bin/python3', ['-c', source, '--lease', directory], {
           env: environment,
           stdio: ['pipe', 'pipe', 'pipe'],
         });
-        finished = new Promise((resolve) => child.on('close', () => resolve()));
+        finished = new Promise((resolve) => child.on('close', (code, signal) => resolve({ code, signal })));
         return child;
       });
+      let terminateCount = 0;
+      const transport: SourceHostLeaseTransport = {
+        start: (source, directory, input) => {
+          const lease = realTransport.start(source, directory, input);
+          return {
+            ...lease,
+            terminate: () => {
+              terminateCount++;
+              lease.terminate();
+            },
+          };
+        },
+      };
       const probe = () =>
         execFileSync(
           '/usr/bin/python3',
@@ -623,20 +654,29 @@ finally:os.close(fd)
           { env: environment, encoding: 'utf8', timeout: 1000 }
         ).trim();
       try {
+        let dispatchCount = 0;
         expect(
           await withRemoteBrokerIssuerLease(
             f.issuer,
             f.binding,
             authority(),
             async () => {
-              expect(probe()).toBe('locked');
+              dispatchCount++;
               throw new Error('lost SSH reply');
             },
             { helper, transport, durationMs: 500 }
           )
         ).toBe('unknown');
-        expect(probe()).toBe('locked');
-        await finished;
+        expect(dispatchCount).toBe(1);
+        expect(terminateCount).toBe(0);
+        expect(await finished).toEqual({ code: 0, signal: null });
+        const held = JSON.parse(await fs.readFile(join(root, 'held'), 'utf8'));
+        const released = JSON.parse(await fs.readFile(join(root, 'released'), 'utf8'));
+        expect(held).toMatchObject({ eof: true, blocked: true, durationMs: 500 });
+        expect(held.eofAt).toBeLessThanOrEqual(held.blockedAt);
+        expect(held.blockedAt).toBeLessThan(held.deadline);
+        expect(released.deadline).toBe(held.deadline);
+        expect(released.at).toBeGreaterThanOrEqual(held.deadline);
         expect(probe()).toBe('free');
       } finally {
         if (finished) await finished;

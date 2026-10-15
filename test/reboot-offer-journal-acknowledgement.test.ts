@@ -19,11 +19,17 @@ const faults = vi.hoisted(() => ({
   cleanupSync: false,
   cleanupRollback: false,
   cleanupAcknowledgements: 0,
+  archiveSync: false,
+  archiveSwap: false,
 }));
 vi.mock('node:fs', async (original) => {
   const native = await original<typeof import('node:fs')>();
   const sync = (fd: number) => {
     const stat = native.fstatSync(fd);
+    if (faults.archiveSync && faults.renamed.startsWith(`${faults.target}.unacknowledged-`) && stat.isDirectory()) {
+      faults.archiveSync = false;
+      throw new Error('Fixture preserved primary directory acknowledgement failed');
+    }
     if (faults.unlinked && stat.isDirectory()) {
       faults.unlinked = false;
       if (faults.cleanupSync) {
@@ -46,6 +52,11 @@ vi.mock('node:fs', async (original) => {
     return native.fsyncSync(fd);
   };
   const rename = (source: fs.PathLike, target: fs.PathLike) => {
+    if (faults.archiveSwap && String(target).startsWith(`${faults.target}.unacknowledged-`)) {
+      faults.archiveSwap = false;
+      native.renameSync(source, `${source}.fixture-original`);
+      native.writeFileSync(source, 'fixture replacement');
+    }
     native.renameSync(source, target);
     faults.renamed = String(target);
     if (String(target) === `${faults.target}.previous`) faults.unlinked = false;
@@ -111,6 +122,8 @@ beforeEach(() => {
     cleanupSync: false,
     cleanupRollback: false,
     cleanupAcknowledgements: 0,
+    archiveSync: false,
+    archiveSwap: false,
   });
 });
 afterEach(() => {
@@ -121,6 +134,8 @@ afterEach(() => {
     cleanup: false,
     cleanupSync: false,
     cleanupRollback: false,
+    archiveSync: false,
+    archiveSwap: false,
   });
   vi.useRealTimers();
   fs.rmSync(directory, { recursive: true, force: true });
@@ -137,6 +152,101 @@ function reload() {
   registry.configurePersistence(path);
   return registry.list(() => true).map((offer) => offer.sessionId);
 }
+
+it.each(['malformed', 'oversized', 'unreadable', 'missing', 'valid'] as const)(
+  'loads the authoritative shadow before a %s primary and preserves its entry on retry',
+  (kind) => {
+    const { original, bytes } = fixture();
+    fs.writeFileSync(`${path}.previous`, bytes);
+    const primary =
+      kind === 'oversized'
+        ? 'x'.repeat(8 * 1024 * 1024 + 1)
+        : kind === 'valid'
+          ? JSON.stringify({ version: 1, builtAt: Date.now(), entries: [] })
+          : '{private malformed primary';
+    if (kind === 'missing') fs.unlinkSync(path);
+    else fs.writeFileSync(path, primary);
+    faults.reads = kind === 'unreadable';
+    const registry = new RebootRestoreRegistry();
+    registry.configurePersistence(path);
+    expect(registry.list(() => true)).toEqual([original]);
+    expect(registry.clear(() => true)).toBe(1);
+    faults.reads = false;
+    expect(reload()).toEqual([]);
+    expect(fs.existsSync(`${path}.previous`)).toBe(false);
+    const preserved = fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'));
+    expect(preserved).toHaveLength(kind === 'missing' ? 0 : 1);
+    if (kind !== 'missing') {
+      expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe(primary);
+      expect(fs.statSync(join(directory, preserved[0])).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(join(directory, preserved[0], 'primary')).mode & 0o777).toBe(0o600);
+    }
+  }
+);
+
+it('refuses a malformed shadow even when its primary is valid', () => {
+  const { bytes } = fixture();
+  fs.writeFileSync(`${path}.previous`, '{private malformed shadow');
+  const registry = new RebootRestoreRegistry();
+  registry.configurePersistence(path);
+  expect(registry.list(() => true)).toEqual([]);
+  expect(() => registry.set([entry('new')])).toThrow('refusing overwrite');
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe('{private malformed shadow');
+});
+
+it('retains shadow authority and old memory when preserving the primary cannot be acknowledged', () => {
+  const { original, bytes } = fixture();
+  fs.writeFileSync(`${path}.previous`, bytes);
+  const damaged = '{private damaged primary';
+  fs.writeFileSync(path, damaged);
+  const registry = new RebootRestoreRegistry();
+  registry.configurePersistence(path);
+  const [held] = registry.take(() => true, undefined, 'alice');
+  expect(held).toEqual(original);
+  faults.archiveSync = true;
+  expect(() => registry.releaseFlight('alice', [])).toThrow('preserved primary directory acknowledgement failed');
+  expect(registry.isHeld(held, 'alice')).toBe(true);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  expect(reload()).toEqual(['original']);
+  const preserved = fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'));
+  expect(preserved).toHaveLength(1);
+  expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe(damaged);
+  registry.releaseFlight('alice', []);
+  expect(reload()).toEqual([]);
+  expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe(damaged);
+});
+
+it.each(['symlink', 'directory'] as const)('retains the shadow and refuses a nonregular primary: %s', (kind) => {
+  const { original, bytes } = fixture();
+  fs.writeFileSync(`${path}.previous`, bytes);
+  fs.unlinkSync(path);
+  if (kind === 'symlink') fs.symlinkSync(`${path}.previous`, path);
+  else fs.mkdirSync(path);
+  const registry = new RebootRestoreRegistry();
+  registry.configurePersistence(path);
+  expect(registry.list(() => true)).toEqual([original]);
+  expect(() => registry.clear(() => true)).toThrow('unreadable');
+  expect(registry.list(() => true)).toEqual([original]);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  expect(fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'))).toEqual([]);
+});
+
+it('retains shadow authority when the primary is replaced during preservation', () => {
+  const { original, bytes } = fixture();
+  fs.writeFileSync(`${path}.previous`, bytes);
+  const registry = new RebootRestoreRegistry();
+  registry.configurePersistence(path);
+  faults.archiveSwap = true;
+  expect(() => registry.clear(() => true)).toThrow('journal changed');
+  expect(registry.list(() => true)).toEqual([original]);
+  expect(reload()).toEqual(['original']);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  expect(fs.readFileSync(`${path}.fixture-original`, 'utf8')).toBe(bytes);
+  const preserved = fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'));
+  expect(preserved).toHaveLength(1);
+  expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe('fixture replacement');
+});
 
 it.each(['dismiss', 'replace', 'release', 'expire'] as const)(
   'preserves memory and restart-readable old bytes after post-rename failure: %s',

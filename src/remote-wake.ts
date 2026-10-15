@@ -72,9 +72,8 @@ export const REMOTE_WAKE_COMMAND_TIMEOUT_MS = 10_000;
 export const REMOTE_WAKE_ATTACH_SETTLE_MS = 1_500;
 /**
  * Cap on buffered input per session while a host is being woken. 4 KB is a lot
- * of typing for a ~10 s wake; beyond it the OLDEST bytes are dropped (keeping the
- * tail preserves what the user just typed, and a silently unbounded buffer would
- * be a memory leak keyed on user input).
+ * of typing for a ~10 s wake. New overflow is refused before ownership is
+ * acknowledged, preserving every accepted FIFO position within this bound.
  */
 export const REMOTE_WAKE_PENDING_MAX_BYTES = 4096;
 /** Default SSH port used when the host config has no explicit `port`. */
@@ -242,10 +241,19 @@ export function buildMagicPacket(mac: number[]): Buffer {
  */
 export interface WakeableSession {
   readonly id: string;
+  readonly owner?: string;
   readonly remote: WakeableRemote | undefined;
   readonly paneStartedAt?: number;
   /** COD-108 reattach: respawns the local ssh pane, idempotently attaching the durable remote tmux. */
   reattachRemote(): Promise<boolean>;
+  /** Fresh private/native proof for a controlled remote target; TCP reachability alone is insufficient. */
+  confirmRemoteWakeReady?(): Promise<boolean>;
+  /** Pure scope check for the last accepted private target proof. */
+  isRemoteWakeReadyCurrent?(): boolean;
+  /** Stable owner/configuration/incarnation scope across acknowledged buffered writes. */
+  remoteWakeScope?(): string;
+  /** Logical input target, allowing same-conversation broker restore without rebinding buffered bytes. */
+  remoteWakeInputScope?(): { configuration: string; conversationId?: string; incarnation?: string } | undefined;
   /** Write bytes to the session's pane. `fromUser` marks input a person typed (or an agent sent for them). */
   writeViaMux(data: string, options?: { fromUser?: boolean }): Promise<boolean>;
 }
@@ -318,12 +326,23 @@ function hostWakeKey(hostId: string): string {
   return `host:${hostId}`;
 }
 
+/** Buffered owner bytes may cross an explicit broker restore, never an owner or transport target change. */
+function queuedInputScope(session: WakeableSession): string {
+  const { wakeCommand: _command, wakeMac: _mac, label: _label, ...target } = session.remote ?? {};
+  return JSON.stringify([session.owner ?? null, target]);
+}
+
 /** Per-session wake bookkeeping. */
 interface WakeState {
   probedAt: number;
+  /** A failed attachment stays gated even when a later TCP probe succeeds. */
+  attachmentReady?: boolean;
   reachable?: boolean;
   waking: Promise<boolean> | null;
   pending: string[];
+  pendingScope?: string;
+  pendingInputScope?: { configuration: string; conversationId?: string; incarnation?: string };
+  inFlightBytes?: number;
   /** Host config resolved after launch (see `RemoteWakeDeps.resolveRemote`). */
   resolvedRemote?: WakeableRemote;
   resolvedAt: number;
@@ -434,22 +453,37 @@ export class RemoteWakeRegistry {
    */
   async handleInput(session: WakeableSession, data: string): Promise<RemoteInputOutcome> {
     const remote = await this._effectiveRemote(session);
+    const existing = this.states.get(session.id);
+    // Already accepted input owns its FIFO position even if wake configuration
+    // changes or a concurrent probe later reports that TCP is reachable.
+    if (existing?.waking || existing?.pendingScope !== undefined) {
+      const queued = this._enqueue(session, data);
+      if (queued === 'buffered' && !existing.waking && remote && isProbeable(remote) && resolveWakeTarget(remote))
+        void this.wake(session);
+      return queued;
+    }
     // A proxied host can never pass the readiness poll, so buffering for it would hold
     // the bytes for the life of the session (reproduced upstream: three inputs, nothing
     // written, no reattach). Deliver, as if the feature were off.
-    if (remote && !isProbeable(remote)) return 'deliver';
+    if (remote && !isProbeable(remote)) {
+      const existing = this.states.get(session.id);
+      return existing?.attachmentReady === false || existing?.pendingScope !== undefined
+        ? this._enqueue(session, data)
+        : 'deliver';
+    }
     const state = this._state(session.id);
     const target = resolveWakeTarget(remote);
     const action = decideRemoteInputAction({
       hasWakeTarget: target !== null,
       waking: state.waking != null,
       probeAgeMs: Date.now() - state.probedAt,
-      lastReachable: state.reachable,
+      lastReachable: state.attachmentReady === false ? false : state.reachable,
     });
 
-    if (action === 'deliver') return 'deliver';
+    if (action === 'deliver' && state.attachmentReady !== false) return 'deliver';
+    if (state.attachmentReady === false && !target) return this._enqueue(session, data);
     if (action === 'buffer') {
-      const queued = this._enqueue(session.id, data);
+      const queued = this._enqueue(session, data);
       // A buffered verdict with no wake in flight still has to DRIVE a wake (the
       // previous one failed and reset the probe state, or the ladder landed here
       // directly) — otherwise the bytes would sit in the buffer forever.
@@ -460,9 +494,16 @@ export class RemoteWakeRegistry {
     // action === 'probe' — the throttle window elapsed, so one TCP connect is owed.
     state.probedAt = Date.now();
     state.reachable = remote ? await this.deps.probe(remote) : true;
-    if (state.reachable) return 'deliver';
+    if (
+      state.reachable &&
+      state.attachmentReady !== false &&
+      !state.waking &&
+      state.pendingScope === undefined &&
+      state.inFlightBytes === undefined
+    )
+      return 'deliver';
 
-    const queued = this._enqueue(session.id, data);
+    const queued = this._enqueue(session, data);
     void this.wake(session);
     return queued;
   }
@@ -475,11 +516,22 @@ export class RemoteWakeRegistry {
   async ensureAwake(session: WakeableSession, opts: { force?: boolean; timeoutMs?: number } = {}): Promise<boolean> {
     if (this.stopped) return false;
     const remote = await this._effectiveRemote(session);
+    const pendingWake = this.states.get(session.id)?.waking;
+    if (pendingWake) return pendingWake;
     const target = resolveWakeTarget(remote);
-    if (!remote || !target) return true;
+    if (!remote || !target) {
+      const state = this.states.get(session.id);
+      return state?.attachmentReady !== false && state?.pendingScope === undefined;
+    }
     // A proxied host: the send-and-wait path has nothing to gate on (unknown is not
     // asleep), so it delivers; the manual button still wakes, blind (see `wake`).
-    if (!isProbeable(remote)) return opts.force ? this.wake(session, opts) : true;
+    if (!isProbeable(remote))
+      return this.states.get(session.id)?.attachmentReady === false ||
+        this.states.get(session.id)?.pendingScope !== undefined
+        ? false
+        : opts.force
+          ? this.wake(session, opts)
+          : true;
     const state = this._state(session.id);
     // `force` is the manual path (a user pressed "wake"): a cached "reachable" from
     // seconds ago must not talk the button out of waking a host that just slept.
@@ -487,7 +539,8 @@ export class RemoteWakeRegistry {
       state.probedAt = Date.now();
       state.reachable = await this.deps.probe(remote);
     }
-    if (state.reachable) return true;
+    if (state.waking) return state.waking;
+    if (state.reachable && state.attachmentReady !== false && state.pendingScope === undefined) return true;
     // The manual button is pressed from the SAME dashboard the create/attach paths are,
     // so it holds its request open under the same reverse proxy — it needs the request
     // budget, not the 90 s session default (see REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS).
@@ -598,17 +651,22 @@ export class RemoteWakeRegistry {
   async wake(session: WakeableSession, opts: { timeoutMs?: number } = {}): Promise<boolean> {
     if (this.stopped) return false;
     const remote = await this._effectiveRemote(session);
+    const existing = this.states.get(session.id);
+    if (existing?.waking) return existing.waking;
     const target = resolveWakeTarget(remote);
-    if (!remote || !target) return true;
+    if (!remote || !target) return existing?.pendingScope === undefined && existing?.attachmentReady !== false;
     if (!isProbeable(remote)) return this._wakeBlind(remote, target);
     const state = this._state(session.id);
     if (state.waking) return state.waking;
 
     state.waking = (async (): Promise<boolean> => {
       const id = session.id;
+      const remoteScope = JSON.stringify(session.remote);
+      const workerScope = session.remoteWakeScope?.();
       try {
         const ready = await this._wakeAndWait(remote, state, { sessionId: id, timeoutMs: opts.timeoutMs });
         if (!ready) return false;
+        state.attachmentReady = false;
 
         const before = session.paneStartedAt;
         const reattached = await session.reattachRemote();
@@ -616,17 +674,34 @@ export class RemoteWakeRegistry {
           this.deps.log?.(`[RemoteWake] ${remote.label} is up but the pane could not be reattached`);
           return false;
         }
-        this.reattachments.set(session, { before, after: session.paneStartedAt });
+        const after = session.paneStartedAt;
+        await this.deps.delay(REMOTE_WAKE_ATTACH_SETTLE_MS);
+        const scopeCurrent = () =>
+          !this.stopped &&
+          this._queuedInputCurrent(state, session) &&
+          session.paneStartedAt === after &&
+          JSON.stringify(session.remote) === remoteScope &&
+          session.remoteWakeScope?.() === workerScope;
+        const current = () =>
+          scopeCurrent() && (!session.isRemoteWakeReadyCurrent || session.isRemoteWakeReadyCurrent() === true);
+        // A respawn ACK proves only the local SSH wrapper. The durable remote
+        // worker may have disappeared while the host was asleep.
+        if ((session.confirmRemoteWakeReady && (await session.confirmRemoteWakeReady()) !== true) || !current())
+          return false;
+        state.attachmentReady = true;
+        if (!(await this._flush(state, session, current, scopeCurrent))) {
+          state.attachmentReady = false;
+          return false;
+        }
+        this.reattachments.set(session, { before, after });
         // The reset also clears an EXHAUSTED COD-108 backoff, which otherwise
         // never fires again for this session (see remote-reconnect.ts).
         this.deps.noteReconnected?.(id, true);
         this.deps.broadcast?.('remote:sessionReconnected', { sessionId: id });
         this.deps.log?.(`[RemoteWake] ${remote.label} reattached for session ${id}`);
-
-        await this.deps.delay(REMOTE_WAKE_ATTACH_SETTLE_MS);
-        await this._flush(state, session);
         return true;
       } catch (err) {
+        state.attachmentReady = false;
         this.deps.log?.(`[RemoteWake] unexpected failure: ${err instanceof Error ? err.message : String(err)}`);
         return false;
       } finally {
@@ -788,56 +863,92 @@ export class RemoteWakeRegistry {
   }
 
   /** Queue a chunk; `'dropped'` when it was over the cap and never entered the buffer. */
-  private _enqueue(sessionId: string, data: string): 'buffered' | 'dropped' {
+  private _enqueue(session: WakeableSession, data: string): 'buffered' | 'dropped' {
+    const sessionId = session.id;
     const state = this._state(sessionId);
-    const next = appendBoundedPending(state.pending, data);
-    if (next === state.pending) {
-      // Oversized chunk: dropped whole (see `appendBoundedPending`), so the buffer is
-      // untouched and nothing is delivered as a fragment. Logged, and reported to the
-      // route, which answers `dropped:true` — the user's paste is gone and a bare 200
-      // could not say so.
-      this.deps.log?.(
-        `[RemoteWake] dropped a ${Buffer.byteLength(data)}-byte input chunk for session ${sessionId} — over the ${REMOTE_WAKE_PENDING_MAX_BYTES}-byte wake buffer, and a truncated paste must not be delivered as a fragment`
-      );
+    const scope = queuedInputScope(session);
+    if (!this._queuedInputCurrent(state, session)) {
+      this.deps.log?.(`[RemoteWake] input target changed for session ${sessionId} — existing buffered input retained`);
       return 'dropped';
     }
-    const before = state.pending.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0);
-    const after = next.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0);
-    if (before + Buffer.byteLength(data) > after) {
-      this.deps.log?.(`[RemoteWake] pending buffer cap reached for session ${sessionId} — oldest input dropped`);
+    if (
+      (state.inFlightBytes ?? 0) +
+        state.pending.reduce((total, chunk) => total + Buffer.byteLength(chunk), 0) +
+        Buffer.byteLength(data) >
+      REMOTE_WAKE_PENDING_MAX_BYTES
+    ) {
+      this.deps.log?.(`[RemoteWake] buffer capacity reached for session ${sessionId} — new input refused`);
+      return 'dropped';
     }
-    state.pending = next;
+    if (state.pendingScope === undefined) {
+      const logical = session.remoteWakeInputScope?.();
+      state.pendingInputScope = logical ? { ...logical } : undefined;
+    }
+    state.pending = [...state.pending, data];
+    state.pendingScope = scope;
     return 'buffered';
   }
 
-  private async _flush(state: WakeState, session: WakeableSession): Promise<void> {
+  private _queuedInputCurrent(state: WakeState, session: WakeableSession): boolean {
+    if (state.pendingScope === undefined) return true;
+    if (state.pendingScope !== queuedInputScope(session)) return false;
+    const captured = state.pendingInputScope;
+    if (!captured) return session.remoteWakeInputScope?.() === undefined;
+    const current = session.remoteWakeInputScope?.();
+    return (
+      !!current &&
+      current.configuration === captured.configuration &&
+      (captured.conversationId !== undefined
+        ? current.conversationId === captured.conversationId
+        : captured.incarnation !== undefined && current.incarnation === captured.incarnation)
+    );
+  }
+
+  private async _flush(
+    state: WakeState,
+    session: WakeableSession,
+    current: () => boolean,
+    scopeCurrent: () => boolean
+  ): Promise<boolean> {
+    let first = true;
     while (state.pending.length > 0) {
+      // A successful owner write advances its generation and broker counters.
+      // Acquire a fresh proof for the next chunk instead of reusing that token.
+      if (!first && session.confirmRemoteWakeReady && (await session.confirmRemoteWakeReady()) !== true) return false;
+      first = false;
+      if (!current()) return false;
       const chunk = state.pending[0];
-      // Take the chunk OUT before awaiting the write. Input arriving during the await is
-      // enqueued by `handleInput` (a wake is still in flight, so it takes the buffer
-      // path), and `appendBoundedPending` may then drop the OLDEST chunk to stay under
-      // the cap — which would be this one, already on its way to the pane. Shifting
-      // afterwards removed the NEXT chunk instead, so the drop-oldest bookkeeping lost a
-      // chunk that was never written while the log line blamed the one that was.
+      // Remove before awaiting so concurrent enqueue/cap eviction cannot remove
+      // a different, unattempted chunk after this write completes.
       state.pending = state.pending.slice(1);
-      // `fromUser`: these bytes came through the input route as a person's prompt, so
-      // they may name the tab — without it a session whose FIRST prompt was buffered
-      // through a wake could never be auto-named.
-      const ok = await session.writeViaMux(chunk, { fromUser: true }).catch(() => false);
-      if (!ok) {
-        // Drop the rest, and say so. Retaining it looked safer but was worse: the wake
-        // still resolves and marks the host reachable, so the NEXT input takes the
-        // deliver path while the old chunks sit here — to be replayed by the next wake,
-        // possibly hours later, after everything typed since, and maybe ending in a
-        // carriage return. Same policy as the oversized paste: gone, with a log line.
+      state.inFlightBytes = Buffer.byteLength(chunk);
+      let ok: boolean;
+      try {
+        ok = await session.writeViaMux(chunk, { fromUser: true });
+      } catch {
+        // A thrown dispatch may have written bytes. Seal the attempted chunk
+        // and trailing queue; replay could execute an unintended later command.
         const dropped = state.pending.length + 1;
         state.pending = [];
+        state.pendingScope = undefined;
+        state.pendingInputScope = undefined;
         this.deps.log?.(
           `[RemoteWake] flush failed for session ${session.id} — ${dropped} buffered chunk(s) dropped rather than replayed on a later wake`
         );
-        return;
+        return false;
+      } finally {
+        state.inFlightBytes = undefined;
+      }
+      if (!ok) {
+        // Session false is a certified pre-delivery refusal. Its reserved slot
+        // preserves the complete accepted FIFO even with concurrent arrivals.
+        state.pending = [chunk, ...state.pending];
+        return false;
       }
     }
+    state.pendingScope = undefined;
+    state.pendingInputScope = undefined;
+    return scopeCurrent();
   }
 }
 

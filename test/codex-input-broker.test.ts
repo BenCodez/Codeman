@@ -211,10 +211,21 @@ it.each(['malformed', 'expired'] as const)(
 );
 
 it('does not forward direct input when its taint journal cannot be acknowledged', async () => {
-  const { broker, child, bytes } = await fixture();
+  const { broker, child, bytes } = await fixture(0, (source) =>
+    source.replace(
+      'except Exception:\n            # Keep the live child and its output.',
+      "except Exception:\n            if state['tainted']:\n                with open(path + '.taint-refused', 'w') as marker: marker.write('refused')\n            # Keep the live child and its output."
+    )
+  );
   await fs.writeFile(join(broker.directory, 'state.json.next'), 'held fake writer');
   child.stdin.write('Unacknowledged direct bytes');
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await eventually(async () =>
+    fs.stat(join(broker.directory, 'state.json.taint-refused')).then(
+      () => true,
+      () => false
+    )
+  );
+  expect(await fs.readFile(join(broker.directory, 'state.json.next'), 'utf8')).toBe('held fake writer');
   expect((await bytes()).length).toBe(0);
   expect(child.exitCode).toBeNull();
   expect((await broker.readState())?.tainted).toBe(false);
@@ -769,25 +780,45 @@ it('withholds ordered probe proof while an outer owner frame is incomplete', asy
 });
 
 it('holds an exact issuer lease until monotonic expiry even after stdin EOF', async () => {
-  const manager = await fixture(0, undefined, undefined, undefined, CID);
+  const manager = await fixture(
+    0,
+    (source) =>
+      source.replace(
+        'except BlockingIOError:\n                                if time.monotonic() >= end:',
+        "except BlockingIOError:\n                                with open(os.path.join(directory, 'lease-blocked'), 'w') as marker: marker.write('blocked')\n                                while not os.path.exists(os.path.join(directory, 'lease-retry')): time.sleep(.001)\n                                if time.monotonic() >= end:"
+      ),
+    undefined,
+    undefined,
+    CID
+  );
   const authority = manager.broker.authority((await manager.broker.prove(manager.child.pid!))!)!;
   const nonce = '99999999-2222-3333-4444-555555555555';
   const lease = spawn('python3', [join(manager.broker.directory, 'broker.py'), '--lease', manager.broker.directory], {
     stdio: ['pipe', 'pipe', 'pipe'],
   });
   let response = '';
+  const owner = manager.broker.frame('owner-key', 'Blocked during issuer lease')!;
+  let submitted = false;
   lease.stdout.on('data', (bytes) => {
     response += bytes.toString();
+    if (!submitted && response.includes('"status": "ready"')) {
+      submitted = true;
+      manager.child.stdin.write(owner.data);
+    }
   });
   lease.stderr.on('data', () => {});
   const done = new Promise<number | null>((resolve) => lease.on('close', resolve));
   lease.stdin.end(JSON.stringify({ issuer: authority, durationMs: 400, nonce }) + '\n');
-  await eventually(async () => response.includes('"status": "ready"'));
-  const owner = manager.broker.frame('owner-key', 'Blocked during issuer lease')!;
-  manager.child.stdin.write(owner.data);
-  await new Promise((resolve) => setTimeout(resolve, 80));
+  await eventually(async () =>
+    fs.stat(join(manager.broker.directory, 'lease-blocked')).then(
+      () => true,
+      () => false
+    )
+  );
+  expect(submitted).toBe(true);
   expect((await manager.bytes()).length).toBe(0);
   expect(await done).toBe(0);
+  await fs.writeFile(join(manager.broker.directory, 'lease-retry'), 'retry');
   expect(await manager.broker.receipt(owner.receipt)).toBe('sent');
   await eventually(async () => (await manager.bytes()).length === 'Blocked during issuer lease'.length);
 });
@@ -989,51 +1020,87 @@ it('rejects stopped owned children for local input and issuer authority, then ac
   await eventually(async () => (await manager.broker.prove(manager.child.pid!)) !== undefined);
 });
 
-it.each(['worker', 'issuer'] as const)('vetoes clean %s exit during the final private evidence read', async (scope) => {
-  const manager = scope === 'issuer' ? await fixture(0, undefined, undefined, undefined, CID) : undefined;
-  const worker = await fixture(
-    0,
-    (source) =>
-      source.replace(
-        "current, _ = snapshot(witness['path'], witness['maxBytes'])",
-        "if witness['path'].endswith('held-final-evidence'):\n            with open(witness['path'] + '.entered', 'w') as marker: marker.write('entered')\n            time.sleep(.25)\n        current, _ = snapshot(witness['path'], witness['maxBytes'])"
-      ),
-    scope === 'worker'
-      ? (source) =>
-          source.replace(
-            "while not os.path.exists(os.path.join(root, 'stop')):",
-            "import signal\nsignal.signal(signal.SIGHUP, signal.SIG_IGN)\nwhile not os.path.exists(os.path.join(root, 'stop')):\n    if os.path.exists(os.path.join(root, 'exit-parent')):\n        if os.fork(): sys.exit(0)\n        os.unlink(os.path.join(root, 'exit-parent'))"
-          )
-      : undefined
-  );
-  const proof = manager && (await manager.broker.prove(manager.child.pid!))!;
-  const authority = proof && manager!.broker.authority(proof);
-  const path = join(worker.root, 'held-final-evidence');
-  await fs.writeFile(path, 'unchanged');
-  const frame = worker.broker.frame(
-    'auto',
-    'Forbidden clean-exit bytes',
-    CID,
-    authority,
-    [await witness(path)],
-    OWNERS
-  )!;
-  worker.child.stdin.write(frame.data);
-  await eventually(async () =>
-    fs.stat(path + '.entered').then(
-      () => true,
-      () => false
-    )
-  );
-  await fs.writeFile(
-    join(scope === 'issuer' ? manager!.root : worker.root, scope === 'issuer' ? 'stop' : 'exit-parent'),
-    'exit'
-  );
-  const receipt = await worker.broker.receipt(frame.receipt);
-  expect(['not-sent', 'unknown']).toContain(receipt);
-  expect((await worker.bytes()).length).toBe(0);
-  expect(worker.child.exitCode).toBeNull();
-});
+it.each((['worker', 'issuer'] as const).flatMap((scope) => [false, true].map((exited) => ({ scope, exited }))))(
+  'rechecks clean $scope exit=$exited after the held final private evidence read',
+  async ({ scope, exited }) => {
+    const manager = scope === 'issuer' ? await fixture(0, undefined, undefined, undefined, CID) : undefined;
+    const worker = await fixture(
+      0,
+      (source) =>
+        source.replace(
+          "current, _ = snapshot(witness['path'], witness['maxBytes'])",
+          "if witness['path'].endswith('held-final-evidence'):\n            with open(witness['path'] + '.entered', 'w') as marker: marker.write('entered')\n            while not os.path.exists(witness['path'] + '.release'): time.sleep(.001)\n        current, _ = snapshot(witness['path'], witness['maxBytes'])"
+        ),
+      scope === 'worker'
+        ? (source) =>
+            source.replace(
+              "while not os.path.exists(os.path.join(root, 'stop')):",
+              "import signal\nsignal.signal(signal.SIGHUP, signal.SIG_IGN)\nwhile not os.path.exists(os.path.join(root, 'stop')):\n    if os.path.exists(os.path.join(root, 'exit-parent')):\n        if os.fork(): sys.exit(0)\n        os.unlink(os.path.join(root, 'exit-parent'))"
+            )
+        : undefined
+    );
+    const proof = manager && (await manager.broker.prove(manager.child.pid!))!;
+    const authority = proof && manager!.broker.authority(proof);
+    const target = manager ?? worker;
+    const originalChild = (await target.broker.readState())!;
+    expect(originalChild.closed).toBe(false);
+    expect(originalChild.childPid).toBeGreaterThan(0);
+    expect(originalChild.childStart).toMatch(/^[1-9]\d*$/);
+    const nativeChild = async () => {
+      const stat = await fs.readFile(`/proc/${originalChild.childPid}/stat`, 'utf8');
+      const fields = stat
+        .slice(stat.lastIndexOf(') ') + 2)
+        .trim()
+        .split(/\s+/);
+      return { birth: fields[19], state: fields[0] };
+    };
+    expect(await nativeChild()).toMatchObject({ birth: originalChild.childStart });
+    expect(['Z', 'X', 'x']).not.toContain((await nativeChild()).state);
+    const path = join(worker.root, 'held-final-evidence');
+    await fs.writeFile(path, 'unchanged');
+    const text = 'Guarded clean-exit bytes';
+    const deadline = Number(process.hrtime.bigint() / 1_000_000n) + 2_000;
+    const frame = worker.broker.frame('auto', text, CID, authority, [await witness(path)], OWNERS, [], [], deadline)!;
+    worker.child.stdin.write(frame.data);
+    await eventually(async () =>
+      fs.stat(path + '.entered').then(
+        () => true,
+        () => false
+      )
+    );
+    expect((await worker.broker.readState())?.receipts).toContainEqual(
+      expect.objectContaining({ nonce: frame.receipt.nonce, status: 'reserved' })
+    );
+    try {
+      if (exited) {
+        await fs.writeFile(join(target.root, scope === 'issuer' ? 'stop' : 'exit-parent'), 'exit');
+        // The held evidence job need not let the broker publish its exit journal yet.
+        // Observe actual death of the exact native PID/birth before releasing that job.
+        await eventually(async () => {
+          try {
+            const current = await nativeChild();
+            return current.birth === originalChild.childStart && ['Z', 'X', 'x'].includes(current.state);
+          } catch (error) {
+            return (error as NodeJS.ErrnoException).code === 'ENOENT';
+          }
+        });
+      }
+      expect(Number(process.hrtime.bigint() / 1_000_000n)).toBeLessThan(deadline);
+    } finally {
+      await fs.writeFile(path + '.release', 'release');
+    }
+    const receipt = await worker.broker.receipt(frame.receipt);
+    if (exited) {
+      expect(['not-sent', 'unknown']).toContain(receipt);
+      expect((await worker.bytes()).length).toBe(0);
+    } else {
+      expect(receipt).toBe('sent');
+      await eventually(async () => (await worker.bytes()).length === text.length);
+      expect((await worker.bytes()).toString()).toBe(text);
+    }
+    expect(worker.child.exitCode).toBeNull();
+  }
+);
 
 it('refuses an unchanged automatic frame after its signed original monotonic expiry', async () => {
   const { broker, child, bytes } = await fixture();

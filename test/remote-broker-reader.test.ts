@@ -2,7 +2,12 @@ import { afterEach, expect, it } from 'vitest';
 import fs from 'node:fs/promises';
 import { createHash, randomUUID } from 'node:crypto';
 import { remoteSourceIssuer } from './helpers/remote-source-issuer.js';
-import { deliverRemoteCodexInput } from '../src/recovery/remote-codex.js';
+import {
+  buildRemoteCodexInputCommand,
+  deliverRemoteCodexInput,
+  parseRemoteCodexInputResult,
+} from '../src/recovery/remote-codex.js';
+import type { BrokerReceipt } from '../src/recovery/codex-input-broker.js';
 import { remoteBrokerReaderFixture } from './mocks/remote-broker-reader-fixture.js';
 
 const fixtures: Awaited<ReturnType<typeof remoteBrokerReaderFixture>>[] = [];
@@ -13,6 +18,51 @@ async function fixture() {
   const f = await remoteBrokerReaderFixture();
   fixtures.push(f);
   return f;
+}
+
+/** Wait for actual fixture publication, without assuming a number of I/O turns. */
+async function waitFor(check: () => Promise<boolean>): Promise<void> {
+  const end = performance.now() + 3000;
+  while (!(await check())) {
+    if (performance.now() >= end) throw Error('Disposable broker did not publish the expected stage');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+async function refusedEnter(f: Awaited<ReturnType<typeof fixture>>, prompt: string): Promise<void> {
+  await waitFor(() =>
+    fs.access(f.root + '/enter-expiry-forwarded').then(
+      () => true,
+      () => false
+    )
+  );
+  const records = (await fs.readFile(f.root + '/enter-expiry-forwarded', 'utf8')).trim().split('\n');
+  expect(records).toHaveLength(1);
+  const forwarded = JSON.parse(records[0]) as {
+    literal: BrokerReceipt;
+    counter: number;
+    nonce: string;
+    hash: string;
+    forwarded: number;
+    before: number;
+    expiry: number;
+    packetDeadline: number;
+  };
+  expect(forwarded.literal).toMatchObject({ channel: 'auto', counter: 1, status: 'sent' });
+  expect(forwarded.before).toBeLessThan(forwarded.expiry);
+  expect(forwarded.forwarded).toBeGreaterThanOrEqual(forwarded.expiry);
+  expect(forwarded.counter).toBe(2);
+  let receipt: BrokerReceipt | undefined;
+  await waitFor(async () => {
+    const state = await f.broker.readState();
+    receipt = state?.receipts.find((entry) => entry.nonce === forwarded.nonce);
+    return receipt !== undefined && receipt.status !== 'reserved';
+  });
+  // A missing deadline guard must fail with actual child CR, not a timing-only assertion.
+  if (receipt?.status === 'sent') await waitFor(async () => (await f.bytes()).equals(Buffer.from(prompt + '\r')));
+  expect((await f.bytes()).toString()).toBe(prompt);
+  expect(receipt).toMatchObject({ channel: 'auto', counter: 2, hash: forwarded.hash, status: 'not-sent' });
+  expect(receipt?.deliveredAt).toBeUndefined();
+  expect((await f.broker.readState())?.counters.auto).toBe(2);
 }
 
 it('probes the actual child and delivers literal text plus actual child Enter once', async () => {
@@ -194,21 +244,26 @@ it('pins the final private configuration before any child command executes', asy
 // The native command has accepted a signed frame, but Python has not consumed it.
 // Its fixed packet expiry must include the original action budget.
 it.each([
-  { label: 'within', delay: '0.05', budget: 1500, sent: true },
-  { label: 'after', delay: '0.65', budget: 600, sent: false },
-])('queued Enter $label the action deadline preserves child-boundary authority', async ({ delay, budget, sent }) => {
+  { label: 'within', sent: true },
+  { label: 'after', sent: false },
+])('queued Enter $label the action deadline preserves child-boundary authority', async ({ sent }) => {
   const f = await fixture();
-  await f.marker('enter-delay', delay);
-  const result = await f.input('deadline text', (q) => {
-    q.actionDeadline = Date.now() + budget;
-  });
-  if (sent) expect(result.result).toMatchObject({ status: 'sent' });
-  else {
+  const q = await f.inputRequest('deadline text');
+  q.actionDeadline = Date.now() + 1500;
+  // Wait for this fixed ACTION boundary only after the literal sent receipt
+  // and actual child bytes. Deriving it from the packet could mask a missing clamp.
+  if (!sent) await f.marker('expire-enter', JSON.stringify({ prompt: q.prompt, actionDeadline: q.actionDeadline }));
+  const wire = await f.run(buildRemoteCodexInputCommand(f.remote, q));
+  const result = { ...wire, result: parseRemoteCodexInputResult(wire.stdout) };
+  if (sent) {
+    expect(result.result).toMatchObject({ status: 'sent' });
+    await waitFor(async () => (await f.bytes()).equals(Buffer.from('deadline text\r')));
+  } else {
     expect(result.failed).toBe(true);
     expect(result.result).toBeUndefined();
+    await refusedEnter(f, 'deadline text');
   }
-  await new Promise((r) => setTimeout(r, 150));
-  // Polling cannot turn the delayed control frame into an extra literal send.
+  // Expiry can never turn the held control frame into an extra literal phase.
   expect((await f.bytes()).toString()).toBe('deadline text' + (sent ? '\r' : ''));
 });
 
@@ -220,7 +275,7 @@ it.each(['healthy', 'manager-journal', 'worker-progress', 'owner-input', 'native
     try {
       const prompt = 'leased worker input',
         q = await f.inputRequest(prompt);
-      if (change === 'expired-enter') await f.marker('enter-delay', '0.65');
+      if (change === 'expired-enter') await f.marker('expire-enter', JSON.stringify({ prompt }));
       if (change === 'manager-journal') await fs.appendFile(manager.broker.directory + '/state.json', ' ');
       if (change === 'native-replaced') f.env.NATIVE_BEFORE_EFFECT = 'pid';
       let wireCalls = 0;
@@ -236,7 +291,14 @@ it.each(['healthy', 'manager-journal', 'worker-progress', 'owner-input', 'native
             if (change === 'worker-progress') await fs.appendFile(f.rollout, ' ');
             if (change === 'owner-input') {
               f.worker.stdin.write('owner raw draft');
-              await new Promise((r) => setTimeout(r, 20));
+              await waitFor(async () => {
+                const state = await f.broker.readState();
+                return (
+                  state?.tainted === true &&
+                  state.rawGeneration > q.expected.inputProof!.rawGeneration &&
+                  (await f.bytes()).equals(Buffer.from('owner raw draft'))
+                );
+              });
             }
             return run(command);
           },
@@ -249,18 +311,17 @@ it.each(['healthy', 'manager-journal', 'worker-progress', 'owner-input', 'native
           check: async () => true,
           isCurrent: () => true,
           getInputIssuer: () => manager.issuer,
-          ...(change === 'expired-enter' ? { getActionDeadline: () => Date.now() + 600 } : {}),
         },
         options
       );
-      await new Promise((r) => setTimeout(r, 150));
       if (change === 'healthy') {
+        await waitFor(async () => (await f.bytes()).equals(Buffer.from(prompt + '\r')));
         expect(result).toMatchObject({ status: 'sent' });
         expect((await f.bytes()).toString()).toBe(prompt + '\r');
         expect(wireCalls).toBe(1);
       } else if (change === 'expired-enter') {
         expect(result).toEqual({ status: 'unknown' });
-        expect((await f.bytes()).toString()).toBe(prompt);
+        await refusedEnter(f, prompt);
         expect(wireCalls).toBe(1);
       } else {
         expect(result.status).not.toBe('sent');

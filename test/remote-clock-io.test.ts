@@ -47,6 +47,8 @@ let material: ReturnType<typeof CodexInputBroker.provisioningMaterial>;
 let cache: OwnedRemoteBrokerCache;
 let root: string;
 const provision = vi.fn();
+const reserve = vi.fn();
+const scope = () => ({ sessionId: SID, remote, workingDir: remote.remotePath, codexHome: '/fixture/codex' });
 function privateProof(closed = false) {
   const directory = '/fixture/private/' + SID + '/' + material.config.incarnation;
   const state: CodexBrokerState = {
@@ -123,7 +125,7 @@ function options(): RemoteCodexExecutionOptions {
 function scopedAuthority(authority: RemoteCodexActionAuthority) {
   return {
     ...(typeof authority === 'function' ? { check: authority, isCurrent: authority } : authority),
-    reserveInputBroker: async () => true,
+    reserveInputBroker: reserve,
     commitInputBroker: async () => true,
   };
 }
@@ -215,10 +217,27 @@ beforeEach(async () => {
   root = await mkdtemp(join(homedir(), 'remote-clock-admission-'));
   cache = new OwnedRemoteBrokerCache(join(root, 'cache'));
   material = CodexInputBroker.provisioningMaterial(SID, 'exec fixture-owned-worker', '/fixture/codex');
+  const retained = privateProof().descriptor;
+  expect(await cache.prepare(scope(), material, retained.directory)).toEqual(retained);
+  reserve.mockReset().mockImplementation(async (oldInc: string, newInc: string) => {
+    expect(oldInc).toBe(retained.incarnation);
+    expect(newInc).not.toBe(oldInc);
+    expect(cache.get(scope(), oldInc)).toEqual(retained);
+    expect(cache.get(scope(), newInc)?.incarnation).toBe(newInc);
+    // The source reservation ACK precedes any remote filesystem/native effect.
+    await writeFile(join(root, 'pending-incarnation.json'), JSON.stringify({ oldInc, newInc }));
+    return true;
+  });
   fixture.exec.mockReset();
   validExec();
   provision.mockReset().mockImplementation(async (_command: string, input: string) => {
     const planned = JSON.parse(input).material;
+    expect(JSON.parse(await readFile(join(root, 'pending-incarnation.json'), 'utf8'))).toEqual({
+      oldInc: material.config.incarnation,
+      newInc: planned.incarnation,
+    });
+    expect(cache.get(scope(), material.config.incarnation)).toEqual(retained);
+    expect(cache.get(scope(), planned.incarnation)?.incarnation).toBe(planned.incarnation);
     return {
       stdout:
         'CODEMAN_REMOTE_BROKER_V1:' +
@@ -235,6 +254,7 @@ beforeEach(async () => {
   });
 });
 afterEach(async () => {
+  vi.restoreAllMocks();
   await rm(root, { recursive: true, force: true });
 });
 
@@ -265,6 +285,7 @@ describe('shared queued SSH mutations', () => {
       }
       expect(await pending).toEqual(kind === 'input' ? { status: 'not-sent' } : 'not-sent');
       expect(authority).toHaveBeenCalled();
+      expect(reserve).toHaveBeenCalledTimes(kind === 'input' ? 0 : 1);
       expect(provision).not.toHaveBeenCalled();
       expect(fixture.exec).not.toHaveBeenCalled();
     }
@@ -290,8 +311,22 @@ describe('shared queued SSH mutations', () => {
       expect(await mutations[kind](remote, request(60_000, kind), { check, isCurrent: () => current })).toEqual(
         kind === 'input' ? { status: 'not-sent' } : 'not-sent'
       );
+      expect(reserve).toHaveBeenCalledTimes(kind === 'input' ? 0 : 1);
+      expect(provision).toHaveBeenCalledTimes(kind === 'input' ? 0 : 1);
       expect(fixture.exec).toHaveBeenCalledOnce();
       expect(fixture.exec.mock.calls[0][0]).toContain('CODEMAN_REMOTE_CLOCK_V1');
+    }
+  );
+  it.each(['missing', 'mismatched'] as const)(
+    'refuses %s retained source material before reserving or dispatching a rotation',
+    async (fault) => {
+      const q = request(60_000, 'restart');
+      if (fault === 'missing') vi.spyOn(cache, 'get').mockReturnValue(undefined);
+      else q.inputBroker.homeDigest = 'b'.repeat(64);
+      expect(await mutations.restart(remote, q)).toBe('not-sent');
+      expect(reserve).not.toHaveBeenCalled();
+      expect(provision).not.toHaveBeenCalled();
+      expect(fixture.exec).not.toHaveBeenCalled();
     }
   );
   it('refuses a Promise-returning bare authority callback without a synchronous final token', async () => {
@@ -314,6 +349,8 @@ describe('shared queued SSH mutations', () => {
       expect(await mutations[kind](remote, request(60_000, kind), { check: authority, isCurrent: () => true })).toEqual(
         kind === 'input' ? { status: 'not-sent' } : 'not-sent'
       );
+      expect(reserve).toHaveBeenCalledTimes(kind === 'input' ? 0 : 1);
+      expect(provision).toHaveBeenCalledTimes(kind === 'input' ? 0 : 1);
       expect(fixture.exec).toHaveBeenCalledOnce();
       expect(fixture.exec.mock.calls[0][0]).toContain('CODEMAN_REMOTE_CLOCK_V1');
     }
