@@ -2,10 +2,10 @@
 import fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { OwnedRemoteBrokerCache, type OwnedRemoteBrokerScope } from '../src/recovery/remote-input-broker-cache.js';
-import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
+import { CodexInputBroker, type CodexBrokerState } from '../src/recovery/codex-input-broker.js';
 let root: string;
 beforeEach(async () => {
   root = await fs.mkdtemp(join(tmpdir(), 'broker-private-cleanup-'));
@@ -52,6 +52,158 @@ function barrier() {
   });
   return { promise, release };
 }
+function witnessedSigner(f: ReturnType<typeof fixture>, material = f.material) {
+  const state: CodexBrokerState = {
+    version: 1,
+    sessionId: f.scope.sessionId,
+    incarnation: material.config.incarnation,
+    pid: 700,
+    childPid: 701,
+    brokerStart: '12345',
+    childStart: '12346',
+    tainted: false,
+    rawGeneration: 0,
+    launchDigest: material.config.launchDigest,
+    homeDigest: material.config.homeDigest,
+    closed: false,
+    exitStatus: null,
+    exitSignal: null,
+    counters: { 'owner-pty': 0, 'owner-key': 0, 'owner-mux': 0, auto: 0, probe: 0 },
+    receipts: [],
+    startup: { nonce: material.config.startup.nonce, status: 'started' },
+  };
+  const serialized = JSON.stringify(state);
+  expect(
+    f.cache.observe(
+      f.scope,
+      material.config.incarnation,
+      serialized,
+      {
+        path: '/worker/brokers/' + f.scope.sessionId + '/' + material.config.incarnation + '/state.json',
+        dev: 1,
+        ino: 2,
+        size: Buffer.byteLength(serialized),
+        mtimeMs: 3,
+        ctimeMs: 4,
+        hash: createHash('sha256').update(serialized).digest('hex'),
+        maxBytes: 98304,
+      },
+      700
+    )
+  ).toBeDefined();
+  const signer = f.cache.signer(f.scope, material.config.incarnation)!;
+  expect(signer.canFrame).toBe(true);
+  return signer;
+}
+it.each([false, true])(
+  'makes bounded progress across 130 rotations with retained foreign artifact=%s',
+  async (foreign) => {
+    const f = fixture(),
+      other = fixture();
+    expect(await f.prepare()).toBeDefined();
+    expect(await other.prepare()).toBeDefined();
+    const otherBytes = await fs.readFile(other.file),
+      incarnations = [f.material.config.incarnation];
+    let active = f.material;
+    for (let index = 1; index < 130; index++) {
+      active = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec rotation-' + index, f.scope.codexHome);
+      expect(
+        await f.cache.prepare(f.scope, active, '/worker/brokers/' + f.scope.sessionId + '/' + active.config.incarnation)
+      ).toBeDefined();
+      incarnations.push(active.config.incarnation);
+      expect(f.cache.activate(f.scope, active.config.incarnation)).toBe(true);
+    }
+    const signer = witnessedSigner(f, active),
+      sessionRoot = join(f.cacheRoot, f.scope.sessionId),
+      unknown = randomUUID(),
+      artifact = join(sessionRoot, unknown, 'owner.txt');
+    if (foreign) {
+      await fs.mkdir(join(sessionRoot, unknown), { mode: 0o700 });
+      await fs.writeFile(artifact, 'unrecognized owner bytes', { mode: 0o600 });
+    }
+    const deleting = f.cache.retireAndDelete(f.scope.sessionId, () => true);
+    // Final deletion revokes held signers synchronously, even before the bounded
+    // first pass completes or a later process retries the remaining disk work.
+    expect(signer.canFrame).toBe(false);
+    expect(f.cache.signer(f.scope, active.config.incarnation)).toBeUndefined();
+    expect(await deleting).toBe(false);
+    const remaining = await fs.readdir(sessionRoot);
+    expect(remaining.length).toBeGreaterThan(0);
+    expect(remaining.length).toBeLessThan(incarnations.length);
+    const restarted = new OwnedRemoteBrokerCache(f.cacheRoot);
+    expect(await restarted.retireAndDelete(f.scope.sessionId, () => true)).toBe(!foreign);
+    expect(await fs.readdir(sessionRoot)).toEqual(foreign ? [unknown] : []);
+    if (foreign) {
+      expect(await restarted.retireAndDelete(f.scope.sessionId, () => true)).toBe(false);
+      expect(await fs.readFile(artifact, 'utf8')).toBe('unrecognized owner bytes');
+    }
+    for (const incarnation of incarnations)
+      await expect(fs.lstat(join(sessionRoot, incarnation))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await restarted.load(f.scope, active.config.incarnation)).toBeUndefined();
+    expect(signer.frame('owner-mux', 'retired signer cannot submit')).toBeUndefined();
+    expect(await fs.readFile(other.file)).toEqual(otherBytes);
+    expect(other.cache.get(other.scope, other.material.config.incarnation)).toBeDefined();
+  }
+);
+it.each(['file', 'directory', 'missing-private'] as const)(
+  'retains an unknown %s in an incarnation and refuses to certify its cleanup on retry',
+  async (foreign) => {
+    const f = fixture();
+    expect(await f.prepare()).toBeDefined();
+    const signer = witnessedSigner(f),
+      incarnationRoot = join(f.cacheRoot, f.scope.sessionId, f.material.config.incarnation),
+      artifact = join(incarnationRoot, 'unrelated');
+    if (foreign === 'file') await fs.writeFile(artifact, 'foreign owner bytes', { mode: 0o600 });
+    else if (foreign === 'directory') await fs.mkdir(artifact, { mode: 0o700 });
+    else await fs.unlink(f.file);
+    const before = await fs.lstat(incarnationRoot);
+    expect(await f.cache.retireAndDelete(f.scope.sessionId, () => true)).toBe(false);
+    expect(signer.canFrame).toBe(false);
+    const restarted = new OwnedRemoteBrokerCache(f.cacheRoot);
+    expect(await restarted.retireAndDelete(f.scope.sessionId, () => true)).toBe(false);
+    expect(await fs.lstat(incarnationRoot)).toMatchObject({ dev: before.dev, ino: before.ino });
+    if (foreign === 'file') expect(await fs.readFile(artifact, 'utf8')).toBe('foreign owner bytes');
+    if (foreign === 'directory') expect((await fs.lstat(artifact)).isDirectory()).toBe(true);
+  }
+);
+it.each(['caller', 'same-inode-metadata', 'directory-replacement', 'symlink-replacement'] as const)(
+  'refuses incarnation removal after %s changes during the emptied directory proof close',
+  async (fault) => {
+    const f = fixture();
+    expect(await f.prepare()).toBeDefined();
+    const incarnationRoot = join(f.cacheRoot, f.scope.sessionId, f.material.config.incarnation),
+      artifact = join(incarnationRoot, 'foreign');
+    let current = true,
+      changed = false;
+    const open = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (args[0] === incarnationRoot) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => {
+          await close();
+          if (changed) return;
+          changed = true;
+          if (fault === 'caller') current = false;
+          else if (fault === 'same-inode-metadata') await fs.writeFile(artifact, 'foreign bytes', { mode: 0o600 });
+          else {
+            await fs.rename(incarnationRoot, incarnationRoot + '.old');
+            if (fault === 'directory-replacement') await fs.mkdir(incarnationRoot, { mode: 0o700 });
+            else await fs.symlink(incarnationRoot + '.old', incarnationRoot);
+          }
+        };
+      }
+      return handle;
+    });
+    const rmdir = vi.spyOn(fs, 'rmdir');
+    expect(await f.cache.retireAndDelete(f.scope.sessionId, () => current)).toBe(false);
+    expect(changed).toBe(true);
+    expect(rmdir).not.toHaveBeenCalled();
+    const retained = await fs.lstat(incarnationRoot);
+    expect(retained.isSymbolicLink()).toBe(fault === 'symlink-replacement');
+    if (fault === 'same-inode-metadata') expect(await fs.readFile(artifact, 'utf8')).toBe('foreign bytes');
+  }
+);
 it('removes exact current and superseded local private material, preserving unrelated session bytes', async () => {
   const f = fixture(),
     other = fixture();

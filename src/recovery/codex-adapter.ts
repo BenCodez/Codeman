@@ -540,7 +540,10 @@ export class CodexRecoveryAdapter {
       if (!pane.dead && (pane.status !== undefined || pane.signal !== undefined)) return unknown('pane-unverified');
       let observation: RecoveryObservation;
       if (pane.dead) {
-        if (pane.status === 0 && !pane.signal) {
+        if (
+          (inputProof.closed && inputProof.exitStatus === 0 && !inputProof.exitSignal) ||
+          (pane.status === 0 && !pane.signal)
+        ) {
           observation = {
             activity: 'exited',
             reason: 'clean-exit',

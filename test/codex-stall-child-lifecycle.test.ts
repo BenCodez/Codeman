@@ -651,7 +651,61 @@ async function remoteFixture(
   };
 }
 
+function setRemoteBrokerCleanExit(evidence: RemoteCodexEvidence) {
+  const original = evidence.inputBroker!;
+  const state = JSON.parse(original.serialized) as CodexBrokerState;
+  Object.assign(state, { closed: true, exitStatus: 0, exitSignal: null });
+  const serialized = JSON.stringify(state);
+  evidence.inputBroker = {
+    ...original,
+    serialized,
+    witness: {
+      ...original.witness,
+      size: Buffer.byteLength(serialized),
+      hash: createHash('sha256').update(serialized).digest('hex'),
+    },
+  };
+}
+
 describe('actual remote adapter uses the same child lifecycle veto', () => {
+  it.each(['initial-observation', 'scheduled-recheck'] as const)(
+    'does not charge a remote stall restart after a clean broker child exit at %s',
+    async (stage) => {
+      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+      try {
+        // The fixture first proves that this exact owned broker and abnormal
+        // outer pane qualify. Only the private child exit changes below.
+        expect(f.evidence.pane).toMatchObject({ dead: true, status: 9 });
+        if (stage === 'scheduled-recheck') {
+          vi.setSystemTime(CHILD_NOW + 15_000);
+          await f.controller.refresh();
+          vi.setSystemTime(CHILD_NOW + 17_000);
+          await f.controller.refresh();
+          expect(f.controller.getStatus().pending).toMatchObject({ reason: 'stalled' });
+          expect(f.controller.getStatus().attempts).toBe(0);
+        }
+        setRemoteBrokerCleanExit(f.evidence);
+        const clean = await f.adapter.observe();
+        expect(clean).toMatchObject({ activity: 'exited', reason: 'clean-exit', safeToAct: false });
+        expect(clean.stallRestartable).toBeUndefined();
+        for (const elapsed of [18_000, 20_000, 21_000]) {
+          vi.setSystemTime(CHILD_NOW + elapsed);
+          await f.controller.refresh();
+        }
+        expect(f.controller.getStatus()).toMatchObject({ attempts: 0, lastReason: 'clean-exit' });
+        expect(f.controller.getStatus().pending).toBeUndefined();
+        expect(f.controller.getStatus().nextRetryAt).toBeUndefined();
+        expect(f.controller.getStatus().inFlight).toBeUndefined();
+        expect(f.store.get(f.session.id).attempts).toBe(0);
+        expect(f.deps.restartRemote).not.toHaveBeenCalled();
+        expect(f.deps.deliverRemote).not.toHaveBeenCalled();
+        expect(f.delivered).not.toHaveBeenCalled();
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+
   it.each(['missing', 'malformed', 'tainted', 'incomplete-head', 'wrong-incarnation'] as const)(
     'preserves an explicitly %s remote broker override as non-actionable',
     async (fault) => {
@@ -1149,45 +1203,55 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
     }
   });
 
-  it.each(['unchanged', 'pane', 'progress', 'owner-input', 'grants', 'cancellation'] as const)(
-    'rechecks %s immediately before remote stalled dispatch',
-    async (veto) => {
-      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
-      try {
-        vi.setSystemTime(CHILD_NOW + 15_000);
-        const observation = await f.adapter.observe();
-        expect(observation.stallRestartable).toBe(true);
-        if (veto === 'pane') f.evidence.pane!.panePid = 701;
-        if (veto === 'progress')
-          f.evidence.identity.tail +=
-            childEvent({ type: 'agent_message', message: 'Fresh structured remote work before dispatch' }, 500) + '\n';
-        if (veto === 'owner-input')
-          expect(await f.session.writeAsync('Owner changed intent\r', { fromUser: true })).toBe(true);
-        if (veto === 'grants')
-          vi.mocked(clampExternalCliConfigsForOwner).mockResolvedValueOnce({
-            codexConfig: { ...f.session.codexConfig, noDaemon: false },
-          });
-        expect(
-          await f.adapter.act(
-            {
-              key: observation.stallEvidenceKey!,
-              action: 'restart',
-              reason: 'stalled',
-              conversationId: CHILD_THREAD,
-              startedAt: Date.now(),
-              stallProgressAt: observation.progressAt,
-              stallProgressEvidenceKey: observation.progressEvidenceKey,
-              stallQuietPeriodMs: 40_000,
-            },
-            () => veto !== 'cancellation'
-          )
-        ).toBe(veto === 'unchanged' ? 'sent' : 'not-sent');
-        expect(f.deps.restartRemote).toHaveBeenCalledTimes(veto === 'unchanged' ? 1 : 0);
-      } finally {
-        await f.cleanup();
-      }
+  it.each([
+    'unchanged',
+    'pane',
+    'progress',
+    'clean-broker-exit',
+    'child-running',
+    'owner-input',
+    'grants',
+    'cancellation',
+  ] as const)('rechecks %s immediately before remote stalled dispatch', async (veto) => {
+    const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+    try {
+      vi.setSystemTime(CHILD_NOW + 15_000);
+      const observation = await f.adapter.observe();
+      expect(observation.stallRestartable).toBe(true);
+      if (veto === 'pane') f.evidence.pane!.panePid = 701;
+      if (veto === 'clean-broker-exit') setRemoteBrokerCleanExit(f.evidence);
+      if (veto === 'child-running')
+        f.evidence.identity.tail +=
+          childEvent({ type: 'collab_resume_end', receiver_thread_id: CHILD_ID, status: 'running' }, 500) + '\n';
+      if (veto === 'progress')
+        f.evidence.identity.tail +=
+          childEvent({ type: 'agent_message', message: 'Fresh structured remote work before dispatch' }, 500) + '\n';
+      if (veto === 'owner-input')
+        expect(await f.session.writeAsync('Owner changed intent\r', { fromUser: true })).toBe(true);
+      if (veto === 'grants')
+        vi.mocked(clampExternalCliConfigsForOwner).mockResolvedValueOnce({
+          codexConfig: { ...f.session.codexConfig, noDaemon: false },
+        });
+      expect(
+        await f.adapter.act(
+          {
+            key: observation.stallEvidenceKey!,
+            action: 'restart',
+            reason: 'stalled',
+            conversationId: CHILD_THREAD,
+            startedAt: Date.now(),
+            stallProgressAt: observation.progressAt,
+            stallProgressEvidenceKey: observation.progressEvidenceKey,
+            stallQuietPeriodMs: 40_000,
+          },
+          () => veto !== 'cancellation'
+        )
+      ).toBe(veto === 'unchanged' ? 'sent' : 'not-sent');
+      expect(f.deps.restartRemote).toHaveBeenCalledTimes(veto === 'unchanged' ? 1 : 0);
+    } finally {
+      await f.cleanup();
     }
-  );
+  });
 
   it('seals an uncertain remote stall dispatch against further recovery and journal reload', async () => {
     const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
