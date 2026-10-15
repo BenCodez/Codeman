@@ -493,7 +493,9 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const isCurrent = () => !this.stopped && revision === this.revision && !this.recoveryWindowExpired();
+    const isCurrent: RecoveryActionAuthority = () =>
+      !this.stopped && revision === this.revision && !this.recoveryWindowExpired();
+    isCurrent.getActionDeadline = () => (this.state.windowStartedAt ?? NaN) + this.state.config.maxRecoveryDurationMs;
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
       outcome = isCurrent() ? await this.deps.act(this.state.inFlight, isCurrent) : 'not-sent';

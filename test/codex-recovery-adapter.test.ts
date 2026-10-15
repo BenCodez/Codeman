@@ -14,6 +14,7 @@ import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import { resolveCodexIdentity, type CodexIdentityResult } from '../src/recovery/codex-identity.js';
 import { CONTINUATION_PROMPT, type RecoveryFlight, type RecoveryObservation } from '../src/recovery/types.js';
 import { createDeferred } from './mocks/index.js';
+import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
 
 vi.mock('../src/recovery/codex-identity.js', () => ({ resolveCodexIdentity: vi.fn() }));
 vi.mock('../src/session-env-clamp.js', () => ({
@@ -43,6 +44,16 @@ type Pane = NonNullable<Awaited<ReturnType<Session['inspectRecoveryPane']>>>;
 type DeliveryResult = Awaited<ReturnType<Session['deliverRecovery']>>;
 
 function event(payload: Record<string, unknown>, at: number): string {
+  // These lifecycle positives model native timestamps and the exact sender;
+  // an explicit undefined override still models a missing evidence field.
+  if (typeof payload.type === 'string' && payload.type.startsWith('collab_')) {
+    payload = {
+      sender_thread_id: THREAD,
+      call_id: 'fixture-child-call',
+      [payload.type.endsWith('_begin') ? 'started_at_ms' : 'completed_at_ms']: at,
+      ...payload,
+    };
+  }
   return JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload });
 }
 
@@ -84,6 +95,7 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 function fixture() {
+  const inputProvenance = fakeInputProvenance({}, '/fixture/codex-home');
   const state = {
     context: {
       generation: 3,
@@ -97,7 +109,7 @@ function fixture() {
         hash: createHash('sha256').update('Sanitized fixture request.').digest('hex'),
       } as { at: number; hash: string } | undefined,
     },
-    pane: { paneId: '%7', panePid: 700, dead: false, screen: READY } as Pane | null,
+    pane: { paneId: '%7', panePid: 700, dead: false, screen: READY, inputProvenance } as Pane | null,
     identity: {
       reason: 'verified',
       conversationId: THREAD,
@@ -121,7 +133,23 @@ function fixture() {
     watching: null as string | null,
     getRecoveryContext: vi.fn(() => ({ ...state.context })),
     getEnvOverridesForPersist: vi.fn(() => state.env),
-    inspectRecoveryPane: vi.fn(async () => state.pane),
+    inspectRecoveryPane: vi.fn(async () => {
+      if (state.pane) {
+        state.pane.inputProvenance = updateFakeInputProvenance(inputProvenance, {
+          closed: state.pane.dead,
+          exitStatus: state.pane.dead ? state.pane.status : undefined,
+          exitSignal: state.pane.dead ? state.pane.signal : undefined,
+        });
+      }
+      return state.pane;
+    }),
+    getRecoveryInputAuthority: (proof: typeof inputProvenance) => ({
+      sessionId: SESSION,
+      incarnation: proof.incarnation,
+      directory: '/fake-private-broker',
+      proof,
+    }),
+    inspectRecoveryInputProvenance: vi.fn(async () => state.pane?.inputProvenance),
     isBusy: vi.fn(() => state.busy),
     pinRecoveryConversation: vi.fn((id: string) => {
       session.codexConfig = { ...session.codexConfig, resumeSessionId: id };
@@ -142,6 +170,10 @@ async function withRollout(
   const home = await fs.mkdtemp(join(homedir(), 'codex-adapter-rollout-'));
   try {
     f.context.codexHome = home;
+    if (f.pane?.inputProvenance)
+      updateFakeInputProvenance(f.pane.inputProvenance, {
+        homeDigest: createHash('sha256').update(home).digest('hex'),
+      });
     f.session.workingDir = join(home, 'workspace');
     const directory = join(home, 'sessions');
     await fs.mkdir(directory);
@@ -694,7 +726,14 @@ describe('authoritative agent exits and process readiness', () => {
       expect.any(Function),
       CONTINUATION_PROMPT,
       expect.any(Function),
-      { paneId: '%7', panePid: 700, status: 1, signal: undefined, paneSignalToken: undefined }
+      {
+        paneId: '%7',
+        panePid: 700,
+        status: 1,
+        signal: undefined,
+        paneSignalToken: undefined,
+        inputProvenance: f.pane!.inputProvenance,
+      }
     );
   });
 

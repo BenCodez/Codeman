@@ -2,7 +2,9 @@
 import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
+import type { CodexBrokerProof } from '../src/recovery/codex-input-broker.js';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { Session } from '../src/session.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
@@ -94,7 +96,16 @@ it.each([
   if (kind === 'truncated') identity.tailTruncated = true;
   if (kind === 'unknown-truncation') delete identity.tailTruncated;
   const config = { noDaemon: true, resumeSessionId: THREAD };
+  const inputProof = fakeInputProvenance();
   const session = {
+    inspectRecoveryInputProvenance: async () => structuredClone(inputProof),
+    getRecoveryInputAuthority: (proof: CodexBrokerProof) => ({
+      sessionId: SESSION,
+      incarnation: proof.incarnation,
+      directory: dirname(proof.fileWitness!.path),
+      proof,
+      files: [proof.fileWitness!],
+    }),
     id: SESSION,
     getRecoveryContext: () => ({ generation: 4 }),
     getEnvOverridesForPersist: () => undefined,
@@ -103,6 +114,7 @@ it.each([
   const adapter = new CodexRecoveryAdapter(session, () => {});
   Reflect.set(adapter, 'verifiedTail', {
     ...identity,
+    inputProof,
     config: JSON.stringify(config),
     env: JSON.stringify(undefined),
   });
@@ -115,7 +127,7 @@ it.each([
   }
   if (['fifo-before', 'inode-before', 'missing-leaf', 'truncated', 'unknown-truncation'].includes(kind))
     expect(boundary.reads).toBe(0);
-  if (kind === 'healthy') expect(boundary.reads).toBe(2);
+  if (kind === 'healthy') expect(boundary.reads).toBe(3);
 });
 
 it.each(['healthy', 'fifo-before', 'inode-before'])(
@@ -159,7 +171,16 @@ it.each(['healthy', 'false', 'async-current', 'rejected-current', 'throwing-curr
   async (kind) => {
     const { identity } = await fixture();
     const config = { noDaemon: true, resumeSessionId: THREAD };
+    const inputProof = fakeInputProvenance();
     const session = {
+      inspectRecoveryInputProvenance: async () => structuredClone(inputProof),
+      getRecoveryInputAuthority: (proof: CodexBrokerProof) => ({
+        sessionId: SESSION,
+        incarnation: proof.incarnation,
+        directory: dirname(proof.fileWitness!.path),
+        proof,
+        files: [proof.fileWitness!],
+      }),
       id: SESSION,
       getRecoveryContext: () => ({ generation: 4 }),
       getEnvOverridesForPersist: () => undefined,
@@ -168,6 +189,7 @@ it.each(['healthy', 'false', 'async-current', 'rejected-current', 'throwing-curr
     const adapter = new CodexRecoveryAdapter(session, () => {});
     Reflect.set(adapter, 'verifiedTail', {
       ...identity,
+      inputProof,
       config: JSON.stringify(config),
       env: JSON.stringify(undefined),
     });
@@ -183,6 +205,6 @@ it.each(['healthy', 'false', 'async-current', 'rejected-current', 'throwing-curr
     };
     const open = vi.spyOn(fs, 'open');
     expect(await adapter.confirmLocalEvidence(THREAD, 4, source)).toBe(kind === 'healthy');
-    expect(open).toHaveBeenCalledTimes(kind === 'healthy' ? 2 : 0);
+    expect(open.mock.calls.filter(([path]) => String(path) === identity.path)).toHaveLength(kind === 'healthy' ? 3 : 0);
   }
 );

@@ -22,11 +22,13 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
 import { collectDescendants } from './proc-tree.js';
 import { execSync, exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 import { existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { writeFile, rename } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -1707,6 +1709,160 @@ function confirmRecoveryMuxDispatch(guard: RecoveryMuxDispatchGuard): boolean {
 export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   readonly backend = 'tmux' as const;
   private sessions: Map<string, MuxSession> = new Map();
+  private readonly inputBrokers = new Map<string, CodexInputBroker>();
+  private readonly inputBrokerLoads = new Map<string, Promise<CodexInputBroker | undefined>>();
+  private readonly inputQueues = new Map<string, Promise<unknown>>();
+
+  canDeliverCodexOwnerInput(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (!session?.recoveryInputBroker) return true;
+    const broker = this.inputBrokers.get(sessionId);
+    return broker?.incarnation === session.recoveryInputBroker && broker.canFrame;
+  }
+
+  getCodexInputAuthority(sessionId: string, proof: CodexBrokerProof) {
+    const session = this.sessions.get(sessionId);
+    const broker = this.inputBrokers.get(sessionId);
+    return session?.pid === proof.brokerPid &&
+      session.recoveryInputBroker === proof.incarnation &&
+      broker?.incarnation === proof.incarnation
+      ? broker.authority(proof)
+      : undefined;
+  }
+
+  async inspectCodexInputProvenance(sessionId: string, panePid: number): Promise<CodexBrokerProof | undefined> {
+    const deadline = performance.now() + 2_000;
+    const session = this.sessions.get(sessionId);
+    if (!session || session.pid !== panePid) return undefined;
+    const broker = await this.getInputBroker(session);
+    let proof = broker && (await broker.prove(panePid, deadline));
+    if (!proof || performance.now() >= deadline) return undefined;
+    if (!proof.closed) {
+      // A zero-child-byte receipt is an ordered barrier for preceding direct
+      // terminal bytes and fragmented owner frames. Passive journal reads alone
+      // cannot certify which thread the live input stream currently belongs to.
+      if (IS_TEST_MODE) return undefined;
+      try {
+        const remaining = () => Math.max(1, Math.ceil(deadline - performance.now()));
+        const { stdout } = await execAsync(
+          `${this.tmux()} display-message -p -t ${shellescape(session.muxName)} '#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}'`,
+          { timeout: remaining(), maxBuffer: 16_384 }
+        );
+        const row = stdout.endsWith('\n') ? stdout.slice(0, -1) : '';
+        const fields = row.split('|');
+        if (
+          fields.length !== 6 ||
+          fields[0] !== session.muxName ||
+          !/^%(?:0|[1-9]\d{0,9})$/.test(fields[1]) ||
+          fields[2] !== String(panePid) ||
+          fields[3] !== '0' ||
+          fields[4] !== '' ||
+          fields[5] !== '' ||
+          performance.now() >= deadline
+        )
+          return undefined;
+        const packet = broker!.frame(
+          'probe',
+          '',
+          undefined,
+          undefined,
+          [],
+          undefined,
+          [],
+          [],
+          Number(process.hrtime.bigint() / 1_000_000n) + Math.max(0, Math.floor(deadline - performance.now()))
+        );
+        if (!packet) return undefined;
+        const predicate = [
+          `#{==:#{session_name},${session.muxName}}`,
+          `#{==:#{pane_id},${fields[1]}}`,
+          `#{==:#{pane_pid},${panePid}}`,
+          '#{==:#{pane_dead},0}',
+          '#{==:#{pane_dead_status},}',
+          '#{==:#{pane_dead_signal},}',
+        ].reduce((all, term) => `#{&&:${all},${term}}`);
+        const send = `send-keys -t ${shellescape(fields[1])} -l ${shellescape(packet.data)}`;
+        const result = await execAsync(
+          `${this.tmux()} if-shell -F -t ${shellescape(fields[1])} ${shellescape(predicate)} ${shellescape(send)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}`,
+          { timeout: remaining() }
+        );
+        if (
+          result.stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED' ||
+          performance.now() >= deadline ||
+          (await broker!.receipt(packet.receipt, deadline)) !== 'sent'
+        )
+          return undefined;
+        proof = await broker!.prove(panePid, deadline);
+      } catch {
+        return undefined;
+      }
+    }
+    return performance.now() < deadline &&
+      this.sessions.get(sessionId) === session &&
+      session.pid === panePid &&
+      session.recoveryInputBroker === proof?.incarnation
+      ? proof
+      : undefined;
+  }
+
+  wrapCodexOwnerInput(
+    sessionId: string,
+    input: string,
+    channel: 'owner-pty' | 'owner-key' = 'owner-pty'
+  ): CodexOwnerInputFrame {
+    const session = this.sessions.get(sessionId);
+    if (!session?.recoveryInputBroker) return { status: 'passthrough', data: input };
+    const broker = this.inputBrokers.get(sessionId);
+    if (!broker || broker.incarnation !== session.recoveryInputBroker) return { status: 'refused' };
+    const frame = broker.frame(channel, input);
+    return frame ? { status: 'framed', data: frame.data } : { status: 'refused' };
+  }
+
+  private async getInputBroker(session: MuxSession): Promise<CodexInputBroker | undefined> {
+    const incarnation = session.recoveryInputBroker;
+    if (!incarnation || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(incarnation)) return undefined;
+    const known = this.inputBrokers.get(session.sessionId);
+    if (known?.incarnation === incarnation) return known;
+    let loading = this.inputBrokerLoads.get(session.sessionId);
+    if (!loading) {
+      loading = CodexInputBroker.load(
+        dataPath('codex-input-brokers', session.sessionId, incarnation),
+        session.sessionId
+      );
+      this.inputBrokerLoads.set(session.sessionId, loading);
+      void loading
+        .then((broker) => {
+          if (this.sessions.get(session.sessionId) === session && session.recoveryInputBroker === incarnation && broker)
+            this.inputBrokers.set(session.sessionId, broker);
+        })
+        .finally(() => {
+          if (this.inputBrokerLoads.get(session.sessionId) === loading) this.inputBrokerLoads.delete(session.sessionId);
+        });
+    }
+    return loading;
+  }
+
+  private async createInputBroker(
+    sessionId: string,
+    command: string,
+    codexHome: string,
+    required = false
+  ): Promise<CodexInputBroker | undefined> {
+    try {
+      await execFileAsync('python3', ['-c', 'import pty, termios, fcntl, select, hmac'], {
+        timeout: EXEC_TIMEOUT_MS,
+        maxBuffer: 1_024,
+      });
+    } catch (error) {
+      if (required) throw error;
+      return undefined;
+    }
+    return CodexInputBroker.create(dataPath('codex-input-brokers', sessionId), sessionId, command, codexHome);
+  }
+
+  private brokerCommand(broker: CodexInputBroker): string {
+    return `exec python3 ${shellescape(`${broker.directory}/broker.py`)} ${shellescape(broker.directory)} ${shellescape(broker.configurationDigest)}`;
+  }
   private readonly tmuxSocket = resolveConfiguredTmuxSocket();
   private statsInterval: NodeJS.Timeout | null = null;
   private mouseSyncInterval: NodeJS.Timeout | null = null;
@@ -1842,9 +1998,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
                 continue;
               }
               this.sessions.delete(priorId);
+              this.inputBrokers.delete(priorId);
+              this.inputBrokerLoads.delete(priorId);
               dropped++;
             }
             this.sessions.set(session.sessionId, session);
+            if (session.recoveryInputBroker) void this.getInputBroker(session);
             if (muxName) keptByMuxName.set(muxName, session.sessionId);
           }
           // Persist the cleaned list so the stale duplicates don't reload.
@@ -2239,6 +2398,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : remote
           ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
           : localFullCmd;
+      const originalLaunch = remote || docker ? fullCmd : `cd ${shellescape(workingDir)} && ${fullCmd}`;
+      const inputBroker =
+        localCodex && codexConfig?.noDaemon === true
+          ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!)
+          : undefined;
 
       // Create tmux session in three steps to handle cold-start (no server running)
       // and avoid the race where the command exits before remain-on-exit is set:
@@ -2296,9 +2460,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
-      const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
+      const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
       execSync(
-        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}`,
         {
           timeout: EXEC_TIMEOUT_MS,
           stdio: 'ignore',
@@ -2359,6 +2523,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         muxName,
         pid,
         recoveryCodexHome,
+        recoveryInputBroker: inputBroker?.incarnation,
         recoveryIsolated:
           !remote &&
           !docker &&
@@ -2373,6 +2538,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         attached: false,
         name,
       };
+      if (inputBroker) {
+        this.inputBrokers.set(sessionId, inputBroker);
+        await inputBroker.startupReceipt(pid);
+      }
 
       this.sessions.set(sessionId, session);
       this.saveSessions();
@@ -2501,6 +2670,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     if (options.onlyIfDead && localCodex && !recoveryCodexHome) return null;
     const guard = options.recoveryDispatchGuard;
     const expected = options.expectedRecoveryPane;
+    const priorBroker = await this.getInputBroker(session);
+    const priorInputProof = priorBroker && (await priorBroker.prove(session.pid));
+    if (
+      options.onlyIfDead &&
+      localCodex &&
+      (!priorInputProof?.closed ||
+        !((priorInputProof.exitStatus ?? 0) > 0 || (priorInputProof.exitSignal ?? 0) > 0) ||
+        priorInputProof.incarnation !== expected?.inputProvenance?.incarnation ||
+        priorInputProof.childPid !== expected?.inputProvenance?.childPid)
+    )
+      return null;
     if (
       expected &&
       (!options.onlyIfDead ||
@@ -2569,6 +2749,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : remote
         ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
         : localFullCmd;
+    const originalLaunch = remote || docker ? fullCmd : `cd ${shellescape(workingDir)} && ${fullCmd}`;
+    const inputBroker =
+      localCodex && codexConfig?.noDaemon === true
+        ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!guard)
+        : undefined;
 
     try {
       if (!canDispatch()) return null;
@@ -2586,13 +2771,34 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       this.applyEnvOverrides(muxName, envOverrides, unsetEnvKeys);
       if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
 
-      // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
-      const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
       if (!canDispatch()) return null;
       if (guard?.prepareEvidence && (await guard.prepareEvidence()) !== true) return null;
       if (!canDispatch()) return null;
+      if (guard) {
+        if (!inputBroker || !guard.inputProof) return null;
+        const expiry =
+          Number(process.hrtime.bigint() / 1_000_000n) +
+          Math.min(
+            2_000,
+            guard.actionDeadline === undefined ? 2_000 : Math.max(0, Math.floor(guard.actionDeadline - Date.now()))
+          );
+        await inputBroker.setStartupAuthority(
+          guard.privateFiles,
+          guard.inputIssuer,
+          guard.privatePaths,
+          guard.missingPaths,
+          expiry
+        );
+        // A second ordered probe would change the issuer journal captured in
+        // startup config. The broker performs the joint final proof after this
+        // async write; retain only the pure owner/revision fence here.
+        if (!canDispatch()) return null;
+      }
+      // Render only after startup authority is durably written; its exact bytes
+      // are checked by Python before any child is created.
+      const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
       guard?.noteDispatch();
-      const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${expected ? shellescape(expected.paneId) : `"${muxName}"`} bash -c ${expected ? shellescape(launchCmd) : JSON.stringify(launchCmd)}`;
+      const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${expected ? shellescape(expected.paneId) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
       const predicate = expected
         ? [
             `#{==:#{session_name},${muxName}}`,
@@ -2622,6 +2828,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const pid = this.getPanePid(muxName);
       if (pid) {
         session.pid = pid;
+        session.recoveryInputBroker = inputBroker?.incarnation;
+        if (inputBroker) this.inputBrokers.set(sessionId, inputBroker);
+        else this.inputBrokers.delete(sessionId);
         session.recoveryCodexHome = recoveryCodexHome;
         session.recoveryIsolated =
           !remote &&
@@ -2629,6 +2838,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
           /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd);
         this.saveSessions();
+        if (guard && inputBroker) {
+          const receipt = await inputBroker.startupReceipt(pid);
+          if (receipt === 'not-sent') guard.noteBrokerRefusal?.();
+          if (receipt === 'started') guard.noteBrokerSent?.();
+          if (receipt !== 'started') return null;
+        }
       }
       return pid;
     } catch (err) {
@@ -2791,6 +3006,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // TEST MODE: Remove from memory only — NEVER touch real tmux sessions
     if (IS_TEST_MODE) {
       this.sessions.delete(sessionId);
+      this.inputBrokers.delete(sessionId);
+      this.inputBrokerLoads.delete(sessionId);
       this.clearRemoteReconnectState(sessionId);
       this.emit('sessionKilled', { sessionId });
       return true;
@@ -2832,6 +3049,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       this.lastPaneCount.delete(session.muxName);
       this.clearPaneExit(session.muxName);
       this.sessions.delete(sessionId);
+      this.inputBrokers.delete(sessionId);
+      this.inputBrokerLoads.delete(sessionId);
       this.clearRemoteReconnectState(sessionId);
       this.saveSessions();
       this.emit('sessionKilled', { sessionId });
@@ -2947,6 +3166,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     this.lastPaneCount.delete(session.muxName);
     this.clearPaneExit(session.muxName);
     this.sessions.delete(sessionId);
+    this.inputBrokers.delete(sessionId);
+    this.inputBrokerLoads.delete(sessionId);
     this.clearRemoteReconnectState(sessionId);
     this.saveSessions();
     this.emit('sessionKilled', { sessionId });
@@ -3021,6 +3242,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       } else {
         dead.push(sessionId);
         this.sessions.delete(sessionId);
+        this.inputBrokers.delete(sessionId);
+        this.inputBrokerLoads.delete(sessionId);
         this.clearPaneExit(session.muxName);
         this.clearRemoteReconnectState(sessionId);
         this.emit('sessionDied', { sessionId });
@@ -3709,6 +3932,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * - Ink (Claude CLI) needs text and Enter split to avoid treating Enter as a newline
    */
   async sendInput(sessionId: string, input: string, recoveryGuard?: RecoveryMuxDispatchGuard): Promise<boolean> {
+    const registered = this.sessions.get(sessionId);
+    const prior = this.inputQueues.get(sessionId) ?? Promise.resolve();
+    const operation = prior
+      .catch(() => {})
+      .then(() =>
+        this.sessions.get(sessionId) === registered && registered
+          ? this.sendInputInOrder(sessionId, input, recoveryGuard)
+          : false
+      );
+    this.inputQueues.set(sessionId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.inputQueues.get(sessionId) === operation) this.inputQueues.delete(sessionId);
+    }
+  }
+
+  private async sendInputInOrder(
+    sessionId: string,
+    input: string,
+    recoveryGuard?: RecoveryMuxDispatchGuard
+  ): Promise<boolean> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       console.error(
@@ -3718,6 +3963,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     const muxName = session.muxName;
+    const inputBroker = await this.getInputBroker(session);
+    if (
+      (session.recoveryInputBroker && !inputBroker) ||
+      (recoveryGuard && (!inputBroker || !(await inputBroker.prove(session.pid)) || !recoveryGuard.conversationId))
+    ) {
+      recoveryGuard?.noteRefusal?.();
+      return false;
+    }
     const livePane = recoveryGuard?.expectedLivePane && { ...recoveryGuard.expectedLivePane };
     if (
       recoveryGuard &&
@@ -3782,9 +4035,46 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           ? `${this.tmux()} if-shell -F -t ${shellescape(livePane!.paneId)} ${shellescape(nativePredicate)} ${shellescape(send)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}`
           : `${this.tmux()} ${send}`;
       };
-      const dispatchInput = async (keys: string): Promise<boolean> => {
+      const dispatchInput = async (keys: string, data: string, expiry: number): Promise<boolean> => {
+        const actionExpiry =
+          recoveryGuard?.actionDeadline === undefined
+            ? expiry
+            : Math.min(
+                expiry,
+                Number(process.hrtime.bigint() / 1_000_000n) +
+                  Math.max(0, Math.floor(recoveryGuard.actionDeadline - Date.now()))
+              );
+        if (!Number.isSafeInteger(actionExpiry) || actionExpiry <= Number(process.hrtime.bigint() / 1_000_000n)) {
+          recoveryGuard?.noteRefusal?.();
+          return false;
+        }
+        const frame = inputBroker?.frame(
+          recoveryGuard ? 'auto' : 'owner-mux',
+          data,
+          recoveryGuard?.conversationId,
+          recoveryGuard?.inputIssuer,
+          recoveryGuard?.privateFiles,
+          recoveryGuard?.inputProof?.ownerCounters,
+          recoveryGuard?.privatePaths,
+          recoveryGuard?.missingPaths,
+          actionExpiry
+        );
+        if (inputBroker && !frame) {
+          recoveryGuard?.noteRefusal?.();
+          return false;
+        }
+        if (frame) keys = `-l ${shellescape(frame.data)}`;
+        recoveryGuard?.noteDispatch();
         const { stdout } = await execAsync(inputCommand(keys), { timeout: EXEC_TIMEOUT_MS });
-        return !nativePredicate || stdout.trim() !== 'CODEMAN_RECOVERY_PANE_REFUSED';
+        if (nativePredicate && stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') {
+          recoveryGuard?.noteRefusal?.();
+          return false;
+        }
+        if (!frame || !inputBroker) return true;
+        const receipt = await inputBroker.receipt(frame.receipt);
+        if (receipt === 'not-sent') recoveryGuard?.noteBrokerRefusal?.();
+        if (receipt === 'sent') recoveryGuard?.noteBrokerSent?.();
+        return receipt === 'sent';
       };
       const composerCurrent = (expected?: string): boolean => {
         if (!recoveryGuard) return true;
@@ -3829,14 +4119,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         if (!accepted) recoveryGuard.noteRefusal?.();
         return accepted;
       };
-      type DispatchAdmission = { screen?: string; started: number };
+      type DispatchAdmission = { screen?: string; started: number; expiry: number };
       const prepareDispatch = async (expected?: string): Promise<DispatchAdmission | undefined> => {
         const started = performance.now();
-        if (!recoveryGuard) return { started };
+        const expiry = Number(process.hrtime.bigint() / 1_000_000n) + 2_000;
+        if (!recoveryGuard) return { started, expiry };
         if (!(await prepared()) || !composerCurrent(expected)) return undefined;
         const screen = composerScreen;
         if (!(await prepared())) return undefined;
-        return { screen, started };
+        return { screen, started, expiry };
       };
       const confirmDispatch = (admission: DispatchAdmission | undefined, expected?: string): boolean => {
         if (!admission) return false;
@@ -3862,25 +4153,21 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // character in the input buffer rather than as form submission.
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
-        recoveryGuard?.noteDispatch();
-        if (!(await dispatchInput(`-l ${shellescape(textPart)}`))) return false;
+        if (!(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry))) return false;
         await new Promise((resolve) => setTimeout(resolve, 50));
         const enterAdmission = await prepareDispatch(textPart);
         if (!confirmDispatch(enterAdmission, textPart) || !canDispatch()) return false;
-        recoveryGuard?.noteDispatch();
-        if (!(await dispatchInput('Enter'))) return false;
+        if (!(await dispatchInput('Enter', '\r', enterAdmission!.expiry))) return false;
       } else if (textPart) {
         // Text only, no Enter
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
-        recoveryGuard?.noteDispatch();
-        if (!(await dispatchInput(`-l ${shellescape(textPart)}`))) return false;
+        if (!(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry))) return false;
       } else if (hasCarriageReturn) {
         // Enter only
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
-        recoveryGuard?.noteDispatch();
-        if (!(await dispatchInput('Enter'))) return false;
+        if (!(await dispatchInput('Enter', '\r', admission!.expiry))) return false;
       }
 
       return true;
@@ -4078,6 +4365,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     status?: number;
     signal?: number;
     paneSignalToken?: string;
+    inputProvenance?: CodexBrokerProof;
     screen: string | null;
   } | null> {
     if (IS_TEST_MODE || !isValidMuxName(muxName)) return null;
@@ -4110,6 +4398,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         });
         screen = capture.stdout;
       }
+      const session = [...this.sessions.values()].find((candidate) => candidate.muxName === muxName);
+      const inputProvenance = session && (await this.inspectCodexInputProvenance(session.sessionId, Number(rawPid)));
       return {
         dead: dead === '1',
         status: number(status),
@@ -4118,6 +4408,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         screen,
         paneId,
         panePid: Number(rawPid),
+        inputProvenance,
       };
     } catch {
       return null;

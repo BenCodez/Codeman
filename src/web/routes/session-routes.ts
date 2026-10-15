@@ -2287,6 +2287,8 @@ export function registerSessionRoutes(
         ? NEWLINE_HEX['line-feed']
         : NEWLINE_HEX[getCli(session.mode)?.capabilities.newline ?? 'line-feed'];
 
+    let brokerRefused = false;
+    let inputHex = hex;
     try {
       // Route through the dedicated Codeman socket — bare `tmux` would target the
       // user's default server and never find this session (same #80 regression class).
@@ -2296,23 +2298,52 @@ export function registerSessionRoutes(
           new Promise<void>((resolve, reject) => {
             execFile(
               'tmux',
-              ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...hex],
+              ['-L', ctx.mux.muxSocket, 'send-keys', '-H', '-t', muxName, ...inputHex],
               { timeout: 5000, signal },
               (err) => {
                 if (err) reject(err);
                 else resolve();
               }
             );
-          })
+          }),
+        () => {
+          if (!ctx.mux.wrapCodexOwnerInput) return true;
+          // Prepare inside named-key admission, before tracking the original
+          // newline. Refused keys must not manufacture a line in the draft.
+          brokerRefused = true;
+          const input = hex.map((byte) => String.fromCharCode(parseInt(byte, 16))).join('');
+          const frame = ctx.mux.wrapCodexOwnerInput(session.id, input, 'owner-key');
+          if (frame && typeof (frame as unknown as { then?: unknown }).then === 'function') {
+            void Promise.resolve(frame).catch(() => {});
+            return false;
+          }
+          if (frame?.status === 'framed' && typeof frame.data === 'string' && frame.data.length > 0)
+            inputHex = [...Buffer.from(frame.data)].map((byte) => byte.toString(16).padStart(2, '0'));
+          else if (frame?.status !== 'passthrough') return false;
+          brokerRefused = false;
+          return true;
+        }
       );
       if (!sent) {
         return {
-          ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input delivery is in progress; retry the key'),
+          ...createErrorResponse(
+            ApiErrorCode.OPERATION_FAILED,
+            brokerRefused
+              ? 'Owned input guard is not ready; retry the key'
+              : 'Input delivery is in progress; retry the key'
+          ),
           retryable: true,
           notSent: true,
         };
       }
     } catch (err) {
+      if (brokerRefused) {
+        return {
+          ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Owned input guard is not ready; retry the key'),
+          retryable: true,
+          notSent: true,
+        };
+      }
       console.error('[Server] send-key failed:', err);
       return createErrorResponse(ApiErrorCode.INTERNAL_ERROR, 'tmux send-keys failed');
     }
