@@ -2488,7 +2488,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const recoveryCodexHome = localCodex
       ? normalizedCodexHome(options.recoveryCodexHome ?? launchEnvCodexHome ?? currentLocalCodexHome())
       : undefined;
-    if (localCodex && !recoveryCodexHome) throw new Error('Local Codex launch home is unverified');
+    // Ordinary Codex resolves a relative CODEX_HOME from its working directory.
+    // Only an isolated launch needs absolute home provenance for its input broker.
+    if (localCodex && codexConfig?.noDaemon === true && !recoveryCodexHome)
+      throw new Error('Local Codex launch home is unverified');
     if (options.codexRestoreGuard && (!localCodex || !codexConfig?.resumeSessionId || !codexConfig.noDaemon))
       throw new Error('Reboot restoration guard requires an exact isolated local Codex launch');
 

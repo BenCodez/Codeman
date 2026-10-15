@@ -198,6 +198,94 @@ describe('ws-routes', () => {
   // ========== Client input ===
 
   describe('client input', () => {
+    it('closes a saturated 256-client backlog without ACK and retries after drain without replaying committed bytes', async () => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const clock = vi.spyOn(performance, 'now').mockReturnValue(0);
+      expect(session.shouldApplyInput('sealed', 7)).toBe(true);
+      session.commitInputSeq('sealed', 7);
+      expect(session.shouldApplyInput('sealed', 8)).toBe(true);
+      for (let index = 0; index < 255; index++) expect(session.shouldApplyInput(`pending-${index}`, 1)).toBe(true);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal?cid=backlog-client');
+      let restored: WebSocket | undefined;
+      try {
+        const first = new Promise((resolve) => {
+          ws.once('message', (raw) => resolve({ message: JSON.parse(String(raw)) }));
+          ws.once('close', (code, reason) => resolve({ code, reason: String(reason) }));
+        });
+        const frame = { t: 'i', d: 'paste first\n', cid: 'backlog-client', seq: 17 };
+        ws.send(JSON.stringify(frame));
+        expect(await first).toEqual({ code: 4008, reason: 'Input backlog full' });
+        expect(written).not.toHaveBeenCalled();
+        expect(Reflect.get(session, '_appliedInputSeq').has(frame.cid)).toBe(false);
+        expect(session.hasAppliedInputSeq(frame.cid, frame.seq)).toBe(false);
+        // Only a completed in-flight occurrence releases one client slot.
+        session.commitInputSeq('pending-0', 1);
+        restored = await connectWs('/ws/sessions/ws-test-session/terminal?cid=backlog-client');
+        let ack = nextMessage(restored);
+        restored.send(JSON.stringify(frame));
+        expect(await ack).toEqual({ t: 'ia', seq: 17 });
+        ack = nextMessage(restored);
+        restored.send(JSON.stringify({ ...frame, d: 'paste second', seq: 18 }));
+        expect(await ack).toEqual({ t: 'ia', seq: 18 });
+        ack = nextMessage(restored);
+        restored.send(JSON.stringify(frame));
+        expect(await ack).toEqual({ t: 'ia', seq: 17, dup: true, last: 18 });
+        ack = nextMessage(restored);
+        restored.send(JSON.stringify({ t: 'i', d: 'already committed', cid: 'sealed', seq: 7 }));
+        expect(await ack).toEqual({ t: 'ia', seq: 7, dup: true, last: 7 });
+        expect(session.shouldApplyInput('sealed', 8)).toBe(false);
+        expect(written.mock.calls.map(([data]) => data)).toEqual(['paste first\n', 'paste second']);
+      } finally {
+        clock.mockRestore();
+        ws.close();
+        restored?.close();
+        await session.stop(false);
+      }
+    });
+
+    it('closes an exhausted per-client deferred tail without ACK and retries the exact identity after its lease', async () => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      let now = 0;
+      const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+      expect(session.shouldApplyInput('tail-client', 1)).toBe(true);
+      session.commitInputSeq('tail-client', 1);
+      for (let seq = 2; seq <= 4097; seq++) expect(session.deferInputSeq('tail-client', seq)).toBe(true);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal?cid=tail-client');
+      let restored: WebSocket | undefined;
+      try {
+        const first = new Promise((resolve) => {
+          ws.once('message', (raw) => resolve({ message: JSON.parse(String(raw)) }));
+          ws.once('close', (code, reason) => resolve({ code, reason: String(reason) }));
+        });
+        const frame = { t: 'i', d: 'retained paste', cid: 'tail-client', seq: 4098 };
+        ws.send(JSON.stringify(frame));
+        expect(await first).toEqual({ code: 4008, reason: 'Input backlog full' });
+        expect(written).not.toHaveBeenCalled();
+        expect(session.lastInputSeq(frame.cid)).toBe(1);
+        expect(session.hasAppliedInputSeq(frame.cid, frame.seq)).toBe(false);
+        now = 60_000;
+        restored = await connectWs('/ws/sessions/ws-test-session/terminal?cid=tail-client');
+        let ack = nextMessage(restored);
+        restored.send(JSON.stringify(frame));
+        expect(await ack).toEqual({ t: 'ia', seq: 4098 });
+        ack = nextMessage(restored);
+        restored.send(JSON.stringify(frame));
+        expect(await ack).toEqual({ t: 'ia', seq: 4098, dup: true, last: 4098 });
+        expect(written).toHaveBeenCalledExactlyOnceWith(frame.d);
+      } finally {
+        clock.mockRestore();
+        ws.close();
+        restored?.close();
+        await session.stop(false);
+      }
+    });
+
     it('retries the same frame after a pre-dispatch identity fence throws', async () => {
       const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
       const session = ctx._session;

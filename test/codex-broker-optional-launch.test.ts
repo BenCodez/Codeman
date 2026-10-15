@@ -114,6 +114,68 @@ function successfulBroker() {
   } as unknown as CodexInputBroker;
 }
 
+it.each([
+  ['create', false],
+  ['create', undefined],
+  ['ordinary-respawn', false],
+  ['ordinary-respawn', undefined],
+] as const)('preserves an ordinary %s relative home with noDaemon=%s', async (kind, noDaemon) => {
+  const create = vi.spyOn(CodexInputBroker, 'create');
+  const launch = {
+    ...options,
+    codexConfig: { resumeSessionId: options.codexConfig.resumeSessionId, ...(noDaemon === false ? { noDaemon } : {}) },
+    envOverrides: { CODEX_HOME: 'relative-home' },
+  };
+  if (kind === 'ordinary-respawn') registerOrdinary();
+  const result = kind === 'create' ? await manager.createSession(launch) : await manager.respawnPane(launch);
+  const session = manager.getSession(SID)!;
+  expect(kind === 'create' ? session.pid : result).toBe(700);
+  expect(session.recoveryCodexHome).toBeUndefined();
+  expect(session.recoveryIsolated).toBe(false);
+  expect(session.recoveryInputBroker).toBeUndefined();
+  expect(create).not.toHaveBeenCalled();
+  const envCommands = commands().filter((command) => command.includes(' CODEX_HOME '));
+  expect(envCommands).toHaveLength(1);
+  expect(envCommands[0]).toMatch(/ CODEX_HOME 'relative-home'$/);
+  const sends = commands().filter((command) => command.includes('respawn-pane'));
+  expect(sends).toHaveLength(1);
+  expect(sends[0]).toContain(options.workingDir);
+  expect(sends[0]).toContain('cd ');
+  expect(sends[0]).toContain('codex');
+  expect(sends[0]).not.toContain('--no-daemon');
+  expect(sends[0]).not.toContain('broker.py');
+  expect(effects.pty).not.toHaveBeenCalled();
+});
+
+it('still refuses a relative home before no-daemon broker creation or native effects', async () => {
+  const create = vi.spyOn(CodexInputBroker, 'create');
+  await expect(manager.createSession({ ...options, envOverrides: { CODEX_HOME: 'relative-home' } })).rejects.toThrow(
+    'Local Codex launch home is unverified'
+  );
+  expect(create).not.toHaveBeenCalled();
+  expect(commands()).toEqual([]);
+  expect(effects.pty).not.toHaveBeenCalled();
+});
+
+it('still refuses a guarded respawn without absolute recorded provenance before native effects', async () => {
+  registerOrdinary();
+  const create = vi.spyOn(CodexInputBroker, 'create');
+  const noteDispatch = vi.fn();
+  expect(
+    await manager.respawnPane({
+      ...options,
+      envOverrides: { CODEX_HOME: 'relative-home' },
+      recoveryCodexHome: 'relative-home',
+      onlyIfDead: true,
+      recoveryDispatchGuard: { confirm: () => true, noteDispatch },
+    })
+  ).toBeNull();
+  expect(create).not.toHaveBeenCalled();
+  expect(noteDispatch).not.toHaveBeenCalled();
+  expect(commands()).toEqual([]);
+  expect(effects.pty).not.toHaveBeenCalled();
+});
+
 it.each(['create', 'ordinary-respawn'] as const)(
   'keeps an ordinary no-daemon %s available after optional private provisioning fails',
   async (kind) => {
@@ -204,6 +266,8 @@ it('keeps the guarded launch command when private provisioning succeeds', async 
   });
   expect(durableSnapshots[1].recoveryInputBrokerPending).toBeUndefined();
   expect(durableSnapshots[1].codexRestoreUncertain).toBeUndefined();
+  expect(session.recoveryCodexHome).toBe('/fixture/codex');
+  expect(session.recoveryIsolated).toBe(true);
   const sends = commands().filter((command) => command.includes('respawn-pane'));
   expect(sends).toHaveLength(1);
   expect(sends[0]).toContain('broker.py');
