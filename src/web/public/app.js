@@ -3854,11 +3854,12 @@ class CodemanApp {
     // as one contiguous stream. A mux write is line-oriented (it strips newlines
     // and sends Enter on its own), so it is never split: refuse it instead.
     const limit = window.CodemanInputLimit;
-    if (limit && input.length > limit.FRAME_MAX_CHARS) {
-      if (useMux || input.length > limit.PASTE_MAX_CHARS) {
+    const inputBytes = limit?.bytes ? limit.bytes(input) : input.length;
+    if (limit && inputBytes > limit.FRAME_MAX_CHARS) {
+      if (useMux || inputBytes > limit.PASTE_MAX_CHARS) {
         const max = useMux ? limit.FRAME_MAX_CHARS : limit.PASTE_MAX_CHARS;
         this.showToast?.(
-          `Input too large (${Math.ceil(input.length / 1024)} KB, limit ${Math.floor(max / 1024)} KB); not sent`,
+          `Input too large (${Math.ceil(inputBytes / 1024)} KB, limit ${Math.floor(max / 1024)} KB); not sent`,
           'error'
         );
         return;

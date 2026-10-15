@@ -2773,6 +2773,13 @@ export class Session extends EventEmitter {
       current
     );
     if (!current()) throw new RebootIdentityFenceError();
+    if (
+      !taintOnly &&
+      this._remote &&
+      mux?.prepareCodexOwnerInput &&
+      ((await mux.prepareCodexOwnerInput(this.id, current, native)) !== true || !current())
+    )
+      throw new RebootIdentityFenceError();
     this._recoveryUntrackedInput ||= durable.untrackedInput === true;
     this._preparedRecoveryInput = { data, fromUser: options.fromUser === true, current };
   }

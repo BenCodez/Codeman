@@ -61,9 +61,16 @@ function taskUiCriterionInput(criterion) {
   };
 }
 Object.assign(CodemanApp.prototype, {
+  supportsSessionTask(session) {
+    return (
+      this.supportsSessionRecovery?.(session) === true &&
+      !session.docker &&
+      (!session.remote || session.remote.owned !== false)
+    );
+  },
   openTaskOptions(sessionId) {
     this.closeTaskOptions();
-    const supported = this.supportsSessionRecovery?.(this.sessions.get(sessionId)) === true;
+    const supported = this.supportsSessionTask(this.sessions.get(sessionId));
     const rail = document.querySelector('#sessionOptionsModal [data-tab="task"]');
     if (rail) rail.style.display = supported ? '' : 'none';
     if (!supported) return false;
@@ -296,7 +303,7 @@ Object.assign(CodemanApp.prototype, {
     const evidence = document.getElementById('taskCriteriaEvidence');
     const selected = force
       ? new Set()
-      : new Set([...evidence.querySelectorAll('input:checked:not(:disabled)')].map((input) => input.value));
+      : new Set([...evidence.querySelectorAll('input:checked')].map((input) => input.value));
     evidence.replaceChildren();
     for (const criterion of state?.criteria ?? []) {
       const row = document.createElement('label');
@@ -404,10 +411,16 @@ Object.assign(CodemanApp.prototype, {
       view.busy ||
       view.loading ||
       this.editingSessionId !== view.sessionId ||
-      !this.supportsSessionRecovery?.(this.sessions.get(view.sessionId))
+      !this.supportsSessionTask(this.sessions.get(view.sessionId))
     )
       return;
     const revision = view.revision;
+    const focused = document.activeElement;
+    const selection =
+      typeof focused?.selectionStart === 'number'
+        ? [focused.selectionStart, focused.selectionEnd, focused.selectionDirection]
+        : null;
+    if (body !== undefined) view.dirty = true;
     view.busy = true;
     this._renderTaskStatus();
     const state = await this._apiJson(`/api/sessions/${encodeURIComponent(view.sessionId)}/task${path}`, {
@@ -420,8 +433,13 @@ Object.assign(CodemanApp.prototype, {
       if (view.revision === revision) view.state = state;
       view.dirty = false;
     } else {
-      view.state = null;
       this.showToast('Task action failed. Refresh status before trying again.', 'error');
+      this._renderTaskStatus();
+      if (focused?.isConnected && document.getElementById('task-tab')?.contains(focused)) {
+        focused.focus();
+        if (selection) focused.setSelectionRange(...selection);
+      }
+      return;
     }
     this._renderTaskStatus(true);
   },

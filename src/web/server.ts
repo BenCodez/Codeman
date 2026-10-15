@@ -2490,7 +2490,9 @@ export class WebServer extends EventEmitter {
       this.recoveryStopping ||
       this.cleaningUp.has(session.id) ||
       this.sessions.get(session.id) !== session ||
-      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout'
+      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout' ||
+      (!!session.remote && session.remote.owned === false) ||
+      !!session.docker
     )
       return undefined;
     const existing = this.taskControllers.get(session.id);
