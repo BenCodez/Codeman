@@ -101,7 +101,8 @@ const CRON_WORKING_DIR_BLOCKED_TREES: readonly string[] = [...DEFAULT_BLOCKED_TR
 const HAS_NEWLINE = /[\r\n]/;
 
 /** The three session calls prompt delivery needs, so it can be tested without a PTY. */
-type CronPromptTarget = Pick<Session, 'write' | 'writeViaMux' | 'verifySubmitted'>;
+type CronPromptTarget = Pick<Session, 'write' | 'writeViaMux' | 'verifySubmitted'> &
+  Partial<Pick<Session, 'writeAsync'>>;
 
 /**
  * Send a cron job's (single-line) prompt into its session and press Enter.
@@ -128,9 +129,9 @@ export async function deliverCronPrompt(
     return target.writeViaMux(prompt.endsWith('\r') ? prompt : `${prompt}\r`);
   }
   const text = prompt.replace(/[\r\n]+$/, '');
-  if (!target.write(text)) return false;
+  if (!(await (target.writeAsync ? target.writeAsync(text) : target.write(text)))) return false;
   await wait(CRON_PASTE_ENTER_DELAY_MS);
-  if (!target.write('\r')) return false;
+  if (!(await (target.writeAsync ? target.writeAsync('\r') : target.write('\r')))) return false;
   target.verifySubmitted(text);
   return true;
 }

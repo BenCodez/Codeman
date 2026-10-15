@@ -561,6 +561,7 @@ describe('ws-routes', () => {
         const written = vi.fn();
         Object.assign(session, { ptyProcess: { write: written } });
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        expect(await session.ensureRecoveryIdentityFence()).toBe(true);
         const held =
           owner === 'named-key'
             ? session.sendNamedKey('\n', () => key.promise)

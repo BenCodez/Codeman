@@ -122,7 +122,8 @@ it('allows a fresh durable retry after a refused rollback while preserving the b
   io.armed = true;
   await store.persistSessionDurably(ID, tentative());
   io.armed = false;
-  expect(io.phases).toEqual(['file', 'rename', 'directory', 'temporary-unlink']);
+  expect(io.phases).toEqual(['file', 'rename', 'directory']);
+  expect(fs.readdirSync(root).filter((name) => name.endsWith('.reboot.tmp'))).toEqual([]);
   expect(store.getSession(ID)).toEqual(tentative());
   expect(new StateStore(statePath).getSession(ID)).toEqual(tentative());
   expect(fs.readFileSync(statePath + '.bak', 'utf8')).toBe(backup);
@@ -156,7 +157,8 @@ it('publishes a healthy backup-only restore after the primary directory acknowle
   io.armed = true;
   await store.persistSessionDurably(ID, tentative());
   io.armed = false;
-  expect(io.phases).toEqual(['file', 'rename', 'directory', 'temporary-unlink']);
+  expect(io.phases).toEqual(['file', 'rename', 'directory']);
+  expect(fs.readdirSync(root).filter((name) => name.endsWith('.reboot.tmp'))).toEqual([]);
   expect(store.getSession(ID)).toEqual(tentative());
   expect(new StateStore(statePath).getSession(ID)).toEqual(tentative());
   expect(fs.readFileSync(statePath + '.bak', 'utf8')).toBe(backup);

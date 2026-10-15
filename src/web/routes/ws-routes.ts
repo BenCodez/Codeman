@@ -39,6 +39,7 @@ import { MAX_INPUT_LENGTH } from '../../config/terminal-limits.js';
 import { isAllowedRequestHost, isAllowedRequestOrigin, type HostPolicy } from '../network-auth-policy.js';
 import { WsConnectionRegistry } from '../ws-connection-registry.js';
 import { canAccessOwned, getAuthUser } from '../route-helpers.js';
+import { canQueueInputDispatch, queueInputDispatch } from '../input-dispatch-queue.js';
 
 /** Micro-batch interval for terminal output (ms). Short enough for low latency,
  *  long enough to group Ink's rapid cursor-up redraw sequences into single frames. */
@@ -193,73 +194,95 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               }
               return;
             }
-            // Reliable delivery: when the frame carries a clientId + seq, apply it
-            // exactly once (skip a duplicate redelivery) but ACK it regardless so
-            // the client can drop it from its durable queue. Frames without seq
-            // (legacy/other tools) are applied as-is — no behavior change.
-            const cid = typeof msg.cid === 'string' ? msg.cid : null;
-            const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
-            if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
-              // Capacity is temporary: an error ACK would permanently discard
-              // the browser's durable input. Reconnect retries the same identity.
+            if (!canQueueInputDispatch(session, msg.d.length)) {
               if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
               return;
             }
-            // A rejected frame must not claim a delivery identity. Otherwise a
-            // burst during recovery can manufacture a watermark for lost bytes.
-            if (session.recoveryInputReserved) return;
-            const apply = cid && seq !== null ? session.shouldApplyInput(cid, seq) : true;
-            let delivered = true;
-            if (apply) {
-              // Typed input from a claim-holding desktop keeps the claim "hot"
-              // and re-asserts the desktop layout after a mobile override.
-              if (holdsDesktopClaim) session.noteDesktopActivity();
-              // Browser keystrokes are the user's own, so they may name the tab.
-              try {
-                delivered = session.write(msg.d, {
-                  fromUser: true,
-                  ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
-                });
-              } catch (err) {
-                if (cid && seq !== null) session.forgetInputSeq(cid, seq);
-                throw err;
+            void queueInputDispatch(session, msg.d.length, async () => {
+              if (ctx.sessions.get(id) !== session || !canAccessOwned(getAuthUser(req), session.owner)) return;
+              // Reliable delivery: when the frame carries a clientId + seq, apply it
+              // exactly once (skip a duplicate redelivery) but ACK it regardless so
+              // the client can drop it from its durable queue. Frames without seq
+              // (legacy/other tools) are applied as-is — no behavior change.
+              const cid = typeof msg.cid === 'string' ? msg.cid : null;
+              const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
+              if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
+                // Capacity is temporary: an error ACK would permanently discard
+                // the browser's durable input. Reconnect retries the same identity.
+                if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
+                return;
               }
-              // A session whose PTY is gone swallows the write. ACKing anyway told
-              // the client to drop the frame from its durable queue and left the seq
-              // burnt, so the retry that reliable delivery exists for was rejected as
-              // a duplicate: the input was lost for good.
-              if (!delivered && cid && seq !== null) session.forgetInputSeq(cid, seq);
-              if (delivered && cid && seq !== null) session.commitInputSeq(cid, seq);
-            }
-            if (seq !== null && socket.readyState === 1) {
+              // A rejected frame must not claim a delivery identity. Otherwise a
+              // burst during recovery can manufacture a watermark for lost bytes.
+              if (session.recoveryInputReserved) return;
+              const apply = cid && seq !== null ? session.shouldApplyInput(cid, seq) : true;
+              let delivered = true;
               if (apply) {
-                if (delivered) socket.send(`{"t":"ia","seq":${seq}}`);
-              } else {
-                // REJECTED as a duplicate. ACK it — the client must still drop it
-                // from its durable queue — but say so, and hand back our watermark.
-                //
-                // A plain ACK here is indistinguishable from "applied", which is
-                // what made a client with a rolled-back counter unrecoverable: its
-                // seqs persist to localStorage on a DEBOUNCED write, so a tab killed
-                // between a send and that write comes back with a counter BELOW this
-                // watermark, every later keystroke lands at or under it, and each one
-                // is dropped-but-ACKed. The UI stays clean, nothing is delivered, and
-                // a reload restores the same stale counter. `last` is what lets the
-                // client lift itself out.
-                // ⚠️ Defensive: the session arrives through a structural port, and an
-                // implementation without this method must not take the whole input
-                // path down with it — a throw here aborts the message handler and the
-                // frame is never ACKed at all, which strands it in the client's queue.
-                const watermark =
-                  typeof (session as { lastInputSeq?: (c: string) => number }).lastInputSeq === 'function'
-                    ? (session as { lastInputSeq: (c: string) => number }).lastInputSeq(cid as string)
-                    : seq;
-                // A matching request is still in flight (or admission is full),
-                // so neither a success nor duplicate ACK can certify delivery.
-                if (cid && !session.hasAppliedInputSeq(cid, seq)) return;
-                socket.send(`{"t":"ia","seq":${seq},"dup":true,"last":${watermark}}`);
+                // Typed input from a claim-holding desktop keeps the claim "hot"
+                // and re-asserts the desktop layout after a mobile override.
+                if (holdsDesktopClaim) session.noteDesktopActivity();
+                // Browser keystrokes are the user's own, so they may name the tab.
+                try {
+                  delivered = await (session.writeAsync
+                    ? session.writeAsync(msg.d, {
+                        fromUser: true,
+                        isCurrent: () =>
+                          socket.readyState === 1 &&
+                          ctx.sessions.get(id) === session &&
+                          canAccessOwned(getAuthUser(req), session.owner),
+                        ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
+                      })
+                    : session.write(msg.d, {
+                        fromUser: true,
+                        isCurrent: () =>
+                          socket.readyState === 1 &&
+                          ctx.sessions.get(id) === session &&
+                          canAccessOwned(getAuthUser(req), session.owner),
+                        ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
+                      }));
+                } catch (err) {
+                  if (cid && seq !== null) session.forgetInputSeq(cid, seq);
+                  throw err;
+                }
+                // A session whose PTY is gone swallows the write. ACKing anyway told
+                // the client to drop the frame from its durable queue and left the seq
+                // burnt, so the retry that reliable delivery exists for was rejected as
+                // a duplicate: the input was lost for good.
+                if (!delivered && cid && seq !== null) session.forgetInputSeq(cid, seq);
+                if (delivered && cid && seq !== null) session.commitInputSeq(cid, seq);
               }
-            }
+              if (seq !== null && socket.readyState === 1) {
+                if (apply) {
+                  if (delivered) socket.send(`{"t":"ia","seq":${seq}}`);
+                } else {
+                  // REJECTED as a duplicate. ACK it — the client must still drop it
+                  // from its durable queue — but say so, and hand back our watermark.
+                  //
+                  // A plain ACK here is indistinguishable from "applied", which is
+                  // what made a client with a rolled-back counter unrecoverable: its
+                  // seqs persist to localStorage on a DEBOUNCED write, so a tab killed
+                  // between a send and that write comes back with a counter BELOW this
+                  // watermark, every later keystroke lands at or under it, and each one
+                  // is dropped-but-ACKed. The UI stays clean, nothing is delivered, and
+                  // a reload restores the same stale counter. `last` is what lets the
+                  // client lift itself out.
+                  // ⚠️ Defensive: the session arrives through a structural port, and an
+                  // implementation without this method must not take the whole input
+                  // path down with it — a throw here aborts the message handler and the
+                  // frame is never ACKed at all, which strands it in the client's queue.
+                  const watermark =
+                    typeof (session as { lastInputSeq?: (c: string) => number }).lastInputSeq === 'function'
+                      ? (session as { lastInputSeq: (c: string) => number }).lastInputSeq(cid as string)
+                      : seq;
+                  // A matching request is still in flight (or admission is full),
+                  // so neither a success nor duplicate ACK can certify delivery.
+                  if (cid && !session.hasAppliedInputSeq(cid, seq)) return;
+                  socket.send(`{"t":"ia","seq":${seq},"dup":true,"last":${watermark}}`);
+                }
+              }
+            }).catch(() => {
+              /* Unacknowledged input retains its durable retry identity. */
+            });
           } else if (
             msg.t === 'z' &&
             Number.isInteger(msg.c) &&

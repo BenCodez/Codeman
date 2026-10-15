@@ -10,19 +10,27 @@
  * Port: N/A (no server needed)
  */
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Session } from '../src/session.js';
+
+function withFakePty(session: Session) {
+  const write = vi.fn();
+  Reflect.set(session, 'ptyProcess', { write });
+  return write;
+}
 
 describe('session submit anchor', () => {
   it('records the pane Enter and carries it into persisted state', () => {
     const session = new Session({ workingDir: '/tmp' });
+    const write = withFakePty(session);
     expect(session.lastSubmitAt).toBe(0);
     expect(session.toState().lastSubmitAt).toBeUndefined();
 
     const before = Date.now();
-    session.write('hello\r');
+    expect(session.write('hello\r')).toBe(true);
     const after = Date.now();
 
+    expect(write.mock.calls).toEqual([['hello\r']]);
     expect(session.lastSubmitAt).toBeGreaterThanOrEqual(before);
     expect(session.lastSubmitAt).toBeLessThanOrEqual(after);
     expect(session.toState().lastSubmitAt).toBe(session.lastSubmitAt);
@@ -30,16 +38,20 @@ describe('session submit anchor', () => {
 
   it('leaves the anchor unset for keystrokes that never submit', () => {
     const session = new Session({ workingDir: '/tmp' });
-    session.write('hello');
-    session.write('\x1b[A'); // arrow-up: history recall, not a submit
+    const write = withFakePty(session);
+    expect(session.write('hello')).toBe(true);
+    expect(session.write('\x1b[A')).toBe(true); // arrow-up: history recall, not a submit
 
+    expect(write.mock.calls).toEqual([['hello'], ['\x1b[A']]);
     expect(session.lastSubmitAt).toBe(0);
     expect(session.toState().lastSubmitAt).toBeUndefined();
   });
 
   it('restores the anchor from persisted state on boot recovery', () => {
     const submitted = new Session({ workingDir: '/tmp' });
-    submitted.write('prompt\r');
+    const write = withFakePty(submitted);
+    expect(submitted.write('prompt\r')).toBe(true);
+    expect(write.mock.calls).toEqual([['prompt\r']]);
     const persisted = submitted.toState();
 
     const recovered = new Session({ workingDir: '/tmp', lastSubmitAt: persisted.lastSubmitAt });
@@ -51,5 +63,12 @@ describe('session submit anchor', () => {
   it('starts a pane with no persisted anchor at zero rather than NaN', () => {
     const recovered = new Session({ workingDir: '/tmp', lastSubmitAt: undefined });
     expect(recovered.lastSubmitAt).toBe(0);
+  });
+
+  it('keeps the anchor unset when an Enter cannot reach a PTY', () => {
+    const session = new Session({ workingDir: '/tmp' });
+    expect(session.write('unsent\r')).toBe(false);
+    expect(session.lastSubmitAt).toBe(0);
+    expect(session.toState().lastSubmitAt).toBeUndefined();
   });
 });

@@ -70,10 +70,10 @@ describe('Codex terminal output filtering', () => {
     expect(session.terminalBuffer).toBe('\x1b[55;1H• Working');
   });
 
-  it('preserves Codex erase-display redraw when the user pressed Ctrl+L', () => {
+  it('preserves Codex erase-display redraw when the user pressed Ctrl+L', async () => {
     const session = new Session({ workingDir: '/tmp', mode: 'codex' });
 
-    session.write('\x0c');
+    expect(await session.writeAsync('\x0c')).toBe(false);
     handleOutput(session, '\x1b[H\x1b[Jredraw after clear');
 
     expect(session.terminalBuffer).toBe('\x1b[H\x1b[Jredraw after clear');

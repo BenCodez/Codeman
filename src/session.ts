@@ -29,6 +29,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { getDataDirPath } from './config/instance.js';
 import { basename } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { v4 as uuidv4 } from 'uuid';
@@ -149,7 +150,11 @@ import { CONTINUATION_PROMPT, isRecoveryEvidenceSourceCurrent, type RecoveryFlig
 import { checkCodexIdentityWitnesses } from './recovery/codex-witness-check.js';
 import type { PrivateFileWitness } from './recovery/private-file-witness.js';
 import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
-import { readRebootIdentityFence, RebootIdentityFenceError } from './recovery/reboot-identity-fence.js';
+import {
+  loadRebootIdentityFence,
+  writeRebootIdentityFence,
+  RebootIdentityFenceError,
+} from './recovery/reboot-identity-fence.js';
 import { clampRecoveryLaunchForOwner } from './session-env-clamp.js';
 import {
   launchModelFor,
@@ -982,9 +987,9 @@ export class Session extends EventEmitter {
       this._muxSession.restoreUncertain !== false;
     this._preserveExitedPane = (config.preserveExitedPane ?? false) || this._codexRestoreWorkerMayExist;
     this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
-    this._recoveryUntrackedInput =
-      getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
-      readRebootIdentityFence(this.id)?.untrackedInput === true;
+    // Construction never performs private disk I/O. Unknown private evidence
+    // remains pending until bounded asynchronous initialization completes.
+    this._recoveryFenceInitialized = getCli(this.mode)?.capabilities.recovery !== 'codex-rollout';
     // Input while the server was down cannot be reconstructed from a launch resume id.
     // A fresh exact ordinary submission must re-verify the physical pane's current thread.
     this._recoverySwitchPending = this._preserveExitedPane || this._recoveryUntrackedInput;
@@ -2325,6 +2330,13 @@ export class Session extends EventEmitter {
   private _recoveryDelivering = false;
   private _namedKeyAbort: AbortController | null = null;
   private _ordinaryInputWrites = 0;
+  private _ownedInputTail: Promise<unknown> = Promise.resolve();
+  private _ownedInputQueued = 0;
+  private _ownedInputBytes = 0;
+  private _recoveryFenceInitialized = false;
+  private _recoveryFenceInitialization?: Promise<boolean>;
+  private _recoveryFencePublication?: Promise<void>;
+  private _preparedRecoveryInput?: { data: string; fromUser: boolean; current(): boolean };
   private _recoverySubmission?: { at: number; hash: string };
   private _recoveryIntentionalStopAt = 0;
   private _recoverySwitchPending = false;
@@ -2336,7 +2348,187 @@ export class Session extends EventEmitter {
 
   /** Lifecycle/recovery admission also excludes ordinary sends already in flight. */
   private get _inputDeliveryInFlight(): boolean {
-    return this.recoveryInputReserved || this._ordinaryInputWrites > 0;
+    return this.recoveryInputReserved || this._ordinaryInputWrites > 0 || this._ownedInputQueued > 0;
+  }
+
+  private _identityInputScope(): string {
+    return JSON.stringify([
+      getDataDirPath(),
+      this.mode,
+      this.owner,
+      this.workingDir,
+      this._envOverrides,
+      this._codexConfig,
+      this._remote,
+      this._docker,
+    ]);
+  }
+
+  /** Unknown evidence is retryable, rather than permanent direct-terminal taint. */
+  async ensureRecoveryIdentityFence(): Promise<boolean> {
+    if (this._recoveryFenceInitialized) return true;
+    if (this._recoveryFenceInitialization) return this._recoveryFenceInitialization;
+    const generation = this._recoveryGeneration,
+      scope = this._identityInputScope();
+    const work = (async () => {
+      try {
+        const fence = await loadRebootIdentityFence(this.id);
+        if (this._closing || generation !== this._recoveryGeneration || scope !== this._identityInputScope())
+          return false;
+        if (fence?.untrackedInput) {
+          this._recoveryUntrackedInput = true;
+          this._recoveryInputProofTracker.invalidate();
+        }
+        if (fence?.switchPending || this._recoveryUntrackedInput) {
+          this._recoverySubmission = undefined;
+          this._recoverySwitchPending = true;
+        }
+        this._recoveryFenceInitialized = true;
+        return true;
+      } catch {
+        return false;
+      }
+    })();
+    this._recoveryFenceInitialization = work;
+    try {
+      return await work;
+    } finally {
+      if (this._recoveryFenceInitialization === work) this._recoveryFenceInitialization = undefined;
+    }
+  }
+
+  private async _queueOwnedInput(
+    data: string,
+    options: SessionWriteOptions,
+    work: () => Promise<boolean>,
+    taintOnly = false
+  ): Promise<boolean> {
+    const bytes = Buffer.byteLength(data),
+      scope = this._identityInputScope(),
+      epoch = this._paneStartedAt,
+      lifecycle = this._paneLifecycleOps;
+    if (!taintOnly && this.recoveryInputReserved) return false;
+    if (!taintOnly && lifecycle > 0) {
+      this._noteRejectedOwnedInput(options);
+      return false;
+    }
+    if (this._ownedInputQueued >= 256 || this._ownedInputBytes + bytes > 2_097_152) return false;
+    this._ownedInputQueued++;
+    this._ownedInputBytes += bytes;
+    const running = this._ownedInputTail
+      .catch(() => {})
+      .then(async () => {
+        if (
+          this._closing ||
+          this._isStopped ||
+          this._paneLifecycleOps !== lifecycle ||
+          (!taintOnly && lifecycle > 0) ||
+          epoch !== this._paneStartedAt ||
+          scope !== this._identityInputScope()
+        )
+          return false;
+        return work();
+      });
+    this._ownedInputTail = running.catch(() => {});
+    try {
+      return await running;
+    } finally {
+      this._ownedInputQueued--;
+      this._ownedInputBytes -= bytes;
+    }
+  }
+
+  private _inputCallerCurrent(options: SessionWriteOptions): boolean {
+    if (options.isCurrent === undefined) return true;
+    if (typeof options.isCurrent !== 'function') return false;
+    try {
+      const result: unknown = options.isCurrent();
+      if (result && typeof (result as { then?: unknown }).then === 'function')
+        void Promise.resolve(result).catch(() => {});
+      return result === true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async _prepareRecoveryInput(data: string, options: SessionWriteOptions, taintOnly = false): Promise<void> {
+    if (!this._inputCallerCurrent(options)) throw new RebootIdentityFenceError();
+    if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return;
+    const lifecycle = this._paneLifecycleOps,
+      epoch = this._paneStartedAt;
+    if (
+      (!taintOnly && lifecycle > 0) ||
+      !(await this.ensureRecoveryIdentityFence()) ||
+      this._paneLifecycleOps !== lifecycle ||
+      this._paneStartedAt !== epoch
+    )
+      throw new RebootIdentityFenceError();
+    this._recoveryGeneration++;
+    this._recoverySubmission = undefined;
+    this._recoverySwitchPending = true;
+    const generation = this._recoveryGeneration,
+      scope = this._identityInputScope();
+    const mux = this._mux,
+      native = this._muxSession,
+      pty = this.ptyProcess;
+    const current = () =>
+      !this._closing &&
+      !this._isStopped &&
+      this._paneLifecycleOps === lifecycle &&
+      (taintOnly || lifecycle === 0) &&
+      epoch === this._paneStartedAt &&
+      generation === this._recoveryGeneration &&
+      scope === this._identityInputScope() &&
+      this._inputCallerCurrent(options) &&
+      mux === this._mux &&
+      native === this._muxSession &&
+      pty === this.ptyProcess;
+    this.emit('recoveryIdentityChanged');
+    const durable = await writeRebootIdentityFence(
+      this.id,
+      {
+        switchPending: true,
+        untrackedInput: this._recoveryUntrackedInput,
+      },
+      current
+    );
+    if (!current()) throw new RebootIdentityFenceError();
+    this._recoveryUntrackedInput ||= durable.untrackedInput === true;
+    this._preparedRecoveryInput = { data, fromUser: options.fromUser === true, current };
+  }
+
+  private _consumePreparedRecoveryInput(data: string, options: SessionWriteOptions): void {
+    if (!this._inputCallerCurrent(options)) throw new RebootIdentityFenceError();
+    if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return;
+    const prepared = this._preparedRecoveryInput;
+    this._preparedRecoveryInput = undefined;
+    if (
+      !prepared ||
+      prepared.data !== data ||
+      prepared.fromUser !== (options.fromUser === true) ||
+      !prepared.current()
+    ) {
+      this._noteRejectedOwnedInput(options);
+      throw new RebootIdentityFenceError();
+    }
+  }
+
+  /** The synchronous effect consumes one exact, current durable-fence receipt. */
+  async writeAsync(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
+    if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return this.write(data, options);
+    return this._queueOwnedInput(data, options, async () => {
+      if (this.recoveryInputReserved) return false;
+      this._ordinaryInputWrites++;
+      try {
+        await this._prepareRecoveryInput(data, options);
+        const delivered = this._doWritePreparedInput(data, options);
+        await this._recoveryFencePublication;
+        return delivered;
+      } finally {
+        this._preparedRecoveryInput = undefined;
+        this._ordinaryInputWrites--;
+      }
+    });
   }
 
   /**
@@ -2350,12 +2542,28 @@ export class Session extends EventEmitter {
     dispatch: (signal: AbortSignal) => Promise<void>,
     prepare?: () => boolean
   ): Promise<boolean> {
-    if (this._inputDeliveryInFlight || this._paneLifecycleOps > 0 || this._closing || this._isStopped) return false;
+    if (this._ordinaryInputWrites > 0) return false;
+    return this._queueOwnedInput(data, { fromUser: true }, () => this._doSendNamedKey(data, dispatch, prepare));
+  }
+  private async _doSendNamedKey(
+    data: string,
+    dispatch: (signal: AbortSignal) => Promise<void>,
+    prepare?: () => boolean
+  ): Promise<boolean> {
+    if (
+      this.recoveryInputReserved ||
+      this._ordinaryInputWrites > 0 ||
+      this._paneLifecycleOps > 0 ||
+      this._closing ||
+      this._isStopped
+    )
+      return false;
     const abort = new AbortController();
     this._namedKeyAbort = abort;
     try {
       this._submitVerifier?.cancel();
       this._submitVerifier = null;
+      await this._prepareRecoveryInput(data, { fromUser: true });
       if (prepare) {
         let admitted = false;
         try {
@@ -2367,15 +2575,17 @@ export class Session extends EventEmitter {
           // Preparation has not dispatched bytes or changed the plaintext draft.
         }
         if (!admitted) {
-          this._noteRejectedOwnedInput();
+          this._noteRejectedOwnedInput({ fromUser: true });
           return false;
         }
       }
+      this._consumePreparedRecoveryInput(data, { fromUser: true });
       const submitted = this._trackSubmit(data, { fromUser: true });
       if (abort.signal.aborted) return false;
       await dispatch(abort.signal);
       if (abort.signal.aborted) throw new Error('Named key dispatch cancelled');
       this._emitSubmittedPrompt(submitted);
+      await this._recoveryFencePublication;
       return true;
     } catch (err) {
       if (getCli(this.mode)?.capabilities.recovery === 'codex-rollout') {
@@ -2384,6 +2594,7 @@ export class Session extends EventEmitter {
       }
       throw err;
     } finally {
+      this._preparedRecoveryInput = undefined;
       if (this._namedKeyAbort === abort) this._namedKeyAbort = null;
     }
   }
@@ -2402,9 +2613,10 @@ export class Session extends EventEmitter {
       generation: this._recoveryGeneration,
       submission: this._recoverySubmission,
       intentionalStopAt: this._recoveryIntentionalStopAt,
-      switchPending: this._recoverySwitchPending,
+      switchPending: this._recoverySwitchPending || !this._recoveryFenceInitialized,
       untrackedInput: this._recoveryUntrackedInput,
       managed:
+        this._recoveryFenceInitialized &&
         this.paneExitApplies &&
         !this._closing &&
         !this._isStopped &&
@@ -3498,6 +3710,9 @@ export class Session extends EventEmitter {
     if (this._closing) {
       throw new Error('Session is being closed');
     }
+    if (!(await this.ensureRecoveryIdentityFence())) throw new RebootIdentityFenceError();
+    if (this._closing || this._inputDeliveryInFlight)
+      throw new Error('Session input scope changed during initialization');
 
     // Bounds the workspace-trust scan (see _maybeAcceptTrustDialog). Stamped here
     // rather than at PTY spawn so a slow mux attach still counts as startup.
@@ -5206,6 +5421,8 @@ export class Session extends EventEmitter {
    * Sends input directly to the PTY process.
    *
    * For interactive sessions, this is how you send user input to Claude.
+   * Codex callers must await writeAsync() so its identity veto is durable first;
+   * this synchronous API refuses Codex input before any bytes or receipt use.
    * Remember to include `\r` (carriage return) to simulate pressing Enter.
    *
    * @example
@@ -5221,16 +5438,24 @@ export class Session extends EventEmitter {
    * input could disappear while the caller believed it had been delivered.
    */
   write(data: string, options: SessionWriteOptions = {}): boolean {
+    // Public synchronous callers cannot borrow a receipt between the private
+    // preparer's resolution and its owner's awaited continuation.
+    if (getCli(this.mode)?.capabilities.recovery === 'codex-rollout') throw new RebootIdentityFenceError();
+    return this._doWritePreparedInput(data, options);
+  }
+  private _doWritePreparedInput(data: string, options: SessionWriteOptions): boolean {
+    if (!this._inputCallerCurrent(options)) return false;
     if (this.recoveryInputReserved) return false;
     this._ordinaryInputWrites++;
     try {
       if (!this.ptyProcess) {
-        this._noteRejectedOwnedInput();
+        this._noteRejectedOwnedInput(options);
         return false;
       }
+      this._consumePreparedRecoveryInput(data, options);
       const input = this._wrapOwnedPtyInput(data);
       if (input === undefined) {
-        this._noteRejectedOwnedInput();
+        this._noteRejectedOwnedInput(options);
         return false;
       }
       const submittedPrompt = this._trackSubmit(data, options);
@@ -5268,8 +5493,13 @@ export class Session extends EventEmitter {
   }
 
   /** Rejected owner input still cancels automation, without inventing delivered text. */
-  private _noteRejectedOwnedInput(): void {
-    if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return;
+  private _noteRejectedOwnedInput(options: SessionWriteOptions): void {
+    if (
+      options.fromUser !== true ||
+      !this._inputCallerCurrent(options) ||
+      getCli(this.mode)?.capabilities.recovery !== 'codex-rollout'
+    )
+      return;
     this._recoveryGeneration++;
     this._invalidateRecoverySubmission();
     this.emit('recoveryUserInput');
@@ -5348,14 +5578,32 @@ export class Session extends EventEmitter {
    * Commit a fail-closed identity veto before a supported client hands its
    * terminal directly to tmux. Bytes typed during that attach bypass every
    * Session write path, so no pre-attach conversation proof can remain valid.
-   * The recoveryIdentityChanged listener writes the fsynced private fence
-   * synchronously; an error therefore prevents the client from attaching.
+   * The private preflight awaits the durable identity veto before the client
+   * may attach. Unknown or timed-out persistence prevents the handoff.
    */
-  fenceUntrackedInput(): void {
+  async fenceUntrackedInput(isCurrent?: () => boolean): Promise<void> {
     if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return;
-    this._recoveryUntrackedInput = true;
-    this._recoveryInputProofTracker.invalidate();
-    this._invalidateRecoverySubmission();
+    const scoped = this._identityInputScope();
+    const delivered = await this._queueOwnedInput(
+      '',
+      { fromUser: true, isCurrent },
+      async () => {
+        await this._prepareRecoveryInput('', { fromUser: true, isCurrent }, true);
+        const generation = this._recoveryGeneration;
+        const preparedCurrent = this._preparedRecoveryInput!.current;
+        const current = () =>
+          preparedCurrent() && scoped === this._identityInputScope() && generation === this._recoveryGeneration;
+        this._preparedRecoveryInput = undefined;
+        await writeRebootIdentityFence(this.id, { switchPending: true, untrackedInput: true }, current);
+        if (!current()) throw new RebootIdentityFenceError();
+        this._recoveryUntrackedInput = true;
+        this._recoveryInputProofTracker.invalidate();
+        this._invalidateRecoverySubmission();
+        return true;
+      },
+      true
+    );
+    if (!delivered) throw new RebootIdentityFenceError();
   }
 
   private _invalidateRecoverySubmission(): void {
@@ -5367,15 +5615,39 @@ export class Session extends EventEmitter {
   }
 
   private _publishRecoveryIdentityAfterDispatch(): void {
-    try {
-      this.emit('recoveryIdentityChanged');
-    } catch (error) {
-      if (!(error instanceof RebootIdentityFenceError)) throw error;
-      // Input already landed. Keep the earlier durable veto and never make its
-      // delivery look unsuccessful to an exactly-once client.
-      this._recoverySubmission = undefined;
-      this._recoverySwitchPending = true;
-    }
+    const generation = this._recoveryGeneration,
+      scope = this._identityInputScope();
+    const submission = this._recoverySubmission;
+    const current = () =>
+      !this._closing &&
+      !this._isStopped &&
+      generation === this._recoveryGeneration &&
+      scope === this._identityInputScope();
+    this._recoverySwitchPending = true;
+    this._recoveryFencePublication = (async () => {
+      try {
+        const durable = await writeRebootIdentityFence(
+          this.id,
+          {
+            switchPending: this._recoveryUntrackedInput || !submission,
+            submission,
+            untrackedInput: this._recoveryUntrackedInput,
+          },
+          current
+        );
+        if (!current()) return;
+        this._recoveryUntrackedInput ||= durable.untrackedInput === true;
+        this._recoverySwitchPending = durable.switchPending || this._recoveryUntrackedInput;
+        this.emit('recoveryIdentityChanged');
+      } catch {
+        // Bytes already landed: retain the acknowledged pending veto, but do
+        // not turn post-delivery persistence failure into a replayable refusal.
+        if (current()) {
+          this._recoverySubmission = undefined;
+          this._recoverySwitchPending = true;
+        }
+      }
+    })();
   }
 
   private _emitSubmittedPrompt(submitted: {
@@ -5390,7 +5662,6 @@ export class Session extends EventEmitter {
         // Direct tmux stdin remains concurrent and invisible for the lifetime of
         // the handoff taint. A tracked browser prompt cannot prove that no later
         // untracked /resume or edit changed the conversation underneath it.
-        this._recoverySwitchPending = this._recoveryUntrackedInput;
         this._publishRecoveryIdentityAfterDispatch();
       } else if (prompt !== undefined && /^\/exit\b/.test(prompt.trimStart())) {
         this._recoveryIntentionalStopAt = proof.at;
@@ -5554,19 +5825,23 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    if (this.recoveryInputReserved) return false;
-    this._ordinaryInputWrites++;
-    try {
-      return await this._doWriteViaMux(data, options);
-    } finally {
-      this._ordinaryInputWrites--;
-    }
+    return this._queueOwnedInput(data, options, async () => {
+      if (this.recoveryInputReserved) return false;
+      this._ordinaryInputWrites++;
+      try {
+        return await this._doWriteViaMux(data, options);
+      } finally {
+        this._preparedRecoveryInput = undefined;
+        this._ordinaryInputWrites--;
+      }
+    });
   }
 
   private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
+    await this._prepareRecoveryInput(data, options);
     const viaMux = !!(this._mux && this._muxSession);
     if (!viaMux && !this.ptyProcess) {
-      this._noteRejectedOwnedInput();
+      this._noteRejectedOwnedInput(options);
       return false;
     }
     if (viaMux && this._mux?.canDeliverCodexOwnerInput) {
@@ -5580,13 +5855,14 @@ export class Session extends EventEmitter {
         // A cache/readiness failure is a known pre-delivery refusal.
       }
       if (!admitted) {
-        this._noteRejectedOwnedInput();
+        this._noteRejectedOwnedInput(options);
         return false;
       }
     }
+    this._consumePreparedRecoveryInput(data, options);
     const input = !viaMux && this.ptyProcess ? this._wrapOwnedPtyInput(data) : data;
     if (input === undefined) {
-      this._noteRejectedOwnedInput();
+      this._noteRejectedOwnedInput(options);
       return false;
     }
     const submittedPrompt = this._trackSubmit(data, options, viaMux);
@@ -5607,6 +5883,7 @@ export class Session extends EventEmitter {
       if (sent) {
         this._commitWriteInput(options);
         this._emitSubmittedPrompt(submittedPrompt);
+        await this._recoveryFencePublication;
         this._verifySubmitted(data);
       }
       return sent;
@@ -5619,6 +5896,7 @@ export class Session extends EventEmitter {
         this._commitWriteInput(options);
       }
       this._emitSubmittedPrompt(submittedPrompt);
+      await this._recoveryFencePublication;
       return true;
     }
     return false;

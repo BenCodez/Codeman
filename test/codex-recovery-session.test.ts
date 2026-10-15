@@ -1,5 +1,6 @@
+import { randomUUID } from 'node:crypto';
 /** Recovery uses the real Session boundary with an isolated fake mux; never a live agent or tmux socket. */
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
@@ -7,7 +8,10 @@ import { CONTINUATION_PROMPT, type RecoveryFlight } from '../src/recovery/types.
 import { createDeferred } from './mocks/index.js';
 
 const THREAD = '11111111-2222-3333-4444-555555555555';
-const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+let SESSION: string;
+beforeEach(() => {
+  SESSION = randomUUID();
+});
 const sessions: Session[] = [];
 afterEach(async () => {
   for (const session of sessions.splice(0)) await session.stop(false);
@@ -68,6 +72,7 @@ function fixture(extra: Record<string, unknown> = {}) {
 describe('the actual Session recovery boundary', () => {
   it('requires realized isolated launch evidence, not just the requested flag', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.muxSession.recoveryIsolated = undefined;
     expect(f.session.getRecoveryContext().noDaemon).toBe(false);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
@@ -76,6 +81,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('refuses legacy isolated panes without actual home provenance', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.muxSession.recoveryCodexHome = undefined;
     expect(f.session.getRecoveryContext().noDaemon).toBe(false);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
@@ -84,6 +90,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('pins the exact thread and preserves all launch settings and the session home on restart', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
     expect(f.mux.respawnPane).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
@@ -111,6 +118,7 @@ describe('the actual Session recovery boundary', () => {
     'never restarts a live, cleanly exited, or unverified pane: %j',
     async (patch) => {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       Object.assign(f.pane, patch);
       expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
       expect(f.mux.respawnPane).not.toHaveBeenCalled();
@@ -119,6 +127,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('pauses instead of inventing a new conversation when the exact identity differs', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.flight.conversationId = '22222222-2222-3333-4444-555555555555';
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
@@ -131,6 +140,7 @@ describe('the actual Session recovery boundary', () => {
       '›\n  user multiline draft\n  example-model high · /tmp\n',
     ]) {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       Object.assign(f.pane, { dead: false, status: undefined, screen });
       f.flight.action = 'continue';
       expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
@@ -140,6 +150,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('delivers one single-line continuation through mux input', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
     f.flight.action = 'continue';
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
@@ -154,6 +165,7 @@ describe('the actual Session recovery boundary', () => {
   it('never re-presses Enter for an unaccepted continuation or a subsequently edited draft', async () => {
     vi.useFakeTimers();
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
     Object.assign(f.mux, { capturePaneText: vi.fn(() => `› ${CONTINUATION_PROMPT} edited draft\n`) });
     f.flight.action = 'continue';
@@ -170,6 +182,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('cancels when user input or cleanup changes the generation during the fresh probe', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const pending = createDeferred<typeof f.pane>();
     f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
     const action = f.session.deliverRecovery(f.flight, 0);
@@ -181,13 +194,14 @@ describe('the actual Session recovery boundary', () => {
 
   it('reserves user write paths while recovery dispatch is in flight', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const pending = createDeferred<number>();
     f.mux.respawnPane.mockImplementationOnce(() => pending.promise);
     const action = f.session.deliverRecovery(f.flight, 0);
     await Promise.resolve();
     expect(f.session.recoveryInputReserved).toBe(true);
     expect(await f.session.writeViaMux('new user prompt\r', { fromUser: true })).toBe(false);
-    expect(f.session.write('x', { fromUser: true })).toBe(false);
+    expect(await f.session.writeAsync('x', { fromUser: true })).toBe(false);
     pending.resolve(99999);
     expect(await action).toBe('sent');
     expect(f.session.recoveryInputReserved).toBe(false);
@@ -197,6 +211,7 @@ describe('the actual Session recovery boundary', () => {
     'rechecks %s at the final Session dispatch boundary',
     async (change) => {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       const pending = createDeferred<typeof f.pane>();
       f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
       const delivery = f.session.deliverRecovery(f.flight, 0);
@@ -214,6 +229,7 @@ describe('the actual Session recovery boundary', () => {
     'respects controller cancellation during the final %s probe',
     async (action) => {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       f.flight.action = action;
       if (action === 'continue')
         Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
@@ -244,6 +260,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('treats a partial dispatch as uncertain, so the controller can avoid replaying it', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.mux.respawnPane.mockResolvedValueOnce(null as unknown as number);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('unknown');
   });
@@ -260,6 +277,7 @@ describe('the actual Session recovery boundary', () => {
       expect(f.mux.respawnPane).not.toHaveBeenCalled();
     }
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.session.markClosing(true);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
   });
@@ -302,6 +320,7 @@ it.each(['unchanged', 'cancelled'] as const)(
   'awaits fresh asynchronous evidence while retaining pure current authority: %s',
   async (change) => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const entered = createDeferred<void>();
     const held = createDeferred<boolean>();
     let current = true;

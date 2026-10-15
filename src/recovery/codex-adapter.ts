@@ -42,7 +42,6 @@ export class CodexRecoveryAdapter {
 
   async observe(): Promise<RecoveryObservation> {
     const session = this.session;
-    const context = session.getRecoveryContext();
     const unknown = (reason: RecoveryObservation['reason']): RecoveryObservation => ({
       activity: 'unknown',
       reason,
@@ -51,6 +50,9 @@ export class CodexRecoveryAdapter {
     });
     this.proof = undefined;
     this.verifiedTail = undefined;
+    if (session.ensureRecoveryIdentityFence && !(await session.ensureRecoveryIdentityFence()))
+      return unknown('identity-unverified');
+    const context = session.getRecoveryContext();
     if (session.remote || session.docker) return unknown('unsupported-location');
     if (!context.managed) return unknown('unowned-session');
     if (!context.noDaemon) return unknown('managed-daemon');

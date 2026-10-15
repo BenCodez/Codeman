@@ -235,7 +235,7 @@ it.each([false, true])(
   async (newer) => {
     const { state, root, home, work } = await fixture();
     const now = Date.now();
-    writeRebootIdentityFence(SID, { switchPending: false, resumeSessionId: CID });
+    await writeRebootIdentityFence(SID, { switchPending: false, resumeSessionId: CID });
     const fenceAt = newer ? now - 10_000 : now;
     await fs.utimes(rebootIdentityFencePath(SID), fenceAt / 1_000, fenceAt / 1_000);
     const metadata = (id: string, at: number) =>
@@ -293,7 +293,7 @@ it.each([
     if (kind === 'legacy-missing-mux-new-broker') await fs.unlink(join(root, 'mux-sessions.json'));
   }
   expect(plan.restore).toHaveLength(1);
-  rebootRestoreRegistry.set(plan.restore);
+  await rebootRestoreRegistry.set(plan.restore);
   if (kind === 'pending-incarnation' || kind === 'new-incarnation') {
     const rows = JSON.parse(await fs.readFile(join(root, 'mux-sessions.json'), 'utf8'));
     if (kind === 'pending-incarnation') rows[0].recoveryInputBrokerPending = OTHER;

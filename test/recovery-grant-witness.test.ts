@@ -156,6 +156,7 @@ describe.each(['continue', 'restart'] as const)('actual local %s grant boundary'
         envOverrides: { CODEX_HOME: home },
       });
       const thread = '11111111-2222-3333-4444-555555555555';
+      expect(await worker.ensureRecoveryIdentityFence()).toBe(true);
       worker.pinRecoveryConversation(thread);
       const revoke = () => replace([account({ canBypassPermissions: false })]);
       const clamp = clamps.clampRecoveryLaunchForOwner;

@@ -103,7 +103,10 @@ interface HistoryIndex {
 }
 
 class Budget {
-  readonly deadline = performance.now() + WALL_CLOCK_MS;
+  readonly deadline: number;
+  constructor(originalDeadline = Infinity) {
+    this.deadline = Math.min(performance.now() + WALL_CLOCK_MS, originalDeadline);
+  }
   files = 0;
   directories = 0;
   entries = 0;
@@ -513,7 +516,8 @@ export async function resolveCodexIdentity(request: CodexIdentityRequest): Promi
  * on it, while malformed history refuses only exact-submission requests.
  */
 export async function resolveCodexIdentities(
-  requests: readonly CodexIdentityRequest[]
+  requests: readonly CodexIdentityRequest[],
+  deadline?: number
 ): Promise<CodexIdentityResult[]> {
   const results: Array<CodexIdentityResult | undefined> = new Array(requests.length);
   const groups = new Map<string, Array<{ index: number; request: CodexIdentityRequest }>>();
@@ -529,7 +533,7 @@ export async function resolveCodexIdentities(
     groups.set(home, group);
   }
 
-  const budget = new Budget();
+  const budget = new Budget(deadline);
   const work = (async () => {
     for (const [home, group] of groups) {
       try {
