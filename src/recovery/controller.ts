@@ -35,6 +35,14 @@ const CONFIRM_MS = 2000;
 const STALL_CONFIRM_MAX_MS = 15_000;
 const promptHash = createHash('sha256').update(CONTINUATION_PROMPT).digest('hex');
 
+/** An owner reset cannot certify that a possibly dispatched operation was never delivered. */
+export class RecoveryResetBlockedError extends Error {
+  constructor() {
+    super('Recovery delivery is still unverified');
+    this.name = 'RecoveryResetBlockedError';
+  }
+}
+
 export class RecoveryController {
   private state: RecoveryState;
   private queue: Promise<unknown> = Promise.resolve();
@@ -323,7 +331,10 @@ export class RecoveryController {
   async reset(): Promise<RecoveryState> {
     this.revision++;
     return this.enqueue(async () => {
-      // Reset is explicit user authorization to clear an unresolved delivery/budget, never itself a retry.
+      // A reset changes retry limits, not delivery evidence. Keep the exact
+      // durable reservation until acceptance (or certified no-send cleanup)
+      // resolves it; otherwise a subsequent Retry could replay its effects.
+      if (this.state.inFlight) throw new RecoveryResetBlockedError();
       this.state.circuitOpen = false;
       this.state.attempts = 0;
       this.state.failedAttempts = 0;

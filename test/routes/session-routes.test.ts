@@ -704,7 +704,7 @@ describe('session-routes', () => {
     });
 
     it('removes a persisted-only session (not live) via the state store, without touching cleanupSession', async () => {
-      vi.mocked(harness.ctx.store.getSession).mockReturnValueOnce({
+      vi.mocked(harness.ctx.store.getSession).mockReturnValue({
         id: 'ghost-session',
         owner: undefined,
       } as never);

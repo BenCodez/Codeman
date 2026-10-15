@@ -870,6 +870,16 @@ export function registerSessionRoutes(
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
   options: { remoteWake?: RemoteWakeRegistry } = {}
 ): RemoteWakeRegistry {
+  let stopBrokerCleanup: (() => Promise<void>) | undefined;
+  app.addHook('onReady', async () => {
+    stopBrokerCleanup = ownedRemoteBrokerCache.startFinalCleanupRetries((id) => ({
+      live: ctx.sessions.has(id),
+      state: ctx.store.getSessions()[id],
+    }));
+  });
+  app.addHook('onClose', async () => {
+    await stopBrokerCleanup?.();
+  });
   // Wake-on-LAN for sleeping remote hosts (see remote-wake.ts). One registry per
   // route registration (= one web server) — the same shape as the process-wide
   // `sessionWaits` singleton, but without the global.
@@ -1492,17 +1502,28 @@ export function registerSessionRoutes(
     if (!ctx.sessions.has(id)) {
       // Called for its existence/ownership 404 side effect only — demoteOrRemoveSession
       // below re-looks-up the record by id, so the returned SessionState is unused here.
-      findPersistedSessionOrFail(ctx.store, id, req);
+      const before = findPersistedSessionOrFail(ctx.store, id, req);
+      const beforeText = JSON.stringify(before);
+      if (killMux) {
+        await ownedRemoteBrokerCache.stageFinalCleanup(
+          id,
+          before.pinned ? { ...before, status: 'stopped', pid: null } : undefined,
+          () => !ctx.sessions.has(id) && ctx.store.getSession(id) === before && JSON.stringify(before) === beforeText
+        );
+        if (ctx.sessions.has(id) || ctx.store.getSession(id) !== before || JSON.stringify(before) !== beforeText)
+          throw Error('Session changed while preparing final cleanup');
+      }
       ctx.store.demoteOrRemoveSession(id);
       if (killMux) {
         const retiredState = ctx.store.getSessions()[id];
         const retiredStateText = JSON.stringify(retiredState);
-        await ownedRemoteBrokerCache.retireAndDelete(
+        await ownedRemoteBrokerCache.finishFinalCleanup(
           id,
           () =>
             !ctx.sessions.has(id) &&
             ctx.store.getSessions()[id] === retiredState &&
-            JSON.stringify(retiredState) === retiredStateText
+            JSON.stringify(retiredState) === retiredStateText,
+          retiredState
         );
       }
       // Mirrors the broadcast at the tail of the live-session cleanup path

@@ -221,7 +221,7 @@ afterEach(async () => {
       const owned = JSON.parse(exists);
       await eventually(async () => {
         const raw = await fs.readFile(`/proc/${owned.pid}/stat`, 'utf8').catch((error: NodeJS.ErrnoException) => {
-          if (error.code === 'ENOENT') return undefined;
+          if (error.code === 'ENOENT' || error.code === 'ESRCH') return undefined;
           throw error;
         });
         if (raw === undefined) return true;

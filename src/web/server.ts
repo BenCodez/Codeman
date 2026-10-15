@@ -1680,6 +1680,22 @@ export class WebServer extends EventEmitter {
       }
       await session.stop(killMux);
       if (this.sessions.get(sessionId) !== session) return;
+      if (killMux) {
+        const before = this.store.getSessions()[sessionId],
+          beforeText = JSON.stringify(before),
+          owner = session.owner;
+        const current = () =>
+          this.sessions.get(sessionId) === session &&
+          session.owner === owner &&
+          this.store.getSessions()[sessionId] === before &&
+          JSON.stringify(before) === beforeText;
+        await ownedRemoteBrokerCache.stageFinalCleanup(
+          sessionId,
+          before?.pinned ? { ...before, status: 'stopped', pid: null } : undefined,
+          current
+        );
+        if (!current()) throw Error('Session changed while preparing final cleanup');
+      }
       this.sessions.delete(sessionId);
       // Only remove from state.json if we're also killing the mux session.
       // When killMux=false (server shutdown), preserve state for recovery.
@@ -1688,13 +1704,14 @@ export class WebServer extends EventEmitter {
         const retiredState = this.store.getSessions()[sessionId];
         const retiredStateText = JSON.stringify(retiredState);
         const retiredOwner = session.owner;
-        await ownedRemoteBrokerCache.retireAndDelete(
+        await ownedRemoteBrokerCache.finishFinalCleanup(
           sessionId,
           () =>
             !this.sessions.has(sessionId) &&
             session.owner === retiredOwner &&
             this.store.getSessions()[sessionId] === retiredState &&
-            JSON.stringify(retiredState) === retiredStateText
+            JSON.stringify(retiredState) === retiredStateText,
+          retiredState
         );
       }
     }
