@@ -1,5 +1,5 @@
 /** Private source-host material for controlled owned-SSH launches; never remote adoption. */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { join, posix } from 'node:path';
@@ -27,11 +27,13 @@ export interface OwnedRemoteBrokerDescriptor {
   startupNonce: string;
 }
 type Entry = {
+  epoch: CacheEpoch;
   scope: string;
   material: BrokerProvisioningMaterial;
   descriptor: OwnedRemoteBrokerDescriptor;
   signer?: CodexInputBroker;
 };
+type CacheEpoch = { id: string; pending: number };
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const MAX_BYTES = 524_288;
 const digest = (input: string) => createHash('sha256').update(input).digest('hex');
@@ -179,7 +181,32 @@ function descriptor(
 export class OwnedRemoteBrokerCache {
   private readonly entries = new Map<string, Entry>();
   private readonly scopes = new Map<string, string>();
+  private readonly epochs = new Map<string, CacheEpoch>();
   constructor(private readonly root = join(getDataDirPath(), 'remote-input-brokers')) {}
+  private begin(sessionId: string): CacheEpoch {
+    let epoch = this.epochs.get(sessionId);
+    if (!epoch) {
+      epoch = { id: randomUUID(), pending: 0 };
+      this.epochs.set(sessionId, epoch);
+    }
+    epoch.pending++;
+    return epoch;
+  }
+  private finish(sessionId: string, epoch: CacheEpoch): void {
+    epoch.pending--;
+    if (this.epochs.get(sessionId) === epoch && epoch.pending === 0 && !this.scopes.has(sessionId))
+      this.epochs.delete(sessionId);
+  }
+  /** Final application deletion only. Private launch provenance stays on disk for verified restoration. */
+  retire(sessionId: string): void {
+    this.epochs.delete(sessionId);
+    this.scopes.delete(sessionId);
+    for (const [key, entry] of this.entries) {
+      if (!key.startsWith(sessionId + ':')) continue;
+      entry.signer?.retire();
+      this.entries.delete(key);
+    }
+  }
   private directories(sessionId: string, incarnation: string): string[] {
     return [this.root, join(this.root, sessionId), join(this.root, sessionId, incarnation)];
   }
@@ -210,47 +237,54 @@ export class OwnedRemoteBrokerCache {
       return undefined;
     const dirs = this.directories(scope.sessionId, copied.config.incarnation);
     const file = join(dirs[2], 'private.json');
-    const prepared = await bounded(
-      'write:' + file + ':' + createHash('sha256').update(bytes).digest('hex'),
-      async () => {
-        for (const path of dirs) {
-          await fs.mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-            if (error.code !== 'EEXIST') throw error;
-          });
-          if (!privateStat(await fs.lstat(path), true)) throw new Error('Private remote cache unavailable');
-        }
-        const handle = await fs.open(
-          file,
-          constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-          0o600
-        );
-        try {
-          await handle.writeFile(bytes);
-          await handle.sync();
-        } finally {
-          await handle.close();
-        }
-        for (const path of dirs.slice().reverse()) {
-          const handle = await fs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    const sessionId = scope.sessionId;
+    const epoch = this.begin(sessionId);
+    try {
+      const prepared = await bounded(
+        'write:' + file + ':' + createHash('sha256').update(bytes).digest('hex') + ':' + epoch.id,
+        async () => {
+          for (const path of dirs) {
+            await fs.mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+              if (error.code !== 'EEXIST') throw error;
+            });
+            if (!privateStat(await fs.lstat(path), true)) throw new Error('Private remote cache unavailable');
+          }
+          const handle = await fs.open(
+            file,
+            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+            0o600
+          );
           try {
+            await handle.writeFile(bytes);
             await handle.sync();
           } finally {
             await handle.close();
           }
+          for (const path of dirs.slice().reverse()) {
+            const handle = await fs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+            try {
+              await handle.sync();
+            } finally {
+              await handle.close();
+            }
+          }
+          return true;
         }
-        return true;
-      }
-    );
-    if (
-      prepared !== true ||
-      scopeKey(scope) !== key ||
-      this.entries.get(entryKey) !== prior ||
-      (this.scopes.has(scope.sessionId) && this.scopes.get(scope.sessionId) !== key)
-    )
-      return undefined;
-    this.scopes.set(scope.sessionId, key);
-    this.entries.set(entryKey, { scope: key, material: copied, descriptor: proof });
-    return { ...proof };
+      );
+      if (
+        prepared !== true ||
+        this.epochs.get(scope.sessionId) !== epoch ||
+        scopeKey(scope) !== key ||
+        this.entries.get(entryKey) !== prior ||
+        (this.scopes.has(scope.sessionId) && this.scopes.get(scope.sessionId) !== key)
+      )
+        return undefined;
+      this.scopes.set(scope.sessionId, key);
+      this.entries.set(entryKey, { epoch, scope: key, material: copied, descriptor: proof });
+      return { ...proof };
+    } finally {
+      this.finish(sessionId, epoch);
+    }
   }
   /** Reads only locally retained launch material; an existing remote pane cannot create this record. */
   async load(scope: OwnedRemoteBrokerScope, incarnation: string): Promise<OwnedRemoteBrokerDescriptor | undefined> {
@@ -263,59 +297,69 @@ export class OwnedRemoteBrokerCache {
       return known.scope === key && known.descriptor.incarnation === incarnation ? { ...known.descriptor } : undefined;
     const dirs = this.directories(scope.sessionId, incarnation);
     const file = join(dirs[2], 'private.json');
-    const value = await bounded('read:' + file + ':' + key, async () => {
-      const parents: Stats[] = [];
-      for (const path of dirs) parents.push(await fs.lstat(path));
-      if (parents.some((value) => !privateStat(value, true))) throw new Error('Private remote cache unavailable');
-      const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
-      let before: Stats, bytes: Buffer;
-      try {
-        before = await handle.stat();
-        if (!privateStat(before) || before.size > MAX_BYTES) throw new Error('Private remote cache unavailable');
-        bytes = Buffer.alloc(before.size + 1);
-        const read = await handle.read(bytes, 0, bytes.length, 0);
-        if (read.bytesRead !== before.size || !same(before, await handle.stat()))
-          throw new Error('Private remote cache changed');
-        bytes = bytes.subarray(0, read.bytesRead);
-      } finally {
-        await handle.close();
-      }
-      const current = await fs.lstat(file);
-      if (!privateStat(current) || !same(before, current)) throw new Error('Private remote cache replaced');
-      const after: Stats[] = [];
-      for (const path of dirs) after.push(await fs.lstat(path));
-      if (after.some((value, index) => !privateStat(value, true) || !same(value, parents[index])))
-        throw new Error('Private remote cache parent changed');
-      return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as {
-        version: unknown;
-        scope: unknown;
-        directory: string;
-        material: BrokerProvisioningMaterial;
-      };
-    });
-    if (
-      !value ||
-      Object.keys(value).sort().join(',') !== 'directory,material,scope,version' ||
-      value.version !== 1 ||
-      value.scope !== key ||
-      scopeKey(scope) !== key
-    )
-      return undefined;
-    const proof = descriptor(scope, value.material, value.directory);
-    if (!proof || proof.incarnation !== incarnation) return undefined;
-    // Another concurrent same-scope load may already have minted owner frames.
-    if (this.scopes.has(scope.sessionId) && this.scopes.get(scope.sessionId) !== key) return undefined;
-    if (!this.entries.has(entryKey)) {
-      if ([...this.entries.keys()].filter((entry) => entry.startsWith(scope.sessionId + ':')).length >= 2)
+    const sessionId = scope.sessionId;
+    const epoch = this.begin(sessionId);
+    try {
+      const value = await bounded('read:' + file + ':' + key + ':' + epoch.id, async () => {
+        const parents: Stats[] = [];
+        for (const path of dirs) parents.push(await fs.lstat(path));
+        if (parents.some((value) => !privateStat(value, true))) throw new Error('Private remote cache unavailable');
+        const handle = await fs.open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        let before: Stats, bytes: Buffer;
+        try {
+          before = await handle.stat();
+          if (!privateStat(before) || before.size > MAX_BYTES) throw new Error('Private remote cache unavailable');
+          bytes = Buffer.alloc(before.size + 1);
+          const read = await handle.read(bytes, 0, bytes.length, 0);
+          if (read.bytesRead !== before.size || !same(before, await handle.stat()))
+            throw new Error('Private remote cache changed');
+          bytes = bytes.subarray(0, read.bytesRead);
+        } finally {
+          await handle.close();
+        }
+        const current = await fs.lstat(file);
+        if (!privateStat(current) || !same(before, current)) throw new Error('Private remote cache replaced');
+        const after: Stats[] = [];
+        for (const path of dirs) after.push(await fs.lstat(path));
+        if (after.some((value, index) => !privateStat(value, true) || !same(value, parents[index])))
+          throw new Error('Private remote cache parent changed');
+        return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes)) as {
+          version: unknown;
+          scope: unknown;
+          directory: string;
+          material: BrokerProvisioningMaterial;
+        };
+      });
+      if (
+        !value ||
+        this.epochs.get(scope.sessionId) !== epoch ||
+        Object.keys(value).sort().join(',') !== 'directory,material,scope,version' ||
+        value.version !== 1 ||
+        value.scope !== key ||
+        scopeKey(scope) !== key
+      )
         return undefined;
-      this.scopes.set(scope.sessionId, key);
-      this.entries.set(entryKey, { scope: key, descriptor: proof, material: value.material });
+      const proof = descriptor(scope, value.material, value.directory);
+      if (!proof || proof.incarnation !== incarnation) return undefined;
+      // Another concurrent same-scope load may already have minted owner frames.
+      if (this.scopes.has(scope.sessionId) && this.scopes.get(scope.sessionId) !== key) return undefined;
+      if (!this.entries.has(entryKey)) {
+        if ([...this.entries.keys()].filter((entry) => entry.startsWith(scope.sessionId + ':')).length >= 2)
+          return undefined;
+        this.scopes.set(scope.sessionId, key);
+        this.entries.set(entryKey, { epoch, scope: key, descriptor: proof, material: value.material });
+      }
+      return this.get(scope, incarnation);
+    } finally {
+      this.finish(sessionId, epoch);
     }
-    return this.get(scope, incarnation);
   }
   get(scope: OwnedRemoteBrokerScope, incarnation: string): OwnedRemoteBrokerDescriptor | undefined {
     const entry = this.entries.get(scope.sessionId + ':' + incarnation);
-    return entry && entry.scope === scopeKey(scope) && entry.descriptor.incarnation === incarnation
+    return entry &&
+      this.epochs.get(scope.sessionId) === entry.epoch &&
+      entry.scope === scopeKey(scope) &&
+      entry.descriptor.incarnation === incarnation
       ? { ...entry.descriptor }
       : undefined;
   }
@@ -325,9 +369,16 @@ export class OwnedRemoteBrokerCache {
   /** Called only after the native startup receipt and durable current-incarnation promotion. */
   activate(scope: OwnedRemoteBrokerScope, incarnation: string): boolean {
     if (!this.get(scope, incarnation)) return false;
+    // Promotion also retires pending work for superseded incarnations, not just
+    // entries already published before this synchronous boundary.
+    const epoch = { id: randomUUID(), pending: 0 };
+    this.epochs.set(scope.sessionId, epoch);
+    this.entries.get(scope.sessionId + ':' + incarnation)!.epoch = epoch;
     for (const key of this.entries.keys())
-      if (key.startsWith(scope.sessionId + ':') && key !== scope.sessionId + ':' + incarnation)
+      if (key.startsWith(scope.sessionId + ':') && key !== scope.sessionId + ':' + incarnation) {
+        this.entries.get(key)?.signer?.retire();
         this.entries.delete(key);
+      }
     return true;
   }
   observe(

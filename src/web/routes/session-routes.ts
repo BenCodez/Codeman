@@ -41,6 +41,7 @@ import {
 import type { PaneCaptureOptions } from '../../mux-interface.js';
 import { SseEvent } from '../sse-events.js';
 import { InputDispatchQueueFullError, queueInputDispatch } from '../input-dispatch-queue.js';
+import { ownedRemoteBrokerCache } from '../../recovery/remote-input-broker-cache.js';
 import { webviewCapabilities } from '../../webview-capabilities.js';
 import {
   CreateSessionSchema,
@@ -1493,6 +1494,7 @@ export function registerSessionRoutes(
       // below re-looks-up the record by id, so the returned SessionState is unused here.
       findPersistedSessionOrFail(ctx.store, id, req);
       ctx.store.demoteOrRemoveSession(id);
+      if (killMux) ownedRemoteBrokerCache.retire(id);
       // Mirrors the broadcast at the tail of the live-session cleanup path
       // (_doCleanupSession in server.ts) — without it, other open tabs keep
       // showing the retired row until their next unrelated fetch.

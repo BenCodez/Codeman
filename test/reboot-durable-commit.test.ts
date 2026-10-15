@@ -69,6 +69,28 @@ vi.mock('node:fs/promises', async () => {
   const real = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
   return {
     ...real,
+    open: async (...args: Parameters<typeof real.open>) => {
+      const file = await real.open(...args);
+      const path = String(args[0]);
+      return new Proxy(file, {
+        get(target, key) {
+          if (key === 'sync')
+            return async () => {
+              const directory = (await target.stat()).isDirectory();
+              if (!directory && path.includes('state.json.')) io.lastFile = path;
+              const phase = io.lastFile.includes('state.json.') ? `state-${directory ? 'directory' : 'file'}` : '';
+              if (phase) io.phases.push(phase);
+              if (phase && io.fault === phase) {
+                io.fault = '';
+                throw new Error('Fixture durability acknowledgement failed');
+              }
+              await target.sync();
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
     writeFile: async (...args: Parameters<typeof real.writeFile>) => {
       if (io.blockedWrite && String(args[0]).startsWith(io.blockPrefix)) {
         const wait = io.blockedWrite;

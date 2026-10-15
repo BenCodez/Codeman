@@ -846,6 +846,11 @@ export class CodexInputBroker {
   get incarnation(): string {
     return this.config.incarnation;
   }
+  /** Permanently revoke a discarded source-host signer, including references held by old callers. */
+  retire(): void {
+    this.ready = false;
+    this.ownerCursorUncertain = true;
+  }
   get canFrame(): boolean {
     return this.ready && !this.ownerCursorUncertain;
   }
