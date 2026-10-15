@@ -26,7 +26,9 @@ it.each([
   vi.stubEnv('CODEMAN_MULTIUSER', '0');
   const phases: string[] = [];
   const pane = {
-    paneId: '%7', panePid: 700, dead: false,
+    paneId: '%7',
+    panePid: 700,
+    dead: false,
     screen: '› \n  fixture-model default · /tmp\n',
   };
   const mux = {
@@ -43,26 +45,37 @@ it.each([
         guard.noteDispatch();
         guard.noteBrokerRefusal?.();
       }
-      if (receipt === 'sent') { guard.noteBrokerSent?.(); phases.push('child-submission'); }
+      if (receipt === 'sent') {
+        guard.noteBrokerSent?.();
+        phases.push('child-submission');
+      }
       if (receipt === 'lost') throw new Error('Isolated lost receipt');
       return receipt === 'sent';
     }),
   };
   const session = new Session({
-    workingDir: '/tmp', mode: 'codex', useMux: true,
+    workingDir: '/tmp',
+    mode: 'codex',
+    useMux: true,
     codexConfig: { noDaemon: true, resumeSessionId: THREAD },
     mux: mux as unknown as TerminalMultiplexer,
     muxSession: {
-      muxName: 'codeman-receipt-fixture', recoveryIsolated: true,
+      muxName: 'codeman-receipt-fixture',
+      recoveryIsolated: true,
       recoveryCodexHome: join(homedir(), '.codex'),
     } as MuxSession,
   });
   sessions.push(session);
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   const context = session.getRecoveryContext();
   expect(context).toMatchObject({ managed: true, noDaemon: true, switchPending: false });
   const flight: RecoveryFlight = {
-    key: 'fixture-evidence', conversationId: THREAD, action: 'continue',
-    reason: 'turn-failed', startedAt: Date.now(), attempts: 1,
+    key: 'fixture-evidence',
+    conversationId: THREAD,
+    action: 'continue',
+    reason: 'turn-failed',
+    startedAt: Date.now(),
+    attempts: 1,
   } as unknown as RecoveryFlight;
   expect(await session.deliverRecovery(flight, context.generation)).toBe(expected);
   expect(mux.sendInput).toHaveBeenCalledOnce();

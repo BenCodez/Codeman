@@ -457,6 +457,7 @@ describe('transport canonical task prompts', () => {
         approvalPolicy: 'on-request',
       },
     });
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     session.pinRecoveryConversation(THREAD);
     let now = 10000;
     let tail =

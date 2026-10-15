@@ -230,11 +230,11 @@ describe('session-routes', () => {
         await vi.waitFor(() => expect(execFile).toHaveBeenCalledTimes(1));
         expect(session.recoveryInputReserved).toBe(true);
         expect(session.paneLifecycleInFlight).toBe(true);
-        expect(session.getRecoveryContext().generation).toBe(1);
+        expect(session.getRecoveryContext().generation).toBe(2);
         expect(
           await session.deliverRecovery(
             { action: 'continue', key: 'fixture', conversationId: thread, startedAt: Date.now() },
-            1
+            2
           )
         ).toBe('not-sent');
         expect(mux.sendInput).not.toHaveBeenCalled();
@@ -256,7 +256,7 @@ describe('session-routes', () => {
         expect((await sending).statusCode).toBe(200);
         expect(session.recoveryInputReserved).toBe(false);
         expect(session.paneLifecycleInFlight).toBe(false);
-        expect(session.getRecoveryContext().generation).toBe(1); // no post-callback double tracking
+        expect(session.getRecoveryContext().generation).toBe(2); // no post-callback double tracking
       } finally {
         complete(null);
         await sending;

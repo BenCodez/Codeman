@@ -48,19 +48,19 @@ function attachFakePty(session: Session): void {
 }
 
 describe('exact append-only recovery input model', () => {
-  it('preserves whitespace and Unicode without trimming or normalization', () => {
+  it('preserves whitespace and Unicode without trimming or normalization', async () => {
     const tracker = new CodexInputProofTracker();
     const prompt = '  Sanitized é e\u0301 😀 fixture.  ';
     expect(tracker.feed(`${prompt}\r`)).toEqual({ prompts: [prompt], invalidated: false });
   });
 
-  it('refuses surrogate halves encoded in different PTY writes', () => {
+  it('refuses surrogate halves encoded in different PTY writes', async () => {
     const tracker = new CodexInputProofTracker();
     expect(tracker.feed('\ud83d')).toEqual({ prompts: [], invalidated: true });
     expect(tracker.feed('\ude00\r')).toEqual({ prompts: [undefined], invalidated: true });
   });
 
-  it('preserves multiline LF input and Shift+Enter across frames', () => {
+  it('preserves multiline LF input and Shift+Enter across frames', async () => {
     const tracker = new CodexInputProofTracker();
     expect(tracker.feed('Fixture line one\n')).toEqual({ prompts: [], invalidated: false });
     expect(tracker.feed('\nFixture line three\r')).toEqual({
@@ -69,7 +69,7 @@ describe('exact append-only recovery input model', () => {
     });
   });
 
-  it('preserves bracketed-paste LF payload and split framing exactly', () => {
+  it('preserves bracketed-paste LF payload and split framing exactly', async () => {
     const tracker = new CodexInputProofTracker();
     tracker.feed('\x1b[20');
     tracker.feed('0~  Fixture one\n');
@@ -80,13 +80,13 @@ describe('exact append-only recovery input model', () => {
     });
   });
 
-  it('vetoes recovery while a framing sequence is incomplete', () => {
+  it('vetoes recovery while a framing sequence is incomplete', async () => {
     const tracker = new CodexInputProofTracker();
     expect(tracker.feed('\x1b[20')).toEqual({ prompts: [], invalidated: true });
     expect(tracker.feed('0~Fixture\x1b[201~\r')).toEqual({ prompts: ['Fixture'], invalidated: false });
   });
 
-  it('refuses CR/CRLF paste rather than guessing TUI normalization', () => {
+  it('refuses CR/CRLF paste rather than guessing TUI normalization', async () => {
     const tracker = new CodexInputProofTracker();
     expect(tracker.feed('\x1b[200~Fixture one\r\nFixture two\x1b[201~\r')).toEqual({
       prompts: [undefined],
@@ -103,13 +103,13 @@ describe('exact append-only recovery input model', () => {
     }
   );
 
-  it('refuses an oversized draft instead of hashing its truncated prefix', () => {
+  it('refuses an oversized draft instead of hashing its truncated prefix', async () => {
     const tracker = new CodexInputProofTracker();
     expect(tracker.feed(`${'x'.repeat(8_193)}\r`)).toEqual({ prompts: [undefined], invalidated: true });
     expect(tracker.feed(`${'é'.repeat(4_097)}\r`)).toEqual({ prompts: [undefined], invalidated: true });
   });
 
-  it('returns no proof for an empty submission or unknown external draft', () => {
+  it('returns no proof for an empty submission or unknown external draft', async () => {
     const tracker = new CodexInputProofTracker();
     expect(tracker.feed('\r')).toEqual({ prompts: [undefined], invalidated: false });
     tracker.invalidate();
@@ -118,13 +118,13 @@ describe('exact append-only recovery input model', () => {
 });
 
 describe('Session records exact delivered browser submissions', () => {
-  it('keeps auto-name flattening separate from raw browser recovery hashing', () => {
+  it('keeps auto-name flattening separate from raw browser recovery hashing', async () => {
     const { session } = fixture(false);
     attachFakePty(session);
     const submitted = vi.fn();
     session.on('promptSubmitted', submitted);
     const prompt = '  Fixture first line\nFixture second line  ';
-    expect(session.write(`\x1b[200~${prompt}\x1b[201~\r`, { fromUser: true })).toBe(true);
+    expect(await session.writeAsync(`\x1b[200~${prompt}\x1b[201~\r`, { fromUser: true })).toBe(true);
     expect(submitted).toHaveBeenCalledWith('Fixture first line Fixture second line');
     expect(session.getRecoveryContext()).toMatchObject({
       switchPending: false,
@@ -134,12 +134,12 @@ describe('Session records exact delivered browser submissions', () => {
     expect(JSON.stringify(session.toDetailedState())).not.toContain('Fixture first line');
   });
 
-  it('uses the literal Shift+Enter line feed reported outside the write path', () => {
+  it('uses the literal Shift+Enter line feed reported outside the write path', async () => {
     const { session } = fixture(false);
     attachFakePty(session);
-    session.write('Fixture first', { fromUser: true });
+    await session.writeAsync('Fixture first', { fromUser: true });
     session.trackUserInput('\n');
-    session.write('Fixture second\r', { fromUser: true });
+    await session.writeAsync('Fixture second\r', { fromUser: true });
     expect(session.getRecoveryContext()).toMatchObject({
       switchPending: false,
       submission: { hash: hashCodexPrompt('Fixture first\nFixture second') },
@@ -175,6 +175,7 @@ describe('Session records exact delivered browser submissions', () => {
     });
     session.on('recoveryUserInput', onInput);
     const writing = session.writeViaMux('/resume fixture\r', { fromUser: true });
+    await vi.waitFor(() => expect(mux.sendInput).toHaveBeenCalledTimes(2));
     expect(onInput).toHaveBeenCalled();
     expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, submission: undefined });
     sent.resolve(false);
@@ -222,8 +223,11 @@ describe('Session records exact delivered browser submissions', () => {
     const sent = createDeferred<boolean>();
     mux.sendInput.mockReturnValueOnce(sent.promise);
     const older = session.writeViaMux('Old fixture.\r', { fromUser: true });
-    await session.writeViaMux('/resume fixture\r', { fromUser: true });
+    await vi.waitFor(() => expect(mux.sendInput).toHaveBeenCalledOnce());
+    const newer = session.writeViaMux('/resume fixture\r', { fromUser: true });
+    expect(mux.sendInput).toHaveBeenCalledOnce();
     sent.resolve(true);
+    expect(await newer).toBe(true);
     expect(await older).toBe(true);
     expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, submission: undefined });
   });

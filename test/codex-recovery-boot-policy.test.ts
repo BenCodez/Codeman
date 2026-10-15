@@ -130,6 +130,7 @@ async function expectCurrentGrantRefusal(session: Session): Promise<void> {
   session.trackUserInput('Inspect the sanitized fixture status.\r');
   expect(session.getRecoveryContext().switchPending).toBe(true);
   session.trackUserInput('Inspect the next clean fixture status.\r');
+  await Reflect.get(session, '_recoveryFencePublication');
   expect(session.getRecoveryContext().switchPending).toBe(false);
   expect(await adapter.observe()).toMatchObject({ activity: 'blocked', reason: 'approval-required', safeToAct: false });
   const flight: RecoveryFlight = {

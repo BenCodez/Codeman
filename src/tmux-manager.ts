@@ -30,18 +30,8 @@ import { promisify } from 'node:util';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-import {
-  existsSync,
-  readFileSync,
-  mkdirSync,
-  openSync,
-  closeSync,
-  fsyncSync,
-  writeFileSync,
-  renameSync,
-  unlinkSync,
-} from 'node:fs';
-import { writeFile, rename } from 'node:fs/promises';
+import { existsSync, readFileSync, constants } from 'node:fs';
+import { writeFile, rename, mkdir, open, unlink, lstat } from 'node:fs/promises';
 import { dirname, join, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
@@ -1722,6 +1712,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   readonly backend = 'tmux' as const;
   private sessions: Map<string, MuxSession> = new Map();
   private sessionSaves: Promise<void> = Promise.resolve();
+  private sessionPersistenceUnknown = false;
   private readonly inputBrokers = new Map<string, CodexInputBroker>();
   private readonly inputBrokerLoads = new Map<string, Promise<CodexInputBroker | undefined>>();
   private readonly inputQueues = new Map<string, Promise<unknown>>();
@@ -2175,18 +2166,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    */
   private saveSessions(): void {
     if (IS_TEST_MODE) return;
-
     try {
-      const dir = dirname(MUX_SESSIONS_FILE);
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
-      }
-      const data = Array.from(this.sessions.values());
-      const json = JSON.stringify(data, null, 2);
-
+      const json = JSON.stringify(Array.from(this.sessions.values()), null, 2);
       const tempPath = MUX_SESSIONS_FILE + '.tmp';
       this.sessionSaves = this.sessionSaves
         .then(async () => {
+          if (this.sessionPersistenceUnknown) throw new Error('Mux metadata requires durable repair');
+          await mkdir(dirname(MUX_SESSIONS_FILE), { recursive: true, mode: 0o700 });
           await writeFile(tempPath, json, 'utf-8');
           await rename(tempPath, MUX_SESSIONS_FILE);
         })
@@ -2198,39 +2184,200 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
   }
 
-  /** Drain old snapshots and acknowledge file plus directory durability before consuming a reboot offer. */
-  async flushSessionsDurably(isCurrent: () => boolean | Promise<boolean> = () => true): Promise<void> {
+  /** Drain every queued metadata write, including work enqueued by request cleanup. */
+  async drainSessionSaves(): Promise<void> {
     let pending: Promise<void>;
     do {
       pending = this.sessionSaves;
       await pending;
     } while (pending !== this.sessionSaves);
-    if ((await isCurrent()) !== true) throw new Error('Reboot restoration was cancelled before mux persistence');
-    if (existsSync(MUX_SESSIONS_FILE) && !Array.isArray(JSON.parse(readFileSync(MUX_SESSIONS_FILE, 'utf8'))))
-      throw new Error('Mux metadata is malformed');
-    mkdirSync(dirname(MUX_SESSIONS_FILE), { recursive: true, mode: 0o700 });
-    const temporary = `${MUX_SESSIONS_FILE}.${process.pid}.${Date.now()}.reboot.tmp`;
+  }
+
+  /** Join the write queue and acknowledge file plus directory durability before proceeding. */
+  flushSessionsDurably(
+    isCurrent: () => boolean | Promise<boolean> = () => true,
+    currentAfterAwait?: () => boolean
+  ): Promise<void> {
+    const writing = this.sessionSaves.then(() => this.persistSessionsDurably(isCurrent, currentAfterAwait));
+    // Waiters remain live after this operation fails; its own caller still gets
+    // the original rejection and retains its native launch uncertainty.
+    this.sessionSaves = writing.catch(() => {});
+    return writing;
+  }
+
+  private async persistSessionsDurably(
+    isCurrent: () => boolean | Promise<boolean>,
+    currentAfterAwait?: () => boolean
+  ): Promise<void> {
+    const map = this.sessions;
+    const entries = [...map.entries()];
+    const json = JSON.stringify(Array.from(map.values()), null, 2);
+    const assertCurrent = () => {
+      const verdict = currentAfterAwait ? currentAfterAwait() : isCurrent();
+      if (typeof verdict !== 'boolean') void Promise.resolve(verdict).catch(() => {});
+      if (
+        verdict !== true ||
+        this.sessions !== map ||
+        this.sessions.size !== entries.length ||
+        entries.some(([id, record]) => this.sessions.get(id) !== record) ||
+        JSON.stringify(Array.from(this.sessions.values()), null, 2) !== json
+      )
+        throw new Error('Reboot restoration was cancelled before mux persistence');
+    };
+    const confirmCurrent = async () => {
+      const verdict = isCurrent();
+      if (typeof verdict !== 'boolean' && !currentAfterAwait) {
+        await verdict;
+        throw new Error('Asynchronous mux authority requires a final synchronous guard');
+      }
+      if ((await verdict) !== true) throw new Error('Reboot restoration was cancelled before mux persistence');
+      assertCurrent();
+    };
+    const sameMetadata = (left: Awaited<ReturnType<typeof lstat>>, right: Awaited<ReturnType<typeof lstat>>) =>
+      ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(
+        (key) => left[key as keyof typeof left] === right[key as keyof typeof right]
+      );
+    const readPrimary = async (maxBytes?: number, path = MUX_SESSIONS_FILE) => {
+      let file: Awaited<ReturnType<typeof open>> | undefined;
+      let opened = false;
+      try {
+        file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        opened = true;
+        const info = await file.stat();
+        if (!info.isFile() || (maxBytes !== undefined && info.size > maxBytes)) throw new Error('Mux metadata changed');
+        const input = Buffer.alloc(info.size + 1);
+        let size = 0;
+        while (size < input.length) {
+          const part = await file.read(input, size, input.length - size, size);
+          if (!part.bytesRead) break;
+          size += part.bytesRead;
+        }
+        const after = await file.stat();
+        const text = input.subarray(0, size).toString('utf8');
+        if (
+          size !== info.size ||
+          !sameMetadata(info, after) ||
+          !Buffer.from(text, 'utf8').equals(input.subarray(0, size))
+        )
+          throw new Error('Mux metadata changed');
+        await file.close();
+        file = undefined;
+        const current = await lstat(path);
+        if (current.isSymbolicLink() || !sameMetadata(after, current)) throw new Error('Mux metadata changed');
+        return { text, info: after };
+      } catch (error) {
+        // Only an absent initial open certifies an absent primary. Removal
+        // during a read is changed evidence, not permission to recreate it.
+        if (opened && (error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('Mux metadata changed');
+        throw error;
+      } finally {
+        if (file) await file.close().catch(() => {});
+      }
+    };
+    await confirmCurrent();
+    await mkdir(dirname(MUX_SESSIONS_FILE), { recursive: true, mode: 0o700 });
+    assertCurrent();
+    let original: Awaited<ReturnType<typeof readPrimary>> | undefined;
     try {
-      const fd = openSync(temporary, 'wx', 0o600);
-      try {
-        writeFileSync(fd, JSON.stringify(Array.from(this.sessions.values()), null, 2));
-        fsyncSync(fd);
-      } finally {
-        closeSync(fd);
+      original = await readPrimary();
+      if (!Array.isArray(JSON.parse(original.text))) throw new Error('Mux metadata is malformed');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.sessionPersistenceUnknown = true;
+        throw error;
       }
-      renameSync(temporary, MUX_SESSIONS_FILE);
-      const directory = openSync(dirname(MUX_SESSIONS_FILE), 'r');
+    }
+    assertCurrent();
+    const originalIsCurrent = async () => {
       try {
-        fsyncSync(directory);
-      } finally {
-        closeSync(directory);
+        const current = await readPrimary(original ? Buffer.byteLength(original.text) : 0);
+        return !!original && sameMetadata(original.info, current.info) && original.text === current.text;
+      } catch (error) {
+        return !original && (error as NodeJS.ErrnoException).code === 'ENOENT';
       }
-    } finally {
+    };
+    const temporary = `${MUX_SESSIONS_FILE}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.reboot.tmp`;
+    let temporaryInode: { dev: number; ino: number } | undefined;
+    let verifiedTemporary: Awaited<ReturnType<typeof lstat>> | undefined;
+    const ownsTemporary = async (text?: string) => {
+      if (!temporaryInode) return false;
       try {
-        unlinkSync(temporary);
+        if (text === undefined) {
+          const stat = await lstat(temporary);
+          return (
+            stat.isFile() &&
+            !stat.isSymbolicLink() &&
+            stat.dev === temporaryInode.dev &&
+            stat.ino === temporaryInode.ino
+          );
+        }
+        const current = await readPrimary(Buffer.byteLength(text), temporary);
+        verifiedTemporary = current.info;
+        return (
+          current.info.dev === temporaryInode.dev && current.info.ino === temporaryInode.ino && current.text === text
+        );
       } catch {
-        /* Already renamed or never created. */
+        return false;
       }
+    };
+    const cleanupTemporary = async () => {
+      if (await ownsTemporary()) await unlink(temporary).catch(() => {});
+    };
+    let commitAttempted = false;
+    try {
+      const file = await open(temporary, 'wx', 0o600);
+      try {
+        const stat = await file.stat();
+        temporaryInode = { dev: stat.dev, ino: stat.ino };
+        assertCurrent();
+        await file.writeFile(json, 'utf8');
+        assertCurrent();
+        await file.sync();
+        assertCurrent();
+      } finally {
+        await file.close();
+      }
+      await confirmCurrent();
+      if (!(await originalIsCurrent())) {
+        this.sessionPersistenceUnknown = true;
+        throw new Error('Mux metadata commit target changed');
+      }
+      if (!(await ownsTemporary(json))) throw new Error('Mux metadata staged file changed');
+      // Both proof descriptors have closed. Scan both names together so neither
+      // verification's awaited close can hide a replacement of the other file.
+      const [target, staged] = await Promise.all([
+        lstat(MUX_SESSIONS_FILE).catch((error) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          this.sessionPersistenceUnknown = true;
+          throw error;
+        }),
+        lstat(temporary),
+      ]);
+      if (original ? !target || !sameMetadata(original.info, target) : target !== undefined) {
+        this.sessionPersistenceUnknown = true;
+        throw new Error('Mux metadata commit target changed');
+      }
+      if (!verifiedTemporary || !sameMetadata(verifiedTemporary, staged))
+        throw new Error('Mux metadata staged file changed');
+      assertCurrent();
+      commitAttempted = true;
+      await rename(temporary, MUX_SESSIONS_FILE);
+      const directory = await open(dirname(MUX_SESSIONS_FILE), 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+      await confirmCurrent();
+      await cleanupTemporary();
+      assertCurrent();
+      this.sessionPersistenceUnknown = false;
+    } catch (error) {
+      if (commitAttempted) this.sessionPersistenceUnknown = true;
+      // Never roll old mux bytes back over a possibly launched worker. The
+      // caller owns pending/uncertain markers and any exact native cleanup.
+      await cleanupTemporary();
+      throw error;
     }
   }
 
@@ -2746,10 +2893,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             : { codexRestoreUncertain: true, codexRestoreConfig: structuredClone(codexConfig) }),
         };
         this.sessions.set(sessionId, reservedRestoreRecord);
+        const reservationIsCurrent = () =>
+          this.sessions.get(sessionId) === reservedRestoreRecord &&
+          (options.codexRestoreGuard
+            ? options.codexRestoreGuard.isCurrent?.() === true
+            : options.restoreGuard
+              ? options.restoreGuard.isCurrent() === true
+              : true);
         await this.flushSessionsDurably(
           () =>
-            this.sessions.get(sessionId) === reservedRestoreRecord &&
-            (options.codexRestoreGuard?.confirm() ?? options.restoreGuard?.confirm() ?? true)
+            reservationIsCurrent() && (options.codexRestoreGuard?.confirm() ?? options.restoreGuard?.confirm() ?? true),
+          reservationIsCurrent
         );
       }
       if (options.codexRestoreGuard) {

@@ -60,6 +60,7 @@ it.each([
     muxSession: { muxName: 'codeman-issuer-fixture', recoveryIsolated: true, recoveryCodexHome: home } as MuxSession,
   });
   sessions.push(session);
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   const issuer = {
     sessionId: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
     incarnation: proof.incarnation,

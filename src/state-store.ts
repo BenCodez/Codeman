@@ -277,10 +277,12 @@ export class StateStore {
       ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(
         (key) => left[key as keyof typeof left] === right[key as keyof typeof right]
       );
-    const readPrimary = async (maxBytes?: number) => {
+    const readPrimary = async (maxBytes?: number, path = this.filePath) => {
       let file: Awaited<ReturnType<typeof open>> | undefined;
+      let opened = false;
       try {
-        file = await open(this.filePath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        opened = true;
         const info = await file.stat();
         if (!info.isFile() || (maxBytes !== undefined && info.size > maxBytes)) throw new Error('State file changed');
         const input = Buffer.alloc(info.size + 1);
@@ -298,9 +300,12 @@ export class StateStore {
         file = undefined;
         // Every participating FD closes before this common pathname scan. No
         // awaited cleanup may follow the successful verdict.
-        const current = await lstat(this.filePath);
+        const current = await lstat(path);
         if (current.isSymbolicLink() || !sameMetadata(after, current)) throw new Error('State file changed');
         return { text, info: after };
+      } catch (error) {
+        if (opened && (error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('State file changed');
+        throw error;
       } finally {
         if (file) await file.close().catch(() => {});
       }
@@ -316,10 +321,12 @@ export class StateStore {
     };
     // Rollback owns only the inode written by this invocation, with its exact
     // candidate bytes. A replacement or in-place edit belongs to another writer.
+    let verifiedCandidate: Awaited<ReturnType<typeof lstat>> | undefined;
     const ownsCandidate = async () => {
       if (!candidateInode) return false;
       try {
         const current = await readPrimary(Buffer.byteLength(json));
+        verifiedCandidate = current.info;
         return (
           current.info.dev === candidateInode.dev && current.info.ino === candidateInode.ino && current.text === json
         );
@@ -327,9 +334,38 @@ export class StateStore {
         return false;
       }
     };
+    let temporaryInode: { dev: number; ino: number } | undefined;
+    let verifiedTemporary: Awaited<ReturnType<typeof lstat>> | undefined;
+    const ownsTemporary = async (text?: string) => {
+      if (!temporaryInode) return false;
+      try {
+        if (text === undefined) {
+          const stat = await lstat(temporary);
+          return (
+            stat.isFile() &&
+            !stat.isSymbolicLink() &&
+            stat.dev === temporaryInode.dev &&
+            stat.ino === temporaryInode.ino
+          );
+        }
+        const current = await readPrimary(Buffer.byteLength(text), temporary);
+        verifiedTemporary = current.info;
+        return (
+          current.info.dev === temporaryInode.dev && current.info.ino === temporaryInode.ino && current.text === text
+        );
+      } catch {
+        return false;
+      }
+    };
+    const cleanupTemporary = async () => {
+      if (await ownsTemporary()) await unlink(temporary).catch(() => {});
+    };
     const write = async (text: string, candidate: boolean) => {
+      temporaryInode = undefined;
       const file = await open(temporary, 'wx', 0o600);
       try {
+        const stat = await file.stat();
+        temporaryInode = { dev: stat.dev, ino: stat.ino };
         if (candidate) assertCurrent();
         await file.writeFile(text, 'utf8');
         if (candidate) assertCurrent();
@@ -347,9 +383,27 @@ export class StateStore {
           this.circuitBreakerOpen = true;
           throw new Error('State commit target changed');
         }
+      } else if (!(await ownsCandidate())) throw new Error('State rollback target changed');
+      if (!(await ownsTemporary(text))) throw new Error('State staged file changed');
+      // All proof descriptors close before this common final pathname scan.
+      const [target, staged] = await Promise.all([
+        lstat(this.filePath).catch((error) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          this.circuitBreakerOpen = true;
+          throw error;
+        }),
+        lstat(temporary),
+      ]);
+      const expectedTarget = candidate ? originalPrimary?.info : verifiedCandidate;
+      if (expectedTarget ? !target || !sameMetadata(expectedTarget, target) : target !== undefined) {
+        this.circuitBreakerOpen = true;
+        throw new Error(candidate ? 'State commit target changed' : 'State rollback target changed');
+      }
+      if (!verifiedTemporary || !sameMetadata(verifiedTemporary, staged)) throw new Error('State staged file changed');
+      if (candidate) {
         assertCurrent();
         commitAttempted = true;
-      } else if (!(await ownsCandidate())) throw new Error('State rollback target changed');
+      }
       await rename(temporary, this.filePath);
       await syncDirectory();
     };
@@ -374,7 +428,7 @@ export class StateStore {
       }
       assertCurrent();
       await write(json, true);
-      await unlink(temporary).catch(() => {});
+      await cleanupTemporary();
       assertCurrent();
       this.state.sessions[id] = record;
       this.cachedSessionJsons.clear();
@@ -404,7 +458,7 @@ export class StateStore {
       this.dirty = true;
       throw error;
     } finally {
-      if (!published) await unlink(temporary).catch(() => {});
+      if (!published) await cleanupTemporary();
     }
   }
 

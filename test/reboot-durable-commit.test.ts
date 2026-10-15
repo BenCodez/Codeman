@@ -28,43 +28,6 @@ const io = vi.hoisted(() => ({
   targetSessionId: '',
   finalizingMux: false,
 }));
-vi.mock('node:fs', async () => {
-  const real = await vi.importActual<typeof import('node:fs')>('node:fs');
-  const open = (...args: Parameters<typeof real.openSync>) => {
-    const fd = real.openSync(...args);
-    io.paths.set(fd, String(args[0]));
-    return fd;
-  };
-  const sync = (fd: number) => {
-    const path = io.paths.get(fd) ?? '';
-    if (!real.fstatSync(fd).isDirectory()) {
-      io.lastFile = path;
-      if (path.includes('mux-sessions.json.')) {
-        const records = JSON.parse(real.readFileSync(path, 'utf8')) as Array<{
-          sessionId: string;
-          codexRestoreUncertain?: boolean;
-        }>;
-        io.finalizingMux =
-          records.find((record) => record.sessionId === io.targetSessionId)?.codexRestoreUncertain === false;
-      }
-    }
-    const domain = io.lastFile.includes('mux-sessions.json.')
-      ? 'mux'
-      : io.lastFile.includes('state.json.')
-        ? 'state'
-        : '';
-    const phase = domain
-      ? `${domain}${domain === 'mux' && io.finalizingMux ? '-clear' : ''}-${real.fstatSync(fd).isDirectory() ? 'directory' : 'file'}`
-      : '';
-    if (phase) io.phases.push(phase);
-    if (phase && io.fault === phase) {
-      io.fault = '';
-      throw new Error('Fixture durability acknowledgement failed');
-    }
-    real.fsyncSync(fd);
-  };
-  return { ...real, default: { ...real, openSync: open, fsyncSync: sync }, openSync: open, fsyncSync: sync };
-});
 vi.mock('node:fs/promises', async () => {
   const real = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
   return {
@@ -77,8 +40,25 @@ vi.mock('node:fs/promises', async () => {
           if (key === 'sync')
             return async () => {
               const directory = (await target.stat()).isDirectory();
-              if (!directory && path.includes('state.json.')) io.lastFile = path;
-              const phase = io.lastFile.includes('state.json.') ? `state-${directory ? 'directory' : 'file'}` : '';
+              if (!directory && (path.includes('state.json.') || path.includes('mux-sessions.json.'))) {
+                io.lastFile = path;
+                if (path.includes('mux-sessions.json.')) {
+                  const records = JSON.parse(fs.readFileSync(path, 'utf8')) as Array<{
+                    sessionId: string;
+                    codexRestoreUncertain?: boolean;
+                  }>;
+                  io.finalizingMux =
+                    records.find((record) => record.sessionId === io.targetSessionId)?.codexRestoreUncertain === false;
+                }
+              }
+              const domain = io.lastFile.includes('mux-sessions.json.')
+                ? 'mux'
+                : io.lastFile.includes('state.json.')
+                  ? 'state'
+                  : '';
+              const phase = domain
+                ? `${domain}${domain === 'mux' && io.finalizingMux ? '-clear' : ''}-${directory ? 'directory' : 'file'}`
+                : '';
               if (phase) io.phases.push(phase);
               if (phase && io.fault === phase) {
                 io.fault = '';
@@ -163,10 +143,10 @@ async function fixture(label: string, pruned = false) {
   const store = Reflect.get(server, 'store') as StateStore;
   store.setSession(id, state);
   store.flush();
-  rebootRestoreRegistry.configurePersistence(dataPath('reboot-restore-offer.json'));
+  await rebootRestoreRegistry.configurePersistence(dataPath('reboot-restore-offer.json'));
   const plan = await planVerifiedRebootRestore([id], { [id]: state }, () => true);
   expect(plan.restore).toHaveLength(1);
-  rebootRestoreRegistry.set(plan.restore);
+  await rebootRestoreRegistry.set(plan.restore);
   if (pruned) {
     store.removeSession(id);
     store.flush();
@@ -283,7 +263,7 @@ it.each(['complete', 'cancel'])(
     expect(completed).toBe(false);
     expect(offers()).toHaveLength(1);
     expect(fs.readFileSync(dataPath('state.json'), 'utf8')).toBe(f.historical);
-    if (outcome === 'cancel') rebootRestoreRegistry.clear(() => true);
+    if (outcome === 'cancel') await rebootRestoreRegistry.clear(() => true);
     gate.resolve();
     const reply = (await result).json();
     expect(reply.restored).toHaveLength(outcome === 'complete' ? 1 : 0);
@@ -326,7 +306,7 @@ it.each(['complete', 'cancel', 'state-failure'] as const)(
           }),
         ])
       );
-      if (outcome === 'cancel') rebootRestoreRegistry.clear(() => true);
+      if (outcome === 'cancel') await rebootRestoreRegistry.clear(() => true);
       if (outcome === 'state-failure')
         vi.spyOn(f.store, 'persistSessionDurably').mockRejectedValueOnce(
           new Error('Fixture state journal unavailable')

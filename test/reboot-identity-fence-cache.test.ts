@@ -19,20 +19,11 @@ const io = vi.hoisted(() => ({
   beforeOpen: undefined as (() => void) | undefined,
   afterRename: undefined as (() => void) | undefined,
 }));
-vi.mock('node:fs', async (original) => {
-  const actual = await original<typeof import('node:fs')>();
-  return {
+vi.mock('node:fs/promises', async (original) => {
+  const actual = await original<typeof import('node:fs/promises')>();
+  const operations = {
     ...actual,
-    fsyncSync(fd: number) {
-      io.syncs++;
-      actual.fsyncSync(fd);
-    },
-    fstatSync(fd: number) {
-      if (io.statUnavailable) throw new Error('Private fixture metadata unavailable');
-      const value = actual.fstatSync(fd);
-      return io.nonregular ? Object.assign(value, { isFile: () => false }) : value;
-    },
-    openSync(...args: Parameters<typeof actual.openSync>) {
+    open: async (...args: Parameters<typeof actual.open>) => {
       if (String(args[0]) === io.unreadable) throw new Error('Private fixture read unavailable');
       if (typeof args[1] === 'number') {
         io.flags.push(args[1]);
@@ -40,19 +31,38 @@ vi.mock('node:fs', async (original) => {
         io.beforeOpen = undefined;
         callback?.();
       }
-      return Reflect.apply(actual.openSync, actual, args);
+      const handle = await actual.open(...args);
+      return new Proxy(handle, {
+        get(target, key) {
+          if (key === 'sync')
+            return async () => {
+              io.syncs++;
+              return target.sync();
+            };
+          if (key === 'stat')
+            return async () => {
+              if (io.statUnavailable) throw Error('Private fixture metadata unavailable');
+              const value = await target.stat();
+              return io.nonregular ? Object.assign(value, { isFile: () => false }) : value;
+            };
+          if (key === 'read')
+            return async (...values: Parameters<typeof handle.read>) => {
+              io.reads++;
+              return target.read(...values);
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
     },
-    readSync(...args: Parameters<typeof actual.readSync>) {
-      io.reads++;
-      return Reflect.apply(actual.readSync, actual, args);
-    },
-    renameSync(from: fs.PathLike, to: fs.PathLike) {
-      actual.renameSync(from, to);
+    rename: async (...args: Parameters<typeof actual.rename>) => {
+      await actual.rename(...args);
       const callback = io.afterRename;
       io.afterRename = undefined;
       callback?.();
     },
   };
+  return { ...operations, default: operations };
 });
 
 let root: string;
@@ -86,14 +96,14 @@ function replace(path: string, value: object) {
   fs.renameSync(next, path);
 }
 
-it.each([pending, untracked])('reuses an unchanged acknowledged veto without another fsync: %j', (value) => {
-  writeRebootIdentityFence(ID, value);
+it.each([pending, untracked])('reuses an unchanged acknowledged veto without another fsync: %j', async (value) => {
+  await writeRebootIdentityFence(ID, value);
   const count = io.syncs;
   const before = fs.statSync(rebootIdentityFencePath(ID));
-  writeRebootIdentityFence(ID, value);
+  await writeRebootIdentityFence(ID, value);
   expect(io.syncs).toBe(count);
   expect(fs.statSync(rebootIdentityFencePath(ID)).ino).toBe(before.ino);
-  expect(readRebootIdentityFence(ID)).toEqual(value);
+  expect(await readRebootIdentityFence(ID)).toEqual(value);
 });
 
 it.each(
@@ -108,8 +118,8 @@ it.each(
       'directory',
     ].map((change) => ({ value, change }))
   )
-)('revalidates $change instead of trusting a cached $value veto', ({ value, change }) => {
-  writeRebootIdentityFence(ID, value);
+)('revalidates $change instead of trusting a cached $value veto', async ({ value, change }) => {
+  await writeRebootIdentityFence(ID, value);
   const path = rebootIdentityFencePath(ID);
   const count = io.syncs;
   const permissive = { switchPending: false };
@@ -124,66 +134,72 @@ it.each(
     fs.symlinkSync(target, path);
   }
   if (change === 'unreadable') io.unreadable = path;
-  if (change === 'directory') expect(() => writeRebootIdentityFence(ID, value)).toThrow();
-  else {
-    writeRebootIdentityFence(ID, value);
+  if (['directory', 'symlink', 'unreadable'].includes(change)) {
+    await expect(writeRebootIdentityFence(ID, value)).rejects.toThrow();
+    expect(io.syncs).toBe(count);
+    if (change === 'symlink') expect(fs.readFileSync(target, 'utf8')).toBe('original-private-target');
+    return;
+  } else {
+    await writeRebootIdentityFence(ID, value);
     io.unreadable = '';
-    expect(readRebootIdentityFence(ID)).toEqual(value);
+    expect(await readRebootIdentityFence(ID)).toEqual(value);
   }
   expect(io.syncs).toBeGreaterThan(count);
   if (change === 'symlink') expect(fs.readFileSync(target, 'utf8')).toBe('original-private-target');
 });
 
-it('does not cache a foreign same-veto inode substituted during publication', () => {
+it('does not cache a foreign same-veto inode substituted during publication', async () => {
   const path = rebootIdentityFencePath(ID);
   io.afterRename = () => replace(path, pending);
-  writeRebootIdentityFence(ID, pending);
+  await expect(writeRebootIdentityFence(ID, pending)).rejects.toThrow();
   const foreign = fs.statSync(path).ino;
   const count = io.syncs;
-  writeRebootIdentityFence(ID, pending);
+  await writeRebootIdentityFence(ID, pending);
   expect(io.syncs).toBeGreaterThan(count);
   expect(fs.statSync(path).ino).not.toBe(foreign);
 });
 
-it('retains previously acknowledged untracked input after a permissive replacement', () => {
-  writeRebootIdentityFence(ID, untracked);
+it('retains previously acknowledged untracked input after a permissive replacement', async () => {
+  await writeRebootIdentityFence(ID, untracked);
   replace(rebootIdentityFencePath(ID), { switchPending: false });
-  writeRebootIdentityFence(ID, pending);
-  expect(readRebootIdentityFence(ID)).toEqual(untracked);
+  await writeRebootIdentityFence(ID, pending);
+  expect(await readRebootIdentityFence(ID)).toEqual(untracked);
 });
 
-it('acknowledges a durable write without caching unavailable owned metadata', () => {
+it('refuses unavailable owned metadata and permits a fresh healthy retry', async () => {
   io.statUnavailable = true;
-  writeRebootIdentityFence(ID, pending);
-  expect(readRebootIdentityFence(ID)).toEqual(pending);
+  await expect(writeRebootIdentityFence(ID, pending)).rejects.toThrow();
+  expect(await readRebootIdentityFence(ID)).toEqual(undefined);
   const count = io.syncs;
   io.statUnavailable = false;
-  writeRebootIdentityFence(ID, pending);
+  await writeRebootIdentityFence(ID, pending);
   expect(io.syncs).toBeGreaterThan(count);
 });
 
-it('rejects a replacement inode at open before reading it and durably reestablishes the veto', () => {
-  writeRebootIdentityFence(ID, pending);
+it('rejects a replacement inode at open before reading it and durably reestablishes the veto', async () => {
+  await writeRebootIdentityFence(ID, pending);
   const path = rebootIdentityFencePath(ID);
   const count = io.syncs;
   io.beforeOpen = () => replace(path, { switchPending: false });
-  writeRebootIdentityFence(ID, pending);
+  await expect(writeRebootIdentityFence(ID, pending)).rejects.toThrow();
+  expect(io.syncs).toBe(count);
+  await writeRebootIdentityFence(ID, pending);
   expect(io.syncs).toBeGreaterThan(count);
-  expect(readRebootIdentityFence(ID)).toEqual(pending);
+  expect(await readRebootIdentityFence(ID)).toEqual(pending);
   for (const flags of io.flags) {
     expect(flags & fs.constants.O_NOFOLLOW).toBe(fs.constants.O_NOFOLLOW);
     expect(flags & fs.constants.O_NONBLOCK).toBe(fs.constants.O_NONBLOCK);
   }
 });
 
-it('never reads a nonregular opened object or treats it as a cached durable veto', () => {
-  writeRebootIdentityFence(ID, pending);
+it('never reads a nonregular opened object or treats it as a cached durable veto', async () => {
+  await writeRebootIdentityFence(ID, pending);
   const count = io.syncs;
   io.nonregular = true;
   io.reads = 0;
-  writeRebootIdentityFence(ID, pending);
+  await expect(writeRebootIdentityFence(ID, pending)).rejects.toThrow();
   expect(io.reads).toBe(0);
-  expect(io.syncs).toBeGreaterThan(count);
+  expect(io.syncs).toBe(count);
   io.nonregular = false;
-  expect(readRebootIdentityFence(ID)).toEqual(pending);
+  expect(await readRebootIdentityFence(ID)).toEqual(pending);
 });

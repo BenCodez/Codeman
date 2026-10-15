@@ -339,7 +339,9 @@ export interface TerminalMultiplexer extends EventEmitter {
    */
   createSession(options: CreateSessionOptions): Promise<MuxSession>;
   /** Strict metadata acknowledgement for owner-controlled reboot restoration. */
-  flushSessionsDurably(isCurrent?: () => boolean): Promise<void>;
+  flushSessionsDurably(isCurrent?: () => boolean | Promise<boolean>, currentAfterAwait?: () => boolean): Promise<void>;
+  /** Await queued metadata writes before process shutdown. */
+  drainSessionSaves?(): Promise<void>;
 
   /**
    * Kill a session and all its child processes.

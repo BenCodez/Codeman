@@ -123,7 +123,7 @@ async function fixture(rawResume = false) {
       recoveryInputBroker: broker.incarnation,
       codexRestoreConfig: state.codexConfig,
     });
-    writeRebootIdentityFence(entry.sid, {
+    await writeRebootIdentityFence(entry.sid, {
       switchPending: false,
       submission: { at: entry.at, hash: hash(entry.prompt) },
     });
@@ -162,7 +162,7 @@ it.each([
     proof = { at: entries[0].at, hash: hash(entries[0].prompt) };
   const journalPath = join(brokers[0].directory, 'state.json');
   if (kind === 'switch-pending' || kind === 'untracked')
-    writeRebootIdentityFence(SID_A, {
+    await writeRebootIdentityFence(SID_A, {
       switchPending: kind === 'switch-pending',
       untrackedInput: kind === 'untracked',
       submission: proof,
