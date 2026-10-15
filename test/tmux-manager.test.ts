@@ -867,15 +867,24 @@ describe('TmuxManager (unit)', () => {
       'async-refused',
       'async-rejected',
     ])('scopes guarded reboot launch effects and cleanup for %s', async (outcome) => {
+      // Guarded acknowledgement uses real async durability; ordinary unit cases
+      // retain their no-I/O mocks. Give this matrix its own complete journal.
+      const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const actualAsyncFs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+      const asyncFs = await import('node:fs/promises');
+      const { join } = await import('node:path');
+      const { homedir } = await import('node:os');
+      const fixtureData = actualFs.mkdtempSync(join(homedir(), 'tmux-guarded-journal-'));
+      const previousData = process.env.CODEMAN_DATA_DIR;
+      const previousWrite = vi.mocked(asyncFs.writeFile).getMockImplementation()!;
+      const previousRename = vi.mocked(asyncFs.rename).getMockImplementation()!;
+      process.env.CODEMAN_DATA_DIR = fixtureData;
+      vi.mocked(asyncFs.writeFile).mockImplementation(actualAsyncFs.writeFile);
+      vi.mocked(asyncFs.rename).mockImplementation(actualAsyncFs.rename);
       const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
       const nonTestManager = new NonTestTmuxManager();
-      // Reboot acknowledgement performs real sync durability beneath setup.ts's temporary HOME.
-      // This suite mocks mkdirSync for ordinary launch tests, so provision only that isolated directory.
-      const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
-      const { dirname } = await import('node:path');
       const { dataPath } = await import('../src/config/instance.js');
       const metadataPath = dataPath('mux-sessions.json');
-      actualFs.mkdirSync(dirname(metadataPath), { recursive: true, mode: 0o700 });
       vi.spyOn(
         nonTestManager as unknown as { buildPathExport(mode: string): { dir: string; pathExport: string } },
         'buildPathExport'
@@ -971,7 +980,16 @@ describe('TmuxManager (unit)', () => {
             },
           ]);
       } finally {
-        nonTestManager.destroy();
+        try {
+          await nonTestManager.drainSessionSaves();
+        } finally {
+          nonTestManager.destroy();
+          vi.mocked(asyncFs.writeFile).mockImplementation(previousWrite);
+          vi.mocked(asyncFs.rename).mockImplementation(previousRename);
+          if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+          else process.env.CODEMAN_DATA_DIR = previousData;
+          actualFs.rmSync(fixtureData, { recursive: true, force: true });
+        }
       }
     });
 

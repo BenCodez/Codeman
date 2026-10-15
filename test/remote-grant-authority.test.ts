@@ -43,7 +43,7 @@ afterEach(async () => {
   vi.restoreAllMocks();
   rmSync(directory, { recursive: true, force: true });
 });
-function worker() {
+async function worker() {
   const home = join(directory, 'codex');
   mkdirSync(home);
   const session = new Session({
@@ -66,13 +66,14 @@ function worker() {
     envOverrides: { CODEX_HOME: home },
   });
   sessions.push(session);
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   return session;
 }
 
 it.each(['unchanged', 'external-revoke', 'cache-revoke', 'unreadable', 'mode-change'] as const)(
   'keeps actual final remote authority bound to the current grant snapshot: %s',
   async (change) => {
-    const session = worker();
+    const session = await worker();
     const expected = session.remoteRecoveryConfiguration();
     expect(await session.confirmRemoteRecoveryAuthority(THREAD, 0, () => true, expected)).toBe(true);
     expect(session.isRemoteRecoveryAuthorityCurrent(THREAD, 0, () => true, expected)).toBe(true);
@@ -88,7 +89,7 @@ it.each(['unchanged', 'external-revoke', 'cache-revoke', 'unreadable', 'mode-cha
 );
 
 it('rejects a grant-only microtask change after the final real lookup resolves', async () => {
-  const session = worker();
+  const session = await worker();
   const expected = session.remoteRecoveryConfiguration();
   const original = clamp.clampRecoveryLaunchForOwner;
   vi.spyOn(clamp, 'clampRecoveryLaunchForOwner').mockImplementation(async (...args) => {
@@ -101,7 +102,7 @@ it('rejects a grant-only microtask change after the final real lookup resolves',
 });
 
 it('cannot reuse an earlier successful snapshot after a denied current confirmation', async () => {
-  const session = worker();
+  const session = await worker();
   const expected = session.remoteRecoveryConfiguration();
   expect(await session.confirmRemoteRecoveryAuthority(THREAD, 0, () => true, expected)).toBe(true);
   replace(false);
@@ -112,7 +113,7 @@ it('cannot reuse an earlier successful snapshot after a denied current confirmat
 it.each(['unchanged', 'disk-replaced', 'owner-changed', 'cancelled', 'expired'] as const)(
   'rechecks pure scope after the bounded final grant FD read: %s',
   async (change) => {
-    const session = worker(),
+    const session = await worker(),
       expected = session.remoteRecoveryConfiguration();
     let current = true,
       proofStage = false,
@@ -180,7 +181,7 @@ it.each(['unchanged', 'disk-replaced', 'owner-changed', 'cancelled', 'expired'] 
 
 it('requires at least one exact bounded private file for a file-only proof', async () => {
   expect(await checkPrivateFileWitnesses([])).toBe(false);
-  const session = worker();
+  const session = await worker();
   const launch = await clamp.clampRecoveryLaunchForOwner(
     session.owner,
     { codexConfig: session.codexConfig },

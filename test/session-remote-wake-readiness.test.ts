@@ -42,7 +42,7 @@ afterEach(async () => {
   invalidateUsersCache();
   await fs.rm(root, { recursive: true, force: true });
 });
-function fixture(mode: 'codex' | 'claude' = 'codex', owned = true) {
+function fixture(mode: 'codex' | 'claude' = 'codex', owned = true, guarded = true) {
   const id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     home = '/fixture/codex-home';
   const remote: SessionRemote = {
@@ -91,7 +91,7 @@ function fixture(mode: 'codex' | 'claude' = 'codex', owned = true) {
     owner: 'owner',
     workingDir: root,
     remote,
-    recoveryInputBroker: descriptor.incarnation,
+    ...(guarded ? { recoveryInputBroker: descriptor.incarnation } : {}),
     recoveryCodexHome: home,
   } as MuxSession;
   const mux = {
@@ -147,6 +147,72 @@ function fixture(mode: 'codex' | 'claude' = 'codex', owned = true) {
     });
   return { session, remote, mux, record, descriptor, state, wire, observe };
 }
+function unguardedFixture(kind: 'legacy' | 'unsupported-broker') {
+  const f = fixture('codex', true, false);
+  if (kind === 'legacy') {
+    delete f.record.recoveryCodexHome;
+    Reflect.set(f.session, '_codexConfig', { sandbox: 'danger-full-access', approvalPolicy: 'never' });
+    Reflect.set(f.session, '_envOverrides', undefined);
+  }
+  return f;
+}
+
+it.each(['legacy', 'unsupported-broker'] as const)(
+  'reattaches an unguarded %s worker with current grants and no broker recovery authority',
+  async (kind) => {
+    const f = unguardedFixture(kind);
+    expect(await f.session.reattachRemote()).toBe(true);
+    expect(f.session.remoteWakeInputScope()).toBeUndefined();
+    expect(f.mux.respawnPane).toHaveBeenCalledOnce();
+    expect(f.mux.getOwnedRemoteInputBroker).not.toHaveBeenCalled();
+    expect(f.observe).not.toHaveBeenCalled();
+    expect(f.mux.observeOwnedRemoteInputBroker).not.toHaveBeenCalled();
+    expect(await f.session.getOwnedRemoteInputBroker()).toBeUndefined();
+    expect(f.observe).not.toHaveBeenCalled();
+  }
+);
+
+it.each(['grant', 'owner', 'config', 'record', 'closing', 'pending', 'malformed'] as const)(
+  'refuses unguarded reconnect after %s changes without losing guarded checks',
+  async (kind) => {
+    const f = unguardedFixture('unsupported-broker');
+    if (kind === 'grant') await grant(false);
+    if (kind === 'owner') f.session.owner = 'other';
+    if (kind === 'config') Reflect.set(f.session, '_codexConfig', { sandbox: 'workspace-write', noDaemon: false });
+    if (kind === 'record') vi.mocked(f.mux.getSession).mockReturnValue({ ...f.record });
+    if (kind === 'closing') f.session.markClosing(true);
+    if (kind === 'pending') f.record.recoveryInputBrokerPending = '11111111-2222-3333-4444-555555555555';
+    if (kind === 'malformed') f.record.recoveryInputBroker = 'malformed';
+    // A changed configuration alone is valid owner transport intent; changing it
+    // after admission must invalidate the exact captured token instead.
+    if (kind === 'config') {
+      expect(await f.session.confirmRemoteWakeReady()).toBe(true);
+      Reflect.set(f.session, '_codexConfig', { sandbox: 'read-only' });
+      expect(f.session.isRemoteWakeReadyCurrent()).toBe(false);
+    } else {
+      expect(await f.session.reattachRemote()).toBe(false);
+      expect(f.mux.respawnPane).not.toHaveBeenCalled();
+    }
+  }
+);
+
+it('does not reuse unguarded transport authority after a controlled incarnation is registered', async () => {
+  const f = unguardedFixture('unsupported-broker');
+  expect(await f.session.confirmRemoteWakeReady()).toBe(true);
+  expect(f.session.isRemoteWakeReadyCurrent()).toBe(true);
+  f.record.recoveryInputBroker = f.descriptor.incarnation;
+  expect(f.session.isRemoteWakeReadyCurrent()).toBe(false);
+  expect(f.session.remoteWakeInputScope()?.incarnation).toBe(f.descriptor.incarnation);
+});
+
+it('refuses lost broker metadata on a known controlled native record instead of downgrading to legacy transport', async () => {
+  const f = fixture();
+  delete f.record.recoveryInputBroker;
+  expect(await f.session.reattachRemote()).toBe(false);
+  expect(f.mux.respawnPane).not.toHaveBeenCalled();
+  expect(f.session.remoteWakeInputScope()).toBeDefined();
+});
+
 it('accepts a fresh exact live worker before any conversation UUID is known', async () => {
   const f = fixture();
   expect(f.session.codexConfig?.resumeSessionId).toBeUndefined();

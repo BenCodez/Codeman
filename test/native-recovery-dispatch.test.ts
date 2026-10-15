@@ -99,6 +99,8 @@ function bareManager(): ManagerType {
   const manager = Object.create(TmuxManager.prototype) as ManagerType;
   for (const name of ['sessions', 'inputBrokers', 'inputBrokerLoads', 'inputQueues'])
     Reflect.set(manager, name, new Map());
+  Reflect.set(manager, 'sessionSaves', Promise.resolve());
+  Reflect.set(manager, 'sessionPersistenceUnknown', false);
   return manager;
 }
 async function fixture(
@@ -242,8 +244,9 @@ async function fixture(
     codexConfig: { noDaemon: true, model: 'fixture-model' },
     envOverrides: { CODEX_HOME: home },
   });
-  worker.pinRecoveryConversation(thread);
   workers.push(worker);
+  await worker.ensureRecoveryIdentityFence();
+  worker.pinRecoveryConversation(thread);
   let current = true;
   let evidence = true;
   const deliver = (
@@ -882,7 +885,10 @@ describe('current native identity after direct TUI resume', () => {
     const unknown = '77777777-8888-4999-8aaa-bbbbbbbbbbbb';
     const ownerPrompt = 'Exact recorded fixture owner prompt';
     const seedOnly = change.startsWith('seed-');
-    if (!seedOnly) f.worker.trackUserInput(ownerPrompt + '\r');
+    if (!seedOnly) {
+      f.worker.trackUserInput(ownerPrompt + '\r');
+      await Reflect.get(f.worker, '_recoveryFencePublication');
+    }
     const context = f.worker.getRecoveryContext();
     if (seedOnly) expect(context.submission).toBeUndefined();
     else expect(context.submission).toBeDefined();
@@ -1021,6 +1027,7 @@ describe('native restart final preparation boundary', () => {
       const f = await fixture('restart');
       const ownerPrompt = 'Exact tracked restart fixture prompt';
       f.worker.trackUserInput(ownerPrompt + '\r');
+      await Reflect.get(f.worker, '_recoveryFencePublication');
       writeFileSync(
         join(f.home, 'history.jsonl'),
         JSON.stringify({

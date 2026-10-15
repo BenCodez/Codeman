@@ -13,6 +13,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { AddressInfo } from 'node:net';
 import type { IncomingMessage } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyWebsocket from '@fastify/websocket';
 import WebSocket from 'ws';
@@ -26,7 +29,7 @@ vi.mock('node:child_process', async (importOriginal) => ({
   execFile: childProcess.execFile,
 }));
 import { MAX_INPUT_LENGTH } from '../../src/config/terminal-limits.js';
-import { RebootIdentityFenceError } from '../../src/recovery/reboot-identity-fence.js';
+import { loadRebootIdentityFence, RebootIdentityFenceError } from '../../src/recovery/reboot-identity-fence.js';
 import { Session } from '../../src/session.js';
 import type { MuxSession, TerminalMultiplexer } from '../../src/mux-interface.js';
 import * as remoteClock from '../../src/recovery/remote-clock.js';
@@ -90,7 +93,8 @@ function collectMessages(ws: WebSocket, count: number, timeoutMs = 3000): Promis
   });
 }
 
-function isolatedRemoteWsSession() {
+const ownedRemoteFixtures = new Set<Session>();
+async function isolatedRemoteWsSession() {
   const session = new Session({
     id: 'ws-test-session',
     workingDir: '/tmp',
@@ -115,6 +119,8 @@ function isolatedRemoteWsSession() {
   });
   const written = vi.fn();
   Object.assign(session, { ptyProcess: { write: written, resize: vi.fn() } });
+  ownedRemoteFixtures.add(session);
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   // These route tests isolate input admission and actual pane lifecycle/epoch
   // transitions. Native ownership/readiness proof has its own Session suite.
   vi.spyOn(session, 'confirmRemoteWakeReady').mockResolvedValue(true);
@@ -134,9 +140,13 @@ async function inputReceived(ws: WebSocket): Promise<void> {
 describe('ws-routes', () => {
   let app: FastifyInstance;
   let ctx: MockRouteContext;
+  let fixtureDirectory: string;
   let requestUser: { username: string; role: 'user' | 'admin' } | undefined;
 
   beforeEach(async () => {
+    fixtureDirectory = await mkdtemp(join(homedir(), 'ws-input-fence-'));
+    vi.stubEnv('CODEMAN_DATA_DIR', fixtureDirectory);
+    ownedRemoteFixtures.clear();
     requestUser = undefined;
     app = Fastify({ logger: false });
     app.addHook('onRequest', async (req) => {
@@ -154,7 +164,20 @@ describe('ws-routes', () => {
   });
 
   afterEach(async () => {
+    vi.useRealTimers();
     await app.close();
+    for (const value of ctx.sessions.values()) if (value instanceof Session) ownedRemoteFixtures.add(value);
+    for (const session of ownedRemoteFixtures) {
+      await session.stop(false);
+      await vi.waitFor(
+        async () => {
+          await loadRebootIdentityFence(session.id);
+        },
+        { timeout: 3000, interval: 5 }
+      );
+    }
+    vi.unstubAllEnvs();
+    await rm(fixtureDirectory, { recursive: true, force: true });
   });
 
   // ========== Session not found ===
@@ -596,7 +619,7 @@ describe('ws-routes', () => {
       const previousMultiuser = process.env.CODEMAN_MULTIUSER;
       process.env.CODEMAN_MULTIUSER = '1';
       requestUser = { username: 'alice', role: 'user' };
-      const { session, written } = isolatedRemoteWsSession();
+      const { session, written } = await isolatedRemoteWsSession();
       session.owner = 'alice';
       (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
       const blocker = createDeferred<void>();
@@ -624,7 +647,7 @@ describe('ws-routes', () => {
     it.each(['ws', 'http', 'named-key'] as const)(
       'records rejected %s owner intent once during an actual tentative pane lifecycle',
       async (transport) => {
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         const respawn = createDeferred<number>();
         Object.assign(session, { _mux: { muxSessionExists: () => true, respawnPane: () => respawn.promise } });
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
@@ -665,7 +688,7 @@ describe('ws-routes', () => {
     it.each(['ws', 'http'] as const)(
       'does not manufacture %s owner intent for an applied duplicate',
       async (transport) => {
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         const respawn = createDeferred<number>();
         Object.assign(session, { _mux: { muxSessionExists: () => true, respawnPane: () => respawn.promise } });
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
@@ -704,7 +727,7 @@ describe('ws-routes', () => {
     it.each(['restart', 'reattach'] as const)(
       'closes an untagged socket when queued input crosses an actual %s pane epoch',
       async (action) => {
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         const mux = { isAvailable: () => true, muxSessionExists: () => true, respawnPane: vi.fn(async () => 123) };
         Object.assign(session, { _mux: mux });
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
@@ -735,11 +758,11 @@ describe('ws-routes', () => {
     it.each(['named-key', 'clock'] as const)(
       'closes an untagged socket while an actual %s operation owns input',
       async (operation) => {
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const key = createDeferred<void>();
         const clock = createDeferred<remoteClock.RemoteClockWitness>();
-        vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
+        vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReset().mockReturnValue(clock.promise);
         const held =
           operation === 'named-key'
             ? session.sendNamedKey('A', () => key.promise)
@@ -766,7 +789,7 @@ describe('ws-routes', () => {
     );
 
     it.each(['false', 'partial'] as const)('closes legacy input after %s delivery without replay', async (outcome) => {
-      const { session, written } = isolatedRemoteWsSession();
+      const { session, written } = await isolatedRemoteWsSession();
       (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
       if (outcome === 'false') Object.assign(session, { ptyProcess: null });
       else
@@ -793,7 +816,8 @@ describe('ws-routes', () => {
         const probe = createDeferred<{ dead: false; screen: string }>();
         const key = createDeferred<void>();
         const clock = createDeferred<remoteClock.RemoteClockWitness>();
-        if (owner === 'remote-clock') vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
+        if (owner === 'remote-clock')
+          vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReset().mockReturnValue(clock.promise);
         const mux = {
           isAvailable: () => true,
           inspectPaneForRecovery: () => probe.promise,
@@ -828,6 +852,7 @@ describe('ws-routes', () => {
         const written = vi.fn();
         Object.assign(session, { ptyProcess: { write: written } });
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+        expect(await session.ensureRecoveryIdentityFence()).toBe(true);
         const held =
           owner === 'remote-clock'
             ? session.prepareUserInputClock('Owner prompt\r', { fromUser: true })
@@ -905,6 +930,7 @@ describe('ws-routes', () => {
         });
         const sampling = vi
           .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockReset()
           .mockImplementation(async () => witness())
           .mockReturnValueOnce(clock.promise);
         const session = new Session({
@@ -935,6 +961,7 @@ describe('ws-routes', () => {
         const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
         const received: unknown[] = [];
         ws.on('message', (raw) => received.push(JSON.parse(String(raw))));
+        expect(await session.ensureRecoveryIdentityFence()).toBe(true);
         const frames = ['first\r', 'n', 'e', 'x', 't', '\r'];
         try {
           for (const [index, d] of frames.entries())
@@ -943,6 +970,7 @@ describe('ws-routes', () => {
           const resized = nextMessage(ws);
           ws.send(JSON.stringify({ t: 'z', c: 100, r: 30 }));
           expect(await resized).toMatchObject({ t: 'zc' });
+          await vi.waitFor(() => expect(sampling).toHaveBeenCalledOnce());
           expect(session.recoveryInputReserved).toBe(true);
           expect(written).not.toHaveBeenCalled();
           clock.resolve(witness());
@@ -975,15 +1003,16 @@ describe('ws-routes', () => {
         const clock = createDeferred<remoteClock.RemoteClockWitness | undefined>();
         const sampling = vi
           .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockReset()
           .mockImplementation(async () => currentClockWitness())
           .mockReturnValueOnce(clock.promise);
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const admitted = vi.spyOn(session, 'deferInputSeq');
-        const write = session.write;
+        const write = session.writeAsync;
         const receipts: Array<ReturnType<Session['getRecoveryContext']>['submission']> = [];
-        vi.spyOn(session, 'write').mockImplementation((data, options) => {
-          const sent = write.call(session, data, options);
+        vi.spyOn(session, 'writeAsync').mockImplementation(async (data, options) => {
+          const sent = await write.call(session, data, options);
           if (data.includes('\r')) receipts.push(session.getRecoveryContext().submission);
           return sent;
         });
@@ -1055,9 +1084,10 @@ describe('ws-routes', () => {
         const clock = createDeferred<remoteClock.RemoteClockWitness | undefined>();
         const sampling = vi
           .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockReset()
           .mockImplementation(async () => currentClockWitness())
           .mockReturnValueOnce(clock.promise);
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const admitted = vi.spyOn(session, 'deferInputSeq');
         const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=http-first');
@@ -1112,9 +1142,10 @@ describe('ws-routes', () => {
         const clock = createDeferred<remoteClock.RemoteClockWitness>();
         const sampling = vi
           .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockReset()
           .mockImplementation(async () => currentClockWitness())
           .mockReturnValueOnce(clock.promise);
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=http-cancel-first');
         const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=http-cancel-second');
@@ -1130,7 +1161,7 @@ describe('ws-routes', () => {
           signal: abort.signal,
           body: JSON.stringify({ input: 'HTTP\r', useMux: false }),
         }).catch(() => undefined);
-        let replacement: ReturnType<typeof isolatedRemoteWsSession> | undefined;
+        let replacement: Awaited<ReturnType<typeof isolatedRemoteWsSession>> | undefined;
         try {
           await vi.waitFor(() => expect(sampling).toHaveBeenCalledTimes(1));
           first.send(JSON.stringify({ t: 'i', d: 'A' }));
@@ -1147,7 +1178,7 @@ describe('ws-routes', () => {
             await httpClosed.promise;
           } else if (change === 'closing-session') session.markClosing(true);
           else if (change === 'replaced-session') {
-            replacement = isolatedRemoteWsSession();
+            replacement = await isolatedRemoteWsSession();
             (ctx.sessions as unknown as Map<string, Session>).set(session.id, replacement.session);
           } else Object.assign(session, { _paneStartedAt: session.paneStartedAt + 1 });
           const rejected = ['closing-session', 'replaced-session', 'replaced-pane'].includes(change)
@@ -1174,7 +1205,7 @@ describe('ws-routes', () => {
 
     it('refuses HTTP and named-key overflow before effects and retries after the shared backlog drains', async () => {
       const heldMux = createDeferred<boolean>();
-      const { session, written } = isolatedRemoteWsSession();
+      const { session, written } = await isolatedRemoteWsSession();
       (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
       const muxWrite = vi.spyOn(session, 'writeViaMux').mockReturnValueOnce(heldMux.promise);
       const socket = await connectWs('/ws/sessions/ws-test-session/terminal?cid=shared-overflow');
@@ -1218,8 +1249,10 @@ describe('ws-routes', () => {
     it.each([false, true])(
       'keeps socket input behind named-key dispatch (unknown child failure=%s)',
       async (failed) => {
-        vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockImplementation(async () => currentClockWitness());
-        const { session, written } = isolatedRemoteWsSession();
+        vi.spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockReset()
+          .mockImplementation(async () => currentClockWitness());
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=key-first');
         const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=key-second');
@@ -1273,9 +1306,10 @@ describe('ws-routes', () => {
         const clock = createDeferred<remoteClock.RemoteClockWitness>();
         const sampling = vi
           .spyOn(remoteClock, 'sampleRemoteCodexClock')
+          .mockReset()
           .mockImplementation(async () => currentClockWitness())
           .mockReturnValueOnce(clock.promise);
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=replaceable-first');
         const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=independent-second');
@@ -1303,7 +1337,7 @@ describe('ws-routes', () => {
             replacementSocket.send(JSON.stringify({ t: 'i', d: 'first\r', cid: 'first-frame', seq: 1 }));
             await inputReceived(replacementSocket);
           } else {
-            const replacement = isolatedRemoteWsSession();
+            const replacement = await isolatedRemoteWsSession();
             replacementSession = replacement.session;
             (ctx.sessions as unknown as Map<string, Session>).set(session.id, replacementSession);
             replacementSocket = await connectWs('/ws/sessions/ws-test-session/terminal?cid=new-session');
@@ -1345,7 +1379,7 @@ describe('ws-routes', () => {
     it.each(['bytes', 'frames'] as const)(
       'keeps reliable input retryable after shared %s backlog saturation without changing delivery proof',
       async (limit) => {
-        const { session, written } = isolatedRemoteWsSession();
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const socket = await connectWs('/ws/sessions/ws-test-session/terminal?cid=retry-backlog');
         let retry: WebSocket | undefined;
@@ -1410,8 +1444,8 @@ describe('ws-routes', () => {
       'bounds the combined %s backlog across independent session sockets',
       async (limit) => {
         const clock = createDeferred<remoteClock.RemoteClockWitness>();
-        const sampling = vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
-        const { session, written } = isolatedRemoteWsSession();
+        const sampling = vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReset().mockReturnValue(clock.promise);
+        const { session, written } = await isolatedRemoteWsSession();
         (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
         const first = await connectWs('/ws/sessions/ws-test-session/terminal?cid=quota-first');
         const second = await connectWs('/ws/sessions/ws-test-session/terminal?cid=quota-second');
@@ -1448,7 +1482,7 @@ describe('ws-routes', () => {
       'drops queued input without dispatch or delivery ACK after %s',
       async (cause) => {
         const clock = createDeferred<remoteClock.RemoteClockWitness>();
-        const sampling = vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReturnValue(clock.promise);
+        const sampling = vi.spyOn(remoteClock, 'sampleRemoteCodexClock').mockReset().mockReturnValue(clock.promise);
         const session = ctx._session;
         session.requiresRemoteInputClock = vi.fn(() => true);
         session.prepareUserInputClock = vi.fn(async () => {

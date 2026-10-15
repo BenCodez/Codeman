@@ -349,7 +349,7 @@ describe('custom-model reboot restore cleanup through the real server route', ()
       resumeConversationId: REBOOT_UUID,
       state,
     };
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     return { entry, rollout, history, rolloutText, historyText };
   }
 
@@ -476,7 +476,7 @@ describe('reboot recovery evidence fence', () => {
       payload: {},
     });
     expect(response.statusCode).toBe(200);
-    expect(readRebootIdentityFence(id)).toEqual({
+    expect(await readRebootIdentityFence(id)).toEqual({
       switchPending: true,
       submission: undefined,
       untrackedInput: true,
@@ -492,7 +492,7 @@ describe('reboot recovery evidence fence', () => {
       expect(browserInput.statusCode).toBe(200);
       expect(directWrite).toHaveBeenCalledWith('tracked browser prompt\r');
       expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
-      expect(readRebootIdentityFence(id)).toEqual({
+      expect(await readRebootIdentityFence(id)).toEqual({
         switchPending: true,
         submission: undefined,
         untrackedInput: true,
@@ -518,6 +518,8 @@ describe('reboot recovery evidence fence', () => {
       codexConfig: { noDaemon: true, resumeSessionId: oldConversation },
       envOverrides: { CODEX_HOME: home },
     });
+    expect(reconstructed.getRecoveryContext()).toMatchObject({ managed: false, switchPending: true });
+    expect(await reconstructed.ensureRecoveryIdentityFence()).toBe(true);
     expect(reconstructed.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
     await internals.registerSessionWithLayout(reconstructed);
     await internals.setupSessionListeners(reconstructed);
@@ -531,6 +533,8 @@ describe('reboot recovery evidence fence', () => {
       });
       expect(browserInput.statusCode).toBe(200);
       expect(restartedWrite).toHaveBeenCalledOnce();
+      expect(reconstructed.getRecoveryContext()).toMatchObject({ managed: false, switchPending: true });
+      expect(await reconstructed.ensureRecoveryIdentityFence()).toBe(true);
       expect(reconstructed.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
       expect(await verifyCodexRebootIdentity(saved)).toBeUndefined();
     } finally {
@@ -554,7 +558,7 @@ describe('reboot recovery evidence fence', () => {
         url: `/api/sessions/${id}/input`,
         payload: { input: '/resume\r', useMux: false, wait: 'exit', waitTimeout: 1000 },
       });
-      expect(response.statusCode).toBe(500);
+      expect(response.statusCode).toBe(422);
       expect(_paneDeathWatcherCount()).toBe(before);
     } finally {
       rmdirSync(path);
@@ -575,8 +579,8 @@ describe('reboot recovery evidence fence', () => {
       payload: { input: '/resume\r', useMux: false, clientId: 'fence-retry-client', seq: 1 },
     };
     try {
-      expect((await internals.app.inject(request)).statusCode).toBe(500);
-      expect((await internals.app.inject(request)).statusCode).toBe(500);
+      expect((await internals.app.inject(request)).statusCode).toBe(422);
+      expect((await internals.app.inject(request)).statusCode).toBe(422);
       expect(write).not.toHaveBeenCalled();
       rmdirSync(path);
       expect((await internals.app.inject(request)).statusCode).toBe(200);
@@ -618,7 +622,7 @@ describe('reboot recovery evidence fence', () => {
     });
     (session as unknown as { ptyProcess: unknown }).ptyProcess = { write };
     try {
-      expect(session.write('authorized task\r', { fromUser: true })).toBe(true);
+      expect(await session.writeAsync('authorized task\r', { fromUser: true })).toBe(true);
       expect(write).toHaveBeenCalledOnce();
       expect(session.getRecoveryContext().switchPending).toBe(true);
     } finally {
@@ -630,12 +634,12 @@ describe('reboot recovery evidence fence', () => {
     const id = 'restored-fence';
     const { writeRebootIdentityFence, readRebootIdentityFence } =
       await import('../src/recovery/reboot-identity-fence.js');
-    writeRebootIdentityFence(id, { switchPending: false });
+    await writeRebootIdentityFence(id, { switchPending: false });
     const session = new Session({ id, workingDir: WORKSPACE, mode: 'codex', useMux: false, preserveExitedPane: true });
     await internals.registerSessionWithLayout(session);
     await internals.setupSessionListeners(session);
-    session.trackUserInput('/resume\r');
-    expect(readRebootIdentityFence(id)?.switchPending).toBe(true);
+    expect(await session.writeAsync('/resume\r', { fromUser: true })).toBe(false);
+    expect((await readRebootIdentityFence(id))?.switchPending).toBe(true);
   });
   it('persists a slash-switch veto before an old UUID can be reused after reboot', async () => {
     const session = new Session({
@@ -648,7 +652,7 @@ describe('reboot recovery evidence fence', () => {
     });
     await internals.registerSessionWithLayout(session);
     await internals.setupSessionListeners(session);
-    session.trackUserInput('/resume\r');
+    expect(await session.writeAsync('/resume\r', { fromUser: true })).toBe(false);
     const persisted = (
       server as unknown as {
         store: { getSessions(): Record<string, unknown> };
@@ -658,7 +662,7 @@ describe('reboot recovery evidence fence', () => {
     expect(persisted.__codexRebootIdentity.submission).toBeUndefined();
     const { readRebootIdentityFence } = await import('../src/recovery/reboot-identity-fence.js');
     // Read the independent on-disk fence immediately, before state.json's debounce.
-    expect(readRebootIdentityFence(SESSION_ID)).toEqual({ switchPending: true, submission: undefined });
+    expect(await readRebootIdentityFence(SESSION_ID)).toEqual({ switchPending: true, submission: undefined });
   });
 
   it('keeps settings and exhausted budgets while removing the pre-reboot pending action', async () => {

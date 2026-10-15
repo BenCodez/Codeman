@@ -43,6 +43,7 @@ it.each(
     envOverrides: { CODEX_HOME: f.home },
   });
   sessions.push(session);
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   const config = session.remoteRecoveryConfiguration();
   let current = true;
   const pure = () => session.isRemoteRecoveryAuthorityCurrent(conversationId, 0, () => current, config);

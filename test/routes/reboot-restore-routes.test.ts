@@ -97,7 +97,7 @@ describe('GET /api/reboot-restore', () => {
   });
 
   it('names what is on offer, and says the scrollback is not coming back', async () => {
-    rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
+    await rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
     const app = await createHarness();
     const body = (await app.inject({ method: 'GET', url: '/api/reboot-restore' })).json().data;
     expect(body.sessions.map((s: { id: string }) => s.id)).toEqual(['a', 'b']);
@@ -106,7 +106,7 @@ describe('GET /api/reboot-restore', () => {
   });
 
   it('never carries the persisted record itself to the browser', async () => {
-    rebootRestoreRegistry.set([offerEntry('a', 'alice')]);
+    await rebootRestoreRegistry.set([offerEntry('a', 'alice')]);
     const app = await createHarness({ username: 'alice', role: 'admin' });
     const body = (await app.inject({ method: 'GET', url: '/api/reboot-restore' })).json().data;
     expect(Object.keys(body.sessions[0]).sort()).toEqual(['id', 'mode', 'name', 'owner', 'workingDir']);
@@ -117,7 +117,7 @@ describe('GET /api/reboot-restore', () => {
 
 describe('POST /api/reboot-restore/restore', () => {
   it('reports a workspace that is gone, and keeps offering it in case it comes back', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     const app = await createHarness();
 
     const first = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json().data;
@@ -133,7 +133,7 @@ describe('POST /api/reboot-restore/restore', () => {
 
   it('never re-offers a conversation that is already open', async () => {
     const entry = offerEntry('a');
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
     const app = await createHarness();
     const ctx = createMockRouteContext({ sessionId: entry.sessionId });
     // A session with that id is live, which is what the Resume list would produce.
@@ -150,7 +150,7 @@ describe('POST /api/reboot-restore/restore', () => {
   });
 
   it('spends only the sessions the click named', async () => {
-    rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
+    await rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
     const app = await createHarness();
 
     const res = await app.inject({
@@ -178,7 +178,7 @@ describe('POST /api/reboot-restore/restore', () => {
   });
 
   it('turns a second concurrent restore away rather than interleaving it', async () => {
-    rebootRestoreRegistry.set([offerEntry('a')]);
+    await rebootRestoreRegistry.set([offerEntry('a')]);
     // Claimed by a restore already in flight for this same owner (undefined in
     // single-user mode, which is what the harness runs as).
     expect(rebootRestoreRegistry.beginSpending(undefined)).toBe(true);
@@ -212,7 +212,7 @@ describe('POST /api/reboot-restore/restore: multi-user workspace confinement', (
     const entry = offerEntry('a', 'alice');
     entry.workingDir = realDir;
     (entry.state as { workingDir: string }).workingDir = realDir;
-    rebootRestoreRegistry.set([entry]);
+    await rebootRestoreRegistry.set([entry]);
 
     // An admin does the clicking. The confinement is still resolved against
     // alice, the entry's OWNER: `isWorkingDirAllowed` waves an admin through, so
@@ -235,7 +235,7 @@ describe('POST /api/reboot-restore/restore: multi-user workspace confinement', (
 
 describe('POST /api/reboot-restore/dismiss', () => {
   it('drops the offer and leaves the banner with nothing to show', async () => {
-    rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
+    await rebootRestoreRegistry.set([offerEntry('a'), offerEntry('b')]);
     const app = await createHarness();
 
     const res = await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });

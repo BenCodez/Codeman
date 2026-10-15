@@ -196,14 +196,14 @@ describe('verified local Codex reboot offers', () => {
   it('honors a newer durable fence over an older debounced state snapshot', async () => {
     const state = fixture();
     (state as unknown as Record<string, unknown>).__codexRebootIdentity = { switchPending: false };
-    writeRebootIdentityFence(state.id, { switchPending: true });
-    expect(readRebootIdentityFence(state.id)).toEqual({ switchPending: true, submission: undefined });
+    await writeRebootIdentityFence(state.id, { switchPending: true });
+    expect(await readRebootIdentityFence(state.id)).toEqual({ switchPending: true, submission: undefined });
     expect(statSync(dataPath('reboot-identities', `${state.id}.json`)).mode & 0o777).toBe(0o600);
     expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
   });
   it('rejects restoration when its private identity fence is corrupt', async () => {
     const state = fixture();
-    writeRebootIdentityFence(state.id, { switchPending: false });
+    await writeRebootIdentityFence(state.id, { switchPending: false });
     writeFileSync(dataPath('reboot-identities', `${state.id}.json`), '{partial');
     expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
   });
@@ -274,7 +274,7 @@ describe('verified local Codex reboot offers', () => {
       join(home, 'history.jsonl'),
       JSON.stringify({ session_id: UUID, ts: at / 1000, text: prompt }) + '\n'
     );
-    writeRebootIdentityFence(state.id, {
+    await writeRebootIdentityFence(state.id, {
       switchPending: false,
       submission: { at, hash: hashCodexPrompt(prompt) },
     });
@@ -290,7 +290,7 @@ describe('verified local Codex reboot offers', () => {
     const home = (state as unknown as { __envOverrides: Record<string, string> }).__envOverrides.CODEX_HOME;
     const prompt = 'repeated ordinary task';
     const at = Date.parse('2026-10-13T15:01:00Z');
-    writeRebootIdentityFence(state.id, {
+    await writeRebootIdentityFence(state.id, {
       switchPending: false,
       submission: { at, hash: hashCodexPrompt(prompt) },
     });
@@ -377,20 +377,20 @@ describe('durable reboot offer', () => {
     const entry = (await planVerifiedRebootRestore(['original'], { original: state }, () => true)).restore[0];
     const path = join(homedir(), 'offers.json');
     const first = new RebootRestoreRegistry();
-    first.configurePersistence(path);
-    first.set([entry]);
+    await first.configurePersistence(path);
+    await first.set([entry]);
     expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(first.take(() => true, undefined, 'admin')).toEqual([entry]);
     const restarted = new RebootRestoreRegistry();
-    restarted.configurePersistence(path);
+    await restarted.configurePersistence(path);
     expect(restarted.list(() => true)).toHaveLength(1);
-    expect(first.clear((owner) => owner === 'bob')).toBe(0);
+    expect(await first.clear((owner) => owner === 'bob')).toBe(0);
     expect(first.isHeld(entry, 'admin')).toBe(true);
-    expect(first.clear((owner) => owner === 'alice')).toBe(1);
+    expect(await first.clear((owner) => owner === 'alice')).toBe(1);
     expect(first.isHeld(entry, 'admin')).toBe(false);
-    first.releaseFlight('admin', [entry]);
+    await first.releaseFlight('admin', [entry]);
     const afterDismiss = new RebootRestoreRegistry();
-    afterDismiss.configurePersistence(path);
+    await afterDismiss.configurePersistence(path);
     expect(afterDismiss.list(() => true)).toEqual([]);
   });
   it('retains the original expiration across restarts', async () => {
@@ -400,13 +400,14 @@ describe('durable reboot offer', () => {
     const entry = (await planVerifiedRebootRestore(['original'], { original: state }, () => true)).restore[0];
     const path = join(homedir(), 'expired-offers.json');
     const first = new RebootRestoreRegistry();
-    first.configurePersistence(path);
-    first.set([entry]);
+    await first.configurePersistence(path);
+    await first.set([entry]);
     vi.useFakeTimers();
     vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
     const restarted = new RebootRestoreRegistry();
-    restarted.configurePersistence(path);
+    await restarted.configurePersistence(path);
     expect(restarted.list(() => true)).toEqual([]);
+    await restarted.flush();
   });
   it('keeps durable and parked offers intact when dismissal storage fails', async () => {
     const state = fixture({ owner: 'alice' });
@@ -417,21 +418,21 @@ describe('durable reboot offer', () => {
       if (failWrites) throw new Error('injected storage failure');
       writeFileSync(target, text, { mode: 0o600 });
     });
-    registry.configurePersistence(path);
-    registry.set([entry]);
+    await registry.configurePersistence(path);
+    await registry.set([entry]);
     expect(registry.take(() => true, undefined, 'alice')).toEqual([entry]);
 
     failWrites = true;
-    expect(() => registry.clear((owner) => owner === 'alice')).toThrow('injected storage failure');
-    // The failed transaction must not cancel the concurrent restore in memory.
-    expect(registry.isHeld(entry, 'alice')).toBe(true);
+    await expect(registry.clear((owner) => owner === 'alice')).rejects.toThrow('injected storage failure');
+    // Owner cancellation is immediate; uncertain storage must not revive that held launch.
+    expect(registry.isHeld(entry, 'alice')).toBe(false);
     // Nor may it erase the old durable offer that a restart will read.
     const restarted = new RebootRestoreRegistry();
-    restarted.configurePersistence(path);
+    await restarted.configurePersistence(path);
     expect(restarted.list(() => true).map((offer) => offer.sessionId)).toEqual(['original']);
 
     failWrites = false;
-    registry.releaseFlight('alice', [entry]);
+    await registry.releaseFlight('alice', [entry]);
     expect(registry.list(() => true).map((offer) => offer.sessionId)).toEqual(['original']);
   });
 });

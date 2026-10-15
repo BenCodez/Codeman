@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 /** Actual Session ownership must settle before a terminal takes direct stdin. */
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
@@ -30,7 +31,7 @@ async function fixture() {
     inspectPaneForRecovery: vi.fn(async () => null),
   };
   const session = new Session({
-    id: 'test-session-1',
+    id: randomUUID(),
     mode: 'codex',
     workingDir: '/fixture/workspace',
     useMux: true,
@@ -43,6 +44,7 @@ async function fixture() {
     codexConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
   });
   sessions.push(session);
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   const app = Fastify({ logger: false });
   apps.push(app);
   await app.register(fastifyCookie);
@@ -77,6 +79,8 @@ describe('direct attach admission', () => {
             : (Reflect.get(f.session, '_withPaneLifecycle').call(f.session, () => lifecycle.promise) as Promise<void>);
       try {
         expect(f.session.paneLifecycleInFlight).toBe(true);
+        if (kind === 'named-key') await vi.waitFor(() => expect(dispatch).toHaveBeenCalledOnce());
+        if (kind === 'ordinary-input') await vi.waitFor(() => expect(f.mux.sendInput).toHaveBeenCalledOnce());
         const before = f.session.getRecoveryContext();
         const refused = await f.post();
         expect(refused.json()).toMatchObject({ success: false, retryable: true, notSent: true });

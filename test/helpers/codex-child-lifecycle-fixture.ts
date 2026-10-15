@@ -5,6 +5,7 @@ import { join, dirname } from 'node:path';
 import { fakeInputProvenance } from './codex-input-provenance.js';
 import type { CodexBrokerProof } from '../../src/recovery/codex-input-broker.js';
 import { expect, vi } from 'vitest';
+import { loadRebootIdentityFence } from '../../src/recovery/reboot-identity-fence.js';
 import { Session } from '../../src/session.js';
 import type { TerminalMultiplexer, MuxSession } from '../../src/mux-interface.js';
 import { CodexRecoveryAdapter } from '../../src/recovery/codex-adapter.js';
@@ -60,6 +61,8 @@ export async function createChildLifecycleFixture(
   config: Partial<RecoveryConfig> = {}
 ) {
   const root = await fs.mkdtemp(join(homedir(), 'codex-child-lifecycle-'));
+  const previousData = process.env.CODEMAN_DATA_DIR;
+  process.env.CODEMAN_DATA_DIR = join(root, 'manager');
   const workspace = join(root, 'workspace');
   const codexHome = join(root, 'codex');
   await fs.mkdir(workspace);
@@ -113,6 +116,7 @@ export async function createChildLifecycleFixture(
     envOverrides: { CODEX_HOME: codexHome },
     ...(storedExit ? { paneExit: { at: CHILD_NOW - 20_000, status: 9 } } : {}),
   });
+  expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   const prompt = 'Sanitized child lifecycle owner request';
   if (trackedSubmission) {
     // Establish the real owner-input proof before the fixture's existing work,
@@ -123,6 +127,8 @@ export async function createChildLifecycleFixture(
     } finally {
       clock.mockRestore();
     }
+    await Reflect.get(session, '_recoveryFencePublication');
+    expect(session.getRecoveryContext().switchPending).toBe(false);
     const submission = session.getRecoveryContext().submission;
     expect(submission).toMatchObject({ at: CHILD_NOW - 60_000 });
     await fs.writeFile(
@@ -168,6 +174,14 @@ export async function createChildLifecycleFixture(
       await controller.drain();
       delivered.mockRestore();
       await session.stop(false);
+      await vi.waitFor(
+        async () => {
+          await loadRebootIdentityFence(session.id);
+        },
+        { timeout: 3000, interval: 5 }
+      );
+      if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+      else process.env.CODEMAN_DATA_DIR = previousData;
       await fs.rm(root, { recursive: true, force: true });
     },
   };

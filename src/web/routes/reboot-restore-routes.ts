@@ -163,10 +163,10 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
         let preserveCustomModelConfigDir = false;
         let restoreCompleted = false;
         let launchAcknowledged = false;
-        const discardTentativeSession = (session: Session): Promise<void> => {
+        const discardTentativeSession = async (session: Session): Promise<void> => {
           if (session.codexRestoreWorkerMayExist) {
-            writeRebootIdentityFence(session.id, {
-              ...readRebootIdentityFence(session.id),
+            await writeRebootIdentityFence(session.id, {
+              ...(await readRebootIdentityFence(session.id)),
               switchPending: true,
               untrackedInput: true,
             });
@@ -681,7 +681,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // historical offer remains durable until both snapshots are acknowledged.
           if (usesCodexRecovery) {
             const identity = session.getRecoveryContext();
-            writeRebootIdentityFence(session.id, {
+            await writeRebootIdentityFence(session.id, {
               resumeSessionId: codexConfig!.resumeSessionId,
               switchPending: identity.switchPending,
               // The new Session has no consumed pre-reboot submission. Retain
@@ -768,7 +768,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
       // Ends the flight: entries still parked for it come back if they are in
       // `unspent`, and a Dismiss that unparked them meanwhile wins.
       try {
-        rebootRestoreRegistry.releaseFlight(owner, [...unspent]);
+        await rebootRestoreRegistry.releaseFlight(owner, [...unspent]);
       } finally {
         rebootRestoreRegistry.endSpending(owner);
       }
@@ -778,7 +778,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
   // ========== Drop it ==========
 
   app.post('/api/reboot-restore/dismiss', async (req) => {
-    const dismissed = rebootRestoreRegistry.clear(accessorFor(req));
+    const dismissed = await rebootRestoreRegistry.clear(accessorFor(req));
     return { dismissed };
   });
 }

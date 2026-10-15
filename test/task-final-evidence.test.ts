@@ -122,6 +122,8 @@ it.each([
     recoveryIsolated: true,
     recoveryCodexHome: home,
   };
+  const previousData = process.env.CODEMAN_DATA_DIR;
+  process.env.CODEMAN_DATA_DIR = join(home, 'state');
   const session = new Session({
     id: SESSION,
     workingDir: work,
@@ -139,7 +141,9 @@ it.each([
     paneExit: undefined,
   });
   try {
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
     session.trackUserInput('Initial owner request\r');
+    await Reflect.get(session, '_recoveryFencePublication');
     const submission = session.getRecoveryContext().submission;
     expect(submission).toBeDefined();
     await fs.writeFile(
@@ -172,7 +176,10 @@ it.each([
     expect(mux.sendInput).toHaveBeenCalledTimes(change === 'unchanged' ? 1 : 0);
     expect(mux.respawnPane).toHaveBeenCalledTimes(0);
   } finally {
+    await Reflect.get(session, '_recoveryFencePublication');
     await session.stop(false);
+    if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+    else process.env.CODEMAN_DATA_DIR = previousData;
     await fs.rm(home, { recursive: true, force: true });
   }
 });

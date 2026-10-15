@@ -6,8 +6,11 @@ import { installOwnedRemoteBrokerFixture } from './helpers/owned-remote-broker.j
 import { sampleRemoteCodexClock } from '../src/recovery/remote-clock.js';
 /** Recovery uses the real Session boundary with an isolated fake mux; never a live agent or tmux socket. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { rmSync } from 'node:fs';
-import { createHash } from 'node:crypto';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { createHash, randomUUID } from 'node:crypto';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
@@ -15,7 +18,11 @@ import { CONTINUATION_PROMPT, type RecoveryFlight } from '../src/recovery/types.
 import { createDeferred } from './mocks/index.js';
 import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../src/recovery/codex-adapter.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
-import { readRebootIdentityFence, writeRebootIdentityFence } from '../src/recovery/reboot-identity-fence.js';
+import {
+  loadRebootIdentityFence,
+  readRebootIdentityFence,
+  writeRebootIdentityFence,
+} from '../src/recovery/reboot-identity-fence.js';
 import { dataPath } from '../src/config/instance.js';
 import {
   clampEnvOverridesForOwner,
@@ -44,7 +51,13 @@ const clockAt = (remoteAt = Date.now(), localAt = Date.now()) => ({
   remoteAfter: remoteAt,
 });
 const THREAD = '11111111-2222-3333-4444-555555555555';
-const SESSION = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+let SESSION: string;
+let fixtureDirectory: string;
+beforeEach(async () => {
+  SESSION = randomUUID();
+  fixtureDirectory = await mkdtemp(join(homedir(), 'remote-session-fence-'));
+  vi.stubEnv('CODEMAN_DATA_DIR', fixtureDirectory);
+});
 const sessions: Session[] = [];
 const configClamp = vi.mocked(clampExternalCliConfigsForOwner);
 const envClamp = vi.mocked(clampEnvOverridesForOwner);
@@ -56,8 +69,19 @@ beforeEach(() => {
   envClamp.mockReset().mockImplementation(async (_owner, env) => env);
 });
 afterEach(async () => {
-  for (const session of sessions.splice(0)) await session.stop(false);
   vi.useRealTimers();
+  for (const session of sessions.splice(0)) {
+    await session.stop(false);
+    // Timed-out private work retains its slot until the real handle closes.
+    await vi.waitFor(
+      async () => {
+        await loadRebootIdentityFence(session.id);
+      },
+      { timeout: 3000, interval: 5 }
+    );
+  }
+  vi.unstubAllEnvs();
+  await rm(fixtureDirectory, { recursive: true, force: true });
 });
 
 function fixture(extra: Record<string, unknown> = {}) {
@@ -117,6 +141,7 @@ describe('the actual Session recovery boundary', () => {
     'checks the ephemeral stalled native pane fence after the final Session read: %s',
     async (change) => {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       f.flight.reason = 'stalled';
       const expected = { paneId: '%7', panePid: 700, status: 1, signal: undefined };
       if (change === 'paneId') f.pane.paneId = '%8';
@@ -142,6 +167,7 @@ describe('the actual Session recovery boundary', () => {
   );
   it('requires realized isolated launch evidence, not just the requested flag', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.muxSession.recoveryIsolated = undefined;
     expect(f.session.getRecoveryContext().noDaemon).toBe(false);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
@@ -150,6 +176,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('refuses legacy isolated panes without actual home provenance', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.muxSession.recoveryCodexHome = undefined;
     expect(f.session.getRecoveryContext().noDaemon).toBe(false);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
@@ -158,6 +185,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('pins the exact thread and preserves all launch settings and the session home on restart', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
     expect(f.mux.respawnPane).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({
@@ -185,6 +213,7 @@ describe('the actual Session recovery boundary', () => {
     'never restarts a live, cleanly exited, or unverified pane: %j',
     async (patch) => {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       Object.assign(f.pane, patch);
       expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
       expect(f.mux.respawnPane).not.toHaveBeenCalled();
@@ -203,6 +232,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('pauses instead of inventing a new conversation when the exact identity differs', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.flight.conversationId = '22222222-2222-3333-4444-555555555555';
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
@@ -215,6 +245,7 @@ describe('the actual Session recovery boundary', () => {
       '›\n  user multiline draft\n  example-model high · /tmp\n',
     ]) {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       Object.assign(f.pane, { dead: false, status: undefined, screen });
       f.flight.action = 'continue';
       expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
@@ -224,6 +255,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('delivers one single-line continuation through mux input', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
     f.flight.action = 'continue';
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('sent');
@@ -238,6 +270,7 @@ describe('the actual Session recovery boundary', () => {
   it('never re-presses Enter for an unaccepted continuation or a subsequently edited draft', async () => {
     vi.useFakeTimers();
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
     Object.assign(f.mux, { capturePaneText: vi.fn(() => `› ${CONTINUATION_PROMPT} edited draft\n`) });
     f.flight.action = 'continue';
@@ -254,6 +287,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('cancels when user input or cleanup changes the generation during the fresh probe', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const pending = createDeferred<typeof f.pane>();
     f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
     const action = f.session.deliverRecovery(f.flight, 0);
@@ -265,13 +299,14 @@ describe('the actual Session recovery boundary', () => {
 
   it('reserves user write paths while recovery dispatch is in flight', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const pending = createDeferred<number>();
     f.mux.respawnPane.mockImplementationOnce(() => pending.promise);
     const action = f.session.deliverRecovery(f.flight, 0);
     await Promise.resolve();
     expect(f.session.recoveryInputReserved).toBe(true);
     expect(await f.session.writeViaMux('new user prompt\r', { fromUser: true })).toBe(false);
-    expect(f.session.write('x', { fromUser: true })).toBe(false);
+    expect(await f.session.writeAsync('x', { fromUser: true })).toBe(false);
     pending.resolve(99999);
     expect(await action).toBe('sent');
     expect(f.session.recoveryInputReserved).toBe(false);
@@ -281,6 +316,7 @@ describe('the actual Session recovery boundary', () => {
     'rechecks %s at the final Session dispatch boundary',
     async (change) => {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       const pending = createDeferred<typeof f.pane>();
       f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
       const delivery = f.session.deliverRecovery(f.flight, 0);
@@ -298,6 +334,7 @@ describe('the actual Session recovery boundary', () => {
     'respects controller cancellation during the final %s probe',
     async (action) => {
       const f = fixture();
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       f.flight.action = action;
       if (action === 'continue')
         Object.assign(f.pane, { dead: false, status: undefined, screen: '›\n  example-model high · /tmp\n' });
@@ -313,7 +350,7 @@ describe('the actual Session recovery boundary', () => {
     }
   );
 
-  it('persists only the Codex home path and keeps all environment overrides off public state', () => {
+  it('persists only the Codex home path and keeps all environment overrides off public state', async () => {
     const f = fixture({
       envOverrides: {
         CODEX_HOME: '/srv/example/codex-home',
@@ -321,6 +358,7 @@ describe('the actual Session recovery boundary', () => {
         OPENCODE_API_KEY: 'fixture-secret',
       },
     });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(f.session.getEnvOverridesForPersist()).toEqual({ CODEX_HOME: '/srv/example/codex-home' });
     expect(JSON.stringify(f.session.toDetailedState())).not.toContain('/srv/example/codex-home');
     expect(JSON.stringify(f.session.toDetailedState())).not.toContain('fixture-secret');
@@ -328,6 +366,7 @@ describe('the actual Session recovery boundary', () => {
 
   it('treats a partial dispatch as uncertain, so the controller can avoid replaying it', async () => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.mux.respawnPane.mockResolvedValueOnce(null as unknown as number);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('unknown');
   });
@@ -340,10 +379,12 @@ describe('the actual Session recovery boundary', () => {
       { useMux: false },
     ]) {
       const f = fixture(extra);
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
       expect(f.mux.respawnPane).not.toHaveBeenCalled();
     }
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     f.session.markClosing(true);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
   });
@@ -363,6 +404,7 @@ describe('the actual owned remote Session boundary', () => {
     'pins a pre-input clock witness for ordinary owner Enter with %i ms skew',
     async (offset) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       const at = Date.now();
       vi.mocked(sampleRemoteCodexClock).mockResolvedValue(clockAt(at + offset, at));
       expect(await f.session.writeViaMux('Sanitized owner prompt\r', { fromUser: true })).toBe(true);
@@ -379,9 +421,11 @@ describe('the actual owned remote Session boundary', () => {
     'refuses original owner input when %s changes during the clock await',
     async (change) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       const release = createDeferred<ReturnType<typeof clockAt>>();
       vi.mocked(sampleRemoteCodexClock).mockReturnValue(release.promise);
       const pending = f.session.writeViaMux('Old owner prompt\r', { fromUser: true });
+      await vi.waitFor(() => expect(sampleRemoteCodexClock).toHaveBeenCalledOnce());
       expect(f.session.recoveryInputReserved).toBe(true);
       if (change === 'closing') f.session.markClosing(true);
       if (change === 'configuration') f.session.pinRecoveryConversation('22222222-2222-4222-8222-222222222222');
@@ -396,6 +440,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('allows owner input after failed read-only clock sampling while leaving it ineligible for automation', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     vi.mocked(sampleRemoteCodexClock).mockRejectedValue(new Error('Fixture SSH transport unavailable'));
     expect(await f.session.writeViaMux('New owner prompt\r', { fromUser: true })).toBe(true);
     expect(f.session.getRecoveryContext().submission?.clock).toBeUndefined();
@@ -404,6 +449,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('rechecks the admission token after the preparation Promise resumes and discards canceled clock provenance', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const prepare = f.session.prepareUserInputClock.bind(f.session);
     vi.spyOn(f.session, 'prepareUserInputClock').mockImplementation(async (data, options) => {
       const admission = await prepare(data, options);
@@ -420,6 +466,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('rejects a claimed remote receipt without clock provenance while keeping actual delivery uncertain', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now() }));
     expect(await f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, dispatch)).toBe('unknown');
     expect(dispatch).toHaveBeenCalledOnce();
@@ -428,7 +475,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it.each(['local', 'remote', 'malformed', 'domain', 'timestamp'] as const)(
     'preserves valid %s private submission clock metadata and fences malformed provenance',
-    (kind) => {
+    async (kind) => {
       const id = `remote-clock-fence-${kind}`;
       const at = Date.now();
       const clock = clockAt(at + 60_000, at);
@@ -441,8 +488,14 @@ describe('the actual owned remote Session boundary', () => {
       if (kind === 'domain') Reflect.set(submission, 'clockDomain', 'unknown');
       if (kind === 'timestamp') submission.at += 0.5;
       try {
-        writeRebootIdentityFence(id, { switchPending: false, submission });
-        expect(readRebootIdentityFence(id)).toEqual(
+        if (['malformed', 'domain', 'timestamp'].includes(kind)) {
+          mkdirSync(dataPath('reboot-identities'), { recursive: true });
+          writeFileSync(
+            dataPath('reboot-identities', `${id}.json`),
+            JSON.stringify({ version: 1, switchPending: false, submission })
+          );
+        } else await writeRebootIdentityFence(id, { switchPending: false, submission });
+        expect(await readRebootIdentityFence(id)).toEqual(
           ['malformed', 'domain', 'timestamp'].includes(kind)
             ? { switchPending: true }
             : { switchPending: false, submission }
@@ -457,6 +510,7 @@ describe('the actual owned remote Session boundary', () => {
     'rechecks one current owner grant snapshot at final SSH admission: %s',
     async (change) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       const expected = f.session.remoteRecoveryConfiguration();
       if (change === 'revoked') configClamp.mockImplementation(async () => ({ codexConfig: { noDaemon: true } }));
       if (change === 'retargeted') f.session.pinRecoveryConversation('22222222-2222-4222-8222-222222222222');
@@ -468,6 +522,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('retains the current grant snapshot token for grant-only changes after the async clamp resolves', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const expected = f.session.remoteRecoveryConfiguration();
     let granted = true;
     vi.mocked(clampRecoveryLaunchForOwner).mockImplementationOnce(async (_owner, configs, env) => ({
@@ -488,6 +543,7 @@ describe('the actual owned remote Session boundary', () => {
         remote: ownedRemote,
         envOverrides: codexHome === undefined ? {} : { CODEX_HOME: codexHome },
       });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       const input = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now(), clock: clockAt() }));
       const restart = vi.fn(async () => 'sent' as const);
       expect(f.session.getRecoveryContext().noDaemon).toBe(false);
@@ -509,6 +565,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('reattaches a healthy worker with attach-only and then delivers once', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now(), clock: clockAt() }));
     Object.assign(f.pane, { dead: true, status: 255, screen: null });
     expect(f.session.getRecoveryContext()).toMatchObject({ managed: true, remoteOwned: true, noDaemon: true });
@@ -529,6 +586,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('does not respawn the local SSH wrapper when it is still live', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now(), clock: clockAt() }));
     Object.assign(f.pane, { dead: false, status: undefined, screen: 'ssh attached' });
     expect(await f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, dispatch)).toBe('sent');
@@ -539,6 +597,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('holds the input reservation through transport reattach and final guarded dispatch', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const reattached = createDeferred<number>();
     f.mux.respawnPane.mockReturnValueOnce(reattached.promise);
     const dispatch = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now(), clock: clockAt() }));
@@ -556,19 +615,32 @@ describe('the actual owned remote Session boundary', () => {
     'excludes all remote mutations while an owner %s send is still in flight',
     async (kind) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
+      expect(f.session.getRecoveryContext()).toMatchObject({
+        managed: true,
+        remoteOwned: true,
+        switchPending: false,
+        untrackedInput: false,
+      });
       const held = createDeferred<boolean>();
+      const dispatched = createDeferred<void>();
       const input =
         kind === 'named-key'
           ? f.session.sendNamedKey('\n', async () => {
+              dispatched.resolve();
               await held.promise;
             })
           : (() => {
-              f.mux.sendInput.mockReturnValueOnce(held.promise);
+              f.mux.sendInput.mockImplementationOnce(() => {
+                dispatched.resolve();
+                return held.promise;
+              });
               return f.session.writeViaMux('owner draft', { fromUser: true });
             })();
-      // Current generation and valid identity make the in-flight input the veto.
+      await dispatched.promise;
+      // Accepted owner intent is durably pending until its completed ordinary Enter.
       const context = f.session.getRecoveryContext();
-      expect(context).toMatchObject({ managed: true, remoteOwned: true, switchPending: false, untrackedInput: false });
+      expect(context).toMatchObject({ managed: true, remoteOwned: true, switchPending: true, untrackedInput: false });
       expect(f.session.paneLifecycleInFlight).toBe(true);
       const deliver = vi.fn(async () => ({ status: 'sent' as const, submittedAt: Date.now(), clock: clockAt() }));
       const restart = vi.fn(async () => 'sent' as const);
@@ -593,7 +665,10 @@ describe('the actual owned remote Session boundary', () => {
       held.resolve(true);
       expect(await input).toBe(true);
       expect(f.session.paneLifecycleInFlight).toBe(false);
-      expect(await f.session.restartRemoteRecoveryPane(THREAD, context.generation, () => true, restart)).toBe('sent');
+      expect(await f.session.writeViaMux(' fresh owner prompt\r', { fromUser: true })).toBe(true);
+      const completed = f.session.getRecoveryContext();
+      expect(completed.switchPending).toBe(false);
+      expect(await f.session.restartRemoteRecoveryPane(THREAD, completed.generation, () => true, restart)).toBe('sent');
       expect(restart).toHaveBeenCalledOnce();
     }
   );
@@ -601,22 +676,16 @@ describe('the actual owned remote Session boundary', () => {
   it.each(['sent', 'unknown'] as const)(
     'keeps a direct-attach taint that lands while guarded remote input is in flight and resolves %s',
     async (outcome) => {
-      const taintedSession = 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff';
+      const taintedSession = randomUUID();
       const fencePath = dataPath('reboot-identities', `${taintedSession}.json`);
       rmSync(fencePath, { force: true });
       const f = fixture({ id: taintedSession, remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       Object.assign(f.pane, { dead: false, status: undefined, screen: 'ssh attached' });
       const started = createDeferred<void>();
       const dispatched = createDeferred<{ status: 'sent'; submittedAt: number } | { status: 'unknown' }>();
       const initialGeneration = f.session.getRecoveryContext().generation;
-      f.session.on('recoveryIdentityChanged', () => {
-        const context = f.session.getRecoveryContext();
-        writeRebootIdentityFence(taintedSession, {
-          switchPending: context.switchPending,
-          submission: context.submission,
-          untrackedInput: context.untrackedInput,
-        });
-      });
+      // Session itself awaits the private fence; event listeners never own disk I/O.
       try {
         const delivery = f.session.deliverRemoteRecoveryInput(
           THREAD,
@@ -628,7 +697,7 @@ describe('the actual owned remote Session boundary', () => {
           }
         );
         await started.promise;
-        f.session.fenceUntrackedInput();
+        await f.session.fenceUntrackedInput();
         expect(f.session.getRecoveryContext()).toMatchObject({
           generation: initialGeneration + 1,
           submission: undefined,
@@ -647,7 +716,7 @@ describe('the actual owned remote Session boundary', () => {
           switchPending: true,
           untrackedInput: true,
         });
-        expect(readRebootIdentityFence(taintedSession)).toEqual({
+        expect(await readRebootIdentityFence(taintedSession)).toEqual({
           switchPending: true,
           submission: undefined,
           untrackedInput: true,
@@ -681,6 +750,7 @@ describe('the actual owned remote Session boundary', () => {
           codexConfig: { noDaemon: true, resumeSessionId: THREAD },
         });
         sessions.push(reconstructed);
+        expect(await reconstructed.ensureRecoveryIdentityFence()).toBe(true);
         expect(reconstructed.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
       } finally {
         rmSync(fencePath, { force: true });
@@ -691,6 +761,7 @@ describe('the actual owned remote Session boundary', () => {
   it('records the remote send instant after an acknowledgement delayed beyond identity tolerance', async () => {
     vi.useFakeTimers();
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     Object.assign(f.pane, { dead: false, status: undefined, screen: 'ssh attached' });
     const remoteSendAt = Date.now() - 60_000;
     const delivery = f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, async () => {
@@ -712,6 +783,7 @@ describe('the actual owned remote Session boundary', () => {
     async (kind) => {
       vi.useFakeTimers();
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       f.session.verifySubmitted('stale prompt');
       const deferred = createDeferred<void>();
       let operation: Promise<'sent' | 'not-sent' | 'unknown'>;
@@ -753,6 +825,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('reserves owner input for a remote restart and cancels before dispatch when authority changes', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const dispatch = vi.fn(async () => 'sent' as const);
     const restart = f.session.restartRemoteRecoveryPane(THREAD, 0, () => true, dispatch);
     expect(f.session.recoveryInputReserved).toBe(true);
@@ -764,6 +837,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('explicitly rebuilds a missing worker only through a confirmed dead local wrapper', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(
       await f.session.restoreMissingRemoteWorker(
         THREAD,
@@ -782,6 +856,7 @@ describe('the actual owned remote Session boundary', () => {
       })
     );
     const live = fixture({ remote: ownedRemote });
+    expect(await live.session.ensureRecoveryIdentityFence()).toBe(true);
     Object.assign(live.pane, { dead: false, status: undefined, screen: 'ssh attached' });
     expect(
       await live.session.restoreMissingRemoteWorker(
@@ -794,6 +869,7 @@ describe('the actual owned remote Session boundary', () => {
     expect(live.mux.respawnPane).not.toHaveBeenCalled();
 
     const clean = fixture({ remote: ownedRemote });
+    expect(await clean.session.ensureRecoveryIdentityFence()).toBe(true);
     Object.assign(clean.pane, { dead: true, status: 0, signal: undefined, screen: null });
     expect(
       await clean.session.restoreMissingRemoteWorker(
@@ -810,8 +886,10 @@ describe('the actual owned remote Session boundary', () => {
     'dispatches missing-worker recreation under the final remote proof after late %s evidence',
     async (change) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       await f.session.prepareUserInputClock('exact fixture restore prompt\r', { fromUser: true });
       f.session.trackUserInput('exact fixture restore prompt\r');
+      await vi.waitFor(() => expect(f.session.getRecoveryContext().switchPending).toBe(false));
       const now = Date.now();
       const baseTail =
         [
@@ -902,6 +980,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it.each(['not-sent', 'unknown'] as const)('does not attach after guarded remote creation is %s', async (outcome) => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(
       await f.session.restoreMissingRemoteWorker(
         THREAD,
@@ -916,6 +995,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('refuses an unguarded missing-worker restore', async () => {
     const f = fixture({ remote: ownedRemote });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(await f.session.restoreMissingRemoteWorker(THREAD, 0)).toBe('not-sent');
     expect(f.mux.inspectPaneForRecovery).not.toHaveBeenCalled();
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
@@ -925,6 +1005,7 @@ describe('the actual owned remote Session boundary', () => {
     'retains uncertainty when %s happens after remote creation',
     async (change) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       let current = true;
       const dispatch = vi.fn(async () => {
         if (change === 'cancel') current = false;
@@ -944,6 +1025,7 @@ describe('the actual owned remote Session boundary', () => {
     'retains uncertainty if %s changes while the local wrapper reattaches',
     async (change) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       let current = true;
       f.mux.respawnPane.mockImplementationOnce(async () => {
         if (change === 'cancel') current = false;
@@ -962,6 +1044,7 @@ describe('the actual owned remote Session boundary', () => {
     'rechecks %s authority after the missing-worker transport probe',
     async (change) => {
       const f = fixture({ remote: ownedRemote });
+      expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
       const pending = createDeferred<typeof f.pane>();
       f.mux.inspectPaneForRecovery.mockImplementationOnce(() => pending.promise);
       const restore = f.session.restoreMissingRemoteWorker(
@@ -985,6 +1068,7 @@ describe('the actual owned remote Session boundary', () => {
 
   it('refuses foreign remote ownership at the last delivery boundary', async () => {
     const f = fixture({ remote: { ...ownedRemote, owned: false } });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(f.session.getRecoveryContext().managed).toBe(false);
     expect(
       await f.session.deliverRemoteRecoveryInput(THREAD, 0, CONTINUATION_PROMPT, async () => ({
@@ -1008,6 +1092,7 @@ describe('the actual owned remote Session boundary', () => {
 describe('Codeman reboot of its own server preserves crashed panes and circuit control', () => {
   it('vetoes the old resume seed on every restored pane, including switches missed during downtime', async () => {
     const f = fixture({ preserveExitedPane: true, codexConfig: { noDaemon: true, resumeSessionId: THREAD } });
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     expect(f.session.getRecoveryContext().switchPending).toBe(true);
     expect(await f.session.deliverRecovery(f.flight, 0)).toBe('not-sent');
     expect(f.mux.respawnPane).not.toHaveBeenCalled();
@@ -1042,6 +1127,7 @@ it.each(['unchanged', 'cancelled'] as const)(
   'awaits fresh asynchronous evidence while retaining pure current authority: %s',
   async (change) => {
     const f = fixture();
+    expect(await f.session.ensureRecoveryIdentityFence()).toBe(true);
     const entered = createDeferred<void>();
     const held = createDeferred<boolean>();
     let current = true;
