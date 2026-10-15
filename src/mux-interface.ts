@@ -34,6 +34,8 @@ import type {
  * Multiplexer session metadata.
  */
 export interface MuxSession {
+  /** An uncommitted local custom-profile launch is inspection-only across server restarts. */
+  restoreUncertain?: boolean;
   /** A guarded reboot launch may have started; preserve this exact pane until owner inspection. */
   codexRestoreUncertain?: boolean;
   /** Non-secret exact argv settings recorded before an uncertain reboot worker effect. */
@@ -102,6 +104,15 @@ export interface MuxSessionWithStats extends MuxSession {
 }
 
 /** Options for creating a new multiplexer session. */
+export interface RestoreLaunchGuard {
+  prepare(): Promise<void>;
+  confirm(): boolean | Promise<boolean>;
+  isCurrent(): boolean;
+  noteDispatch?(): void;
+  noteCleanupUncertain?(): void;
+  noteBrokerRefusal?(): void;
+}
+
 export interface CodexRestoreLaunchGuard {
   prepare(): Promise<void>;
   confirm(): boolean | Promise<boolean>;
@@ -118,6 +129,8 @@ export interface CodexRestoreLaunchGuard {
 }
 
 export interface CreateSessionOptions {
+  /** Current owner intent for a certified optional guard fallback; never automatic authority. */
+  ownerLaunchIsCurrent?(): boolean;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;
@@ -152,6 +165,8 @@ export interface CreateSessionOptions {
   /** Private owner/generation veto for a controlled SSH launch; never persisted. */
   remoteLaunchCurrent?: () => boolean;
   remoteLaunchPrepare?: () => Promise<boolean>;
+  /** Ephemeral exact custom-profile authority for a local non-Codex reboot launch. */
+  restoreGuard?: RestoreLaunchGuard;
   /** Claude CLI effort level, injected as a `--settings` soft default (overridable via /effort in-session) */
   effort?: EffortLevel;
   /** Claude advisor model, merged into the same `--settings` JSON (overridable via /advisor in-session) */
@@ -203,6 +218,8 @@ export interface RecoveryPaneIdentity {
 }
 
 export interface RespawnPaneOptions {
+  /** Current owner intent for a certified optional guard fallback; never automatic authority. */
+  ownerLaunchIsCurrent?(): boolean;
   /** Automatic local recovery checks authority again immediately before its worker effect. */
   recoveryDispatchGuard?: RecoveryMuxDispatchGuard;
   /** Recovery refuses a pane that became live by omitting tmux's kill-live-pane flag. Local only. */
@@ -353,6 +370,10 @@ export interface TerminalMultiplexer extends EventEmitter {
    * Uses a multi-strategy approach (children → process group → mux kill → SIGKILL).
    */
   killSession(sessionId: string): Promise<boolean>;
+  /** Cancel only a locally acknowledged reboot worker, with exact native ownership. */
+  cancelAcknowledgedRebootLaunch?(record: MuxSession, isCurrent: () => boolean): Promise<boolean>;
+  /** Clear only our acknowledged generic launch marker after the caller has committed main state. */
+  completeAcknowledgedRebootLaunch?(record: MuxSession, isCurrent: () => boolean): Promise<boolean>;
 
   /** Clean up resources (stop stats collection, etc.) */
   destroy(): void;

@@ -1171,7 +1171,7 @@ describe('recovery action authority', () => {
   });
 
   it.each([true, false])(
-    'clears owned stall attention after settings change its reason (automatic: %s)',
+    'retains the stall reason across settings and clears attention on actual progress (automatic: %s)',
     async (enabled) => {
       const f = fixture(enabledState({}, { enabled, detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
       f.observation = stalled('settings-during-stall');
@@ -1183,7 +1183,7 @@ describe('recovery action authority', () => {
       await f.controller.updateConfig({ maxRetries: 4 });
       expect(f.controller.getStatus()).toMatchObject({
         needsAttention: true,
-        lastReason: enabled ? 'observing' : 'disabled',
+        lastReason: 'stall-unverified',
       });
       f.observation.progressAt = Date.now();
       await f.controller.inspect();

@@ -399,7 +399,7 @@ describe('screen evidence may veto but never authorize recovery', () => {
 
   it('reads the newest composer row and bounds the search to the footer', () => {
     expect(hasEmptyCodexComposer('› \n› Unsent fixture draft\n')).toBe(false);
-    expect(hasEmptyCodexComposer('› Ask Codex to do anything\n')).toBe(true);
+    expect(hasEmptyCodexComposer('› Ask Codex to do anything\n')).toBe(false);
     expect(hasEmptyCodexComposer('› \na\nb\nc\nd\ne\nf\n')).toBe(false);
   });
 

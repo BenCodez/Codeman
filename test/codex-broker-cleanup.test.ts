@@ -1,6 +1,6 @@
 /** Every process is a disposable Python helper/child in the test-owned HOME. No native pane or SSH runs. */
 import fs from 'node:fs/promises';
-import { writeFileSync } from 'node:fs';
+import { mkdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -72,7 +72,103 @@ it('prunes a certified closed unreferenced UUID incarnation from before startup'
   const f = await fixture();
   await f.prune();
   expect(await f.exists()).toBe(false);
-  expect(await fs.readdir(f.session)).toEqual([]);
+  expect(await f.exists(f.session)).toBe(false);
+});
+it('prunes an already empty private UUID session directory', async () => {
+  const f = await fixture();
+  await fs.rm(f.broker.directory, { recursive: true });
+  await f.prune();
+  expect(await f.exists(f.session)).toBe(false);
+});
+it.each(['provider', 'metadata', 'child', 'session-inode', 'root-inode', 'symlink'] as const)(
+  'retains an empty container when %s changes after its fresh handshake',
+  async (change) => {
+    const f = await fixture();
+    await fs.rm(f.broker.directory, { recursive: true });
+    const outside = join(f.root, 'private-outside');
+    await fs.mkdir(outside, { mode: 0o700 });
+    let reached = false;
+    const transport = ((...args: Parameters<typeof spawn>) => {
+      const child = spawn(...args);
+      let output = '';
+      child.stdout!.on('data', (chunk: Buffer) => {
+        output += chunk.toString('utf8');
+        let at: number;
+        while ((at = output.indexOf('\n')) !== -1) {
+          const frame = JSON.parse(output.slice(0, at));
+          output = output.slice(at + 1);
+          if (frame.empty !== SID) continue;
+          reached = true;
+          if (change === 'provider') f.refs({ current: randomUUID() });
+          if (change === 'metadata')
+            writeFileSync(join(f.root, 'state.json'), JSON.stringify({ sessions: {}, updated: true }));
+          if (change === 'child') {
+            mkdirSync(join(f.session, 'owner-new-child'), { mode: 0o700 });
+            writeFileSync(join(f.session, 'owner-new-child', 'keep'), 'private owner bytes');
+          }
+          if (change === 'session-inode' || change === 'symlink') {
+            renameSync(f.session, f.session + '.held');
+            if (change === 'session-inode') mkdirSync(f.session, { mode: 0o700 });
+            else symlinkSync(outside, f.session);
+          }
+          if (change === 'root-inode') {
+            const root = join(f.root, 'codex-input-brokers');
+            renameSync(root, root + '.held');
+            mkdirSync(f.session, { recursive: true, mode: 0o700 });
+          }
+        }
+      });
+      return child;
+    }) as typeof spawn;
+    await f.prune(transport);
+    expect(reached).toBe(true);
+    expect(await f.exists(f.session)).toBe(true);
+    expect(await fs.readdir(outside)).toEqual([]);
+    if (change === 'child')
+      expect(await fs.readFile(join(f.session, 'owner-new-child', 'keep'), 'utf8')).toBe('private owner bytes');
+  }
+);
+it.each(['unknown-file', 'public-directory', 'malformed-journal', 'missing-provider'] as const)(
+  'retains a session container with %s evidence',
+  async (kind) => {
+    const f = await fixture();
+    await fs.rm(f.broker.directory, { recursive: true });
+    if (kind === 'unknown-file') await fs.writeFile(join(f.session, 'owner-notes'), 'retain');
+    if (kind === 'public-directory') await fs.chmod(f.session, 0o755);
+    if (kind === 'malformed-journal') await fs.writeFile(join(f.root, 'state.json'), '{');
+    if (kind === 'missing-provider') await pruneCodexInputBrokers(f.root, () => undefined, spawn);
+    else await f.prune();
+    expect(await f.exists(f.session)).toBe(true);
+  }
+);
+it('makes bounded progress through more than 512 empty parents and reaches later private brokers', async () => {
+  const f = await fixture();
+  const root = join(f.root, 'codex-input-brokers');
+  // Retain the same closed broker under a newly created final parent, after
+  // enough historical empty parents to exhaust the old deterministic scan.
+  const held = join(f.root, 'held-broker');
+  await fs.rename(f.broker.directory, held);
+  for (let index = 0; index < 520; index++) await fs.mkdir(join(root, randomUUID()), { mode: 0o700 });
+  const last = randomUUID();
+  await fs.mkdir(join(root, last), { mode: 0o700 });
+  await fs.rename(held, join(root, last, f.broker.incarnation));
+  const configPath = join(root, last, f.broker.incarnation, 'config.json');
+  const statePath = join(root, last, f.broker.incarnation, 'state.json');
+  const config = JSON.parse(await fs.readFile(configPath, 'utf8'));
+  config.sessionId = last;
+  f.state.sessionId = last;
+  await fs.writeFile(configPath, JSON.stringify(config));
+  await fs.writeFile(statePath, JSON.stringify(f.state));
+  const before = (await fs.readdir(root)).length;
+  await f.prune();
+  expect((await fs.readdir(root)).length).toBeLessThan(before);
+  for (let pass = 0; pass < 4 && (await fs.readdir(root)).length; pass++) {
+    const remaining = (await fs.readdir(root)).length;
+    await f.prune();
+    expect((await fs.readdir(root)).length).toBeLessThan(remaining);
+  }
+  expect(await f.exists(join(root, last))).toBe(false);
+  expect(await fs.readdir(root)).toEqual([]);
 });
 it('retains every incarnation without a complete private reference provider', async () => {
   const f = await fixture();

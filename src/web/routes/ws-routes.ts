@@ -176,7 +176,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
         if (
           msg.t === 'i' &&
           typeof msg.d === 'string' &&
-          !(typeof msg.cid === 'string' && msg.cid.length > 0 && Number.isInteger(msg.seq)) &&
+          !(typeof msg.cid === 'string' && msg.cid.length > 0 && Number.isSafeInteger(msg.seq)) &&
           socket.readyState === 1
         )
           socket.close(4011, 'Input delivery not confirmed');
@@ -186,7 +186,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
       const noteLifecycleOwnerIntent = (msg: Record<string, unknown>) => {
         if (
           typeof msg.cid === 'string' &&
-          Number.isInteger(msg.seq) &&
+          Number.isSafeInteger(msg.seq) &&
           session.hasAppliedInputSeq(msg.cid, msg.seq as number)
         )
           return;
@@ -226,7 +226,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               // unACKed and the client redelivered it every few seconds forever
               // (issue #484). A client that predates `err` reads this as a plain
               // ACK and drops the frame, which is also the right outcome.
-              if (Number.isInteger(msg.seq) && socket.readyState === 1) {
+              if (Number.isSafeInteger(msg.seq) && socket.readyState === 1) {
                 socket.send(`{"t":"ia","seq":${msg.seq as number},"err":"too_large","max":${MAX_INPUT_LENGTH}}`);
               }
               return;
@@ -236,7 +236,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             // the client can drop it from its durable queue. Frames without seq
             // (legacy/other tools) are applied as-is — no behavior change.
             const cid = typeof msg.cid === 'string' ? msg.cid : null;
-            const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
+            const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
             // A rejected frame must not claim a delivery identity. Otherwise a
             // burst during recovery can manufacture a watermark for lost bytes.
             if (session.recoveryInputReserved) {
@@ -352,12 +352,20 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
       socket.on('message', (raw) => {
         try {
           const msg = JSON.parse(String(raw)) as Record<string, unknown>;
+          // Validate delivery tags before async admission, retention, or any ACK.
+          if (
+            msg.t === 'i' &&
+            typeof msg.d === 'string' &&
+            ((msg.cid !== undefined && (typeof msg.cid !== 'string' || msg.cid.length === 0 || msg.cid.length > 128)) ||
+              (msg.seq !== undefined && (typeof msg.seq !== 'number' || !Number.isSafeInteger(msg.seq) || msg.seq < 0)))
+          )
+            return;
           if (msg.t !== 'i' || typeof msg.d !== 'string' || msg.d.length > MAX_INPUT_LENGTH) {
             void handleMessage(msg);
             return;
           }
           const cid = typeof msg.cid === 'string' ? msg.cid : null;
-          const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
+          const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
           if (!canQueueInputDispatch(session, msg.d.length)) {
             if (cid && seq !== null) {
               if (socket.readyState === 1) socket.send(JSON.stringify({ t: 'ia', seq, err: 'input_backlog_full' }));

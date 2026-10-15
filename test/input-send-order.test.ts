@@ -448,22 +448,78 @@ describe('named newline keys in the input queue', () => {
     expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'error');
   });
 
-  it('cancels a recovery-blocked key on owner destruction and still delivers ordinary text', async () => {
+  it.each(['S-Enter', 'C-Enter'])(
+    'cancels a certified-unsent %s and its dependent text on owner destruction',
+    async (key) => {
+      const app = makeApp();
+      const owner = {};
+      const requests: string[] = [];
+      global.fetch = vi.fn(async (url) => {
+        requests.push(String(url));
+        return String(url).endsWith('/send-key') ? busy() : new Response('{}', { status: 200 });
+      });
+      app._sendNamedKey('session-1', key, owner);
+      app._sendInputAsync('session-1', 'after');
+      await waitForCalls(requests, 1);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(app._pendingDeliveries.get('session-1')![0].retryAt).toBeGreaterThan(0);
+      app._cancelPendingKeys(owner);
+      app._drainSession('session-1');
+      await new Promise((r) => setTimeout(r, 0));
+      expect(requests).toEqual(['/api/sessions/session-1/send-key']);
+      expect(app._pendingDeliveries.has('session-1')).toBe(false);
+      expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('cancelled'), 'warning');
+      expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
+    }
+  );
+
+  it('keeps preceding text and another session when a tab change cancels an unattempted newline', () => {
     const app = makeApp();
     const owner = {};
-    const requests: string[] = [];
-    global.fetch = vi.fn(async (url) => {
-      requests.push(String(url));
-      return String(url).endsWith('/send-key') ? busy() : new Response('{}', { status: 200 });
+    const frames: Frame[] = [];
+    app._ws = { readyState: 1, send: (data) => frames.push(JSON.parse(data)) };
+    app._wsSessionId = 'session-1';
+    app._sendInputAsync('session-1', 'before');
+    app._sendNamedKey('session-1', 'S-Enter', owner);
+    app._sendInputAsync('session-1', 'dependent');
+    // The old terminal's queue is independent of the newly selected session.
+    app.activeSessionId = 'session-2';
+    Reflect.set(app, '_extraInputSockets', new Map([['session-2', { ws: app._ws, lastRecvAt: Date.now() }]]));
+    app._sendInputAsync('session-2', 'unrelated');
+    const unrelated = app._pendingDeliveries.get('session-2')![0];
+    expect(app._pendingDeliveries.get('session-1')![1].tries).toBe(0);
+    app._cancelPendingKeys(owner);
+    expect(app._pendingDeliveries.get('session-1')?.map((rec) => rec.data)).toEqual(['before']);
+    expect(app._pendingDeliveries.get('session-2')).toEqual([unrelated]);
+    expect(frames.map((frame) => frame.d)).toEqual(['before', 'unrelated']);
+    app._onWsInputAck(1, {}, 'session-1');
+    app._drainSession('session-1');
+    expect(frames.map((frame) => frame.d)).toEqual(['before', 'unrelated']);
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+  });
+
+  it('keeps text after an acknowledged newline when its former owner is destroyed', async () => {
+    const app = makeApp();
+    const owner = {};
+    const keys: string[] = [];
+    global.fetch = vi.fn(async (_url, init) => {
+      keys.push(JSON.parse(String(init?.body)).key);
+      return new Response('{}', { status: 200 });
     });
     app._sendNamedKey('session-1', 'C-Enter', owner);
-    app._sendInputAsync('session-1', 'after');
-    await waitForCalls(requests, 1);
     await new Promise((r) => setTimeout(r, 0));
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+    const frames: Frame[] = [];
+    app._ws = { readyState: 1, send: (data) => frames.push(JSON.parse(data)) };
+    app._wsSessionId = 'session-1';
+    app._sendInputAsync('session-1', 'after');
+    const after = app._pendingDeliveries.get('session-1')![0];
     app._cancelPendingKeys(owner);
-    await waitForCalls(requests, 2);
-    expect(requests.filter((url) => url.endsWith('/send-key'))).toHaveLength(1);
-    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('cancelled'), 'warning');
+    app._drainSession('session-1');
+    expect(keys).toEqual(['C-Enter']);
+    expect(frames.map((frame) => frame.d)).toEqual(['after']);
+    expect(app._pendingDeliveries.get('session-1')).toEqual([after]);
+    expect(app.showToast).not.toHaveBeenCalled();
   });
 
   it.each([400, 404, 410, 413])('refuses dependent text when the key receives HTTP %s', async (status) => {

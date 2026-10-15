@@ -276,6 +276,122 @@ describe('ws-routes', () => {
         ws.close();
       }
     });
+    it.each([
+      { label: 'empty cid', metadata: { cid: '', seq: 1 } },
+      { label: '129-char cid', metadata: { cid: 'c'.repeat(129), seq: 1 } },
+      { label: 'near-frame-limit cid', metadata: { cid: 'c'.repeat(MAX_INPUT_LENGTH), seq: 1 } },
+      { label: 'non-string cid', metadata: { cid: 7, seq: 1 } },
+      { label: 'null cid', metadata: { cid: null, seq: 1 } },
+      {
+        label: 'oversized input with invalid cid',
+        metadata: { cid: 'c'.repeat(129), seq: 1 },
+        input: 'x'.repeat(MAX_INPUT_LENGTH + 1),
+      },
+      {
+        label: 'oversized input with invalid seq',
+        metadata: { cid: 'bounded-client', seq: Number.MAX_SAFE_INTEGER + 1 },
+        input: 'x'.repeat(MAX_INPUT_LENGTH + 1),
+      },
+      { label: 'negative seq', metadata: { cid: 'bounded-client', seq: -1 } },
+      { label: 'fractional seq', metadata: { cid: 'bounded-client', seq: 1.5 } },
+      { label: 'unsafe seq', metadata: { cid: 'bounded-client', seq: Number.MAX_SAFE_INTEGER + 1 } },
+      { label: 'null seq', metadata: { cid: 'bounded-client', seq: null } },
+      { label: 'string seq', metadata: { cid: 'bounded-client', seq: '1' } },
+      { label: 'cid without seq still invalid', metadata: { cid: 'c'.repeat(129) } },
+      { label: 'seq without cid still invalid', metadata: { seq: -1 } },
+      { label: 'NaN encoding', raw: '{"t":"i","d":"forbidden","cid":"bounded-client","seq":NaN}' },
+      { label: 'infinite seq', raw: '{"t":"i","d":"forbidden","cid":"bounded-client","seq":1e309}' },
+    ])('rejects $label before retaining delivery identity or downgrading to legacy input', async (entry) => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      const deferred = vi.spyOn(session, 'deferInputSeq');
+      Object.assign(session, { ptyProcess: { write: written } });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const key = createDeferred<void>();
+      const held = session.sendNamedKey('\n', () => key.promise);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      const messages: unknown[] = [];
+      ws.on('message', (raw) => messages.push(JSON.parse(String(raw))));
+      const sync = async () => {
+        const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+        ws.ping();
+        await pong;
+      };
+      const frame = entry.raw ?? JSON.stringify({ t: 'i', d: entry.input ?? 'forbidden', ...entry.metadata });
+      try {
+        expect(session.recoveryInputReserved).toBe(true);
+        ws.send(frame);
+        await sync();
+        expect(deferred).not.toHaveBeenCalled();
+        expect(Reflect.get(session, '_appliedInputSeq').size).toBe(0);
+        key.resolve();
+        await held;
+        ws.send(frame);
+        await sync();
+        expect(deferred).not.toHaveBeenCalled();
+        expect(written).not.toHaveBeenCalled();
+        expect(messages).toEqual([]);
+        expect(Reflect.get(session, '_appliedInputSeq').size).toBe(0);
+      } finally {
+        key.resolve();
+        await held;
+        ws.close();
+        await session.stop(false);
+      }
+    });
+
+    it('retains 128-character client IDs and safe sequence boundaries in actual FIFO admission', async () => {
+      const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      const key = createDeferred<void>();
+      const held = session.sendNamedKey('\n', () => key.promise);
+      const cid = 'c'.repeat(128);
+      const ws = await connectWs('/ws/sessions/ws-test-session/terminal');
+      const sync = async () => {
+        const pong = new Promise<void>((resolve) => ws.once('pong', () => resolve()));
+        ws.ping();
+        await pong;
+      };
+      const frame = (seq: number) => JSON.stringify({ t: 'i', d: String(seq), cid, seq });
+      try {
+        ws.send(frame(0));
+        ws.send(frame(Number.MAX_SAFE_INTEGER));
+        await sync();
+        expect(written).not.toHaveBeenCalled();
+        expect(session.hasAppliedInputSeq(cid, 0)).toBe(false);
+        expect(Reflect.get(session, '_appliedInputSeq').get(cid).waiting.size).toBe(2);
+        key.resolve();
+        await held;
+        // A later sparse retry still cannot overtake the retained zero identity.
+        ws.send(frame(Number.MAX_SAFE_INTEGER));
+        await sync();
+        expect(written).not.toHaveBeenCalled();
+        const applied = collectMessages(ws, 2);
+        ws.send(frame(0));
+        ws.send(frame(Number.MAX_SAFE_INTEGER));
+        expect(await applied).toEqual([
+          { t: 'ia', seq: 0 },
+          { t: 'ia', seq: Number.MAX_SAFE_INTEGER },
+        ]);
+        expect(written.mock.calls.map(([data]) => data)).toEqual(['0', String(Number.MAX_SAFE_INTEGER)]);
+        const duplicates = collectMessages(ws, 2);
+        ws.send(frame(0));
+        ws.send(frame(Number.MAX_SAFE_INTEGER));
+        expect(await duplicates).toEqual([
+          { t: 'ia', seq: 0, dup: true, last: Number.MAX_SAFE_INTEGER },
+          { t: 'ia', seq: Number.MAX_SAFE_INTEGER, dup: true, last: Number.MAX_SAFE_INTEGER },
+        ]);
+        expect(written).toHaveBeenCalledTimes(2);
+      } finally {
+        key.resolve();
+        await held;
+        ws.close();
+        await session.stop(false);
+      }
+    });
+
     it('gates a higher frame when the key lock releases between earlier blocked frames and its arrival', async () => {
       const session = new Session({ id: 'ws-test-session', workingDir: '/tmp', mode: 'claude' });
       const written = vi.fn();
