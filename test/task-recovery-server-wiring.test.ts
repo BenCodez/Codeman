@@ -427,6 +427,233 @@ describe('task and recovery server action wiring', () => {
     }
   );
 
+  it.each(
+    (['unknown', 'blocked'] as const).flatMap((outcome) =>
+      (['crashed', 'interrupted'] as const).map((activity) => ({ outcome, activity }))
+    )
+  )(
+    'retains owner $outcome against sibling $activity recovery through settings and reload',
+    async ({ outcome, activity }) => {
+      let now = Date.now();
+      vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+        observation: {
+          activity: 'working',
+          reason: 'turn-running',
+          at: now,
+          conversationId: flight.conversationId,
+          submissionKey: 'owner-veto-submission',
+          safeToAct: false,
+        },
+        commands: new Map(),
+      }));
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockImplementation(async () => ({
+        activity,
+        reason: activity === 'crashed' ? 'process-crashed' : 'turn-interrupted',
+        at: now,
+        conversationId: flight.conversationId,
+        evidenceKey: `owner-${outcome}-${activity}`,
+        safeToAct: true,
+      }));
+      const act = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const id = `owner-progress-veto-${outcome}-${activity}`;
+      const { task, taskDeps, recovery, recoveryDeps } = controllers(id);
+      taskDeps.now = recoveryDeps.now = () => now;
+      await task.update({
+        objective: 'Keep owner uncertainty authoritative',
+        criteria: [{ id: 'review', description: 'Owner acceptance', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      await task.progress({ outcome: 'unfinished', checkpoint: 'Previous work', nextAction: 'Continue' });
+      await recovery.updateConfig({ enabled: true });
+      await task.progress({ outcome, checkpoint: 'Owner needs inspection' });
+      await recovery.refresh();
+      now += 2000;
+      await recovery.refresh();
+      await recovery.retry();
+      expect(recovery.getStatus()).toMatchObject({ attempts: 0, failedAttempts: 0, circuitOpen: false });
+      expect(recovery.getStatus().inFlight).toBeUndefined();
+      expect(act).not.toHaveBeenCalled();
+      expect(task.getStatus()).toMatchObject({
+        outcome,
+        phase: outcome === 'blocked' ? 'blocked' : 'paused',
+        agentProgressVeto: true,
+        continuations: 0,
+      });
+      expect(new TaskStore().get(id).agentProgressVeto).toBe(true);
+      await task.update({ config: { maxContinuations: 1, enabled: false } });
+      await task.update({ config: { enabled: true } });
+      await task.pause();
+      expect(task.getStatus().agentProgressVeto).toBe(true);
+      const session = internals.sessions.get(id)!;
+      await internals.stopRecoveryController(id, false);
+      const restoredTask = internals.getTaskController(session)!;
+      const restoredRecovery = internals.getRecoveryController(session)!;
+      (restoredTask as unknown as TaskControllerInternals).deps.now = () => now;
+      (restoredRecovery as unknown as RecoveryControllerInternals).deps.now = () => now;
+      expect(restoredTask.getStatus().agentProgressVeto).toBe(true);
+      expect(new TaskStore().get(id).agentProgressVeto).toBe(true);
+      await restoredRecovery.retry();
+      expect(restoredRecovery.getStatus().attempts).toBe(0);
+      expect(act).not.toHaveBeenCalled();
+      // Supported owner actions release the veto only after their journal ACK.
+      if (outcome === 'unknown') {
+        restoredTask.noteUserInput();
+        await restoredTask.drain();
+      } else await restoredTask.reset();
+      expect(internals.taskStore.get(id).agentProgressVeto).toBeUndefined();
+      await restoredRecovery.retry();
+      expect(act).toHaveBeenCalledOnce();
+      expect(restoredRecovery.getStatus().attempts).toBe(1);
+    }
+  );
+
+  it.each(['unknown', 'blocked'] as const)(
+    'does not auto-complete an owner %s report from older verified criteria',
+    async (outcome) => {
+      vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({
+        observation: {
+          activity: 'idle',
+          reason: 'observing',
+          at: Date.now(),
+          conversationId: flight.conversationId,
+          processReady: true,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      });
+      const act = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const id = `owner-completed-then-${outcome}`;
+      const { task, recoveryDeps } = controllers(id);
+      await task.update({
+        objective: 'Acceptance does not erase later owner uncertainty',
+        criteria: [{ id: 'review', description: 'Owner acceptance', kind: 'manual' }],
+      });
+      await task.progress({ outcome: 'completed', verifiedCriteria: ['review'] });
+      expect(task.getStatus()).toMatchObject({ outcome: 'completed', phase: 'completed' });
+      await task.progress({ outcome });
+      await task.update({ config: { enabled: true } });
+      expect(task.getStatus()).toMatchObject({ outcome, agentProgressVeto: true });
+      expect(task.getStatus().criteria[0].verified).toBe(true);
+      expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+      expect(act).not.toHaveBeenCalled();
+      // A fresh explicit completion remains supported with the original evidence.
+      await task.progress({ outcome: 'completed' });
+      expect(task.getStatus()).toMatchObject({ outcome: 'completed', phase: 'completed' });
+      expect(task.getStatus().agentProgressVeto).toBeUndefined();
+      expect(await recoveryDeps.act(flight, () => true)).toBe('sent');
+      expect(act).toHaveBeenCalledOnce();
+    }
+  );
+
+  it.each(['unknown', 'blocked'] as const)(
+    'retains live owner %s before and after a failed task journal ACK',
+    async (outcome) => {
+      vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({
+        observation: {
+          activity: 'working',
+          reason: 'turn-running',
+          at: Date.now(),
+          conversationId: flight.conversationId,
+          safeToAct: false,
+        },
+        commands: new Map(),
+      });
+      const act = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+      const id = `owner-progress-failed-ack-${outcome}`;
+      const { task, taskDeps, recoveryDeps } = controllers(id);
+      await task.update({
+        objective: 'A missing ACK does not authorize sibling recovery',
+        criteria: [{ id: 'review', description: 'Owner acceptance', kind: 'manual' }],
+        config: { enabled: true },
+      });
+      const persist = taskDeps.persist;
+      const entered = createDeferred();
+      const release = createDeferred();
+      taskDeps.persist = async () => {
+        entered.resolve();
+        await release.promise;
+        throw new Error('Fixture failed journal ACK');
+      };
+      const reporting = task.progress({ outcome });
+      const settled = reporting.then(
+        () => undefined,
+        (error: unknown) => error
+      );
+      await entered.promise;
+      try {
+        expect(task.getStatus().agentProgressVeto).toBe(true);
+        expect(internals.taskStore.get(id).agentProgressVeto).toBeUndefined();
+        expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+      } finally {
+        release.resolve();
+      }
+      expect(await settled).toBeInstanceOf(Error);
+      taskDeps.persist = persist;
+      expect(task.getStatus()).toMatchObject({
+        phase: 'blocked',
+        reason: 'persistence-failed',
+        agentProgressVeto: true,
+      });
+      expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+      expect(act).not.toHaveBeenCalled();
+      // An acknowledged owner reset repairs this exact live refusal.
+      await task.reset();
+      expect(await recoveryDeps.act(flight, () => true)).toBe('sent');
+      expect(act).toHaveBeenCalledOnce();
+    }
+  );
+
+  it.each([false, true])('keeps owner uncertainty after an existing delivery is accepted=%s', async (accepted) => {
+    let now = Date.now();
+    let observation: RecoveryObservation = {
+      activity: 'idle',
+      reason: 'observing',
+      at: now,
+      conversationId: flight.conversationId,
+      submissionKey: 'before-owner-veto-kickoff',
+      processReady: true,
+      safeToAct: false,
+    };
+    vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockImplementation(async () => ({
+      observation,
+      commands: new Map(),
+    }));
+    const kickoff = vi.spyOn(CodexTaskAdapter.prototype, 'act').mockResolvedValue('unknown');
+    const act = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('sent');
+    const id = `owner-veto-delivery-${accepted}`;
+    const { task, taskDeps, recoveryDeps } = controllers(id);
+    taskDeps.now = () => now;
+    await task.update({
+      objective: 'Unknown progress must outlive reservation cleanup',
+      criteria: [{ id: 'review', description: 'Owner acceptance', kind: 'manual' }],
+    });
+    await task.resume();
+    const pending = task.getStatus().inFlight!;
+    expect(pending.promptHash).toBeDefined();
+    expect(internals.actionReservationStore.get(id).inFlight).toBeDefined();
+    observation = {
+      ...observation,
+      activity: 'working',
+      reason: 'turn-running',
+      at: ++now,
+      ...(accepted ? { submissionKey: 'accepted-owner-veto-kickoff', submissionHash: pending.promptHash } : {}),
+    };
+    await task.progress({ outcome: 'unknown' });
+    expect(task.getStatus()).toMatchObject({ outcome: 'unknown', agentProgressVeto: true, continuations: 0 });
+    expect(kickoff).toHaveBeenCalledOnce();
+    if (accepted) {
+      // The common flight is gone: the progress veto alone must deny recovery.
+      expect(task.getStatus().inFlight).toBeUndefined();
+      expect(internals.actionReservationStore.get(id).inFlight).toBeUndefined();
+    } else {
+      expect(task.getStatus().inFlight?.key).toBe(pending.key);
+      expect(internals.actionReservationStore.get(id).inFlight).toBeDefined();
+    }
+    expect(new TaskStore().get(id).agentProgressVeto).toBe(true);
+    expect(await recoveryDeps.act(flight, () => true)).toBe('not-sent');
+    expect(act).not.toHaveBeenCalled();
+  });
+
   it('checks both live and durable progress vetoes while task journal writes are pending', async () => {
     let now = Date.now();
     let marker: Awaited<ReturnType<TaskDependencies['observe']>>['marker'];
