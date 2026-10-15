@@ -71,7 +71,15 @@ describe('verified local Codex reboot offers', () => {
     Object.assign(state.codexConfig!, patch);
     const read = vi.spyOn(fs, 'opendir');
     expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
-    expect((await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true)).restore).toEqual([]);
+    expect(
+      (
+        await planVerifiedRebootRestore([state.id], { [state.id]: state }, async () => ({
+          status: 'present' as const,
+          dev: 1,
+          ino: 1,
+        }))
+      ).restore
+    ).toEqual([]);
     expect(read).not.toHaveBeenCalled();
   });
 
@@ -89,7 +97,15 @@ describe('verified local Codex reboot offers', () => {
       JSON.stringify({ timestamp: new Date(Date.now() - 1000).toISOString(), type: 'event_msg', payload }) + '\n'
     );
     expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
-    expect((await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true)).restore).toEqual([]);
+    expect(
+      (
+        await planVerifiedRebootRestore([state.id], { [state.id]: state }, async () => ({
+          status: 'present' as const,
+          dev: 1,
+          ino: 1,
+        }))
+      ).restore
+    ).toEqual([]);
   });
 
   it('refuses a truncated rollout which can hide earlier live children', async () => {
@@ -162,7 +178,11 @@ describe('verified local Codex reboot offers', () => {
         Object.assign(state, { __envOverrides: { CODEX_HOME: '' } });
         vi.stubEnv('CODEX_HOME', join(homedir(), 'different-current-profile'));
         expect(await verifyCodexRebootIdentity(state)).toBe(UUID);
-        const plan = await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true);
+        const plan = await planVerifiedRebootRestore([state.id], { [state.id]: state }, async () => ({
+          status: 'present' as const,
+          dev: 1,
+          ino: 1,
+        }));
         expect(plan.skipped).toEqual([]);
         expect(plan.restore[0]).toMatchObject({ sessionId: state.id, resumeConversationId: UUID });
         expect((state as SessionState & { __codexRecoveryHome: string }).__codexRecoveryHome).toBe(home);
@@ -189,7 +209,15 @@ describe('verified local Codex reboot offers', () => {
       Object.assign(state, { __envOverrides: { CODEX_HOME: overrides } });
       if (kind === 'missing-pin') delete (state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome;
       expect(await verifyCodexRebootIdentity(state)).toBeUndefined();
-      expect((await planVerifiedRebootRestore([state.id], { [state.id]: state }, () => true)).restore).toEqual([]);
+      expect(
+        (
+          await planVerifiedRebootRestore([state.id], { [state.id]: state }, async () => ({
+            status: 'present' as const,
+            dev: 1,
+            ino: 1,
+          }))
+        ).restore
+      ).toEqual([]);
     }
   );
 
@@ -209,7 +237,11 @@ describe('verified local Codex reboot offers', () => {
   });
   it('keeps the exact conversation, original managed id and full launch state', async () => {
     const state = fixture();
-    const plan = await planVerifiedRebootRestore(['original'], { original: state }, () => true);
+    const plan = await planVerifiedRebootRestore(['original'], { original: state }, async () => ({
+      status: 'present' as const,
+      dev: 1,
+      ino: 1,
+    }));
     expect(plan.skipped).toEqual([]);
     expect(plan.restore[0].resumeConversationId).toBe(UUID);
     expect(plan.restore[0].sessionId).toBe('original');
@@ -234,7 +266,15 @@ describe('verified local Codex reboot offers', () => {
       fixture({ paneExit: { status: 0, at: 1 } }),
       fixture({ remote: { host: 'remote' } as SessionState['remote'] }),
     ]) {
-      expect((await planVerifiedRebootRestore(['original'], { original: state }, () => true)).restore).toEqual([]);
+      expect(
+        (
+          await planVerifiedRebootRestore(['original'], { original: state }, async () => ({
+            status: 'present' as const,
+            dev: 1,
+            ino: 1,
+          }))
+        ).restore
+      ).toEqual([]);
     }
   });
   it('rejects an unresolved slash switch even when the previous UUID still verifies', async () => {
@@ -281,7 +321,11 @@ describe('verified local Codex reboot offers', () => {
 
     expect(state.recovery?.config.enabled).toBe(false);
     expect(state.codexConfig?.resumeSessionId).toBeUndefined();
-    const plan = await planVerifiedRebootRestore(['original'], { original: state }, () => true);
+    const plan = await planVerifiedRebootRestore(['original'], { original: state }, async () => ({
+      status: 'present' as const,
+      dev: 1,
+      ino: 1,
+    }));
     expect(plan.skipped).toEqual([]);
     expect(plan.restore[0].resumeConversationId).toBe(UUID);
   });
@@ -360,7 +404,11 @@ describe('verified local Codex reboot offers', () => {
       writeFileSync(join(home, 'history.jsonl'), history.join('\n') + '\n');
       const scan = vi.spyOn(fs, 'opendir');
 
-      const plan = await planVerifiedRebootRestore(dead, persisted, () => true);
+      const plan = await planVerifiedRebootRestore(dead, persisted, async () => ({
+        status: 'present' as const,
+        dev: 1,
+        ino: 1,
+      }));
 
       expect(plan.restore.map((entry) => entry.sessionId)).toEqual(authority === 'seed' ? dead : ['fresh-23']);
       expect(plan.skipped).toEqual(
@@ -374,7 +422,13 @@ describe('verified local Codex reboot offers', () => {
 describe('durable reboot offer', () => {
   it('survives restart, includes a parked flight and durably respects owner-scoped dismissal', async () => {
     const state = fixture({ owner: 'alice' });
-    const entry = (await planVerifiedRebootRestore(['original'], { original: state }, () => true)).restore[0];
+    const entry = (
+      await planVerifiedRebootRestore(['original'], { original: state }, async () => ({
+        status: 'present' as const,
+        dev: 1,
+        ino: 1,
+      }))
+    ).restore[0];
     const path = join(homedir(), 'offers.json');
     const first = new RebootRestoreRegistry();
     await first.configurePersistence(path);
@@ -397,7 +451,13 @@ describe('durable reboot offer', () => {
     vi.useFakeTimers();
     const state = fixture();
     vi.useRealTimers();
-    const entry = (await planVerifiedRebootRestore(['original'], { original: state }, () => true)).restore[0];
+    const entry = (
+      await planVerifiedRebootRestore(['original'], { original: state }, async () => ({
+        status: 'present' as const,
+        dev: 1,
+        ino: 1,
+      }))
+    ).restore[0];
     const path = join(homedir(), 'expired-offers.json');
     const first = new RebootRestoreRegistry();
     await first.configurePersistence(path);
@@ -411,7 +471,13 @@ describe('durable reboot offer', () => {
   });
   it('keeps durable and parked offers intact when dismissal storage fails', async () => {
     const state = fixture({ owner: 'alice' });
-    const entry = (await planVerifiedRebootRestore(['original'], { original: state }, () => true)).restore[0];
+    const entry = (
+      await planVerifiedRebootRestore(['original'], { original: state }, async () => ({
+        status: 'present' as const,
+        dev: 1,
+        ino: 1,
+      }))
+    ).restore[0];
     const path = join(homedir(), 'failed-dismiss-offers.json');
     let failWrites = false;
     const registry = new RebootRestoreRegistry((target, text) => {
