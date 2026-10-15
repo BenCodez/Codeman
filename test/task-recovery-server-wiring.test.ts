@@ -7,7 +7,11 @@ import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { WebServer } from '../src/web/server.js';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
-import { TaskController, type TaskDependencies } from '../src/supervision/controller.js';
+import {
+  TaskConfigurationCancelledError,
+  TaskController,
+  type TaskDependencies,
+} from '../src/supervision/controller.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 import { RecoveryController, type RecoveryDependencies } from '../src/recovery/controller.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
@@ -140,6 +144,63 @@ describe('task and recovery server action wiring', () => {
         observe.mockRestore();
         restore.mockRestore();
         act.mockRestore();
+      }
+    }
+  );
+
+  it.each([false, true])(
+    'forwards delegated configuration authority to the real journal (current=%s)',
+    async (currentAtCommit) => {
+      const id = `task-configuration-authority-${currentAtCommit}`;
+      const { task } = controllers(id);
+      await task.update({
+        objective: 'Owner objective',
+        criteria: [{ id: 'owner', description: 'Owner review', kind: 'manual' }],
+      });
+      const original = task.getStatus();
+      const entered = createDeferred<void>();
+      const release = createDeferred<void>();
+      const save = internals.taskStore.save.bind(internals.taskStore);
+      const saving = vi
+        .spyOn(internals.taskStore, 'save')
+        .mockImplementationOnce(async (sessionId, state, authority) => {
+          entered.resolve();
+          await release.promise;
+          return save(sessionId, state, authority);
+        });
+      let current = true;
+      try {
+        const updating = task.update(
+          {
+            objective: 'Delegated objective',
+            criteria: [{ id: 'delegated', description: 'Delegated review', kind: 'manual' }],
+          },
+          () => current
+        );
+        // Attach the rejection observer before releasing the real asynchronous write.
+        const settled = updating.then(
+          (value) => ({ value }),
+          (error) => ({ error })
+        );
+        await entered.promise;
+        expect(task.getStatus()).toEqual(original);
+        current = currentAtCommit;
+        release.resolve();
+        const result = await settled;
+        expect(saving.mock.calls[0]?.[2]?.isCurrent).toBeTypeOf('function');
+        if (currentAtCommit) {
+          expect(result).toHaveProperty('value.objective', 'Delegated objective');
+          expect(task.getStatus().objective).toBe('Delegated objective');
+          expect(new TaskStore().get(id).objective).toBe('Delegated objective');
+        } else {
+          expect(result).toHaveProperty('error');
+          expect('error' in result && result.error).toBeInstanceOf(TaskConfigurationCancelledError);
+          expect(task.getStatus()).toEqual(original);
+          expect(new TaskStore().get(id)).toEqual(original);
+        }
+      } finally {
+        release.resolve();
+        saving.mockRestore();
       }
     }
   );
@@ -614,6 +675,130 @@ describe('task and recovery server action wiring', () => {
       }
     }
   );
+
+  it.each(['task-veto', 'worker-failure', 'worker-failure-late-veto', 'cleanup-unknown'] as const)(
+    'retains the certified final veto across asynchronous common cleanup: %s',
+    async (result) => {
+      const id = `final-task-veto-cleanup-${result}`;
+      const workerFailure = result === 'worker-failure' || result === 'worker-failure-late-veto';
+      const now = Date.now();
+      vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockResolvedValue({
+        activity: 'crashed',
+        reason: 'process-crashed',
+        at: now,
+        conversationId: flight.conversationId,
+        evidenceKey: id,
+        safeToAct: true,
+      });
+      const worker = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockResolvedValue('not-sent');
+      const { task, recovery, recoveryDeps } = controllers(id);
+      recoveryDeps.now = () => now;
+      await task.update({
+        objective: 'Preserve task ownership at the final action boundary',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+        config: { enabled: false },
+      });
+      await recovery.updateConfig({ maxRetries: 1 });
+      const reservationEntered = createDeferred();
+      const reservationRelease = createDeferred();
+      const cleanupEntered = createDeferred();
+      const cleanupRelease = createDeferred();
+      const save = internals.actionReservationStore.save.bind(internals.actionReservationStore);
+      const saving = vi.spyOn(internals.actionReservationStore, 'save').mockImplementation(async (key, state) => {
+        if (key === id) {
+          if (state.inFlight) {
+            reservationEntered.resolve();
+            await reservationRelease.promise;
+          } else {
+            cleanupEntered.resolve();
+            await cleanupRelease.promise;
+            if (result === 'cleanup-unknown') throw new Error('Fixture common cleanup uncertain');
+          }
+        }
+        await save(key, state);
+      });
+      const retrying = recovery.retry();
+      try {
+        await reservationEntered.promise;
+        if (!workerFailure) {
+          await task.update({ config: { enabled: true } });
+          expect(task.getStatus().phase).toBe('watching');
+        }
+        reservationRelease.resolve();
+        await cleanupEntered.promise;
+        // The task veto is no longer present by the time the adapter result
+        // traverses the common arbiter's asynchronous durable cleanup.
+        if (workerFailure) await task.update({ config: { enabled: true } });
+        if (result !== 'worker-failure-late-veto') await task.pause();
+        expect(task.getStatus().phase).toBe(result === 'worker-failure-late-veto' ? 'watching' : 'paused');
+        cleanupRelease.resolve();
+        await retrying;
+        expect(worker).toHaveBeenCalledTimes(workerFailure ? 1 : 0);
+        if (result === 'task-veto') {
+          expect(recovery.getStatus()).toMatchObject({ attempts: 0, failedAttempts: 0, circuitOpen: false });
+          expect(recovery.getStatus().inFlight).toBeUndefined();
+          expect(recovery.getStatus().windowStartedAt).toBeUndefined();
+          expect(internals.actionReservationStore.get(id).inFlight).toBeUndefined();
+          // The sole retry remains available once the supervising task releases ownership.
+          worker.mockResolvedValueOnce('sent');
+          await recovery.retry();
+          expect(worker).toHaveBeenCalledOnce();
+          expect(recovery.getStatus().attempts).toBe(1);
+        } else {
+          expect(recovery.getStatus()).toMatchObject({ attempts: 1, failedAttempts: 1 });
+          if (workerFailure) {
+            expect(recovery.getStatus()).toMatchObject({ lastReason: 'delivery-failed', circuitOpen: true });
+            expect(recovery.getStatus().inFlight).toBeUndefined();
+          } else {
+            expect(recovery.getStatus()).toMatchObject({ lastReason: 'acceptance-unverified' });
+            expect(recovery.getStatus().inFlight).toBeDefined();
+            expect(internals.actionReservationStore.get(id).inFlight).toBeDefined();
+          }
+        }
+      } finally {
+        reservationRelease.resolve();
+        cleanupRelease.resolve();
+        await retrying;
+        saving.mockRestore();
+      }
+    }
+  );
+
+  it('retains an unknown partial delivery even when the task veto was observed and then withdrawn', async () => {
+    const id = 'partial-task-veto-recovery';
+    vi.spyOn(CodexRecoveryAdapter.prototype, 'observe').mockResolvedValue({
+      activity: 'crashed',
+      reason: 'process-crashed',
+      at: Date.now(),
+      conversationId: flight.conversationId,
+      evidenceKey: id,
+      safeToAct: true,
+    });
+    const { task, recovery } = controllers(id);
+    await task.update({
+      objective: 'Do not replay partial input',
+      criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+      config: { enabled: false },
+    });
+    await recovery.updateConfig({ maxRetries: 1 });
+    const authorityChecks: boolean[] = [];
+    const worker = vi.spyOn(CodexRecoveryAdapter.prototype, 'act').mockImplementation(async (_flight, isCurrent) => {
+      // Model bytes already delivered before a later owner/task change.
+      await task.update({ config: { enabled: true } });
+      authorityChecks.push(isCurrent());
+      await task.pause();
+      authorityChecks.push(isCurrent());
+      return 'unknown';
+    });
+    await recovery.retry();
+    expect(worker).toHaveBeenCalledOnce();
+    expect(authorityChecks).toEqual([false, false]);
+    expect(recovery.getStatus()).toMatchObject({ attempts: 1, failedAttempts: 1, lastReason: 'acceptance-unverified' });
+    expect(recovery.getStatus().inFlight).toBeDefined();
+    expect(internals.actionReservationStore.get(id).inFlight).toBeDefined();
+    await recovery.retry();
+    expect(worker).toHaveBeenCalledOnce();
+  });
 
   it('settles an accepted kickoff when the owner completes the task before the acceptance poll', async () => {
     const observe = vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({

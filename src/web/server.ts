@@ -60,6 +60,10 @@ import type { ClaudeMode, SessionAttachmentHistoryItem, SessionState, WorkflowRu
 import { RespawnController, RespawnConfig } from '../respawn-controller.js';
 import type { TerminalMultiplexer } from '../mux-interface.js';
 import { createMultiplexer } from '../mux-factory.js';
+import {
+  captureBrokerCleanupReferences,
+  type BrokerCleanupReferenceSnapshot,
+} from '../recovery/codex-broker-cleanup.js';
 import { getStore } from '../state-store.js';
 import { TabLayoutService } from '../tab-layout-service.js';
 import { ownerLayoutKey } from '../tab-layout-persistence.js';
@@ -2492,7 +2496,7 @@ export class WebServer extends EventEmitter {
             if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
             return adapter.act(key, conversationId, prompt, isCurrent);
           }),
-        persist: (state) => this.taskStore.save(session.id, state),
+        persist: (state, authority) => this.taskStore.save(session.id, state, authority),
         changed: (state) => {
           if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;
           this.broadcast(SseEvent.SessionTask, { sessionId: session.id, state });
@@ -2548,7 +2552,7 @@ export class WebServer extends EventEmitter {
         act: (flight, isCurrent) =>
           this.getActionArbiter(session.id).run('recovery', flight.key, () => {
             // Retain the final veto for a task that acquires authority after observation.
-            if (taskBlocksRecovery()) return Promise.resolve('not-sent');
+            if (!isCurrent() || taskBlocksRecovery()) return Promise.resolve('not-sent');
             return adapter.act(flight, isCurrent);
           }),
         restoreMissingRemote: (isCurrent) =>
@@ -3223,6 +3227,28 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  /** Complete private references only; never installed before startup reconciliation. */
+  private captureInputBrokerCleanupReferences(): BrokerCleanupReferenceSnapshot | undefined {
+    return captureBrokerCleanupReferences(() => {
+      const recovery = this.recoveryStore.getCleanupSnapshot();
+      const reboot = rebootRestoreRegistry.getBrokerCleanupState();
+      const task = this.taskStore.getBrokerCleanupState();
+      const actions = this.actionReservationStore.getBrokerCleanupState();
+      if (!recovery || !reboot || !task || !actions) throw new Error('Recovery references are unavailable');
+      return {
+        persisted: this.store.getState(),
+        mux: this.mux.getSessions(),
+        live: Array.from(this.sessions.values(), (session) => session.getRecoveryContext()),
+        recovery,
+        reboot,
+        task,
+        actions,
+        taskControllers: Array.from(this.taskControllers.values(), (controller) => controller.getStatus()),
+        recoveryControllers: Array.from(this.recoveryControllers.values(), (controller) => controller.getStatus()),
+      };
+    });
+  }
+
   async start(): Promise<void> {
     // Multi-user first boot: create the initial admin from CODEMAN_USERNAME/PASSWORD
     // if there are no users yet, else refuse to start (there would be no way in).
@@ -3261,6 +3287,9 @@ export class WebServer extends EventEmitter {
     if (!this.testMode) {
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
+      // Include every private board record and live scope; unknown/in-flight
+      // evidence disables retirement. The janitor also rechecks durable metadata.
+      this.mux.setBrokerCleanupReferenceProvider?.(() => this.captureInputBrokerCleanupReferences());
 
       // Instance-scoped reaper: after restore, `docker rm -f` managed containers of
       // THIS instance whose case is gone from docker-cases.json (best-effort, never

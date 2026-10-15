@@ -582,11 +582,19 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const isCurrent: RecoveryActionAuthority = () =>
-      !this.stopped &&
-      revision === this.revision &&
-      !this.recoveryWindowExpired() &&
-      (this.deps.hasActionAuthority ? this.deps.hasActionAuthority() === true : true);
+    // Authority belongs to this attempt. Once withdrawn, a later task pause
+    // cannot revive it while the common reservation's cleanup is awaited.
+    let authorityWithdrawn = false;
+    const isCurrent: RecoveryActionAuthority = () => {
+      if (
+        this.stopped ||
+        revision !== this.revision ||
+        this.recoveryWindowExpired() ||
+        (this.deps.hasActionAuthority && this.deps.hasActionAuthority() !== true)
+      )
+        authorityWithdrawn = true;
+      return !authorityWithdrawn;
+    };
     isCurrent.getActionDeadline = () => (this.state.windowStartedAt ?? NaN) + this.state.config.maxRecoveryDurationMs;
     let outcome: 'sent' | 'not-sent' | 'unknown';
     try {
@@ -594,7 +602,12 @@ export class RecoveryController {
     } catch {
       outcome = 'unknown';
     }
-    if (outcome === 'not-sent' && !isCurrent()) {
+    // Do not newly sample task ownership after the adapter returns: a task
+    // acquiring authority during cleanup did not cause a real worker failure.
+    if (
+      outcome === 'not-sent' &&
+      (authorityWithdrawn || this.stopped || revision !== this.revision || this.recoveryWindowExpired())
+    ) {
       // The adapter certified that no bytes were sent. Release the durable reservation
       // without consuming a retry or labelling an explicit disable/shutdown as a failure.
       this.state.inFlight = undefined;

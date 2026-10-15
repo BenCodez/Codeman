@@ -74,7 +74,8 @@ sys.exit(int(open(root+'/exit-status').read()) if os.path.exists(root+'/exit-sta
     join(root, 'private', SID),
     SID,
     `exec /usr/bin/python3 -u ${quote(child)} ${quote(root)}`,
-    home
+    home,
+    root
   );
   await fs.writeFile(
     join(bin, 'codex'),
