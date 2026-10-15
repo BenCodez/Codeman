@@ -1871,7 +1871,7 @@ export function registerSessionRoutes(
     let backgroundOwnsQueue = false;
     const acquired = new Promise<void>((resolve) => {
       try {
-        void queueInputDispatch(session, inputStr.length, async () => {
+        void queueInputDispatch(session, Buffer.byteLength(inputStr, 'utf8'), async () => {
           const released = new Promise<void>((unlock) => {
             unlockInput = unlock;
           });
