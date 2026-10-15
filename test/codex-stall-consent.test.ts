@@ -312,3 +312,30 @@ it.each(['true', 1, null])('never repairs malformed restart consent into authori
   expect(await readFile(f.path, 'utf8')).toBe(bytes);
   expect(f.effects).not.toHaveBeenCalled();
 });
+
+it.each(
+  [false, true].flatMap((remote) =>
+    (['recoverCrashes', 'recoverInterrupted'] as const).map((setting) => ({ remote, setting }))
+  )
+)(
+  'requires fresh stall probes after $setting changes without resetting quiet time (SSH=$remote)',
+  async ({ remote, setting }) => {
+    const f = await fixture(remote, true, false);
+    await f.controller.retry();
+    const before = f.controller.getStatus();
+    const consent = before.config[setting];
+    await f.controller.updateConfig({ [setting]: !consent });
+    await f.controller.updateConfig({ [setting]: consent });
+    expect(f.controller.getStatus().armedAt).toBe(before.armedAt);
+    vi.setSystemTime(NOW + 2000);
+    await f.controller.retry();
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 3999);
+    await f.controller.retry();
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 4000);
+    await f.controller.retry();
+    expect(f.effects).toHaveBeenCalledOnce();
+    expect(f.effects.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
+  }
+);

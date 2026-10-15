@@ -233,7 +233,10 @@ function harness(
   const wake = vi.fn(async () => true);
   const waitUntilReady = vi.fn(async () => true);
   const reattachRemote = vi.fn(async () => true);
-  const writeViaMux = vi.fn(async () => !opts.writesFail);
+  const writeViaMux = vi.fn(async () => {
+    if (opts.writesFail) throw new Error('Uncertain mux delivery');
+    return true;
+  });
   const noteReconnected = vi.fn();
   const events: string[] = [];
   const payloads: Array<{ event: string; payload: Record<string, unknown> }> = [];
@@ -343,7 +346,7 @@ describe('RemoteWakeRegistry', () => {
     expect(h.events).toContain('remote:hostWakeFailed');
   });
 
-  it('retries the wake on the next input after a failed wake (probe state reset)', async () => {
+  it('retries the wake on the next input after a failed wake while preserving the accepted FIFO', async () => {
     const h = harness();
     h.probe.mockResolvedValue(false);
     h.waitUntilReady.mockResolvedValueOnce(false);
@@ -352,10 +355,12 @@ describe('RemoteWakeRegistry', () => {
     await h.registry.wake(h.session);
     expect(h.wake).toHaveBeenCalledTimes(1);
 
-    // Next keystroke must probe again (not trust the stale "down" verdict) and retry.
+    // The next keystroke must retry the wake without overtaking the retained FIFO.
     await h.registry.handleInput(h.session, 'b');
     await h.registry.wake(h.session);
-    expect(h.probe).toHaveBeenCalledTimes(2);
+    // The retained FIFO drives another wake directly; a TCP-only probe may
+    // never grant delivery ahead of its accepted input.
+    expect(h.probe).toHaveBeenCalledTimes(1);
     expect(h.wake).toHaveBeenCalledTimes(2);
     expect(h.writeViaMux.mock.calls.map((c) => c[0])).toEqual(['a', 'b']);
   });
@@ -405,17 +410,18 @@ describe('RemoteWakeRegistry', () => {
 
     expect(h.writeViaMux).toHaveBeenCalledTimes(1);
     expect(h.registry.pendingBytes('sess-1')).toBe(0);
-    // And the recovered host takes the deliver path from here, with nothing behind it.
+    // The uncertain chunk stays sealed; a later healthy wake only sends new input.
+    h.writeViaMux.mockResolvedValue(true);
     h.probe.mockClear();
-    await expect(h.registry.handleInput(h.session, 'g')).resolves.toBe('deliver');
+    await expect(h.registry.handleInput(h.session, 'g')).resolves.toBe('buffered');
+    await h.registry.wake(h.session);
+    expect(h.writeViaMux.mock.calls.map(([data]) => data)).toEqual(['abc', 'g']);
     expect(h.registry.pendingBytes('sess-1')).toBe(0);
   });
 
-  it('flushes the chunk it is writing out of the buffer first, so a concurrent enqueue cannot drop a different one', async () => {
-    // Input arriving DURING the flush is enqueued (`waking` is still set), and the cap
-    // then drops the OLDEST chunk — the one already on its way to the pane. Shifting the
-    // buffer after the write removed the NEXT chunk instead, so the drop-oldest
-    // bookkeeping lost a chunk that was never written.
+  it('reserves in-flight buffer capacity so a concurrent enqueue cannot displace accepted input', async () => {
+    // Keep the in-flight chunk reserved until its delivery is known. A new
+    // overflow is refused so it cannot displace an accepted FIFO position.
     const h = harness();
     h.probe.mockResolvedValue(false);
     let release: (() => void) | undefined;
@@ -429,17 +435,16 @@ describe('RemoteWakeRegistry', () => {
     const big = 'a'.repeat(REMOTE_WAKE_PENDING_MAX_BYTES - 10);
     await h.registry.handleInput(h.session, big);
     await h.registry.handleInput(h.session, 'bbbbbbbbbb'); // fills the cap exactly
-    // The third chunk arrives while the FIRST write is in flight, which is what pushes
-    // the buffer over the cap mid-flush.
+    // The third chunk arrives before the first delivery ACK and exceeds the cap.
     h.writeViaMux.mockImplementationOnce(async () => {
-      await h.registry.handleInput(h.session, 'c');
+      expect(await h.registry.handleInput(h.session, 'c')).toBe('dropped');
       return true;
     });
 
     release?.();
     await h.registry.wake(h.session);
 
-    expect(h.writeViaMux.mock.calls.map((c) => c[0])).toEqual([big, 'bbbbbbbbbb', 'c']);
+    expect(h.writeViaMux.mock.calls.map((c) => c[0])).toEqual([big, 'bbbbbbbbbb']);
     expect(h.registry.pendingBytes('sess-1')).toBe(0);
   });
 

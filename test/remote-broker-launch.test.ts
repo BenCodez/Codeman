@@ -14,7 +14,7 @@ import type { SessionRemote } from '../src/types.js';
 const SID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const SHIM = '#!/bin/sh\nfor arg; do last="$arg"; done\nexec /bin/sh -c "$last"\n';
 const NATIVE = String.raw`#!/usr/bin/python3
-import hashlib,json,os,re,shlex,subprocess,sys
+import hashlib,json,os,re,shlex,subprocess,sys,time
 a=sys.argv[1:];assert a[:2]==['-L','codeman-remote']
 root=os.environ['FAKE_ROOT'];file=os.path.join(root,'native.json')
 with open(file) as f:s=json.load(f)
@@ -45,9 +45,29 @@ if a[2]=='if-shell':
  s['pane_pid']=str(child.pid);s['pane_dead']='0';s['pane_dead_status']='';s['pane_dead_signal']=''
  with open(file,'w') as f:json.dump(s,f)
  os.close(fifo);os.close(log)
+ if os.environ.get('STARTUP_BARRIER')=='1':
+  deadline=time.monotonic()+1
+  while True:
+   try:
+    with open(os.path.join(cmd[9],'state.json')) as f:started=json.load(f)
+    if started['startup']['status']=='started' and started['pid']==child.pid and started['childPid']>0:
+     with open(os.path.join(root,'startup-barrier'),'w') as f:f.write(started['incarnation'])
+     break
+   except (FileNotFoundError,KeyError,json.JSONDecodeError):pass
+   if time.monotonic()>=deadline:raise AssertionError('Fixture startup publication was not acknowledged')
+   time.sleep(.005)
 elif a[2]=='list-panes':
  assert a[3:]==['-t','codeman-ssh-aaaaaaaa','-F','#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}']
  if os.environ.get('OPPONENT')=='after-launch':s['pane_pid']='1234'
+ if os.environ.get('OPPONENT')=='journal-replacement':
+  with open(os.path.join(root,'startup-barrier')) as f:inc=f.read()
+  journal=os.path.join(root,'remote-private','aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',inc,'state.json')
+  before=os.stat(journal).st_ino
+  with open(journal,'rb') as f:original=f.read()
+  with open(journal+'.fixture','xb') as f:f.write(original)
+  os.chmod(journal+'.fixture',0o600)
+  os.replace(journal+'.fixture',journal)
+  with open(os.path.join(root,'journal-replaced'),'w') as f:json.dump({'before':before,'after':os.stat(journal).st_ino,'hash':hashlib.sha256(original).hexdigest()},f)
  print('|'.join(s[k] for k in ['session_name','pane_id','pane_pid','pane_dead','pane_dead_status','pane_dead_signal']))
 else:raise AssertionError('Forbidden real-effect native command '+repr(a))
 `;
@@ -195,15 +215,34 @@ afterEach(async () => {
   await fs.writeFile(join(root, 'stop'), 'stop');
   const exists = await fs.readFile(join(directory, 'state.json'), 'utf8').catch(() => undefined);
   if (exists) {
-    await eventually(async () => {
-      const state = JSON.parse(await fs.readFile(join(directory, 'state.json'), 'utf8'));
-      return state.closed === true || state.startup.status === 'not-sent';
-    });
+    if (await fs.stat(join(root, 'journal-replaced')).catch(() => undefined)) {
+      // The forced replacement correctly prevents this disposable broker from
+      // overwriting its journal. Wait for that exact owned process to exit.
+      const owned = JSON.parse(exists);
+      await eventually(async () => {
+        const raw = await fs.readFile(`/proc/${owned.pid}/stat`, 'utf8').catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined;
+          throw error;
+        });
+        if (raw === undefined) return true;
+        const fields = raw
+          .slice(raw.lastIndexOf(')') + 2)
+          .trim()
+          .split(/\s+/);
+        return fields[19] !== owned.brokerStart || ['Z', 'X', 'x'].includes(fields[0]);
+      });
+    } else {
+      await eventually(async () => {
+        const state = JSON.parse(await fs.readFile(join(directory, 'state.json'), 'utf8'));
+        return state.closed === true || state.startup.status === 'not-sent';
+      });
+    }
   }
   await fs.rm(root, { recursive: true, force: true });
 });
 
 it('launches only the exact inert pane and seeds signed Unicode owner input without local PID adoption', async () => {
+  environment.STARTUP_BARRIER = '1';
   const observed = await launch();
   expect(observed.status, await fs.readFile(join(root, 'broker.log'), 'utf8').catch(() => 'no fake broker log')).toBe(
     'observed'
@@ -215,6 +254,18 @@ it('launches only the exact inert pane and seeds signed Unicode owner input with
   const input = 'Pasted 😀\nsecond line\r';
   const frame = signer.frame('owner-mux', input)!;
   await fs.writeFile(join(root, 'input.fifo'), frame.data);
+  await eventually(async () => {
+    const state = JSON.parse(await fs.readFile(join(directory, 'state.json'), 'utf8'));
+    return state.receipts.some(
+      (item: typeof frame.receipt) =>
+        item.channel === frame.receipt.channel &&
+        item.counter === frame.receipt.counter &&
+        item.nonce === frame.receipt.nonce &&
+        item.hash === frame.receipt.hash &&
+        item.conversationId === frame.receipt.conversationId &&
+        item.status === 'sent'
+    );
+  });
   const receipt = await observeOwnedRemoteBroker(
     remote,
     { sessionId: SID, descriptor, receipt: frame.receipt },
@@ -272,6 +323,7 @@ it.each(['config', 'helper', 'private-mode', 'symlink', 'startup-issuer', 'start
   }
 );
 it('keeps lost post-launch responses uncertain and does not automatically replay', async () => {
+  environment.STARTUP_BARRIER = '1';
   const runner = transport();
   const result = await observeOwnedRemoteBroker(
     remote,
@@ -293,6 +345,7 @@ it('keeps lost post-launch responses uncertain and does not automatically replay
   ).toHaveLength(1);
 });
 it('never treats a live replacement as the new controlled broker', async () => {
+  environment.STARTUP_BARRIER = '1';
   environment.OPPONENT = 'after-launch';
   expect(await launch()).toEqual({ status: 'unknown' });
 });
@@ -302,6 +355,7 @@ it('pins startup config bytes across the last native queue and Python child fork
   expect(await fs.stat(join(root, 'wrong-command')).catch(() => undefined)).toBeUndefined();
 });
 it('retains the same signer and owner counters across passive attachment observations', async () => {
+  environment.STARTUP_BARRIER = '1';
   const first = await launch();
   expect(first.status).toBe('observed');
   if (first.status !== 'observed') return;
@@ -318,6 +372,27 @@ it('retains the same signer and owner counters across passive attachment observa
   ).toBeUndefined();
   expect(cache.signer(scope(), descriptor.incarnation)).toBe(signer);
   expect(signer.frame('owner-key', '\t')?.receipt.counter).toBe(2);
+});
+it('keeps a forced same-byte journal replacement during observation uncertain without replay', async () => {
+  environment.STARTUP_BARRIER = '1';
+  environment.OPPONENT = 'journal-replacement';
+  expect(await launch()).toEqual({ status: 'unknown' });
+  expect(await fs.readFile(join(root, 'startup-barrier'), 'utf8')).toBe(descriptor.incarnation);
+  const replacement = JSON.parse(await fs.readFile(join(root, 'journal-replaced'), 'utf8'));
+  const serialized = await fs.readFile(join(directory, 'state.json'), 'utf8');
+  expect(replacement.before).not.toBe(replacement.after);
+  expect(replacement.hash).toBe(hash(serialized));
+  expect(JSON.parse(serialized)).toMatchObject({
+    sessionId: SID,
+    incarnation: descriptor.incarnation,
+    startup: { status: 'started' },
+    closed: false,
+  });
+  expect(await fs.readFile(join(root, 'bytes')).catch(() => Buffer.alloc(0))).toHaveLength(0);
+  expect(calls).toHaveLength(1);
+  expect(
+    (await fs.readFile(join(root, 'native.log'), 'utf8')).split('\n').filter((line) => line.includes('if-shell'))
+  ).toHaveLength(1);
 });
 it('checks cancellation after awaited preparation before opening the SSH transport', async () => {
   let current = true;

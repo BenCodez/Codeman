@@ -292,7 +292,18 @@ it.each(['read', 'close'] as const)(
     const original = fs.open.bind(fs);
     const releases: Array<() => void> = [];
     let held = 0,
-      closed = 0;
+      closed = 0,
+      bothHeld!: () => void,
+      bothClosed!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      bothHeld = resolve;
+    });
+    const didClose = new Promise<void>((resolve) => {
+      bothClosed = resolve;
+    });
+    const noteHeld = () => {
+      if (++held === 2) bothHeld();
+    };
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
       const handle = await original(...args);
@@ -306,18 +317,18 @@ it.each(['read', 'close'] as const)(
         stat: handle.stat.bind(handle),
         read: async (...input: Parameters<typeof handle.read>) => {
           if (hold === 'read') {
-            held++;
+            noteHeld();
             await barrier;
           }
           return handle.read(...input);
         },
         close: async () => {
           if (hold === 'close') {
-            held++;
+            noteHeld();
             await barrier;
           }
           await handle.close();
-          closed++;
+          if (++closed === 2) bothClosed();
         },
       } as unknown as typeof handle;
     });
@@ -325,7 +336,8 @@ it.each(['read', 'close'] as const)(
       .slice(0, 2)
       .map((f) => new OwnedRemoteBrokerCache(join(root, 'cache')).load(f.scope, f.material.config.incarnation));
     try {
-      for (let turn = 0; turn < 1000 && held !== 2; turn++) await new Promise<void>((resolve) => setImmediate(resolve));
+      // Filesystem progress has no relationship to the number of event-loop turns.
+      await reached;
       expect(held).toBe(2);
       await vi.advanceTimersByTimeAsync(2001);
       expect(await Promise.all(loads)).toEqual([undefined, undefined]);
@@ -337,8 +349,7 @@ it.each(['read', 'close'] as const)(
       expect(vi.mocked(fs.open).mock.calls).toHaveLength(openCount);
       expect(closed).toBe(0);
       releases.forEach((release) => release());
-      for (let turn = 0; turn < 1000 && closed !== 2; turn++)
-        await new Promise<void>((resolve) => setImmediate(resolve));
+      await didClose;
       expect(closed).toBe(2);
       // Final path checks must also settle before the same slot can be reused.
       // Observe actual slot release rather than assuming a number of I/O turns.

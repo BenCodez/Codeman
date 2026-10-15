@@ -94,6 +94,10 @@ function fixture(mode: 'codex' | 'claude', owned?: boolean, bound = true) {
     },
   });
   workers.push(worker);
+  // These cases isolate attach-command generation. Private target readiness
+  // is exercised by the actual Session readiness suite.
+  vi.spyOn(worker, 'confirmRemoteWakeReady').mockResolvedValue(true);
+  vi.spyOn(worker, 'isRemoteWakeReadyCurrent').mockReturnValue(true);
   const registry = new RemoteWakeRegistry({
     probe: async () => false,
     wake: async () => true,
@@ -135,3 +139,18 @@ it('retains ordinary launch/reattach semantics for other owned CLI sessions', as
   await expect(f.registry.ensureAwake(f.worker)).resolves.toBe(true);
   expect(f.command()).toContain('new-session -A');
 });
+
+it.each([
+  ['claude', true],
+  ['codex', false],
+] as const)(
+  'flushes ordinary %s owned=%s buffered input without controlled-worker identity requirements',
+  async (mode, owned) => {
+    const f = fixture(mode, owned, false);
+    const delivered = vi.spyOn(f.worker, 'writeViaMux').mockResolvedValue(true);
+    expect(await f.registry.handleInput(f.worker, 'queued')).toBe('buffered');
+    expect(await f.registry.wake(f.worker)).toBe(true);
+    expect(delivered).toHaveBeenCalledWith('queued', { fromUser: true });
+    expect(f.registry.pendingBytes(f.worker.id)).toBe(0);
+  }
+);
