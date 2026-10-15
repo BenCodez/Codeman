@@ -10,6 +10,7 @@ import {
 } from './schema.js';
 import { commandHash, type CommandSuccessEvidence, type TaskProgressMarker } from './evidence.js';
 import { earliestActionDeadline } from '../recovery/action-deadline.js';
+import type { TaskSaveAuthority } from './store.js';
 import {
   CONTINUATION_PROMPT,
   hasFreshProcessReady,
@@ -35,11 +36,14 @@ export interface TaskDependencies {
     prompt: string,
     isCurrent: RecoveryActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'>;
-  persist(state: TaskState): Promise<void>;
+  /** Durable implementations must forward authority to their journal commit. */
+  persist(state: TaskState, authority?: TaskSaveAuthority): Promise<void>;
   changed(state: TaskState): void;
   now?: () => number;
 }
 export class TaskValidationError extends Error {}
+/** No task configuration reached its durable commit before authority was revoked. */
+export class TaskConfigurationCancelledError extends TaskValidationError {}
 function acceptanceCriteriaComplete(state: TaskState): boolean {
   return state.criteria.length > 0 && state.criteria.every((criterion) => criterion.verified);
 }
@@ -53,6 +57,7 @@ export class TaskController {
   private lastOwnerPauseRevision = 0;
   private userInputSaveQueued = false;
   private stopped = false;
+  private configurationCommitUncertain = false;
   constructor(
     private readonly deps: TaskDependencies,
     restored?: TaskState
@@ -104,6 +109,47 @@ export class TaskController {
       this.revision++;
       this.deps.changed(this.getStatus());
       throw new Error('Task state could not be saved');
+    }
+    this.deps.changed(this.getStatus());
+    return this.getStatus();
+  }
+  /** Delegated configuration stays private until the journal's authorized commit. */
+  private async saveGuardedUpdate(candidate: TaskState, reason: string, isCurrent: () => boolean): Promise<TaskState> {
+    candidate.reason = reason;
+    candidate.history = [...candidate.history, { at: this.now(), reason }].slice(-100);
+    const snapshot = structuredClone(candidate);
+    let committed = false;
+    const commit = () => {
+      this.state = candidate;
+      committed = true;
+    };
+    try {
+      if (!isCurrent()) throw new TaskConfigurationCancelledError('Task configuration authority was cancelled');
+      await this.deps.persist(snapshot, {
+        isCurrent,
+        cancelled: () => new TaskConfigurationCancelledError('Task configuration authority was cancelled'),
+        commit,
+      });
+      // In-memory persistence implementations commit when their promise settles.
+      // The real store invokes commit at its atomic pathname replacement instead.
+      if (!committed) {
+        if (!isCurrent()) throw new TaskConfigurationCancelledError('Task configuration authority was cancelled');
+        commit();
+      }
+      this.lastPersisted = snapshot;
+    } catch (error) {
+      if (error instanceof TaskConfigurationCancelledError) throw error;
+      // Once committed, retain that task and any newer synchronous owner input.
+      // A durability failure never restores an older objective over that state.
+      this.state = structuredClone(this.state);
+      this.state.config.enabled = false;
+      this.state.phase = 'blocked';
+      this.state.reason = 'persistence-failed';
+      this.configurationCommitUncertain = true;
+      this.revision++;
+      this.arm();
+      this.deps.changed(this.getStatus());
+      throw error;
     }
     this.deps.changed(this.getStatus());
     return this.getStatus();
@@ -282,13 +328,19 @@ export class TaskController {
     return true;
   }
   private requireCurrent(revision: number): void {
+    if (this.configurationCommitUncertain) throw new TaskValidationError('Task journal durability is uncertain');
     if (this.stopped || this.revision !== revision)
       throw new TaskValidationError('Task action was superseded by session input');
   }
-  update(patch: TaskUpdate): Promise<TaskState> {
+  update(patch: TaskUpdate, externallyCurrent?: () => boolean): Promise<TaskState> {
     TaskUpdateSchema.parse(patch);
+    if (externallyCurrent && !externallyCurrent())
+      return Promise.reject(new TaskConfigurationCancelledError('Task configuration authority was cancelled'));
     const revision = ++this.revision;
     return this.enqueue(async () => {
+      const isCurrent = () => !this.stopped && this.revision === revision && externallyCurrent?.() === true;
+      if (externallyCurrent && !this.configurationCommitUncertain && !isCurrent())
+        throw new TaskConfigurationCancelledError('Task configuration authority was cancelled');
       this.requireCurrent(revision);
       const objective = patch.objective ?? this.state.objective;
       const criteria =
@@ -348,8 +400,12 @@ export class TaskController {
             ? candidate.reason
             : 'configured';
       if (candidate.config.enabled) candidate.startedAt ??= this.now();
-      this.state = candidate;
-      const result = await this.save(reason);
+      let result: TaskState;
+      if (externallyCurrent) result = await this.saveGuardedUpdate(candidate, reason, isCurrent);
+      else {
+        this.state = candidate;
+        result = await this.save(reason);
+      }
       this.arm();
       return result;
     });

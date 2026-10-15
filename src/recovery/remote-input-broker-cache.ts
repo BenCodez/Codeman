@@ -349,8 +349,8 @@ export class OwnedRemoteBrokerCache {
       const signer = CodexInputBroker.fromRemoteMaterial(entry.descriptor.directory, entry.material, state);
       if (!signer) return undefined;
       const proof = signer.observeRemote(serialized, witness, panePid);
-      // Retain a valid startup signer even when raw taint/closed state makes
-      // automation ineligible. Future refreshes never recreate its counters.
+      // Retain witnessed live or certified closed signers. Once retained,
+      // failed refreshes never recreate their existing reservation counters.
       if (signer.canFrame || proof) entry.signer = signer;
       return proof;
     }

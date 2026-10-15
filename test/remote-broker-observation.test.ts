@@ -79,6 +79,15 @@ function receipt(channel: keyof CodexBrokerState['counters'], counter: number) {
   };
 }
 
+it('requires a witnessed native observation before newly loaded remote material admits input', () => {
+  const f = fixture();
+  expect(f.broker.canFrame).toBe(false);
+  expect(f.broker.frame('owner-pty', 'must await observation')).toBeUndefined();
+  expect(f.observe()).toBeDefined();
+  expect(f.broker.canFrame).toBe(true);
+  expect(f.broker.frame('owner-pty', 'verified input')).toBeDefined();
+});
+
 it('an observed owner counter ahead of the sole signer permanently vetoes catch-up', () => {
   const f = fixture();
   f.state.counters['owner-pty'] = 1;
@@ -151,6 +160,8 @@ it.each([
   if (change === 'extra') Object.assign(sample.witness, { secret: 'must not accept arbitrary fields' });
   if (change === 'utf8') sample.serialized += '\ud800';
   expect(f.broker.observeRemote(sample.serialized, sample.witness, 700)).toBeUndefined();
+  expect(f.broker.canFrame).toBe(false);
+  expect(f.broker.frame('owner-key', '\t')).toBeUndefined();
 });
 
 it('keeps the exact certified child exit available while refusing new owner frames to the closed process', () => {
