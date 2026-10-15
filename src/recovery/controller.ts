@@ -260,6 +260,15 @@ export class RecoveryController {
       const confirmationPolicyChanged = (
         ['enabled', 'recoverCrashes', 'recoverInterrupted', 'detectStalls', 'restartStalls', 'stalledAfterMs'] as const
       ).some((key) => config[key] !== this.state.config[key]);
+      const pending = this.state.pending;
+      const canceledOwnedStall =
+        !(config.enabled && config.detectStalls && config.restartStalls) &&
+        pending?.action === 'restart' &&
+        pending.reason === 'stalled' &&
+        this.state.stallAlert?.key === pending.key &&
+        this.state.stallAlert.conversationId === pending.conversationId &&
+        !this.state.needsAttention &&
+        ['scheduled', 'stalled', 'stall-unverified', 'observing', 'disabled'].includes(this.state.lastReason);
       // A newly consented policy needs its own fresh observations, even when
       // the old confirmation had not yet scheduled an action.
       if (confirmationPolicyChanged) this.confirmation = undefined;
@@ -275,6 +284,13 @@ export class RecoveryController {
         this.state.pending = undefined;
         this.state.nextRetryAt = undefined;
         if (!this.state.inFlight) this.state.phase = 'idle';
+      }
+      if (canceledOwnedStall && !this.state.inFlight && !this.state.circuitOpen) {
+        // Scheduling hid this exact warning while recovery was pending. Canceling
+        // the restart does not acknowledge the unresolved stall or a newer veto.
+        this.state.needsAttention = true;
+        this.state.lastReason = 'stall-unverified';
+        this.state.phase = 'paused';
       }
       if (
         !config.restartStalls &&

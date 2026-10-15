@@ -80,6 +80,147 @@ function fixture(remote: boolean, legacy: boolean, change: Partial<RecoveryState
   return Object.assign(f, { controller, persist, act });
 }
 
+async function scheduledStall(remote: boolean, liveWarning = true) {
+  const x = fixture(remote, false, { needsAttention: false, history: [], lastReason: 'turn-running' });
+  await x.controller.updateConfig({ restartStalls: true });
+  vi.setSystemTime(NOW + 10_000);
+  if (liveWarning) {
+    await x.controller.refresh();
+    vi.setSystemTime(NOW + 12_000);
+    await x.controller.refresh();
+    expect(x.controller.getStatus()).toMatchObject({ needsAttention: true, lastReason: 'stall-unverified' });
+    expect(x.controller.getStatus().stallAlert).toBeDefined();
+    vi.setSystemTime(NOW + 13_000);
+  }
+  Object.assign(x.observation, { stallRestartable: true, processProofKey: 'exact-dead-worker' });
+  await x.controller.refresh();
+  vi.setSystemTime(Date.now() + 2000);
+  await x.controller.refresh();
+  expect(x.controller.getStatus()).toMatchObject({
+    needsAttention: false,
+    lastReason: 'scheduled',
+    pending: { key: 'same-turn', action: 'restart', conversationId: THREAD, reason: 'stalled' },
+  });
+  expect(x.controller.getStatus().nextRetryAt).toBeGreaterThan(Date.now());
+  expect(x.act).not.toHaveBeenCalled();
+  return x;
+}
+
+const withdrawStallConsent = ['enabled', 'detectStalls', 'restartStalls'] as const;
+it.each(
+  [false, true].flatMap((remote) =>
+    withdrawStallConsent.flatMap((setting) =>
+      [false, true].map((settingsSummary) => ({ remote, setting, settingsSummary }))
+    )
+  )
+)(
+  'restores the scheduled warning after $setting withdrawal through polling and reload (SSH=$remote summary=$settingsSummary)',
+  async ({ remote, setting, settingsSummary }) => {
+    const x = await scheduledStall(remote);
+    if (settingsSummary) await x.controller.updateConfig({ maxRetries: 4 });
+    const before = x.controller.getStatus();
+    const saved = await x.controller.updateConfig({ [setting]: false });
+    expect(saved).toMatchObject({ needsAttention: true, lastReason: 'stall-unverified', phase: 'paused' });
+    expect(saved.pending).toBeUndefined();
+    expect(saved.nextRetryAt).toBeUndefined();
+    expect(saved.stallAlert).toEqual(before.stallAlert);
+    expect(saved.history).toEqual(before.history);
+    for (const field of [
+      'attempts',
+      'failedAttempts',
+      'windowStartedAt',
+      'handledEvidence',
+      'inFlight',
+      'circuitOpen',
+    ] as const)
+      expect(saved[field]).toEqual(before[field]);
+    expect(x.persist).toHaveBeenLastCalledWith(saved);
+    const pushes = [...x.pushes];
+    await x.controller.updateConfig({ [setting]: false });
+    expect(x.pushes).toEqual(pushes);
+    vi.setSystemTime(Date.now() + 60_000);
+    await x.controller.refresh();
+    await x.controller.inspect();
+    expect(x.controller.getStatus()).toMatchObject({
+      needsAttention: true,
+      lastReason: 'stall-unverified',
+      phase: 'paused',
+    });
+    expect(x.act).not.toHaveBeenCalled();
+    x.controller.stop();
+    const restored = new RecoveryController(
+      {
+        observe: async () => ({ ...structuredClone(x.observation), stallObservedAt: Date.now() }),
+        persist: vi.fn(async () => {}),
+        act: x.act,
+        changed: () => {},
+      },
+      saved
+    );
+    controllers.push(restored);
+    await restored.refresh();
+    await restored.inspect();
+    expect(restored.getStatus()).toMatchObject({
+      needsAttention: true,
+      lastReason: 'stall-unverified',
+      phase: 'paused',
+    });
+    expect(restored.getStatus().stallAlert).toEqual(before.stallAlert);
+    expect(x.act).not.toHaveBeenCalled();
+  }
+);
+
+it.each([false, true].flatMap((remote) => withdrawStallConsent.map((setting) => ({ remote, setting }))))(
+  'does not invent a prior warning when canceling a dead-only $setting restart (SSH=$remote)',
+  async ({ remote, setting }) => {
+    const x = await scheduledStall(remote, false);
+    expect(x.controller.getStatus().stallAlert).toBeUndefined();
+    const saved = await x.controller.updateConfig({ [setting]: false });
+    expect(saved.needsAttention).toBe(false);
+    expect(saved.stallAlert).toBeUndefined();
+    expect(saved.pending).toBeUndefined();
+    expect(saved.nextRetryAt).toBeUndefined();
+    expect(saved.history.filter((event) => event.kind === 'attention')).toEqual([]);
+    expect(x.act).not.toHaveBeenCalled();
+  }
+);
+
+it.each(['empty', 'idempotent', 'unrelated', 'owner-input', 'reset', 'progress'] as const)(
+  'preserves the scheduled-warning ownership boundary for %s edits',
+  async (kind) => {
+    const x = await scheduledStall(false);
+    const before = x.controller.getStatus();
+    if (kind === 'owner-input') {
+      x.controller.noteUserInput();
+      await x.controller.drain();
+    } else if (kind === 'reset') await x.controller.reset();
+    else if (kind === 'progress') {
+      x.observation.progressAt = Date.now();
+      await x.controller.inspect();
+    }
+    const release = ['owner-input', 'reset', 'progress'].includes(kind);
+    const saved = await x.controller.updateConfig(
+      release
+        ? { enabled: false }
+        : kind === 'empty'
+          ? {}
+          : kind === 'idempotent'
+            ? { restartStalls: true }
+            : { maxRetries: 4 }
+    );
+    expect(saved.needsAttention).toBe(false);
+    if (release) {
+      expect(saved.stallAlert).toBeUndefined();
+      expect(saved.pending).toBeUndefined();
+    } else {
+      expect(saved.stallAlert).toEqual(before.stallAlert);
+      expect(saved.pending).toEqual(before.pending);
+      expect(saved.nextRetryAt).toBe(before.nextRetryAt);
+    }
+    expect(x.act).not.toHaveBeenCalled();
+  }
+);
+
 const patches: Array<{ label: string; patch: Partial<RecoveryConfig> }> = [
   { label: 'empty', patch: {} },
   { label: 'unrelated', patch: { maxRetries: 4 } },

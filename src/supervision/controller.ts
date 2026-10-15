@@ -411,7 +411,9 @@ export class TaskController {
       const enabledChanged = candidate.config.enabled !== this.state.config.enabled;
       candidate.phase = candidate.agentProgressVeto
         ? candidate.config.enabled
-          ? 'paused'
+          ? candidate.outcome === 'blocked'
+            ? 'blocked'
+            : 'paused'
           : 'disabled'
         : candidate.outcome === 'completed'
           ? 'completed'
@@ -486,7 +488,10 @@ export class TaskController {
       }
       if (patch.outcome === 'completed' && (!candidate.criteria.length || !candidate.criteria.every((c) => c.verified)))
         throw new TaskValidationError('Acceptance criteria remain unverified');
-      if (patch.outcome === 'unfinished' || patch.outcome === 'completed') delete candidate.agentProgressVeto;
+      // Owner uncertainty has the same cross-controller veto as agent attention.
+      // Pausing this task must not transfer authority to generic recovery.
+      if (patch.outcome === 'unknown' || patch.outcome === 'blocked') candidate.agentProgressVeto = true;
+      else delete candidate.agentProgressVeto;
       const acceptedFlight = candidate.inFlight?.accepted;
       if (!acceptedFlight) candidate.submissionKey = observation.submissionKey;
       if (
@@ -511,7 +516,8 @@ export class TaskController {
         ].slice(-32);
       }
       candidate.lastProgressAt = this.now();
-      candidate.outcome = acceptanceCriteriaComplete(candidate) ? 'completed' : patch.outcome;
+      candidate.outcome =
+        !candidate.agentProgressVeto && acceptanceCriteriaComplete(candidate) ? 'completed' : patch.outcome;
       candidate.checkpoint = patch.checkpoint ?? candidate.checkpoint;
       candidate.nextAction = patch.nextAction ?? candidate.nextAction;
       // Owner certification ends the task without sending another prompt.

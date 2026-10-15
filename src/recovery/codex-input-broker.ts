@@ -188,6 +188,7 @@ async function readProcessIdentity(path: string): Promise<PrivateRead> {
 }
 /** Timed-out reads keep their slot; a stuck filesystem cannot accumulate readers. */
 async function boundedRead(path: string, callerDeadline = Infinity, reader = readPrivateJson): Promise<PrivateRead> {
+  if (performance.now() >= callerDeadline || Number.isNaN(callerDeadline)) throw new Error('Input journal deadline');
   let job = pending.get(path);
   if (!job) {
     if (pending.size >= 2) throw new Error('Input journal reader occupied');
@@ -737,9 +738,11 @@ export class CodexInputBroker {
     directory: string,
     sessionId: string,
     incarnation: string,
-    codexHome: string
+    codexHome: string,
+    originalDeadline = Infinity
   ): Promise<BrokerPrivateEvidence | undefined> {
-    const deadline = performance.now() + 2_000;
+    const deadline = Math.min(performance.now() + 2_000, originalDeadline);
+    if (!Number.isFinite(deadline) || performance.now() >= deadline) return undefined;
     try {
       const configInput = await boundedRead(join(directory, 'config.json'), deadline);
       if (!HistoricalConfig.safeParse(configInput.value).success) return undefined;

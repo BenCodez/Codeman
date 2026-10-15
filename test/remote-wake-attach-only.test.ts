@@ -169,3 +169,64 @@ it.each([
     expect(f.registry.pendingBytes(f.worker.id)).toBe(0);
   }
 );
+
+it.each(['completed', 'uncertain'] as const)(
+  'reattach cannot replace a pane between literal text and Enter (%s)',
+  async (outcome) => {
+    const f = fixture('claude', true);
+    let entering!: () => void, release!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      entering = resolve;
+    });
+    const pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const bytes: string[] = [];
+    effects.exec.mockImplementation(async (command: string) => {
+      if (command.includes('send-keys') && command.includes(' -l ')) bytes.push('literal');
+      else if (command.includes('send-keys') && command.includes('Enter')) {
+        entering();
+        await pending;
+        if (outcome === 'uncertain') throw new Error('Fixture lost Enter ACK');
+        bytes.push('Enter');
+      }
+      return { stdout: '99999\n', stderr: '' };
+    });
+    const identity = { clientId: 'reconnect-owner', seq: 1 };
+    expect(f.worker.deferInputSeq(identity.clientId, identity.seq)).toBe(true);
+    expect(f.worker.shouldApplyInput(identity.clientId, identity.seq)).toBe(true);
+    const writing = f.worker.writeViaMux('literal\r', { fromUser: true, inputSeq: identity }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error })
+    );
+    await entered;
+    try {
+      expect(bytes).toEqual(['literal']);
+      expect(f.worker.paneLifecycleInFlight).toBe(true);
+      expect(await f.worker.reattachRemote()).toBe(false);
+      expect(await f.registry.ensureAwake(f.worker)).toBe(false);
+      expect(f.command()).toBeUndefined();
+    } finally {
+      release();
+    }
+    const result = await writing;
+    if (outcome === 'completed') expect(result).toEqual({ value: true });
+    else expect(result).toHaveProperty('error');
+    expect(f.worker.paneLifecycleInFlight).toBe(false);
+    expect(await f.worker.reattachRemote()).toBe(true);
+    expect(f.command()).toContain('new-session -A');
+    // A successful reconnect must never reopen a delivered or uncertain identity.
+    expect(f.worker.shouldApplyInput(identity.clientId, identity.seq)).toBe(false);
+    expect(bytes).toEqual(outcome === 'completed' ? ['literal', 'Enter'] : ['literal']);
+  }
+);
+
+it('ordinary reconnect proceeds after a certified pre-dispatch input refusal', async () => {
+  const f = fixture('claude', true);
+  vi.spyOn(Reflect.get(f.worker, '_mux') as ManagerType, 'canDeliverCodexOwnerInput').mockReturnValue(false);
+  await expect(f.worker.writeViaMux('not sent\r', { fromUser: true })).resolves.toBe(false);
+  expect(effects.exec.mock.calls.some(([command]) => command.includes('send-keys'))).toBe(false);
+  expect(f.worker.paneLifecycleInFlight).toBe(false);
+  await expect(f.worker.reattachRemote()).resolves.toBe(true);
+  expect(f.command()).toContain('new-session -A');
+});

@@ -22,7 +22,7 @@
  */
 
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
 import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
 import { ownedRemoteBrokerCache, type OwnedRemoteBrokerScope } from './recovery/remote-input-broker-cache.js';
@@ -2210,6 +2210,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private async prepareOwnedRemoteLaunch(options: CreateSessionOptions, codexHome: string) {
     const remote = options.remote!;
     let before = this.sessions.get(options.sessionId);
+    const retainedBinding = before && JSON.stringify(before);
     const snapshot = JSON.stringify(options);
     const ownerFence = options.remoteLaunchCurrent,
       ownerPrepare = options.remoteLaunchPrepare;
@@ -2260,7 +2261,79 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       { planOnly: true }
     );
     if (!current()) throw new Error('Owned SSH launch authority changed');
-    if (planned.status === 'existing') return { command: buildOwnedRemoteAttachCommand(remote, options.sessionId) };
+    if (planned.status === 'existing') {
+      const command = buildOwnedRemoteAttachCommand(remote, options.sessionId);
+      if (
+        before?.recoveryInputBroker === undefined &&
+        before?.recoveryInputBrokerPending === undefined &&
+        before?.codexRestoreUncertain === undefined
+      )
+        return { command, isCurrent: current };
+      const retained = before;
+      const incarnation = retained?.recoveryInputBroker;
+      const retainedCurrent = () =>
+        current() && this.sessions.get(options.sessionId) === retained && JSON.stringify(retained) === retainedBinding;
+      if (
+        !retained ||
+        !incarnation ||
+        retained.recoveryInputBrokerPending !== undefined ||
+        (retained.codexRestoreUncertain !== undefined && retained.codexRestoreUncertain !== false) ||
+        retained.mode !== options.mode ||
+        retained.owner !== options.owner ||
+        retained.workingDir !== options.workingDir ||
+        retained.recoveryCodexHome !== codexHome ||
+        retained.recoveryIsolated !== true ||
+        JSON.stringify(retained.remote) !== JSON.stringify(remote) ||
+        JSON.stringify(retained.codexRestoreConfig) !== JSON.stringify(options.codexConfig) ||
+        !retainedCurrent()
+      )
+        throw new Error('Retained owned SSH launch authority is unavailable');
+      const scope = this.remoteBrokerScope(retained);
+      const descriptor = await this.getOwnedRemoteInputBroker(options.sessionId);
+      if (
+        !scope ||
+        !descriptor ||
+        descriptor.incarnation !== incarnation ||
+        descriptor.launchDigest !==
+          createHash('sha256')
+            .update(
+              buildRemoteCodexPaneCommand({
+                remotePath: remote.remotePath,
+                sessionId: options.sessionId,
+                codexConfig: options.codexConfig,
+                codexHome,
+              })
+            )
+            .digest('hex') ||
+        descriptor.homeDigest !== createHash('sha256').update(codexHome).digest('hex') ||
+        !retainedCurrent()
+      )
+        throw new Error('Retained owned SSH input provenance is unavailable');
+      const observed = await observeOwnedRemoteBroker(
+        remote,
+        { sessionId: options.sessionId, descriptor, codexHome, inspect: true },
+        { prepare: async () => retainedCurrent(), isCurrent: retainedCurrent }
+      );
+      if (observed.status !== 'observed' || !retainedCurrent())
+        throw new Error('Retained owned SSH worker could not be verified');
+      const proof = ownedRemoteBrokerCache.observe(
+        scope,
+        incarnation,
+        observed.serialized,
+        observed.witness,
+        observed.panePid
+      );
+      if (!proof || proof.closed || !ownedRemoteBrokerCache.signer(scope, incarnation)?.canFrame || !retainedCurrent())
+        throw new Error('Retained owned SSH worker is not ready for framed input');
+      return { command, incarnation, isCurrent: retainedCurrent };
+    }
+    if (
+      before &&
+      (before.recoveryInputBroker !== undefined ||
+        before.recoveryInputBrokerPending !== undefined ||
+        before.codexRestoreUncertain !== undefined)
+    )
+      throw new Error('Retained controlled SSH worker requires exact existing provenance');
     // A missing Python broker leaves a manual-only owner launch available. No
     // existing or uncertain remote pane is ever replaced by this branch.
     if (planned.status === 'unsupported') return undefined;
@@ -2272,11 +2345,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       codexHome,
       owner: options.owner,
     };
+    if (before) throw new Error('Owned SSH launch already has a local registration');
     const descriptor = await ownedRemoteBrokerCache.prepare(scope, material, planned.directory);
     if (!descriptor || !current()) throw new Error('Owned SSH launch material unavailable');
     // An owner launch has no local SSH wrapper yet. Save its exact pending
     // incarnation before the remote child can start; never rediscover a latest file.
-    if (before) throw new Error('Owned SSH launch already has a local registration');
     const reservation: MuxSession = {
       sessionId: options.sessionId,
       muxName: `codeman-${options.sessionId.slice(0, 8)}`,
@@ -2326,7 +2399,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       throw new Error('Owned SSH launch input provenance unavailable');
     if (!(await this.commitOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) || !current())
       throw new Error('Owned SSH launch commit needs owner inspection');
-    return { command: buildOwnedRemoteAttachCommand(remote, options.sessionId), incarnation: descriptor.incarnation };
+    return {
+      command: buildOwnedRemoteAttachCommand(remote, options.sessionId),
+      incarnation: descriptor.incarnation,
+      isCurrent: current,
+    };
   }
   private optionalBrokerDispatchReceipt(
     output: unknown
@@ -3094,6 +3171,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : controlledRemoteCodex
         ? normalizedCodexHome(launchEnvCodexHome)
         : undefined;
+    const retainedControlled = this.sessions.get(sessionId);
+    if (
+      retainedControlled?.remote &&
+      (retainedControlled.recoveryInputBroker !== undefined ||
+        retainedControlled.recoveryInputBrokerPending !== undefined) &&
+      (!controlledRemoteCodex || !recoveryCodexHome)
+    )
+      throw new Error('Retained controlled SSH input provenance cannot be removed');
     // Ordinary Codex resolves a relative CODEX_HOME from its working directory.
     // Only an isolated launch needs absolute home provenance for its input broker.
     if (localCodex && codexConfig?.noDaemon === true && !recoveryCodexHome)
@@ -3291,6 +3376,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
           throw new Error('Reboot restoration authority changed');
       }
+      if (ownedRemoteLaunch?.isCurrent() === false) throw new Error('Owned SSH attach authority changed');
       attemptedRestoreShell = !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard;
       const created = execSync(createSessionCommand, {
         cwd: TMUX_LAUNCH_CWD,
@@ -3507,6 +3593,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       if (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
         throw new Error('Codex launch ownership changed');
+      if (ownedRemoteLaunch?.isCurrent() === false) throw new Error('Owned SSH attach authority changed');
       const session: MuxSession = {
         sessionId,
         muxName,

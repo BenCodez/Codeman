@@ -11,6 +11,7 @@ const MAX_BYTES = 2 * 1024 * 1024;
 export class SupervisorStore {
   private records: Record<string, SupervisorState> = {};
   private writes: Promise<unknown> = Promise.resolve();
+  private writeUncertain = false;
   private pendingCleanupWrites = 0;
   private cleanupWriteFailed = false;
   readonly loadFailed: boolean;
@@ -41,7 +42,7 @@ export class SupervisorStore {
 
   get(id: string): SupervisorState {
     const state = structuredClone(this.records[id] ?? initialSupervisorState(id));
-    if (this.loadFailed) {
+    if (this.loadFailed || this.writeUncertain) {
       state.enabled = false;
       state.phase = 'blocked';
       state.reason = 'persistence-failed';
@@ -55,19 +56,21 @@ export class SupervisorStore {
 
   /** Cleanup requires the complete settled domain, without changing worker automation. */
   getBrokerCleanupState(): Record<string, SupervisorState> | undefined {
-    return this.loadFailed || this.pendingCleanupWrites > 0 || this.cleanupWriteFailed
+    return this.loadFailed || this.writeUncertain || this.pendingCleanupWrites > 0 || this.cleanupWriteFailed
       ? undefined
       : structuredClone(this.records);
   }
 
   save(id: string, state: SupervisorState): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
+    if (this.writeUncertain) return Promise.reject(new Error('Supervisor journal durability is uncertain'));
     if (!/^[\w-]{8,100}$/.test(id)) return Promise.reject(new Error('Invalid supervisor identity'));
     if (state.supervisorSessionId !== id) return Promise.reject(new Error('Supervisor journal identity mismatch'));
     SupervisorStateSchema.parse(state);
     const copy = structuredClone(state);
     this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
+      if (this.writeUncertain) throw new Error('Supervisor journal durability is uncertain');
       const next = { ...this.records, [id]: copy };
       if (Object.keys(next).length > 100) throw new Error('Supervisor journal is over capacity');
       await this.write(next);
@@ -88,8 +91,10 @@ export class SupervisorStore {
 
   drop(id: string): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
+    if (this.writeUncertain) return Promise.reject(new Error('Supervisor journal durability is uncertain'));
     this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
+      if (this.writeUncertain) throw new Error('Supervisor journal durability is uncertain');
       if (!this.records[id]) return;
       const next = { ...this.records };
       delete next[id];
@@ -112,8 +117,10 @@ export class SupervisorStore {
   /** Retire only unreachable settled manager records; uncertain operations retain their binding. */
   pruneOrphans(keep: (id: string) => boolean): Promise<number> {
     if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
+    if (this.writeUncertain) return Promise.reject(new Error('Supervisor journal durability is uncertain'));
     this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
+      if (this.writeUncertain) throw new Error('Supervisor journal durability is uncertain');
       const next = { ...this.records };
       let removed = 0;
       for (const [id, state] of Object.entries(next)) {
@@ -145,6 +152,7 @@ export class SupervisorStore {
     if (Buffer.byteLength(serialized) > MAX_BYTES) throw new Error('Supervisor journal is over byte capacity');
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${randomUUID()}.tmp`;
+    let commitAttempted = false;
     try {
       const handle = await open(temp, 'wx', 0o600);
       try {
@@ -153,6 +161,9 @@ export class SupervisorStore {
       } finally {
         await handle.close();
       }
+      // A rejected rename may have landed. Once replacement starts, a failed
+      // acknowledgement cannot authorize another write from the old snapshot.
+      commitAttempted = true;
       await rename(temp, this.path);
       const dir = await open(dirname(this.path), 'r');
       try {
@@ -160,6 +171,9 @@ export class SupervisorStore {
       } finally {
         await dir.close();
       }
+    } catch (error) {
+      if (commitAttempted) this.writeUncertain = true;
+      throw error;
     } finally {
       await unlink(temp).catch(() => {});
     }
