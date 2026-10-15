@@ -17,6 +17,16 @@ TEMP_REF=""
 LOCK_DIR=""
 LOCK_CREATED=0
 RUNNER_OWNED=0
+SWITCH_ACTIVE=0
+SWITCH_HEAD=""
+SWITCH_BRANCH=""
+SWITCH_MASTER=""
+SWITCH_ORIGIN=""
+SWITCH_ORIGIN_OTHER=""
+SWITCH_ORIGIN_ATTEMPTED=0
+SWITCH_NEW_MASTER=0
+SWITCH_NEW_BACKUP=0
+SWITCH_BACKUP_CONFIG=""
 
 fail() {
   printf 'Fork update stopped: %s\n' "$1" >&2
@@ -40,7 +50,82 @@ but still checks release tags, so it does not offer untagged master commits.
 HELP
 }
 
+# Missing sections are valid; unreadable configuration is not a rollback receipt.
+remote_section() {
+  local section result
+  if section="$(git config --local --get-regexp "^remote[.]$1[.]")"; then
+    printf '%s' "$section"
+  else
+    result=$?
+    [[ "$result" == "1" ]] || return "$result"
+  fi
+}
+
+rollback_switch() {
+  local current_head current_branch current_master changes marker path worktrees origin_config origin_url origin_other backup_config refs branches incomplete
+  SWITCH_ACTIVE=0
+  current_head="$(git rev-parse --verify HEAD)" || return 1
+  current_branch="$(git symbolic-ref --quiet --short HEAD || true)"
+  changes="$(git status --porcelain --untracked-files=all)" || return 1
+  [[ -z "$changes" ]] || return 1
+  for marker in MERGE_HEAD CHERRY_PICK_HEAD REVERT_HEAD rebase-apply rebase-merge sequencer BISECT_LOG; do
+    path="$(git rev-parse --git-path "$marker")" || return 1
+    [[ ! -e "$path" ]] || return 1
+  done
+  current_master="$(git rev-parse --verify "refs/heads/$TARGET_BRANCH" 2>/dev/null || true)"
+  if [[ "$current_head" != "$SWITCH_HEAD" || "$current_branch" != "$SWITCH_BRANCH" ]]; then
+    # A failed command may have landed a fast-forward, or another actor may have
+    # moved HEAD. Only our unchanged preparatory checkout can be undone.
+    [[ -z "$SWITCH_BRANCH" && "$current_branch" == "$TARGET_BRANCH" &&
+      "$current_head" == "${SWITCH_MASTER:-$SWITCH_HEAD}" && "$current_master" == "$current_head" ]] || return 1
+    git -c core.hooksPath=/dev/null checkout --detach "$SWITCH_HEAD" || return 1
+  fi
+  incomplete=0
+  if [[ "$SWITCH_NEW_MASTER" == "1" && -n "$current_master" ]]; then
+    worktrees="$(git worktree list --porcelain)" || return 1
+    if [[ "$current_master" == "$SWITCH_HEAD" ]] &&
+      ! printf '%s\n' "$worktrees" | grep -Fx -- "branch refs/heads/$TARGET_BRANCH" >/dev/null; then
+      git update-ref -d "refs/heads/$TARGET_BRANCH" "$SWITCH_HEAD" || incomplete=1
+    else
+      incomplete=1
+    fi
+  fi
+  if [[ "$SWITCH_ORIGIN_ATTEMPTED" == "1" ]]; then
+    origin_config="$(remote_section origin)" || return 1
+    origin_url="$(git config --get-all remote.origin.url)" || return 1
+    origin_other="$(printf '%s\n' "$origin_config" | sed '/^remote[.]origin[.]url /d')"
+    if [[ "$origin_other" != "$SWITCH_ORIGIN_OTHER" ]]; then
+      incomplete=1
+    elif [[ "$origin_url" == "$FORK_URL" ]]; then
+      git remote set-url origin "$SWITCH_ORIGIN" || incomplete=1
+    elif [[ "$origin_url" != "$SWITCH_ORIGIN" ]]; then
+      incomplete=1
+    fi
+  fi
+  if [[ "$SWITCH_NEW_BACKUP" == "1" ]]; then
+    backup_config="$(remote_section codeman-before-fork)" || return 1
+    refs="$(git for-each-ref --format='%(refname)' refs/remotes/codeman-before-fork/)" || return 1
+    if branches="$(git config --local --get-regexp '^branch[.].*[.]remote$')"; then :; else
+      [[ "$?" == "1" ]] || return 1
+    fi
+    if [[ "$backup_config" == "$SWITCH_BACKUP_CONFIG" && -z "$refs" ]] &&
+      ! printf '%s\n' "$branches" | grep -E ' codeman-before-fork$' >/dev/null; then
+      git remote remove codeman-before-fork || incomplete=1
+    elif [[ -n "$backup_config" || -n "$refs" ]]; then
+      incomplete=1
+    fi
+  fi
+  [[ "$incomplete" == "0" ]]
+}
+
 cleanup() {
+  if [[ "$SWITCH_ACTIVE" == "1" ]]; then
+    if rollback_switch; then
+      printf 'Original checkout and remotes restored; no build or restart was run.\n' >&2
+    else
+      printf 'Rollback incomplete: concurrent or possibly committed changes were retained. Inspect HEAD, master, and remotes before retrying.\n' >&2
+    fi
+  fi
   if [[ -n "$TEMP_REF" ]]; then
     git update-ref -d "$TEMP_REF" >/dev/null 2>&1 || true
   fi
@@ -106,7 +191,7 @@ restart_hint() {
 }
 
 main() {
-  local next_mode initial_head initial_branch original_origin common_dir target_head master_head runner_dir
+  local next_mode initial_head initial_branch original_origin common_dir target_head master_head runner_dir origin_config
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --repo)
@@ -195,11 +280,20 @@ main() {
     git merge-base --is-ancestor "$master_head" "$target_head" \
       || fail "Local master has diverged from fork master. No branch or origin switch was applied."
   fi
+  SWITCH_HEAD="$initial_head"
+  SWITCH_BRANCH="$initial_branch"
+  SWITCH_MASTER="$master_head"
+  SWITCH_ORIGIN="$original_origin"
+  origin_config="$(remote_section origin)" || fail "Could not snapshot origin before switching."
+  SWITCH_ORIGIN_OTHER="$(printf '%s\n' "$origin_config" | sed '/^remote[.]origin[.]url /d')"
+  SWITCH_ACTIVE=1
   if [[ "$original_origin" != "$FORK_URL" ]]; then
     if git remote get-url codeman-before-fork >/dev/null 2>&1; then
       [[ "$(git config --get-all remote.codeman-before-fork.url)" == "$original_origin" ]] \
         || fail "codeman-before-fork already records another source. Keep it intact and resolve the remote name first."
     else
+      SWITCH_NEW_BACKUP=1
+      SWITCH_BACKUP_CONFIG="$(printf 'remote.codeman-before-fork.url %s\nremote.codeman-before-fork.fetch +refs/heads/*:refs/remotes/codeman-before-fork/*' "$original_origin")"
       git remote add codeman-before-fork "$original_origin"
     fi
   fi
@@ -210,14 +304,17 @@ main() {
     if [[ -n "$master_head" ]]; then
       git -c core.hooksPath=/dev/null checkout "$TARGET_BRANCH"
     else
+      SWITCH_NEW_MASTER=1
       git -c core.hooksPath=/dev/null checkout -b "$TARGET_BRANCH" "$initial_head"
     fi
   fi
+  SWITCH_ORIGIN_ATTEMPTED=1
   git remote set-url origin "$FORK_URL"
   if ! git -c core.hooksPath=/dev/null merge --ff-only --no-edit "$target_head"; then
-    git remote set-url origin "$original_origin" || true
-    fail "Fast-forward failed. Original origin was restored; no build or restart was run."
+    fail "Fast-forward failed. No build or restart was run."
   fi
+  # Source updates are committed now; dependency/build failures remain retryable in place.
+  SWITCH_ACTIVE=0
   git update-ref "refs/remotes/origin/$TARGET_BRANCH" "$target_head"
   git branch --set-upstream-to="origin/$TARGET_BRANCH" "$TARGET_BRANCH"
   printf '\nInstalling dependencies in the existing checkout (server auto-start disabled)...\n'

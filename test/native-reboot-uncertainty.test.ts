@@ -1011,116 +1011,130 @@ describe('native uncertain Codex reboot ownership', () => {
     }
   );
 
-  it.each([
-    'empty',
-    'other-live',
-    'own-live',
-    'failed',
-    'malformed',
-    'truncated',
-    'invalid-exit',
-    'invalid-pid',
-    'nul-name',
-    'control-name',
-    'missing-final-newline',
-    'blank-line',
-    'crlf',
-    'no-server',
-    'wrong-socket',
-    'missing-socket',
-    'no-server-signal',
-    'no-server-killed',
-    'no-server-status',
-    'no-server-timeout',
-    'no-server-output',
-    'no-server-extra',
-  ] as const)('retires uncertain identity only after a complete pane listing proves absence (%s)', async (listing) => {
-    const { manager, home } = fixture();
-    const record: MuxSession = {
-      sessionId: ID,
-      muxName: 'codeman-aaaaaaaa',
-      pid: 0,
-      createdAt: Date.now(),
-      workingDir: root,
-      mode: 'codex',
-      owner: 'worker',
-      attached: false,
-      recoveryCodexHome: home,
-      codexRestoreUncertain: true,
-      codexRestoreConfig: config,
-    };
-    manager.registerSession(record);
-    await manager.flushSessionsDurably();
-    const sep = '|'; // Exact native PANE_LIST_FORMAT separator.
-    const valid = (name: string, pid: string) => [name, pid, '0', '', ''].join(sep) + '\n';
-    effects.sync.mockImplementation((command: string) => {
-      expect(command).not.toContain('|| true');
-      if (
-        listing === 'no-server' ||
-        listing === 'wrong-socket' ||
-        listing === 'missing-socket' ||
-        listing.startsWith('no-server-')
-      ) {
-        const socket = join(process.env.TMUX_TMPDIR ?? '/tmp', `tmux-${process.getuid!()}`, 'fixture-socket');
-        const diagnostic =
-          listing === 'missing-socket'
-            ? `error connecting to ${socket} (No such file or directory)\n`
-            : `no server running on ${listing === 'wrong-socket' ? socket + '-other' : socket}\n`;
-        throw Object.assign(new Error('Fixture native no-server'), {
-          status: listing === 'no-server-status' ? 2 : 1,
-          stdout: listing === 'no-server-output' ? 'partial listing' : '',
-          stderr: diagnostic + (listing === 'no-server-extra' ? 'extra diagnostic\n' : ''),
-          ...(listing === 'no-server-signal' ? { signal: 'SIGTERM' } : {}),
-          ...(listing === 'no-server-killed' ? { killed: true } : {}),
-          ...(listing === 'no-server-timeout' ? { code: 'ETIMEDOUT' } : {}),
-        });
+  it.each(
+    (['codex', 'generic'] as const).flatMap((kind) =>
+      (
+        [
+          'empty',
+          'other-live',
+          'own-live',
+          'own-dead',
+          'failed',
+          'malformed',
+          'truncated',
+          'invalid-exit',
+          'invalid-pid',
+          'nul-name',
+          'control-name',
+          'missing-final-newline',
+          'blank-line',
+          'crlf',
+          'no-server',
+          'wrong-socket',
+          'missing-socket',
+          'no-server-signal',
+          'no-server-killed',
+          'no-server-status',
+          'no-server-timeout',
+          'no-server-output',
+          'no-server-extra',
+        ] as const
+      ).map((listing) => ({ kind, listing }))
+    )
+  )(
+    'retires $kind uncertain identity only after a complete pane listing proves absence ($listing)',
+    async ({ kind, listing }) => {
+      const { manager, home } = fixture();
+      const record: MuxSession = {
+        sessionId: ID,
+        muxName: 'codeman-aaaaaaaa',
+        pid: 0,
+        createdAt: Date.now(),
+        workingDir: root,
+        mode: kind === 'codex' ? 'codex' : 'claude',
+        owner: 'worker',
+        attached: false,
+        ...(kind === 'codex'
+          ? { recoveryCodexHome: home, codexRestoreUncertain: true, codexRestoreConfig: config }
+          : { restoreUncertain: true }),
+      };
+      manager.registerSession(record);
+      await manager.flushSessionsDurably();
+      const sep = '|'; // Exact native PANE_LIST_FORMAT separator.
+      const valid = (name: string, pid: string) => [name, pid, '0', '', ''].join(sep) + '\n';
+      effects.sync.mockImplementation((command: string) => {
+        expect(command).not.toContain('|| true');
+        if (
+          listing === 'no-server' ||
+          listing === 'wrong-socket' ||
+          listing === 'missing-socket' ||
+          listing.startsWith('no-server-')
+        ) {
+          const socket = join(process.env.TMUX_TMPDIR ?? '/tmp', `tmux-${process.getuid!()}`, 'fixture-socket');
+          const diagnostic =
+            listing === 'missing-socket'
+              ? `error connecting to ${socket} (No such file or directory)\n`
+              : `no server running on ${listing === 'wrong-socket' ? socket + '-other' : socket}\n`;
+          throw Object.assign(new Error('Fixture native no-server'), {
+            status: listing === 'no-server-status' ? 2 : 1,
+            stdout: listing === 'no-server-output' ? 'partial listing' : '',
+            stderr: diagnostic + (listing === 'no-server-extra' ? 'extra diagnostic\n' : ''),
+            ...(listing === 'no-server-signal' ? { signal: 'SIGTERM' } : {}),
+            ...(listing === 'no-server-killed' ? { killed: true } : {}),
+            ...(listing === 'no-server-timeout' ? { code: 'ETIMEDOUT' } : {}),
+          });
+        }
+        if (listing === 'failed') throw new Error('Fixture pane listing unavailable');
+        return listing === 'empty'
+          ? ''
+          : listing === 'other-live'
+            ? valid('codeman-other', '123')
+            : listing === 'own-live'
+              ? valid(record.muxName, '700')
+              : listing === 'own-dead'
+                ? [record.muxName, '700', '1', '1', ''].join(sep) + '\n'
+                : listing === 'malformed'
+                  ? 'not-a-pane-frame\n'
+                  : listing === 'truncated'
+                    ? 'x'.repeat(600 * 1024)
+                    : listing === 'invalid-exit'
+                      ? [record.muxName, '700', '0', '0', ''].join(sep) + '\n'
+                      : listing === 'invalid-pid'
+                        ? valid(record.muxName, '700junk')
+                        : listing === 'nul-name'
+                          ? valid('codeman-other\0', '123')
+                          : listing === 'control-name'
+                            ? valid('codeman-other\t', '123')
+                            : listing === 'missing-final-newline'
+                              ? valid('codeman-other', '123').slice(0, -1)
+                              : listing === 'blank-line'
+                                ? valid('codeman-other', '123') + '\n'
+                                : valid('codeman-other', '123').replace(/\n$/, '\r\n');
+      });
+      const died = vi.fn();
+      manager.on('sessionDied', died);
+      const result = await manager.reconcileSessions();
+      const absent = listing === 'empty' || listing === 'other-live' || listing === 'no-server';
+      expect(manager.getSession(ID)).toBe(absent ? undefined : record);
+      if (absent) {
+        expect(result.dead).toContain(ID);
+        expect(died).toHaveBeenCalledExactlyOnceWith({ sessionId: ID });
+      } else {
+        expect(result.dead).not.toContain(ID);
+        expect(died).not.toHaveBeenCalled();
+        expect(record.pid).toBe(listing === 'own-live' || listing === 'own-dead' ? 700 : 0);
+        if (kind === 'codex') {
+          expect(record.codexRestoreUncertain).toBe(true);
+          expect(record.codexRestoreConfig).toEqual(config);
+          expect(record.recoveryCodexHome).toBe(home);
+        } else expect(record.restoreUncertain).toBe(true);
       }
-      if (listing === 'failed') throw new Error('Fixture pane listing unavailable');
-      return listing === 'empty'
-        ? ''
-        : listing === 'other-live'
-          ? valid('codeman-other', '123')
-          : listing === 'own-live'
-            ? valid(record.muxName, '700')
-            : listing === 'malformed'
-              ? 'not-a-pane-frame\n'
-              : listing === 'truncated'
-                ? 'x'.repeat(600 * 1024)
-                : listing === 'invalid-exit'
-                  ? [record.muxName, '700', '0', '0', ''].join(sep) + '\n'
-                  : listing === 'invalid-pid'
-                    ? valid(record.muxName, '700junk')
-                    : listing === 'nul-name'
-                      ? valid('codeman-other\0', '123')
-                      : listing === 'control-name'
-                        ? valid('codeman-other\t', '123')
-                        : listing === 'missing-final-newline'
-                          ? valid('codeman-other', '123').slice(0, -1)
-                          : listing === 'blank-line'
-                            ? valid('codeman-other', '123') + '\n'
-                            : valid('codeman-other', '123').replace(/\n$/, '\r\n');
-    });
-    const died = vi.fn();
-    manager.on('sessionDied', died);
-    const result = await manager.reconcileSessions();
-    const absent = listing === 'empty' || listing === 'other-live' || listing === 'no-server';
-    expect(manager.getSession(ID)).toBe(absent ? undefined : record);
-    if (absent) {
-      expect(result.dead).toContain(ID);
-      expect(died).toHaveBeenCalledExactlyOnceWith({ sessionId: ID });
-    } else {
-      expect(result.dead).not.toContain(ID);
-      expect(died).not.toHaveBeenCalled();
-      expect(record.pid).toBe(listing === 'own-live' ? 700 : 0);
-      expect(record.codexRestoreUncertain).toBe(true);
-      expect(record.codexRestoreConfig).toEqual(config);
-      expect(record.recoveryCodexHome).toBe(home);
+      await manager.flushSessionsDurably();
+      const persisted = JSON.parse(readFileSync(metadata, 'utf8')) as MuxSession[];
+      expect(persisted.some((saved) => saved.sessionId === ID)).toBe(!absent);
+      expect(effects.sync.mock.calls).toHaveLength(1);
     }
-    await manager.flushSessionsDurably();
-    const persisted = JSON.parse(readFileSync(metadata, 'utf8')) as MuxSession[];
-    expect(persisted.some((saved) => saved.sessionId === ID)).toBe(!absent);
-    expect(effects.sync.mock.calls).toHaveLength(1);
-  });
+  );
 
   it.each(['failed', 'malformed', 'truncated', 'healthy', 'absent'] as const)(
     'rebuilds a completed bound worker for inspection without pruning history after a %s listing',
