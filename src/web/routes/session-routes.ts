@@ -1819,11 +1819,11 @@ export function registerSessionRoutes(
     const inputAbort = abortOnClientHangUp(reply);
 
     const inputStr = String(input);
-    if (inputStr.length > MAX_INPUT_LENGTH) {
-      return createErrorResponse(
-        ApiErrorCode.INVALID_INPUT,
-        `Input exceeds maximum length (${MAX_INPUT_LENGTH} bytes)`
-      );
+    if (Buffer.byteLength(inputStr, 'utf8') > MAX_INPUT_LENGTH) {
+      return reply.code(413).send({
+        ...createErrorResponse(ApiErrorCode.INVALID_INPUT, `Input exceeds maximum length (${MAX_INPUT_LENGTH} bytes)`),
+        notSent: true,
+      });
     }
 
     // Send-and-wait (agent orchestration). This has to be ONE endpoint rather than a

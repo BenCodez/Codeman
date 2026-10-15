@@ -29,6 +29,18 @@ import { writeCustomModelHosts, type CustomModelHost } from '../../src/custom-mo
 import { customModelConfigDir } from '../../src/custom-model-injection-apply.js';
 import { createUser, deleteUser, updateUser, findUser, invalidateUsersCache } from '../../src/user-store.js';
 
+const syncProfileProbe = vi.hoisted(() => ({ path: '', calls: 0 }));
+vi.mock('node:fs', async (original) => {
+  const actual = await original<typeof import('node:fs')>();
+  return {
+    ...actual,
+    existsSync: (path: Parameters<typeof actual.existsSync>[0]) => {
+      if (String(path) === syncProfileProbe.path) syncProfileProbe.calls++;
+      return actual.existsSync(path);
+    },
+  };
+});
+
 /** Set per test: whether the mocked `startInteractive()` rejects. */
 let startShouldThrow = false;
 let startBarrier: Promise<void> | undefined;
@@ -161,6 +173,8 @@ async function createHarness(ctx: ReturnType<typeof createMockRouteContext>): Pr
 }
 
 beforeEach(() => {
+  syncProfileProbe.path = '';
+  syncProfileProbe.calls = 0;
   startShouldThrow = false;
   startBarrier = undefined;
   afterGuardPrepare = undefined;
@@ -177,6 +191,80 @@ afterEach(async () => {
 });
 
 describe('a rebuild that fails after the session is registered', () => {
+  it.each(['unreadable', 'cancelled', 'healthy'] as const)(
+    'waits for an actual asynchronous profile preflight: %s',
+    async (outcome) => {
+      const endpoint: CustomModelHost = {
+        id: 'async-preflight-endpoint',
+        label: 'Fixture',
+        baseUrl: 'http://endpoint.invalid',
+        apiKey: 'fixture-key',
+        models: ['fixture-model'],
+      };
+      await writeCustomModelHosts(getDataDir(), [endpoint]);
+      const entry = offerEntry(`async-profile-${outcome}`),
+        profile = customModelConfigDir(entry.sessionId);
+      (entry.state as unknown as Record<string, unknown>).__customModel = {
+        endpointId: endpoint.id,
+        modelId: 'fixture-model',
+        envKeys: ['CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY'],
+        configDir: profile,
+      };
+      const historical = structuredClone(entry.state);
+      syncProfileProbe.path = profile;
+      await rebootRestoreRegistry.set([entry]);
+      const ctx = createMockRouteContext({ workspaceHooksEnabled: false }),
+        app = await createHarness(ctx);
+      let entered!: () => void,
+        release!: () => void,
+        held = false;
+      const at = new Promise<void>((resolve) => {
+          entered = resolve;
+        }),
+        barrier = new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      const lstat = fs.lstat.bind(fs);
+      const lookup = vi.spyOn(fs, 'lstat').mockImplementation(async (path, ...args) => {
+        if (!held && String(path) === profile) {
+          held = true;
+          entered();
+          await barrier;
+          if (outcome === 'unreadable') throw Object.assign(Error('Profile unavailable'), { code: 'EACCES' });
+        }
+        return lstat(path, ...args);
+      });
+      try {
+        const response = app
+          .inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })
+          .then((value) => value);
+        await Promise.race([
+          at,
+          response.then(() => {
+            throw Error('Restore completed without awaiting the async profile preflight');
+          }),
+        ]);
+        expect(syncProfileProbe.calls).toBe(0);
+        expect(callOrder).not.toContain('startInteractive');
+        expect(ctx.addSession).not.toHaveBeenCalled();
+        if (outcome === 'cancelled') await rebootRestoreRegistry.clear(() => true);
+        release();
+        const result = (await response).json().data;
+        expect(result.restored).toHaveLength(outcome === 'healthy' ? 1 : 0);
+        expect(callOrder.filter((value) => value === 'launchAccepted')).toHaveLength(outcome === 'healthy' ? 1 : 0);
+        expect(entry.state).toEqual(historical);
+        if (outcome !== 'healthy') {
+          expect(ctx.addSession).not.toHaveBeenCalled();
+          expect(ctx.discardPartiallyBuiltSession).not.toHaveBeenCalled();
+          await expect(fs.lstat(profile)).rejects.toMatchObject({ code: 'ENOENT' });
+        }
+      } finally {
+        release();
+        lookup.mockRestore();
+        await app.close();
+      }
+    }
+  );
   it('restores Claude without depending on the Codex recovery journal', async () => {
     await rebootRestoreRegistry.set([offerEntry('claude-with-full-codex-journal')]);
     const ctx = createMockRouteContext({ workspaceHooksEnabled: false });
@@ -806,12 +894,11 @@ describe('Codex reboot launch and cancellation', () => {
         } else {
           expect(result.restored).toEqual([]);
           expect(result.skipped).toEqual([{ sessionId: 'codex-original', reason: 'rebuild-failed' }]);
-          // Construction is tentative; the final launch guard refuses before dispatch.
-          expect(ctx.discardPartiallyBuiltSession).toHaveBeenCalledWith(
-            'codex-original',
-            expect.objectContaining({ codexRestoreWorkerMayExist: false }),
-            { preserveCustomModelConfigDir: true }
-          );
+          // The async profile preflight now refuses a missing grant before any
+          // profile writes or tentative Session construction.
+          expect(launchConfigs).toEqual([]);
+          expect(ctx.addSession).not.toHaveBeenCalled();
+          expect(ctx.discardPartiallyBuiltSession).not.toHaveBeenCalled();
           expect(ctx.sessions.has('codex-original')).toBe(false);
           expect(rebootRestoreRegistry.list(() => true)).toEqual([entry]);
           expect(ctx.persistRebootRestoreDurably).not.toHaveBeenCalled();

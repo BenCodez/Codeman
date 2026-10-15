@@ -18,10 +18,12 @@ const io = vi.hoisted(() => ({
   commits: 0,
   temporary: '',
   primaryCloses: 0,
+  onStage: undefined as ((stage: string) => void) | undefined,
 }));
 vi.mock('node:fs/promises', async (original) => {
   const real = await original<typeof import('node:fs/promises')>();
   const pause = async (stage: string) => {
+    io.onStage?.(stage);
     if (io.stage !== stage) return;
     io.stage = '';
     io.entered?.();
@@ -62,7 +64,13 @@ vi.mock('node:fs/promises', async (original) => {
                   io.failure = '';
                   throw io.error;
                 }
-              } else if (candidate) await pause('file-sync');
+              } else if (candidate) {
+                await pause('file-sync');
+                if (io.failure === 'file-sync') {
+                  io.failure = '';
+                  throw io.error;
+                }
+              }
               return target.sync();
             };
           if (key === 'close')
@@ -134,12 +142,14 @@ beforeEach(() => {
   io.directorySyncs = 0;
   io.entered = undefined;
   io.held = undefined;
+  io.onStage = undefined;
 });
 afterEach(async () => {
   release?.();
   release = undefined;
   io.stage = '';
   io.failure = '';
+  io.onStage = undefined;
   // Baseline compatibility is cleanup-only, so the old synchronous method can
   // fail the causal barrier test without a missing-new-API teardown error.
   const drain = Reflect.get(store, 'flushAllAsync') as (() => Promise<void>) | undefined;
@@ -174,6 +184,174 @@ async function reached(entered: Promise<void>, operation: Promise<unknown>) {
 function reload() {
   return new StateStore(path);
 }
+
+function seedUnrelatedState() {
+  store.setSession(OTHER, { ...historical, id: OTHER, name: 'Unrelated historical session' });
+  store.setTask('unrelated-task', {
+    id: 'unrelated-task',
+    prompt: 'Owner task',
+    workingDir: '/fixture/work',
+    priority: 0,
+    dependencies: [],
+    status: 'pending',
+    assignedSessionId: null,
+    createdAt: 1,
+    startedAt: null,
+    completedAt: null,
+    output: '',
+    error: null,
+  });
+  store.flush();
+}
+
+function editUnrelatedState(kind: 'session' | 'config' | 'task') {
+  if (kind === 'session') store.getSession(OTHER)!.name = 'Unrelated concurrent owner edit';
+  if (kind === 'config') store.getConfig().pollIntervalMs += 1000;
+  if (kind === 'task') store.getTask('unrelated-task')!.output = 'Unrelated concurrent task edit';
+  store.save();
+}
+
+it.each(
+  ['file-sync', 'rename', 'directory-sync', 'directory-close'].flatMap((stage) =>
+    (['session', 'config', 'task'] as const).map((kind) => ({ stage, kind }))
+  )
+)(
+  'durably includes a same-object $kind edit during $stage before ACK, even with ordinary writes held',
+  async ({ stage, kind }) => {
+    seedUnrelatedState();
+    const entered = hold(stage);
+    const committing = store.persistSessionDurably(ID, tentative());
+    await reached(entered, committing);
+    editUnrelatedState(kind);
+    const expected = structuredClone(store.getState());
+    expected.sessions[ID] = tentative();
+    const releaseCandidate = release!;
+    // An ordinary save must not repair stale durable bytes before this assertion.
+    // The new strict transaction may make this queued write unnecessary entirely.
+    hold('ordinary-write');
+    const ordinary = store.saveNowAsync();
+    releaseCandidate();
+    try {
+      await committing;
+      expect(JSON.parse(fs.readFileSync(path, 'utf8'))).toEqual(expected);
+      expect(store.getState()).toEqual(expected);
+      expect(reload().getState()).toEqual(expected);
+    } finally {
+      release!();
+      await ordinary;
+    }
+  }
+);
+
+it.each(['file-sync', 'directory-sync'])(
+  'bounds continuous unrelated edits during %s and refuses success with historical owner bytes intact',
+  async (stage) => {
+    const previous = fs.readFileSync(path, 'utf8');
+    let edits = 0;
+    io.onStage = (current) => {
+      if (current === stage) {
+        edits++;
+        store.setConfig({ pollIntervalMs: 1000 + edits });
+      }
+    };
+    await expect(store.persistSessionDurably(ID, tentative())).rejects.toThrow('Concurrent state edit');
+    io.onStage = undefined;
+    expect(edits).toBeGreaterThanOrEqual(3);
+    expect(io.writes).toBeLessThanOrEqual(stage === 'file-sync' ? 3 : 6);
+    expect(store.getSession(ID)).toEqual(historical);
+    expect(fs.readFileSync(path, 'utf8')).toBe(previous);
+    expect(Reflect.get(store, 'dirty')).toBe(true);
+    expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(false);
+    // The bounded refusal releases the shared queue; ordinary saves preserve
+    // the latest unrelated intent without publishing a restored worker.
+    await store.saveNowAsync();
+    expect(reload().getConfig().pollIntervalMs).toBe(1000 + edits);
+    expect(reload().getSession(ID)).toEqual(historical);
+  }
+);
+
+it.each(['owner', 'producer', 'cancel', 'equal-replacement'] as const)(
+  'does not adopt a changed %s anchor while restaging a concurrent unrelated edit',
+  async (change) => {
+    const previous = fs.readFileSync(path, 'utf8');
+    const first = hold('file-sync');
+    let record = tentative(),
+      current = true;
+    const committing = store.persistSessionDurably(
+      ID,
+      () => record,
+      () => current
+    );
+    const rejected = expect(committing).rejects.toThrow('cancelled');
+    await reached(first, committing);
+    store.setConfig({ pollIntervalMs: 12345 });
+    const releaseFirst = release!;
+    const second = hold('rollback-write');
+    releaseFirst();
+    await reached(second, committing);
+    if (change === 'owner') store.getSession(ID)!.owner = 'new-owner';
+    if (change === 'producer') record = { ...record, owner: 'new-owner' };
+    if (change === 'cancel') current = false;
+    if (change === 'equal-replacement') store.setSession(ID, structuredClone(historical));
+    const expected = structuredClone(store.getSession(ID));
+    release!();
+    await rejected;
+    expect(store.getSession(ID)).toEqual(expected);
+    expect(fs.readFileSync(path, 'utf8')).toBe(previous);
+    expect(io.commits).toBe(0);
+    await store.saveNowAsync();
+    expect(reload().getSession(ID)).toEqual(expected);
+    expect(reload().getConfig().pollIntervalMs).toBe(12345);
+  }
+);
+
+it.each(['write', 'file-sync', 'rename-ack', 'directory-sync'])(
+  'never retries a real %s error as a concurrent snapshot edit',
+  async (fault) => {
+    const previous = fs.readFileSync(path, 'utf8');
+    const entered = hold(fault === 'write' ? 'write' : fault === 'file-sync' ? 'file-sync' : 'rename');
+    io.failure = fault;
+    const committing = store.persistSessionDurably(ID, tentative());
+    const rejected = expect(committing).rejects.toBe(io.error);
+    await reached(entered, committing);
+    store.setConfig({ pollIntervalMs: 12345 });
+    release!();
+    await rejected;
+    expect(io.writes).toBe(fault === 'write' || fault === 'file-sync' ? 1 : 2);
+    expect(store.getSession(ID)).toEqual(historical);
+    expect(fs.readFileSync(path, 'utf8')).toBe(previous);
+    await store.saveNowAsync();
+    expect(reload().getSession(ID)).toEqual(historical);
+    expect(reload().getConfig().pollIntervalMs).toBe(12345);
+  }
+);
+
+it.each(['write', 'directory-sync'])(
+  'does not retry a changed snapshot after a rollback %s acknowledgement fails',
+  async (fault) => {
+    const entered = hold('directory-sync');
+    const committing = store.persistSessionDurably(ID, tentative());
+    const rejected = expect(committing).rejects.toThrow('uncertain durable commit');
+    await reached(entered, committing);
+    store.setConfig({ pollIntervalMs: 12345 });
+    io.onStage = (stage) => {
+      if (fault === 'write' && stage === 'rollback-write') throw io.error;
+      if (fault === 'directory-sync' && stage === 'directory-sync' && io.directorySyncs === 2) throw io.error;
+    };
+    release!();
+    await rejected;
+    io.onStage = undefined;
+    expect(io.writes).toBe(2);
+    expect(io.commits).toBe(fault === 'write' ? 1 : 2);
+    expect(store.getSession(ID)).toEqual(historical);
+    if (fault === 'write') {
+      expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(true);
+      const uncertain = fs.readFileSync(path, 'utf8');
+      await store.saveNowAsync();
+      expect(fs.readFileSync(path, 'utf8')).toBe(uncertain);
+    } else expect(reload().getSession(ID)).toEqual(historical);
+  }
+);
 
 it.each(['open', 'write', 'file-sync', 'close', 'rename', 'directory-sync', 'directory-close', 'success-cleanup'])(
   'keeps the event loop responsive and historical memory until asynchronous %s acknowledges',
