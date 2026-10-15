@@ -8,6 +8,7 @@ import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
 import type { RecoveryFlight } from '../src/recovery/types.js';
 import { resolveCodexIdentity } from '../src/recovery/codex-identity.js';
+import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 
 const NOW = Date.UTC(2026, 9, 13, 12);
 const THREAD = '11111111-2222-3333-4444-555555555555';
@@ -44,10 +45,20 @@ for (const action of ['continue', 'restart'] as const) {
       status: action === 'restart' ? 1 : undefined,
       signal: undefined,
       screen: action === 'restart' ? null : '›\n  fixture-model default · /tmp\n',
+      inputProvenance: fakeInputProvenance(
+        { closed: action === 'restart', exitStatus: action === 'restart' ? 1 : undefined },
+        home
+      ),
     };
     let reads = 0;
     const mux = {
       isAvailable: () => true,
+      getCodexInputAuthority: (_id: string, proof: typeof pane.inputProvenance) => ({
+        sessionId: SESSION,
+        incarnation: proof.incarnation,
+        directory: '/fake-private-broker',
+        proof,
+      }),
       inspectPaneForRecovery: vi.fn(async () => {
         if (++reads === 3 && !['unchanged', 'unrelated-existing'].includes(change)) {
           const additions: Record<string, string> = {
@@ -89,6 +100,7 @@ for (const action of ['continue', 'restart'] as const) {
         }
         return { ...pane };
       }),
+      inspectCodexInputProvenance: vi.fn(async () => pane.inputProvenance),
       sendInput: vi.fn(async () => true),
       respawnPane: vi.fn(async () => 99999),
       clearPaneExit: vi.fn(),
@@ -96,7 +108,7 @@ for (const action of ['continue', 'restart'] as const) {
     const muxSession: MuxSession = {
       sessionId: SESSION,
       muxName: 'codeman-aaaaaaaa',
-      pid: 99999,
+      pid: 700,
       createdAt: NOW,
       workingDir: work,
       mode: 'codex',
@@ -197,6 +209,7 @@ for (const action of ['continue', 'restart'] as const) {
               status: 1,
               signal: undefined,
               paneSignalToken: undefined,
+              inputProvenance: pane.inputProvenance,
             },
             codexConfig: expect.objectContaining({
               noDaemon: true,

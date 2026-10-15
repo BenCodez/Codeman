@@ -57,13 +57,18 @@ export function resolveTmuxSocketName(): string {
 
 let _ensured = false;
 
+/** Resolve this instance's data path without touching the filesystem. */
+export function getDataDirPath(): string {
+  return process.env.CODEMAN_DATA_DIR || join(homedir(), `.codeman${INSTANCE_SUFFIX}`);
+}
+
 /**
  * Absolute path to this instance's data directory (created on first use). All
  * persisted state (`state.json`, `mux-sessions.json`, settings, push keys,
  * lifecycle log, screenshots, certs, …) lives here.
  */
 export function getDataDir(): string {
-  const dir = process.env.CODEMAN_DATA_DIR || join(homedir(), `.codeman${INSTANCE_SUFFIX}`);
+  const dir = getDataDirPath();
   if (!_ensured) {
     try {
       mkdirSync(dir, { recursive: true });

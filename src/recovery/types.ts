@@ -42,7 +42,10 @@ export type RecoveryAction = 'continue' | 'restart';
 /** Pure current owner authority plus a fresh issuer evidence check at each effect boundary. */
 export interface RecoveryEvidenceSource {
   sessionId: string;
+  inputBroker?: import('./codex-input-broker.js').BrokerAuthority;
   identity: CodexIdentityResult;
+  /** Related broker/grant evidence must share the rollout's final read barrier. */
+  files?: readonly import('./private-file-witness.js').PrivateFileWitness[];
   isCurrent(): boolean;
 }
 export function isRecoveryEvidenceSourceCurrent(source: RecoveryEvidenceSource): boolean {
@@ -62,6 +65,8 @@ export type RecoveryEvidenceGuard = (() => boolean | Promise<boolean>) & {
   getEvidenceSource?: () => RecoveryEvidenceSource | undefined;
 };
 export type RecoveryActionAuthority = (() => boolean) & {
+  getActionDeadline?: () => number;
+  getInputIssuer?: () => import('./codex-input-broker.js').BrokerAuthority | undefined;
   prepareEvidence?: (source?: RecoveryEvidenceSource) => Promise<boolean>;
 };
 

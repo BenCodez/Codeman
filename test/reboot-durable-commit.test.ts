@@ -222,7 +222,10 @@ it.each(['state-file', 'state-directory', 'mux-file', 'mux-directory', 'mux-clea
     expect(result.restored).toEqual([]);
     expect(result.skipped).toEqual([{ sessionId: f.id, reason: 'restore-uncertain' }]);
     expect(offers()).toHaveLength(1);
-    expect(offers()[0].state).toEqual(f.state);
+    // The private offer binds proven legacy absence; the historical session
+    // snapshot and its original disk bytes must remain untouched.
+    expect(offers()[0].state).toEqual({ ...f.state, __codexPriorInputBroker: null });
+    expect(f.state).not.toHaveProperty('__codexPriorInputBroker');
     expect(fs.readFileSync(dataPath('state.json'), 'utf8')).toBe(f.historical);
     expect(f.store.getSession(f.id)).toEqual(f.state);
     expect(kill).not.toHaveBeenCalled();

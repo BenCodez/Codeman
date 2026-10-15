@@ -42,6 +42,7 @@ import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { hostname as getHostname, uptime as osUptime } from 'node:os';
 import { looksLikeHostReboot, newestPersistedActivity, planVerifiedRebootRestore } from '../reboot-restore.js';
+import { captureRebootBrokerBindings } from '../recovery/reboot-launch-witness.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
 import { writeRebootIdentityFence } from '../recovery/reboot-identity-fence.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
@@ -1361,6 +1362,19 @@ export class WebServer extends EventEmitter {
     // See session-manager.updateSessionState: __envOverrides is an internal disk-only
     // field kept off SessionState to avoid leaking via API broadcasts.
     const base = session.toState();
+    const native = this.mux.getSession(session.id);
+    const previousBroker = (
+      this.store.getSession(session.id) as (SessionState & { __codexInputBroker?: unknown }) | null
+    )?.__codexInputBroker;
+    const brokerBinding = native
+      ? native.sessionId === session.id &&
+        native.mode === 'codex' &&
+        native.owner === session.owner &&
+        native.workingDir === session.workingDir &&
+        native.recoveryCodexHome === session.getRecoveryContext().codexHome
+        ? (native.recoveryInputBroker ?? null)
+        : 'unknown'
+      : (previousBroker ?? null);
     const envOverrides = session.getEnvOverridesForPersist();
     // __attachmentHistory keeps the private (externalPath-bearing) history on disk,
     // separate from the sanitized public attachmentHistory in toState().
@@ -1380,6 +1394,7 @@ export class WebServer extends EventEmitter {
             },
           }
         : {}),
+      ...(getCli(session.mode)?.capabilities.recovery === 'codex-rollout' ? { __codexInputBroker: brokerBinding } : {}),
       ...(session.getRecoveryContext().codexHome
         ? { __codexRecoveryHome: session.getRecoveryContext().codexHome }
         : {}),
@@ -3439,7 +3454,11 @@ export class WebServer extends EventEmitter {
    *
    * @returns how many sessions are on offer.
    */
-  private async planRebootRestoreOffer(dead: string[], livePaneCount: number): Promise<number> {
+  private async planRebootRestoreOffer(
+    dead: string[],
+    livePaneCount: number,
+    bindings?: ReadonlyMap<string, string | null>
+  ): Promise<number> {
     rebootRestoreRegistry.configurePersistence(join(getDataDir(), 'reboot-restore-offer.json'));
     if (dead.length === 0) return 0;
 
@@ -3456,8 +3475,11 @@ export class WebServer extends EventEmitter {
       return 0;
     }
 
-    const { restore, skipped } = await planVerifiedRebootRestore(dead, persisted, (workingDir) =>
-      existsSync(workingDir)
+    const { restore, skipped } = await planVerifiedRebootRestore(
+      dead,
+      persisted,
+      (workingDir) => existsSync(workingDir),
+      bindings
     );
     if (skipped.length > 0) {
       console.log(`[Server] Reboot restore is passing over ${skipped.length} dead session(s):`);
@@ -3589,10 +3611,15 @@ export class WebServer extends EventEmitter {
     const ownsCleanupFence = !this.cleaningUp.has(sessionId);
     this.cleaningUp.add(sessionId);
     session.markClosing(true);
+    if (session.codexRestoreWorkerMayExist) {
+      this.tentativeSessionRegistrations.add(session);
+      this.persistDeb.cancelKey(sessionId);
+    }
     try {
       await this.stopRecoveryController(sessionId, false);
       if (this.sessions.get(sessionId) !== session) return;
-      if (options?.retainForInspection && options.preserveMuxPane && session.codexRestoreWorkerMayExist) {
+      if (session.codexRestoreWorkerMayExist) {
+        this.tentativeSessionRegistrations.add(session);
         session.adoptUncertainCodexRestore();
         this.persistDeb.cancelKey(sessionId);
         // Keep tentative protection: the historical state record must remain intact.
@@ -3683,6 +3710,8 @@ export class WebServer extends EventEmitter {
 
   private async restoreMuxSessions(): Promise<boolean> {
     try {
+      // Capture durable prior broker bindings before reconciliation removes dead rows.
+      const priorBrokerBindings = await captureRebootBrokerBindings(this.store.getSessions());
       // Reconcile mux sessions to find which ones are still alive (also discovers unknown ones)
       const { alive, dead, discovered } = await this.mux.reconcileSessions();
 
@@ -3728,7 +3757,7 @@ export class WebServer extends EventEmitter {
       // failure of the thing it is supposed to help. An offer nobody gets is the
       // correct way for this to fail.
       try {
-        await this.planRebootRestoreOffer(dead, alive.length);
+        await this.planRebootRestoreOffer(dead, alive.length, priorBrokerBindings ?? new Map());
       } catch (err) {
         console.error('[Server] Building the reboot-restore offer failed; continuing recovery:', err);
       }

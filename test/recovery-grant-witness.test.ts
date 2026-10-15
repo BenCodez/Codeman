@@ -41,7 +41,7 @@ afterEach(() => {
   rmSync(directory, { recursive: true, force: true });
 });
 
-describe('final synchronous owner grant witness', () => {
+describe('pure owner grant authority and bounded private disk witness', () => {
   it('uses the current disk grant even while ordinary authentication has a warm older cache', async () => {
     expect(await grants.canUsernameRunPrivilegedCommands(owner)).toBe(true);
     replace([account({ canBypassPermissions: false })]);
@@ -66,7 +66,10 @@ describe('final synchronous owner grant witness', () => {
       if (change === 'deleted') replace([]);
       if (change === 'mode-change') process.env.CODEMAN_MULTIUSER = '0';
       if (change === 'malformed') writeFileSync(dataPath('users.json'), '{malformed-fixture}');
-      expect(grant.isCurrent()).toBe(false);
+      const knownMemoryChange = change === 'cache-revoke' || change === 'mode-change';
+      expect(grant.isCurrent()).toBe(!knownMemoryChange);
+      expect(await grant.verifyCurrent()).toBe(false);
+      expect(grant.getFileWitness()).toEqual(grant.fileWitness);
     }
   );
 
@@ -89,6 +92,8 @@ describe('final synchronous owner grant witness', () => {
     const grant = await grants.prepareRecoveryPrivilegeGrant(undefined);
     expect(grant.privileged).toBe(true);
     expect(grant.isCurrent()).toBe(true);
+    expect(grant.getFileWitness()).toBeUndefined();
+    expect(await grant.verifyCurrent()).toBe(true);
     process.env.CODEMAN_MULTIUSER = '1';
     expect(grant.isCurrent()).toBe(false);
     const unowned = await grants.prepareRecoveryPrivilegeGrant(undefined);

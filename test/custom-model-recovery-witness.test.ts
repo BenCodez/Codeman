@@ -26,7 +26,7 @@ it.skipIf(process.platform === 'win32').each(['store', 'config'] as const)(
       const recovery = pathToFileURL(join(process.cwd(), 'src/custom-model-recovery.ts')).href;
       const script = `
       import { captureCustomModelRecoveryWitness } from ${JSON.stringify(recovery)};
-      const result = captureCustomModelRecoveryWitness('codex', 'fixture-worker', {
+      const result = await captureCustomModelRecoveryWitness('codex', 'fixture-worker', {
         endpointId: 'fixture-endpoint', modelId: 'fixture-model', envKeys: ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY']
       }, { CODEX_HOME: ${JSON.stringify(configDir)}, CODEMAN_CUSTOM_MODEL_API_KEY: 'local-dummy-key' });
       if (result !== undefined) throw new Error('Nonregular evidence unexpectedly authorized a launch');
