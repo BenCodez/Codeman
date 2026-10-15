@@ -885,7 +885,7 @@ async function rotateRemoteCodexBroker(
   let reservationAttempted = false;
   try {
     assertExactRemoteResume(request);
-    if (!currentRemoteAuthority(authority)) return 'not-sent';
+    if ((await authority.check()) !== true || !currentRemoteAuthority(authority)) return 'not-sent';
     const command = buildRemoteCodexPaneCommand({
       remotePath: remote.remotePath,
       sessionId: request.sessionId,

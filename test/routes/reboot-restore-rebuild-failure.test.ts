@@ -76,6 +76,10 @@ vi.mock('../../src/session.js', () => ({
         if (this.restoreGuard.isCurrent?.() !== true) throw new Error('Reboot restoration authority changed');
       }
       if (this.profileGuard) {
+        // The real Session wrapper checks the unprepared route scope first.
+        // A guard that requires its own prepare result here can never start.
+        if (!this.profileGuard.isCurrent()) throw new Error('Restore scope changed before prepare');
+        if ((await this.profileGuard.confirm()) !== false) throw new Error('Unprepared restore authorized');
         await this.profileGuard.prepare();
         await afterGuardPrepare?.();
         if ((await this.profileGuard.confirm()) !== true || !this.profileGuard.isCurrent())
