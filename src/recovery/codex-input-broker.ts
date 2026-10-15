@@ -2,7 +2,7 @@
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join, isAbsolute, normalize } from 'node:path';
 import { CODEX_INPUT_BROKER_SOURCE } from './codex-input-broker-source.js';
 import { parseNativePaneSignal } from './native-pane-signal.js';
 import type { CodexIdentityWitness } from './codex-identity.js';
@@ -385,18 +385,56 @@ export class CodexInputBroker {
     broker.ready = state.startup.status === 'started' && state.childPid > 0;
     return broker;
   }
-  static async create(root: string, sessionId: string, command: string, codexHome = ''): Promise<CodexInputBroker> {
+  /** durableParent is an existing canonical private creation boundary, never discovered after mkdir. */
+  static async create(
+    root: string,
+    sessionId: string,
+    command: string,
+    codexHome = '',
+    durableParent = dirname(root)
+  ): Promise<CodexInputBroker> {
     if (!UUID.test(sessionId) || !command || Buffer.byteLength(command) > 65_536)
       throw new Error('Invalid broker launch');
     const { config } = CodexInputBroker.provisioningMaterial(sessionId, command, codexHome);
     const serialized = JSON.stringify(config);
+    if (
+      !isAbsolute(root) ||
+      normalize(root) !== root ||
+      root.includes('\0') ||
+      !isAbsolute(durableParent) ||
+      normalize(durableParent) !== durableParent ||
+      durableParent === '/' ||
+      !root.startsWith(`${durableParent}/`) ||
+      (await fs.realpath(durableParent)) !== durableParent
+    )
+      throw new Error('Broker parent durability boundary is unverified');
+    const parents: string[] = [];
+    for (let path = root; ; path = dirname(path)) {
+      parents.push(path);
+      if (path === durableParent) break;
+      if (parents.length >= 32) throw new Error('Broker parent durability boundary is too deep');
+    }
     await fs.mkdir(root, { mode: 0o700, recursive: true });
+    for (const path of parents) {
+      const stat = await fs.lstat(path);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error('Broker parent is not a private directory');
+    }
     const directory = join(root, config.incarnation);
     await fs.mkdir(directory, { mode: 0o700 });
     await fs.writeFile(join(directory, 'broker.py'), CODEX_INPUT_BROKER_SOURCE, { mode: 0o600, flag: 'wx' });
     await fs.writeFile(join(directory, 'config.json'), serialized, { mode: 0o600, flag: 'wx' });
     await fs.writeFile(join(directory, 'lock'), '', { mode: 0o600, flag: 'wx' });
-    for (const path of [join(directory, 'broker.py'), join(directory, 'config.json'), directory, root]) {
+    const syncPaths = [
+      join(directory, 'broker.py'),
+      join(directory, 'config.json'),
+      join(directory, 'lock'),
+      directory,
+      root,
+    ];
+    // Always acknowledge the bounded chain, including after a previous attempt
+    // created directories but failed before their parent entries were durable.
+    syncPaths.push(...parents.slice(1));
+    for (const path of syncPaths) {
       const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         await handle.sync();
