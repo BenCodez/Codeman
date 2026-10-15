@@ -220,107 +220,112 @@ describe('Codex supervisor UI in Chromium', () => {
     });
 
     for (const responseFailure of ['lost', 'malformed-json'] as const) {
-      it(`reuses an accepted request after ${responseFailure} and HTTP-origin reload at ${width}px`, async () => {
-        const page = await render(width);
-        const bindings = new Map<string, { workerId: string; action: string }>();
-        const requests: string[] = [];
-        let loseResponse = true;
-        const key = 'codeman:supervisorWorkerRequests:v1';
-        const state = () => ({
-          version: 1,
-          supervisorSessionId: SID,
-          objective: 'Coordinate fixture work',
-          enabled: true,
-          phase: 'active',
-          reason: 'owner-started',
-          startedAt: Date.now(),
-          workers: [
-            {
-              sessionId: WID,
-              task: 'Review fixture',
-              criteria: [{ id: 'review', description: 'Owner reviews', kind: 'manual' }],
-              maxAssignments: 2,
-              maxRuntimeMs: 60000,
-              assignments: bindings.size,
-            },
-          ],
-          handledRequestIds: [...bindings.keys()],
-          handledRequestBindings: [...bindings].map(([requestId, binding]) => ({ requestId, ...binding })),
-          history: [],
-        });
-        try {
-          await page.route(`${fixtureOrigin}/api/**`, async (route) => {
-            const request = route.request();
-            const path = new URL(request.url()).pathname;
-            if (request.method() === 'POST') {
-              expect(path).toBe(`/api/sessions/${SID}/supervisor/workers/${WID}/assign`);
-              expect(request.headers()['x-codeman-supervisor-session']).toBe(SID);
-              const { requestId } = request.postDataJSON();
-              requests.push(requestId);
-              // A fake server records the accepted operation before losing its ACK.
-              // Repeating the exact tuple/ID has no additional effect.
-              const existing = bindings.get(requestId);
-              if (existing) expect(existing).toEqual({ workerId: WID, action: 'assign' });
-              else bindings.set(requestId, { workerId: WID, action: 'assign' });
-              if (loseResponse) {
-                loseResponse = false;
-                if (responseFailure === 'lost') await route.abort('failed');
-                else
-                  await route.fulfill({
-                    status: 200,
-                    contentType: 'application/json',
-                    body: '{incomplete-fixture-json',
-                  });
-                return;
-              }
-            }
-            const data = path.endsWith('/workers')
-              ? [{ sessionId: WID, health: 'idle', stale: false, observedAt: Date.now(), task: { phase: 'watching' } }]
-              : state();
-            await route.fulfill({
-              status: 200,
-              contentType: 'application/json',
-              body: JSON.stringify({ success: true, data }),
-            });
+      it.each(['assign', 'retry'] as const)(
+        `reconciles accepted %s after ${responseFailure} and HTTP-origin reload at ${width}px`,
+        async (action) => {
+          const page = await render(width);
+          const bindings = new Map<string, { workerId: string; action: string }>();
+          const requests: string[] = [];
+          let loseResponse = true;
+          let health = action === 'retry' ? 'dead-pane' : 'idle';
+          const key = 'codeman:supervisorWorkerRequests:v1';
+          const state = () => ({
+            version: 1,
+            supervisorSessionId: SID,
+            objective: 'Coordinate fixture work',
+            enabled: true,
+            phase: 'active',
+            reason: 'owner-started',
+            startedAt: Date.now(),
+            workers: [
+              {
+                sessionId: WID,
+                task: 'Review fixture',
+                criteria: [{ id: 'review', description: 'Owner reviews', kind: 'manual' }],
+                maxAssignments: 2,
+                maxRuntimeMs: 60000,
+                assignments: [...bindings.values()].filter((binding) => binding.action === 'assign').length,
+              },
+            ],
+            handledRequestIds: [...bindings.keys()],
+            handledRequestBindings: [...bindings].map(([requestId, binding]) => ({ requestId, ...binding })),
+            history: [],
           });
-          const useActualHelpers = async () => {
-            await page.addScriptTag({ content: apiHelpers });
-            await page.evaluate(async () => {
-              const app = (window as any).app;
-              delete app._apiJson;
-              await app.loadSupervisorStatus();
-              app.switchOptionsTab('supervisor');
+          try {
+            await page.route(`${fixtureOrigin}/api/**`, async (route) => {
+              const request = route.request();
+              const path = new URL(request.url()).pathname;
+              if (request.method() === 'POST') {
+                expect(path).toBe(`/api/sessions/${SID}/supervisor/workers/${WID}/${action}`);
+                expect(request.headers()['x-codeman-supervisor-session']).toBe(SID);
+                const { requestId } = request.postDataJSON();
+                requests.push(requestId);
+                // A fake server records the accepted operation before losing its ACK.
+                // Repeating the exact tuple/ID has no additional effect.
+                const existing = bindings.get(requestId);
+                if (existing) expect(existing).toEqual({ workerId: WID, action });
+                else bindings.set(requestId, { workerId: WID, action });
+                health = 'working';
+                if (loseResponse) {
+                  loseResponse = false;
+                  if (responseFailure === 'lost') await route.abort('failed');
+                  else
+                    await route.fulfill({
+                      status: 200,
+                      contentType: 'application/json',
+                      body: '{incomplete-fixture-json',
+                    });
+                  return;
+                }
+              }
+              const data = path.endsWith('/workers')
+                ? [{ sessionId: WID, health, stale: false, observedAt: Date.now(), task: { phase: 'watching' } }]
+                : state();
+              await route.fulfill({
+                status: 200,
+                contentType: 'application/json',
+                body: JSON.stringify({ success: true, data }),
+              });
             });
-          };
-          await useActualHelpers();
-          await page.getByRole('button', { name: 'Assign task' }).click();
-          await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);
-          expect(requests).toHaveLength(1);
-          expect(bindings.size).toBe(1);
-          const stored = await page.evaluate((storageKey) => sessionStorage.getItem(storageKey), key);
-          expect(JSON.parse(stored!)).toEqual([
-            { sessionId: SID, workerId: WID, action: 'assign', requestId: requests[0] },
-          ]);
-          await page.reload({ waitUntil: 'domcontentloaded' });
-          expect(await page.evaluate((storageKey) => sessionStorage.getItem(storageKey), key)).toBe(stored);
-          await mount(page);
-          await useActualHelpers();
-          await page.getByRole('button', { name: 'Assign task' }).click();
-          await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);
-          expect(requests).toHaveLength(2);
-          expect(requests[1]).toBe(requests[0]);
-          expect(bindings.size).toBe(1);
-          expect(await page.evaluate((storageKey) => sessionStorage.getItem(storageKey), key)).toBe('[]');
-          // An explicit new owner action after acknowledged acceptance gets a new identity.
-          await page.getByRole('button', { name: 'Assign task' }).click();
-          await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);
-          expect(requests).toHaveLength(3);
-          expect(requests[2]).not.toBe(requests[0]);
-          expect(bindings.size).toBe(2);
-        } finally {
-          await page.close();
+            const useActualHelpers = async () => {
+              await page.addScriptTag({ content: apiHelpers });
+              await page.evaluate(async () => {
+                const app = (window as any).app;
+                delete app._apiJson;
+                await app.loadSupervisorStatus();
+                app.switchOptionsTab('supervisor');
+              });
+            };
+            await useActualHelpers();
+            await page
+              .getByRole('button', { name: action === 'assign' ? 'Assign task' : 'Retry crash', exact: true })
+              .click();
+            await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);
+            expect(requests).toHaveLength(1);
+            expect(bindings.size).toBe(1);
+            const stored = await page.evaluate((storageKey) => sessionStorage.getItem(storageKey), key);
+            expect(JSON.parse(stored!)).toEqual([{ sessionId: SID, workerId: WID, action, requestId: requests[0] }]);
+            // The first retry recovered; a later fresh inspection now reports a second crash.
+            health = action === 'retry' ? 'dead-pane' : 'idle';
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            expect(await page.evaluate((storageKey) => sessionStorage.getItem(storageKey), key)).toBe(stored);
+            await mount(page);
+            await useActualHelpers();
+            expect(await page.evaluate((storageKey) => sessionStorage.getItem(storageKey), key)).toBe('[]');
+            expect(requests).toHaveLength(1);
+            await page
+              .getByRole('button', { name: action === 'assign' ? 'Assign task' : 'Retry crash', exact: true })
+              .click();
+            await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);
+            expect(requests).toHaveLength(2);
+            expect(requests[1]).not.toBe(requests[0]);
+            expect(bindings.size).toBe(2);
+            expect(await page.evaluate((storageKey) => sessionStorage.getItem(storageKey), key)).toBe('[]');
+          } finally {
+            await page.close();
+          }
         }
-      });
+      );
     }
   }
 

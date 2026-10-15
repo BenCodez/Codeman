@@ -164,6 +164,45 @@ describe('owned SSH private broker provisioning', () => {
     return provisionRemoteInputBroker(remote, input, authority(), { root: privateRoot, transport: runner() });
   }
 
+  it('plans the exact remote directory without creating a pane or private files', async () => {
+    const result = await provisionRemoteInputBroker(remote, material, authority(), {
+      root: privateRoot,
+      transport: runner(),
+      planOnly: true,
+    });
+    expect(result).toEqual({ status: 'planned', directory: directory(), incarnation: INCARNATION });
+    await expect(fs.stat(privateRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.stat(environment.FAKE_STATE!)).rejects.toMatchObject({ code: 'ENOENT' });
+    const operations = (await fs.readFile(environment.FAKE_LOG!, 'utf8'))
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(operations).toEqual([['-L', 'codeman-remote', 'has-session', '-t', 'codeman-ssh-aaaaaaaa']]);
+  });
+
+  it.each(['foreign-incarnation', 'uncanonical-directory', 'extra-fields', 'wrong-root'] as const)(
+    'rejects a malformed read-only %s plan before any second provisioning',
+    async (kind) => {
+      const value = { status: 'planned', directory: directory(), incarnation: INCARNATION } as Record<string, unknown>;
+      if (kind === 'foreign-incarnation') value.incarnation = SESSION;
+      if (kind === 'uncanonical-directory') value.directory = privateRoot + '/./' + SESSION + '/' + INCARNATION;
+      if (kind === 'extra-fields') value.pane = {};
+      if (kind === 'wrong-root') value.directory = '/foreign/' + SESSION + '/' + INCARNATION;
+      const run = vi.fn(async () => ({
+        stdout: 'CODEMAN_REMOTE_BROKER_V1:' + Buffer.from(JSON.stringify(value)).toString('base64') + '\n',
+      }));
+      expect(
+        await provisionRemoteInputBroker(remote, material, authority(), {
+          root: privateRoot,
+          transport: { run },
+          planOnly: true,
+        })
+      ).toEqual({ status: 'not-sent' });
+      expect(run).toHaveBeenCalledOnce();
+      await expect(fs.stat(privateRoot)).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+  );
+
   it('provisions a new inert exact pane with private exclusive files and no CLI/input launch', async () => {
     const result = await provision();
     expect(result).toEqual({

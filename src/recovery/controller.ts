@@ -491,7 +491,7 @@ export class RecoveryController {
   }
 
   private stallHandledKey(key: string, progressAt: number, progressEvidenceKey?: string): string {
-    return `stall:${createHash('sha256').update(key).digest('hex')}:${progressEvidenceKey ?? progressAt}`;
+    return `stall:${createHash('sha256').update(key).digest('hex')}:${progressEvidenceKey ? `${progressEvidenceKey}:${progressAt}` : progressAt}`;
   }
 
   private sameStallProgress(
@@ -823,18 +823,25 @@ export class RecoveryController {
       if (
         previousCycles.includes(handledKey) ||
         (previousCycles.length > 0 &&
-          ((observation.progressLowerBound ?? progress) <= (this.state.lastSuccessfulRecovery ?? Infinity) ||
-            previousCycles.some((entry) => {
-              const suffix = entry.slice(prefix.length);
-              if (/^remote:[a-f0-9]{64}$/.test(suffix)) return observation.progressEvidenceKey === undefined;
-              const previousProgress = Number(suffix);
-              return (
-                !Number.isFinite(previousProgress) ||
-                previousProgress <= 0 ||
-                previousProgress > Number.MAX_SAFE_INTEGER ||
-                (observation.progressLowerBound ?? progress) <= previousProgress
-              );
-            })))
+          previousCycles.some((entry) => {
+            const suffix = entry.slice(prefix.length);
+            const remote = /^(remote:[a-f0-9]{64})(?::([0-9]+))?$/.exec(suffix);
+            if (remote) {
+              // Old native-only records have no reserved clock baseline. Retain
+              // their veto; a probe's later acceptance time is never progress.
+              if (!remote[2] || !observation.progressEvidenceKey || observation.progressEvidenceKey === remote[1])
+                return true;
+              const baseline = Number(remote[2]);
+              return !Number.isSafeInteger(baseline) || baseline <= 0 || observation.progressLowerBound! <= baseline;
+            }
+            const previousProgress = Number(suffix);
+            return (
+              !Number.isFinite(previousProgress) ||
+              previousProgress <= 0 ||
+              previousProgress > Number.MAX_SAFE_INTEGER ||
+              (observation.progressLowerBound ?? progress) <= previousProgress
+            );
+          }))
       )
         return;
     }

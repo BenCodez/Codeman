@@ -196,6 +196,26 @@ function supervisorUiAcceptedRequest(state, sessionId, workerId, action, request
     )
   );
 }
+function supervisorUiReconcileRequests(state, sessionId) {
+  if (!supervisorUiStateValid(state, sessionId)) return;
+  try {
+    const records = supervisorUiRequestLedger();
+    const accepted = new Set(
+      state.handledRequestBindings.map((binding) =>
+        JSON.stringify([binding.workerId, binding.action, binding.requestId])
+      )
+    );
+    const pending = records.filter(
+      (record) =>
+        record.sessionId !== sessionId ||
+        !accepted.has(JSON.stringify([record.workerId, record.action, record.requestId]))
+    );
+    if (pending.length !== records.length)
+      sessionStorage.setItem(SUPERVISOR_UI_REQUEST_STORAGE, JSON.stringify(pending));
+  } catch {
+    // Unreadable storage or a failed acknowledgement write must retain pending identities.
+  }
+}
 Object.assign(CodemanApp.prototype, {
   openSupervisorOptions(sessionId) {
     this.closeSupervisorOptions();
@@ -220,6 +240,7 @@ Object.assign(CodemanApp.prototype, {
     if (this._supervisorView !== view) return;
     view.busy = false;
     view.state = supervisorUiStateValid(state, view.sessionId) ? state : null;
+    if (view.state) supervisorUiReconcileRequests(view.state, view.sessionId);
     this._renderSupervisorStatus(true);
     if (view.state?.phase === 'active') await this.loadSupervisorWorkers();
   },
@@ -358,8 +379,10 @@ Object.assign(CodemanApp.prototype, {
     }
     if (this._supervisorView !== view) return;
     view.workersBusy = false;
-    if (supervisorUiStateValid(state, view.sessionId)) view.state = state;
-    else this.showToast(supervisorUiTranslate('Worker action was refused or its delivery is uncertain.'), 'error');
+    if (supervisorUiStateValid(state, view.sessionId)) {
+      view.state = state;
+      supervisorUiReconcileRequests(state, view.sessionId);
+    } else this.showToast(supervisorUiTranslate('Worker action was refused or its delivery is uncertain.'), 'error');
     this._renderSupervisorStatus(true);
     if (view.state?.phase === 'active') await this.loadSupervisorWorkers();
   },
@@ -398,6 +421,7 @@ Object.assign(CodemanApp.prototype, {
     if (this._supervisorView !== view) return;
     view.busy = false;
     view.state = supervisorUiStateValid(state, view.sessionId) ? state : null;
+    if (view.state) supervisorUiReconcileRequests(view.state, view.sessionId);
     if (!view.state)
       this.showToast(supervisorUiTranslate('Supervisor action failed. Refresh status before trying again.'), 'error');
     this._renderSupervisorStatus(true);

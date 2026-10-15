@@ -23,6 +23,24 @@ function state() {
     history: [],
   };
 }
+function activeState() {
+  return {
+    ...state(),
+    enabled: true,
+    phase: 'active',
+    reason: 'owner-started',
+    workers: [
+      {
+        sessionId: WID,
+        task: 'Review the fixture',
+        criteria: [{ id: 'review', description: 'Owner review', kind: 'manual' }],
+        assignments: 0,
+        maxAssignments: 3,
+        maxRuntimeMs: 60000,
+      },
+    ],
+  };
+}
 function harness() {
   const dom = new JSDOM(read('index.html'), { runScripts: 'outside-only', url: 'http://localhost/' });
   doms.push(dom);
@@ -338,6 +356,193 @@ describe('Codex supervisor UI', () => {
       await reloaded.app.supervisorWorkerAction(WID, 'assign');
       expect(requests[2]).not.toBe(requests[0]);
       expect(records.size).toBe(2);
+    }
+  );
+
+  it.each(
+    [false, true].flatMap((mobile) =>
+      [false, true].flatMap((reload) => ['assign', 'retry'].map((action) => ({ mobile, reload, action })))
+    )
+  )(
+    'retires status-proven $action before the next click (mobile=$mobile, reload=$reload)',
+    async ({ mobile, reload, action }) => {
+      const storageKey = 'codeman:supervisorWorkerRequests:v1';
+      const bindings = new Map<string, { workerId: string; action: string }>();
+      const requests: string[] = [];
+      let health = 'dead-pane';
+      let loseResponse = true;
+      const attach = (h: ReturnType<typeof harness>) => {
+        h.dom.window.document.body.classList.toggle('mobile', mobile);
+        h.app._apiJson.mockImplementation(
+          async (path: string, options?: { method?: string; body?: { requestId: string } }) => {
+            if (path.endsWith('/workers')) return [{ sessionId: WID, health, recoveryStale: false, stale: false }];
+            if (options?.method === 'POST') {
+              const id = options.body!.requestId;
+              requests.push(id);
+              if (!bindings.has(id)) bindings.set(id, { workerId: WID, action });
+              health = 'working';
+              if (loseResponse) {
+                loseResponse = false;
+                throw new Error('Fixture accepted action response lost');
+              }
+            }
+            return {
+              ...activeState(),
+              handledRequestIds: [...bindings.keys()],
+              handledRequestBindings: [...bindings].map(([requestId, binding]) => ({ requestId, ...binding })),
+            };
+          }
+        );
+      };
+      const first = harness();
+      attach(first);
+      first.app.openSupervisorOptions(SID);
+      await vi.waitFor(() =>
+        expect(first.app._supervisorView.workersBusy || first.app._supervisorView.busy).toBe(false)
+      );
+      first.get('supervisorWorkerStatus').querySelectorAll('button')[action === 'assign' ? 0 : 1].click();
+      await vi.waitFor(() => expect(first.app._supervisorView.workersBusy).toBe(false));
+      expect(requests).toHaveLength(1);
+      expect(bindings.size).toBe(1);
+      const pending = first.dom.window.sessionStorage.getItem(storageKey)!;
+      expect(JSON.parse(pending)[0].requestId).toBe(requests[0]);
+      // A later fresh dead-pane inspection represents the next crash; the full
+      // status still proves the first occurrence was already accepted.
+      health = 'dead-pane';
+      let current = first;
+      if (reload) {
+        first.app.closeSupervisorOptions();
+        current = harness();
+        current.dom.window.sessionStorage.setItem(storageKey, pending);
+        attach(current);
+        current.app.openSupervisorOptions(SID);
+        await vi.waitFor(() =>
+          expect(current.app._supervisorView.workersBusy || current.app._supervisorView.busy).toBe(false)
+        );
+      } else await current.app.loadSupervisorStatus();
+      expect(current.dom.window.sessionStorage.getItem(storageKey)).toBe('[]');
+      expect(requests).toHaveLength(1); // Status reconciliation never dispatches an action.
+      const button = current.get('supervisorWorkerStatus').querySelectorAll('button')[action === 'assign' ? 0 : 1];
+      expect(button.disabled).toBe(false);
+      button.click();
+      await vi.waitFor(() => expect(current.app._supervisorView.workersBusy).toBe(false));
+      expect(requests).toHaveLength(2);
+      expect(requests[1]).not.toBe(requests[0]);
+      expect(bindings.size).toBe(2);
+    }
+  );
+
+  it.each(['status', 'configuration', 'start'] as const)(
+    'reconciles exact accepted tuples from valid %s state only',
+    async (path) => {
+      const h = harness();
+      const key = 'codeman:supervisorWorkerRequests:v1';
+      const accepted = { sessionId: SID, workerId: WID, action: 'retry', requestId: 'request-accepted' };
+      const retained = [
+        { ...accepted, requestId: 'request-ambiguous', action: 'assign' },
+        { ...accepted, sessionId: WID },
+      ];
+      h.dom.window.sessionStorage.setItem(key, JSON.stringify([accepted, ...retained]));
+      h.app._supervisorView = { sessionId: SID, state: state(), workerStatus: [], busy: false, workersBusy: false };
+      h.app._apiJson.mockResolvedValue({
+        ...state(),
+        handledRequestIds: [accepted.requestId],
+        handledRequestBindings: [{ requestId: accepted.requestId, workerId: WID, action: 'retry' }],
+      });
+      if (path === 'status') await h.app.loadSupervisorStatus();
+      else await h.app._performSupervisorRequest(path === 'start' ? '/start' : '', path === 'start' ? 'POST' : 'PUT');
+      expect(JSON.parse(h.dom.window.sessionStorage.getItem(key)!)).toEqual(retained);
+    }
+  );
+
+  it.each(['missing-binding', 'wrong-manager', 'wrong-worker', 'wrong-action', 'malformed', 'in-flight-only'] as const)(
+    'retains an ambiguous ledger after %s status',
+    async (kind) => {
+      const h = harness();
+      const key = 'codeman:supervisorWorkerRequests:v1';
+      const pending = { sessionId: SID, workerId: WID, action: 'retry', requestId: 'request-ambiguous' };
+      const stored = JSON.stringify([pending]);
+      h.dom.window.sessionStorage.setItem(key, stored);
+      const result: any = {
+        ...state(),
+        handledRequestIds: [pending.requestId],
+        handledRequestBindings: [{ requestId: pending.requestId, workerId: WID, action: 'retry' }],
+      };
+      if (kind === 'missing-binding') result.handledRequestBindings = [];
+      if (kind === 'wrong-manager') result.supervisorSessionId = WID;
+      if (kind === 'wrong-worker') result.handledRequestBindings[0].workerId = SID;
+      if (kind === 'wrong-action') result.handledRequestBindings[0].action = 'assign';
+      if (kind === 'malformed') result.workers = [null];
+      if (kind === 'in-flight-only') {
+        result.handledRequestIds = [];
+        result.handledRequestBindings = [];
+        result.inFlight = { requestId: pending.requestId, workerId: WID, action: 'retry', reservedAt: 1 };
+      }
+      h.app._supervisorView = { sessionId: SID, state: state(), workerStatus: [], busy: false, workersBusy: false };
+      h.app._apiJson.mockResolvedValue(result);
+      await h.app.loadSupervisorStatus();
+      expect(h.dom.window.sessionStorage.getItem(key)).toBe(stored);
+    }
+  );
+
+  it('does not reconcile a late status from a closed view or worker-health rows', async () => {
+    const h = harness();
+    const key = 'codeman:supervisorWorkerRequests:v1';
+    const pending = { sessionId: SID, workerId: WID, action: 'retry', requestId: 'request-ambiguous' };
+    const stored = JSON.stringify([pending]);
+    h.dom.window.sessionStorage.setItem(key, stored);
+    h.app._supervisorView = { sessionId: SID, state: state(), workerStatus: [], busy: false, workersBusy: false };
+    let finish!: (value: unknown) => void;
+    h.app._apiJson.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const loading = h.app.loadSupervisorStatus();
+    h.app.closeSupervisorOptions();
+    finish({
+      ...state(),
+      handledRequestIds: [pending.requestId],
+      handledRequestBindings: [{ requestId: pending.requestId, workerId: WID, action: 'retry' }],
+    });
+    await loading;
+    expect(h.dom.window.sessionStorage.getItem(key)).toBe(stored);
+    h.app._supervisorView = { sessionId: SID, state: activeState(), workerStatus: [], busy: false, workersBusy: false };
+    h.app._apiJson.mockResolvedValue([
+      {
+        sessionId: WID,
+        health: 'dead-pane',
+        stale: false,
+        handledRequestBindings: [{ requestId: pending.requestId, workerId: WID, action: 'retry' }],
+      },
+    ]);
+    await h.app.loadSupervisorWorkers();
+    expect(h.dom.window.sessionStorage.getItem(key)).toBe(stored);
+  });
+
+  it.each(['malformed', 'unwritable'] as const)(
+    'retains %s request storage during accepted-status reconciliation',
+    async (kind) => {
+      const h = harness();
+      const key = 'codeman:supervisorWorkerRequests:v1';
+      const pending = { sessionId: SID, workerId: WID, action: 'retry', requestId: 'request-ambiguous' };
+      const stored = kind === 'malformed' ? '{unreadable}' : JSON.stringify([pending]);
+      h.dom.window.sessionStorage.setItem(key, stored);
+      if (kind === 'unwritable')
+        vi.spyOn(h.dom.window.Storage.prototype, 'setItem').mockImplementation(() => {
+          throw new Error('Fixture unavailable storage');
+        });
+      const accepted = {
+        ...state(),
+        handledRequestIds: [pending.requestId],
+        handledRequestBindings: [{ requestId: pending.requestId, workerId: WID, action: 'retry' }],
+      };
+      h.app._supervisorView = { sessionId: SID, state: state(), workerStatus: [], busy: false, workersBusy: false };
+      h.app._apiJson.mockResolvedValue(accepted);
+      await h.app.loadSupervisorStatus();
+      expect(h.app._supervisorView.state).toEqual(accepted);
+      expect(h.dom.window.sessionStorage.getItem(key)).toBe(stored);
     }
   );
 

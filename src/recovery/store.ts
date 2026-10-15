@@ -143,7 +143,7 @@ const StateSchema = z
       if (!flight?.accepted) return true;
       const handledKey =
         flight.reason === 'stalled' && flight.stallProgressAt !== undefined
-          ? `stall:${createHash('sha256').update(flight.key).digest('hex')}:${flight.stallProgressEvidenceKey ?? flight.stallProgressAt}`
+          ? `stall:${createHash('sha256').update(flight.key).digest('hex')}:${flight.stallProgressEvidenceKey ? `${flight.stallProgressEvidenceKey}:${flight.stallProgressAt}` : flight.stallProgressAt}`
           : flight.key;
       return (
         (flight.reason !== 'stalled' || flight.stallProgressAt !== undefined) &&
@@ -151,7 +151,12 @@ const StateSchema = z
         flight.acceptedAt !== undefined &&
         flight.acceptedAt >= flight.startedAt &&
         state.lastSuccessfulRecovery === flight.acceptedAt &&
-        state.handledEvidence.includes(handledKey) &&
+        (state.handledEvidence.includes(handledKey) ||
+          (flight.reason === 'stalled' &&
+            flight.stallProgressEvidenceKey !== undefined &&
+            state.handledEvidence.includes(
+              `stall:${createHash('sha256').update(flight.key).digest('hex')}:${flight.stallProgressEvidenceKey}`
+            ))) &&
         state.history.some(
           (event) => event.kind === 'accepted' && event.reason === 'recovery-accepted' && event.at >= flight.startedAt
         )

@@ -1,6 +1,7 @@
 /** @fileoverview Bounded durable configuration for an opt-in Codex supervisor. */
 import { z } from 'zod';
 import { CriteriaSchema, PromptTextSchema } from '../supervision/schema.js';
+import { taskPromptFits } from '../supervision/prompt.js';
 import type {
   SupervisorConfig as PublicSupervisorConfig,
   SupervisorState as PublicSupervisorState,
@@ -36,7 +37,19 @@ export const SupervisorConfigSchema = z
       .max(12),
   })
   .strict()
-  .refine((v) => new Set(v.workers.map((w) => w.sessionId)).size === v.workers.length, 'Duplicate worker');
+  .refine((v) => new Set(v.workers.map((w) => w.sessionId)).size === v.workers.length, 'Duplicate worker')
+  .refine(
+    (config) =>
+      config.workers.every((worker) =>
+        taskPromptFits({
+          objective: worker.task,
+          criteria: worker.criteria.map((criterion) => ({ ...criterion, verified: false })),
+          checkpoint: '',
+          nextAction: '',
+        })
+      ),
+    'Worker task prompt must fit 64KiB of valid UTF8'
+  );
 
 export const SupervisorRequestSchema = z.object({ requestId: RequestId }).strict();
 export const SupervisorActionSchema = z.object({}).strict();

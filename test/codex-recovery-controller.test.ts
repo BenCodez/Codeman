@@ -727,6 +727,83 @@ describe('recovery action authority', () => {
     expect(f.act).toHaveBeenCalledOnce();
   });
 
+  it.each([false, true])(
+    'recovers progress written before the acceptance poll after durable reload (remote=%s)',
+    async (remote) => {
+      let f = fixture(enabledState({}, { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }));
+      const native = (key: string, at: number) =>
+        remote ? { progressEvidenceKey: `remote:${key.repeat(64)}`, progressLowerBound: at - 1 } : {};
+      f.observation = { ...stalled('pre-acceptance-progress', true), ...native('a', NOW - 20_000) };
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.act).toHaveBeenCalledOnce();
+      advance(1000);
+      const newProgress = Date.now();
+      advance(1000);
+      f.observation = {
+        ...stalled('pre-acceptance-progress'),
+        progressAt: newProgress,
+        ...native('b', newProgress),
+        processReady: true,
+        processReadyAt: Date.now(),
+      };
+      await f.controller.inspect();
+      const accepted = f.controller.getStatus();
+      expect(accepted.lastSuccessfulRecovery).toBeGreaterThan(newProgress);
+      expect(accepted.inFlight).toBeUndefined();
+      f.controller.stop();
+      f = fixture(accepted);
+      f.observation = {
+        ...stalled('pre-acceptance-progress', true),
+        progressAt: newProgress,
+        ...native('b', newProgress),
+      };
+      advance(10_000);
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.act).toHaveBeenCalledOnce();
+      expect(f.controller.getStatus()).toMatchObject({ attempts: 2, inFlight: { stallProgressAt: newProgress } });
+    }
+  );
+
+  it.each(['same-native-event', 'older-local', 'overlapping-remote-clock', 'legacy-remote'] as const)(
+    'does not turn %s evidence into another accepted stall cycle',
+    async (kind) => {
+      const prefix = `stall:${createHash('sha256').update('veto-progress').digest('hex')}:`;
+      const remote = kind !== 'older-local';
+      const baseline = NOW - 20_000;
+      const f = fixture(
+        enabledState(
+          {
+            handledEvidence: [
+              prefix +
+                (remote ? `remote:${'a'.repeat(64)}${kind === 'legacy-remote' ? '' : `:${baseline}`}` : baseline),
+            ],
+            lastSuccessfulRecovery: NOW - 10_000,
+          },
+          { detectStalls: true, restartStalls: true, stalledAfterMs: 10_000 }
+        )
+      );
+      f.observation = {
+        ...stalled('veto-progress', true),
+        progressAt: kind === 'older-local' ? baseline - 1 : baseline + 1000,
+        ...(remote
+          ? {
+              progressEvidenceKey: `remote:${(kind === 'same-native-event' ? 'a' : 'b').repeat(64)}`,
+              progressLowerBound: kind === 'overlapping-remote-clock' ? baseline : baseline + 999,
+            }
+          : {}),
+      };
+      await f.controller.retry();
+      advance(2000);
+      await f.controller.retry();
+      expect(f.act).not.toHaveBeenCalled();
+      expect(f.controller.getStatus().attempts).toBe(0);
+    }
+  );
+
   it.each([undefined, NaN, Infinity, -1, 0, Number.MAX_SAFE_INTEGER + 1, NOW + 1])(
     'never authorizes a stall restart from invalid structured progress %s',
     async (progressAt) => {

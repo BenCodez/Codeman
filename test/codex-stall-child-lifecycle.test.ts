@@ -859,12 +859,15 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
         vi.setSystemTime(CHILD_NOW + 19_100);
         await f.controller.refresh();
         expect(f.store.get(f.session.id).inFlight).toBeUndefined();
-        expect(f.store.get(f.session.id).handledEvidence[0]).toMatch(/^stall:[a-f0-9]{64}:remote:[a-f0-9]{64}$/);
+        expect(f.store.get(f.session.id).handledEvidence[0]).toMatch(
+          /^stall:[a-f0-9]{64}:remote:[a-f0-9]{64}:[1-9]\d*$/
+        );
         if (legacyNumeric) {
           const state = f.store.get(f.session.id);
           state.handledEvidence = state.handledEvidence.map((key) =>
-            key.replace(/remote:[a-f0-9]{64}$/, String(CHILD_NOW - 25_000 + 20))
+            key.replace(/remote:[a-f0-9]{64}:[1-9]\d*$/, String(CHILD_NOW - 25_000 + 20))
           );
+          expect(state.handledEvidence[0]).toMatch(/^stall:[a-f0-9]{64}:[1-9]\d*$/);
           await f.store.save(f.session.id, state);
         }
         f.controller.stop();

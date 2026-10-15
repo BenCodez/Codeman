@@ -11,7 +11,8 @@ import { TaskController, type TaskObservation } from '../src/supervision/control
 import { RecoveryController } from '../src/recovery/controller.js';
 import { initialRecoveryState, type RecoveryObservation } from '../src/recovery/types.js';
 import { buildSupervisorManagerTask, SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from '../src/supervisor/manager-task.js';
-import { SupervisorConfigSchema } from '../src/supervisor/schema.js';
+import { SupervisorConfigSchema, initialSupervisorState } from '../src/supervisor/schema.js';
+import { formatTaskPrompt } from '../src/supervision/prompt.js';
 import { SupervisorStore } from '../src/supervisor/store.js';
 import { dataPath } from '../src/config/instance.js';
 import { readFileSync } from 'node:fs';
@@ -83,6 +84,158 @@ function harness(overrides: Partial<SupervisorDependencies> = {}) {
 }
 
 describe('SupervisorController', () => {
+  describe('worker prompt admission', () => {
+    function largeWorker(text = 'x'.repeat(1000)) {
+      return {
+        ...config.workers[0],
+        task: 'o'.repeat(4000),
+        criteria: Array.from({ length: 30 }, (_, index) => ({
+          id: `criterion-${index}`,
+          description: text,
+          kind: 'command' as const,
+          command: text,
+        })),
+      };
+    }
+    function wire(worker: ReturnType<typeof largeWorker>) {
+      return formatTaskPrompt({
+        objective: worker.task,
+        criteria: worker.criteria.map((criterion) => ({ ...criterion, verified: false })),
+        checkpoint: '',
+        nextAction: '',
+      });
+    }
+    function boundary(bytes: number) {
+      const worker = largeWorker();
+      const overhead = Buffer.byteLength(wire({ ...worker, task: '' }));
+      expect(bytes - overhead).toBeGreaterThan(0);
+      expect(bytes - overhead).toBeLessThanOrEqual(4000);
+      worker.task = 'o'.repeat(bytes - overhead);
+      expect(Buffer.byteLength(wire(worker))).toBe(bytes);
+      return worker;
+    }
+    it.each(
+      [
+        { name: 'maximum ASCII fields', worker: () => largeWorker() },
+        { name: 'multibyte fields', worker: () => largeWorker('界'.repeat(1000)) },
+        { name: 'JSON-escaped fields', worker: () => largeWorker('"'.repeat(1000)) },
+        { name: 'one serialized byte over 64KiB', worker: () => boundary(65_537) },
+        { name: 'non-roundtrippable high surrogate', worker: () => ({ ...largeWorker('x'), task: 'Owner\ud800task' }) },
+        { name: 'non-roundtrippable low surrogate', worker: () => ({ ...largeWorker('x'), task: 'Owner\udc00task' }) },
+      ].flatMap((entry) => [false, true].map((enabled) => ({ ...entry, enabled })))
+    )('rejects $name before changing existing configuration (enabled=$enabled)', async ({ worker, enabled }) => {
+      const h = harness();
+      await h.controller.configure(config);
+      await h.controller.start();
+      const before = h.controller.getStatus();
+      vi.mocked(h.deps.persist).mockClear();
+      vi.mocked(h.deps.validateWorkers).mockClear();
+      vi.mocked(h.deps.pauseManager).mockClear();
+      const changed = {
+        ...config,
+        enabled,
+        workers: [...config.workers, { ...worker(), sessionId: '33333333-3333-4333-8333-333333333333' }],
+      };
+      expect(() => h.controller.configure(changed)).toThrow(/prompt/i);
+      expect(h.controller.getStatus()).toEqual(before);
+      expect(h.deps.persist).not.toHaveBeenCalled();
+      expect(h.deps.validateWorkers).not.toHaveBeenCalled();
+      expect(h.deps.pauseManager).not.toHaveBeenCalled();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+    });
+
+    it('assigns an exact 64KiB Unicode and JSON-escaped prompt through the actual TaskController', async () => {
+      const worker = boundary(65_536);
+      worker.task = `界${worker.task.slice(3)}`;
+      worker.criteria[0].description = `"${worker.criteria[0].description.slice(2)}`;
+      const expected = wire(worker);
+      expect(Buffer.byteLength(expected)).toBe(65_536);
+      const act = vi.fn(async (_key: string, _conversation: string, _prompt: string) => 'sent' as const);
+      const task = new TaskController({
+        now: () => 10_000,
+        observe: async () => ({
+          observation: {
+            activity: 'completed',
+            reason: 'turn-completed',
+            at: 10_001,
+            conversationId: WORKER,
+            turnId: 'finished-turn',
+            submissionKey: 'owner-submission',
+            processReady: true,
+            safeToAct: false,
+          },
+          commands: new Map(),
+        }),
+        act,
+        persist: async () => {},
+        changed: () => {},
+      });
+      const h = harness();
+      h.worker.task = task;
+      try {
+        await h.controller.configure({ ...config, workers: [worker] });
+        await h.controller.start();
+        await h.controller.assign(WORKER, 'request-boundary-prompt');
+        expect(act).toHaveBeenCalledOnce();
+        expect(act.mock.calls[0][2]).toBe(expected);
+        expect(h.controller.getStatus().handledRequestIds).toContain('request-boundary-prompt');
+      } finally {
+        h.controller.stop();
+        task.stop();
+        await task.drain();
+      }
+    });
+
+    it('does not withdraw an admitted assignment when a rejected configuration arrives', async () => {
+      const h = harness();
+      await h.controller.configure(config);
+      await h.controller.start();
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      vi.mocked(h.worker.task.update).mockImplementationOnce(async () => {
+        await held;
+        return h.taskState;
+      });
+      const assigning = h.controller.assign(WORKER, 'request-keep-owner-intent');
+      try {
+        await vi.waitFor(() => expect(h.worker.task.update).toHaveBeenCalledOnce());
+        expect(() => h.controller.configure({ ...config, workers: [largeWorker()] })).toThrow(/prompt/i);
+        expect(vi.mocked(h.worker.task.update).mock.calls[0][1]!()).toBe(true);
+        release();
+        await assigning;
+        expect(h.worker.task.resume).toHaveBeenCalledOnce();
+        expect(h.controller.getStatus().handledRequestIds).toContain('request-keep-owner-intent');
+      } finally {
+        release();
+        await assigning.catch(() => {});
+      }
+    });
+
+    it('loads an oversized historical worker and still permits owner pause and reset', async () => {
+      const store = new SupervisorStore(dataPath('supervisor-oversized-history.json'));
+      const historical = {
+        ...initialSupervisorState(SUPERVISOR),
+        objective: config.objective,
+        enabled: true,
+        phase: 'active' as const,
+        workers: [{ ...largeWorker(), assignments: 0 }],
+      };
+      await store.save(SUPERVISOR, historical);
+      const reloaded = new SupervisorStore(dataPath('supervisor-oversized-history.json'));
+      expect(reloaded.loadFailed).toBe(false);
+      expect(reloaded.get(SUPERVISOR)).toEqual(historical);
+      const h = harness({ persist: (state) => reloaded.save(SUPERVISOR, state) });
+      const controller = new SupervisorController(h.deps, SUPERVISOR, reloaded.get(SUPERVISOR));
+      await expect(controller.pause()).resolves.toMatchObject({ phase: 'paused', workers: historical.workers });
+      await expect(controller.reset()).resolves.toMatchObject({ phase: 'disabled', enabled: false, workers: [] });
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+      expect(h.worker.task.resume).not.toHaveBeenCalled();
+    });
+  });
+
   it.each(
     ['objective', 'task'].flatMap((field) => [' ', '\r\n ', '\u00a0\u2028\u3000'].map((blank) => ({ field, blank })))
   )('rejects blank required supervisor $field before mutation or reservation: $blank', async ({ field, blank }) => {
