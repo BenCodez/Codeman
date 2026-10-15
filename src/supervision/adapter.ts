@@ -1,10 +1,17 @@
 /** @fileoverview Same-owner attributed task observations and guarded delivery. */
 import type { Session } from '../session.js';
-import type { RecoveryActionAuthority, RecoveryEvidenceGuard } from '../recovery/types.js';
+import {
+  isRecoveryEvidenceSourceCurrent,
+  type RecoveryActionAuthority,
+  type RecoveryEvidenceGuard,
+} from '../recovery/types.js';
 import { CodexRecoveryAdapter, type CodexRecoveryAdapterDeps } from '../recovery/codex-adapter.js';
 import { successfulCommands, latestProgressMarker } from './evidence.js';
 import type { TaskObservation } from './controller.js';
 import { validRemoteClock, remoteToLocal, remoteCompletionToLocal } from '../recovery/remote-clock.js';
+import { taskPromptFrameFits } from './prompt.js';
+import { clampRecoveryLaunchForOwner } from '../session-env-clamp.js';
+import { currentLocalCodexHome } from '../recovery/codex-home.js';
 export class CodexTaskAdapter {
   private readonly recovery: CodexRecoveryAdapter;
   private continuationProof?: {
@@ -96,6 +103,105 @@ export class CodexTaskAdapter {
       };
     }
     return result;
+  }
+  /** Read-only framing admission using the same current private evidence as delivery. */
+  async admitPrompt(prompt: string, authority: RecoveryActionAuthority, expected?: TaskObservation): Promise<boolean> {
+    if (this.session.remote) {
+      const preview = await this.recovery.previewRemotePrompt(prompt, authority);
+      if (!preview) return false;
+      const { observation, tail, clock } = preview;
+      const marker = latestProgressMarker(tail, 0, clock.remoteAfter);
+      // Compare the same remote marker identity without publishing a new continuation proof.
+      return (
+        authority() === true &&
+        !!observation.conversationId &&
+        !['unknown', 'blocked', 'paused', 'exited'].includes(observation.activity) &&
+        (!expected ||
+          (['conversationId', 'activity', 'turnId', 'submissionKey', 'evidenceKey'].every(
+            (key) =>
+              observation[key as keyof typeof observation] === expected.observation[key as keyof typeof observation]
+          ) &&
+            marker?.key === expected.marker?.key))
+      );
+    }
+    const originalProof = this.continuationProof;
+    let observed: TaskObservation;
+    try {
+      observed = await this.observe();
+    } finally {
+      this.continuationProof = originalProof;
+    }
+    const { observation, marker } = observed;
+    const context = this.session.getRecoveryContext();
+    if (
+      !observation.conversationId ||
+      authority() !== true ||
+      ['unknown', 'blocked', 'paused', 'exited'].includes(observation.activity) ||
+      (expected &&
+        ['conversationId', 'activity', 'turnId', 'submissionKey', 'evidenceKey'].some(
+          (key) =>
+            observation[key as keyof typeof observation] !== expected.observation[key as keyof typeof observation]
+        )) ||
+      (expected && marker?.key !== expected.marker?.key)
+    )
+      return false;
+    const source = this.recovery.getLocalEvidenceSource(observation.conversationId, context.generation);
+    if (
+      !source?.inputBroker ||
+      !source.identity.witness ||
+      source.identity.tailTruncated !== false ||
+      !isRecoveryEvidenceSourceCurrent(source)
+    )
+      return false;
+    const snapshot = JSON.stringify([
+      this.session.owner,
+      this.session.codexConfig,
+      this.session.getEnvOverridesForPersist(),
+      context,
+    ]);
+    const current = () =>
+      authority() === true &&
+      isRecoveryEvidenceSourceCurrent(source) &&
+      snapshot ===
+        JSON.stringify([
+          this.session.owner,
+          this.session.codexConfig,
+          this.session.getEnvOverridesForPersist(),
+          this.session.getRecoveryContext(),
+        ]);
+    const env =
+      context.codexHome !== currentLocalCodexHome()
+        ? { ...this.session.getEnvOverridesForPersist(), CODEX_HOME: context.codexHome! }
+        : this.session.getEnvOverridesForPersist();
+    const grant = await clampRecoveryLaunchForOwner(this.session.owner, { codexConfig: this.session.codexConfig }, env);
+    if (
+      !current() ||
+      !grant.isCurrent() ||
+      JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(this.session.codexConfig) ||
+      JSON.stringify(grant.env) !== JSON.stringify(env)
+    )
+      return false;
+    const grantFile = grant.getFileWitness?.() ?? grant.fileWitness;
+    const files = [...(source.files ?? []), ...(grantFile ? [grantFile] : [])];
+    if (authority.prepareEvidence && (await authority.prepareEvidence({ ...source, files })) !== true) return false;
+    if (!current() || !grant.isCurrent()) return false;
+    const issuer = authority.getInputIssuer?.();
+    if (issuer instanceof Promise || (issuer && typeof (issuer as unknown as { then?: unknown }).then === 'function')) {
+      void Promise.resolve(issuer).catch(() => {});
+      return false;
+    }
+    if (authority.getInputIssuer && (!issuer || issuer.sessionId === this.session.id)) return false;
+    return (
+      taskPromptFrameFits(prompt, {
+        sessionId: this.session.id,
+        incarnation: source.inputBroker.incarnation,
+        conversationId: observation.conversationId,
+        expectedOwners: source.inputBroker.proof.ownerCounters,
+        privateFiles: [...files, ...(issuer?.files ?? [])],
+        privatePaths: [...source.identity.witness.paths, ...(issuer?.paths ?? [])],
+        issuer,
+      }) && current()
+    );
   }
   async recover(
     observation: import('../recovery/types.js').RecoveryObservation,

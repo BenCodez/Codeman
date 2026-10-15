@@ -3,7 +3,11 @@ import { createHash } from 'node:crypto';
 import type { Session } from '../session.js';
 import type { RecoveryPaneIdentity } from '../mux-interface.js';
 import { matchesNativePaneSignal } from './native-pane-signal.js';
-import { clampExternalCliConfigsForOwner, clampEnvOverridesForOwner } from '../session-env-clamp.js';
+import {
+  clampExternalCliConfigsForOwner,
+  clampEnvOverridesForOwner,
+  clampRecoveryLaunchForOwner,
+} from '../session-env-clamp.js';
 import { resolveCodexIdentity, type CodexIdentityWitness } from './codex-identity.js';
 import { checkCodexIdentityWitnesses } from './codex-witness-check.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './codex-home.js';
@@ -26,6 +30,8 @@ import {
 } from './types.js';
 import {
   inspectRemoteCodex,
+  remotePromptFrameAdmission,
+  remotePromptCommandFits,
   deliverRemoteCodexInput,
   restartRemoteCodexPane,
   restoreRemoteCodexWorker,
@@ -191,6 +197,129 @@ export class CodexRecoveryAdapter {
     private readonly persistSession: () => void,
     private readonly deps: CodexRecoveryAdapterDeps = defaultDeps
   ) {}
+
+  /** Passive SSH envelope proof; never hydrates the broker cache or mints delivery authority. */
+  async previewRemotePrompt(
+    prompt: string,
+    authority: import('./types.js').RecoveryActionAuthority
+  ): Promise<{ observation: RecoveryObservation; tail: string; clock: RemoteClockWitness } | undefined> {
+    const session = this.session,
+      context = session.getRecoveryContext();
+    if (
+      !session.remote ||
+      session.remote.owned === false ||
+      session.docker ||
+      !context.managed ||
+      !context.noDaemon ||
+      !normalizedCodexHome(context.codexHome) ||
+      !context.submission ||
+      context.switchPending ||
+      context.untrackedInput ||
+      context.inputBrokerPending ||
+      session.paneLifecycleInFlight ||
+      authority() !== true
+    )
+      return undefined;
+    const scope = () =>
+      JSON.stringify([
+        session.owner,
+        session.workingDir,
+        session.remote,
+        session.codexConfig,
+        session.getEnvOverridesForPersist(),
+        session.getRecoveryContext(),
+        session.paneLifecycleInFlight,
+      ]);
+    const snapshot = scope(),
+      current = () => authority() === true && scope() === snapshot;
+    const env = { ...session.getEnvOverridesForPersist(), CODEX_HOME: context.codexHome! };
+    const grant = await clampRecoveryLaunchForOwner(session.owner, { codexConfig: session.codexConfig }, env);
+    if (
+      !current() ||
+      !grant.isCurrent() ||
+      JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(session.codexConfig) ||
+      JSON.stringify(grant.env) !== JSON.stringify(env)
+    )
+      return undefined;
+    const inputBroker = await session.getOwnedRemoteInputBroker();
+    if (!inputBroker || !current() || !grant.isCurrent()) return undefined;
+    if (authority.prepareEvidence && (await authority.prepareEvidence()) !== true) return undefined;
+    if (!current() || !grant.isCurrent()) return undefined;
+    const issuer = authority.getInputIssuer?.();
+    if (issuer instanceof Promise || (issuer && typeof (issuer as unknown as { then?: unknown }).then === 'function')) {
+      void Promise.resolve(issuer).catch(() => {});
+      return undefined;
+    }
+    if (authority.getInputIssuer && (!issuer || issuer.sessionId === session.id)) return undefined;
+    const admission = remotePromptFrameAdmission(prompt, issuer);
+    if (!admission) return undefined;
+    const issuerSnapshot = JSON.stringify(issuer);
+    const brokerSnapshot = JSON.stringify(inputBroker);
+    const request: RemoteCodexEvidenceRequest = {
+      sessionId: session.id,
+      workingDir: session.remote.remotePath,
+      codexHome: context.codexHome,
+      resumeId: session.codexConfig?.resumeSessionId,
+      submission: context.submission,
+      inputBroker,
+      frameAdmission: admission,
+    };
+    const evidence = await this.deps.inspectRemote(session.remote, request);
+    const retained = await session.getOwnedRemoteInputBroker();
+    const finalIssuer = authority.getInputIssuer?.();
+    if (
+      finalIssuer instanceof Promise ||
+      (finalIssuer && typeof (finalIssuer as unknown as { then?: unknown }).then === 'function')
+    ) {
+      void Promise.resolve(finalIssuer).catch(() => {});
+      return undefined;
+    }
+    if (JSON.stringify(finalIssuer) !== issuerSnapshot) return undefined;
+    if (
+      !current() ||
+      !grant.isCurrent() ||
+      JSON.stringify(retained) !== brokerSnapshot ||
+      evidence.transport !== 'reachable' ||
+      evidence.session !== 'present' ||
+      !evidence.pane ||
+      evidence.pane.dead ||
+      !evidence.inputBroker ||
+      evidence.identity.reason !== 'verified' ||
+      !evidence.identity.conversationId ||
+      !evidence.identity.tail ||
+      evidence.identity.tailTruncated !== false ||
+      !validRemoteClock(evidence.clock) ||
+      !remoteSubmissionWindow(context.submission, evidence.clock) ||
+      !evidence.frameAdmission?.fits ||
+      ['promptHash', 'maxPhaseBytes', 'issuerLeaseBytes'].some(
+        (key) => evidence.frameAdmission![key as keyof typeof admission] !== admission[key as keyof typeof admission]
+      )
+    )
+      return undefined;
+    if (!remotePromptCommandFits(session.remote, request, prompt, evidence, issuer)) return undefined;
+    const clock = evidence.clock;
+    const observation = classifyCodexTail(evidence.identity.tail, {
+      conversationId: evidence.identity.conversationId,
+      now: clock.remoteAfter,
+      screen: evidence.pane.screen,
+      busy: session.isBusy(),
+      watching: !!session.watching,
+      tailTruncated: false,
+      lastIntentionalStopAt:
+        context.intentionalStopAt > 0
+          ? context.intentionalStopAt + remoteClockOffset(clock).max
+          : context.intentionalStopAt,
+    });
+    observation.at = remoteToLocal(observation.at, clock);
+    if (observation.progressAt !== undefined)
+      observation.progressAt = remoteCompletionToLocal(observation.progressAt, clock);
+    observation.conversationId = evidence.identity.conversationId;
+    observation.processReady =
+      evidence.pane.screen !== null &&
+      hasEmptyCodexComposer(evidence.pane.screen) &&
+      !['blocked', 'paused', 'unknown'].includes(observation.activity);
+    return current() && grant.isCurrent() ? { observation, tail: evidence.identity.tail, clock } : undefined;
+  }
 
   async observe(): Promise<RecoveryObservation> {
     this.latestLiveProofAt = undefined;
