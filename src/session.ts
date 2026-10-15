@@ -6636,7 +6636,7 @@ export class Session extends EventEmitter {
   private static readonly MAX_PENDING_INPUT_SEQS = 4096;
   private static readonly INPUT_DEFERRED_LEASE_MS = 60_000;
 
-  /** Reclaim only abandoned, certified-unsent tails; never erase delivery proof or sparse holes. */
+  /** Reclaim abandoned unsent input; stale sparse identities remain rejection-sealed. */
   private expireDeferredInputSeq(clientId: string, now: number): void {
     const state = this._appliedInputSeq.get(clientId);
     if (
@@ -6647,7 +6647,13 @@ export class Session extends EventEmitter {
       now - state.deferredAt < Session.INPUT_DEFERRED_LEASE_MS
     )
       return;
-    // A retained sparse hole must not trigger another full scan on each refused frame.
+    if (state.last !== undefined && [...state.waiting].some((seq) => seq <= state.last!)) {
+      // A higher committed frame prevents safely treating the lower hole as
+      // applied. Retire the entire identity instead of pinning its slot forever.
+      this._retiredInputClients.add(clientId);
+      this._appliedInputSeq.delete(clientId);
+      return;
+    }
     state.deferredAt = now;
     for (const seq of state.waiting) {
       // An earlier known-unsent hole still outranks a higher committed watermark.
@@ -6683,7 +6689,10 @@ export class Session extends EventEmitter {
   deferInputSeq(clientId: string, seq: number): boolean {
     const now = performance.now();
     let state = this._appliedInputSeq.get(clientId);
-    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) this.expireDeferredInputSeq(clientId, now);
+    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) {
+      this.expireDeferredInputSeq(clientId, now);
+      state = this._appliedInputSeq.get(clientId);
+    }
     // Active retries renew the lease without relying on adjustable wall time.
     if (state && now >= state.deferredAt) state.deferredAt = now;
     if (state && (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq))) return true;
@@ -6697,6 +6706,10 @@ export class Session extends EventEmitter {
         let idle: string | undefined;
         for (const [id, entry] of this._appliedInputSeq) {
           this.expireDeferredInputSeq(id, now);
+          if (!this._appliedInputSeq.has(id)) {
+            idle = id;
+            break;
+          }
           if (entry.waiting.size === 0 && entry.pending.size === 0) {
             if (entry.last !== undefined) this._retiredInputClients.add(id);
             idle = id;

@@ -979,6 +979,7 @@ async function rotateRemoteCodexBroker(
   const oldInc = request.inputBroker.incarnation;
   const cache = options.cache ?? ownedRemoteBrokerCache;
   let reservationAttempted = false;
+  let provisional: OwnedRemoteBrokerDescriptor | undefined;
   try {
     assertExactRemoteResume(request);
     if ((await authority.check()) !== true || !currentRemoteAuthority(authority)) return 'not-sent';
@@ -1004,8 +1005,10 @@ async function rotateRemoteCodexBroker(
     // A cache failure or cancellation must occur before creating an inert pane.
     const directory = posix.join(posix.dirname(retained.directory), material.config.incarnation);
     const descriptor = await cache.prepare(sourceScope, material, directory);
+    provisional = descriptor;
     if (!descriptor || !currentRemoteAuthority(authority)) return 'not-sent';
     reservationAttempted = true;
+    cache.sealPreparation(descriptor);
     if (!(await authority.reserveInputBroker(oldInc, descriptor.incarnation)) || !currentRemoteAuthority(authority))
       return 'unknown';
     const prepared = await provisionRemoteInputBroker(
@@ -1058,6 +1061,8 @@ async function rotateRemoteCodexBroker(
     return 'sent';
   } catch {
     return reservationAttempted ? 'unknown' : 'not-sent';
+  } finally {
+    if (provisional && !reservationAttempted) await cache.discardUnreservedPreparation(sourceScope, provisional);
   }
 }
 

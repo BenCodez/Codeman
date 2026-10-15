@@ -569,3 +569,125 @@ it('retires only the selected session, preserving another host/owner signer and 
   expect(f.cache.signer(other, material.config.incarnation)).toBe(signer);
   expect(signer.frame('owner-pty', 'second')?.receipt.counter).toBe(first.receipt.counter + 1);
 });
+
+it('discards only its exact unreserved preparation while preserving the active signer and old private material', async () => {
+  const f = fixture();
+  expect(await f.cache.prepare(f.scope, f.material, f.remoteDirectory)).toBeDefined();
+  expect(f.observe()).toBeDefined();
+  const signer = f.cache.signer(f.scope, f.material.config.incarnation)!,
+    first = signer.frame('owner-key', '\t')!,
+    oldBytes = await fs.readFile(f.file),
+    next = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec replacement', f.scope.codexHome),
+    directory = '/remote/private/' + f.scope.sessionId + '/' + next.config.incarnation,
+    receipt = (await f.cache.prepare(f.scope, next, directory))!;
+  expect(await f.cache.discardUnreservedPreparation(f.scope, receipt)).toBe(true);
+  expect(f.cache.signer(f.scope, f.material.config.incarnation)).toBe(signer);
+  expect(signer.frame('owner-key', '\t')?.receipt.counter).toBe(first.receipt.counter + 1);
+  expect(await fs.readFile(f.file)).toEqual(oldBytes);
+  const restarted = new OwnedRemoteBrokerCache(join(root, 'cache'));
+  expect(await restarted.load(f.scope, receipt.incarnation)).toBeUndefined();
+  expect(await restarted.load(f.scope, f.material.config.incarnation)).toBeDefined();
+});
+
+it.each(['copied-receipt', 'foreign-scope', 'observed', 'promoted', 'sealed'] as const)(
+  'cannot discard a %s preparation',
+  async (change) => {
+    const f = fixture(),
+      receipt = (await f.cache.prepare(f.scope, f.material, f.remoteDirectory))!,
+      bytes = await fs.readFile(f.file);
+    if (change === 'observed') expect(f.observe()).toBeDefined();
+    if (change === 'promoted') expect(f.cache.activate(f.scope, receipt.incarnation)).toBe(true);
+    if (change === 'sealed') f.cache.sealPreparation(receipt);
+    expect(
+      await f.cache.discardUnreservedPreparation(
+        change === 'foreign-scope' ? { ...f.scope, owner: 'different-owner' } : f.scope,
+        change === 'copied-receipt' ? { ...receipt } : receipt
+      )
+    ).toBe(false);
+    expect(await fs.readFile(f.file)).toEqual(bytes);
+    expect(f.cache.get(f.scope, receipt.incarnation)).toEqual(receipt);
+  }
+);
+
+it.each(['same-bytes', 'symlink'] as const)(
+  'preserves %s replacement during cancellation proof close',
+  async (change) => {
+    const f = fixture(),
+      receipt = (await f.cache.prepare(f.scope, f.material, f.remoteDirectory))!,
+      bytes = await fs.readFile(f.file),
+      open = fs.open.bind(fs);
+    let changed = false;
+    const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (args[0] === f.file) {
+        const close = handle.close.bind(handle);
+        handle.close = async () => {
+          await close();
+          if (changed) return;
+          changed = true;
+          await fs.rename(f.file, f.file + '.old');
+          if (change === 'same-bytes') await fs.writeFile(f.file, bytes, { mode: 0o600 });
+          else await fs.symlink(f.file + '.old', f.file);
+        };
+      }
+      return handle;
+    });
+    try {
+      expect(await f.cache.discardUnreservedPreparation(f.scope, receipt)).toBe(false);
+      expect(changed).toBe(true);
+      expect(await fs.readFile(f.file)).toEqual(bytes);
+      expect((await fs.lstat(f.file)).isSymbolicLink()).toBe(change === 'symlink');
+    } finally {
+      spy.mockRestore();
+    }
+  }
+);
+
+it.each(['foreign-artifact', 'lost-parent-sync'] as const)(
+  'retries a known cancellation after %s without evicting the active incarnation',
+  async (change) => {
+    const f = fixture();
+    expect(await f.cache.prepare(f.scope, f.material, f.remoteDirectory)).toBeDefined();
+    const material = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec provisional', f.scope.codexHome),
+      directory = '/remote/private/' + f.scope.sessionId + '/' + material.config.incarnation,
+      receipt = (await f.cache.prepare(f.scope, material, directory))!,
+      localDirectory = join(root, 'cache', f.scope.sessionId, receipt.incarnation),
+      artifact = join(localDirectory, 'owner-note'),
+      open = fs.open.bind(fs);
+    let failed = false;
+    if (change === 'foreign-artifact') await fs.writeFile(artifact, 'keep owner bytes', { mode: 0o600 });
+    const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await open(...args);
+      if (change === 'lost-parent-sync' && args[0] === join(root, 'cache', f.scope.sessionId)) {
+        const sync = handle.sync.bind(handle);
+        handle.sync = async () => {
+          if (!failed) {
+            failed = true;
+            throw Object.assign(Error('Fixture sync failure'), { code: 'EIO' });
+          }
+          return sync();
+        };
+      }
+      return handle;
+    });
+    try {
+      expect(await f.cache.discardUnreservedPreparation(f.scope, receipt)).toBe(false);
+      expect(f.cache.get(f.scope, f.material.config.incarnation)).toBeDefined();
+      if (change === 'foreign-artifact') {
+        expect(await fs.readFile(artifact, 'utf8')).toBe('keep owner bytes');
+        await fs.unlink(artifact); // Explicit disposable owner resolution, never recursive cleanup.
+      } else {
+        expect(failed).toBe(true);
+        await expect(fs.lstat(localDirectory)).rejects.toMatchObject({ code: 'ENOENT' });
+      }
+      const fresh = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec next attempt', f.scope.codexHome);
+      expect(
+        await f.cache.prepare(f.scope, fresh, '/remote/private/' + f.scope.sessionId + '/' + fresh.config.incarnation)
+      ).toBeDefined();
+      expect(f.cache.get(f.scope, f.material.config.incarnation)).toBeDefined();
+      expect(await new OwnedRemoteBrokerCache(join(root, 'cache')).load(f.scope, receipt.incarnation)).toBeUndefined();
+    } finally {
+      spy.mockRestore();
+    }
+  }
+);

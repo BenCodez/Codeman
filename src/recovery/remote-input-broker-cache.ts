@@ -34,6 +34,14 @@ type Entry = {
   signer?: CodexInputBroker;
 };
 type CacheEpoch = { id: string; pending: number };
+type Preparation = {
+  entry: Entry;
+  epoch: CacheEpoch;
+  file: Stats;
+  parents: Stats[];
+  unlinked?: boolean;
+  removed?: boolean;
+};
 type CleanupIntent = {
   version: 1;
   sessionId: string;
@@ -198,6 +206,8 @@ export class OwnedRemoteBrokerCache {
   private readonly scopes = new Map<string, string>();
   private readonly epochs = new Map<string, CacheEpoch>();
   private readonly deletions = new Map<string, object>();
+  private readonly preparations = new WeakMap<OwnedRemoteBrokerDescriptor, Preparation>();
+  private readonly canceledPreparations = new Map<string, OwnedRemoteBrokerDescriptor>();
   constructor(private readonly root = join(getDataDirPath(), 'remote-input-brokers')) {}
   private begin(sessionId: string): CacheEpoch {
     let epoch = this.epochs.get(sessionId);
@@ -217,6 +227,8 @@ export class OwnedRemoteBrokerCache {
   retire(sessionId: string): void {
     this.epochs.delete(sessionId);
     this.scopes.delete(sessionId);
+    for (const key of this.canceledPreparations.keys())
+      if (key.startsWith(sessionId + ':')) this.canceledPreparations.delete(key);
     for (const [key, entry] of this.entries) {
       if (!key.startsWith(sessionId + ':')) continue;
       entry.signer?.retire();
@@ -644,12 +656,154 @@ export class OwnedRemoteBrokerCache {
   private directories(sessionId: string, incarnation: string): string[] {
     return [this.root, join(this.root, sessionId), join(this.root, sessionId, incarnation)];
   }
+  /** Caller certifies no reservation/remote dispatch was attempted for this exact prepare receipt. */
+  async discardUnreservedPreparation(
+    scope: OwnedRemoteBrokerScope,
+    receipt: OwnedRemoteBrokerDescriptor
+  ): Promise<boolean> {
+    const prepared = this.preparations.get(receipt),
+      key = scope.sessionId + ':' + receipt.incarnation;
+    const current = () =>
+      !!prepared &&
+      !this.deletions.has(scope.sessionId) &&
+      this.epochs.get(scope.sessionId) === prepared.epoch &&
+      this.entries.get(key) === prepared.entry &&
+      prepared.entry.epoch === prepared.epoch &&
+      prepared.entry.scope === scopeKey(scope) &&
+      !prepared.entry.signer &&
+      Object.keys(receipt).length === Object.keys(prepared.entry.descriptor).length &&
+      Object.entries(prepared.entry.descriptor).every(
+        ([field, value]) => receipt[field as keyof OwnedRemoteBrokerDescriptor] === value
+      );
+    if (!prepared || !current()) return false;
+    this.canceledPreparations.set(key, receipt);
+    const dirs = this.directories(scope.sessionId, receipt.incarnation),
+      path = join(dirs[2], 'private.json'),
+      expected = Buffer.from(
+        JSON.stringify({
+          version: 1,
+          scope: prepared.entry.scope,
+          directory: receipt.directory,
+          material: prepared.entry.material,
+        })
+      ),
+      deadline = performance.now() + 2000,
+      check = () => current() && performance.now() < deadline;
+    const finish = async () => {
+      const parent = await fs.open(dirs[1], constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try {
+        await parent.sync();
+      } finally {
+        await parent.close();
+      }
+      const finalParents = dirs.slice(0, 2).map((path) => lstatSync(path));
+      if (
+        !check() ||
+        finalParents.some(
+          (stat, index) =>
+            !privateStat(stat, true) ||
+            stat.dev !== prepared.parents[index].dev ||
+            stat.ino !== prepared.parents[index].ino
+        )
+      )
+        return false;
+      try {
+        lstatSync(path);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      }
+      this.entries.delete(key);
+      this.canceledPreparations.delete(key);
+      this.preparations.delete(receipt);
+      if (![...this.entries.keys()].some((entry) => entry.startsWith(scope.sessionId + ':'))) {
+        this.scopes.delete(scope.sessionId);
+        if (prepared.epoch.pending === 0) this.epochs.delete(scope.sessionId);
+      }
+      return true;
+    };
+    return (
+      (await bounded('discard:' + path, async () => {
+        if (prepared.removed) return finish();
+        const parents = await Promise.all(dirs.map((path) => fs.lstat(path)));
+        if (
+          !check() ||
+          parents.some(
+            (stat, index) =>
+              !privateStat(stat, true) ||
+              stat.dev !== prepared.parents[index].dev ||
+              stat.ino !== prepared.parents[index].ino
+          )
+        )
+          return false;
+        if (!prepared.unlinked) {
+          const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+          try {
+            const stat = await file.stat();
+            if (!privateStat(stat) || !same(stat, prepared.file) || stat.size !== expected.length) return false;
+            const bytes = Buffer.alloc(stat.size + 1),
+              read = await file.read(bytes, 0, bytes.length, 0);
+            if (
+              read.bytesRead !== stat.size ||
+              !bytes.subarray(0, read.bytesRead).equals(expected) ||
+              !same(stat, await file.stat())
+            )
+              return false;
+          } finally {
+            await file.close();
+          }
+          const after = await Promise.all([...dirs, path].map((path) => fs.lstat(path)));
+          if (
+            !check() ||
+            after.slice(0, 3).some((stat, index) => !privateStat(stat, true) || !same(stat, parents[index])) ||
+            !privateStat(after[3]) ||
+            !same(after[3], prepared.file)
+          )
+            return false;
+          await fs.unlink(path);
+          prepared.unlinked = true;
+        }
+        const directory = await fs.open(dirs[2], constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        let empty: Stats;
+        try {
+          await directory.sync();
+          empty = await directory.stat();
+        } finally {
+          await directory.close();
+        }
+        const after = await Promise.all(dirs.map((path) => fs.lstat(path)));
+        if (
+          !check() ||
+          !privateStat(empty, true) ||
+          empty.dev !== prepared.parents[2].dev ||
+          empty.ino !== prepared.parents[2].ino ||
+          after.some((stat, index) => !privateStat(stat, true) || !same(stat, index === 2 ? empty : parents[index]))
+        )
+          return false;
+        // No recursive removal: unrelated artifacts always remain intact.
+        try {
+          await fs.rmdir(dirs[2]);
+          prepared.removed = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOTEMPTY') return false;
+          throw error;
+        }
+        return finish();
+      })) === true
+    );
+  }
+  /** Reservation/dispatch permanently ends local known-unsent rollback authority. */
+  sealPreparation(receipt: OwnedRemoteBrokerDescriptor): void {
+    this.preparations.delete(receipt);
+  }
   /** O_EXCL only, after missing/inert remote provisioning and before any broker child launch. */
   async prepare(
     scope: OwnedRemoteBrokerScope,
     material: BrokerProvisioningMaterial,
     directory: string
   ): Promise<OwnedRemoteBrokerDescriptor | undefined> {
+    for (const [key, receipt] of this.canceledPreparations)
+      if (key.startsWith(scope.sessionId + ':')) await this.discardUnreservedPreparation(scope, receipt);
     const key = scopeKey(scope);
     if (this.deletions.has(scope.sessionId)) return undefined;
     const proof = descriptor(scope, material, directory);
@@ -674,6 +828,8 @@ export class OwnedRemoteBrokerCache {
     const file = join(dirs[2], 'private.json');
     const sessionId = scope.sessionId;
     const epoch = this.begin(sessionId);
+    let ownedFile: Stats | undefined;
+    const ownedParents: Stats[] = [];
     try {
       const prepared = await bounded(
         'write:' + file + ':' + createHash('sha256').update(bytes).digest('hex') + ':' + epoch.id,
@@ -692,6 +848,7 @@ export class OwnedRemoteBrokerCache {
           try {
             await handle.writeFile(bytes);
             await handle.sync();
+            ownedFile = await handle.stat();
           } finally {
             await handle.close();
           }
@@ -699,6 +856,7 @@ export class OwnedRemoteBrokerCache {
             const handle = await fs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
             try {
               await handle.sync();
+              ownedParents.unshift(await handle.stat());
             } finally {
               await handle.close();
             }
@@ -715,14 +873,19 @@ export class OwnedRemoteBrokerCache {
       )
         return undefined;
       this.scopes.set(scope.sessionId, key);
-      this.entries.set(entryKey, { epoch, scope: key, material: copied, descriptor: proof });
-      return { ...proof };
+      const entry = { epoch, scope: key, material: copied, descriptor: proof },
+        receipt = { ...proof };
+      this.entries.set(entryKey, entry);
+      if (ownedFile && ownedParents.length === 3)
+        this.preparations.set(receipt, { entry, epoch, file: ownedFile, parents: ownedParents });
+      return receipt;
     } finally {
       this.finish(sessionId, epoch);
     }
   }
   /** Reads only locally retained launch material; an existing remote pane cannot create this record. */
   async load(scope: OwnedRemoteBrokerScope, incarnation: string): Promise<OwnedRemoteBrokerDescriptor | undefined> {
+    if (this.canceledPreparations.has(scope.sessionId + ':' + incarnation)) return undefined;
     if (this.deletions.has(scope.sessionId)) return undefined;
     const key = scopeKey(scope);
     if (!key || !UUID.test(incarnation)) return undefined;
@@ -791,6 +954,7 @@ export class OwnedRemoteBrokerCache {
     }
   }
   get(scope: OwnedRemoteBrokerScope, incarnation: string): OwnedRemoteBrokerDescriptor | undefined {
+    if (this.canceledPreparations.has(scope.sessionId + ':' + incarnation)) return undefined;
     const entry = this.entries.get(scope.sessionId + ':' + incarnation);
     return entry &&
       this.epochs.get(scope.sessionId) === entry.epoch &&
