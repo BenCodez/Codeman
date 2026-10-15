@@ -164,6 +164,8 @@ export class RecoveryStore {
   private records: Record<string, RecoveryState> = {};
   private writes: Promise<unknown> = Promise.resolve();
   readonly loadFailed: boolean;
+  private pendingCleanupWrites = 0;
+  private cleanupWriteFailed = false;
 
   constructor(private readonly path = dataPath('recovery.json')) {
     let failed = false;
@@ -186,6 +188,13 @@ export class RecoveryStore {
     this.loadFailed = failed;
   }
 
+  /** Pure complete private reference domain; pending/failed durability is unknown. */
+  getCleanupSnapshot(): Record<string, RecoveryState> | undefined {
+    return this.loadFailed || this.pendingCleanupWrites > 0 || this.cleanupWriteFailed
+      ? undefined
+      : structuredClone(this.records);
+  }
+
   get(id: string): RecoveryState {
     const state = structuredClone(this.records[id] ?? initialRecoveryState());
     if (this.loadFailed) {
@@ -203,18 +212,28 @@ export class RecoveryStore {
     if (!/^[\w-]{1,100}$/.test(id)) return Promise.reject(new Error('Invalid session identity'));
     StateSchema.parse(state);
     const copy = structuredClone(state);
+    this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
       const next = { ...this.records, [id]: copy };
       if (Object.keys(next).length > 200) throw new Error('Recovery journal is over capacity');
       await this.write(next);
       this.records = next;
     });
-    this.writes = result.catch(() => {});
-    return result;
+    const tracked = result
+      .catch((error: unknown) => {
+        this.cleanupWriteFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.pendingCleanupWrites--;
+      });
+    this.writes = tracked.catch(() => {});
+    return tracked;
   }
 
   drop(id: string): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
+    this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
       if (!this.records[id]) return;
       const next = { ...this.records };
@@ -222,13 +241,22 @@ export class RecoveryStore {
       await this.write(next);
       this.records = next;
     });
-    this.writes = result.catch(() => {});
-    return result;
+    const tracked = result
+      .catch((error: unknown) => {
+        this.cleanupWriteFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.pendingCleanupWrites--;
+      });
+    this.writes = tracked.catch(() => {});
+    return tracked;
   }
 
   /** Remove unreachable settings/intentions; a durable delivery reservation remains evidence. */
   pruneOrphans(keep: (id: string) => boolean): Promise<number> {
     if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
+    this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
       const next = { ...this.records };
       let removed = 0;
@@ -243,8 +271,16 @@ export class RecoveryStore {
       }
       return removed;
     });
-    this.writes = result.catch(() => {});
-    return result;
+    const tracked = result
+      .catch((error: unknown) => {
+        this.cleanupWriteFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.pendingCleanupWrites--;
+      });
+    this.writes = tracked.catch(() => {});
+    return tracked;
   }
 
   private async write(records: Record<string, RecoveryState>): Promise<void> {

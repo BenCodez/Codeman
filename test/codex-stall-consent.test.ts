@@ -15,6 +15,7 @@ import { createDeferred } from './mocks/index.js';
 
 const NOW = Date.UTC(2026, 9, 14, 12);
 const THREAD = '11111111-2222-3333-4444-555555555555';
+const STALL_POLICY_SETTINGS = ['enabled', 'detectStalls', 'restartStalls'] as const;
 const controllers: RecoveryController[] = [];
 const roots: string[] = [];
 beforeEach(() => {
@@ -67,7 +68,10 @@ async function fixture(remote: boolean, restartStalls?: boolean, warning = true)
     safeToAct: false,
     ...(remote ? { progressEvidenceKey: `remote:${'a'.repeat(64)}`, progressLowerBound: NOW - 20_001 } : {}),
   };
-  const effects = vi.fn(async (_flight: RecoveryFlight, _current: RecoveryActionAuthority) => 'sent' as const);
+  const effects = vi.fn(
+    async (_flight: RecoveryFlight, _current: RecoveryActionAuthority): Promise<'sent' | 'not-sent' | 'unknown'> =>
+      'sent'
+  );
   const controller = new RecoveryController(
     {
       observe: async () => ({ ...observation, stallObservedAt: Date.now() }),
@@ -122,7 +126,7 @@ it.each([false, true].flatMap((remote) => [undefined, false].map((consent) => ({
   }
 );
 
-it.each(['restartStalls', 'detectStalls'] as const)(
+it.each(STALL_POLICY_SETTINGS)(
   'withdraws %s authority during held final dispatch without any worker effect',
   async (setting) => {
     const f = await fixture(false, true);
@@ -156,17 +160,111 @@ it.each(['restartStalls', 'detectStalls'] as const)(
   }
 );
 
-it('preserves prior explicit restart consent across an unrelated setting change', async () => {
-  const f = await fixture(false, true);
-  await f.controller.updateConfig({ maxRetries: 4 });
-  expect(f.controller.getStatus().config.restartStalls).toBe(true);
+it.each(
+  [false, true].flatMap((remote) =>
+    (['unrelated', ...STALL_POLICY_SETTINGS] as const).map((setting) => ({ remote, setting }))
+  )
+)('preserves current confirmation for an unchanged policy ($setting SSH=$remote)', async ({ remote, setting }) => {
+  const f = await fixture(remote, true);
   await f.controller.retry();
+  expect(f.effects).not.toHaveBeenCalled();
+  await f.controller.updateConfig(setting === 'unrelated' ? { maxRetries: 4 } : { [setting]: true });
+  expect(f.controller.getStatus().config.restartStalls).toBe(true);
   vi.setSystemTime(NOW + 2000);
   await f.controller.retry();
   expect(f.effects).toHaveBeenCalledOnce();
 });
 
-it.each(['restartStalls', 'detectStalls'] as const)(
+it.each(
+  [false, true].flatMap((remote) =>
+    STALL_POLICY_SETTINGS.flatMap((setting) => [10_000, 15_000].map((quiet) => ({ remote, setting, quiet })))
+  )
+)(
+  'requires two fresh post-consent probes after $setting off/on (SSH=$remote quiet=$quiet)',
+  async ({ remote, setting, quiet }) => {
+    const f = await fixture(remote, true);
+    await f.controller.updateConfig({ stalledAfterMs: quiet });
+    await f.controller.retry();
+    const before = f.controller.getStatus();
+    expect(before.pending).toBeUndefined();
+    expect(before.inFlight).toBeUndefined();
+    expect(before.attempts).toBe(0);
+    // Exercise both a rapid real-time change and a same-millisecond change at
+    // the maximum lifetime of the old private confirmation.
+    const armedAt = quiet === 10_000 ? NOW + 200 : NOW;
+    vi.setSystemTime(armedAt);
+    await f.controller.updateConfig({ [setting]: false });
+    await f.controller.updateConfig({ [setting]: true });
+    expect(f.controller.getStatus().armedAt).toBe(armedAt);
+    vi.setSystemTime(armedAt + quiet);
+    await f.controller.retry();
+    expect(f.effects).not.toHaveBeenCalled();
+    expect(f.controller.getStatus()).toMatchObject({ attempts: 0 });
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.controller.getStatus().history.filter((event) => event.kind === 'attention')).toEqual(
+      before.history.filter((event) => event.kind === 'attention')
+    );
+    vi.setSystemTime(armedAt + quiet + 1999);
+    await f.controller.retry();
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(armedAt + quiet + 2000);
+    await f.controller.retry();
+    expect(f.effects).toHaveBeenCalledOnce();
+    expect(f.effects.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
+  }
+);
+
+it.each(STALL_POLICY_SETTINGS.flatMap((setting) => ['accepted', 'uncertain'].map((phase) => ({ setting, phase }))))(
+  'retains $phase delivery history through $setting off/on without replay',
+  async ({ setting, phase }) => {
+    const f = await fixture(true, true);
+    f.effects.mockResolvedValueOnce(phase === 'uncertain' ? 'unknown' : 'sent');
+    await f.controller.retry();
+    vi.setSystemTime(NOW + 2000);
+    await f.controller.retry();
+    expect(f.effects).toHaveBeenCalledOnce();
+    if (phase === 'accepted') {
+      vi.setSystemTime(NOW + 3000);
+      Object.assign(f.observation, {
+        activity: 'completed',
+        reason: 'turn-completed',
+        stallRestartable: false,
+        processReady: true,
+        processReadyAt: Date.now(),
+      });
+      await f.controller.inspect();
+      expect(f.controller.getStatus().inFlight).toBeUndefined();
+      expect(f.controller.getStatus().handledEvidence).toHaveLength(1);
+      Object.assign(f.observation, {
+        activity: 'working',
+        reason: 'turn-running',
+        stallRestartable: true,
+        processReady: false,
+      });
+    }
+    const before = f.controller.getStatus();
+    await f.controller.updateConfig({ [setting]: false });
+    await f.controller.updateConfig({ [setting]: true });
+    vi.setSystemTime(Date.now() + 10_000);
+    await f.controller.retry();
+    vi.setSystemTime(Date.now() + 2000);
+    await f.controller.retry();
+    expect(f.effects).toHaveBeenCalledOnce();
+    const after = new RecoveryStore(f.path).get('worker');
+    expect(after.attempts).toBe(before.attempts);
+    expect(after.failedAttempts).toBe(before.failedAttempts);
+    expect(after.windowStartedAt).toBe(before.windowStartedAt);
+    expect(after.lastSuccessfulRecovery).toBe(before.lastSuccessfulRecovery);
+    expect(after.inFlight).toEqual(before.inFlight);
+    expect(after.handledEvidence).toEqual(before.handledEvidence);
+    expect(after.history.filter((event) => event.kind === 'accepted')).toEqual(
+      before.history.filter((event) => event.kind === 'accepted')
+    );
+  }
+);
+
+it.each(STALL_POLICY_SETTINGS)(
   'durably cancels a scheduled stall action immediately when %s is withdrawn',
   async (setting) => {
     const f = await fixture(false, true, false);

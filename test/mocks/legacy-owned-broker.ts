@@ -45,7 +45,8 @@ os.close(fd)
     join(root, 'private', SID),
     SID,
     `exec /usr/bin/python3 -u ${quote(childPath)} ${quote(root)}`,
-    home
+    home,
+    root
   );
   const workers: ChildProcessWithoutNullStreams[] = [];
   let pid = 4242;
@@ -174,7 +175,7 @@ os.close(fd)
       codexHome: home,
       codexConfig: { noDaemon: true, resumeSessionId: CID, model: 'fixture-model' },
     });
-    const next = await CodexInputBroker.create(join(root, 'private', SID), SID, workerCommand, home);
+    const next = await CodexInputBroker.create(join(root, 'private', SID), SID, workerCommand, home, root);
     const nextDescriptor = await descriptorFor(next);
     const native = join(bin, 'owned-tmux');
     await fs.writeFile(

@@ -60,6 +60,10 @@ import type { ClaudeMode, SessionAttachmentHistoryItem, SessionState, WorkflowRu
 import { RespawnController, RespawnConfig } from '../respawn-controller.js';
 import type { TerminalMultiplexer } from '../mux-interface.js';
 import { createMultiplexer } from '../mux-factory.js';
+import {
+  captureBrokerCleanupReferences,
+  type BrokerCleanupReferenceSnapshot,
+} from '../recovery/codex-broker-cleanup.js';
 import { getStore } from '../state-store.js';
 import { TabLayoutService } from '../tab-layout-service.js';
 import { ownerLayoutKey } from '../tab-layout-persistence.js';
@@ -160,7 +164,7 @@ import { MAX_CONCURRENT_SESSIONS, MAX_SSE_CLIENTS } from '../config/map-limits.j
 import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
-import { TaskController } from '../supervision/controller.js';
+import { TaskConfigurationCancelledError, TaskController } from '../supervision/controller.js';
 import { TaskStore, taskJournalHasOwnership } from '../supervision/store.js';
 import { initialTaskState, TaskStateSchema, type TaskState } from '../supervision/schema.js';
 import { CodexTaskAdapter } from '../supervision/adapter.js';
@@ -168,6 +172,7 @@ import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
 import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
 import { SupervisorStore } from '../supervisor/store.js';
+import { SupervisorStateSchema } from '../supervisor/schema.js';
 import { RecoveryController } from '../recovery/controller.js';
 import { hasFreshProcessReady, isRecoveryEvidenceSourceCurrent, type RecoveryObservation } from '../recovery/types.js';
 import { RecoveryStore } from '../recovery/store.js';
@@ -2769,10 +2774,24 @@ export class WebServer extends EventEmitter {
           managerEvidence = undefined;
           const task = this.getTaskController(session);
           if (!task) throw new Error('Supervisor task controller is unavailable');
-          await task.update(buildSupervisorManagerTask(objective));
-          if (!isCurrent()) return false;
-          const started = await task.resume(isCurrent, runtimeStartedAt);
-          if (!isCurrent()) {
+          const scope = managerScope();
+          const current = () =>
+            isCurrent() &&
+            !this.recoveryStopping &&
+            !this.cleaningUp.has(session.id) &&
+            this.sessions.get(session.id) === session &&
+            this.taskControllers.get(session.id) === task &&
+            managerScope() === scope;
+          try {
+            await task.update(buildSupervisorManagerTask(objective), current);
+          } catch (error) {
+            if (error instanceof TaskConfigurationCancelledError)
+              throw new SupervisorValidationError('Manager start was cancelled');
+            throw error;
+          }
+          if (!current()) return false;
+          const started = await task.resume(current, runtimeStartedAt);
+          if (!current()) {
             if (started.inFlight) throw new Error('Manager task delivery may have started before cancellation');
             return false;
           }
@@ -2843,7 +2862,7 @@ export class WebServer extends EventEmitter {
             if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
             return adapter.act(key, conversationId, prompt, isCurrent);
           }),
-        persist: (state) => this.taskStore.save(session.id, state),
+        persist: (state, authority) => this.taskStore.save(session.id, state, authority),
         changed: (state) => {
           if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;
           this.broadcast(SseEvent.SessionTask, { sessionId: session.id, state });
@@ -2900,7 +2919,7 @@ export class WebServer extends EventEmitter {
         act: (flight, isCurrent) =>
           this.getActionArbiter(session.id).run('recovery', flight.key, () => {
             // Retain the final veto for a task that acquires authority after observation.
-            if (taskBlocksRecovery()) return Promise.resolve('not-sent');
+            if (!isCurrent() || taskBlocksRecovery()) return Promise.resolve('not-sent');
             return adapter.act(flight, isCurrent);
           }),
         restoreMissingRemote: (isCurrent) =>
@@ -3612,6 +3631,43 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  /** Complete private references only; never installed before startup reconciliation. */
+  private captureInputBrokerCleanupReferences(): BrokerCleanupReferenceSnapshot | undefined {
+    return captureBrokerCleanupReferences(() => {
+      const recovery = this.recoveryStore.getCleanupSnapshot();
+      const reboot = rebootRestoreRegistry.getBrokerCleanupState();
+      const task = this.taskStore.getBrokerCleanupState();
+      const actions = this.actionReservationStore.getBrokerCleanupState();
+      const supervisors = this.supervisorStore.getBrokerCleanupState();
+      if (!recovery || !reboot || !task || !actions || !supervisors)
+        throw new Error('Recovery references are unavailable');
+      const supervisorControllers = Array.from(this.supervisorControllers.values(), (controller) =>
+        controller.getStatus()
+      );
+      for (const status of supervisorControllers) {
+        if (!SupervisorStateSchema.safeParse(status).success) {
+          // A future asynchronous status reader is unknown; drain its rejection
+          // without adopting it as an empty private reference domain.
+          void Promise.resolve(status).catch(() => {});
+          throw new Error('Supervisor references are unavailable');
+        }
+      }
+      return {
+        persisted: this.store.getState(),
+        mux: this.mux.getSessions(),
+        live: Array.from(this.sessions.values(), (session) => session.getRecoveryContext()),
+        recovery,
+        reboot,
+        task,
+        actions,
+        supervisors,
+        supervisorControllers,
+        taskControllers: Array.from(this.taskControllers.values(), (controller) => controller.getStatus()),
+        recoveryControllers: Array.from(this.recoveryControllers.values(), (controller) => controller.getStatus()),
+      };
+    });
+  }
+
   async start(): Promise<void> {
     // Multi-user first boot: create the initial admin from CODEMAN_USERNAME/PASSWORD
     // if there are no users yet, else refuse to start (there would be no way in).
@@ -3650,6 +3706,9 @@ export class WebServer extends EventEmitter {
     if (!this.testMode) {
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
+      // Include every private board record and live scope; unknown/in-flight
+      // evidence disables retirement. The janitor also rechecks durable metadata.
+      this.mux.setBrokerCleanupReferenceProvider?.(() => this.captureInputBrokerCleanupReferences());
 
       // Instance-scoped reaper: after restore, `docker rm -f` managed containers of
       // THIS instance whose case is gone from docker-cases.json (best-effort, never

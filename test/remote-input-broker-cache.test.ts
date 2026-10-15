@@ -137,6 +137,53 @@ it('repeated load/observe retains the exact signer and its pending owner counter
   expect(signer.frame('owner-pty', 'next')?.receipt.counter).toBe(2);
 });
 
+it.each(['raw', 'reserved', 'birth'] as const)(
+  'refuses owner input from initial and refreshed uncertain %s snapshots',
+  async (fault) => {
+    for (const refreshed of [false, true]) {
+      const f = fixture();
+      await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+      if (refreshed) expect(f.observe()).toBeDefined();
+      if (fault === 'raw') {
+        f.state.tainted = true;
+        f.state.rawGeneration = 1;
+      }
+      if (fault === 'birth') f.state.childStart = '0';
+      if (fault === 'reserved') {
+        f.state.counters.auto = 1;
+        f.state.receipts = [
+          {
+            channel: 'auto',
+            counter: 1,
+            nonce: f.material.config.startup.nonce,
+            conversationId: '11111111-2222-3333-4444-555555555555',
+            hash: createHash('sha256').update('unfinished phase').digest('hex'),
+            status: 'reserved',
+          },
+        ];
+      }
+      expect(f.observe()).toBeUndefined();
+      const signer = f.cache.signer(f.scope, f.material.config.incarnation);
+      if (refreshed) expect(signer).toBeDefined();
+      else expect(signer).toBeUndefined();
+      expect(signer?.canFrame ?? false).toBe(false);
+      expect(signer?.frame('owner-pty', 'must not be ACKed')).toBeUndefined();
+    }
+  }
+);
+
+it('retains certified closed evidence without admitting owner input', async () => {
+  const f = fixture();
+  await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  f.state.closed = true;
+  f.state.exitStatus = 1;
+  expect(f.observe()).toMatchObject({ closed: true, exitStatus: 1 });
+  const signer = f.cache.signer(f.scope, f.material.config.incarnation);
+  expect(signer).toBeDefined();
+  expect(signer?.canFrame).toBe(false);
+  expect(signer?.frame('owner-key', '\r')).toBeUndefined();
+});
+
 it('scope serialization order does not change a retained host/home identity', async () => {
   const f = fixture();
   await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
@@ -294,10 +341,15 @@ it.each(['read', 'close'] as const)(
         await new Promise<void>((resolve) => setImmediate(resolve));
       expect(closed).toBe(2);
       // Final path checks must also settle before the same slot can be reused.
-      for (let turn = 0; turn < 20; turn++) await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(
-        await new OwnedRemoteBrokerCache(join(root, 'cache')).load(f.scope, f.material.config.incarnation)
-      ).toBeDefined();
+      // Observe actual slot release rather than assuming a number of I/O turns.
+      const readyBy = process.hrtime.bigint() + 2_000_000_000n;
+      let available: Awaited<ReturnType<OwnedRemoteBrokerCache['load']>>;
+      do {
+        available = await new OwnedRemoteBrokerCache(join(root, 'cache')).load(f.scope, f.material.config.incarnation);
+        if (available) break;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      } while (process.hrtime.bigint() < readyBy);
+      expect(available).toBeDefined();
     } finally {
       releases.forEach((release) => release());
       vi.useRealTimers();

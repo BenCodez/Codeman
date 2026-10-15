@@ -11,6 +11,8 @@ const MAX_BYTES = 2 * 1024 * 1024;
 export class SupervisorStore {
   private records: Record<string, SupervisorState> = {};
   private writes: Promise<unknown> = Promise.resolve();
+  private pendingCleanupWrites = 0;
+  private cleanupWriteFailed = false;
   readonly loadFailed: boolean;
 
   constructor(private readonly path = dataPath('supervisors.json')) {
@@ -51,24 +53,41 @@ export class SupervisorStore {
     return Object.values(this.records).map((v) => structuredClone(v));
   }
 
+  /** Cleanup requires the complete settled domain, without changing worker automation. */
+  getBrokerCleanupState(): Record<string, SupervisorState> | undefined {
+    return this.loadFailed || this.pendingCleanupWrites > 0 || this.cleanupWriteFailed
+      ? undefined
+      : structuredClone(this.records);
+  }
+
   save(id: string, state: SupervisorState): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
     if (!/^[\w-]{8,100}$/.test(id)) return Promise.reject(new Error('Invalid supervisor identity'));
     if (state.supervisorSessionId !== id) return Promise.reject(new Error('Supervisor journal identity mismatch'));
     SupervisorStateSchema.parse(state);
     const copy = structuredClone(state);
+    this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
       const next = { ...this.records, [id]: copy };
       if (Object.keys(next).length > 100) throw new Error('Supervisor journal is over capacity');
       await this.write(next);
       this.records = next;
     });
-    this.writes = result.catch(() => {});
-    return result;
+    const tracked = result
+      .catch((error: unknown) => {
+        this.cleanupWriteFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.pendingCleanupWrites--;
+      });
+    this.writes = tracked.catch(() => {});
+    return tracked;
   }
 
   drop(id: string): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
+    this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
       if (!this.records[id]) return;
       const next = { ...this.records };
@@ -76,13 +95,22 @@ export class SupervisorStore {
       await this.write(next);
       this.records = next;
     });
-    this.writes = result.catch(() => {});
-    return result;
+    const tracked = result
+      .catch((error: unknown) => {
+        this.cleanupWriteFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.pendingCleanupWrites--;
+      });
+    this.writes = tracked.catch(() => {});
+    return tracked;
   }
 
   /** Retire only unreachable settled manager records; uncertain operations retain their binding. */
   pruneOrphans(keep: (id: string) => boolean): Promise<number> {
     if (this.loadFailed) return Promise.reject(new Error('Supervisor journal failed to load'));
+    this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
       const next = { ...this.records };
       let removed = 0;
@@ -97,8 +125,16 @@ export class SupervisorStore {
       }
       return removed;
     });
-    this.writes = result.catch(() => {});
-    return result;
+    const tracked = result
+      .catch((error: unknown) => {
+        this.cleanupWriteFailed = true;
+        throw error;
+      })
+      .finally(() => {
+        this.pendingCleanupWrites--;
+      });
+    this.writes = tracked.catch(() => {});
+    return tracked;
   }
 
   private async write(next: Record<string, SupervisorState>): Promise<void> {

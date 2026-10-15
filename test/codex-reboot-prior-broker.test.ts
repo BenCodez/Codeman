@@ -72,7 +72,8 @@ async function fixture(raw = false, exitStatus = 1) {
     join(root, 'codex-input-brokers', SID),
     SID,
     `exec python3 ${quote(script)}`,
-    home
+    home,
+    root
   );
   const child = spawn('python3', [join(broker.directory, 'broker.py'), broker.directory, broker.configurationDigest], {
     env: { ...process.env, CODEX_HOME: home },
@@ -355,7 +356,8 @@ it.each(['healthy', 'tainted', 'missing', 'replaced'])(
       join(root, 'codex-input-brokers', SID),
       SID,
       `printf new > ${quote(marker)}`,
-      home
+      home,
+      root
     );
     await next.setStartupAuthority(startup.files, undefined, startup.paths, startup.missing);
     if (kind !== 'healthy') await damage(journal, kind);

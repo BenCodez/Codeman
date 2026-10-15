@@ -257,6 +257,13 @@ export class RecoveryController {
       const enabledNow = config.enabled && !this.state.config.enabled;
       const stallEnabledNow = config.detectStalls && !this.state.config.detectStalls;
       const stallRestartEnabledNow = config.restartStalls && !this.state.config.restartStalls;
+      const confirmationPolicyChanged =
+        config.enabled !== this.state.config.enabled ||
+        config.detectStalls !== this.state.config.detectStalls ||
+        config.restartStalls !== this.state.config.restartStalls;
+      // A newly consented policy needs its own fresh observations, even when
+      // the old confirmation had not yet scheduled an action.
+      if (confirmationPolicyChanged) this.confirmation = undefined;
       this.state.config = config;
       if (enabledNow || stallEnabledNow || stallRestartEnabledNow) this.state.armedAt = this.now();
       if (!(config.detectStalls && config.restartStalls) && this.state.pending?.reason === 'stalled') {
@@ -938,14 +945,27 @@ export class RecoveryController {
     this.event('state', 'scheduled');
     // This reservation MUST be durable before any bytes or restart reach the pane.
     await this.save();
-    const canDispatch: RecoveryActionAuthority = () =>
-      isCurrent() &&
-      (!restartableStall || (this.state.config.detectStalls === true && this.state.config.restartStalls === true)) &&
-      !this.recoveryWindowExpired() &&
-      (this.deps.hasActionAuthority ? this.deps.hasActionAuthority() === true : true);
+    // Once sampled, a withdrawn task or supervisor authority cannot revive this attempt.
+    let authorityWithdrawn = false;
+    const canDispatch: RecoveryActionAuthority = () => {
+      if (
+        !isCurrent() ||
+        (restartableStall && (this.state.config.detectStalls !== true || this.state.config.restartStalls !== true)) ||
+        this.recoveryWindowExpired() ||
+        (this.deps.hasActionAuthority && this.deps.hasActionAuthority() !== true)
+      )
+        authorityWithdrawn = true;
+      return !authorityWithdrawn;
+    };
     if (externallyCurrent.prepareEvidence) {
-      canDispatch.prepareEvidence = async (source) =>
-        canDispatch() && (await externallyCurrent.prepareEvidence!(source)) === true && canDispatch();
+      canDispatch.prepareEvidence = async (source) => {
+        if (!canDispatch()) return false;
+        const prepared = (await externallyCurrent.prepareEvidence!(source)) === true;
+        // Sample while the admitted preparation callback is active, including
+        // a false result caused by owner withdrawal before any worker effect.
+        const current = canDispatch();
+        return prepared && current;
+      };
     }
     if (externallyCurrent.getInputIssuer)
       canDispatch.getInputIssuer = () => (canDispatch() ? externallyCurrent.getInputIssuer!() : undefined);
@@ -960,7 +980,12 @@ export class RecoveryController {
     } catch {
       outcome = 'unknown';
     }
-    if (outcome === 'not-sent' && !canDispatch()) {
+    // Do not newly sample task ownership after the adapter returns: a task
+    // acquiring authority during cleanup did not cause a real worker failure.
+    if (
+      outcome === 'not-sent' &&
+      (authorityWithdrawn || this.stopped || revision !== this.revision || this.recoveryWindowExpired())
+    ) {
       // The adapter certified that no bytes were sent. Release the durable reservation
       // without consuming a retry or labelling an explicit disable/shutdown as a failure.
       this.state.inFlight = undefined;

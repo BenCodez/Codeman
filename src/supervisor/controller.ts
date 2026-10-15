@@ -1,6 +1,7 @@
 /** @fileoverview Codex manager authority, expressed only through guarded worker controllers. */
 import type { RecoveryActionAuthority, RecoveryEvidenceSource, RecoveryState } from '../recovery/types.js';
 import type { TaskState, TaskUpdate } from '../supervision/schema.js';
+import { TaskConfigurationCancelledError } from '../supervision/controller.js';
 import type { SupervisorWorkerInspection } from '../types/supervisor.js';
 import { SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from './manager-task.js';
 import {
@@ -38,7 +39,7 @@ export interface SupervisorWorkerHandle {
   isCurrent?(): boolean;
   task: {
     getStatus(): TaskState;
-    update(patch: TaskUpdate): Promise<TaskState>;
+    update(patch: TaskUpdate, isCurrent?: () => boolean): Promise<TaskState>;
     resume(isCurrent?: RecoveryActionAuthority, runtimeStartedAt?: number): Promise<TaskState>;
   };
   recovery: {
@@ -468,24 +469,33 @@ export class SupervisorController {
               criterion.command === expected.command
             );
           });
-        await worker.task.update({
-          objective: configured.task,
-          criteria: configured.criteria,
-          config: {
-            // Configuration is inert until the guarded resume below accepts the
-            // supervisor's live cancellation token.
-            enabled: false,
-            maxContinuations: Math.min(
-              10,
-              configured.maxAssignments,
-              preservesTask ? existing.config.maxContinuations : 10
-            ),
-            maxRuntimeMs: Math.min(
-              configured.maxRuntimeMs,
-              preservesTask ? existing.config.maxRuntimeMs : configured.maxRuntimeMs
-            ),
-          },
-        });
+        await worker.task
+          .update(
+            {
+              objective: configured.task,
+              criteria: configured.criteria,
+              config: {
+                // Configuration is inert until the guarded resume below accepts the
+                // supervisor's live cancellation token.
+                enabled: false,
+                maxContinuations: Math.min(
+                  10,
+                  configured.maxAssignments,
+                  preservesTask ? existing.config.maxContinuations : 10
+                ),
+                maxRuntimeMs: Math.min(
+                  configured.maxRuntimeMs,
+                  preservesTask ? existing.config.maxRuntimeMs : configured.maxRuntimeMs
+                ),
+              },
+            },
+            isCurrent
+          )
+          .catch((error: unknown) => {
+            if (error instanceof TaskConfigurationCancelledError)
+              throw new SupervisorOperationRefused('Worker assignment was cancelled');
+            throw error;
+          });
         if (!isCurrent()) throw new SupervisorOperationRefused('Worker assignment was cancelled');
         const started = await worker.task.resume(isCurrent, runtimeStartedAt);
         if (!isCurrent()) {

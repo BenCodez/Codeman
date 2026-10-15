@@ -12,6 +12,7 @@ export async function remoteSourceIssuer(root: string) {
     join(root, 'manager', sid),
     sid,
     'exec /usr/bin/python3 -c "import time;time.sleep(60)" ' + "'" + root.replace(/'/g, "'\"'\"'") + "'",
+    root,
     root
   );
   const env = { PATH: '/usr/bin:/bin', HOME: root, CODEX_HOME: root, LANG: 'C.UTF-8' };

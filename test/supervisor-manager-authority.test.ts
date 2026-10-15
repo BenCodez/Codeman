@@ -364,6 +364,105 @@ describe('manager authority at the real server boundary', () => {
     nextAction: 'Assign the authorized repair',
   };
 
+  it.each([
+    'allowed',
+    'pause',
+    'io-pause',
+    'manager-session',
+    'manager-controller',
+    'manager-owner',
+    'manager-config',
+  ] as const)('binds actual manager startup configuration to current authority (%s)', async (outcome) => {
+    await managerTask.progress({
+      outcome: 'unfinished',
+      checkpoint: 'Retain original manager checkpoint',
+      nextAction: 'Owner review next',
+    });
+    await manager.pause();
+    await managerTask.drain();
+    await manager.configure({ ...config, objective: 'A replacement manager objective' });
+    await managerTask.drain();
+    observation = { ...observation, activity: 'idle', reason: 'observing', processReady: true, at: Date.now() };
+    const before = managerTask.getStatus();
+    const priorHistoryLength = manager.getStatus().history.length;
+    const bytes = await fs.readFile(Reflect.get(internals.taskStore, 'path') as string, 'utf8');
+    const entered = createDeferred();
+    const release = createDeferred();
+    const taskDeps = Reflect.get(managerTask, 'deps') as TaskDependencies;
+    const persist = taskDeps.persist.bind(taskDeps);
+    const ioError = new Error('Task configuration authority was cancelled');
+    vi.spyOn(taskDeps, 'persist').mockImplementationOnce(async (state, authority) => {
+      entered.resolve();
+      await release.promise;
+      if (outcome === 'io-pause') throw ioError;
+      await persist(state, authority);
+    });
+    const starting = manager.start();
+    const result = starting.then(
+      (state) => state,
+      (error: unknown) => error
+    );
+    let pausing: Promise<unknown> | undefined;
+    try {
+      await entered.promise;
+      // Configuration is still the owner's original state during preparation.
+      expect(managerTask.getStatus()).toEqual(before);
+      expect(await fs.readFile(Reflect.get(internals.taskStore, 'path') as string, 'utf8')).toBe(bytes);
+      if (outcome === 'pause' || outcome === 'io-pause') pausing = manager.pause();
+      if (outcome === 'manager-session') internals.sessions.set(MANAGER, fakeSession(MANAGER, MANAGER_THREAD));
+      if (outcome === 'manager-controller')
+        internals.taskControllers.set(MANAGER, new TaskController(taskDeps, before));
+      if (outcome === 'manager-owner') managerSession.owner = 'replacement-owner';
+      if (outcome === 'manager-config')
+        Reflect.set(managerSession, '_codexConfig', { ...managerSession.codexConfig, model: 'replacement-model' });
+      release.resolve();
+      const finished = await result;
+      await pausing;
+      await managerTask.drain();
+      if (outcome === 'allowed') {
+        expect(finished).toMatchObject({ phase: 'active', reason: 'owner-started' });
+        expect(taskAct).toHaveBeenCalledOnce();
+        expect(managerTask.getStatus()).toMatchObject({
+          checkpoint: '',
+          phase: 'watching',
+          config: { enabled: true },
+        });
+        expect(managerTask.getStatus().objective).toContain('A replacement manager objective');
+      } else {
+        expect(finished).toBeInstanceOf(Error);
+        expect(taskAct).not.toHaveBeenCalled();
+        expect(managerTask.getStatus()).toMatchObject({
+          objective: before.objective,
+          criteria: before.criteria,
+          checkpoint: before.checkpoint,
+          nextAction: before.nextAction,
+        });
+        const history = manager.getStatus().history.slice(priorHistoryLength);
+        if (outcome !== 'io-pause') {
+          expect(history.some((entry) => entry.reason === 'manager-start-refused')).toBe(true);
+          expect(history.some((entry) => entry.reason === 'manager-start-uncertain')).toBe(false);
+        } else {
+          expect(finished).toBe(ioError);
+          expect(history.some((entry) => entry.reason === 'manager-start-uncertain')).toBe(true);
+          await expect(manager.start()).rejects.toThrow(/uncertain/);
+          expect(taskAct).not.toHaveBeenCalled();
+        }
+      }
+      const currentTask = internals.taskControllers.get(MANAGER)!;
+      await currentTask.drain();
+      expect(internals.taskStore.get(MANAGER)).toEqual(currentTask.getStatus());
+      expect(new TaskStore(Reflect.get(internals.taskStore, 'path') as string).get(MANAGER)).toEqual(
+        currentTask.getStatus()
+      );
+      if (outcome === 'manager-controller') expect(managerTask.getStatus()).toEqual(before);
+    } finally {
+      release.resolve();
+      await result;
+      await pausing;
+      if (outcome === 'manager-controller') managerTask.stop();
+    }
+  });
+
   it.each(
     (['assign', 'retry'] as const).flatMap((action) =>
       [false, true].flatMap((busy) =>

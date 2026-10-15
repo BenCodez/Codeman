@@ -173,7 +173,8 @@ describe('SupervisorController', () => {
         objective: 'Implement the parser',
         criteria: config.workers[0].criteria,
         config: { enabled: false, maxContinuations: 2, maxRuntimeMs: 60_000 },
-      })
+      }),
+      expect.any(Function)
     );
     expect(h.worker.task.resume).toHaveBeenCalledTimes(1);
     await h.controller.assign(WORKER, 'request-0001');
@@ -866,6 +867,67 @@ describe('SupervisorController', () => {
     expect(managerTask.getStatus()).toMatchObject({ phase: 'paused' });
     managerTask.stop();
   });
+
+  it.each(['prepared', 'current-refusal', 'owner-pause'] as const)(
+    'samples inherited preparation authority before recovery returns (%s)',
+    async (outcome) => {
+      const base = harness();
+      let pausing: Promise<unknown> | undefined;
+      const effects = vi.fn();
+      const recovery = new RecoveryController({
+        now: () => 10_000,
+        observe: async () => ({
+          activity: 'crashed',
+          reason: 'process-crashed',
+          at: 10_000,
+          conversationId: WORKER,
+          evidenceKey: 'preparation-cancellation',
+          safeToAct: true,
+        }),
+        act: async (_flight, authority) => {
+          expect(authority.getActionDeadline?.()).toBe(70_000);
+          if (!(await authority.prepareEvidence?.())) return 'not-sent';
+          effects();
+          return 'sent';
+        },
+        persist: async () => {},
+        changed: () => {},
+      });
+      const worker = { ...base.worker, recovery };
+      const prepare = vi.fn(async () => {
+        if (outcome === 'owner-pause') pausing = controller.pause();
+        return outcome === 'prepared';
+      });
+      const controller = new SupervisorController(
+        { ...base.deps, worker: () => worker, prepareManagerAuthority: prepare },
+        SUPERVISOR
+      );
+      try {
+        await controller.configure(config);
+        await controller.start();
+        const retrying = controller.retry(WORKER, `preparation-${outcome}`);
+        if (outcome === 'prepared') await retrying;
+        else await expect(retrying).rejects.toThrow();
+        await pausing;
+        expect(prepare).toHaveBeenCalledOnce();
+        expect(effects).toHaveBeenCalledTimes(outcome === 'prepared' ? 1 : 0);
+        expect(recovery.getStatus()).toMatchObject({
+          attempts: outcome === 'owner-pause' ? 0 : 1,
+          failedAttempts: outcome === 'current-refusal' ? 1 : 0,
+        });
+        if (outcome === 'owner-pause') {
+          expect(recovery.getStatus().inFlight).toBeUndefined();
+          expect(recovery.getStatus().windowStartedAt).toBeUndefined();
+          expect(controller.getStatus()).toMatchObject({ phase: 'paused', workers: [{ assignments: 0 }] });
+          expect(controller.getStatus().inFlight).toBeUndefined();
+        }
+      } finally {
+        await pausing;
+        controller.stop();
+        recovery.stop();
+      }
+    }
+  );
 
   it('propagates owner pause through a real recovery retry observation', async () => {
     const crash: RecoveryObservation = {
@@ -1662,8 +1724,8 @@ describe('SupervisorController', () => {
       try {
         h.setNow(10_000);
         const update = h.task.update.bind(h.task);
-        vi.spyOn(h.task, 'update').mockImplementation(async (patch) => {
-          const updated = await update(patch);
+        vi.spyOn(h.task, 'update').mockImplementation(async (patch, isCurrent) => {
+          const updated = await update(patch, isCurrent);
           h.setNow(10_800);
           return updated;
         });
