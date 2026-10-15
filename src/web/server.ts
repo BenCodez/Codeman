@@ -2506,13 +2506,16 @@ export class WebServer extends EventEmitter {
     // prevent its durable leases from being released through reset.
     const existing = this.supervisorControllers.get(session.id);
     if (existing) return existing;
+    // Rebuild an existing durable role for owner inspection and lease release
+    // even when a failed rebuild removed its live controller and launch rights.
+    const restored = this.supervisorStore.all().find((state) => state.supervisorSessionId === session.id);
     const managerIsEligible = () =>
       getCli(session.mode)?.capabilities.recovery === 'codex-rollout' &&
       !session.remote &&
       !session.docker &&
       session.getRecoveryContext().managed &&
       session.getRecoveryContext().noDaemon;
-    if (!managerIsEligible()) return undefined;
+    if (!restored && !managerIsEligible()) return undefined;
     const managerAdapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
     const managerScope = () => {
       const context = session.getRecoveryContext();
@@ -2823,7 +2826,7 @@ export class WebServer extends EventEmitter {
         changed: () => this.persistSessionState(session),
       },
       session.id,
-      this.supervisorStore.get(session.id)
+      restored ?? this.supervisorStore.get(session.id)
     );
     this.supervisorControllers.set(session.id, controller);
     return controller;

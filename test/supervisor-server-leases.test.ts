@@ -1,5 +1,7 @@
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 import { join, dirname } from 'node:path';
+import { readFile } from 'node:fs/promises';
+import { dataPath } from '../src/config/instance.js';
 import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 /** @fileoverview Supervisor leases follow surviving/restorable manager identities after boot. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -24,6 +26,7 @@ import { createRouteTestHarness, type RouteTestHarness } from './routes/_route-t
 const OLD = '11111111-1111-4111-8111-111111111111';
 const NEXT = '22222222-2222-4222-8222-222222222222';
 const WORKER = '33333333-3333-4333-8333-333333333333';
+const FRESH = '44444444-4444-4444-8444-444444444444';
 const config = {
   objective: 'Coordinate the fix',
   enabled: true,
@@ -48,11 +51,12 @@ interface Internals {
   getSupervisorController(session: Session): SupervisorController | undefined;
   getTaskController(session: Session): TaskController | undefined;
   supervisorLeaseHolder(workerId: string, excluding: string): string | undefined;
+  supervisorControllers: Map<string, SupervisorController>;
   stopRecoveryController(id: string, drop: boolean): Promise<void>;
+  discardPartiallyBuiltSession(id: string, expected: Session): Promise<void>;
 }
 
 function session(id: string): Session {
-  const mux = { isAvailable: () => true } as unknown as TerminalMultiplexer;
   const muxSession = {
     sessionId: id,
     muxName: `fixture-${id}`,
@@ -60,10 +64,16 @@ function session(id: string): Session {
     recoveryCodexHome: join(currentLocalCodexHome(), `fixture-${id}`),
     workingDir: process.cwd(),
     mode: 'codex',
+    owner: 'alice',
     attached: true,
     pid: 99999,
     createdAt: Date.now(),
   } as MuxSession;
+  const mux = {
+    isAvailable: () => true,
+    getSession: () => muxSession,
+    registerSession: vi.fn(),
+  } as unknown as TerminalMultiplexer;
   return new Session({
     id,
     mode: 'codex',
@@ -132,7 +142,7 @@ describe('server supervisor lease reconciliation', () => {
   afterEach(async () => {
     for (const h of routes) await h.app.close();
     rebootRestoreRegistry.reset();
-    for (const id of [OLD, NEXT, WORKER]) {
+    for (const id of [OLD, NEXT, WORKER, FRESH]) {
       await internals.stopRecoveryController(id, true);
       internals.sessions.delete(id);
       internals.store.removeSession(id);
@@ -169,13 +179,120 @@ describe('server supervisor lease reconciliation', () => {
   );
 
   it.each(['stopped', 'breaker'] as const)('does not create a new controller for a %s manager', async (kind) => {
-    internals.sessions.set(OLD, old);
-    await revoke(kind);
+    const fresh = session(FRESH);
+    internals.sessions.set(FRESH, fresh);
+    if (kind === 'stopped') await fresh.stop(false);
+    else Reflect.set(fresh, '_respawnBlocked', true);
     const app = await route();
-    expect((await app.inject({ method: 'GET', url: `/api/sessions/${OLD}/supervisor` })).statusCode).toBe(400);
+    expect((await app.inject({ method: 'GET', url: `/api/sessions/${FRESH}/supervisor` })).statusCode).toBe(400);
+    expect(internals.supervisorStore.all().some((state) => state.supervisorSessionId === FRESH)).toBe(false);
     expect(internals.supervisorStore.get(OLD)).toEqual(journal);
     expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
   });
+
+  it('restores owner controls from the durable role after an uncertain rebuild removes its live controller', async () => {
+    internals.sessions.set(OLD, old);
+    const original = internals.getSupervisorController(old)!;
+    const bytes = await readFile(dataPath('supervisors.json'), 'utf8');
+    const act = vi.spyOn(CodexTaskAdapter.prototype, 'act');
+    const recover = vi.spyOn(CodexTaskAdapter.prototype, 'recover');
+    const input = vi.spyOn(old, 'writeViaMux');
+    vi.spyOn(TmuxManager.prototype, 'flushSessionsDurably').mockResolvedValue();
+    Reflect.set(old, '_codexRestoreWorkerMayExist', true);
+    await internals.discardPartiallyBuiltSession(OLD, old);
+    expect(internals.sessions.get(OLD)).toBe(old);
+    expect(internals.supervisorControllers.has(OLD)).toBe(false);
+    expect(old.getRecoveryContext().managed).toBe(false);
+    expect(old.getRecoveryContext().untrackedInput).toBe(true);
+    expect(await readFile(dataPath('supervisors.json'), 'utf8')).toBe(bytes);
+    expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+    const app = await route();
+    const status = await app.inject({ method: 'GET', url: `/api/sessions/${OLD}/supervisor` });
+    expect(status.statusCode).toBe(200);
+    expect(status.json().data).toMatchObject({ enabled: true, phase: 'paused', reason: 'restart-in-flight' });
+    expect(status.json().data.inFlight).toEqual(journal.inFlight);
+    expect(internals.supervisorControllers.get(OLD)).not.toBe(original);
+    expect((await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/start` })).statusCode).toBe(400);
+    const pause = await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/pause` });
+    expect(pause.statusCode).toBe(200);
+    expect(pause.json().data.inFlight).toEqual(journal.inFlight);
+    expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+    const reset = await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/reset` });
+    expect(reset.statusCode).toBe(200);
+    expect(reset.json().data).toMatchObject({ enabled: false, workers: [] });
+    expect(internals.supervisorStore.get(OLD)).toMatchObject({ enabled: false, workers: [] });
+    expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBeUndefined();
+    expect(act).not.toHaveBeenCalled();
+    expect(recover).not.toHaveBeenCalled();
+    expect(input).not.toHaveBeenCalled();
+  });
+
+  it.each(['stopped', 'breaker', 'isolation'] as const)(
+    'reconstructs a durable %s manager for owner control without fresh manager or worker dispatch',
+    async (kind) => {
+      internals.sessions.set(OLD, old);
+      await internals.supervisorStore.save(OLD, { ...journal, inFlight: undefined, phase: 'active' });
+      await revoke(kind);
+      const act = vi.spyOn(CodexTaskAdapter.prototype, 'act');
+      const recover = vi.spyOn(CodexTaskAdapter.prototype, 'recover');
+      const input = vi.spyOn(old, 'writeViaMux');
+      const app = await route();
+      expect((await app.inject({ method: 'GET', url: `/api/sessions/${OLD}/supervisor` })).statusCode).toBe(200);
+      expect(internals.getSupervisorController(old)?.getStatus()).toMatchObject({
+        enabled: true,
+        phase: 'paused',
+        reason: 'restart-requires-resume',
+      });
+      expect((await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/start` })).statusCode).toBe(400);
+      for (const action of ['assign', 'retry']) {
+        const response = await app.inject({
+          method: 'POST',
+          url: `/api/sessions/${OLD}/supervisor/workers/${WORKER}/${action}`,
+          headers: { 'x-codeman-supervisor-session': OLD },
+          payload: { requestId: `durable-role-${action}` },
+        });
+        expect(response.statusCode).toBe(400);
+      }
+      expect(act).not.toHaveBeenCalled();
+      expect(recover).not.toHaveBeenCalled();
+      expect(input).not.toHaveBeenCalled();
+      expect((await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/reset` })).statusCode).toBe(200);
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBeUndefined();
+    }
+  );
+
+  it.each(['paused', 'disabled'] as const)(
+    'retains actual durable %s history without fabricating a fresh role',
+    async (phase) => {
+      internals.sessions.set(OLD, old);
+      const saved = { ...journal, phase, enabled: phase === 'paused', inFlight: undefined };
+      await internals.supervisorStore.save(OLD, saved);
+      await revoke('breaker');
+      const app = await route();
+      const response = await app.inject({ method: 'GET', url: `/api/sessions/${OLD}/supervisor` });
+      expect(response.statusCode).toBe(200);
+      expect(response.json().data.objective).toBe(journal.objective);
+      expect(response.json().data.workers[0].assignments).toBe(1);
+      expect(internals.supervisorStore.get(OLD)).toEqual(saved);
+    }
+  );
+
+  it.each(['', '/pause', '/reset', '/start'])(
+    'does not reconstruct a revoked durable role for a foreign owner at %s',
+    async (suffix) => {
+      internals.sessions.set(OLD, old);
+      await revoke('breaker');
+      const app = await route('bob');
+      const response = await app.inject({
+        method: suffix ? 'POST' : 'GET',
+        url: `/api/sessions/${OLD}/supervisor${suffix}`,
+      });
+      expect(response.statusCode).toBe(404);
+      expect(internals.supervisorControllers.has(OLD)).toBe(false);
+      expect(internals.supervisorStore.get(OLD)).toEqual(journal);
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBe(OLD);
+    }
+  );
 
   it.each(['stopped', 'breaker', 'isolation'] as const)(
     'refuses a fresh task kickoff through the existing %s manager',

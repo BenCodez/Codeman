@@ -20,6 +20,7 @@ import type { WebServer as ServerType } from '../src/web/server.js';
 import type { SessionState } from '../src/types.js';
 import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 import { rebootStateBinding } from '../src/recovery/reboot-state-binding.js';
+import { createUser, updateUser, invalidateUsersCache } from '../src/user-store.js';
 
 const effects = vi.hoisted(() => ({
   sync: vi.fn(),
@@ -1626,6 +1627,8 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
     ...(
       [
         'healthy',
+        'owner-healthy',
+        'owner-downgrade',
         'changed-profile',
         'cancelled',
         'changed-session',
@@ -1641,6 +1644,8 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
     ...(
       [
         'healthy',
+        'owner-healthy',
+        'owner-downgrade',
         'cancelled',
         'changed-session',
         'worker-refused',
@@ -1652,6 +1657,15 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
       ] as const
     ).map((kind) => ({ kind, customModel: false })),
   ])('checks the route after internal telemetry awaits (custom=$customModel): $kind', async ({ kind, customModel }) => {
+    const previousMultiuser = process.env.CODEMAN_MULTIUSER;
+    const owned = kind === 'owner-healthy' || kind === 'owner-downgrade';
+    if (owned) {
+      process.env.CODEMAN_MULTIUSER = '1';
+      writeFileSync(join(root, 'users.json'), JSON.stringify({ version: 1, users: [] }));
+      invalidateUsersCache();
+      await createUser({ username: 'operator', role: 'admin', password: 'fixture-password' });
+      await createUser({ username: 'worker', role: 'admin', password: 'fixture-password' });
+    }
     const hooks = await import('../src/hooks-config.js');
     const { writeCustomModelHosts } = await import('../src/custom-model-hosts.js');
     const { customModelHostsPath } = await import('../src/custom-model-hosts.js');
@@ -1684,6 +1698,7 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
     const state: SessionState = {
       id: ID,
       mode: 'claude',
+      owner: owned ? 'worker' : undefined,
       pid: 1234,
       status: 'idle',
       workingDir: root,
@@ -1700,7 +1715,15 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
         },
       });
     rebootRestoreRegistry.set([
-      { sessionId: ID, mode: 'claude', name: 'fixture', workingDir: root, resumeConversationId: THREAD, state },
+      {
+        sessionId: ID,
+        mode: 'claude',
+        owner: state.owner,
+        name: 'fixture',
+        workingDir: root,
+        resumeConversationId: THREAD,
+        state,
+      },
     ]);
     const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
     store.setSession(ID, state);
@@ -1809,8 +1832,16 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
     const legacyKill = vi.spyOn(manager, 'killSession');
     try {
       const pending = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
-      await reached;
+      // A refusal before telemetry must fail promptly instead of leaving this
+      // test waiting on a hook that was never reached.
+      await Promise.race([
+        reached,
+        pending.then(() => {
+          throw new Error('Restore returned before reaching the internal telemetry boundary');
+        }),
+      ]);
       expect(effects.sync.mock.calls.some(([command]) => command.includes(' new-session '))).toBe(false);
+      if (kind === 'owner-downgrade') await updateUser('worker', { role: 'user' });
       if (kind === 'changed-profile')
         await writeCustomModelHosts(root, [{ ...endpoint, apiKey: 'replacement-secret' }]);
       if (kind === 'cancelled') rebootRestoreRegistry.clear(() => true);
@@ -1821,6 +1852,7 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
       expect(launched).toHaveLength(
         [
           'healthy',
+          'owner-healthy',
           'worker-lost-ack',
           'worker-refused',
           'cancelled-after-launch',
@@ -1831,12 +1863,25 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
           : 0
       );
       expect(effects.attach).toHaveBeenCalledTimes(
-        ['healthy', 'cancelled-after-launch', 'cancelled-lost-ack', 'cancel-after-commit-lost-ack'].includes(kind)
+        [
+          'healthy',
+          'owner-healthy',
+          'cancelled-after-launch',
+          'cancelled-lost-ack',
+          'cancel-after-commit-lost-ack',
+        ].includes(kind)
           ? 1
           : 0
       );
-      expect(result.restored).toHaveLength(kind === 'healthy' ? 1 : 0);
-      if (kind === 'healthy') {
+      const healthy = kind === 'healthy' || kind === 'owner-healthy';
+      expect(result.restored).toHaveLength(healthy ? 1 : 0);
+      if (kind === 'owner-downgrade') {
+        expect(effects.sync.mock.calls.some(([command]) => command.includes(' new-session '))).toBe(false);
+        expect(board.has(ID)).toBe(false);
+        expect(store.getSession(ID)).toEqual(historical);
+        expect(rebootRestoreRegistry.list(() => true).map((entry) => entry.sessionId)).toEqual([ID]);
+      }
+      if (healthy) {
         const session = board.get(ID)!;
         sessions.push(session);
         expect(Reflect.get(session, '_restoreLaunchGuard')).toBeUndefined();
@@ -1897,6 +1942,12 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
     } finally {
       release();
       await app.close();
+      if (owned) {
+        rmSync(join(root, 'users.json'), { force: true });
+        invalidateUsersCache();
+        if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+      }
     }
   });
 

@@ -4,16 +4,78 @@ import fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 import { remoteBrokerReaderFixture } from './mocks/remote-broker-reader-fixture.js';
+import { Session } from '../src/session.js';
+import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 const fixtures: Awaited<ReturnType<typeof remoteBrokerReaderFixture>>[] = [];
+const sessions: Session[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
+  for (const session of sessions.splice(0)) await session.stop(false);
   for (const fixture of fixtures.splice(0)) await fixture.close();
+  vi.unstubAllEnvs();
 });
 async function fixture() {
   const f = await remoteBrokerReaderFixture();
   fixtures.push(f);
   return f;
 }
+it.each(
+  (['restart', 'restore'] as const).flatMap((kind) =>
+    (['healthy', 'grant-denied', 'cancelled-after-check', 'lookup-failed'] as const).map((change) => ({ kind, change }))
+  )
+)('refreshes the first real Session grant before remote $kind rotation: $change', async ({ kind, change }) => {
+  vi.stubEnv('CODEMAN_MULTIUSER', '0');
+  const f = await fixture();
+  const conversationId = '11111111-2222-3333-4444-555555555555';
+  const session = new Session({
+    id: f.scope.sessionId,
+    workingDir: f.scope.workingDir,
+    mode: 'codex',
+    remote: f.remote,
+    useMux: true,
+    mux: { isAvailable: () => true } as TerminalMultiplexer,
+    muxSession: {
+      muxName: 'codeman-aaaaaaaa',
+      recoveryIsolated: true,
+      recoveryCodexHome: f.home,
+    } as MuxSession,
+    codexConfig: { noDaemon: true, resumeSessionId: conversationId },
+    envOverrides: { CODEX_HOME: f.home },
+  });
+  sessions.push(session);
+  const config = session.remoteRecoveryConfiguration();
+  let current = true;
+  const pure = () => session.isRemoteRecoveryAuthorityCurrent(conversationId, 0, () => current, config);
+  expect(session.getRecoveryContext()).toMatchObject({ managed: true, remoteOwned: true });
+  expect(pure()).toBe(false);
+  const prepare = vi.spyOn(f.cache, 'prepare');
+  const provision = vi.spyOn(f.options.provisionTransport, 'run');
+  const check = vi.fn(async () => {
+    if (change === 'lookup-failed') throw Error('Fixture owner lookup failed');
+    if (change === 'grant-denied') vi.stubEnv('CODEMAN_MULTIUSER', '1');
+    const granted = await session.confirmRemoteRecoveryAuthority(conversationId, 0, () => current, config);
+    if (change === 'cancelled-after-check') current = false;
+    return granted;
+  });
+  const result = await f.rotate(kind, (authority) => {
+    authority.check = check;
+    authority.isCurrent = pure;
+  });
+  expect(check).toHaveBeenCalled();
+  if (change === 'healthy') {
+    expect(result.result).toBe('sent');
+    expect(result.pending).toBe(result.promoted);
+    expect(check.mock.invocationCallOrder[0]).toBeLessThan(prepare.mock.invocationCallOrder[0]);
+    expect(check.mock.invocationCallOrder[0]).toBeLessThan(provision.mock.invocationCallOrder[0]);
+    expect(await f.starts()).toBe(2);
+  } else {
+    expect(result.result).toBe('not-sent');
+    expect(result.pending).toBeUndefined();
+    expect(prepare).not.toHaveBeenCalled();
+    expect(provision).not.toHaveBeenCalled();
+    expect(await f.starts()).toBe(1);
+  }
+});
 it.each(['restart', 'restore'] as const)(
   'does not provision a remote %s when source-host material cannot be retained',
   async (kind) => {
