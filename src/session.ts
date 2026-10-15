@@ -1352,7 +1352,8 @@ export class Session extends EventEmitter {
    * drop would be published as an agent exit. Unproven locality fails closed.
    */
   private get paneExitApplies(): boolean {
-    if (this._discoveredMuxSession) return false;
+    if (this._discoveredMuxSession || (this._muxSession?.recoveryInputBroker && this._muxSession.pid === 0))
+      return false;
     return this._useMux && this._muxSession !== null && !this._remote && !this._docker;
   }
 
@@ -2140,7 +2141,8 @@ export class Session extends EventEmitter {
       this._preserveExitedPane ||
       this._codexRestoreWorkerMayExist ||
       this._restoreLaunchMayExist ||
-      this._discoveredMuxSession;
+      this._discoveredMuxSession ||
+      (!!this._muxSession?.recoveryInputBroker && this._muxSession.pid === 0);
     this._preserveExitedPane = false;
 
     // Verify stale mux session — tmux may have been destroyed (e.g., killed externally).
