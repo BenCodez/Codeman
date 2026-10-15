@@ -48,7 +48,7 @@ The status shows observed Codex activity separately from recovery-controller sta
 - App input retains its ordinary bytes and order. Direct terminal input is durably recorded before it reaches Codex and permanently disables automatic actions for that launch, including an unobserved `/resume`. App input cannot clear that record. Missing, replaced or uncertain guard journals require inspection.
 - A crash restart requires a fresh, explicit non-zero exit or signal and an exact conversation. The recovery primitive omits tmux's kill-live-pane flag, so a pane that became healthy cannot be killed by a stale crash observation. Clean exits are never revived. The guard must record the exact owned child exit; a dead wrapper without that receipt cannot authorize a restart.
 - Current owner grants are checked after asynchronous evidence reads and immediately before dispatch. Recovery preserves model, effort, directory, environment, sandbox, approvals and supported launch options.
-- Every action is reserved atomically before dispatch. A possibly partial delivery or restart during an in-flight action pauses for inspection instead of replaying it. Inspect the terminal before resetting an uncertain reservation.
+- Every action is reserved atomically before dispatch. A possibly partial delivery or restart during an in-flight action pauses for inspection instead of replaying it. Reset cannot discard an unresolved reservation: verified acceptance or certified non-delivery must resolve it first. A timeout does not prove that nothing was delivered.
 - Continuations are confirmed by structured Codex input events. Recovery does not schedule unattended Enter retransmissions; a missed Enter remains an unconfirmed reservation requiring inspection.
 - Codeman's own server restart attaches to exited Codex panes without automatically relaunching them outside the controller. Previously tripped breakers stay tripped. Restored panes pause identity verification because the pane may have switched threads or retained a draft while the server was down. The first Enter clears unknown draft tracking; a subsequent exact ordinary submission from a clean composer establishes the current conversation. A dead pane without fresh verifiable identity requires manual intervention. Host-reboot restoration is a separate follow-up.
 
@@ -65,7 +65,7 @@ All routes use existing authentication and session ownership checks. `/api/v1` a
 | GET    | `/api/sessions/:id/recovery`        | Read fresh evidence without scheduling or dispatching recovery        |
 | PUT    | `/api/sessions/:id/recovery/config` | Update bounded settings; unknown fields are rejected                  |
 | POST   | `/api/sessions/:id/recovery/retry`  | Request one guarded attempt, with no caller-supplied prompt or thread |
-| POST   | `/api/sessions/:id/recovery/reset`  | Clear retry/circuit/uncertain-reservation state explicitly            |
+| POST   | `/api/sessions/:id/recovery/reset`  | Clear retry/circuit limits after delivery reservations are resolved   |
 
 The API returns `{ "success": true, "data": ... }` or the existing error envelope. The owner-scoped SSE event `session:recovery` carries `{ sessionId, state }`. Attention events use the existing push/webhook integrations and sanitized reason codes; ordinary successful retries do not send notifications.
 
