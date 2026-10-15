@@ -22,6 +22,7 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
 import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
 import { collectDescendants } from './proc-tree.js';
 import { execSync, exec, execFile } from 'node:child_process';
@@ -47,6 +48,7 @@ import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/nativ
 import { hasCodexComposerText } from './recovery/codex-classifier.js';
 import {
   dataPath,
+  getDataDirPath,
   DEFAULT_TMUX_SOCKET,
   CODEMAN_INSTANCE,
   SAFE_TMUX_SOCKET_PATTERN,
@@ -1864,11 +1866,22 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         timeout: EXEC_TIMEOUT_MS,
         maxBuffer: 1_024,
       });
+      const dataDir = getDataDirPath();
+      const home = homedir();
+      // Choose the existing boundary before provisioning creates any directories.
+      // A configured missing parent refuses controlled provisioning conservatively.
+      const durableParent = dataDir.startsWith(`${home}/`) ? home : dirname(dataDir);
+      return await CodexInputBroker.create(
+        join(dataDir, 'codex-input-brokers', sessionId),
+        sessionId,
+        command,
+        codexHome,
+        durableParent
+      );
     } catch (error) {
       if (required) throw error;
       return undefined;
     }
-    return CodexInputBroker.create(dataPath('codex-input-brokers', sessionId), sessionId, command, codexHome);
   }
 
   private brokerCommand(broker: CodexInputBroker): string {
@@ -1933,6 +1946,29 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * processes per dead session.
    */
   private remoteAliveInFlight: Set<string> = new Set();
+
+  private brokerCleanupProvider?: BrokerCleanupReferenceProvider;
+  private brokerCleanupInterval?: ReturnType<typeof setInterval>;
+  private brokerCleanupRunning = false;
+  setBrokerCleanupReferenceProvider(provider: BrokerCleanupReferenceProvider): void {
+    this.brokerCleanupProvider = provider;
+    if (!IS_TEST_MODE && !this.brokerCleanupInterval) {
+      this.brokerCleanupInterval = setInterval(() => void this.pruneInputBrokers(), 60_000);
+      this.brokerCleanupInterval.unref();
+      void this.pruneInputBrokers();
+    }
+  }
+  private async pruneInputBrokers(): Promise<void> {
+    if (IS_TEST_MODE || this.brokerCleanupRunning || !this.brokerCleanupProvider) return;
+    this.brokerCleanupRunning = true;
+    try {
+      await pruneCodexInputBrokers(getDataDirPath(), this.brokerCleanupProvider);
+    } catch {
+      /* Optional maintenance never blocks session lifecycle. */
+    } finally {
+      this.brokerCleanupRunning = false;
+    }
+  }
 
   private trueColorConfigured = false;
   /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
@@ -4213,6 +4249,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   destroy(): void {
+    this.brokerCleanupProvider = undefined;
+    if (this.brokerCleanupInterval) clearInterval(this.brokerCleanupInterval);
+    this.brokerCleanupInterval = undefined;
     this.stopStatsCollection();
     this.stopPaneExitWatcher();
     this.paneExits.clear();

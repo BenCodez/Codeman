@@ -142,6 +142,15 @@ function readSnapshotBytes(path: string): string | undefined {
   }
 }
 
+function syncSnapshotDirectory(path: string): void {
+  const directory = openSync(dirname(path), 'r');
+  try {
+    fsyncSync(directory);
+  } finally {
+    closeSync(directory);
+  }
+}
+
 function replaceSnapshot(path: string, text: string): void {
   const temporary = `${path}.tmp-${randomUUID()}`;
   try {
@@ -153,12 +162,7 @@ function replaceSnapshot(path: string, text: string): void {
       closeSync(fd);
     }
     renameSync(temporary, path);
-    const directory = openSync(dirname(path), 'r');
-    try {
-      fsyncSync(directory);
-    } finally {
-      closeSync(directory);
-    }
+    syncSnapshotDirectory(path);
   } finally {
     try {
       unlinkSync(temporary);
@@ -188,20 +192,29 @@ function writeAtomicSnapshot(path: string, text: string): void {
     }
     throw error;
   }
-  // Reclaim only after the primary acknowledgement. A surviving/reappearing
-  // shadow remains a conservative prior offer, with its original expiry and
-  // explicit-restore checks. A known cleanup failure is still surfaced.
+  // The shadow is authoritative on reload, so its removal is part of the
+  // transaction. Acknowledge only once that removal is durable too.
   try {
-    unlinkSync(shadowPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      try {
-        replaceSnapshot(path, previous);
-      } catch {
-        /* retain the shadow on uncertain rollback */
-      }
-      throw error;
+    try {
+      unlinkSync(shadowPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
+    syncSnapshotDirectory(path);
+  } catch (error) {
+    // An unacknowledged unlink may survive or disappear after a crash. Restore
+    // both prior views before reporting failure; memory retains the old offer.
+    try {
+      replaceSnapshot(shadowPath, previous);
+    } catch {
+      /* still attempt to restore the primary if shadow acknowledgement failed */
+    }
+    try {
+      replaceSnapshot(path, previous);
+    } catch {
+      /* a surviving shadow retains the prior snapshot on uncertain rollback */
+    }
+    throw error;
   }
 }
 
@@ -303,6 +316,12 @@ export class RebootRestoreRegistry {
    * Single-user mode has one key, `undefined`, so it behaves as one global flight.
    */
   private spending = new Set<string | undefined>();
+
+  /** Pure private ownership snapshot: cleanup must never expire or spend an offer. */
+  getBrokerCleanupState(): { entries: RebootRestoreEntry[]; parked: ParkedEntry[] } | undefined {
+    if (this.persistenceLoadFailed || this.spending.size > 0 || this.failedReleases.size > 0) return undefined;
+    return structuredClone({ entries: [...this.entries.values()], parked: [...this.parked.values()] });
+  }
 
   /** Replace the plan with what the boot pass found. An empty list clears it. */
   set(entries: readonly RebootRestoreEntry[]): void {

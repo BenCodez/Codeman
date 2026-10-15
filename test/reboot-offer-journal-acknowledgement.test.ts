@@ -15,16 +15,32 @@ const faults = vi.hoisted(() => ({
   reads: false,
   cleanup: false,
   renames: 0,
+  unlinked: false,
+  cleanupSync: false,
+  cleanupRollback: false,
+  cleanupAcknowledgements: 0,
 }));
 vi.mock('node:fs', async (original) => {
   const native = await original<typeof import('node:fs')>();
   const sync = (fd: number) => {
     const stat = native.fstatSync(fd);
+    if (faults.unlinked && stat.isDirectory()) {
+      faults.unlinked = false;
+      if (faults.cleanupSync) {
+        faults.cleanupSync = false;
+        throw new Error('Fixture shadow removal directory acknowledgement failed');
+      }
+      faults.cleanupAcknowledgements++;
+    }
     if (faults.armed && faults.renamed === faults.target && stat.isDirectory()) {
       faults.armed = false;
       throw new Error('Fixture post-rename directory acknowledgement failed');
     }
-    if (faults.rollback && !faults.armed && faults.renamed === faults.target && stat.isFile()) {
+    if (
+      stat.isFile() &&
+      ((faults.rollback && !faults.armed && faults.renamed === faults.target) ||
+        (faults.cleanupRollback && !faults.cleanupSync && faults.renamed === `${faults.target}.previous`))
+    ) {
       throw new Error('Fixture rollback file acknowledgement failed');
     }
     return native.fsyncSync(fd);
@@ -32,12 +48,15 @@ vi.mock('node:fs', async (original) => {
   const rename = (source: fs.PathLike, target: fs.PathLike) => {
     native.renameSync(source, target);
     faults.renamed = String(target);
+    if (String(target) === `${faults.target}.previous`) faults.unlinked = false;
     if (String(target) === faults.target) faults.renames++;
   };
   const unlink = (path: fs.PathLike) => {
     if (faults.cleanup && String(path) === `${faults.target}.previous`)
       throw new Error('Fixture shadow cleanup unavailable');
-    return native.unlinkSync(path);
+    const result = native.unlinkSync(path);
+    if (String(path) === `${faults.target}.previous`) faults.unlinked = true;
+    return result;
   };
   const open = (...args: Parameters<typeof native.openSync>) => {
     if (faults.reads && String(args[0]) === faults.target && typeof args[1] === 'number') {
@@ -88,10 +107,21 @@ beforeEach(() => {
     reads: false,
     cleanup: false,
     renames: 0,
+    unlinked: false,
+    cleanupSync: false,
+    cleanupRollback: false,
+    cleanupAcknowledgements: 0,
   });
 });
 afterEach(() => {
-  Object.assign(faults, { armed: false, rollback: false, reads: false, cleanup: false });
+  Object.assign(faults, {
+    armed: false,
+    rollback: false,
+    reads: false,
+    cleanup: false,
+    cleanupSync: false,
+    cleanupRollback: false,
+  });
   vi.useRealTimers();
   fs.rmSync(directory, { recursive: true, force: true });
 });
@@ -155,6 +185,7 @@ it('retains the proven shadow when rollback acknowledgement fails too', () => {
 
 it.each(['dismiss', 'replace', 'release'] as const)('publishes only an acknowledged healthy journal: %s', (action) => {
   const { registry, original } = fixture();
+  const acknowledgements = faults.cleanupAcknowledgements;
   if (action !== 'replace') registry.take(() => true, undefined, 'alice');
   if (action === 'dismiss') expect(registry.clear(() => true)).toBe(1);
   else if (action === 'replace') registry.set([entry('new')]);
@@ -162,6 +193,7 @@ it.each(['dismiss', 'replace', 'release'] as const)('publishes only an acknowled
   expect(registry.isHeld(original, 'alice')).toBe(false);
   expect(reload()).toEqual(action === 'replace' ? ['new'] : []);
   expect(fs.existsSync(`${path}.previous`)).toBe(false);
+  expect(faults.cleanupAcknowledgements).toBe(acknowledgements + 1);
 });
 
 it('does not overwrite an unreadable old journal or alter its held offer', () => {
@@ -269,4 +301,77 @@ it('acknowledges 1000 offers and refuses a 1001st before changing memory or jour
   expect(fs.existsSync(`${path}.previous`)).toBe(false);
   expect(faults.renames).toBe(replacements);
   expect(reload()).toEqual(supported.map((offer) => offer.sessionId));
+});
+
+it.each(['dismiss', 'replace', 'release'] as const)(
+  'retains prior memory and reload view when shadow removal is not durably acknowledged: %s',
+  (action) => {
+    const { registry, original, bytes } = fixture();
+    if (action !== 'replace') registry.take(() => true, undefined, 'alice');
+    faults.cleanupSync = true;
+    const execute = () =>
+      action === 'dismiss'
+        ? registry.clear(() => true)
+        : action === 'replace'
+          ? registry.set([entry('new')])
+          : registry.releaseFlight('alice', []);
+    expect(execute).toThrow('shadow removal directory acknowledgement failed');
+    if (action !== 'replace') expect(registry.isHeld(original, 'alice')).toBe(true);
+    else expect(registry.list(() => true)).toEqual([original]);
+    expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+    expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+    expect(reload()).toEqual(['original']);
+    execute();
+    expect(registry.isHeld(original, 'alice')).toBe(false);
+    expect(reload()).toEqual(action === 'replace' ? ['new'] : []);
+    expect(fs.existsSync(`${path}.previous`)).toBe(false);
+  }
+);
+
+it('retains the restored shadow when primary rollback acknowledgement also fails after unlink', () => {
+  const { registry, original, bytes } = fixture();
+  registry.take(() => true, undefined, 'alice');
+  faults.cleanupSync = true;
+  faults.cleanupRollback = true;
+  expect(() => registry.releaseFlight('alice', [])).toThrow('shadow removal directory acknowledgement failed');
+  expect(registry.isHeld(original, 'alice')).toBe(true);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  faults.cleanupRollback = false;
+  expect(reload()).toEqual(['original']);
+});
+
+it('captures active and parked private cleanup references without expiring or mutating offers', () => {
+  const { registry, original, bytes } = fixture();
+  const active = registry.getBrokerCleanupState()!;
+  expect(active.entries).toEqual([original]);
+  active.entries[0].state.workingDir = 'detached clone';
+  expect(registry.getBrokerCleanupState()!.entries[0].state.workingDir).toBe(directory);
+  expect(registry.take(() => true, undefined, 'alice')).toEqual([original]);
+  const parked = registry.getBrokerCleanupState()!;
+  expect(parked.entries).toEqual([]);
+  expect(parked.parked).toEqual([{ entry: original, spender: 'alice' }]);
+  vi.useFakeTimers();
+  vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
+  expect(registry.getBrokerCleanupState()).toEqual(parked);
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+});
+
+it('withholds cleanup authority while restore spending or failed release ownership is unresolved', () => {
+  const { registry, original } = fixture();
+  expect(registry.beginSpending('alice')).toBe(true);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  registry.take(() => true, undefined, 'alice');
+  faults.cleanup = true;
+  expect(() => registry.releaseFlight('alice', [])).toThrow();
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  faults.cleanup = false;
+  registry.endSpending('alice');
+  expect(registry.getBrokerCleanupState()).toEqual({ entries: [original], parked: [] });
+});
+
+it('withholds cleanup authority when an existing durable offer cannot be read', () => {
+  fs.writeFileSync(path, '{');
+  const registry = new RebootRestoreRegistry();
+  registry.configurePersistence(path);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
 });
