@@ -2679,6 +2679,83 @@ describe('registered Codex-compatible uncertain launch adoption', () => {
   });
 
   it.each(
+    (['codex', 'adopt-codex', 'claude'] as const).flatMap((mode) =>
+      (['healthy', 'metadata-failure', 'native-replaced'] as const).map((outcome) => ({ mode, outcome }))
+    )
+  )('uses the registered recovery cancellation fence for $mode: $outcome', async ({ mode, outcome }) => {
+    const { manager, home } = fixture();
+    const capable = mode !== 'claude';
+    expect(getCli(mode)?.capabilities.recovery === 'codex-rollout').toBe(capable);
+    const record = await manager.createSession({
+      sessionId: ID,
+      mode,
+      workingDir: root,
+      owner: 'fixture-owner',
+      ...(capable
+        ? { codexConfig: config, recoveryCodexHome: home, codexRestoreGuard: healthyGuard() }
+        : { restoreGuard: { prepare: async () => {}, confirm: () => true, isCurrent: () => true } }),
+    });
+    if (!capable) {
+      // The acknowledged generic launch may legitimately have completed its
+      // original commit; cancellation must first renew its durable uncertainty.
+      expect(await manager.completeAcknowledgedRebootLaunch(record, () => true)).toBe(true);
+      expect(record.restoreUncertain).toBeUndefined();
+    }
+    const events: string[] = [];
+    let nativeKills = 0;
+    const native = effects.sync.getMockImplementation()!;
+    effects.sync.mockImplementation((command: string) => {
+      if (command.includes('CODEMAN_REBOOT_CANCEL_REFUSED')) {
+        events.push('native');
+        for (const term of [
+          '#{==:#{pid},88}',
+          '#{==:#{session_id},$1}',
+          '#{==:#{pane_id},%7}',
+          '#{==:#{pane_pid},99999}',
+          '#{==:#{window_panes},1}',
+          '#{==:#{session_windows},1}',
+        ])
+          expect(command).toContain(term);
+        if (outcome === 'native-replaced') return 'CODEMAN_REBOOT_CANCEL_REFUSED\n';
+        nativeKills++;
+        return '';
+      }
+      return native(command);
+    });
+    const flush = manager.flushSessionsDurably.bind(manager);
+    vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async (...args) => {
+      events.push('metadata');
+      if (outcome === 'metadata-failure') throw Error('Fixture cancellation metadata ACK unavailable');
+      return flush(...args);
+    });
+    const killed = await manager.cancelAcknowledgedRebootLaunch(record, () => true);
+    expect(killed).toBe(outcome === 'healthy');
+    expect(nativeKills).toBe(outcome === 'native-replaced' || (!capable && outcome === 'metadata-failure') ? 0 : 1);
+    expect(events).toEqual(
+      capable
+        ? outcome === 'native-replaced'
+          ? ['native']
+          : ['native', 'metadata']
+        : outcome === 'metadata-failure'
+          ? ['metadata']
+          : outcome === 'native-replaced'
+            ? ['metadata', 'native']
+            : ['metadata', 'native', 'metadata']
+    );
+    if (outcome === 'healthy') expect(manager.getSession(ID)).toBeUndefined();
+    else {
+      expect(manager.getSession(ID)).toBe(record);
+      if (capable) {
+        expect(record.codexRestoreUncertain).toBe(true);
+        // This also catches a capability fix in only the pre-kill branch: a
+        // failed post-kill metadata ACK must not invent the generic marker.
+        expect(record).not.toHaveProperty('restoreUncertain');
+      } else expect(record.restoreUncertain).toBe(true);
+    }
+    expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
+  });
+
+  it.each(
     (['codex', 'adopt-codex'] as const).flatMap((mode) =>
       (['startup-receipt', 'metadata-ack'] as const).map((failure) => ({ mode, failure }))
     )
