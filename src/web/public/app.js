@@ -2352,7 +2352,7 @@ class CodemanApp {
     }
   }
 
-  _onSessionDeleted(data) {
+  _onSessionDeleted(data, confirmed = true) {
     if (this.editingSessionId === data.id) this.closeSessionOptions?.();
     if (this._wsSessionId === data.id) this._disconnectWs();
     // Solo window whose session just ended → show the "unavailable" state.
@@ -2361,7 +2361,7 @@ class CodemanApp {
     }
     // Dashboard: a detached session ended → clear its detached state/timers.
     if (this.detachedSessions.has(data.id)) this._redock(data.id);
-    this._cleanupSessionData(data.id);
+    this._cleanupSessionData(data.id, confirmed);
     // ⚠️ Skip the whole active-session handoff while THIS tab is closing that
     // session: closeSession() owns the follow-up selection and moves you to the
     // next tab, so acting here would race it and flash the welcome screen (or
@@ -4032,6 +4032,7 @@ class CodemanApp {
 
   /** Deliver all unacked records for a session, in seq order. */
   _drainSession(sessionId) {
+    if (this._closingSessions?.has(sessionId)) return;
     const list = this._pendingDeliveries.get(sessionId);
     if (!list || list.length === 0 || list[0].persistenceBlocked) return;
     // An HTTP key (or input POST already in flight) owns the ordering barrier.
@@ -4068,6 +4069,7 @@ class CodemanApp {
       try {
         for (;;) {
           const cur = this._pendingDeliveries.get(sessionId);
+          if (this._closingSessions?.has(sessionId)) break;
           if (!cur || cur.length === 0) break;
           // If the WebSocket came back mid-drain, yield to it (the acked stream)
           // so we don't redundantly re-POST what onopen is already re-sending.
@@ -4613,6 +4615,84 @@ class CodemanApp {
       if (rec._durableKey) localStorage.removeItem(rec._durableKey);
       return true;
     } catch { return false; }
+  }
+
+  /** Retire only a positively deleted target, without turning partial deletion into an ACK. */
+  _retireDeletedSessionInput(sessionId) {
+    const prefix = 'codeman:pendingInput:v3:';
+    let retired = false;
+    try {
+      const index = () => {
+        const length = localStorage.length;
+        if (!Number.isSafeInteger(length) || length < 0 || length > 8192) throw new Error('Unverified input index');
+        const names = [];
+        for (let i = 0; i < length; i++) {
+          const key = localStorage.key(i);
+          if (typeof key !== 'string' || key.length > 2048) throw new Error('Unverified input key');
+          names.push(key);
+        }
+        if (localStorage.length !== length || new Set(names).size !== length) throw new Error('Input index changed');
+        return names.sort();
+      };
+      const names = index(), expected = new Set(names), records = new Map();
+      if (JSON.stringify(index()) !== JSON.stringify(names)) throw new Error('Input index changed');
+      let bytes = 0;
+      for (const key of names) {
+        if (!key.startsWith(prefix)) continue;
+        let identity;
+        try { identity = JSON.parse(decodeURIComponent(key.slice(prefix.length))); } catch { continue; }
+        if (!Array.isArray(identity) || identity.length !== 3 || identity[1] !== sessionId) continue;
+        const [cid, sid, seq] = identity;
+        if (typeof cid !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(cid) ||
+            !Number.isSafeInteger(seq) || seq <= 0 || key !== prefix + encodeURIComponent(JSON.stringify(identity)))
+          throw new Error('Unverified deleted input identity');
+        const raw = localStorage.getItem(key);
+        if (typeof raw !== 'string' || (bytes += raw.length) > this._reliableMaxBytes * 6 + 65536 || records.size >= 4096)
+          throw new Error('Unverified deleted input storage');
+        const rec = JSON.parse(raw);
+        if (rec?.version !== 3 || rec.cid !== cid || rec.sessionId !== sid || rec.seq !== seq ||
+            typeof rec.data !== 'string' || (rec.key !== undefined && rec.key !== 'S-Enter' && rec.key !== 'C-Enter') ||
+            (rec.after !== undefined && (!rec.after || typeof rec.after !== 'object' || Array.isArray(rec.after) ||
+              Object.keys(rec.after).sort().join(',') !== 'cid,seq' || typeof rec.after.cid !== 'string' ||
+              !/^[A-Za-z0-9_-]{1,128}$/.test(rec.after.cid) || !Number.isSafeInteger(rec.after.seq) || rec.after.seq <= 0)))
+          throw new Error('Unverified deleted input record');
+        records.set(JSON.stringify([cid, seq]), { cid, seq, key, raw, after: rec.after });
+      }
+      if (JSON.stringify(index()) !== JSON.stringify(names)) throw new Error('Input index changed');
+      const prior = new Map(), tails = new Map();
+      for (const rec of [...records.values()].sort((a, b) => a.seq - b.seq)) {
+        if (tails.has(rec.cid)) prior.set(rec, tails.get(rec.cid));
+        tails.set(rec.cid, rec);
+      }
+      const ordered = [], visiting = new Set(), visited = new Set();
+      const visit = (rec) => {
+        if (visited.has(rec)) return;
+        if (visiting.has(rec)) throw new Error('Unverified deleted input dependency');
+        visiting.add(rec);
+        if (prior.has(rec)) visit(prior.get(rec));
+        const dependency = rec.after && records.get(JSON.stringify([rec.after.cid, rec.after.seq]));
+        if (dependency) visit(dependency);
+        visiting.delete(rec); visited.add(rec); ordered.push(rec);
+      };
+      for (const rec of records.values()) visit(rec);
+      for (const rec of ordered.reverse()) {
+        if (JSON.stringify(index()) !== JSON.stringify([...expected].sort())) throw new Error('Input index changed');
+        for (const remaining of records.values())
+          if (localStorage.getItem(remaining.key) !== remaining.raw) throw new Error('Input record changed');
+        localStorage.removeItem(rec.key);
+        if (localStorage.getItem(rec.key) !== null) throw new Error('Input removal was not confirmed');
+        records.delete(JSON.stringify([rec.cid, rec.seq]));
+        expected.delete(rec.key);
+      }
+      retired = true;
+    } catch {
+      this.showToast?.('Deleted session input could not be fully retired; retained input requires attention', 'warning');
+    }
+    this._pendingDeliveries?.delete(sessionId);
+    // Preserve this document's monotonic counter and an unresolved HTTP lease.
+    // A reused session id cannot reuse an old receipt or overlap an old request.
+    this._persistReliableState();
+    return retired;
   }
 
   _persistReliableState() {
@@ -10162,7 +10242,7 @@ class CodemanApp {
   }
 
   // Shared cleanup for all session data — called from both closeSession() and session:deleted handler
-  _cleanupSessionData(sessionId) {
+  _cleanupSessionData(sessionId, confirmed = true) {
     this.closeTabRailActionMenu?.();
     // A dead session has no buffer to reconcile; leaving the marker set would
     // make a later socket for a REUSED id reconcile against nothing.
@@ -10188,22 +10268,9 @@ class CodemanApp {
     this._flushedOffsets?.delete(sessionId);
     this._flushedTexts?.delete(sessionId);
     if (typeof KeyboardAccessoryBar !== 'undefined') KeyboardAccessoryBar.discardComposerDraft?.(sessionId);
-    // Drop any durably-queued input for a session that's actually gone (deleted/
-    // exited). Not a lost prompt — the target no longer exists. Only reached on
-    // real session removal, never on a tab switch.
-    // Preserve an unreplayable newline and its dependent suffix even when this
-    // window still owns the live queue. Partial storage deletion must not make
-    // a surviving suffix look as though the key was acknowledged.
-    const pendingInput = this._pendingDeliveries?.get(sessionId) ?? [];
-    const keyIndex = pendingInput.findIndex((rec) => rec.key);
-    const ordinaryPrefix = pendingInput.slice(0, keyIndex === -1 ? pendingInput.length : keyIndex);
-    for (const rec of ordinaryPrefix.reverse()) {
-      if (!this._forgetReliableRecord(sessionId, rec)) break;
-    }
-    this._pendingDeliveries?.delete(sessionId);
-    this._seqCounters?.delete(sessionId);
-    this._postDraining?.delete(sessionId);
-    this._persistReliableState();
+    // Optimistic tab removal is not evidence that its server target disappeared.
+    // A confirmed deletion retires all captured occurrences, including key barriers.
+    if (confirmed) this._retireDeletedSessionInput(sessionId);
     this.ralphStates.delete(sessionId);
     this.ralphClosedSessions.delete(sessionId);
     this.projectInsights.delete(sessionId);
@@ -10259,7 +10326,7 @@ class CodemanApp {
       // The same teardown the SSE event runs (split pane, tile, detached window,
       // WebSocket, per-session state), only now instead of when the server is
       // done. It is idempotent, so the real event finds nothing left to do.
-      this._onSessionDeleted({ id: sessionId });
+      this._onSessionDeleted({ id: sessionId }, false);
 
       if (wasActive && grid?.open) {
         // `auto`: the app chose this tile because the previous one went away.
@@ -10308,6 +10375,7 @@ class CodemanApp {
       // An SSE resync (handleInit) that landed mid-request rebuilds the list from
       // the server, which still had the session then.
       if (this.sessions.has(sessionId)) this._onSessionDeleted({ id: sessionId });
+      else this._retireDeletedSessionInput(sessionId);
       if (killMux) {
         this.showToast('Session closed and tmux killed', 'success');
       } else {

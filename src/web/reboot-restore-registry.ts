@@ -384,6 +384,7 @@ export class RebootRestoreRegistry {
   private stateRevision = 0;
   private expired = false;
   private expiryScheduled = false;
+  private expiryWork?: Promise<void>;
   private revoked = new WeakSet<RebootRestoreEntry>();
   private configurationWork?: Promise<void>;
 
@@ -432,6 +433,8 @@ export class RebootRestoreRegistry {
     this.failedReleases.clear();
     this.builtAt = 0;
     this.expired = false;
+    this.expiryScheduled = false;
+    this.expiryWork = undefined;
     const epoch = this.epoch;
     const work = this.enqueue(async () => {
       try {
@@ -869,7 +872,13 @@ export class RebootRestoreRegistry {
 
   /** One owner click may retry a failed journal ACK; no automatic action retries it. */
   async beginSpendingAfterRepair(owner?: string): Promise<boolean> {
+    const epochBeforeExpiry = this.epoch;
     this.dropIfExpired();
+    // An explicit click owns this retry: wait for its bounded durable expiry
+    // cleanup instead of treating our own queued write as another restore.
+    const expiry = this.expiryWork;
+    if (expiry) await expiry;
+    if (this.epoch !== epochBeforeExpiry) return false;
     if (!this.persistenceWriteFailed) return this.beginSpending(owner);
     if (
       this.loading ||
@@ -935,6 +944,7 @@ export class RebootRestoreRegistry {
     this.loading = false;
     this.expired = false;
     this.expiryScheduled = false;
+    this.expiryWork = undefined;
     this.configurationWork = undefined;
     this.acknowledgedSnapshot = undefined;
     this.entries.clear();
@@ -977,7 +987,7 @@ export class RebootRestoreRegistry {
       return;
     }
     this.expiryScheduled = true;
-    void this.enqueue(async () => {
+    const work = this.enqueue(async () => {
       if (revision !== this.stateRevision) return;
       await this.persistState(nextEntries, nextParked, builtAt);
       if (revision === this.stateRevision) publish();
@@ -986,8 +996,12 @@ export class RebootRestoreRegistry {
         /* Old bytes remain evidence; expiry never grants authority. */
       })
       .finally(() => {
-        this.expiryScheduled = false;
+        if (this.expiryWork === work) {
+          this.expiryScheduled = false;
+          this.expiryWork = undefined;
+        }
       });
+    this.expiryWork = work;
   }
 }
 

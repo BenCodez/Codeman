@@ -1,5 +1,8 @@
 /** Bounded optional retirement. Unknown references or evidence always retain private files. */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { constants } from 'node:fs';
+import fs from 'node:fs/promises';
+import { join, normalize, isAbsolute } from 'node:path';
 import { CODEX_BROKER_CLEANUP_SOURCE } from './codex-broker-cleanup-source.js';
 export interface BrokerCleanupReferenceSnapshot {
   references: readonly string[];
@@ -57,6 +60,8 @@ export function captureBrokerCleanupReferences(read: () => unknown): BrokerClean
 }
 
 const active = new Set<ChildProcessWithoutNullStreams>();
+// Non-authorizing scan positions rotate the existing bounded discovery window.
+const discoveryOffsets = new Map<string, number>();
 /** testSpawn is only for disposable fake transport/process fixtures, never a runtime option. */
 export async function pruneCodexInputBrokers(
   dataDir: string,
@@ -90,8 +95,9 @@ export async function pruneCodexInputBrokers(
     }
   };
   if (!current()) return;
-  await runBrokerCleanup(
-    { dataDir, references: snapshot.references },
+  const retiredRollbacks = new Set<string>();
+  const cleaned = await runBrokerCleanup(
+    { dataDir, references: snapshot.references, scanOffset: discoveryOffsets.get(dataDir) ?? 0 },
     (value) => {
       if (Object.keys(value).join(',') === 'empty') {
         return (
@@ -112,8 +118,48 @@ export async function pruneCodexInputBrokers(
         current()
       );
     },
-    testSpawn
+    testSpawn,
+    undefined,
+    (value) => {
+      if (Object.keys(value).join(',') === 'scanOffset') {
+        if (
+          !Number.isSafeInteger(value.scanOffset) ||
+          (value.scanOffset as number) < 0 ||
+          (value.scanOffset as number) > 512
+        )
+          return false;
+        discoveryOffsets.delete(dataDir);
+        discoveryOffsets.set(dataDir, value.scanOffset as number);
+        if (discoveryOffsets.size > 32) discoveryOffsets.delete(discoveryOffsets.keys().next().value!);
+        return true;
+      }
+      if (Object.keys(value).join(',') !== 'rolledBack') return false;
+      const [sid, inc, extra] = typeof value.rolledBack === 'string' ? value.rolledBack.split('/') : [];
+      if (
+        extra !== undefined ||
+        !sid ||
+        !inc ||
+        !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(sid) ||
+        !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(inc) ||
+        snapshot!.references.includes(inc) ||
+        !current()
+      )
+        return false;
+      retiredRollbacks.add(`${sid}/${inc}`);
+      return true;
+    }
   );
+  if (cleaned) {
+    for (const [key, pending] of pendingRollbacks) {
+      const receipt = pending.receipt;
+      if (
+        retiredRollbacks.has(`${receipt.sessionId}/${receipt.incarnation}`) &&
+        receipt.root === join(dataDir, 'codex-input-brokers', receipt.sessionId)
+      )
+        pendingRollbacks.delete(key);
+    }
+    scheduleRollbackSweep();
+  }
 }
 
 /** Captured only by create(); rollback callers must certify no native dispatch was attempted. */
@@ -125,6 +171,59 @@ export interface BrokerProvisioningRollback {
   parents: Array<{ path: string; dev: number; ino: number }>;
   files: Array<{ name: string; dev: number; ino: number; size: number; hash: string }>;
 }
+/** Store the exact unlaunched proof outside the incarnation before optional helper dispatch. */
+async function persistRollbackReceipt(receipt: BrokerProvisioningRollback): Promise<void> {
+  try {
+    if (
+      !isAbsolute(receipt.root) ||
+      normalize(receipt.root) !== receipt.root ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(receipt.incarnation) ||
+      (await fs.realpath(receipt.root)) !== receipt.root
+    )
+      return;
+    for (const parent of receipt.parents) {
+      const stat = await fs.lstat(parent.path);
+      if (
+        !stat.isDirectory() ||
+        stat.isSymbolicLink() ||
+        stat.dev !== parent.dev ||
+        stat.ino !== parent.ino ||
+        (stat.mode & 0o022) !== 0 ||
+        (process.getuid !== undefined && stat.uid !== process.getuid())
+      )
+        return;
+    }
+    const directory = await fs.lstat(join(receipt.root, receipt.incarnation));
+    if (
+      !directory.isDirectory() ||
+      directory.isSymbolicLink() ||
+      directory.dev !== receipt.directory.dev ||
+      directory.ino !== receipt.directory.ino ||
+      (directory.mode & 0o077) !== 0 ||
+      (process.getuid !== undefined && directory.uid !== process.getuid())
+    )
+      return;
+    const marker = await fs.open(join(receipt.root, `.rollback-${receipt.incarnation}.json`), 'wx', 0o600);
+    try {
+      await marker.writeFile(JSON.stringify(receipt));
+      await marker.sync();
+    } finally {
+      await marker.close();
+    }
+    const parent = await fs.open(receipt.root, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = await parent.stat();
+      if (stat.dev !== receipt.parents[0]?.dev || stat.ino !== receipt.parents[0]?.ino) return;
+      await parent.sync();
+    } finally {
+      await parent.close();
+    }
+  } catch {
+    // Existing, unreadable or partially written markers are never overwritten.
+    // The live receipt still retries; a valid durable marker survives restart.
+  }
+}
+
 type PendingRollback = {
   receipt: BrokerProvisioningRollback;
   spawn?: typeof spawn;
@@ -208,11 +307,15 @@ export async function rollbackCodexBrokerProvisioning(
 ): Promise<boolean> {
   const key = JSON.stringify(receipt);
   if (Buffer.byteLength(key) > 262_144) return false;
+  const captured: BrokerProvisioningRollback = JSON.parse(key);
   let pending = pendingRollbacks.get(key);
   if (!pending) {
-    if (pendingRollbacks.size >= 256) return false;
+    if (pendingRollbacks.size >= 256) {
+      await persistRollbackReceipt(captured);
+      return false;
+    }
     pending = {
-      receipt: structuredClone(receipt),
+      receipt: captured,
       spawn: testSpawn,
       retry: testRetry,
       attempts: 0,
@@ -224,6 +327,8 @@ export async function rollbackCodexBrokerProvisioning(
     pending.spawn = testSpawn;
     pending.retry = testRetry;
   }
+  // Reserve the FIFO slot before asynchronous publication can reorder callers.
+  await persistRollbackReceipt(captured);
   return attemptRollback(key, pending);
 }
 
@@ -231,7 +336,8 @@ async function runBrokerCleanup(
   request: object,
   accept: (value: Record<string, unknown>) => boolean,
   testSpawn?: typeof spawn,
-  complete?: (value: Record<string, unknown>) => boolean
+  complete?: (value: Record<string, unknown>) => boolean,
+  notification?: (value: Record<string, unknown>) => boolean
 ): Promise<boolean> {
   if (active.size >= 2 || (process.env.VITEST && !testSpawn)) return false;
   const serialized = JSON.stringify(request);
@@ -256,7 +362,7 @@ async function runBrokerCleanup(
     const finish = (success = false) => {
       if (!settled) {
         settled = true;
-        resolve(success && acknowledged && completed && !failed && output.length === 0);
+        resolve(success && acknowledged && (!complete || completed) && !failed && output.length === 0);
       }
     };
     const timeout = setTimeout(() => {
@@ -294,6 +400,9 @@ async function runBrokerCleanup(
         output = output.slice(at + 1);
         try {
           const value = JSON.parse(line);
+          // Periodic discovery can retire several exact proofs. Completion
+          // notices never send an ACK that a later READY could accidentally use.
+          if (notification?.(value)) continue;
           if (acknowledged && !completed && complete?.(value)) {
             completed = true;
             continue;
