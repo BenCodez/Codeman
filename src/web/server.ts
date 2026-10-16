@@ -3735,7 +3735,7 @@ export class WebServer extends EventEmitter {
     session: Session,
     saved: SessionState,
     phase: 'before-spawn' | 'after-spawn',
-    options?: { rearmAutoResumeSchedule?: boolean }
+    options?: { rearmAutoResumeSchedule?: boolean; rebootCustomModelEnv?: Record<string, string> }
   ): Promise<void> {
     if (phase === 'before-spawn') {
       // The custom-model env has to be rebuilt from the endpoint store: the persist
@@ -3743,7 +3743,12 @@ export class WebServer extends EventEmitter {
       // bookkeeping survives a restart and the values are re-derived here.
       const savedCustomModel = (saved as { __customModel?: CustomModelBookkeeping }).__customModel;
       if (savedCustomModel) {
-        session.setCustomModel(savedCustomModel, await this._rebuildCustomModelEnv(session, savedCustomModel));
+        // Reboot has already rebuilt and witnessed these exact files. A second
+        // rebuild would replace their inodes and invalidate that launch proof.
+        session.setCustomModel(
+          savedCustomModel,
+          options?.rebootCustomModelEnv ?? (await this._rebuildCustomModelEnv(session, savedCustomModel))
+        );
       }
       if (saved.niceEnabled !== undefined || saved.niceValue !== undefined) {
         session.setNice({ enabled: saved.niceEnabled, niceValue: saved.niceValue });

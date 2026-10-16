@@ -258,6 +258,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             (saved as { __envOverrides?: Record<string, string> }).__envOverrides
           );
           const savedCustomModel = (saved as { __customModel?: CustomModelBookkeeping }).__customModel;
+          let trustedCustomModelEnv: Record<string, string> | undefined;
           let customModelIsCurrent: RebootLaunchWitness = Object.assign(async () => true, {
             getStartupEvidence: () => undefined,
           });
@@ -288,7 +289,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
             // admin-owned endpoint store and the deterministic per-session config
             // directory. A privileged owner's clamp retains saved values, so a
             // failed rebuild must refuse the launch even when the old home verifies.
-            const trustedCustomModelEnv = await rebuildPersistedCustomModelEnv(
+            trustedCustomModelEnv = await rebuildPersistedCustomModelEnv(
               saved.mode ?? 'claude',
               saved.id,
               savedCustomModel,
@@ -438,7 +439,9 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // Before the listeners, because setupSessionListeners() reads the
           // image-watcher flag this phase restores; before the spawn, because the
           // custom-model environment and the nice priority shape the process.
-          await ctx.reapplyPersistedSessionState(session, saved, 'before-spawn');
+          await ctx.reapplyPersistedSessionState(session, saved, 'before-spawn', {
+            rebootCustomModelEnv: trustedCustomModelEnv,
+          });
           await ctx.setupSessionListeners(session);
           let cancellationIsCurrent = () => false;
           const discardCancelledRestore = async (): Promise<void> => {

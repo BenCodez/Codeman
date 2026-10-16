@@ -100,6 +100,11 @@ async function fixture(kind: 'manual' | 'command', outcome: 'blocked' | 'unknown
     freshCommand: () => {
       tail += run(21000, 'fresh');
     },
+    failedCommand: () => {
+      tail +=
+        line(21000, { type: 'exec_command_begin', call_id: 'failed', command: ['bash', '-lc', 'check'] }) +
+        line(22000, { type: 'exec_command_end', call_id: 'failed', exit_code: 1 });
+    },
     bytes: async () => JSON.parse(await readFile(path, 'utf8')).sessions[SID] as TaskState,
   };
 }
@@ -165,6 +170,78 @@ it.each([20000, NaN, Infinity, 25001])('refuses equal-boundary or malformed/futu
   expect(f.task.getStatus().outcome).not.toBe('completed');
   expect((await f.bytes()).outcome).not.toBe('completed');
   expect(f.task.getStatus().criteria[0].verified).toBe(true);
+  expect(f.act).not.toHaveBeenCalled();
+  expect(f.recover).not.toHaveBeenCalled();
+});
+
+it.each(
+  (['manual', 'command'] as const).flatMap((kind) =>
+    (['blocked', 'unknown'] as const).map((outcome) => ({ kind, outcome }))
+  )
+)(
+  'settings cannot certify retained $kind criteria after $outcome Resume, including durable reload',
+  async ({ kind, outcome }) => {
+    const f = await fixture(kind, outcome),
+      before = f.task.getStatus();
+    const edited = await f.task.update({ config: { maxContinuations: 5 } });
+    expect(edited).toMatchObject({
+      phase: 'watching',
+      outcome: 'unknown',
+      resumedAt: 20000,
+      config: { maxContinuations: 5 },
+    });
+    expect(edited.criteria).toEqual(before.criteria);
+    expect((await f.bytes()).outcome).toBe('unknown');
+    const restarted = new TaskController(f.deps, new TaskStore(f.path).get(SID));
+    f.tasks.push(restarted);
+    const reedited = await restarted.update({ config: { maxContinuations: 6 } });
+    expect(reedited.outcome).toBe('unknown');
+    expect((await f.bytes()).outcome).toBe('unknown');
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.recover).not.toHaveBeenCalled();
+  }
+);
+it('settings after unknown Resume cannot conceal a newer failed command or stop its evidence invalidation', async () => {
+  const f = await fixture('command', 'unknown');
+  f.clock(23000);
+  f.observed(22500);
+  f.failedCommand();
+  const edited = await f.task.update({ config: { maxContinuations: 5 } });
+  expect(edited).toMatchObject({ phase: 'watching', outcome: 'unknown' });
+  expect(edited.criteria[1].verified).toBe(true); // Settings neither sample nor certify new command evidence.
+  await f.task.refresh();
+  expect(f.task.getStatus().criteria[1].verified).toBe(false);
+  expect((await f.bytes()).criteria[1].verified).toBe(false);
+  expect((await f.bytes()).outcome).not.toBe('completed');
+  expect(f.act).not.toHaveBeenCalled();
+  expect(f.recover).not.toHaveBeenCalled();
+});
+it.each(['manual', 'command'] as const)(
+  'settings retain an already completed %s task and exact acceptance evidence',
+  async (kind) => {
+    const f = await fixture(kind, 'blocked');
+    f.clock(23000);
+    f.observed(22500);
+    if (kind === 'command') f.freshCommand();
+    await f.task.refresh();
+    const completed = f.task.getStatus();
+    expect(completed.outcome).toBe('completed');
+    const edited = await f.task.update({ config: { maxContinuations: 5 } });
+    expect(edited).toMatchObject({ phase: 'completed', outcome: 'completed' });
+    expect(edited.criteria).toEqual(completed.criteria);
+    expect((await f.bytes()).criteria).toEqual(completed.criteria);
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.recover).not.toHaveBeenCalled();
+  }
+);
+it('settings preserve fresh explicit manual owner completion after resumed uncertainty', async () => {
+  const f = await fixture('manual', 'unknown');
+  await f.task.progress({ outcome: 'completed' });
+  const completed = f.task.getStatus();
+  const edited = await f.task.update({ config: { maxContinuations: 5 } });
+  expect(edited).toMatchObject({ phase: 'completed', outcome: 'completed' });
+  expect(edited.criteria).toEqual(completed.criteria);
+  expect((await f.bytes()).outcome).toBe('completed');
   expect(f.act).not.toHaveBeenCalled();
   expect(f.recover).not.toHaveBeenCalled();
 });
