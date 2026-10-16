@@ -3958,7 +3958,7 @@ export class Session extends EventEmitter {
           !this._codexRestoreGuard &&
           pending?.codexRestoreUncertain === true &&
           pending.recoveryInputBrokerPending &&
-          pending.mode === 'codex' &&
+          getCli(pending.mode)?.capabilities.recovery === 'codex-rollout' &&
           !pending.remote &&
           !pending.docker &&
           pending.sessionId === this.id &&

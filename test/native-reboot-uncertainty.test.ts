@@ -2517,6 +2517,133 @@ describe('registered Codex-compatible uncertain launch adoption', () => {
   });
 
   it.each(
+    (['codex', 'adopt-codex'] as const).flatMap((mode) =>
+      (['startup-receipt', 'metadata-ack'] as const).map((failure) => ({ mode, failure }))
+    )
+  )('retains an ordinary $mode worker for inspection after $failure', async ({ mode, failure }) => {
+    const { manager, home, getBroker } = fixture();
+    const broker = await getBroker();
+    const durableFlush = manager.flushSessionsDurably.bind(manager);
+    if (failure === 'startup-receipt')
+      vi.mocked(broker.startupReceipt).mockRejectedValue(Error('Ordinary startup receipt lost'));
+    else {
+      let acknowledgements = 0;
+      vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(async (...args) => {
+        if (++acknowledgements === 2) throw Error('Ordinary metadata acknowledgement lost');
+        return durableFlush(...args);
+      });
+    }
+    const session = new Session({
+      id: ID,
+      mode,
+      owner: 'worker',
+      workingDir: root,
+      useMux: true,
+      mux: manager,
+      codexConfig: config,
+      recoveryCodexHome: home,
+    });
+    sessions.push(session);
+    await expect(session.startInteractive()).rejects.toThrow();
+    const record = manager.getSession(ID)!;
+    expect(session.codexRestoreWorkerMayExist).toBe(true);
+    expect(Reflect.get(session, '_muxSession')).toBe(record);
+    expect(record).toMatchObject({
+      mode,
+      owner: 'worker',
+      workingDir: root,
+      recoveryInputBrokerPending: broker.incarnation,
+      codexRestoreUncertain: true,
+    });
+    expect(session.getRecoveryContext()).toMatchObject({ managed: false, switchPending: true, untrackedInput: true });
+    expect(effects.attach).not.toHaveBeenCalled();
+
+    // Exercise the quick-start failure cleanup which must keep this exact pane.
+    const server = Object.create(WebServer.prototype) as ServerType;
+    const board = new Map([[ID, session]]);
+    Reflect.set(server, 'sessions', board);
+    Reflect.set(server, 'mux', manager);
+    Reflect.set(server, 'cleaningUp', new Set());
+    Reflect.set(server, 'tentativeSessionRegistrations', new WeakSet());
+    Reflect.set(server, 'persistDeb', { cancelKey: vi.fn() });
+    Reflect.set(
+      server,
+      'stopRecoveryController',
+      vi.fn(async () => {})
+    );
+    Reflect.set(server, 'broadcast', vi.fn());
+    Reflect.set(
+      server,
+      'getSessionStateWithRespawn',
+      vi.fn(() => ({ id: ID }))
+    );
+    const kill = vi.spyOn(manager, 'killSession');
+    // The deliberately lost acknowledgement above was one-shot; owner cleanup
+    // must still acknowledge its retained uncertainty without creating a worker.
+    vi.spyOn(manager, 'flushSessionsDurably').mockImplementation(durableFlush);
+    await server.discardPartiallyBuiltSession(ID, session);
+    expect(board.get(ID)).toBe(session);
+    expect(manager.getSession(ID)).toBe(record);
+    expect(kill).not.toHaveBeenCalled();
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
+    expect(
+      effects.sync.mock.calls.some(([command]) => command.includes('kill-pane ') || command.includes('kill-session '))
+    ).toBe(false);
+    expect(effects.attach).not.toHaveBeenCalled();
+  });
+
+  it('keeps an ordinary uncertain custom worker from adopting another capable CLI identity', async () => {
+    const { manager, home, getBroker } = fixture();
+    vi.mocked((await getBroker()).startupReceipt).mockRejectedValue(Error('Ordinary startup receipt lost'));
+    const session = new Session({
+      id: ID,
+      mode: 'adopt-codex',
+      owner: 'worker',
+      workingDir: root,
+      useMux: true,
+      mux: manager,
+      codexConfig: config,
+      recoveryCodexHome: home,
+    });
+    sessions.push(session);
+    await expect(session.startInteractive()).rejects.toThrow();
+    expect(session.codexRestoreWorkerMayExist).toBe(true);
+    const retained = manager.getSession(ID)!;
+    for (const mode of ['codex', 'other-adopt-codex', 'unsupported-adopt', 'unregistered-adopt']) {
+      retained.mode = mode;
+      expect(session.adoptUncertainCodexRestore()).toBe(false);
+      expect(manager.getSession(ID)).toBe(retained);
+    }
+    retained.mode = 'adopt-codex';
+    expect(session.adoptUncertainCodexRestore()).toBe(true);
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
+    expect(effects.attach).not.toHaveBeenCalled();
+  });
+
+  it('attaches a healthy ordinary custom launch without manufacturing uncertainty', async () => {
+    const { manager, home, getBroker } = fixture();
+    const session = new Session({
+      id: ID,
+      mode: 'adopt-codex',
+      owner: 'worker',
+      workingDir: root,
+      useMux: true,
+      mux: manager,
+      codexConfig: config,
+      recoveryCodexHome: home,
+    });
+    sessions.push(session);
+    await session.startInteractive();
+    expect(session.codexRestoreWorkerMayExist).toBe(false);
+    expect(manager.getSession(ID)?.mode).toBe('adopt-codex');
+    expect(manager.getSession(ID)?.recoveryInputBroker).toBe((await getBroker()).incarnation);
+    expect(manager.getSession(ID)?.recoveryInputBrokerPending).toBeUndefined();
+    expect(manager.getSession(ID)?.codexRestoreUncertain).toBeUndefined();
+    expect(effects.attach).toHaveBeenCalledOnce();
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
+  });
+
+  it.each(
     (['throw', 'timeout'] as const).flatMap((failure) =>
       (
         [
