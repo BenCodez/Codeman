@@ -824,4 +824,60 @@ describe('Session Options responsive layout in Chromium', () => {
       await page.evaluate(() => (window as any).app.closeTaskOptions());
     }
   );
+  it.each([390, 1280])(
+    'keeps completed task Pause disabled, then pauses new unfinished work at %spx',
+    async (width) => {
+      await page.close();
+      page = await browser.newPage();
+      await renderAt(width);
+      await page.addScriptTag({ content: 'window.CodemanApp = class {};' });
+      for (const file of ['api-client.js', 'recovery-ui.js', 'supervision-ui.js'])
+        await page.addScriptTag({ content: readFileSync(resolve(publicDir, file), 'utf8') });
+      await page.evaluate(async () => {
+        const w = window as any;
+        document.getElementById('context-tab')!.classList.add('hidden');
+        document.getElementById('task-tab')!.classList.remove('hidden');
+        w.__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
+        w.app = new w.CodemanApp();
+        w.app.sessions = new Map([['a', { mode: 'codex', taskSupported: true }]]);
+        w.app.editingSessionId = 'a';
+        w.app.showToast = () => {};
+        w.taskState = {
+          version: 1,
+          objective: 'Finished owner task',
+          criteria: [{ id: 'owner', kind: 'manual', description: 'Owner accepted', verified: true }],
+          config: { enabled: true, maxContinuations: 3, maxRuntimeMs: 900000 },
+          phase: 'completed',
+          outcome: 'completed',
+          reason: 'completed',
+          continuations: 0,
+          history: [],
+        };
+        w.pauseRequests = 0;
+        w.fetch = async (url: string, options?: { method?: string }) => {
+          if (url.endsWith('/pause') && options?.method === 'POST') {
+            w.pauseRequests++;
+            w.taskState = { ...w.taskState, phase: 'paused', reason: 'owner-paused' };
+          }
+          return new Response(JSON.stringify({ success: true, data: w.taskState }), { status: 200 });
+        };
+        w.app.openTaskOptions('a');
+        await w.app.loadTaskStatus();
+      });
+      expect(await page.locator('#taskPauseBtn').isDisabled()).toBe(true);
+      expect(await page.locator('#taskPhase').textContent()).toBe('Completed');
+      await page.evaluate(async () => (window as any).app.taskAction('pause'));
+      expect(await page.evaluate(() => (window as any).pauseRequests)).toBe(0);
+      await page.evaluate(() => {
+        const w = window as any;
+        w.taskState = { ...w.taskState, objective: 'New unfinished task', phase: 'watching', outcome: 'unfinished' };
+        w.app._onSessionTask({ sessionId: 'a', state: w.taskState });
+      });
+      expect(await page.locator('#taskPauseBtn').isEnabled()).toBe(true);
+      await page.locator('#taskPauseBtn').click();
+      await expect.poll(() => page.evaluate(() => (window as any).pauseRequests)).toBe(1);
+      await expect.poll(() => page.locator('#taskPhase').textContent()).toBe('Paused');
+      await page.evaluate(() => (window as any).app.closeTaskOptions());
+    }
+  );
 });

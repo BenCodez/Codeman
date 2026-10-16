@@ -300,7 +300,8 @@ Object.assign(CodemanApp.prototype, {
       state?.outcome === 'completed' ||
       !state?.objective ||
       !state?.criteria.length;
-    document.getElementById('taskPauseBtn').disabled = !available || !state?.config.enabled;
+    document.getElementById('taskPauseBtn').disabled =
+      !available || !state?.config.enabled || state?.outcome === 'completed';
     document.getElementById('taskResetBtn').disabled = !available;
     const configurationDirty =
       view.configurationDraftBaseline !== undefined &&

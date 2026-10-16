@@ -326,7 +326,7 @@ describe('mobile prompt composer', () => {
   });
 
   it('wires session cleanup to composer draft cleanup', () => {
-    const cleanupStart = appSource.indexOf('  _cleanupSessionData(sessionId) {');
+    const cleanupStart = /^ {2}_cleanupSessionData\(sessionId(?:,[^)\n]*)?\) \{/m.exec(appSource)?.index ?? -1;
     expect(cleanupStart, '_cleanupSessionData not found — renamed?').toBeGreaterThan(-1);
     // The whole method, not a fixed byte window. A 1200-character slice made
     // this assertion depend on how much OTHER code sat above the line it cares

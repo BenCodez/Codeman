@@ -30,6 +30,7 @@
 
 import { EventEmitter } from 'node:events';
 import { prepareSupervisorManagerLaunch, type SupervisorManagerLaunch } from './supervisor/manager-launch.js';
+import { supervisorManagerBridgeCommand } from './supervisor/manager-bridge-command.js';
 import { createHash } from 'node:crypto';
 import { getDataDirPath } from './config/instance.js';
 import { RetiredInputClients } from './input-client-retirement.js';
@@ -2488,6 +2489,7 @@ export class Session extends EventEmitter {
     };
     await retirement;
     if (!current()) return false;
+    const bridge = supervisorManagerBridgeCommand();
     profile = await prepareSupervisorManagerLaunch({
       home: context.codexHome,
       workingDir: this.workingDir,
@@ -2496,8 +2498,8 @@ export class Session extends EventEmitter {
       conversationId,
       token: options.token,
       endpoint: options.endpoint,
-      bridgeCommand: 'codeman',
-      bridgeArgs: ['agent', 'supervisor-mcp'],
+      bridgeCommand: bridge.command,
+      bridgeArgs: bridge.args,
       isCurrent: current,
     });
     if (!profile) return false;

@@ -1,6 +1,7 @@
 /** Bounded optional retirement. Unknown references or evidence always retain private files. */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { constants } from 'node:fs';
+import { constants, type Stats } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { join, normalize, isAbsolute } from 'node:path';
 import { CODEX_BROKER_CLEANUP_SOURCE } from './codex-broker-cleanup-source.js';
@@ -171,16 +172,24 @@ export interface BrokerProvisioningRollback {
   parents: Array<{ path: string; dev: number; ino: number }>;
   files: Array<{ name: string; dev: number; ino: number; size: number; hash: string }>;
 }
-/** Store the exact unlaunched proof outside the incarnation before optional helper dispatch. */
-async function persistRollbackReceipt(receipt: BrokerProvisioningRollback): Promise<void> {
-  try {
-    if (
-      !isAbsolute(receipt.root) ||
-      normalize(receipt.root) !== receipt.root ||
-      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(receipt.incarnation) ||
-      (await fs.realpath(receipt.root)) !== receipt.root
-    )
-      return;
+/** Publish only complete private receipts; existing marker names are never replaced. */
+async function persistRollbackReceipt(receipt: BrokerProvisioningRollback): Promise<'retained' | 'retry'> {
+  let staging: string | undefined,
+    created: Stats | undefined,
+    publicationAllowed = false,
+    linkAttempted = false;
+  const bytes = Buffer.from(JSON.stringify(receipt));
+  const marker = join(receipt.root, `.rollback-${receipt.incarnation}.json`);
+  const privateFile = (stat: Stats) =>
+    stat.isFile() && (stat.mode & 0o077) === 0 && (process.getuid === undefined || stat.uid === process.getuid());
+  const same = (left: Stats, right: Stats) =>
+    left.dev === right.dev &&
+    left.ino === right.ino &&
+    left.size === right.size &&
+    left.mtimeMs === right.mtimeMs &&
+    left.ctimeMs === right.ctimeMs;
+  const parentsCurrent = async () => {
+    if ((await fs.realpath(receipt.root)) !== receipt.root) return false;
     for (const parent of receipt.parents) {
       const stat = await fs.lstat(parent.path);
       if (
@@ -191,8 +200,44 @@ async function persistRollbackReceipt(receipt: BrokerProvisioningRollback): Prom
         (stat.mode & 0o022) !== 0 ||
         (process.getuid !== undefined && stat.uid !== process.getuid())
       )
-        return;
+        return false;
     }
+    return true;
+  };
+  const owned = async (path: string, partial = false) => {
+    if (!created) return undefined;
+    const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    try {
+      const before = await handle.stat();
+      if (
+        !privateFile(before) ||
+        before.dev !== created.dev ||
+        before.ino !== created.ino ||
+        before.size > bytes.length ||
+        (!partial && before.size !== bytes.length)
+      )
+        return undefined;
+      const buffer = Buffer.alloc(before.size + 1);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+      return bytesRead === before.size &&
+        buffer.subarray(0, bytesRead).equals(bytes.subarray(0, bytesRead)) &&
+        same(before, await handle.stat()) &&
+        (await parentsCurrent()) &&
+        same(before, await fs.lstat(path))
+        ? before
+        : undefined;
+    } finally {
+      await handle.close();
+    }
+  };
+  try {
+    if (
+      !isAbsolute(receipt.root) ||
+      normalize(receipt.root) !== receipt.root ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(receipt.incarnation) ||
+      !(await parentsCurrent())
+    )
+      return 'retained';
     const directory = await fs.lstat(join(receipt.root, receipt.incarnation));
     if (
       !directory.isDirectory() ||
@@ -202,25 +247,52 @@ async function persistRollbackReceipt(receipt: BrokerProvisioningRollback): Prom
       (directory.mode & 0o077) !== 0 ||
       (process.getuid !== undefined && directory.uid !== process.getuid())
     )
-      return;
-    const marker = await fs.open(join(receipt.root, `.rollback-${receipt.incarnation}.json`), 'wx', 0o600);
+      return 'retained';
+    publicationAllowed = true;
+    staging = join(receipt.root, `.rollback-${receipt.incarnation}.${randomUUID()}.next`);
+    const handle = await fs.open(staging, 'wx', 0o600);
     try {
-      await marker.writeFile(JSON.stringify(receipt));
-      await marker.sync();
+      created = await handle.stat();
+      if (!privateFile(created) || created.size !== 0) throw new Error('Rollback staging changed');
+      await handle.writeFile(bytes);
+      await handle.sync();
     } finally {
-      await marker.close();
+      await handle.close();
     }
+    const staged = await owned(staging);
+    if (!staged || !(await parentsCurrent()) || !same(staged, await fs.lstat(staging)))
+      throw new Error('Rollback staging changed');
+    // link is an atomic, exclusive commit: a foreign final name is never replaced.
+    linkAttempted = true;
+    await fs.link(staging, marker);
+    if (!(await owned(marker))) throw new Error('Rollback publication changed');
     const parent = await fs.open(receipt.root, constants.O_RDONLY | constants.O_NOFOLLOW);
     try {
       const stat = await parent.stat();
-      if (stat.dev !== receipt.parents[0]?.dev || stat.ino !== receipt.parents[0]?.ino) return;
+      if (stat.dev !== receipt.parents[0]?.dev || stat.ino !== receipt.parents[0]?.ino) return 'retry';
       await parent.sync();
     } finally {
       await parent.close();
     }
-  } catch {
-    // Existing, unreadable or partially written markers are never overwritten.
-    // The live receipt still retries; a valid durable marker survives restart.
+    return 'retained';
+  } catch (error) {
+    if (linkAttempted && (error as NodeJS.ErrnoException).code === 'EEXIST') return 'retained';
+    // A lost link/fsync acknowledgement may leave a complete owned final file.
+    if (linkAttempted && (await owned(marker).catch(() => false))) return 'retained';
+    return publicationAllowed ? 'retry' : 'retained';
+  } finally {
+    // Partial writes can be removed only with this invocation's inode and exact
+    // byte-prefix proof. Unknown/replaced staging survives untouched.
+    if (staging) {
+      const captured = await owned(staging, true).catch(() => undefined);
+      if (captured) {
+        try {
+          if ((await parentsCurrent()) && same(captured, await fs.lstat(staging))) await fs.unlink(staging);
+        } catch {
+          /* Uncertain cleanup retains staging; it never blocks a fresh exclusive attempt. */
+        }
+      }
+    }
   }
 }
 
@@ -230,6 +302,7 @@ type PendingRollback = {
   retry: boolean;
   attempts: number;
   nextRetryAt: number;
+  retryPublication?: boolean;
   work?: Promise<boolean>;
 };
 // Keep exact ownership proof until deletion is positively acknowledged. One
@@ -276,15 +349,24 @@ function attemptRollback(key: string, pending: PendingRollback): Promise<boolean
   if (pending.work) return pending.work;
   pending.attempts = Math.min(pending.attempts + 1, 6);
   const request = pending.receipt;
-  const work = runBrokerCleanup(
-    { rollback: request },
-    (value) =>
-      Object.keys(value).join(',') === 'rollback' && value.rollback === `${request.sessionId}/${request.incarnation}`,
-    pending.spawn,
-    (value) =>
-      Object.keys(value).join(',') === 'rolledBack' &&
-      value.rolledBack === `${request.sessionId}/${request.incarnation}`
-  )
+  const publication = pending.retryPublication
+    ? persistRollbackReceipt(request).then((result) => {
+        pending.retryPublication = result === 'retry';
+      })
+    : Promise.resolve();
+  const work = publication
+    .then(() =>
+      runBrokerCleanup(
+        { rollback: request },
+        (value) =>
+          Object.keys(value).join(',') === 'rollback' &&
+          value.rollback === `${request.sessionId}/${request.incarnation}`,
+        pending.spawn,
+        (value) =>
+          Object.keys(value).join(',') === 'rolledBack' &&
+          value.rolledBack === `${request.sessionId}/${request.incarnation}`
+      )
+    )
     .catch(() => false)
     .then((removed) => {
       pending.work = undefined;
@@ -327,8 +409,9 @@ export async function rollbackCodexBrokerProvisioning(
     pending.spawn = testSpawn;
     pending.retry = testRetry;
   }
-  // Reserve the FIFO slot before asynchronous publication can reorder callers.
-  await persistRollbackReceipt(captured);
+  // Own publication and cleanup together: duplicate callers cannot accumulate
+  // staging writes while this receipt's first write is still pending.
+  pending.retryPublication = true;
   return attemptRollback(key, pending);
 }
 

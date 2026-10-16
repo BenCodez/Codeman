@@ -1,4 +1,4 @@
-/** Old alert-only journals cannot become restart consent; no real panes or SSH. */
+/** @fileoverview Old alert-only journals cannot become restart consent; no real panes or SSH. */
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -247,7 +247,8 @@ it.each([false, true])(
     expect(before.pending).toMatchObject({ action: 'restart', reason: 'stalled' });
     expect(before.nextRetryAt).toBe(NOW + 3000);
     await f.controller.updateConfig({ stalledAfterMs: 15_000 });
-    expect(f.controller.getStatus().pending).toEqual(before.pending);
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.controller.getStatus().nextRetryAt).toBeUndefined();
     vi.setSystemTime(NOW + 3000);
     await f.controller.refresh();
     expect(f.effects).not.toHaveBeenCalled();
@@ -256,6 +257,10 @@ it.each([false, true])(
     await f.controller.refresh();
     expect(f.effects).not.toHaveBeenCalled();
     vi.setSystemTime(NOW + 5000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().nextRetryAt).toBe(NOW + 6000);
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 6000);
     await f.controller.refresh();
     expect(f.effects).toHaveBeenCalledOnce();
   }
@@ -521,5 +526,144 @@ it.each(
     }
     expect(f.controller.getStatus().history.some((event) => event.reason === 'stall-unverified')).toBe(false);
     expect(f.effects).not.toHaveBeenCalled();
+  }
+);
+
+it.each([false, true].flatMap((remote) => [10_000, 15_000].map((threshold) => ({ remote, threshold }))))(
+  'durably starts a full new delay after an expired stall timer and threshold edit (SSH=$remote old=$threshold)',
+  async ({ remote, threshold }) => {
+    const f = await fixture(remote, true, false);
+    await f.controller.updateConfig({ stalledAfterMs: threshold, retryDelayMs: 10_000, maxRetryDelayMs: 10_000 });
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 2000);
+    await f.controller.refresh();
+    const before = f.controller.getStatus();
+    expect(before.nextRetryAt).toBe(NOW + 12_000);
+    vi.setSystemTime(NOW + 13_000);
+    await f.controller.updateConfig({ stalledAfterMs: threshold === 10_000 ? 15_000 : 10_000 });
+    const edited = new RecoveryStore(f.path).get('worker');
+    expect(edited.pending).toBeUndefined();
+    expect(edited.nextRetryAt).toBeUndefined();
+    for (const key of ['armedAt', 'attempts', 'failedAttempts', 'windowStartedAt', 'handledEvidence'] as const)
+      expect(edited[key]).toEqual(before[key]);
+    await f.controller.refresh();
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 15_000);
+    await f.controller.refresh();
+    expect(f.effects).not.toHaveBeenCalled();
+    expect(new RecoveryStore(f.path).get('worker')).toMatchObject({
+      pending: { reason: 'stalled', action: 'restart' },
+      nextRetryAt: NOW + 25_000,
+      attempts: 0,
+    });
+    vi.setSystemTime(NOW + 24_999);
+    await f.controller.refresh();
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 25_000);
+    await f.controller.refresh();
+    expect(f.effects).toHaveBeenCalledOnce();
+    expect(f.effects.mock.calls[0][0]).toMatchObject({ reason: 'stalled', startedAt: NOW + 25_000 });
+    expect(new RecoveryStore(f.path).get('worker').inFlight?.startedAt).toBe(NOW + 25_000);
+  }
+);
+
+it.each([false, true])(
+  'explicit Retry still waives the new delay after two post-edit stall probes (SSH=%s)',
+  async (remote) => {
+    const f = await fixture(remote, true, false);
+    await f.controller.updateConfig({ retryDelayMs: 10_000, maxRetryDelayMs: 10_000 });
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 2000);
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 13_000);
+    await f.controller.updateConfig({ stalledAfterMs: 15_000 });
+    await f.controller.retry();
+    expect(f.effects).not.toHaveBeenCalled();
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    vi.setSystemTime(NOW + 15_000);
+    await f.controller.retry();
+    expect(f.effects).toHaveBeenCalledOnce();
+    expect(f.effects.mock.calls[0][0].startedAt).toBe(NOW + 15_000);
+  }
+);
+
+it.each(['unchanged', 'unrelated'] as const)('preserves a scheduled stall delay for %s settings', async (change) => {
+  const f = await fixture(false, true, false);
+  await f.controller.updateConfig({ retryDelayMs: 10_000, maxRetryDelayMs: 10_000 });
+  await f.controller.refresh();
+  vi.setSystemTime(NOW + 2000);
+  await f.controller.refresh();
+  const before = f.controller.getStatus();
+  await f.controller.updateConfig(change === 'unchanged' ? { stalledAfterMs: 10_000 } : { maxRetries: 4 });
+  expect(new RecoveryStore(f.path).get('worker')).toMatchObject({
+    pending: before.pending,
+    nextRetryAt: before.nextRetryAt,
+  });
+  vi.setSystemTime(NOW + 12_000);
+  await f.controller.refresh();
+  expect(f.effects).toHaveBeenCalledOnce();
+});
+
+it.each(['interrupted', 'crashed'] as const)(
+  'a threshold edit retains an unrelated pending %s action',
+  async (activity) => {
+    const f = await fixture(false, true, false);
+    await f.controller.updateConfig({ recoverCrashes: true, retryDelayMs: 10_000, maxRetryDelayMs: 10_000 });
+    Object.assign(f.observation, {
+      activity,
+      reason: activity === 'crashed' ? 'process-crashed' : 'turn-failed',
+      at: NOW,
+      safeToAct: true,
+      evidenceKey: 'unrelated-failure',
+      stallRestartable: false,
+      stallEvidenceKey: undefined,
+    });
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 2000);
+    await f.controller.refresh();
+    const before = f.controller.getStatus();
+    expect(before.pending?.reason).not.toBe('stalled');
+    expect(before.pending).toBeDefined();
+    await f.controller.updateConfig({ stalledAfterMs: 15_000 });
+    expect(new RecoveryStore(f.path).get('worker')).toMatchObject({
+      pending: before.pending,
+      nextRetryAt: before.nextRetryAt,
+    });
+    vi.setSystemTime(NOW + 12_000);
+    await f.controller.refresh();
+    expect(f.effects).not.toHaveBeenCalled(); // The policy edit still invalidates confirmations.
+    vi.setSystemTime(NOW + 14_000);
+    await f.controller.refresh();
+    expect(f.effects).toHaveBeenCalledOnce();
+    expect(f.effects.mock.calls[0][0].reason).toBe(before.pending?.reason);
+  }
+);
+
+it.each(['input', 'reset', 'approval', 'healthy'] as const)(
+  'a freshly rescheduled stall retains the final %s veto',
+  async (veto) => {
+    const f = await fixture(false, true, false);
+    await f.controller.updateConfig({ retryDelayMs: 10_000, maxRetryDelayMs: 10_000 });
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 2000);
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 13_000);
+    await f.controller.updateConfig({ stalledAfterMs: 15_000 });
+    await f.controller.refresh();
+    vi.setSystemTime(NOW + 15_000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus().nextRetryAt).toBe(NOW + 25_000);
+    if (veto === 'input') {
+      f.controller.noteUserInput();
+      await f.controller.drain();
+    } else if (veto === 'reset') await f.controller.reset();
+    else if (veto === 'approval')
+      Object.assign(f.observation, { activity: 'blocked', reason: 'approval-required', stallRestartable: false });
+    else f.observation.stallRestartable = false;
+    vi.setSystemTime(NOW + 25_000);
+    await f.controller.refresh();
+    expect(f.effects).not.toHaveBeenCalled();
+    expect(new RecoveryStore(f.path).get('worker').pending).toBeUndefined();
+    expect(f.controller.getStatus().attempts).toBe(0);
   }
 );

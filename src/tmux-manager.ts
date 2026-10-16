@@ -3533,8 +3533,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         localCodex && codexConfig?.noDaemon === true
           ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!options.codexRestoreGuard)
           : undefined;
-      if (options.codexRestoreGuard && !inputBroker) throw new Error('Reboot restoration requires input provenance');
-      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+
+      if (localCodex && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
         throw new Error('Owner launch authority changed before native creation');
 
       // Create tmux session in three steps to handle cold-start (no server running)
@@ -3601,39 +3601,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         };
         restoreCleanupPid = restorePane.panePid;
       }
-      this.resizeWindow(muxName, 120, 40);
-
-      // Set remain-on-exit now that the server is running — must be before respawn-pane
-      try {
-        execSync(`${this.tmux()} set-option -t "${muxName}" remain-on-exit on`, {
-          timeout: EXEC_TIMEOUT_MS,
-          stdio: 'ignore',
-        });
-      } catch {
-        /* Non-critical */
-      }
-
-      // Per-CLI env: API keys, config blobs, config-sourced vars, status bridges. All of
-      // it is registry data, so this is one unconditional call rather than a per-mode ladder.
-      this._configureCliEnv(
-        muxName,
-        sessionId,
-        mode,
-        legacyConfigForMode(mode, options as unknown as Record<string, unknown>)
-      );
-      this._configureStatusLineUserCommand(muxName, userStatusLineCommand);
-
-      // Apply user-supplied env overrides (e.g., CLAUDE_CODE_EFFORT_LEVEL) via tmux setenv
-      // so secret values stay off the bash command line. Must run before respawn-pane.
-      this.applyEnvOverrides(muxName, envOverrides);
-      if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
-
-      // Replace the shell with the actual command (no echo in terminal). Keep
-      // pane launch in /tmp, then cd inside bash against the current mount table.
-      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
-        throw new Error('Owner launch authority changed before native dispatch');
-      if (inputBroker || options.codexRestoreGuard || options.restoreGuard) {
-        // Record exact ownership before a dispatch whose receipt may be lost.
+      if (localCodex || options.codexRestoreGuard || options.restoreGuard) {
+        // Track the confirmed new shell before fallible env/home setup. Keep
+        // exact launch intent separate from historical state until commit.
         // PID 0 is explicitly unknown; it never supplies live/dead action proof.
         reservedRestoreRecord = {
           sessionId,
@@ -3669,6 +3639,40 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           reservationIsCurrent
         );
       }
+      this.resizeWindow(muxName, 120, 40);
+
+      // Set remain-on-exit now that the server is running — must be before respawn-pane
+      try {
+        execSync(`${this.tmux()} set-option -t "${muxName}" remain-on-exit on`, {
+          timeout: EXEC_TIMEOUT_MS,
+          stdio: 'ignore',
+        });
+      } catch {
+        /* Non-critical */
+      }
+
+      // Per-CLI env: API keys, config blobs, config-sourced vars, status bridges. All of
+      // it is registry data, so this is one unconditional call rather than a per-mode ladder.
+      this._configureCliEnv(
+        muxName,
+        sessionId,
+        mode,
+        legacyConfigForMode(mode, options as unknown as Record<string, unknown>)
+      );
+      this._configureStatusLineUserCommand(muxName, userStatusLineCommand);
+
+      // Apply user-supplied env overrides (e.g., CLAUDE_CODE_EFFORT_LEVEL) via tmux setenv
+      // so secret values stay off the bash command line. Must run before respawn-pane.
+      this.applyEnvOverrides(muxName, envOverrides);
+      if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
+
+      // Replace the shell with the actual command (no echo in terminal). Keep
+      // pane launch in /tmp, then cd inside bash against the current mount table.
+      if (
+        localCodex &&
+        (this.sessions.get(sessionId) !== (reservedRestoreRecord ?? priorRegistration) || !ownerCurrent())
+      )
+        throw new Error('Owner launch authority changed before native dispatch');
       if (options.codexRestoreGuard) {
         await options.codexRestoreGuard.prepare();
         const startupDeadline = Number(process.hrtime.bigint() / 1_000_000n) + 2_000;
@@ -3874,7 +3878,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         reservedRestoreRecord = session;
         await this.flushSessionsDurably(() => this.sessions.get(sessionId) === session);
       }
-      if (reservedRestoreRecord && this.sessions.get(sessionId) !== session)
+      if (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
         throw new Error('Codex launch ownership changed');
       this.sessions.set(sessionId, session);
       this.saveSessions();

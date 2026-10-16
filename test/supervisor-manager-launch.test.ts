@@ -15,6 +15,7 @@ import {
   type SupervisorManagerLaunch,
 } from '../src/supervisor/manager-launch.js';
 import { createDeferred } from './mocks/index.js';
+import { supervisorManagerBridgeCommand } from '../src/supervisor/manager-bridge-command.js';
 
 const catalogRead = vi.hoisted(() => vi.fn());
 vi.mock('../src/supervisor/manager-catalog.js', async (importOriginal) => ({
@@ -729,6 +730,15 @@ it('ordinary restored Session cannot adopt a manager role; exact acknowledged re
   const f = await fixture();
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
   expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+  const preparedProfile = Reflect.get(f.session, '_supervisorManagerProfile') as SupervisorManagerLaunch;
+  const bridge = supervisorManagerBridgeCommand();
+  const servers = parse(await fs.readFile(preparedProfile.file, 'utf8')).mcp_servers as Record<
+    string,
+    { command: string; args: string[] }
+  >;
+  expect(servers.codeman_supervisor.command).toBe(process.execPath);
+  expect(servers.codeman_supervisor.args.slice(0, -2)).toEqual(bridge.args);
+  expect(servers.codeman_supervisor.args.at(-2)).toBe('--credential-file');
   expect(f.respawn).toHaveBeenCalledOnce();
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(true);
   expect(f.session.codexConfig?.resumeSessionId).toBe(CID);

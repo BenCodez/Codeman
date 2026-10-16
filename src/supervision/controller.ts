@@ -669,6 +669,8 @@ export class TaskController {
   pause(): Promise<TaskState> {
     this.lastOwnerPauseRevision = ++this.revision;
     return this.enqueue(async () => {
+      // Completion is terminal. Pause cannot reopen the finished objective.
+      if (this.state.outcome === 'completed') return this.getStatus();
       this.state.phase = 'paused';
       this.arm();
       return this.save('owner-paused');
