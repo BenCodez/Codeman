@@ -81,7 +81,8 @@ export class TaskController {
       this.state.criteria.every((criterion) => criterion.kind === 'manual' && criterion.evidence?.source === 'owner')
     )
       this.state.outcome = 'completed';
-    if (this.state.config.enabled && this.state.inFlight) {
+    const terminalCompletion = this.state.outcome === 'completed' && this.state.phase === 'completed';
+    if (this.state.config.enabled && this.state.inFlight && !terminalCompletion) {
       this.state.phase = 'paused';
       this.state.reason = 'restart-in-flight';
     } else if (this.state.agentProgressVeto) {
