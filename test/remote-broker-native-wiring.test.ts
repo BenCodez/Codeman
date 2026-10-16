@@ -69,7 +69,12 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 beforeEach(async () => {
-  effects.sync.mockReset().mockReturnValue('99999\n');
+  effects.sync.mockReset().mockImplementation((command: string) => {
+    if (command.includes(' new-session ') && command.includes(' -P ')) return '$1|%7|10001|88\n';
+    if (command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED'))
+      return 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|$1|%7|99999|88\n';
+    return '99999\n';
+  });
   effects.exec.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
   effects.provision.mockReset().mockImplementation(async (_remote, material, authority, options) => {
     expect(authority.isCurrent()).toBe(true);
@@ -372,6 +377,116 @@ it('persists the exact pending incarnation before remote fork and commits before
   expect(controlled.taskSupervisionSupported).toBe(true);
   expect(controlled.toLightDetailedState().taskSupported).toBe(true);
 });
+it.each([
+  'env-failed',
+  'owner-revoked',
+  'cleanup-refused',
+  'create-lost-ack',
+  'dispatch-lost-ack',
+  'dispatch-malformed',
+  'postdispatch-revoked',
+  'map-replaced',
+] as const)('owns only the exact local SSH attach wrapper after %s', async (kind) => {
+  const { manager, options } = fixture();
+  let current = true,
+    localCreates = 0,
+    attachDispatches = 0,
+    localKills = 0,
+    configured = false;
+  options.remoteLaunchCurrent = () => current;
+  const native = effects.sync.getMockImplementation()!;
+  effects.sync.mockImplementation((command: string) => {
+    if (command.includes(' new-session ')) {
+      localCreates++;
+      if (kind === 'create-lost-ack') throw Error('Fixture new local wrapper ACK lost');
+    }
+    if (command.includes('respawn-pane ')) {
+      attachDispatches++;
+      if (kind === 'dispatch-lost-ack') throw Error('Fixture local attach ACK lost');
+      if (kind === 'dispatch-malformed') return 'unexpected attach receipt';
+      if (kind === 'postdispatch-revoked') current = false;
+      if (kind === 'map-replaced') {
+        const record = manager.getSession(options.sessionId)!;
+        Reflect.get(manager, 'sessions').set(options.sessionId, { ...record, owner: 'replacement-owner', pid: 77777 });
+      }
+    }
+    if (command.includes('kill-pane ')) {
+      if (kind === 'cleanup-refused') return 'CODEMAN_REBOOT_CLEANUP_REFUSED\n';
+      localKills++;
+      return '';
+    }
+    return native(command);
+  });
+  const configure = vi.mocked(Reflect.get(manager, '_configureCliEnv') as () => void);
+  configure.mockImplementation(() => {
+    configured = true;
+    if (kind === 'env-failed' || kind === 'cleanup-refused') throw Error('Fixture local env setup failed');
+    if (kind === 'owner-revoked') current = false;
+  });
+  await expect(manager.createSession(options)).rejects.toThrow();
+  expect(localCreates).toBe(1);
+  if (kind !== 'create-lost-ack') expect(configured).toBe(true);
+  expect(effects.provision).toHaveBeenCalledTimes(2); // Plan + one remote worker, never a replacement.
+  const record = manager.getSession(options.sessionId)!;
+  expect(record.recoveryInputBroker).toMatch(/^[a-f0-9-]{36}$/);
+  expect(record.recoveryInputBrokerPending).toBeUndefined();
+  expect(effects.sync.mock.calls.some(([command]) => String(command).includes('kill-session '))).toBe(false);
+  if (kind === 'env-failed' || kind === 'owner-revoked') {
+    expect(localKills).toBe(1);
+    expect(attachDispatches).toBe(0);
+    expect(record.codexRestoreUncertain).not.toBe(true);
+    // The remote worker/provenance survive exact local cleanup. Keep the
+    // existing PID-0 inspection veto instead of authorizing a fresh worker.
+    expect(record.pid).toBe(0);
+    expect(await manager.getOwnedRemoteInputBroker(options.sessionId)).toMatchObject({
+      incarnation: record.recoveryInputBroker,
+    });
+    expect(manager.wrapCodexOwnerInput(options.sessionId, 'no replay')).toEqual({ status: 'refused' });
+    await expect(manager.createSession(options)).rejects.toThrow('uncertain');
+    expect(localCreates).toBe(1);
+    expect(effects.provision).toHaveBeenCalledTimes(2);
+  } else if (kind === 'map-replaced') {
+    expect(record.owner).toBe('replacement-owner');
+    expect(record.pid).toBe(77777);
+    expect(record.codexRestoreUncertain).not.toBe(true);
+    expect(localKills).toBe(0);
+  } else {
+    expect(localKills).toBe(0);
+    expect(record.codexRestoreUncertain).toBe(true);
+    expect(record.pid).toBe(kind === 'cleanup-refused' ? 10001 : kind === 'postdispatch-revoked' ? 99999 : 0);
+    const disk = JSON.parse(await fs.readFile(join(root, 'mux-sessions.json'), 'utf8')) as MuxSession[];
+    expect(disk.find((value) => value.sessionId === options.sessionId)).toMatchObject({
+      pid: record.pid,
+      codexRestoreUncertain: true,
+    });
+    current = true;
+    if (record.pid > 0) effects.provision.mockResolvedValueOnce({ status: 'existing' });
+    await expect(manager.createSession(options)).rejects.toThrow();
+    expect(localCreates).toBe(1);
+    expect(effects.provision).toHaveBeenCalledTimes(record.pid > 0 ? 3 : 2);
+    expect(effects.observe).toHaveBeenCalledOnce();
+  }
+  const commands = effects.sync.mock.calls.map(([command]) => String(command));
+  const create = commands.find((command) => command.includes(' new-session '))!;
+  expect(create).toContain(' -P -F ');
+  expect(create).toContain('/bin/sleep 86400');
+  for (const command of commands.filter((value) => value.includes('respawn-pane ') || value.includes('kill-pane '))) {
+    for (const term of [
+      '#{==:#{pid},88}',
+      '#{==:#{session_id},$1}',
+      '#{==:#{pane_id},%7}',
+      '#{==:#{pane_pid},10001}',
+      '#{==:#{window_panes},1}',
+      '#{==:#{session_windows},1}',
+    ])
+      expect(command).toContain(term);
+    if (command.includes('respawn-pane ')) {
+      expect(command).toContain('attach');
+      expect(command).toContain('CODEMAN_OPTIONAL_BROKER_DISPATCHED');
+    }
+  }
+});
+
 it.each(['unknown', 'not-sent'] as const)(
   'keeps %s launch sealed without native/local or fresh-worker fallback',
   async (status) => {
