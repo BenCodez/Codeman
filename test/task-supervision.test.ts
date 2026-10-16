@@ -1,3 +1,4 @@
+/** @fileoverview Bounded task-controller behavior with fake worker observations and effects. */
 import { describe, it, expect, vi } from 'vitest';
 import { createHash } from 'node:crypto';
 import { CONTINUATION_PROMPT } from '../src/recovery/types.js';
@@ -2544,3 +2545,132 @@ it.each(['kickoff', 'continuation', 'recovery'] as const)(
     }
   }
 );
+
+describe('explicit blocked-task resume keeps observing without stale continuation authority', () => {
+  function blockedFixture(limit = 3, spent = true) {
+    const restored = initialTaskState();
+    Object.assign(restored, {
+      objective: 'Finish the accepted objective',
+      criteria: [{ id: 'owner', description: 'Owner certifies completion', kind: 'manual', verified: false }],
+      phase: 'blocked',
+      outcome: 'blocked',
+      agentProgressVeto: true,
+      kickoffAt: 10_000,
+      startedAt: 10_000,
+      configuredAt: 10_000,
+      conversationId: id,
+      submissionKey: 'blocked-submission',
+      checkpoint: 'Old blocked checkpoint',
+      nextAction: 'Old blocked action',
+      handledEvidence: ['old-blocker'],
+      continuations: spent ? limit : 0,
+    });
+    restored.config = { enabled: true, maxContinuations: limit, maxRuntimeMs: 900_000 };
+    let now = 10_001;
+    let current: TaskObservation = {
+      observation: {
+        activity: 'working',
+        reason: 'turn-running',
+        at: now,
+        conversationId: id,
+        submissionKey: 'blocked-submission',
+        turnId: 'accepted-turn',
+        processReady: true,
+        safeToAct: false,
+      },
+      commands: new Map(),
+      marker: { key: 'old-blocker', at: 10_000, submissionKey: 'blocked-submission', progress: { outcome: 'blocked' } },
+    };
+    const act = vi.fn(async () => 'sent' as const),
+      recover = vi.fn(async () => 'sent' as const);
+    const observe = vi.fn(async () => current),
+      persist = vi.fn(async () => {});
+    const controller = new TaskController(
+      { now: () => now, observe, act, recover, persist, changed: () => {} },
+      restored
+    );
+    return {
+      controller,
+      act,
+      recover,
+      observe,
+      persist,
+      next: (progress?: unknown, activity: 'working' | 'completed' = 'working') => {
+        now++;
+        current = {
+          ...current,
+          observation: { ...current.observation, activity, at: now },
+          marker:
+            progress === undefined
+              ? current.marker
+              : { key: `new-report-${now}`, at: now, submissionKey: 'blocked-submission', progress },
+        };
+      },
+    };
+  }
+  it.each([0, 3])(
+    'keeps working polls armed after %i spent continuations and accepts later fresh progress',
+    async (limit) => {
+      const f = blockedFixture(limit);
+      try {
+        await f.controller.resume();
+        expect(f.controller.getStatus()).toMatchObject({ phase: 'watching', outcome: 'unknown', continuations: limit });
+        expect(f.controller.getStatus().agentProgressVeto).toBeUndefined();
+        expect(f.observe).not.toHaveBeenCalled();
+        await f.controller.refresh();
+        expect(f.controller.getStatus()).toMatchObject({ phase: 'watching', outcome: 'unknown' });
+        f.next({ outcome: 'unfinished', checkpoint: 'Newly verified step', nextAction: 'New owner-authorized step' });
+        await f.controller.refresh();
+        expect(f.controller.getStatus()).toMatchObject({
+          phase: 'watching',
+          outcome: 'unfinished',
+          checkpoint: 'Newly verified step',
+          nextAction: 'New owner-authorized step',
+        });
+        expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+        expect(f.act).not.toHaveBeenCalled();
+        expect(f.recover).not.toHaveBeenCalled();
+      } finally {
+        f.controller.stop();
+      }
+    }
+  );
+  it('cannot dispatch from the old blocked checkpoint after Resume', async () => {
+    const f = blockedFixture(3, false);
+    try {
+      await f.controller.resume();
+      f.next(undefined, 'completed');
+      await f.controller.refresh();
+      expect(f.controller.getStatus()).toMatchObject({
+        phase: 'paused',
+        outcome: 'unknown',
+        reason: 'task-evidence-unknown',
+      });
+      expect(f.act).not.toHaveBeenCalled();
+      expect(f.recover).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  });
+  it.each([
+    { outcome: 'blocked' },
+    { outcome: 'unknown' },
+    { outcome: 'unfinished', checkpoint: 'Incomplete report' },
+    { outcome: 'completed', verifiedCriteria: ['owner'] },
+  ])('a new veto report after Resume retains attention and cannot certify manual criteria: %j', async (progress) => {
+    const f = blockedFixture();
+    try {
+      await f.controller.resume();
+      await f.controller.refresh();
+      f.next(progress);
+      await f.controller.refresh();
+      expect(f.controller.getStatus().phase).toBe(progress.outcome === 'blocked' ? 'blocked' : 'paused');
+      expect(f.controller.getStatus().agentProgressVeto).toBe(true);
+      expect(f.controller.getStatus().criteria[0].verified).toBe(false);
+      expect(f.act).not.toHaveBeenCalled();
+      expect(f.recover).not.toHaveBeenCalled();
+    } finally {
+      f.controller.stop();
+    }
+  });
+});

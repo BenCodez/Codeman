@@ -3969,7 +3969,11 @@ export class WebServer extends EventEmitter {
       }
 
       for (const muxSession of this.mux.getSessions()) {
-        if (muxSession.mode !== 'codex' || muxSession.codexRestoreStateBinding === undefined) continue;
+        if (
+          getCli(muxSession.mode)?.capabilities.recovery !== 'codex-rollout' ||
+          muxSession.codexRestoreStateBinding === undefined
+        )
+          continue;
         const savedState = this.store.getSession(muxSession.sessionId);
         const nativeBinding = savedState
           ? rebootStateBinding({

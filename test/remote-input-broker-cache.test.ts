@@ -1,8 +1,10 @@
 /** Source-host private cache only, under a disposable HOME; no SSH/tmux/CLI effects. */
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
+import { setTimeout as realTimeout, clearTimeout as clearRealTimeout } from 'node:timers';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CodexInputBroker, type CodexBrokerState } from '../src/recovery/codex-input-broker.js';
 import { OwnedRemoteBrokerCache, type OwnedRemoteBrokerScope } from '../src/recovery/remote-input-broker-cache.js';
@@ -74,6 +76,114 @@ function fixture() {
   };
   return { scope, material, remoteDirectory, cache, file, state, observe, snapshot };
 }
+
+it.each([
+  'write',
+  'sync',
+  'close',
+  'retire',
+  'activate',
+  'replacement',
+  'same-bytes',
+  'symlink',
+  'parent',
+  'sync-error',
+] as const)('retains exact rollback ownership when a private write finishes late: %s', async (fault) => {
+  const f = fixture(),
+    open = fs.open.bind(fs);
+  let release!: () => void, entered!: () => void, finished!: (value: boolean) => void;
+  const blocked = new Promise<void>((resolve) => (release = resolve));
+  const reached = new Promise<void>((resolve) => (entered = resolve));
+  const cleaned = new Promise<boolean>((resolve) => (finished = resolve));
+  const discard = f.cache.discardUnreservedPreparation.bind(f.cache);
+  const discardSpy = vi.spyOn(f.cache, 'discardUnreservedPreparation').mockImplementation(async (...args) => {
+    const completedWrite = (Reflect.get(f.cache, 'preparations') as WeakMap<object, unknown>).has(args[1]);
+    const result = await discard(...args);
+    if (completedWrite) finished(result);
+    return result;
+  });
+  const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const handle = await open(...args);
+    if (args[0] !== f.file || typeof args[1] !== 'number' || !(args[1] & constants.O_CREAT)) return handle;
+    const stage = fault === 'write' ? 'writeFile' : fault === 'sync' || fault === 'sync-error' ? 'sync' : 'close';
+    const original = handle[stage].bind(handle) as (...input: unknown[]) => Promise<unknown>;
+    Reflect.set(handle, stage, async (...input: unknown[]) => {
+      entered();
+      await blocked;
+      const result = await original(...input);
+      if (fault === 'sync-error') throw Object.assign(Error('lost sync ACK'), { code: 'EIO' });
+      if (fault === 'replacement' || fault === 'same-bytes' || fault === 'symlink') {
+        await fs.rename(f.file, f.file + '.owned');
+        if (fault === 'replacement') await fs.writeFile(f.file, 'foreign bytes', { mode: 0o600 });
+        else if (fault === 'same-bytes')
+          await fs.writeFile(f.file, await fs.readFile(f.file + '.owned'), { mode: 0o600 });
+        else await fs.symlink(f.file + '.owned', f.file);
+      }
+      if (fault === 'parent') {
+        const dir = join(root, 'cache', f.scope.sessionId, f.material.config.incarnation);
+        await fs.rename(dir, dir + '.owned');
+        await fs.mkdir(dir, { mode: 0o700 });
+        await fs.writeFile(f.file, 'foreign parent bytes', { mode: 0o600 });
+      }
+      return result;
+    });
+    return handle;
+  });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+  const preparing = f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  let replacement: { incarnation: string; directory: string } | undefined;
+  try {
+    await reached;
+    await vi.advanceTimersByTimeAsync(2001);
+    expect(await preparing).toBeUndefined();
+    expect(f.cache.get(f.scope, f.material.config.incarnation)).toBeUndefined();
+    expect(f.cache.signer(f.scope, f.material.config.incarnation)).toBeUndefined();
+    expect(await f.cache.load(f.scope, f.material.config.incarnation)).toBeUndefined();
+    if (fault === 'retire') f.cache.retire(f.scope.sessionId);
+    if (fault === 'activate') {
+      const next = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec new worker', f.scope.codexHome);
+      replacement = (await f.cache.prepare(
+        f.scope,
+        next,
+        '/remote/private/' + f.scope.sessionId + '/' + next.config.incarnation
+      ))!;
+      expect(replacement).toBeDefined();
+      expect(f.cache.activate(f.scope, next.config.incarnation)).toBe(true);
+    }
+    release();
+    let timer: ReturnType<typeof realTimeout> | undefined;
+    const result = await Promise.race([
+      cleaned,
+      new Promise<string>((resolve) => {
+        timer = realTimeout(() => resolve('cleanup missing'), 2000);
+      }),
+    ]).finally(() => {
+      if (timer) clearRealTimeout(timer);
+    });
+    if (['replacement', 'same-bytes', 'symlink', 'parent'].includes(fault)) {
+      expect(result).toBe(false);
+      const receipts = Reflect.get(f.cache, 'canceledPreparations') as Map<string, unknown>;
+      expect(receipts.size).toBe(1); // Exact rollback proof remains retryable, never silently orphaned.
+      expect(await f.cache.load(f.scope, f.material.config.incarnation)).toBeUndefined();
+      expect(await fs.readFile(f.file, 'utf8')).toContain(
+        ['symlink', 'same-bytes'].includes(fault) ? '"material"' : 'foreign'
+      );
+      expect((await fs.lstat(f.file)).isSymbolicLink()).toBe(fault === 'symlink');
+    } else {
+      expect(result).toBe(true);
+      await expect(fs.lstat(f.file)).rejects.toMatchObject({ code: 'ENOENT' });
+      expect((Reflect.get(f.cache, 'canceledPreparations') as Map<string, unknown>).size).toBe(0);
+    }
+    if (replacement) expect(f.cache.get(f.scope, replacement.incarnation)).toEqual(replacement);
+    expect(f.observe()).toBeUndefined();
+  } finally {
+    release();
+    await preparing;
+    spy.mockRestore();
+    discardSpy.mockRestore();
+    vi.useRealTimers();
+  }
+});
 
 it('retains private launch material and returns only a secret-free reader descriptor', async () => {
   const f = fixture();
