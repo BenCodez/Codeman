@@ -2671,7 +2671,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!)
           : undefined;
 
-      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+      if (localCodex && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
         throw new Error('Owner launch authority changed before native creation');
 
       // Create tmux session in three steps to handle cold-start (no server running)
@@ -2701,6 +2701,36 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         stdio: 'ignore',
         env: cleanEnv,
       });
+      let reservedRegistration: MuxSession | undefined;
+      if (localCodex) {
+        // A confirmed new native shell must remain tracked even when later env
+        // setup/home pinning fails before the worker can be dispatched.
+        reservedRegistration = {
+          ...priorRegistration,
+          sessionId,
+          muxName,
+          pid: 0,
+          recoveryCodexHome,
+          recoveryInputBroker: inputBroker?.incarnation,
+          recoveryIsolated: !!inputBroker,
+          createdAt: priorRegistration?.createdAt ?? Date.now(),
+          workingDir,
+          remote,
+          docker,
+          owner,
+          mode,
+          attached: false,
+          name: name ?? priorRegistration?.name,
+        };
+        this.sessions.set(sessionId, reservedRegistration);
+        if (inputBroker) this.inputBrokers.set(sessionId, inputBroker);
+        this.saveSessions();
+      }
+      const reservationBinding = reservedRegistration && JSON.stringify(reservedRegistration);
+      const registrationCurrent = () =>
+        this.sessions.get(sessionId) === (reservedRegistration ?? priorRegistration) &&
+        (!reservedRegistration || JSON.stringify(reservedRegistration) === reservationBinding) &&
+        ownerCurrent();
       this.resizeWindow(muxName, 120, 40);
 
       // Set remain-on-exit now that the server is running — must be before respawn-pane
@@ -2731,38 +2761,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
       const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
-      if (inputBroker && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+      if (localCodex && !registrationCurrent())
         throw new Error('Owner launch authority changed before native dispatch');
-      let reservedRegistration: MuxSession | undefined;
-      if (inputBroker) {
-        // Save exact ownership before the effect: the process can start even if
-        // the trailing native display-message reply never reaches this caller.
-        reservedRegistration = {
-          ...priorRegistration,
-          sessionId,
-          muxName,
-          pid: 0,
-          recoveryCodexHome,
-          recoveryInputBroker: inputBroker.incarnation,
-          recoveryIsolated: true,
-          createdAt: priorRegistration?.createdAt ?? Date.now(),
-          workingDir,
-          remote,
-          docker,
-          owner,
-          mode,
-          attached: false,
-          name: name ?? priorRegistration?.name,
-        };
-        this.sessions.set(sessionId, reservedRegistration);
-        this.inputBrokers.set(sessionId, inputBroker);
-        this.saveSessions();
-      }
-      const reservationBinding = reservedRegistration && JSON.stringify(reservedRegistration);
-      const registrationCurrent = () =>
-        this.sessions.get(sessionId) === (reservedRegistration ?? priorRegistration) &&
-        (!reservedRegistration || JSON.stringify(reservedRegistration) === reservationBinding) &&
-        ownerCurrent();
       brokerDispatchStarted = true;
       const dispatchOutput = execSync(
         `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${shellescape(launchCmd)}${inputBroker ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
