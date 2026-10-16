@@ -11,6 +11,8 @@ import { clampRecoveryLaunchForOwner } from '../src/session-env-clamp.js';
 import { dataPath } from '../src/config/instance.js';
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 import { WebServer } from '../src/web/server.js';
+import { registerSupervisorRoutes } from '../src/web/routes/supervisor-routes.js';
+import { createRouteTestHarness } from './routes/_route-test-utils.js';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
 import type { MuxSession, RecoveryMuxDispatchGuard, TerminalMultiplexer } from '../src/mux-interface.js';
@@ -444,6 +446,112 @@ describe('manager authority at the real server boundary', () => {
     expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
     expect(prepare).toHaveBeenCalledOnce();
   });
+
+  it.each(['reset', 'current-ready', 'current-uncertain', 'unknown', 'replacement', 'cancelled'] as const)(
+    'handles one confirmed Prepare after %s at the real HTTP boundary',
+    async (kind) => {
+      await manager.pause();
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      let ownerCurrent = true,
+        launches = 0,
+        offset = 0;
+      const now = performance.now();
+      vi.spyOn(performance, 'now').mockImplementation(() => now + offset);
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe),
+        originalObserve = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        if (launches && kind === 'current-uncertain') {
+          offset += 5001;
+          return { ...observation, activity: 'unknown', processReady: false };
+        }
+        return originalObserve.call(this);
+      });
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockImplementation(() =>
+        Session.prototype.captureSupervisorManagerLaunchAuthority.call(managerSession)
+      );
+      const profiles: Array<{ isCurrent(): boolean; revoke: ReturnType<typeof vi.fn> }> = [];
+      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        expect(options.isCurrent()).toBe(true);
+        const profile = { isCurrent: () => true, revoke: vi.fn(async () => true) };
+        profiles.push(profile);
+        Reflect.set(managerSession, '_supervisorManagerProfile', profile);
+        launches++;
+        return true;
+      });
+      const h = await createRouteTestHarness(
+        (app, ctx) =>
+          registerSupervisorRoutes(app, {
+            ...ctx,
+            sessions: internals.sessions,
+            getSupervisorController: (session: Session) => internals.getSupervisorController(session),
+            prepareSupervisorManager: (session: Session, current: () => boolean) =>
+              internals.prepareSupervisorManager(session, () => current() && ownerCurrent),
+          }),
+        { authUser: { username: 'alice', role: 'user' } }
+      );
+      // Real responses carry writableFinished; synthetic injection responses do not.
+      await h.app.listen({ port: 0, host: '127.0.0.1' });
+      const port = (h.app.server.address() as { port: number }).port;
+      const request = async (action = 'prepare-manager') => {
+        const response = await fetch(`http://127.0.0.1:${port}/api/sessions/${MANAGER}/supervisor/${action}`, {
+          method: 'POST',
+          ...(action === 'prepare-manager'
+            ? {
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ confirmRestrictedManager: true }),
+              }
+            : {}),
+        });
+        const body = await response.json();
+        return { statusCode: response.status, json: () => body };
+      };
+      let replacement: { isCurrent(): boolean; revoke: ReturnType<typeof vi.fn> } | undefined;
+      try {
+        const first = await request();
+        expect(first.statusCode).toBe(200);
+        expect(first.json().data).toEqual(
+          kind === 'current-uncertain' ? { managerReady: false, managerInspectionOnly: true } : { managerReady: true }
+        );
+        expect(prepare).toHaveBeenCalledOnce();
+        if (['reset', 'unknown', 'cancelled'].includes(kind)) {
+          const reset = await request('reset');
+          expect(reset.statusCode).toBe(200);
+          expect(profiles[0].revoke).toHaveBeenCalledOnce();
+          expect(managerSession.hasSupervisorManagerLaunch()).toBe(false);
+        }
+        if (kind === 'unknown') observation = { ...observation, activity: 'unknown', processReady: false };
+        if (kind === 'cancelled') ownerCurrent = false;
+        if (kind === 'replacement') {
+          replacement = { isCurrent: () => true, revoke: vi.fn(async () => true) };
+          Reflect.set(managerSession, '_supervisorManagerProfile', replacement);
+        }
+        const second = await request();
+        if (kind === 'reset' || kind === 'current-ready') {
+          expect(second.statusCode).toBe(200);
+          expect(second.json().data).toEqual({ managerReady: true });
+          expect(prepare).toHaveBeenCalledTimes(kind === 'reset' ? 2 : 1);
+          if (kind === 'reset') expect(Reflect.get(managerSession, '_supervisorManagerProfile')).toBe(profiles[1]);
+        } else if (kind === 'current-uncertain') {
+          expect(second.statusCode).toBe(200);
+          expect(second.json().data).toEqual({ managerReady: false, managerInspectionOnly: true });
+          expect(prepare).toHaveBeenCalledOnce();
+        } else {
+          expect(second.statusCode).toBe(400);
+          expect(prepare).toHaveBeenCalledOnce();
+          if (replacement) {
+            expect(Reflect.get(managerSession, '_supervisorManagerProfile')).toBe(replacement);
+            expect(replacement.revoke).not.toHaveBeenCalled();
+          }
+        }
+        expect(taskAct).not.toHaveBeenCalled();
+        expect(recoveryAct).not.toHaveBeenCalled();
+        expect(effects).not.toHaveBeenCalled();
+      } finally {
+        await h.app.close();
+        Reflect.set(managerSession, '_supervisorManagerProfile', undefined);
+      }
+    }
+  );
 
   it('binds inspection authority and retirement to one exact profile, preserving a replacement', async () => {
     const original = {},

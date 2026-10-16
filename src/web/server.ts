@@ -2586,7 +2586,18 @@ export class WebServer extends EventEmitter {
     )
       return false;
     const retained = this.supervisorManagerPreparationChecks.get(session);
-    if (retained) return retained(callerCurrent);
+    if (retained) {
+      const prepared = await retained(callerCurrent);
+      if (
+        prepared !== false ||
+        this.supervisorManagerPreparationChecks.has(session) ||
+        session.hasSupervisorManagerLaunch()
+      )
+        return prepared;
+      // A retired exact launch no longer owns this request. Re-enter all fresh
+      // admission checks; a pending callback or replacement profile never does.
+      return this.prepareSupervisorManager(session, callerCurrent);
+    }
     // Serialize owner preparation/rechecks before their first asynchronous proof.
     const pending = Object.assign(async () => false, { canOperate: () => false });
     this.supervisorManagerPreparationChecks.set(session, pending);

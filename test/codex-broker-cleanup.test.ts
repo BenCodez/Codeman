@@ -395,6 +395,66 @@ it('allows full-window receipt eviction while preserving each retained channel h
   await f.prune();
   expect(await f.exists()).toBe(false);
 });
+it.each([
+  'healthy',
+  'boundary',
+  'wrong-channel',
+  'not-sent',
+  'null',
+  'unknown-field',
+  'missing-field',
+  'boolean',
+  'fraction',
+  'negative',
+  'unsafe',
+  'wall-reversed',
+  'mono-reversed',
+  'too-slow',
+  'clock-jump',
+  'unknown-receipt-field',
+] as const)('validates automatic Enter deliveredAt evidence before retirement: %s', async (kind) => {
+  const f = await fixture();
+  const at: Record<string, unknown> = { wallBefore: 1000, wallAfter: 1010, monoBefore: 2000, monoAfter: 2010 };
+  const receipt: Record<string, unknown> = {
+    channel: 'auto',
+    counter: 1,
+    nonce: randomUUID(),
+    conversationId: randomUUID(),
+    hash: createHash('sha256').update('\r').digest('hex'),
+    status: 'sent',
+    deliveredAt: at,
+  };
+  f.state.counters.auto = 1;
+  if (kind === 'boundary') Object.assign(at, { wallAfter: 1500, monoAfter: 2600 });
+  if (kind === 'wrong-channel') {
+    receipt.channel = 'owner-pty';
+    f.state.counters.auto = 0;
+    f.state.counters['owner-pty'] = 1;
+  }
+  if (kind === 'not-sent') receipt.status = 'not-sent';
+  if (kind === 'null') receipt.deliveredAt = null;
+  if (kind === 'unknown-field') at.unknown = 1;
+  if (kind === 'missing-field') delete at.monoBefore;
+  if (kind === 'boolean') at.wallBefore = true;
+  if (kind === 'fraction') at.wallBefore = 1000.5;
+  if (kind === 'negative') at.wallBefore = -1;
+  if (kind === 'unsafe') at.wallAfter = Number.MAX_SAFE_INTEGER + 1;
+  if (kind === 'wall-reversed') at.wallAfter = 999;
+  if (kind === 'mono-reversed') at.monoAfter = 1999;
+  if (kind === 'too-slow') Object.assign(at, { wallAfter: 1501, monoAfter: 2501 });
+  if (kind === 'clock-jump') at.monoAfter = 2111;
+  if (kind === 'unknown-receipt-field') receipt.unknown = true;
+  f.state.receipts = [receipt];
+  await f.save();
+  const paths = ['config.json', 'state.json', 'broker.py'];
+  const before = await Promise.all(paths.map((path) => fs.readFile(join(f.broker.directory, path))));
+  await f.prune();
+  const retired = kind === 'healthy' || kind === 'boundary';
+  expect(await f.exists()).toBe(!retired);
+  if (!retired) {
+    expect(await Promise.all(paths.map((path) => fs.readFile(join(f.broker.directory, path))))).toEqual(before);
+  }
+});
 it('resumes only a private certified retirement tombstone after an interrupted exact-file deletion', async () => {
   const f = await fixture();
   const transport = ((command: string, args: readonly string[], options: Parameters<typeof spawn>[2]) =>
