@@ -205,6 +205,9 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
               return;
             }
+            // Cached local-worker exits require no tmux probe on the input hot
+            // path. Retain the FIFO identity without dispatch, owner intent or ACK.
+            if (cid && seq !== null && session.paneExit) return;
             // A rejected frame must not claim a delivery identity. Otherwise a
             // burst during recovery can manufacture a watermark for lost bytes.
             if (session.recoveryInputReserved) return;
@@ -229,8 +232,11 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               // burnt, so the retry that reliable delivery exists for was rejected as
               // a duplicate: the input was lost for good.
               if (!delivered && cid && seq !== null) session.forgetInputSeq(cid, seq);
-              if (delivered && cid && seq !== null) session.commitInputSeq(cid, seq);
+              if (delivered && cid && seq !== null && !session.paneExit) session.commitInputSeq(cid, seq);
             }
+            // An exit observed during a dispatch cannot acknowledge delivery.
+            // Session keeps any attempted/uncertain bytes sealed against replay.
+            if (cid && seq !== null && session.paneExit) return;
             if (seq !== null && socket.readyState === 1) {
               if (apply) {
                 if (delivered) socket.send(`{"t":"ia","seq":${seq}}`);
