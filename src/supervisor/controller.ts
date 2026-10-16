@@ -54,7 +54,7 @@ export interface SupervisorWorkerHandle {
 }
 export interface SupervisorDependencies {
   /** Eligibility refusals are validation errors; operational failures must retain their type. */
-  validateWorkers(ids: readonly string[]): void;
+  validateWorkers(ids: readonly string[]): void | Promise<void>;
   worker(id: string): SupervisorWorkerHandle | undefined;
   persist(state: SupervisorState): Promise<void>;
   withLeases<T>(fn: () => Promise<T>): Promise<T>;
@@ -196,7 +196,9 @@ export class SupervisorController {
           if (this.state.inFlight)
             throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
           if (config.enabled) {
-            this.deps.validateWorkers(config.workers.map((w) => w.sessionId));
+            await this.deps.validateWorkers(config.workers.map((w) => w.sessionId));
+            if (this.stopped || this.revision !== revision)
+              throw new SupervisorValidationError('Supervisor action was superseded');
             if (this.deps.leaseHolder(this.state.supervisorSessionId, this.state.supervisorSessionId))
               throw new SupervisorValidationError('A worker cannot become a supervisor');
             for (const worker of config.workers) {
@@ -233,7 +235,9 @@ export class SupervisorController {
         if (this.state.phase === 'active') throw new SupervisorValidationError('Supervisor is already active');
         if (this.state.inFlight)
           throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
-        this.deps.validateWorkers(this.state.workers.map((w) => w.sessionId));
+        await this.deps.validateWorkers(this.state.workers.map((w) => w.sessionId));
+        if (this.stopped || this.revision !== revision)
+          throw new SupervisorValidationError('Supervisor action was superseded');
         if (this.deps.leaseHolder(this.state.supervisorSessionId, this.state.supervisorSessionId))
           throw new SupervisorValidationError('A worker cannot become a supervisor');
         for (const worker of this.state.workers) {
@@ -249,7 +253,8 @@ export class SupervisorController {
             this.revision === revision &&
             this.hasRuntimeBudget(runtimeStartedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS);
           if (!isCurrent()) throw new SupervisorOperationRefused('Manager start was cancelled');
-          this.deps.validateWorkers(this.state.workers.map((worker) => worker.sessionId));
+          await this.deps.validateWorkers(this.state.workers.map((worker) => worker.sessionId));
+          if (!isCurrent()) throw new SupervisorOperationRefused('Manager start was cancelled');
           if (!(await this.deps.startManager(this.state.objective, this.state.workers, isCurrent, runtimeStartedAt)))
             throw new SupervisorOperationRefused('Manager conversation is not ready for task kickoff');
         } catch (error) {
@@ -739,7 +744,7 @@ export class SupervisorController {
         await requireManagerAuthority();
         requireCurrent();
         try {
-          this.deps.validateWorkers([workerId]);
+          await this.deps.validateWorkers([workerId]);
         } catch (error) {
           if (error instanceof SupervisorValidationError)
             throw new SupervisorOperationRefused('Worker eligibility changed');

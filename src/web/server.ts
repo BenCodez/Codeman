@@ -171,6 +171,7 @@ import { initialTaskState, TaskStateSchema, type TaskState } from '../supervisio
 import { CodexTaskAdapter } from '../supervision/adapter.js';
 import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
+import { haveDistinctSupervisorHomes } from '../supervisor/home-identity.js';
 import { ManagerCredentialRegistry } from '../supervisor/manager-credentials.js';
 import { drainSupervisorManagerRetirements } from '../supervisor/manager-launch.js';
 import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
@@ -2908,6 +2909,42 @@ export class WebServer extends EventEmitter {
       if (!accepted && managerEvidence === expected) managerEvidence = undefined;
       return accepted;
     };
+    const validateWorkerHomes = async (workers: readonly Session[]) => {
+      const deadline = performance.now() + 2_000;
+      const scope = managerScope();
+      const managerHome = session.getRecoveryContext().codexHome;
+      for (const worker of workers) {
+        // An owned SSH worker has a separate filesystem namespace.
+        if (worker.remote) continue;
+        const home = worker.getRecoveryContext().codexHome;
+        const workerScope = JSON.stringify([
+          worker.owner,
+          worker.codexConfig,
+          worker.getEnvOverridesForPersist(),
+          worker.getRecoveryContext(),
+        ]);
+        const current = () =>
+          !this.recoveryStopping &&
+          !this.cleaningUp.has(session.id) &&
+          !this.cleaningUp.has(worker.id) &&
+          this.sessions.get(session.id) === session &&
+          this.sessions.get(worker.id) === worker &&
+          managerIsEligible() &&
+          managerScope() === scope &&
+          !worker.remote &&
+          worker.owner === session.owner &&
+          JSON.stringify([
+            worker.owner,
+            worker.codexConfig,
+            worker.getEnvOverridesForPersist(),
+            worker.getRecoveryContext(),
+          ]) === workerScope;
+        if (!(await haveDistinctSupervisorHomes(managerHome, home, current, deadline)))
+          throw new SupervisorValidationError(
+            'Local manager and worker require verified distinct Codex homes for independent history'
+          );
+      }
+    };
     const prepareManagerAuthority = async (
       workerId: string,
       source?: import('../recovery/types.js').RecoveryEvidenceSource
@@ -2943,11 +2980,18 @@ export class WebServer extends EventEmitter {
               isRecoveryEvidenceSourceCurrent(source))
         );
       };
+      if (!currentWorker()) return false;
+      try {
+        await validateWorkerHomes([worker]);
+      } catch {
+        return false;
+      }
       return currentWorker() && (await confirmManagerEvidence(source)) && currentWorker();
     };
     const controller = new SupervisorController(
       {
         validateWorkers: (ids) => {
+          const workers: Session[] = [];
           for (const id of ids) {
             const worker = this.sessions.get(id);
             if (
@@ -2967,11 +3011,9 @@ export class WebServer extends EventEmitter {
             // manager role is released. Neither state can hide the other's role.
             if (this.supervisorControllers.get(id)?.getStatus().enabled || this.supervisorStore.get(id).enabled)
               throw new SupervisorValidationError('Supervisor cycles are not allowed');
-            if (!worker.remote && worker.getRecoveryContext().codexHome === session.getRecoveryContext().codexHome)
-              throw new SupervisorValidationError(
-                'Local manager and worker require distinct Codex homes for independent history'
-              );
+            workers.push(worker);
           }
+          return validateWorkerHomes(workers);
         },
         worker: (id) => {
           const worker = this.sessions.get(id);

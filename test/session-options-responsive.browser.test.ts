@@ -252,6 +252,11 @@ describe('Session Options responsive layout in Chromium', () => {
       }, original);
       expect(await page.locator('#taskOwnerAuthNotice').isVisible()).toBe(true);
       expect(await page.locator('#taskOwnerAuthNotice').textContent()).toContain('Sign in with Codeman authentication');
+      await page.addScriptTag({ content: readFileSync(resolve(publicDir, 'i18n.js'), 'utf8') });
+      await page.evaluate(() => (window as any).CodemanI18n.configure({ language: 'zh-CN' }));
+      expect(await page.locator('#taskOwnerAuthNotice').textContent()).toContain('请通过 Codeman 身份验证登录');
+      await page.evaluate(() => (window as any).CodemanI18n.configure({ language: 'en' }));
+      expect(await page.locator('#taskOwnerAuthNotice').textContent()).toContain('Sign in with Codeman authentication');
       const rows = page.locator('#taskCriteriaRows > [data-task-criterion-row]');
       await expect.poll(() => rows.count()).toBe(3);
       expect(await rows.first().locator('[data-task-field="command"]').inputValue()).toBe(exact.replace(/\r\n/g, '\n'));
@@ -558,6 +563,7 @@ describe('Session Options responsive layout in Chromium', () => {
     });
     await page.getByRole('button', { name: 'Save task configuration', exact: true }).click();
     await expect.poll(() => page.evaluate(() => (window as any).taskRequests.length)).toBe(4);
+    await expect.poll(() => page.evaluate(() => (window as any).app._taskView.busy)).toBe(false);
     const requests = await page.evaluate(() => (window as any).taskRequests);
     expect(requests.slice(0, 3).map((request: any) => request.body)).toEqual([null, null, null]);
     expect(requests[3].body).toMatchObject({
@@ -569,15 +575,20 @@ describe('Session Options responsive layout in Chromium', () => {
     await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(true);
     expect(await page.locator('#taskCheckpoint').inputValue()).toBe(draft.checkpoint);
     expect(await page.locator('#taskNextAction').inputValue()).toBe(draft.nextAction);
-    expect(await page.locator('#taskCriteriaEvidence input').first().isChecked()).toBe(true);
+    expect(await page.locator('#taskCriteriaEvidence input').first().isChecked()).toBe(false);
     await page.getByRole('button', { name: 'Save checkpoint / verification', exact: true }).click();
     await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
     const progress = await page.evaluate(() => (window as any).taskRequests[4]);
     expect(progress.body).toMatchObject({
       checkpoint: draft.checkpoint,
       nextAction: draft.nextAction,
-      verifiedCriteria: ['manual'],
+      verifiedCriteria: [],
     });
+    // An owner can certify the replacement only by selecting its newly rendered check.
+    await page.locator('#taskCriteriaEvidence input').first().check();
+    await page.getByRole('button', { name: 'Save checkpoint / verification', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).taskRequests.length)).toBe(6);
+    expect(await page.evaluate(() => (window as any).taskRequests[5].body.verifiedCriteria)).toEqual(['manual']);
     await page.evaluate(() => (window as any).app.closeTaskOptions());
   });
   it.each([390, 1280])('preserves original and edited checkpoint whitespace at %spx', async (width) => {
@@ -806,7 +817,7 @@ describe('Session Options responsive layout in Chromium', () => {
         expect(await page.locator('#taskCriteriaRows textarea').inputValue()).toBe('Latest server owner criterion');
         expect(await page.locator('#taskMaxContinuations').inputValue()).toBe('7');
         expect(await page.locator('#taskCheckpoint').inputValue()).toBe('Unsaved owner checkpoint');
-        expect(await page.locator('#taskCriteriaEvidence input').isChecked()).toBe(true);
+        expect(await page.locator('#taskCriteriaEvidence input').isChecked()).toBe(false);
         await page.getByRole('button', { name: 'Save task configuration', exact: true }).click();
       }
       await expect.poll(() => page.evaluate(() => (window as any).writes.length)).toBe(1);

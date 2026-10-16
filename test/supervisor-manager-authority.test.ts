@@ -85,6 +85,8 @@ async function fakeSession(id: string, conversationId: string): Promise<Session>
     pid: 99999,
     createdAt: Date.now(),
   } as MuxSession;
+  // Real directory identity, isolated under the suite's temporary HOME.
+  await fs.mkdir(muxSession.recoveryCodexHome!, { recursive: true, mode: 0o700 });
   const inputProof = fakeInputProvenance({ brokerPid: 99999, childPid: 100000 }, muxSession.recoveryCodexHome);
   let probeSequence = 0;
   const session = new Session({
@@ -1194,8 +1196,10 @@ describe('manager authority at the real server boundary', () => {
         sandbox: 'danger-full-access',
         approvalPolicy: 'never',
       });
-    if (['healthy-custom-home', 'home-revoked'].includes(kind))
+    if (['healthy-custom-home', 'home-revoked'].includes(kind)) {
       Reflect.get(managerSession, '_muxSession').recoveryCodexHome = join(grantDirectory, 'owned-home');
+      await fs.mkdir(join(grantDirectory, 'owned-home'));
+    }
     await manager.pause();
     await manager.start();
     taskAct.mockClear();
@@ -1569,6 +1573,67 @@ describe('manager authority at the real server boundary', () => {
     });
     expect(internals.supervisorStore.get(MANAGER)).toEqual(paused);
     expect(managerTask.getStatus()).toMatchObject({ phase: 'paused', reason: 'owner-paused' });
+    expect(effects).not.toHaveBeenCalled();
+  });
+
+  it.each(['direct-alias', 'ancestor-alias', 'missing', 'independent'] as const)(
+    'requires verified independent local history directories (%s)',
+    async (kind) => {
+      const worker = internals.sessions.get(WORKER)!;
+      const home = managerSession.getRecoveryContext().codexHome!;
+      const candidate = join(fixtureData, 'candidate-home');
+      if (kind === 'direct-alias') await fs.symlink(home, candidate);
+      if (kind === 'ancestor-alias') {
+        await fs.symlink(dirname(home), candidate);
+      }
+      if (kind === 'independent') await fs.mkdir(candidate);
+      Reflect.get(worker, '_muxSession').recoveryCodexHome =
+        kind === 'ancestor-alias' ? join(candidate, home.split('/').at(-1)!) : candidate;
+      if (kind === 'independent') {
+        await expect(manager.configure(config)).resolves.toMatchObject({ phase: 'ready' });
+      } else {
+        await expect(manager.configure(config)).rejects.toThrow(/verified distinct Codex homes/);
+        expect(manager.getStatus().phase).toBe('paused');
+      }
+      expect(effects).not.toHaveBeenCalled();
+    }
+  );
+
+  it('rechecks a history alias introduced after configuration before granting an action', async () => {
+    expect(await managerDeps.validateManagerAuthority()).toBe(true);
+    const worker = internals.sessions.get(WORKER)!;
+    const alias = join(fixtureData, 'late-history-alias');
+    await fs.symlink(managerSession.getRecoveryContext().codexHome!, alias);
+    Reflect.get(worker, '_muxSession').recoveryCodexHome = alias;
+    await expect(manager.assign(WORKER, 'alias-worker-request')).rejects.toThrow();
+    expect(taskAct).not.toHaveBeenCalled();
+    expect(recoveryAct).not.toHaveBeenCalled();
+    expect(effects).not.toHaveBeenCalled();
+  });
+
+  it('does not grant a worker lease when owner pause supersedes a held directory proof', async () => {
+    const entered = createDeferred<void>();
+    const release = createDeferred<void>();
+    const home = managerSession.getRecoveryContext().codexHome!;
+    const realpath = fs.realpath.bind(fs);
+    let held = false;
+    vi.spyOn(fs, 'realpath').mockImplementation(async (path) => {
+      const result = await realpath(path);
+      if (path === home && !held) {
+        held = true;
+        entered.resolve();
+        await release.promise;
+      }
+      return result;
+    });
+    const replacement = manager.configure({ ...config, objective: 'Superseded owner objective' });
+    const refused = expect(replacement).rejects.toThrow(/superseded/);
+    await entered.promise;
+    const pause = manager.pause();
+    release.resolve();
+    await refused;
+    await pause;
+    expect(manager.getStatus()).toMatchObject({ phase: 'paused', objective: config.objective });
     expect(effects).not.toHaveBeenCalled();
   });
 

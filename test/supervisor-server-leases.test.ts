@@ -1,6 +1,6 @@
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 import { join, dirname } from 'node:path';
-import { readFile, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, mkdtemp, rm, mkdir } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dataPath } from '../src/config/instance.js';
 import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
@@ -70,6 +70,7 @@ async function session(id: string): Promise<Session> {
     pid: 99999,
     createdAt: Date.now(),
   } as MuxSession;
+  await mkdir(muxSession.recoveryCodexHome!, { recursive: true, mode: 0o700 });
   const mux = {
     isAvailable: () => true,
     getSession: () => muxSession,
