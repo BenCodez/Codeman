@@ -130,16 +130,52 @@ type PendingRollback = {
   spawn?: typeof spawn;
   retry: boolean;
   attempts: number;
+  nextRetryAt: number;
   work?: Promise<boolean>;
-  timer?: ReturnType<typeof setTimeout>;
 };
-// Retain exhausted/uncertain receipts rather than evicting their ownership proof.
-// Each admitted receipt gets at most three attempts; an explicit call can retry
-// the same receipt later. The janitor still rechecks every file and native veto.
+// Keep exact ownership proof until deletion is positively acknowledged. One
+// unref'ed sweep admits at most two retries per tick and rotates serviced entries
+// behind their peers; unavailable helpers back off rather than becoming inert.
 const pendingRollbacks = new Map<string, PendingRollback>();
+const ROLLBACK_RETRY_MIN_MS = 2_100;
+const ROLLBACK_RETRY_MAX_MS = 60_000;
+let rollbackSweep: ReturnType<typeof setTimeout> | undefined;
+let rollbackSweepAt = Infinity;
+function scheduleRollbackSweep(): void {
+  let next = Infinity;
+  for (const pending of pendingRollbacks.values()) {
+    if (pending.retry && !pending.work) next = Math.min(next, pending.nextRetryAt);
+  }
+  if (!Number.isFinite(next)) {
+    if (rollbackSweep) clearTimeout(rollbackSweep);
+    rollbackSweep = undefined;
+    rollbackSweepAt = Infinity;
+    return;
+  }
+  const now = performance.now();
+  const at = Math.max(next, now + ROLLBACK_RETRY_MIN_MS);
+  if (rollbackSweep && rollbackSweepAt <= at) return;
+  if (rollbackSweep) clearTimeout(rollbackSweep);
+  rollbackSweepAt = at;
+  rollbackSweep = setTimeout(() => {
+    rollbackSweep = undefined;
+    rollbackSweepAt = Infinity;
+    const due = performance.now();
+    let admitted = 0;
+    for (const [key, pending] of [...pendingRollbacks]) {
+      if (!pending.retry || pending.work || pending.nextRetryAt > due) continue;
+      pendingRollbacks.delete(key);
+      pendingRollbacks.set(key, pending);
+      void attemptRollback(key, pending);
+      if (++admitted === 2) break;
+    }
+    scheduleRollbackSweep();
+  }, at - now);
+  rollbackSweep.unref?.();
+}
 function attemptRollback(key: string, pending: PendingRollback): Promise<boolean> {
   if (pending.work) return pending.work;
-  pending.attempts++;
+  pending.attempts = Math.min(pending.attempts + 1, 6);
   const request = pending.receipt;
   const work = runBrokerCleanup(
     { rollback: request },
@@ -154,14 +190,10 @@ function attemptRollback(key: string, pending: PendingRollback): Promise<boolean
     .then((removed) => {
       pending.work = undefined;
       if (removed) pendingRollbacks.delete(key);
-      else if (pending.retry && pending.attempts < 3) {
-        // Let the existing two-second helper deadline release a saturated slot.
-        pending.timer = setTimeout(() => {
-          pending.timer = undefined;
-          void attemptRollback(key, pending);
-        }, 2_100);
-        pending.timer.unref?.();
-      }
+      else
+        pending.nextRetryAt =
+          performance.now() + Math.min(ROLLBACK_RETRY_MAX_MS, ROLLBACK_RETRY_MIN_MS * 2 ** (pending.attempts - 1));
+      scheduleRollbackSweep();
       return removed;
     });
   pending.work = work;
@@ -179,17 +211,18 @@ export async function rollbackCodexBrokerProvisioning(
   let pending = pendingRollbacks.get(key);
   if (!pending) {
     if (pendingRollbacks.size >= 256) return false;
-    pending = { receipt: structuredClone(receipt), spawn: testSpawn, retry: testRetry, attempts: 0 };
+    pending = {
+      receipt: structuredClone(receipt),
+      spawn: testSpawn,
+      retry: testRetry,
+      attempts: 0,
+      nextRetryAt: Infinity,
+    };
     pendingRollbacks.set(key, pending);
   } else {
     if (pending.work) return pending.work;
     pending.spawn = testSpawn;
     pending.retry = testRetry;
-    if (pending.timer) {
-      clearTimeout(pending.timer);
-      pending.timer = undefined;
-    }
-    if (pending.attempts >= 3) pending.attempts = 0;
   }
   return attemptRollback(key, pending);
 }

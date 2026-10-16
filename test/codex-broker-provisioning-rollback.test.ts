@@ -110,7 +110,7 @@ it('retries an exact capacity-refused receipt after other janitors release their
   const f = await fixture();
   f.fail('none');
   const [first, second, pending] = [await f.create(), await f.create(), await f.create()];
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
   const held = [fakeJanitor('hold'), fakeJanitor('hold')];
   let index = 0;
   hooks.transport = (() => held[index++]) as unknown as typeof spawn;
@@ -139,11 +139,11 @@ it('retries an exact capacity-refused receipt after other janitors release their
   expect(Reflect.get(pending, 'unlaunchedRollback')).toBeUndefined();
 });
 
-it('bounds automatic retries while retaining the receipt for a later explicit retry', async () => {
+it('backs off automatic retries while retaining the receipt for a later explicit retry', async () => {
   const f = await fixture();
   f.fail('none');
   const broker = await f.create();
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
   const unavailable = vi.fn(() => {
     throw Error('fixture persistent spawn failure');
   });
@@ -151,7 +151,7 @@ it('bounds automatic retries while retaining the receipt for a later explicit re
   hooks.retry = true;
   await broker.rollbackUnlaunchedProvisioning();
   await vi.advanceTimersByTimeAsync(20_000);
-  expect(unavailable).toHaveBeenCalledTimes(3);
+  expect(unavailable).toHaveBeenCalledTimes(4);
   expect(Reflect.get(broker, 'unlaunchedRollback')).toBeDefined();
   hooks.transport = undefined;
   await broker.rollbackUnlaunchedProvisioning();
