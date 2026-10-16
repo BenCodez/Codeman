@@ -3272,6 +3272,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         }
       }
 
+      if (workspaceLaunch?.confirmStartup) {
+        if (!(await workspaceLaunch.confirmStartup(inputBroker ? undefined : pid)))
+          throw new Error('Reboot workspace startup acknowledgment unavailable');
+        const currentPane =
+          restorePane &&
+          execSync(
+            `${this.tmux()} display-message -p -t ${shellescape(restorePane.paneId)} '#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}'`,
+            {
+              timeout: Math.max(1, Math.min(EXEC_TIMEOUT_MS, Math.floor(workspaceLaunch.remainingStartupMs?.() ?? 1))),
+              encoding: 'utf8',
+              maxBuffer: 1024,
+            }
+          );
+        if (
+          !restorePane ||
+          currentPane !== `${restorePane.sessionNativeId}|${restorePane.paneId}|${pid}|${restorePane.serverPid}|0\n` ||
+          !workspaceLaunch.isCurrent() ||
+          !ownerCurrent() ||
+          (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
+        )
+          throw new Error('Reboot launch authority changed before startup acknowledgment');
+      }
       if (options.restoreGuard) {
         this.sessions.set(sessionId, session);
         reservedRestoreRecord = session;
