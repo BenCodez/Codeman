@@ -82,7 +82,11 @@ const MAX_REBOOT_SNAPSHOT_ATTEMPTS = 3;
 /** Only a verified concurrent snapshot change permits restaging, never an I/O error. */
 class RebootSnapshotChanged extends Error {}
 
-/** Output accounting may restage; every owner/launch/identity field remains an authority anchor. */
+/**
+ * Session.toState() output accounting and CLI display reports may restage.
+ * Their launch/config counterparts, identity, owner intent and unknown fields
+ * remain authority anchors; a reported model never changes the requested model.
+ */
 function rebootRecordAuthorityJson(record: AppState['sessions'][string]): string {
   return JSON.stringify({
     ...record,
@@ -91,6 +95,12 @@ function rebootRecordAuthorityJson(record: AppState['sessions'][string]): string
     inputTokens: undefined,
     outputTokens: undefined,
     totalCost: undefined,
+    cliMouseTracking: undefined,
+    cliVersion: undefined,
+    cliModel: undefined,
+    cliAccountType: undefined,
+    cliLatestVersion: undefined,
+    displayModel: undefined,
   });
 }
 

@@ -1,5 +1,9 @@
-/** Owner completion retains receipt observation without granting another dispatch. */
+/** @fileoverview Owner completion retains receipt observation without granting another dispatch. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { TaskStore, taskJournalHasOwnership, type TaskSaveAuthority } from '../src/supervision/store.js';
 import { TaskController, type TaskObservation } from '../src/supervision/controller.js';
 import { SessionActionArbiter } from '../src/supervision/action-arbiter.js';
 import { type TaskState } from '../src/supervision/schema.js';
@@ -7,17 +11,23 @@ import { createDeferred } from './mocks/index.js';
 
 const THREAD = '11111111-2222-4333-8444-555555555555';
 const controllers: TaskController[] = [];
+const roots: string[] = [];
+const SID = 'completed-worker';
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(10_000);
 });
-afterEach(() => {
-  for (const controller of controllers.splice(0)) controller.stop();
+afterEach(async () => {
+  for (const controller of controllers.splice(0)) {
+    controller.stop();
+    await controller.drain();
+  }
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
   vi.restoreAllMocks();
   vi.useRealTimers();
 });
 
-async function pending(kind: 'kickoff' | 'continuation' = 'kickoff') {
+async function pending(kind: 'kickoff' | 'continuation' = 'kickoff', store?: TaskStore, ownerComplete = true) {
   let observation: TaskObservation = {
     observation: {
       conversationId: THREAD,
@@ -36,7 +46,8 @@ async function pending(kind: 'kickoff' | 'continuation' = 'kickoff') {
   const arbiter = new SessionActionArbiter(async (key) => {
     common = key;
   });
-  const persist = vi.fn(async (state: TaskState) => {
+  const persist = vi.fn(async (state: TaskState, authority?: TaskSaveAuthority) => {
+    if (store) await store.save(SID, state, authority);
     durable = structuredClone(state);
   });
   const observe = vi.fn(async () => observation);
@@ -74,8 +85,10 @@ async function pending(kind: 'kickoff' | 'continuation' = 'kickoff') {
   expect(flight).toBeDefined();
   expect(common).toBeDefined();
   set({ activity: 'working', submissionHash: 'not-the-reserved-prompt', submissionKey: 'unaccepted' });
-  await controller.progress({ outcome: 'completed', verifiedCriteria: ['review'] });
-  expect(controller.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed', inFlight: flight });
+  if (ownerComplete) {
+    await controller.progress({ outcome: 'completed', verifiedCriteria: ['review'] });
+    expect(controller.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed', inFlight: flight });
+  }
   observe.mockClear();
   accept.mockClear();
   return {
@@ -241,4 +254,100 @@ it('withdraws a held receipt observation on stop and schedules no more work', as
   expect(f.observe).toHaveBeenCalledOnce();
   expect(f.accept).not.toHaveBeenCalled();
   expect(f.common).toBeDefined();
+});
+
+async function durablePending(kind: 'kickoff' | 'continuation', ownerComplete = true) {
+  const root = await mkdtemp(join(tmpdir(), 'task-completed-reload-'));
+  roots.push(root);
+  const path = join(root, 'tasks.json'),
+    store = new TaskStore(path);
+  return Object.assign(await pending(kind, store, ownerComplete), { path });
+}
+function reload(f: Awaited<ReturnType<typeof durablePending>>) {
+  f.controller.stop();
+  const restored = new TaskStore(f.path).get(SID);
+  const controller = new TaskController(
+    {
+      observe: f.observe,
+      act: f.act,
+      recover: f.recover,
+      persist: f.persist,
+      changed: () => {},
+      acceptReservation: f.accept,
+    },
+    restored
+  );
+  controllers.push(controller);
+  return controller;
+}
+it.each(['kickoff', 'continuation'] as const)(
+  'a durably owner-completed %s remains terminal through reload, uncertain polling and exact receipt settlement',
+  async (kind) => {
+    const f = await durablePending(kind),
+      before = f.controller.getStatus(),
+      effects = f.act.mock.calls.length;
+    expect(new TaskStore(f.path).get(SID)).toMatchObject({
+      phase: 'completed',
+      outcome: 'completed',
+      inFlight: f.flight,
+    });
+    const restored = reload(f);
+    expect(restored.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed', inFlight: f.flight });
+    await vi.advanceTimersByTimeAsync(5000);
+    await restored.drain();
+    expect(restored.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed', inFlight: f.flight });
+    expect(f.accept).not.toHaveBeenCalled();
+    expect(f.common).toBeDefined();
+    f.proof();
+    await vi.advanceTimersByTimeAsync(5000);
+    await restored.drain();
+    const durable = new TaskStore(f.path).get(SID);
+    expect(durable).toMatchObject({
+      phase: 'completed',
+      outcome: 'completed',
+      criteria: before.criteria,
+      continuations: before.continuations,
+      kickoffAt: before.kickoffAt,
+    });
+    expect(durable.inFlight).toBeUndefined();
+    expect(f.common).toBeUndefined();
+    expect(taskJournalHasOwnership(durable)).toBe(false);
+    expect(f.act).toHaveBeenCalledTimes(effects);
+    expect(f.recover).not.toHaveBeenCalled();
+    const observations = f.observe.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(f.observe).toHaveBeenCalledTimes(observations);
+  }
+);
+it.each(
+  (['kickoff', 'continuation'] as const).flatMap((kind) =>
+    (['unfinished', 'owner-input', 'unknown'] as const).map((veto) => ({ kind, veto }))
+  )
+)('reload preserves the $veto veto while settling only a $kind receipt', async ({ kind, veto }) => {
+  const f = await durablePending(kind, veto !== 'unfinished');
+  if (veto === 'owner-input') {
+    f.controller.noteUserInput();
+    await f.controller.drain();
+  }
+  if (veto === 'unknown') await f.controller.progress({ outcome: 'unknown' });
+  const before = f.controller.getStatus(),
+    effects = f.act.mock.calls.length;
+  const restored = reload(f);
+  expect(restored.getStatus().phase).toBe('paused');
+  if (veto === 'unknown') expect(restored.getStatus().agentProgressVeto).toBe(true);
+  f.proof();
+  await vi.advanceTimersByTimeAsync(5000);
+  await restored.drain();
+  const durable = new TaskStore(f.path).get(SID);
+  expect(durable).toMatchObject({
+    phase: 'paused',
+    outcome: before.outcome,
+    criteria: before.criteria,
+    config: before.config,
+  });
+  expect(durable.agentProgressVeto).toBe(before.agentProgressVeto);
+  expect(durable.inFlight).toBeUndefined();
+  expect(taskJournalHasOwnership(durable)).toBe(true);
+  expect(f.act).toHaveBeenCalledTimes(effects);
+  expect(f.recover).not.toHaveBeenCalled();
 });
