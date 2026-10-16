@@ -21,6 +21,8 @@ import type { SessionState } from '../src/types.js';
 import { fakeInputProvenance } from './helpers/codex-input-provenance.js';
 import { rebootStateBinding } from '../src/recovery/reboot-state-binding.js';
 import { createUser, updateUser, invalidateUsersCache } from '../src/user-store.js';
+import { getCli, reloadCliRegistry } from '../src/config/cli-registry/registry.js';
+import { captureRebootBrokerBindings } from '../src/recovery/reboot-launch-witness.js';
 
 const effects = vi.hoisted(() => ({
   sync: vi.fn(),
@@ -2264,4 +2266,224 @@ describe('boot inspection does not restart uncertain automation', () => {
       ).toBe(false);
     }
   );
+});
+
+describe('registered Codex-compatible live-pane restart configuration', () => {
+  beforeEach(() => {
+    const codex = getCli('codex')!;
+    writeFileSync(
+      join(root, 'clis.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        clis: {
+          'restart-codex': { ...codex, id: 'restart-codex', label: 'Restart Codex', order: 990 },
+          'restart-capability-only': {
+            ...codex,
+            id: 'restart-capability-only',
+            label: 'Capability only',
+            order: 991,
+            launch: { ...codex.launch, legacyConfigField: undefined },
+            capabilities: { ...codex.capabilities, launchDefaults: undefined },
+          },
+          'restart-config-only': {
+            ...codex,
+            id: 'restart-config-only',
+            label: 'Config only',
+            order: 992,
+            capabilities: { ...codex.capabilities, recovery: undefined },
+          },
+          'restart-unrelated': {
+            ...codex,
+            id: 'restart-unrelated',
+            label: 'Unrelated CLI',
+            order: 993,
+            launch: { ...codex.launch, legacyConfigField: undefined },
+            capabilities: { ...codex.capabilities, recovery: undefined, launchDefaults: undefined },
+          },
+        },
+      }),
+      { mode: 0o600 }
+    );
+    reloadCliRegistry();
+  });
+  afterEach(() => {
+    rmSync(join(root, 'clis.json'), { force: true });
+    reloadCliRegistry();
+  });
+
+  async function restartFixture(
+    mode: string,
+    savedPatch: Partial<SessionState> = {},
+    nativePatch: Partial<MuxSession> = {}
+  ) {
+    const { manager } = fixture();
+    const home = join(root, `restart-home-${randomUUID()}`);
+    mkdirSync(home);
+    const launchConfig = { ...config, reasoningEffort: 'high' as const, noAltScreen: true, animations: false };
+    const record: MuxSession = {
+      sessionId: ID,
+      muxName: 'codeman-aaaaaaaa',
+      pid: 700,
+      createdAt: Date.now() - 60_000,
+      workingDir: root,
+      owner: 'fixture-owner',
+      mode,
+      attached: false,
+      recoveryIsolated: true,
+      recoveryCodexHome: home,
+      ...nativePatch,
+    };
+    manager.registerSession(record);
+    await manager.flushSessionsDurably();
+    vi.spyOn(manager, 'reconcileSessions').mockResolvedValue({ alive: [ID], dead: [], discovered: [] });
+    vi.spyOn(manager, 'muxSessionExists').mockReturnValue(true);
+    vi.spyOn(manager, 'isPaneDead').mockReturnValue(false);
+    vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+    const server = new WebServer(0, false, true);
+    servers.push(server);
+    Reflect.set(server, 'mux', manager);
+    for (const method of [
+      'startStatsCollection',
+      'startMouseModeSync',
+      'startPaneExitWatcher',
+      'startRemoteReconnectWatcher',
+      'destroy',
+    ] as const)
+      vi.spyOn(manager, method).mockImplementation(() => {});
+    vi.spyOn(
+      server as unknown as { getWorkspaceHooksEnabled(): Promise<boolean> },
+      'getWorkspaceHooksEnabled'
+    ).mockResolvedValue(false);
+    vi.spyOn(
+      server as unknown as { setupSessionListeners(session: SessionType): Promise<void> },
+      'setupSessionListeners'
+    ).mockResolvedValue();
+    const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+    const saved: SessionState = {
+      id: ID,
+      mode,
+      owner: record.owner,
+      workingDir: root,
+      pid: 1234,
+      status: 'idle',
+      currentTaskId: null,
+      createdAt: record.createdAt,
+      codexConfig: launchConfig,
+      ...savedPatch,
+    };
+    Object.assign(saved, { __codexRecoveryHome: home, __envOverrides: { CODEX_HOME: home } });
+    store.setSession(ID, saved);
+    store.flush();
+    const historical = structuredClone(store.getSession(ID));
+    expect(await Reflect.get(server, 'restoreMuxSessions').call(server)).toBe(true);
+    const session = Reflect.get(server, 'sessions').get(ID) as SessionType;
+    sessions.push(session);
+    expect(session).toBeDefined();
+    return { server, store, session, home, launchConfig, record, historical };
+  }
+
+  it.each(['codex', 'restart-codex'])(
+    'normal server restart preserves %s exact launch settings into a later verified reboot offer',
+    async (mode) => {
+      const f = await restartFixture(mode);
+      expect(f.session.codexConfig).toEqual(f.launchConfig);
+      expect(f.session.getRecoveryContext()).toMatchObject({ noDaemon: true, codexHome: f.home });
+      expect(effects.attach).toHaveBeenCalledOnce();
+      expect(
+        effects.sync.mock.calls.some(
+          ([command]) => command.includes('new-session ') || command.includes('respawn-pane ')
+        )
+      ).toBe(false);
+      Reflect.get(f.server, '_persistSessionStateNow').call(f.server, f.session);
+      f.store.flush();
+      const saved = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID] as SessionState;
+      expect(saved).toMatchObject({
+        mode,
+        owner: 'fixture-owner',
+        workingDir: root,
+        codexConfig: f.launchConfig,
+        __codexRecoveryHome: f.home,
+        __codexInputBroker: null,
+      });
+      mkdirSync(join(f.home, 'sessions'), { recursive: true });
+      writeFileSync(
+        join(f.home, 'sessions', `rollout-2026-10-16T12-00-00-${THREAD}.jsonl`),
+        JSON.stringify({
+          type: 'session_meta',
+          timestamp: new Date(Date.now() - 30_000).toISOString(),
+          payload: { id: THREAD, cwd: root, originator: `codeman_${ID}` },
+        }) + '\n'
+      );
+      const bindings = await captureRebootBrokerBindings({ [ID]: saved });
+      expect(bindings).toEqual(new Map([[ID, null]]));
+      const plan = await planVerifiedRebootRestore(
+        [ID],
+        { [ID]: saved },
+        async () => ({ status: 'present', dev: 1, ino: 1 }),
+        bindings
+      );
+      expect(plan.skipped).toEqual([]);
+      expect(plan.restore).toHaveLength(1);
+      expect(plan.restore[0]).toMatchObject({
+        sessionId: ID,
+        mode,
+        resumeConversationId: THREAD,
+        state: { codexConfig: f.launchConfig },
+      });
+    }
+  );
+  it.each(['restart-capability-only', 'restart-config-only'])(
+    'restores settings declared by the registered %s CLI without inferring extra recovery authority',
+    async (mode) => {
+      const f = await restartFixture(mode);
+      expect(f.session.codexConfig).toEqual(f.launchConfig);
+      expect(f.session.toState().mode).toBe(mode);
+      Reflect.get(f.server, '_persistSessionStateNow').call(f.server, f.session);
+      f.store.flush();
+      const saved = f.store.getSession(ID)!;
+      expect(saved.codexConfig).toEqual(f.launchConfig);
+      expect(await captureRebootBrokerBindings({ [ID]: saved })).toEqual(
+        mode === 'restart-capability-only' ? new Map([[ID, null]]) : new Map()
+      );
+    }
+  );
+  it.each(['restart-unrelated', 'unregistered-restart-cli'])(
+    'does not inject Codex settings into unrelated or unregistered mode %s',
+    async (mode) => {
+      const f = await restartFixture(mode);
+      expect(f.session.codexConfig).toBeUndefined();
+      expect(f.session.getRecoveryContext().noDaemon).toBe(false);
+      expect(await captureRebootBrokerBindings({ [ID]: f.session.toState() })).toEqual(new Map());
+    }
+  );
+  it.each(['codex', 'restart-config-only', 'unregistered-restart-cli'])(
+    'a custom native CLI cannot borrow launch settings saved for %s',
+    async (savedMode) => {
+      const f = await restartFixture('restart-codex', { mode: savedMode });
+      expect(f.session.codexConfig).toBeUndefined();
+      expect(f.session.getRecoveryContext().noDaemon).toBe(false);
+      expect(
+        effects.sync.mock.calls.some(
+          ([command]) => command.includes('new-session ') || command.includes('respawn-pane ')
+        )
+      ).toBe(false);
+    }
+  );
+  it('retains uncertain native settings for inspection and cannot overwrite historical configuration', async () => {
+    const nativeConfig = { ...config, model: 'uncertain-native-model', sandbox: 'workspace-write' as const };
+    const f = await restartFixture(
+      'restart-codex',
+      {},
+      { codexRestoreUncertain: true, codexRestoreConfig: nativeConfig }
+    );
+    expect(f.session.codexConfig).toEqual(nativeConfig);
+    expect(f.session.getRecoveryContext().managed).toBe(false);
+    Reflect.get(f.server, '_persistSessionStateNow').call(f.server, f.session);
+    f.store.flush();
+    expect(f.store.getSession(ID)).toEqual(f.historical);
+    expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID]).toEqual(f.historical);
+    expect(
+      effects.sync.mock.calls.some(([command]) => command.includes('new-session ') || command.includes('respawn-pane '))
+    ).toBe(false);
+  });
 });

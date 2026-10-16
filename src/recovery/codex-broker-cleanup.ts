@@ -125,27 +125,84 @@ export interface BrokerProvisioningRollback {
   parents: Array<{ path: string; dev: number; ino: number }>;
   files: Array<{ name: string; dev: number; ino: number; size: number; hash: string }>;
 }
-export async function rollbackCodexBrokerProvisioning(
-  receipt: BrokerProvisioningRollback,
-  testSpawn?: typeof spawn
-): Promise<void> {
-  const request = structuredClone(receipt);
-  await runBrokerCleanup(
+type PendingRollback = {
+  receipt: BrokerProvisioningRollback;
+  spawn?: typeof spawn;
+  retry: boolean;
+  attempts: number;
+  work?: Promise<boolean>;
+  timer?: ReturnType<typeof setTimeout>;
+};
+// Retain exhausted/uncertain receipts rather than evicting their ownership proof.
+// Each admitted receipt gets at most three attempts; an explicit call can retry
+// the same receipt later. The janitor still rechecks every file and native veto.
+const pendingRollbacks = new Map<string, PendingRollback>();
+function attemptRollback(key: string, pending: PendingRollback): Promise<boolean> {
+  if (pending.work) return pending.work;
+  pending.attempts++;
+  const request = pending.receipt;
+  const work = runBrokerCleanup(
     { rollback: request },
     (value) =>
       Object.keys(value).join(',') === 'rollback' && value.rollback === `${request.sessionId}/${request.incarnation}`,
-    testSpawn
-  );
+    pending.spawn,
+    (value) =>
+      Object.keys(value).join(',') === 'rolledBack' &&
+      value.rolledBack === `${request.sessionId}/${request.incarnation}`
+  )
+    .catch(() => false)
+    .then((removed) => {
+      pending.work = undefined;
+      if (removed) pendingRollbacks.delete(key);
+      else if (pending.retry && pending.attempts < 3) {
+        // Let the existing two-second helper deadline release a saturated slot.
+        pending.timer = setTimeout(() => {
+          pending.timer = undefined;
+          void attemptRollback(key, pending);
+        }, 2_100);
+        pending.timer.unref?.();
+      }
+      return removed;
+    });
+  pending.work = work;
+  return work;
+}
+/** True requires terminal deletion/anchored-absence ACK; failed receipts stay retryable.
+ * testSpawn/testRetry exercise disposable janitors only; neither is a runtime option. */
+export async function rollbackCodexBrokerProvisioning(
+  receipt: BrokerProvisioningRollback,
+  testSpawn?: typeof spawn,
+  testRetry = !process.env.VITEST
+): Promise<boolean> {
+  const key = JSON.stringify(receipt);
+  if (Buffer.byteLength(key) > 262_144) return false;
+  let pending = pendingRollbacks.get(key);
+  if (!pending) {
+    if (pendingRollbacks.size >= 256) return false;
+    pending = { receipt: structuredClone(receipt), spawn: testSpawn, retry: testRetry, attempts: 0 };
+    pendingRollbacks.set(key, pending);
+  } else {
+    if (pending.work) return pending.work;
+    pending.spawn = testSpawn;
+    pending.retry = testRetry;
+    if (pending.timer) {
+      clearTimeout(pending.timer);
+      pending.timer = undefined;
+    }
+    if (pending.attempts >= 3) pending.attempts = 0;
+  }
+  return attemptRollback(key, pending);
 }
 
 async function runBrokerCleanup(
   request: object,
   accept: (value: Record<string, unknown>) => boolean,
-  testSpawn?: typeof spawn
-): Promise<void> {
-  if (active.size >= 2 || (process.env.VITEST && !testSpawn)) return;
+  testSpawn?: typeof spawn,
+  complete?: (value: Record<string, unknown>) => boolean
+): Promise<boolean> {
+  if (active.size >= 2 || (process.env.VITEST && !testSpawn)) return false;
   const serialized = JSON.stringify(request);
-  if (Buffer.byteLength(serialized) > 2_097_152) return;
+  if (Buffer.byteLength(serialized) > 2_097_152) return false;
   let child: ChildProcessWithoutNullStreams;
   try {
     child = (testSpawn ?? spawn)('python3', ['-I', '-c', CODEX_BROKER_CLEANUP_SOURCE], {
@@ -153,27 +210,30 @@ async function runBrokerCleanup(
       stdio: ['pipe', 'pipe', 'pipe'],
     }) as ChildProcessWithoutNullStreams;
   } catch {
-    return;
+    return false;
   }
   active.add(child);
-  await new Promise<void>((resolve) => {
+  return new Promise<boolean>((resolve) => {
     let output = '',
       bytes = 0,
-      settled = false;
-    const finish = () => {
+      settled = false,
+      acknowledged = false,
+      completed = false,
+      failed = false;
+    const finish = (success = false) => {
       if (!settled) {
         settled = true;
-        resolve();
+        resolve(success && acknowledged && completed && !failed && output.length === 0);
       }
     };
     const timeout = setTimeout(() => {
       child.kill('SIGKILL');
       finish();
     }, 2_000);
-    child.on('close', () => {
+    child.on('close', (code) => {
       active.delete(child);
       clearTimeout(timeout);
-      finish();
+      finish(code === 0);
     });
     child.on('error', () => {
       child.kill('SIGKILL');
@@ -182,12 +242,16 @@ async function runBrokerCleanup(
     child.stdin.on('error', () => {});
     child.stderr.on('data', (data: Buffer) => {
       bytes += data.length;
-      if (bytes > 65_536) child.kill('SIGKILL');
+      if (bytes > 65_536) {
+        failed = true;
+        child.kill('SIGKILL');
+      }
     });
     child.stdout.on('data', (data: Buffer) => {
       bytes += data.length;
       output += data.toString('utf8');
       if (bytes > 65_536) {
+        failed = true;
         child.kill('SIGKILL');
         return;
       }
@@ -197,12 +261,19 @@ async function runBrokerCleanup(
         output = output.slice(at + 1);
         try {
           const value = JSON.parse(line);
-          if (!accept(value)) {
+          if (acknowledged && !completed && complete?.(value)) {
+            completed = true;
+            continue;
+          }
+          if (completed || !accept(value)) {
+            failed = true;
             child.kill('SIGKILL');
             return;
           }
+          acknowledged = true;
           child.stdin.write('ACK\n');
         } catch {
+          failed = true;
           child.kill('SIGKILL');
           return;
         }
