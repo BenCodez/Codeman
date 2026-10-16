@@ -77,6 +77,126 @@ function fixture() {
   return { scope, material, remoteDirectory, cache, file, state, observe, snapshot };
 }
 
+async function partialPreparation(
+  f: ReturnType<typeof fixture>,
+  material: ReturnType<typeof CodexInputBroker.provisioningMaterial>,
+  length: number,
+  fault?: 'same-bytes' | 'symlink' | 'parent' | 'unknown-read' | 'unknown-bytes' | 'sealed'
+) {
+  const path = join(root, 'cache', f.scope.sessionId, material.config.incarnation, 'private.json');
+  const open = fs.open.bind(fs),
+    discard = f.cache.discardUnreservedPreparation.bind(f.cache);
+  let finish!: (result: boolean) => void;
+  const cleaned = new Promise<boolean>((resolve) => (finish = resolve));
+  const discardSpy = vi.spyOn(f.cache, 'discardUnreservedPreparation').mockImplementation(async (...args) => {
+    const completedWrite = (Reflect.get(f.cache, 'preparations') as WeakMap<object, unknown>).has(args[1]);
+    if (fault === 'sealed' && completedWrite) f.cache.sealPreparation(args[1]);
+    const result = await discard(...args);
+    if (completedWrite) finish(result);
+    return result;
+  });
+  const spy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const handle = await open(...args);
+    if (args[0] !== path || typeof args[1] !== 'number' || !(args[1] & constants.O_CREAT)) return handle;
+    const write = handle.writeFile.bind(handle),
+      close = handle.close.bind(handle);
+    handle.writeFile = async (data) => {
+      const prefix = Buffer.from(data as Buffer).subarray(0, length);
+      await write(fault === 'unknown-bytes' ? Buffer.alloc(length, 120) : prefix);
+      throw Object.assign(Error('Disposable disk full'), { code: 'ENOSPC' });
+    };
+    if (fault === 'unknown-read')
+      handle.read = async () => {
+        throw Error('Unreadable partial file');
+      };
+    handle.close = async () => {
+      await close();
+      if (fault === 'same-bytes' || fault === 'symlink') {
+        await fs.rename(path, path + '.owned');
+        if (fault === 'same-bytes') await fs.writeFile(path, await fs.readFile(path + '.owned'), { mode: 0o600 });
+        else await fs.symlink(path + '.owned', path);
+      }
+      if (fault === 'parent') {
+        const parent = join(root, 'cache', f.scope.sessionId, material.config.incarnation);
+        await fs.rename(parent, parent + '.owned');
+        await fs.mkdir(parent, { mode: 0o700 });
+        await fs.writeFile(path, 'foreign parent bytes', { mode: 0o600 });
+      }
+    };
+    return handle;
+  });
+  try {
+    expect(
+      await f.cache.prepare(
+        f.scope,
+        material,
+        '/remote/private/' + f.scope.sessionId + '/' + material.config.incarnation
+      )
+    ).toBeUndefined();
+    expect(f.cache.get(f.scope, material.config.incarnation)).toBeUndefined();
+    let timer: ReturnType<typeof realTimeout> | undefined;
+    const result = await Promise.race([
+      cleaned,
+      new Promise<string>((resolve) => {
+        timer = realTimeout(() => resolve('cleanup missing'), 2000);
+      }),
+    ]).finally(() => {
+      if (timer) clearRealTimeout(timer);
+    });
+    return { result, path };
+  } finally {
+    spy.mockRestore();
+    discardSpy.mockRestore();
+  }
+}
+
+it.each([0, 128])('cleans an exact %i-byte ENOSPC artifact and releases capacity before reload', async (length) => {
+  const f = fixture();
+  const failed = [
+    f.material,
+    CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec second', f.scope.codexHome),
+  ];
+  for (const material of failed) {
+    const attempt = await partialPreparation(f, material, length);
+    expect(attempt.result).toBe(true);
+    await expect(fs.lstat(attempt.path)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((Reflect.get(f.cache, 'canceledPreparations') as Map<string, unknown>).size).toBe(0);
+    expect(
+      await new OwnedRemoteBrokerCache(join(root, 'cache')).load(f.scope, material.config.incarnation)
+    ).toBeUndefined();
+  }
+  const healthy = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec healthy', f.scope.codexHome);
+  const descriptor = await f.cache.prepare(
+    f.scope,
+    healthy,
+    '/remote/private/' + f.scope.sessionId + '/' + healthy.config.incarnation
+  );
+  expect(descriptor).toBeDefined();
+  expect(await new OwnedRemoteBrokerCache(join(root, 'cache')).load(f.scope, healthy.config.incarnation)).toEqual(
+    descriptor
+  );
+});
+
+it.each(['same-bytes', 'symlink', 'parent', 'unknown-read', 'unknown-bytes', 'sealed'] as const)(
+  'preserves a failed partial preparation after %s veto',
+  async (fault) => {
+    const f = fixture();
+    const attempt = await partialPreparation(f, f.material, 128, fault);
+    expect(attempt.result).toBe(false);
+    expect((Reflect.get(f.cache, 'canceledPreparations') as Map<string, unknown>).size).toBe(1);
+    expect((await fs.lstat(attempt.path)).isSymbolicLink()).toBe(fault === 'symlink');
+    const bytes = await fs.readFile(attempt.path);
+    expect(bytes.length).toBe(fault === 'parent' ? Buffer.byteLength('foreign parent bytes') : 128);
+    if (fault === 'parent') expect(bytes.toString()).toBe('foreign parent bytes');
+    if (fault === 'unknown-bytes') expect(bytes).toEqual(Buffer.alloc(128, 120));
+    expect(await f.cache.load(f.scope, f.material.config.incarnation)).toBeUndefined();
+    expect(
+      await new OwnedRemoteBrokerCache(join(root, 'cache')).load(f.scope, f.material.config.incarnation)
+    ).toBeUndefined();
+    expect(await fs.readFile(attempt.path)).toEqual(bytes);
+  }
+);
+
 it.each([
   'write',
   'sync',

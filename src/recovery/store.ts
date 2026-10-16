@@ -1,5 +1,5 @@
 /** @fileoverview Instance-scoped, atomic recovery journal. Persistence failure stops automation. */
-import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, unlinkSync } from 'node:fs';
 import { mkdir, open, rename, unlink } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
@@ -188,6 +188,13 @@ export class RecoveryStore {
         if (Object.keys(parsed.sessions).length > 200) throw new Error('Journal is over capacity');
         this.records = parsed.sessions as Record<string, RecoveryState>;
       }
+      // Preserve readable reservations, but never activate an unacknowledged mutation.
+      try {
+        lstatSync(`${path}.pending`);
+        failed = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
     } catch {
       failed = true;
     }
@@ -304,7 +311,9 @@ export class RecoveryStore {
       throw new Error('Recovery journal is over byte capacity');
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${randomUUID()}.tmp`;
-    let commitAttempted = false;
+    const marker = `${this.path}.pending`;
+    const token = `${randomUUID()}\n`;
+    let fenceAttempted = false;
     try {
       const handle = await open(temp, 'wx', 0o600);
       try {
@@ -313,21 +322,48 @@ export class RecoveryStore {
       } finally {
         await handle.close();
       }
-      // Replacement or its durability acknowledgement may fail after publication.
-      // Require a fresh journal load before another snapshot can overwrite it.
-      commitAttempted = true;
-      await rename(temp, this.path);
-      const directory = await open(dirname(this.path), 'r');
+      // The fence must survive restart BEFORE a replacement can publish consent,
+      // reset budgets, or delivery ownership. Failure leaves it for inspection.
+      fenceAttempted = true;
+      const fence = await open(marker, 'wx', 0o600);
+      let identity;
       try {
-        await directory.sync();
+        identity = await fence.stat();
+        await fence.writeFile(token);
+        await fence.sync();
       } finally {
-        await directory.close();
+        await fence.close();
       }
+      await this.syncDirectory();
+      await rename(temp, this.path);
+      await this.syncDirectory();
+      const current = lstatSync(marker);
+      if (
+        !current.isFile() ||
+        current.isSymbolicLink() ||
+        current.dev !== identity.dev ||
+        current.ino !== identity.ino ||
+        readFileSync(marker, 'utf8') !== token
+      )
+        throw new Error('Recovery publication fence changed');
+      // Final synchronous commit: no later durability/cleanup error can reject
+      // consent after removing its fence. A crash may retain the fence, which
+      // conservatively blocks an acknowledged write rather than enabling a failure.
+      unlinkSync(marker);
     } catch (error) {
-      if (commitAttempted) this.writeUncertain = true;
+      if (fenceAttempted) this.writeUncertain = true;
       throw error;
     } finally {
       await unlink(temp).catch(() => {});
+    }
+  }
+
+  private async syncDirectory(): Promise<void> {
+    const directory = await open(dirname(this.path), 'r');
+    try {
+      await directory.sync();
+    } finally {
+      await directory.close();
     }
   }
 

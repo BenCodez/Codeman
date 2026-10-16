@@ -41,7 +41,7 @@ function state(patch: Partial<RecoveryState> = {}): RecoveryState {
 }
 
 it.each(['directory-open', 'directory-sync', 'directory-close', 'rename-ack'] as const)(
-  'seals queued and later writes after %s failure until the published reservation is reloaded',
+  'seals queued and later writes after %s failure across restart without losing published reservation proof',
   async (fault) => {
     const store = new RecoveryStore(path);
     const previous = state();
@@ -51,8 +51,9 @@ it.each(['directory-open', 'directory-sync', 'directory-close', 'rename-ack'] as
       attempts: 1,
       inFlight: { key: 'failure-1', action: 'continue', conversationId: THREAD, startedAt: NOW },
     });
+    let publishedJournal = false;
     vi.mocked(open).mockImplementation(async (name, flags, mode) => {
-      const directory = name === dirname(path) && flags === 'r';
+      const directory = publishedJournal && name === dirname(path) && flags === 'r';
       if (directory && fault === 'directory-open') throw new Error(fault);
       const handle = await native.open(name, flags, mode);
       if (directory && fault === 'directory-sync')
@@ -70,7 +71,10 @@ it.each(['directory-open', 'directory-sync', 'directory-close', 'rename-ack'] as
     });
     vi.mocked(rename).mockImplementation(async (from, to) => {
       await native.rename(from, to);
-      if (to === path && fault === 'rename-ack') throw new Error(fault);
+      if (to === path) {
+        publishedJournal = true;
+        if (fault === 'rename-ack') throw new Error(fault);
+      }
     });
     const results = await Promise.allSettled([
       store.save('owned', reserved),
@@ -99,9 +103,14 @@ it.each(['directory-open', 'directory-sync', 'directory-close', 'rename-ack'] as
     await expect(store.pruneOrphans(() => false)).rejects.toThrow(/uncertain/);
     expect(await fs.readFile(path, 'utf8')).toBe(published);
     const restored = new RecoveryStore(path);
-    expect(restored.loadFailed).toBe(false);
-    expect(restored.get('owned')).toEqual(reserved);
-    await restored.save('later-sibling', previous);
+    expect(restored.loadFailed).toBe(true);
+    expect(restored.get('owned')).toMatchObject({
+      config: { enabled: false },
+      circuitOpen: true,
+      lastReason: 'persistence-failed',
+      inFlight: reserved.inFlight,
+    });
+    await expect(restored.save('later-sibling', previous)).rejects.toThrow(/could not be loaded/);
     expect(new RecoveryStore(path).get('owned').inFlight).toEqual(reserved.inFlight);
     const act = vi.fn(async () => 'sent' as const);
     const controller = new RecoveryController(
@@ -123,8 +132,8 @@ it.each(['directory-open', 'directory-sync', 'directory-close', 'rename-ack'] as
       restored.get('owned')
     );
     try {
-      await controller.refresh();
-      await controller.refresh();
+      await controller.inspect();
+      await controller.inspect();
       expect(act).not.toHaveBeenCalled();
       expect(controller.getStatus().inFlight).toEqual(reserved.inFlight);
     } finally {

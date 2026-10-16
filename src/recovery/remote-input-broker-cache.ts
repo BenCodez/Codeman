@@ -1033,6 +1033,7 @@ export class OwnedRemoteBrokerCache {
     let retained: Promise<unknown> | undefined,
       published = false;
     let ownedFile: Stats | undefined;
+    let rollbackBytes = bytes;
     const ownedParents: Stats[] = [];
     this.preparingReceipts.add(receipt);
     this.canceledPreparations.set(entryKey, receipt);
@@ -1051,16 +1052,31 @@ export class OwnedRemoteBrokerCache {
             }
             const handle = await fs.open(
               file,
-              constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+              constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
               0o600
             );
+            let writeCompleted = false;
             try {
               ownedFile = await handle.stat();
               await handle.writeFile(bytes);
+              writeCompleted = true;
               await handle.sync();
             } finally {
               try {
                 ownedFile = await handle.stat();
+                if (!writeCompleted && privateStat(ownedFile) && ownedFile.size <= bytes.length) {
+                  // A failed write may have left only a prefix. Capture it from
+                  // our still-open O_EXCL descriptor, never from a replacement
+                  // pathname, so the usual exact rollback proof can remove it.
+                  const partial = Buffer.alloc(ownedFile.size + 1);
+                  const read = await handle.read(partial, 0, partial.length, 0);
+                  if (
+                    read.bytesRead === ownedFile.size &&
+                    same(ownedFile, await handle.stat()) &&
+                    partial.subarray(0, read.bytesRead).equals(bytes.subarray(0, read.bytesRead))
+                  )
+                    rollbackBytes = partial.subarray(0, read.bytesRead);
+                }
               } finally {
                 await handle.close();
               }
@@ -1083,7 +1099,7 @@ export class OwnedRemoteBrokerCache {
                 epoch,
                 file: ownedFile!,
                 parents: ownedParents,
-                bytes,
+                bytes: rollbackBytes,
                 unpublished: true,
               });
               this.canceledPreparations.set(entryKey, receipt);
