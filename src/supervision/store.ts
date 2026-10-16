@@ -11,6 +11,8 @@ const MAX_JOURNAL_BYTES = 2 * 1024 * 1024;
 /** The synchronous commit callback publishes an already prepared controller state. */
 export interface TaskSaveAuthority {
   isCurrent(): boolean;
+  /** Revalidate asynchronous evidence, then invoke commit without another await. */
+  prepareCommit?(commit: () => void): Promise<void>;
   cancelled(): Error;
   commit(): void;
 }
@@ -86,6 +88,7 @@ export class TaskStore {
     let certifiedCancellation: Error | undefined;
     const guarded = authority && {
       isCurrent: () => authority.isCurrent(),
+      prepareCommit: authority.prepareCommit?.bind(authority),
       commit: () => authority.commit(),
       cancelled: () => (certifiedCancellation = authority.cancelled()),
     };
@@ -192,14 +195,20 @@ export class TaskStore {
         await handle.close();
       }
       if (authority) {
-        if (!authority.isCurrent()) throw authority.cancelled();
-        // Only the atomic metadata replacement is synchronous: cancellation
-        // cannot interleave its final check and controller publication. All
-        // preparation, data writes, fsync and directory work remain async.
-        commitAttempted = true;
-        renameSync(temp, this.path);
-        this.records = records;
-        authority.commit();
+        const commit = () => {
+          if (commitAttempted) throw new Error('Task journal commit was already attempted');
+          if (!authority.isCurrent()) throw authority.cancelled();
+          // No await separates final evidence validation, authority, pathname
+          // replacement and controller publication. All file preparation stays async.
+          commitAttempted = true;
+          renameSync(temp, this.path);
+          this.records = records;
+          authority.commit();
+        };
+        if (authority.prepareCommit) {
+          await authority.prepareCommit(commit);
+          if (!commitAttempted) throw authority.cancelled();
+        } else commit();
       } else {
         commitAttempted = true;
         await rename(temp, this.path);

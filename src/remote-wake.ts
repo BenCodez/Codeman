@@ -117,30 +117,21 @@ export function decideRemoteInputAction(args: {
 }
 
 /**
- * Append `data` to the pending buffer, dropping the OLDEST whole chunks when the cap
- * is exceeded. Returns the resulting buffer — the SAME array reference when the chunk
- * was rejected, so the caller can tell the two apart. Pure.
+ * Append `data` only when the entire chunk fits beside all accepted chunks.
+ * Returns the SAME array reference on refusal, so callers retain their bytes.
  *
  * A chunk LARGER than the cap is dropped outright rather than trimmed: one paste is
  * one `input` value, and it was never typed character by character, so delivering its
  * tail would execute a fragment of it (with the trailing carriage return, if the paste
- * had one) — a partial command the user never sent. Keeping the tail is right for
- * typing, where the newest bytes are the ones the user just produced, and wrong for a
- * chunk that arrived whole.
+ * had one) — a partial command the user never sent.
  */
 export function appendBoundedPending(
   pending: string[],
   data: string,
   maxBytes = REMOTE_WAKE_PENDING_MAX_BYTES
 ): string[] {
-  if (Buffer.byteLength(data) > maxBytes) return pending;
-  const next = [...pending, data];
-  let total = next.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0);
-  while (next.length > 1 && total > maxBytes) {
-    total -= Buffer.byteLength(next[0]);
-    next.shift();
-  }
-  return next;
+  const total = pending.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), Buffer.byteLength(data));
+  return total > maxBytes ? pending : [...pending, data];
 }
 
 /** The remote fields the wake flow needs. Structurally satisfied by `SessionRemote`. */
@@ -533,6 +524,9 @@ export class RemoteWakeRegistry {
           ? this.wake(session, opts)
           : true;
     const state = this._state(session.id);
+    // Reachability becomes true before reattach/settle/flush completes. A sibling
+    // request must join that whole operation rather than write into its old pane.
+    if (state.waking) return state.waking;
     // `force` is the manual path (a user pressed "wake"): a cached "reachable" from
     // seconds ago must not talk the button out of waking a host that just slept.
     if (opts.force || (state.reachable !== false && Date.now() - state.probedAt >= REMOTE_WAKE_PROBE_MIN_INTERVAL_MS)) {
@@ -550,10 +544,11 @@ export class RemoteWakeRegistry {
   /** Admit only this wake's reattach, never an unrelated pane replacement during the wait. */
   async ensureAwakeForInput(
     session: WakeableSession & { readonly paneStartedAt: number },
-    paneStartedAt: number
+    paneStartedAt: number,
+    opts: { timeoutMs?: number } = {}
   ): Promise<number | null> {
     const previous = this.reattachments.get(session);
-    if (!(await this.ensureAwake(session))) return null;
+    if (!(await this.ensureAwake(session, opts))) return null;
     const transition = this.reattachments.get(session);
     const current = session.paneStartedAt;
     return current === paneStartedAt ||
@@ -665,12 +660,12 @@ export class RemoteWakeRegistry {
       const workerScope = session.remoteWakeScope?.();
       try {
         const ready = await this._wakeAndWait(remote, state, { sessionId: id, timeoutMs: opts.timeoutMs });
-        if (!ready) return false;
+        if (!ready || this.stopped || this.states.get(id) !== state) return false;
         state.attachmentReady = false;
 
         const before = session.paneStartedAt;
         const reattached = await session.reattachRemote();
-        if (!reattached) {
+        if (!reattached || this.stopped || this.states.get(id) !== state) {
           this.deps.log?.(`[RemoteWake] ${remote.label} is up but the pane could not be reattached`);
           return false;
         }
@@ -678,6 +673,7 @@ export class RemoteWakeRegistry {
         await this.deps.delay(REMOTE_WAKE_ATTACH_SETTLE_MS);
         const scopeCurrent = () =>
           !this.stopped &&
+          this.states.get(id) === state &&
           this._queuedInputCurrent(state, session) &&
           session.paneStartedAt === after &&
           JSON.stringify(session.remote) === remoteScope &&
@@ -918,8 +914,8 @@ export class RemoteWakeRegistry {
       first = false;
       if (!current()) return false;
       const chunk = state.pending[0];
-      // Remove before awaiting so concurrent enqueue/cap eviction cannot remove
-      // a different, unattempted chunk after this write completes.
+      // Remove before awaiting and keep in-flight bytes charged to capacity
+      // until this guarded send completes.
       state.pending = state.pending.slice(1);
       state.inFlightBytes = Buffer.byteLength(chunk);
       let ok: boolean;

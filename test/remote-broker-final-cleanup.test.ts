@@ -3,7 +3,7 @@ import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CodexInputBroker, type CodexBrokerState } from '../src/recovery/codex-input-broker.js';
 import { OwnedRemoteBrokerCache, type OwnedRemoteBrokerScope } from '../src/recovery/remote-input-broker-cache.js';
@@ -24,6 +24,15 @@ if os.environ.get('FIXTURE_UNLINK_FAILURE'):
   if path=='config.json': raise OSError('fixture held config unlink')
   return original(path,*args,**kwargs)
  os.unlink=unlink
+if os.environ.get('FIXTURE_PARENT_FAILURE'):
+ original_rmdir=os.rmdir
+ def rmdir(path,*args,**kwargs):
+  if path==os.environ['FIXTURE_PARENT_PATH']:
+   if os.environ['FIXTURE_PARENT_FAILURE']=='before': raise OSError('fixture held parent removal')
+   original_rmdir(path,*args,**kwargs)
+   raise OSError('fixture lost parent removal ACK')
+  return original_rmdir(path,*args,**kwargs)
+ os.rmdir=rmdir
 exec(compile(source,'<trusted-cleanup>','exec'))
 `;
 beforeEach(async () => {
@@ -43,7 +52,9 @@ afterEach(async () => {
   vi.useRealTimers();
   await fs.rm(root, { recursive: true, force: true });
 });
-function transport(options: { offline?: boolean; partial?: boolean; after?: () => void } = {}): RemoteBrokerTransport {
+function transport(
+  options: { offline?: boolean; partial?: boolean; parentFailure?: 'before' | 'after'; after?: () => void } = {}
+): RemoteBrokerTransport {
   return {
     run: async (command, input) => {
       if (options.offline) throw Error('fixture offline');
@@ -65,6 +76,8 @@ function transport(options: { offline?: boolean; partial?: boolean; after?: () =
             PATH: `${bin}:/usr/bin:/bin`,
             FIXTURE_MUX_LIVE: join(root, 'live-pane'),
             FIXTURE_UNLINK_FAILURE: options.partial ? 'yes' : '',
+            FIXTURE_PARENT_FAILURE: options.parentFailure ?? '',
+            FIXTURE_PARENT_PATH: dirname(JSON.parse(input).directory),
           },
           stdio: ['pipe', 'pipe', 'pipe'],
         });
@@ -138,7 +151,9 @@ async function fixture() {
     cleanupRemoteBroker(target, directory, material, current, { transport: io });
   const cacheRoot = join(root, 'cache');
   const makeCache = (io = transport()) =>
-    new OwnedRemoteBrokerCache(cacheRoot, (...args) => cleanupRemoteBroker(...args, { transport: io }));
+    new OwnedRemoteBrokerCache(cacheRoot, (target, directory, material, current, options) =>
+      cleanupRemoteBroker(target, directory, material, current, { ...options, transport: io })
+    );
   const privateFile = join(cacheRoot, scope.sessionId, material.config.incarnation, 'private.json');
   return { scope, material, directory, target, state, writeState, clean, cacheRoot, makeCache, privateFile };
 }
@@ -156,6 +171,8 @@ it.each(['unstarted', 'closed', 'abruptly-stopped'] as const)(
     }
     expect(await f.clean()).toBe(true);
     await expect(fs.lstat(f.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.lstat(dirname(f.directory))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
     expect(await f.clean()).toBe(true); // lost ACK / idempotent retry
   }
 );
@@ -255,11 +272,15 @@ it('retains offline cleanup authority through cache reload and retries every rot
   const reopened = f.makeCache();
   const stop = reopened.startFinalCleanupRetries(() => ({ live: false }));
   try {
-    await vi.waitFor(async () => expect(await fs.readdir(join(f.cacheRoot, f.scope.sessionId))).toEqual([]));
+    await vi.waitFor(
+      async () => await expect(fs.lstat(join(f.cacheRoot, f.scope.sessionId))).rejects.toMatchObject({ code: 'ENOENT' })
+    );
     for (const m of materials)
       await expect(fs.lstat(join(root, 'remote', f.scope.sessionId, m.config.incarnation))).rejects.toMatchObject({
         code: 'ENOENT',
       });
+    await expect(fs.lstat(dirname(f.directory))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
   } finally {
     await stop();
   }
@@ -364,3 +385,199 @@ it.each(['missing', 'disabled', 'regular-owner'] as const)(
     }
   }
 );
+
+it.each(['before', 'after'] as const)(
+  'retries remote session-parent removal after a failure %s rmdir and a fresh source cache',
+  async (point) => {
+    const f = await fixture();
+    const cache = f.makeCache(transport({ parentFailure: point }));
+    expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+    await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, f.target);
+    expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+    await expect(fs.lstat(f.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
+    const receipt = join(root, 'remote', `.cleanup-${f.scope.sessionId}-${f.material.config.incarnation}.json`);
+    expect((await fs.lstat(receipt)).isFile()).toBe(true);
+    if (point === 'before') expect(await fs.readdir(dirname(f.directory))).toEqual([]);
+    else await expect(fs.lstat(dirname(f.directory))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
+    expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
+    expect(await fs.readdir(f.cacheRoot)).toEqual([]);
+  }
+);
+
+it.each(['foreign-file', 'new-incarnation', 'replacement', 'symlink'] as const)(
+  'retains remote parent authority and never removes %s while retrying final cleanup',
+  async (kind) => {
+    const f = await fixture();
+    const cache = f.makeCache(transport({ parentFailure: 'before' }));
+    expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+    await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, f.target);
+    expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+    const parent = dirname(f.directory),
+      original = await fs.lstat(parent);
+    const artifact = join(parent, kind === 'new-incarnation' ? randomUUID() : 'owner-file');
+    if (kind === 'foreign-file') await fs.writeFile(artifact, 'owner content', { mode: 0o600 });
+    if (kind === 'new-incarnation') await fs.mkdir(artifact, { mode: 0o700 });
+    if (kind === 'replacement' || kind === 'symlink') {
+      await fs.rename(parent, parent + '.old');
+      if (kind === 'replacement') await fs.mkdir(parent, { mode: 0o700 });
+      else await fs.symlink(parent + '.old', parent);
+    }
+    expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+    expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
+    if (kind === 'foreign-file') expect(await fs.readFile(artifact, 'utf8')).toBe('owner content');
+    if (kind === 'new-incarnation') expect((await fs.lstat(artifact)).isDirectory()).toBe(true);
+    if (kind === 'replacement') expect((await fs.lstat(parent)).ino).not.toBe(original.ino);
+    if (kind === 'symlink') expect((await fs.lstat(parent)).isSymbolicLink()).toBe(true);
+    if (kind === 'foreign-file') await fs.unlink(artifact);
+    if (kind === 'new-incarnation') await fs.rmdir(artifact);
+    if (kind === 'replacement' || kind === 'symlink') {
+      if (kind === 'replacement') await fs.rmdir(parent);
+      else await fs.unlink(parent);
+      await fs.rename(parent + '.old', parent);
+    }
+    expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
+    expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
+    expect(await fs.readdir(f.cacheRoot)).toEqual([]);
+  }
+);
+
+it.each(['before-rmdir', 'after-rmdir-fsync', 'replaced', 'symlink'] as const)(
+  'durably retries source parent cleanup across %s without adopting a replacement',
+  async (point) => {
+    const f = await fixture(),
+      cache = f.makeCache(),
+      parent = dirname(dirname(f.privateFile));
+    expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+    await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, f.target);
+    const remove = fs.rmdir.bind(fs),
+      open = fs.open.bind(fs);
+    let failed = false;
+    if (point !== 'after-rmdir-fsync')
+      vi.spyOn(fs, 'rmdir').mockImplementation(async (path) => {
+        if (String(path) === parent && !failed) {
+          failed = true;
+          throw Error('Held source parent removal');
+        }
+        return remove(path);
+      });
+    else
+      vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await open(...args);
+        if (String(args[0]) === f.cacheRoot && !failed) {
+          try {
+            await fs.lstat(parent);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+              failed = true;
+              vi.spyOn(handle, 'sync').mockRejectedValueOnce(Error('Lost source parent ACK'));
+            }
+          }
+        }
+        return handle;
+      });
+    expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+    expect(failed).toBe(true);
+    vi.restoreAllMocks();
+    expect((await fs.lstat(join(f.cacheRoot, f.scope.sessionId + '.cleanup.json'))).isFile()).toBe(true);
+    await expect(fs.lstat(dirname(f.directory))).rejects.toMatchObject({ code: 'ENOENT' });
+    if (point === 'after-rmdir-fsync') await expect(fs.lstat(parent)).rejects.toMatchObject({ code: 'ENOENT' });
+    else expect(await fs.readdir(parent)).toEqual([]);
+    if (point === 'replaced' || point === 'symlink') {
+      const original = await fs.lstat(parent);
+      await fs.rename(parent, parent + '.old');
+      if (point === 'replaced') await fs.mkdir(parent, { mode: 0o700 });
+      else await fs.symlink(parent + '.old', parent);
+      expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+      if (point === 'replaced') {
+        expect((await fs.lstat(parent)).ino).not.toBe(original.ino);
+        await fs.rmdir(parent);
+      } else {
+        expect((await fs.lstat(parent)).isSymbolicLink()).toBe(true);
+        await fs.unlink(parent);
+      }
+      await fs.rename(parent + '.old', parent);
+    }
+    expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
+    expect(await fs.readdir(f.cacheRoot)).toEqual([]);
+  }
+);
+
+it('does not transfer final parent authority to an unknown source incarnation', async () => {
+  const f = await fixture(),
+    cache = f.makeCache();
+  expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+  const unknown = join(f.cacheRoot, f.scope.sessionId, randomUUID());
+  await fs.mkdir(unknown, { mode: 0o700 });
+  await fs.writeFile(join(unknown, 'owner.txt'), 'source owner content', { mode: 0o600 });
+  const remoteArtifact = join(dirname(f.directory), 'owner.txt');
+  await fs.writeFile(remoteArtifact, 'remote owner content', { mode: 0o600 });
+  await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, f.target);
+  expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+  expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
+  expect(await fs.readFile(join(unknown, 'owner.txt'), 'utf8')).toBe('source owner content');
+  await fs.unlink(join(unknown, 'owner.txt'));
+  await fs.rmdir(unknown);
+  expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+  expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
+  expect(await fs.readFile(remoteArtifact, 'utf8')).toBe('remote owner content');
+  await fs.unlink(remoteArtifact);
+  expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
+  expect(await fs.readdir(f.cacheRoot)).toEqual([]);
+  expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
+});
+
+it('does not delegate a final parent ACK to a retained incarnation on a different remote root', async () => {
+  const f = await fixture(),
+    cache = f.makeCache();
+  expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+  expect(cache.activate(f.scope, f.material.config.incarnation)).toBe(true);
+  const material = CodexInputBroker.provisioningMaterial(f.scope.sessionId, 'exec other-root', f.scope.codexHome);
+  const directory = join(root, 'other-remote-root', f.scope.sessionId, material.config.incarnation);
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  await fs.writeFile(join(directory, 'broker.py'), material.helper, { mode: 0o600 });
+  await fs.writeFile(join(directory, 'config.json'), JSON.stringify(material.config), { mode: 0o600 });
+  await fs.writeFile(join(directory, 'lock'), '', { mode: 0o600 });
+  expect(await cache.prepare(f.scope, material, directory)).toBeDefined();
+  const artifact = join(dirname(f.directory), 'owner.txt');
+  await fs.writeFile(artifact, 'foreign root content', { mode: 0o600 });
+  await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, f.target);
+  expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+  expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
+  expect(await fs.readFile(artifact, 'utf8')).toBe('foreign root content');
+  await expect(fs.lstat(dirname(directory))).rejects.toMatchObject({ code: 'ENOENT' });
+  await fs.unlink(artifact);
+  expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
+  expect(await fs.readdir(f.cacheRoot)).toEqual([]);
+  expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
+  expect(await fs.readdir(join(root, 'other-remote-root'))).toEqual([]);
+});
+
+it('does not infer parent completion from an older SSH cleanup intent with weaker ACK semantics', async () => {
+  const f = await fixture(),
+    cache = f.makeCache();
+  expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+  await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, f.target);
+  const marker = join(f.cacheRoot, f.scope.sessionId + '.cleanup.json');
+  const intent = JSON.parse(await fs.readFile(marker, 'utf8'));
+  expect(intent.version).toBe(2);
+  intent.version = 1;
+  await fs.writeFile(marker, JSON.stringify(intent));
+  expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+  expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
+  expect(await fs.readFile(join(f.directory, 'config.json'), 'utf8')).toContain(f.material.config.secret);
+  expect(JSON.parse(await fs.readFile(marker, 'utf8')).version).toBe(1);
+});
+
+it('removes both exact session UUID parents before acknowledging final cleanup', async () => {
+  const f = await fixture(),
+    cache = f.makeCache();
+  expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+  await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, f.target);
+  expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
+  await expect(fs.lstat(join(f.cacheRoot, f.scope.sessionId))).rejects.toMatchObject({ code: 'ENOENT' });
+  await expect(fs.lstat(dirname(f.directory))).rejects.toMatchObject({ code: 'ENOENT' });
+  expect(await fs.readdir(f.cacheRoot)).toEqual([]);
+  expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
+});

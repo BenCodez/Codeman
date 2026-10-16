@@ -80,9 +80,11 @@ describe('appendBoundedPending', () => {
     expect(appendBoundedPending(['a', 'b'], 'c')).toEqual(['a', 'b', 'c']);
   });
 
-  it('drops the OLDEST chunk when the cap is exceeded, keeping the tail', () => {
+  it('refuses capacity without evicting previously accepted chunks', () => {
     const big = 'x'.repeat(REMOTE_WAKE_PENDING_MAX_BYTES);
-    expect(appendBoundedPending([big], 'newest')).toEqual(['newest']);
+    const accepted = [big];
+    expect(appendBoundedPending(accepted, 'newest')).toBe(accepted);
+    expect(accepted).toEqual([big]);
   });
 
   it('drops an oversized chunk outright instead of delivering a fragment of it', () => {
@@ -277,6 +279,52 @@ function harness(
 }
 
 describe('RemoteWakeRegistry', () => {
+  it('joins the whole in-flight wake even after the readiness probe succeeds', async () => {
+    const h = harness();
+    const reattaching = Promise.withResolvers<void>();
+    const attached = Promise.withResolvers<boolean>();
+    h.reattachRemote.mockImplementation(async () => {
+      reattaching.resolve();
+      return attached.promise;
+    });
+    const waking = h.registry.wake(h.session);
+    await reattaching.promise;
+    let completed = false;
+    const ensure = h.registry.ensureAwake(h.session).then((ok) => {
+      completed = true;
+      return ok;
+    });
+    try {
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(completed).toBe(false);
+      expect(h.writeViaMux).not.toHaveBeenCalled();
+    } finally {
+      attached.resolve(true);
+    }
+    await expect(waking).resolves.toBe(true);
+    await expect(ensure).resolves.toBe(true);
+    expect(h.reattachRemote).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['drop', 'stop'] as const)('refuses stale wake completion after %s during readiness', async (cancel) => {
+    const h = harness();
+    const started = Promise.withResolvers<void>();
+    const ready = Promise.withResolvers<boolean>();
+    h.waitUntilReady.mockImplementation(async () => {
+      started.resolve();
+      return ready.promise;
+    });
+    const waking = h.registry.wake(h.session);
+    await started.promise;
+    if (cancel === 'drop') h.registry.drop(h.session.id);
+    else h.registry.stop();
+    ready.resolve(true);
+    await expect(waking).resolves.toBe(false);
+    expect(h.reattachRemote).not.toHaveBeenCalled();
+    expect(h.writeViaMux).not.toHaveBeenCalled();
+  });
+
   it('does nothing at all when the host has no wake command', async () => {
     const h = harness({ remote: { hostId: 'x', label: 'X', host: '10.0.0.9' } });
     await expect(h.registry.handleInput(h.session, 'a')).resolves.toBe('deliver');
