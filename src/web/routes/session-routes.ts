@@ -1889,6 +1889,14 @@ export function registerSessionRoutes(
         notSent: true,
       });
     }
+    const deadInputResponse = (notSent: boolean) =>
+      reply.code(409).send({
+        ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'The worker has exited; retry input after it restarts'),
+        retryable: true,
+        ...(notSent ? { notSent: true } : {}),
+      });
+    const inputKnownUnsent = () =>
+      !session.hasAppliedInputSeq(clientId as string, seq as number) && !session.paneLifecycleInFlight;
     let unlockInput: (() => void) | undefined;
     let backgroundOwnsQueue = false;
     const acquired = new Promise<void>((resolve) => {
@@ -1927,6 +1935,9 @@ export function registerSessionRoutes(
           retryable: true,
           notSent: true,
         };
+      // Cached, locality-filtered exits refuse without probing tmux, claiming
+      // delivery, or recording owner intent. The received FIFO slot stays intact.
+      if (tagged && session.paneExit) return deadInputResponse(inputKnownUnsent());
       if (session.recoveryInputReserved) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');
       }
@@ -1955,6 +1966,7 @@ export function registerSessionRoutes(
         if (
           !duplicate &&
           !ownerIntentNoted &&
+          !(tagged && session.paneExit) &&
           ctx.sessions.get(id) === session &&
           !abortWait?.signal.aborted &&
           canAccessOwned(getAuthUser(req), session.owner) &&
@@ -2031,6 +2043,8 @@ export function registerSessionRoutes(
           }
         }
 
+        if (tagged && session.paneExit) return deadInputResponse(inputKnownUnsent());
+
         const timeoutMs = clampWaitMs(waitTimeout ?? undefined);
         let workerDead = false;
         const inputWait: { promise: Promise<SignalWaitResult> | null } = { promise: null };
@@ -2038,6 +2052,7 @@ export function registerSessionRoutes(
         // letting an earlier queued owner's turn satisfy a fresh send-and-wait.
         const registerInputWait = () => {
           workerDead = wantsWait && workerIsDead(ctx.mux, session);
+          if (tagged && workerDead) return;
           if (wantsWait) {
             inputWait.promise = sessionWaits.waitForSignal(id, {
               until,
@@ -2072,6 +2087,7 @@ export function registerSessionRoutes(
         };
         let legacyBackground = false;
         const inputCurrent = () => {
+          if (tagged && session.paneExit) return false;
           if (
             ctx.sessions.get(id) !== session ||
             req.raw.aborted ||
@@ -2132,6 +2148,7 @@ export function registerSessionRoutes(
           const delivery = (async () => {
             if (!inputCurrent()) return;
             registerInputWait();
+            if (tagged && workerDead) return;
             if (workerDead) delete writeOptions.inputSeq;
             if ((useMux || autoMux) && inputWait.promise) {
               // The response is already staying open for the wait, so the tmux write can be
@@ -2186,6 +2203,8 @@ export function registerSessionRoutes(
           } else await delivery;
         }
 
+        if (tagged && (session.paneExit || workerDead))
+          return deadInputResponse(!delivered && !duplicate && inputKnownUnsent());
         if (!duplicate && tagged && delivered && !workerDead) session.commitInputSeq(clientId as string, seq as number);
 
         if (!backgroundOwnsQueue) releaseInputDispatch();

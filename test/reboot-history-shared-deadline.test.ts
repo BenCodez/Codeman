@@ -1,7 +1,7 @@
-/** Real private broker/rollout files, responsive staged reads, and one monotonic batch budget. */
+/** @fileoverview Real private broker/rollout files, responsive staged reads, and one monotonic batch budget. */
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
@@ -253,4 +253,81 @@ it('expired shared evidence starts no new broker, binding, or witness filesystem
   expect(await captureRebootBrokerBindings(f.states, deadline)).toBeUndefined();
   expect(await witnesses.checkCodexIdentityWitnesses([], [], deadline)).toBe(false);
   expect(open).not.toHaveBeenCalled();
+});
+
+it.each([
+  'completed-legacy',
+  'broker-still-required',
+  'malformed',
+  'wrong-uuid',
+  'changed-scope',
+  'cancelled',
+  'stalled-first',
+] as const)('retains only completely validated identities after a later home stalls: %s', async (kind) => {
+  const f = await fixtures(2);
+  const [firstId, stalledId] = Object.keys(f.states);
+  const first = f.states[firstId],
+    stalled = f.states[stalledId];
+  const stalledHome = join(root, 'stalled-home');
+  await fs.mkdir(join(stalledHome, 'sessions'), { recursive: true });
+  const stalledRollout = join(stalledHome, 'sessions', basename(f.rollouts[1]));
+  await fs.rename(f.rollouts[1], stalledRollout);
+  Object.assign(stalled, { __codexRecoveryHome: stalledHome, __envOverrides: { CODEX_HOME: stalledHome } });
+  if (kind !== 'broker-still-required') f.bindings.set(firstId, null);
+  f.bindings.set(stalledId, null);
+  if (kind === 'malformed') await fs.writeFile(f.rollouts[0], '{bad frame\n');
+  if (kind === 'wrong-uuid') first.codexConfig!.resumeSessionId = randomUUID();
+  const entered = barrier(),
+    release = barrier();
+  releases.push(release.release);
+  let closed = false,
+    current = true,
+    settled = false;
+  const opens: Array<{ path: string; at: number }> = [];
+  const open = fs.open.bind(fs);
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    opens.push({ path: String(args[0]), at: performance.now() });
+    const handle = await open(...args);
+    if (args[0] === stalledRollout) {
+      const read = handle.read.bind(handle),
+        close = handle.close.bind(handle);
+      handle.read = (async (...input: unknown[]) => {
+        entered.release();
+        await release.promise;
+        return (read as (...args: unknown[]) => Promise<unknown>)(...input);
+      }) as typeof handle.read;
+      handle.close = async () => {
+        await close();
+        closed = true;
+      };
+    }
+    return handle;
+  });
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+  const ids = kind === 'stalled-first' ? [stalledId, firstId] : [firstId, stalledId];
+  const planning = planVerifiedRebootRestore(
+    ids,
+    f.states,
+    async () => ({ status: 'present' as const, dev: 1, ino: 1 }),
+    f.bindings,
+    () => current
+  ).then((plan) => {
+    settled = true;
+    return plan;
+  });
+  jobs.push(planning);
+  await entered.promise;
+  if (kind === 'changed-scope') first.owner = 'changed-owner';
+  if (kind === 'cancelled') current = false;
+  await vi.advanceTimersByTimeAsync(2000);
+  await until(() => settled);
+  const plan = await planning;
+  expect(plan.restore.map((entry) => entry.sessionId)).toEqual(kind === 'completed-legacy' ? [firstId] : []);
+  expect(plan.skipped).toHaveLength(kind === 'completed-legacy' ? 1 : 2);
+  expect(performance.now()).toBe(2000);
+  expect(opens.every((entry) => entry.at < 2000)).toBe(true);
+  expect(opens.some((entry) => f.configs.includes(entry.path))).toBe(false);
+  expect(closed).toBe(false);
+  release.release();
+  await until(() => closed);
 });

@@ -420,8 +420,10 @@ async function withHistoricalInput(
   planning = false,
   deadline = performance.now() + 2000
 ): Promise<CodexRebootEvidence | undefined> {
-  if (performance.now() >= deadline) return undefined;
+  // Legacy bindings require no remaining filesystem validation. Preserve an
+  // already completed identity even if a later home's scan used the budget.
   if (binding === null) return identity;
+  if (performance.now() >= deadline) return undefined;
   const home = normalizedCodexHome((state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome);
   if (!home) return undefined;
   const evidence = await CodexInputBroker.inspectHistoricalEvidence(
@@ -564,7 +566,7 @@ export async function planVerifiedRebootRestore(
     deadline
   );
   for (const [index, resolution] of resolutions.entries()) {
-    if (!current() || performance.now() >= deadline) break;
+    if (!current()) break;
     const candidate = candidates[index];
     const id = resolution.conversationId;
     if (

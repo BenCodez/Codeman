@@ -2805,8 +2805,10 @@ export class Session extends EventEmitter {
 
   /** The synchronous effect consumes one exact, current durable-fence receipt. */
   async writeAsync(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
+    if (options.inputSeq && this.paneExit) return false;
     if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return this.write(data, options);
     return this._queueOwnedInput(data, options, async () => {
+      if (options.inputSeq && this.paneExit) return false;
       if (this.recoveryInputReserved) return false;
       this._ordinaryInputWrites++;
       try {
@@ -6307,12 +6309,14 @@ export class Session extends EventEmitter {
    * input could disappear while the caller believed it had been delivered.
    */
   write(data: string, options: SessionWriteOptions = {}): boolean {
+    if (options.inputSeq && this.paneExit) return false;
     // Public synchronous callers cannot borrow a receipt between the private
     // preparer's resolution and its owner's awaited continuation.
     if (getCli(this.mode)?.capabilities.recovery === 'codex-rollout') throw new RebootIdentityFenceError();
     return this._doWritePreparedInput(data, options);
   }
   private _doWritePreparedInput(data: string, options: SessionWriteOptions): boolean {
+    if (options.inputSeq && this.paneExit) return false;
     if (!this._inputCallerCurrent(options)) return false;
     if (!this.inputDispatchAllowed || this.recoveryInputReserved) {
       this._rejectLifecycleOwnerInput(data, options);
@@ -6330,6 +6334,7 @@ export class Session extends EventEmitter {
         this._noteRejectedOwnedInput(options);
         return false;
       }
+      if (options.inputSeq && this.paneExit) return false;
       const submittedPrompt = this._trackSubmit(data, options);
       try {
         this.ptyProcess.write(input);
@@ -6802,11 +6807,13 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
+    if (options.inputSeq && this.paneExit) return false;
     if (!this.inputDispatchAllowed || this.recoveryInputReserved) {
       this._rejectLifecycleOwnerInput(data, options);
       return false;
     }
     return this._queueOwnedInput(data, options, async () => {
+      if (options.inputSeq && this.paneExit) return false;
       if (this.recoveryInputReserved) return false;
       this._ordinaryInputWrites++;
       try {
@@ -6820,6 +6827,7 @@ export class Session extends EventEmitter {
 
   private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
     await this._prepareRecoveryInput(data, options);
+    if (options.inputSeq && this.paneExit) return false;
     const viaMux = !!(this._mux && this._muxSession);
     if (!viaMux && !this.ptyProcess) {
       this._noteRejectedOwnedInput(options);
@@ -6850,6 +6858,7 @@ export class Session extends EventEmitter {
       this._noteRejectedOwnedInput(options);
       return false;
     }
+    if (options.inputSeq && this.paneExit) return false;
     const submittedPrompt = this._trackSubmit(data, options, viaMux);
     if (this._mux && this._muxSession) {
       let sent: boolean;
