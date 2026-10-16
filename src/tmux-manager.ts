@@ -26,6 +26,8 @@ import { randomUUID } from 'node:crypto';
 import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
 import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
 import { collectDescendants } from './proc-tree.js';
+import { prepareRebootWorkspaceLaunch, type RebootWorkspaceLaunch } from './recovery/reboot-workspace-launch.js';
+import { isMultiUserMode } from './config/multiuser.js';
 import { execSync, exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -2894,7 +2896,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const priorCreateRecord = this.sessions.get(sessionId);
     let inputBroker: CodexInputBroker | undefined;
     let brokerDispatchStarted = false;
+    let workspaceLaunch: RebootWorkspaceLaunch | undefined;
     try {
+      const workspaceGuard = options.codexRestoreGuard ?? options.restoreGuard;
+      if (workspaceGuard && owner && isMultiUserMode()) {
+        if (options.codexRestoreGuard) {
+          await options.codexRestoreGuard.prepare();
+          if ((await options.codexRestoreGuard.confirm()) !== true)
+            throw new Error('Reboot restoration authority changed');
+        }
+        if (options.restoreGuard) {
+          await options.restoreGuard.prepare();
+          if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
+            throw new Error('Reboot restoration authority changed');
+        }
+        workspaceLaunch = await prepareRebootWorkspaceLaunch(
+          owner,
+          workingDir,
+          () => workspaceGuard.isCurrent?.() === true,
+          workspaceGuard.getWorkspaceDeadline?.() ?? Infinity
+        );
+        if (!workspaceLaunch) throw new Error('Reboot workspace identity unavailable');
+      }
       // Build the full command to run inside tmux
       const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
       const fullCmd = docker
@@ -2902,7 +2925,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : remote
           ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
           : localFullCmd;
-      const originalLaunch = remote || docker ? fullCmd : `cd ${shellescape(workingDir)} && ${fullCmd}`;
+      const originalLaunch =
+        remote || docker
+          ? fullCmd
+          : workspaceLaunch
+            ? workspaceLaunch.wrap(fullCmd)
+            : `cd ${shellescape(workingDir)} && ${fullCmd}`;
       inputBroker =
         localCodex && codexConfig?.noDaemon === true
           ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!options.codexRestoreGuard)
@@ -2949,6 +2977,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
           throw new Error('Reboot restoration authority changed');
       }
+      if (workspaceLaunch && !workspaceLaunch.isCurrent()) throw new Error('Reboot workspace changed');
       attemptedRestoreShell = !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard;
       const created = execSync(createSessionCommand, {
         cwd: TMUX_LAUNCH_CWD,
@@ -3076,6 +3105,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Dispatch can start a worker before a timeout/exception is returned. Seal before sending bytes.
       const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
       const optionalDispatch = !!inputBroker && !options.codexRestoreGuard && !options.restoreGuard;
+      if (workspaceLaunch && !workspaceLaunch.isCurrent()) throw new Error('Reboot workspace changed');
       options.codexRestoreGuard?.noteDispatch?.();
       const spawnCommand = `respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t ${restorePane ? shellescape(restorePane.paneId) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
       const dispatchCommand = optionalDispatch
@@ -3096,6 +3126,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         throw new Error('Reboot restoration authority changed');
       launchedRestoreWorker = !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard;
       options.restoreGuard?.noteDispatch?.();
+      workspaceLaunch?.noteDispatch();
       brokerDispatchStarted = true;
       const spawned = execSync(
         `${this.tmux()} ${restorePane ? `if-shell -F -t ${shellescape(restorePane.paneId)} ${shellescape(restorePredicate!)} ${shellescape(dispatchCommand)} ${shellescape('display-message -p CODEMAN_REBOOT_LAUNCH_REFUSED')}` : spawnCommand}`,
@@ -3316,6 +3347,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
       throw new Error(`Failed to create tmux session: ${getErrorMessage(err)}`);
     } finally {
+      workspaceLaunch?.release();
       if (!brokerDispatchStarted) await inputBroker?.rollbackUnlaunchedProvisioning?.();
     }
   }
