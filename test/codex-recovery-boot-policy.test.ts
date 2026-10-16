@@ -26,6 +26,17 @@ const THREAD = '11111111-2222-3333-4444-555555555555';
 const sessions: Session[] = [];
 const multiplexers: TmuxManager[] = [];
 const resolver = vi.mocked(resolveCodexIdentity);
+const attachEffects = vi.hoisted(() => ({
+  spawn: vi.fn(() => ({
+    pid: 0,
+    write: vi.fn(),
+    resize: vi.fn(),
+    kill: vi.fn(),
+    onData: () => ({ dispose() {} }),
+    onExit: () => ({ dispose() {} }),
+  })),
+}));
+vi.mock('node-pty', () => ({ spawn: attachEffects.spawn }));
 
 beforeAll(async () => {
   process.env.CODEMAN_MULTIUSER = '1';
@@ -51,7 +62,12 @@ afterAll(() => {
   invalidateUsersCache();
 });
 
-async function attachSavedPane(config: Partial<CodexConfig> = {}, env?: Record<string, string>) {
+async function attachSavedPane(
+  config: Partial<CodexConfig> = {},
+  env?: Record<string, string>,
+  provenance: Partial<MuxSession> = {},
+  deadPane?: boolean
+) {
   const codexConfig: CodexConfig = {
     noDaemon: true,
     noAltScreen: true,
@@ -90,6 +106,8 @@ async function attachSavedPane(config: Partial<CodexConfig> = {}, env?: Record<s
     owner: saved.owner,
     recoveryIsolated: true,
     recoveryCodexHome: envOverrides.CODEX_HOME ?? join(homedir(), '.codex'),
+    recoveryInputBroker: 'bbbbbbbb-cccc-dddd-eeee-ffffffffffff',
+    ...provenance,
   };
   const mux = new TmuxManager();
   multiplexers.push(mux);
@@ -98,7 +116,14 @@ async function attachSavedPane(config: Partial<CodexConfig> = {}, env?: Record<s
   vi.spyOn(mux, 'startMouseModeSync').mockImplementation(() => {});
   vi.spyOn(mux, 'startPaneExitWatcher').mockImplementation(() => {});
   vi.spyOn(mux, 'startRemoteReconnectWatcher').mockImplementation(() => {});
-  const attach = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue();
+  const start = Session.prototype.startInteractive;
+  const attach = vi.spyOn(Session.prototype, 'startInteractive').mockImplementation(function () {
+    return deadPane === undefined ? Promise.resolve() : start.call(this);
+  });
+  vi.spyOn(mux, 'muxSessionExists').mockReturnValue(true);
+  vi.spyOn(mux, 'isPaneDead').mockReturnValue(deadPane === true);
+  const respawn = vi.spyOn(mux, 'respawnPane').mockResolvedValue(54321);
+  const create = vi.spyOn(mux, 'createSession');
   const context = {
     mux,
     sessions: new Map<string, Session>(),
@@ -119,7 +144,7 @@ async function attachSavedPane(config: Partial<CodexConfig> = {}, env?: Record<s
   expect(context.store.getSessions).toHaveBeenCalled();
   expect(context.store.getSessions.mock.invocationCallOrder[0]).toBeLessThan(attach.mock.invocationCallOrder[0]);
   expect(context.persistSessionState).toHaveBeenCalledWith(session);
-  return { session, saved, codexConfig, envOverrides };
+  return { session, saved, codexConfig, envOverrides, respawn, create };
 }
 
 async function expectCurrentGrantRefusal(session: Session): Promise<void> {
@@ -147,6 +172,24 @@ async function expectCurrentGrantRefusal(session: Session): Promise<void> {
 }
 
 describe('boot attachment preserves the actual Codex launch policy', () => {
+  it.each([
+    { name: 'isolated broker', config: {}, provenance: {}, preserve: true },
+    { name: 'shared daemon', config: { noDaemon: false }, provenance: {}, preserve: false },
+    { name: 'missing noDaemon', config: { noDaemon: undefined }, provenance: {}, preserve: false },
+    { name: 'optional fallback', config: {}, provenance: { recoveryInputBroker: undefined }, preserve: false },
+    { name: 'nonisolated launch', config: {}, provenance: { recoveryIsolated: false }, preserve: false },
+    { name: 'malformed broker', config: {}, provenance: { recoveryInputBroker: 'unverified' }, preserve: false },
+    { name: 'unknown home', config: {}, provenance: { recoveryCodexHome: undefined }, preserve: false },
+    { name: 'changed home', config: {}, provenance: { recoveryCodexHome: '/different/home' }, preserve: false },
+    { name: 'uncertain broker dispatch', config: {}, provenance: { pid: 0 }, preserve: true },
+  ])('preserves only recovery-eligible dead-pane startup: $name', async ({ config, provenance, preserve }) => {
+    const { session, codexConfig, respawn, create } = await attachSavedPane(config, undefined, provenance, true);
+    expect(respawn).toHaveBeenCalledTimes(preserve ? 0 : 1);
+    if (!preserve) expect(respawn.mock.lastCall?.[0].codexConfig).toEqual(codexConfig);
+    expect(create).not.toHaveBeenCalled();
+    expect(session.getRecoveryContext().switchPending).toBe(preserve);
+  });
+
   it('does not sanitize saved unsafe flags or the active home when the grant was revoked before boot', async () => {
     await updateUser('worker', { canBypassPermissions: false });
     const { session, saved, codexConfig, envOverrides } = await attachSavedPane();

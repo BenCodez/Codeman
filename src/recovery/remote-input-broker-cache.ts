@@ -8,6 +8,7 @@ import type { SessionRemote } from '../types.js';
 import { CodexInputBroker, type BrokerProvisioningMaterial } from './codex-input-broker.js';
 import { CODEX_INPUT_BROKER_SOURCE } from './codex-input-broker-source.js';
 import type { PrivateFileWitness } from './private-file-witness.js';
+import { cleanupRemoteBroker, type RemoteBrokerCleanupTarget } from './remote-broker-cleanup.js';
 
 export interface OwnedRemoteBrokerScope {
   sessionId: string;
@@ -34,6 +35,15 @@ type Entry = {
   signer?: CodexInputBroker;
 };
 type CacheEpoch = { id: string; pending: number };
+type Preparation = {
+  entry: Entry;
+  epoch: CacheEpoch;
+  file: Stats;
+  parents: Stats[];
+  bytes: Buffer;
+  unlinked?: boolean;
+  removed?: boolean;
+};
 type CleanupIntent = {
   version: 1;
   sessionId: string;
@@ -42,6 +52,7 @@ type CleanupIntent = {
   rootIno: number;
   sessionDev: number;
   sessionIno: number;
+  target?: RemoteBrokerCleanupTarget;
 };
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const MAX_BYTES = 524_288;
@@ -110,6 +121,39 @@ function privateStat(value: Stats, directory = false): boolean {
 }
 function same(a: Stats, b: Stats): boolean {
   return a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
+}
+function validCleanupTarget(value: RemoteBrokerCleanupTarget): boolean {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    !Array.isArray(value) &&
+    Object.keys(value).every((key) => key === 'remote' || key === 'owner') &&
+    (value.owner === undefined || (typeof value.owner === 'string' && /^[\w-]{1,100}$/.test(value.owner))) &&
+    !!value.remote &&
+    typeof value.remote === 'object' &&
+    !Array.isArray(value.remote) &&
+    value.remote.owned !== false &&
+    ['host', 'hostId', 'username', 'remotePath'].every(
+      (key) =>
+        typeof value.remote[key as keyof SessionRemote] === 'string' &&
+        (value.remote[key as keyof SessionRemote] as string).length > 0
+    ) &&
+    Buffer.byteLength(JSON.stringify(value)) <= 65536
+  );
+}
+function privateMaterialKeys(value: object): boolean {
+  return (
+    Object.keys(value).sort().join(',') ===
+    ['directory', 'material', 'scope', 'version', ...(Object.hasOwn(value, 'scopeData') ? ['scopeData'] : [])]
+      .sort()
+      .join(',')
+  );
+}
+function validStoredScope(value: { scope: unknown; scopeData?: OwnedRemoteBrokerScope }, sessionId: string): boolean {
+  return (
+    value.scopeData === undefined ||
+    (value.scopeData?.sessionId === sessionId && scopeKey(value.scopeData) === value.scope)
+  );
 }
 function descriptor(
   scope: { sessionId: string; codexHome?: string },
@@ -198,7 +242,12 @@ export class OwnedRemoteBrokerCache {
   private readonly scopes = new Map<string, string>();
   private readonly epochs = new Map<string, CacheEpoch>();
   private readonly deletions = new Map<string, object>();
-  constructor(private readonly root = join(getDataDirPath(), 'remote-input-brokers')) {}
+  private readonly preparations = new WeakMap<OwnedRemoteBrokerDescriptor, Preparation>();
+  private readonly canceledPreparations = new Map<string, OwnedRemoteBrokerDescriptor>();
+  constructor(
+    private readonly root = join(getDataDirPath(), 'remote-input-brokers'),
+    private readonly remoteCleanup?: typeof cleanupRemoteBroker
+  ) {}
   private begin(sessionId: string): CacheEpoch {
     let epoch = this.epochs.get(sessionId);
     if (!epoch) {
@@ -217,6 +266,8 @@ export class OwnedRemoteBrokerCache {
   retire(sessionId: string): void {
     this.epochs.delete(sessionId);
     this.scopes.delete(sessionId);
+    for (const key of this.canceledPreparations.keys())
+      if (key.startsWith(sessionId + ':')) this.canceledPreparations.delete(key);
     for (const [key, entry] of this.entries) {
       if (!key.startsWith(sessionId + ':')) continue;
       entry.signer?.retire();
@@ -250,7 +301,7 @@ export class OwnedRemoteBrokerCache {
     let before: Stats, bytes: Buffer;
     try {
       before = await file.stat();
-      if (!privateStat(before) || before.size > 1024) throw Error('Unknown cleanup intent');
+      if (!privateStat(before) || before.size > MAX_BYTES) throw Error('Unknown cleanup intent');
       bytes = Buffer.alloc(before.size + 1);
       const read = await file.read(bytes, 0, bytes.length, 0);
       if (read.bytesRead !== before.size || !same(before, await file.stat())) throw Error('Changed cleanup intent');
@@ -262,10 +313,23 @@ export class OwnedRemoteBrokerCache {
     const value = JSON.parse(text) as CleanupIntent;
     if (
       !value ||
-      Object.keys(value).sort().join(',') !== 'retiredHash,rootDev,rootIno,sessionDev,sessionId,sessionIno,version' ||
+      Object.keys(value).sort().join(',') !==
+        [
+          'retiredHash',
+          'rootDev',
+          'rootIno',
+          'sessionDev',
+          'sessionId',
+          'sessionIno',
+          'version',
+          ...(value.target === undefined ? [] : ['target']),
+        ]
+          .sort()
+          .join(',') ||
       value.version !== 1 ||
       value.sessionId !== sessionId ||
       !/^[a-f0-9]{64}$/.test(value.retiredHash) ||
+      (value.target !== undefined && !validCleanupTarget(value.target)) ||
       ![value.rootDev, value.rootIno, value.sessionDev, value.sessionIno].every(
         (number) => Number.isSafeInteger(number) && number >= 0
       )
@@ -277,7 +341,12 @@ export class OwnedRemoteBrokerCache {
     return { value, text, stat: current };
   }
   /** Acknowledge retirement before removing the last owner-visible session record. */
-  async stageFinalCleanup(sessionId: string, retiredState: unknown, isCurrent: () => boolean): Promise<void> {
+  async stageFinalCleanup(
+    sessionId: string,
+    retiredState: unknown,
+    isCurrent: () => boolean,
+    target?: RemoteBrokerCleanupTarget
+  ): Promise<void> {
     if (!UUID.test(sessionId)) return;
     const deadline = performance.now() + 2000,
       current = () => performance.now() < deadline && isCurrent() === true;
@@ -314,7 +383,9 @@ export class OwnedRemoteBrokerCache {
         rootIno: parents[0].ino,
         sessionDev: parents[1].dev,
         sessionIno: parents[1].ino,
+        ...(target === undefined ? {} : { target: structuredClone(target) }),
       };
+      if (value.target !== undefined && !validCleanupTarget(value.target)) throw Error('Unknown cleanup target');
       const text = JSON.stringify(value),
         path = this.cleanupPath(sessionId);
       let existing: Awaited<ReturnType<OwnedRemoteBrokerCache['readCleanupIntent']>> | undefined;
@@ -411,7 +482,7 @@ export class OwnedRemoteBrokerCache {
         return false;
       }
     };
-    if (!(await this.retireAndDelete(sessionId, current))) return false;
+    if (!(await this.retireAndDelete(sessionId, current, intent.value.target))) return false;
     const acknowledged = await this.readCleanupIntent(sessionId);
     if (!current() || !same(acknowledged.stat, intent.stat) || acknowledged.text !== intent.text) return false;
     await fs.unlink(this.cleanupPath(sessionId));
@@ -423,7 +494,7 @@ export class OwnedRemoteBrokerCache {
     }
     return true;
   }
-  /** Local private-file work only. Each pass is bounded and retains its directory cursor. */
+  /** Each pass is bounded and retains its cursor and private remote retry material. */
   startFinalCleanupRetries(read: (id: string) => { live: boolean; state?: unknown }): () => Promise<void> {
     let stopped = false,
       scan: Dir | undefined,
@@ -483,7 +554,11 @@ export class OwnedRemoteBrokerCache {
     };
   }
   /** Final owner deletion only. Unknown files remain private and are never recursively removed. */
-  async retireAndDelete(sessionId: string, isCurrent: () => boolean): Promise<boolean> {
+  async retireAndDelete(
+    sessionId: string,
+    isCurrent: () => boolean,
+    target?: RemoteBrokerCleanupTarget
+  ): Promise<boolean> {
     const callerCurrent = () => {
       try {
         const verdict: unknown = isCurrent();
@@ -552,12 +627,29 @@ export class OwnedRemoteBrokerCache {
                   const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
                   if (
                     !value ||
-                    Object.keys(value).sort().join(',') !== 'directory,material,scope,version' ||
+                    !privateMaterialKeys(value) ||
+                    !validStoredScope(value, sessionId) ||
                     value.version !== 1 ||
                     !/^[a-f0-9]{64}$/.test(value.scope) ||
                     descriptor({ sessionId }, value.material, value.directory)?.incarnation !== item.name
                   )
                     throw Error('Unknown private material');
+                  // The local source template is the last exact remote identity
+                  // witness. Retain it and the durable intent until remote ACK.
+                  if (
+                    target &&
+                    (!value.scopeData ||
+                      scopeKey({ ...value.scopeData, remote: target.remote, owner: target.owner }) !== value.scope ||
+                      !(await (this.remoteCleanup ?? cleanupRemoteBroker)(
+                        target,
+                        value.directory,
+                        value.material,
+                        current
+                      )))
+                  ) {
+                    complete = false;
+                    continue;
+                  }
                   // All proof handles have closed before this common final scan.
                   const after = await Promise.all([...dirs, path].map((path) => fs.lstat(path)));
                   if (
@@ -644,12 +736,147 @@ export class OwnedRemoteBrokerCache {
   private directories(sessionId: string, incarnation: string): string[] {
     return [this.root, join(this.root, sessionId), join(this.root, sessionId, incarnation)];
   }
+  /** Caller certifies no reservation/remote dispatch was attempted for this exact prepare receipt. */
+  async discardUnreservedPreparation(
+    scope: OwnedRemoteBrokerScope,
+    receipt: OwnedRemoteBrokerDescriptor
+  ): Promise<boolean> {
+    const prepared = this.preparations.get(receipt),
+      key = scope.sessionId + ':' + receipt.incarnation;
+    const current = () =>
+      !!prepared &&
+      !this.deletions.has(scope.sessionId) &&
+      this.epochs.get(scope.sessionId) === prepared.epoch &&
+      this.entries.get(key) === prepared.entry &&
+      prepared.entry.epoch === prepared.epoch &&
+      prepared.entry.scope === scopeKey(scope) &&
+      !prepared.entry.signer &&
+      Object.keys(receipt).length === Object.keys(prepared.entry.descriptor).length &&
+      Object.entries(prepared.entry.descriptor).every(
+        ([field, value]) => receipt[field as keyof OwnedRemoteBrokerDescriptor] === value
+      );
+    if (!prepared || !current()) return false;
+    this.canceledPreparations.set(key, receipt);
+    const dirs = this.directories(scope.sessionId, receipt.incarnation),
+      path = join(dirs[2], 'private.json'),
+      expected = prepared.bytes,
+      deadline = performance.now() + 2000,
+      check = () => current() && performance.now() < deadline;
+    const finish = async () => {
+      const parent = await fs.open(dirs[1], constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+      try {
+        await parent.sync();
+      } finally {
+        await parent.close();
+      }
+      const finalParents = dirs.slice(0, 2).map((path) => lstatSync(path));
+      if (
+        !check() ||
+        finalParents.some(
+          (stat, index) =>
+            !privateStat(stat, true) ||
+            stat.dev !== prepared.parents[index].dev ||
+            stat.ino !== prepared.parents[index].ino
+        )
+      )
+        return false;
+      try {
+        lstatSync(path);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+      }
+      this.entries.delete(key);
+      this.canceledPreparations.delete(key);
+      this.preparations.delete(receipt);
+      if (![...this.entries.keys()].some((entry) => entry.startsWith(scope.sessionId + ':'))) {
+        this.scopes.delete(scope.sessionId);
+        if (prepared.epoch.pending === 0) this.epochs.delete(scope.sessionId);
+      }
+      return true;
+    };
+    return (
+      (await bounded('discard:' + path, async () => {
+        if (prepared.removed) return finish();
+        const parents = await Promise.all(dirs.map((path) => fs.lstat(path)));
+        if (
+          !check() ||
+          parents.some(
+            (stat, index) =>
+              !privateStat(stat, true) ||
+              stat.dev !== prepared.parents[index].dev ||
+              stat.ino !== prepared.parents[index].ino
+          )
+        )
+          return false;
+        if (!prepared.unlinked) {
+          const file = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+          try {
+            const stat = await file.stat();
+            if (!privateStat(stat) || !same(stat, prepared.file) || stat.size !== expected.length) return false;
+            const bytes = Buffer.alloc(stat.size + 1),
+              read = await file.read(bytes, 0, bytes.length, 0);
+            if (
+              read.bytesRead !== stat.size ||
+              !bytes.subarray(0, read.bytesRead).equals(expected) ||
+              !same(stat, await file.stat())
+            )
+              return false;
+          } finally {
+            await file.close();
+          }
+          const after = await Promise.all([...dirs, path].map((path) => fs.lstat(path)));
+          if (
+            !check() ||
+            after.slice(0, 3).some((stat, index) => !privateStat(stat, true) || !same(stat, parents[index])) ||
+            !privateStat(after[3]) ||
+            !same(after[3], prepared.file)
+          )
+            return false;
+          await fs.unlink(path);
+          prepared.unlinked = true;
+        }
+        const directory = await fs.open(dirs[2], constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        let empty: Stats;
+        try {
+          await directory.sync();
+          empty = await directory.stat();
+        } finally {
+          await directory.close();
+        }
+        const after = await Promise.all(dirs.map((path) => fs.lstat(path)));
+        if (
+          !check() ||
+          !privateStat(empty, true) ||
+          empty.dev !== prepared.parents[2].dev ||
+          empty.ino !== prepared.parents[2].ino ||
+          after.some((stat, index) => !privateStat(stat, true) || !same(stat, index === 2 ? empty : parents[index]))
+        )
+          return false;
+        // No recursive removal: unrelated artifacts always remain intact.
+        try {
+          await fs.rmdir(dirs[2]);
+          prepared.removed = true;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOTEMPTY') return false;
+          throw error;
+        }
+        return finish();
+      })) === true
+    );
+  }
+  /** Reservation/dispatch permanently ends local known-unsent rollback authority. */
+  sealPreparation(receipt: OwnedRemoteBrokerDescriptor): void {
+    this.preparations.delete(receipt);
+  }
   /** O_EXCL only, after missing/inert remote provisioning and before any broker child launch. */
   async prepare(
     scope: OwnedRemoteBrokerScope,
     material: BrokerProvisioningMaterial,
     directory: string
   ): Promise<OwnedRemoteBrokerDescriptor | undefined> {
+    for (const [key, receipt] of this.canceledPreparations)
+      if (key.startsWith(scope.sessionId + ':')) await this.discardUnreservedPreparation(scope, receipt);
     const key = scopeKey(scope);
     if (this.deletions.has(scope.sessionId)) return undefined;
     const proof = descriptor(scope, material, directory);
@@ -657,7 +884,9 @@ export class OwnedRemoteBrokerCache {
     let copied: BrokerProvisioningMaterial, bytes: Buffer;
     try {
       copied = structuredClone(material);
-      bytes = Buffer.from(JSON.stringify({ version: 1, scope: key, directory, material: copied }));
+      bytes = Buffer.from(
+        JSON.stringify({ version: 1, scope: key, directory, material: copied, scopeData: structuredClone(scope) })
+      );
     } catch {
       return undefined;
     }
@@ -674,6 +903,8 @@ export class OwnedRemoteBrokerCache {
     const file = join(dirs[2], 'private.json');
     const sessionId = scope.sessionId;
     const epoch = this.begin(sessionId);
+    let ownedFile: Stats | undefined;
+    const ownedParents: Stats[] = [];
     try {
       const prepared = await bounded(
         'write:' + file + ':' + createHash('sha256').update(bytes).digest('hex') + ':' + epoch.id,
@@ -692,6 +923,7 @@ export class OwnedRemoteBrokerCache {
           try {
             await handle.writeFile(bytes);
             await handle.sync();
+            ownedFile = await handle.stat();
           } finally {
             await handle.close();
           }
@@ -699,6 +931,7 @@ export class OwnedRemoteBrokerCache {
             const handle = await fs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
             try {
               await handle.sync();
+              ownedParents.unshift(await handle.stat());
             } finally {
               await handle.close();
             }
@@ -715,14 +948,19 @@ export class OwnedRemoteBrokerCache {
       )
         return undefined;
       this.scopes.set(scope.sessionId, key);
-      this.entries.set(entryKey, { epoch, scope: key, material: copied, descriptor: proof });
-      return { ...proof };
+      const entry = { epoch, scope: key, material: copied, descriptor: proof },
+        receipt = { ...proof };
+      this.entries.set(entryKey, entry);
+      if (ownedFile && ownedParents.length === 3)
+        this.preparations.set(receipt, { entry, epoch, file: ownedFile, parents: ownedParents, bytes });
+      return receipt;
     } finally {
       this.finish(sessionId, epoch);
     }
   }
   /** Reads only locally retained launch material; an existing remote pane cannot create this record. */
   async load(scope: OwnedRemoteBrokerScope, incarnation: string): Promise<OwnedRemoteBrokerDescriptor | undefined> {
+    if (this.canceledPreparations.has(scope.sessionId + ':' + incarnation)) return undefined;
     if (this.deletions.has(scope.sessionId)) return undefined;
     const key = scopeKey(scope);
     if (!key || !UUID.test(incarnation)) return undefined;
@@ -764,12 +1002,14 @@ export class OwnedRemoteBrokerCache {
           scope: unknown;
           directory: string;
           material: BrokerProvisioningMaterial;
+          scopeData?: OwnedRemoteBrokerScope;
         };
       });
       if (
         !value ||
         this.epochs.get(scope.sessionId) !== epoch ||
-        Object.keys(value).sort().join(',') !== 'directory,material,scope,version' ||
+        !privateMaterialKeys(value) ||
+        !validStoredScope(value, sessionId) ||
         value.version !== 1 ||
         value.scope !== key ||
         scopeKey(scope) !== key
@@ -791,6 +1031,7 @@ export class OwnedRemoteBrokerCache {
     }
   }
   get(scope: OwnedRemoteBrokerScope, incarnation: string): OwnedRemoteBrokerDescriptor | undefined {
+    if (this.canceledPreparations.has(scope.sessionId + ':' + incarnation)) return undefined;
     const entry = this.entries.get(scope.sessionId + ':' + incarnation);
     return entry &&
       this.epochs.get(scope.sessionId) === entry.epoch &&

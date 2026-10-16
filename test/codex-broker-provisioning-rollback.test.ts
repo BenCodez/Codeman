@@ -132,6 +132,18 @@ it('keeps a healthy returned broker intact and never requests prelaunch rollback
   expect(hooks.receipt).toBeUndefined();
   expect(await fs.readdir(broker.directory)).toEqual(['broker.py', 'config.json', 'lock']);
 });
+it.each([false, true])(
+  'can roll back a returned but unlaunched broker after startup authority changed=%s',
+  async (guarded) => {
+    const f = await fixture();
+    f.fail('none');
+    const broker = await f.create();
+    if (guarded) await broker.setStartupAuthority();
+    await broker.rollbackUnlaunchedProvisioning();
+    expect(await fs.readdir(f.session)).toEqual([]);
+    expect(hooks.receipt?.files.map((file) => file.name)).toEqual(['broker.py', 'config.json', 'lock']);
+  }
+);
 it.each([
   'directory',
   'parent',

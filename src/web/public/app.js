@@ -4105,15 +4105,16 @@ class CodemanApp {
             const bodyBytes = window.CodemanInputLimit?.bytes?.(serializedBody) ?? Infinity;
             // The server bounds tmux at 5s; bound the browser request too so a
             // stalled proxy cannot hold all later keystrokes indefinitely.
-            if (rec.key) rec.abort = new AbortController();
-            const deadline = rec.key ? setTimeout(() => rec.abort.abort(), 10000) : null;
+            const controller = new AbortController();
+            rec.abort = controller;
+            const deadline = setTimeout(() => controller.abort(), 10000);
             try {
               resp = await fetch(`/api/sessions/${sessionId}/${rec.key ? 'send-key' : 'input'}`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: serializedBody,
                 keepalive: !rec.key && bodyBytes < 65536,
-                ...(rec.key ? { signal: rec.abort.signal } : {}),
+                signal: controller.signal,
               });
               if (rec.key && resp.status === 422) {
                 const failure = await resp.json();
@@ -4122,7 +4123,7 @@ class CodemanApp {
                 }
               }
             } finally {
-              if (deadline) clearTimeout(deadline);
+              clearTimeout(deadline);
               rec.abort = null;
             }
           } catch {
@@ -4396,7 +4397,8 @@ class CodemanApp {
     };
     const add = (cid, sid, rec, storedKey, legacy = false) => {
       const partition = group(cid, sid);
-      if (++records > 4096 || (bytes += typeof rec?.data === 'string' ? rec.data.length : 0) > this._reliableMaxBytes)
+      const dataBytes = typeof rec?.data === 'string' ? window.CodemanInputLimit?.bytes?.(rec.data) : 0;
+      if (++records > 4096 || (bytes += Number.isSafeInteger(dataBytes) && dataBytes >= 0 ? dataBytes : 0) > this._reliableMaxBytes)
         throw new Error('Pending input exceeds its bounded recovery limit');
       if (!rec || !Number.isSafeInteger(rec.seq) || rec.seq <= 0) {
         partition.barrier = 0;
@@ -4407,7 +4409,12 @@ class CodemanApp {
         partition.barrier = Math.min(partition.barrier, rec.seq);
         return;
       }
-      if (rec.data.length > (window.CodemanInputLimit?.FRAME_MAX_CHARS ?? Infinity)) return;
+      const frameLimit = window.CodemanInputLimit?.FRAME_MAX_CHARS;
+      if (!Number.isSafeInteger(dataBytes) || dataBytes <= 0 ||
+          !Number.isSafeInteger(frameLimit) || frameLimit <= 0 || dataBytes > frameLimit) {
+        partition.barrier = Math.min(partition.barrier, rec.seq);
+        return;
+      }
       if (!legacy && Object.prototype.hasOwnProperty.call(rec, 'after') &&
           (!rec.after || typeof rec.after !== 'object' || Array.isArray(rec.after) ||
            Object.keys(rec.after).sort().join(',') !== 'cid,seq' ||

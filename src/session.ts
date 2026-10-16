@@ -1990,6 +1990,7 @@ export class Session extends EventEmitter {
       cliLatestVersion: this._cliLatestVersion || undefined,
       openCodeConfig: this._openCodeConfig,
       codexConfig: this._codexConfig,
+      taskSupported: this.taskSupervisionSupported,
       geminiConfig: this._geminiConfig,
       antigravityConfig: this._antigravityConfig,
       piConfig: this._piConfig,
@@ -2904,6 +2905,25 @@ export class Session extends EventEmitter {
       this._preparedRecoveryInput = undefined;
       if (this._namedKeyAbort === abort) this._namedKeyAbort = null;
     }
+  }
+
+  /** Launch-shape eligibility only; admission still verifies current identity and permission evidence. */
+  get taskSupervisionSupported(): boolean {
+    const incarnation = this._muxSession?.recoveryInputBroker;
+    return (
+      getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
+      (!this._remote ||
+        (this._remote.owned !== false &&
+          // Requested flags survive manual-only SSH launch fallbacks. Only
+          // pinned native launch metadata and a committed broker grant tasks.
+          this.getRecoveryContext().noDaemon &&
+          typeof incarnation === 'string' &&
+          /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(incarnation))) &&
+      !this._docker &&
+      !this._discoveredMuxSession &&
+      this._useMux &&
+      this._codexConfig?.noDaemon === true
+    );
   }
 
   /** Private recovery evidence; raw prompts and environment values never enter the public session state. */
@@ -6643,7 +6663,7 @@ export class Session extends EventEmitter {
   private static readonly MAX_PENDING_INPUT_SEQS = 4096;
   private static readonly INPUT_DEFERRED_LEASE_MS = 60_000;
 
-  /** Reclaim only abandoned, certified-unsent tails; never erase delivery proof or sparse holes. */
+  /** Reclaim abandoned unsent input; stale sparse identities remain rejection-sealed. */
   private expireDeferredInputSeq(clientId: string, now: number): void {
     const state = this._appliedInputSeq.get(clientId);
     if (
@@ -6654,7 +6674,13 @@ export class Session extends EventEmitter {
       now - state.deferredAt < Session.INPUT_DEFERRED_LEASE_MS
     )
       return;
-    // A retained sparse hole must not trigger another full scan on each refused frame.
+    if (state.last !== undefined && [...state.waiting].some((seq) => seq <= state.last!)) {
+      // A higher committed frame prevents safely treating the lower hole as
+      // applied. Retire the entire identity instead of pinning its slot forever.
+      this._retiredInputClients.add(clientId);
+      this._appliedInputSeq.delete(clientId);
+      return;
+    }
     state.deferredAt = now;
     for (const seq of state.waiting) {
       // An earlier known-unsent hole still outranks a higher committed watermark.
@@ -6690,7 +6716,10 @@ export class Session extends EventEmitter {
   deferInputSeq(clientId: string, seq: number): boolean {
     const now = performance.now();
     let state = this._appliedInputSeq.get(clientId);
-    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) this.expireDeferredInputSeq(clientId, now);
+    if (state && state.waiting.size >= Session.MAX_PENDING_INPUT_SEQS) {
+      this.expireDeferredInputSeq(clientId, now);
+      state = this._appliedInputSeq.get(clientId);
+    }
     // Active retries renew the lease without relying on adjustable wall time.
     if (state && now >= state.deferredAt) state.deferredAt = now;
     if (state && (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq))) return true;
@@ -6704,6 +6733,10 @@ export class Session extends EventEmitter {
         let idle: string | undefined;
         for (const [id, entry] of this._appliedInputSeq) {
           this.expireDeferredInputSeq(id, now);
+          if (!this._appliedInputSeq.has(id)) {
+            idle = id;
+            break;
+          }
           if (entry.waiting.size === 0 && entry.pending.size === 0) {
             if (entry.last !== undefined) this._retiredInputClients.add(id);
             idle = id;

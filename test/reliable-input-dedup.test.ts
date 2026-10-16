@@ -49,6 +49,39 @@ describe('abandoned known-unsent input admission', () => {
     expect(s.hasAppliedInputSeq('fresh-client', 1)).toBe(true);
   });
 
+  it('retires abandoned sparse identities under capacity pressure without replaying or acknowledging their holes', () => {
+    const setTime = clock();
+    const s = makeSession();
+    for (let i = 0; i < 256; i++) {
+      const client = `sparse-${i}`;
+      expect(s.shouldApplyInput(client, 10)).toBe(true);
+      expect(s.deferInputSeq(client, 3)).toBe(true);
+      s.commitInputSeq(client, 10);
+    }
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(false);
+    setTime(60_000);
+    expect(apply(s, 'fresh-client', 1)).toBe(true);
+    expect(s.shouldApplyInput('sparse-0', 3)).toBe(false);
+    expect(s.hasAppliedInputSeq('sparse-0', 3)).toBe(false);
+    expect(s.shouldApplyInput('sparse-0', 10)).toBe(false);
+    expect(s.shouldApplyInput('sparse-0', 11)).toBe(false);
+    expect(apply(s, 'fresh-client', 2)).toBe(true);
+  });
+
+  it('retires a full stale sparse identity during its own admission while keeping the entire identity sealed', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.shouldApplyInput('sparse', 5000)).toBe(true);
+    for (let seq = 1; seq <= 4095; seq++) expect(s.deferInputSeq('sparse', seq)).toBe(true);
+    s.commitInputSeq('sparse', 5000);
+    expect(s.deferInputSeq('sparse', 6000)).toBe(true);
+    setTime(60_000);
+    expect(s.shouldApplyInput('sparse', 6001)).toBe(false);
+    expect(s.hasAppliedInputSeq('sparse', 1)).toBe(false);
+    expect(s.shouldApplyInput('sparse', 1)).toBe(false);
+    expect(apply(s, 'replacement-document', 1)).toBe(true);
+  });
+
   it('reclaims an expired 4096-frame unsent tail while retaining its committed watermark', () => {
     const setTime = clock();
     const s = makeSession();
