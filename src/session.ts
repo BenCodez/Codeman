@@ -2394,6 +2394,11 @@ export class Session extends EventEmitter {
     return this._supervisorManagerRetirement;
   }
 
+  /** Restriction presence is a worker veto, never proof of usable manager authority. */
+  hasSupervisorManagerLaunch(): boolean {
+    return this._supervisorManagerProfile !== undefined;
+  }
+
   /** Only a newly acknowledged restricted launch can acquire the manager role. Never hydrated from state. */
   isSupervisorManagerLaunchCurrent(): boolean {
     const profile = this._supervisorManagerProfile;

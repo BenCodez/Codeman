@@ -2970,6 +2970,10 @@ export class WebServer extends EventEmitter {
       if (!accepted && managerEvidence === expected) managerEvidence = undefined;
       return accepted;
     };
+    const workerHasManagerRole = (worker: Session) =>
+      worker.hasSupervisorManagerLaunch() ||
+      !!this.supervisorControllers.get(worker.id)?.getStatus().enabled ||
+      !!this.supervisorStore.get(worker.id).enabled;
     const validateWorkerHomes = async (workers: readonly Session[]) => {
       const deadline = performance.now() + 2_000;
       const scope = managerScope();
@@ -2993,6 +2997,7 @@ export class WebServer extends EventEmitter {
           managerIsEligible() &&
           managerScope() === scope &&
           !worker.remote &&
+          !workerHasManagerRole(worker) &&
           worker.owner === session.owner &&
           JSON.stringify([
             worker.owner,
@@ -3028,6 +3033,7 @@ export class WebServer extends EventEmitter {
           this.sessions.get(workerId) === worker &&
           worker.owner === session.owner &&
           !worker.docker &&
+          !workerHasManagerRole(worker) &&
           context.managed &&
           context.noDaemon &&
           !context.switchPending &&
@@ -3069,16 +3075,16 @@ export class WebServer extends EventEmitter {
             )
               throw new SupervisorValidationError('Worker is not an eligible owned isolated Codex session');
             // A failed reset disables the live controller before the durable
-            // manager role is released. Neither state can hide the other's role.
-            if (this.supervisorControllers.get(id)?.getStatus().enabled || this.supervisorStore.get(id).enabled)
-              throw new SupervisorValidationError('Supervisor cycles are not allowed');
+            // manager role is released. A restricted launch remains a manager
+            // even when its role settings are still disabled or readiness is uncertain.
+            if (workerHasManagerRole(worker)) throw new SupervisorValidationError('Supervisor cycles are not allowed');
             workers.push(worker);
           }
           return validateWorkerHomes(workers);
         },
         worker: (id) => {
           const worker = this.sessions.get(id);
-          if (!worker || worker.owner !== session.owner) return undefined;
+          if (!worker || worker.owner !== session.owner || workerHasManagerRole(worker)) return undefined;
           const task = this.getTaskController(worker);
           const recovery = this.getRecoveryController(worker);
           return task && recovery
@@ -3095,6 +3101,7 @@ export class WebServer extends EventEmitter {
                   !this.cleaningUp.has(id) &&
                   this.sessions.get(id) === worker &&
                   worker.owner === session.owner &&
+                  !workerHasManagerRole(worker) &&
                   this.taskControllers.get(id) === task &&
                   this.recoveryControllers.get(id) === recovery,
               }

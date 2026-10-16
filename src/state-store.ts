@@ -101,6 +101,9 @@ function rebootRecordAuthorityJson(record: AppState['sessions'][string]): string
     cliAccountType: undefined,
     cliLatestVersion: undefined,
     displayModel: undefined,
+    // Startup magic links/artifact reports update public and disk-private twins.
+    attachmentHistory: undefined,
+    __attachmentHistory: undefined,
   });
 }
 

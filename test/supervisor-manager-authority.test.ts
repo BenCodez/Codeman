@@ -1670,6 +1670,71 @@ describe('manager authority at the real server boundary', () => {
     expect(effects).not.toHaveBeenCalled();
   });
 
+  it.each((['configure', 'start'] as const).flatMap((action) => [true, false].map((ready) => ({ action, ready }))))(
+    'refuses a disabled restricted manager as worker at $action (ready=$ready)',
+    async ({ action, ready }) => {
+      await manager.pause();
+      const worker = internals.sessions.get(WORKER)!;
+      expect(internals.getSupervisorController(worker)!.getStatus().enabled).toBe(false);
+      const profile = { isCurrent: () => ready, revoke: vi.fn(async () => {}) };
+      Reflect.set(worker, '_supervisorManagerProfile', profile);
+      vi.mocked(worker.isSupervisorManagerLaunchCurrent).mockReturnValue(ready);
+      try {
+        expect(worker.hasSupervisorManagerLaunch()).toBe(true);
+        await expect(action === 'configure' ? manager.configure(config) : manager.start()).rejects.toThrow(/cycles/);
+        expect(managerDeps.worker(WORKER)).toBeUndefined();
+        expect(await managerDeps.prepareManagerAuthority(WORKER)).toBe(false);
+        expect(taskAct).not.toHaveBeenCalled();
+        expect(recoveryAct).not.toHaveBeenCalled();
+        expect(effects).not.toHaveBeenCalled();
+        expect(Reflect.get(worker, '_supervisorManagerProfile')).toBe(profile);
+      } finally {
+        Reflect.set(worker, '_supervisorManagerProfile', undefined);
+      }
+    }
+  );
+
+  it.each(
+    (['assign', 'retry'] as const).flatMap((action) => [true, false].map((restricted) => ({ action, restricted })))
+  )(
+    'rechecks a disabled worker restriction at final $action dispatch (restricted=$restricted)',
+    async ({ action, restricted }) => {
+      const worker = internals.sessions.get(WORKER)!;
+      expect(internals.getSupervisorController(worker)!.getStatus().enabled).toBe(false);
+      const selected = managerDeps.worker(WORKER)!;
+      const profile = { isCurrent: () => true, revoke: vi.fn(async () => {}) };
+      const finalDispatch = async (current: RecoveryActionAuthority) => {
+        expect(current()).toBe(true);
+        if (restricted) Reflect.set(worker, '_supervisorManagerProfile', profile);
+        if (!(await prepared(current, privateEvidenceSource(worker, workerRolloutPath, WORKER_THREAD))))
+          return 'not-sent' as const;
+        effects();
+        return 'sent' as const;
+      };
+      if (action === 'assign')
+        taskAct.mockImplementation(async (_key, _thread, _prompt, current) => finalDispatch(current));
+      else recoveryAct.mockImplementation(async (_flight, current) => finalDispatch(current));
+      try {
+        if (restricted) {
+          await expect(manager[action](WORKER, 'restricted-worker-operation')).rejects.toThrow();
+          expect(selected.isCurrent?.()).toBe(false);
+          expect(await managerDeps.prepareManagerAuthority(WORKER)).toBe(false);
+          expect(effects).not.toHaveBeenCalled();
+          expect(manager.getStatus().workers[0].assignments).toBe(0);
+          expect(manager.getStatus().inFlight).toBeUndefined();
+          expect(Reflect.get(worker, '_supervisorManagerProfile')).toBe(profile);
+        } else {
+          await expect(manager[action](WORKER, 'ordinary-worker-operation')).resolves.toMatchObject({
+            workers: [expect.objectContaining({ assignments: 1 })],
+          });
+          expect(effects).toHaveBeenCalledOnce();
+        }
+      } finally {
+        Reflect.set(worker, '_supervisorManagerProfile', undefined);
+      }
+    }
+  );
+
   it('rejects a local worker sharing the manager history home before configuration', async () => {
     const worker = internals.sessions.get(WORKER)!;
     Reflect.get(worker, '_muxSession').recoveryCodexHome = managerSession.getRecoveryContext().codexHome;
