@@ -94,7 +94,14 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
         // A late completion of older work must not erase a newer execution's freshness proof.
         if (!prior || begin.at > prior.startedAt || (begin.at === prior.startedAt && at > prior.completedAt)) {
           const evidence = { startedAt: begin.at, completedAt: at };
-          executionIdentities.set(evidence, createHash('sha256').update(p.call_id).digest('hex'));
+          // Keep the original execution and remote-domain timestamps stable even
+          // when a later SSH sample changes their plausible local-time bounds.
+          executionIdentities.set(
+            evidence,
+            createHash('sha256')
+              .update(JSON.stringify([p.call_id, begin.at, at]))
+              .digest('hex')
+          );
           result.set(hash, evidence);
         }
       }

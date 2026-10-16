@@ -4,6 +4,7 @@ import { z } from 'zod';
 import type { SessionState } from '../types.js';
 import { CODEX_REASONING_EFFORTS } from '../types/session.js';
 import { normalizedCodexHome } from './codex-home.js';
+import { getCli } from '../config/cli-registry/registry.js';
 
 type Snapshot = SessionState & { __codexRecoveryHome?: string };
 // Only an exact eligible launch configuration may acknowledge this transition.
@@ -39,7 +40,7 @@ export function rebootStateBinding(state: Snapshot | null | undefined): string |
   const config = state?.codexConfig;
   if (
     !state ||
-    state.mode !== 'codex' ||
+    getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' ||
     !home ||
     !config ||
     typeof config !== 'object' ||
@@ -52,6 +53,6 @@ export function rebootStateBinding(state: Snapshot | null | undefined): string |
     return undefined;
   const canonicalConfig = Object.fromEntries(Object.entries(config).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
   return createHash('sha256')
-    .update(JSON.stringify([state.id, state.owner ?? null, state.workingDir, home, canonicalConfig]))
+    .update(JSON.stringify([state.id, state.mode, state.owner ?? null, state.workingDir, home, canonicalConfig]))
     .digest('hex');
 }

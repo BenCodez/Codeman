@@ -895,3 +895,48 @@ it('a draft save may acknowledge the identical server event published before its
   expect(h.app._taskView.state).toEqual(accepted);
   expect(h.get('taskObjective').value).toBe(accepted.objective);
 });
+
+describe('owner progress text preserves exact whitespace', () => {
+  it.each(['untouched', 'edited', 'empty', 'whitespace-only'] as const)(
+    'saves %s checkpoint and next action without normalization',
+    async (edit) => {
+      const initial = {
+        ...state(),
+        checkpoint: ' \tOwner checkpoint\r\n界\r\n  ',
+        nextAction: '\r\n  Next owner action\r\n\t ',
+      };
+      const h = harness(initial);
+      await h.open();
+      let checkpoint = initial.checkpoint,
+        nextAction = initial.nextAction;
+      if (edit !== 'untouched') {
+        checkpoint = edit === 'empty' ? '' : edit === 'whitespace-only' ? ' \t\n  ' : ' \nEdited checkpoint 界\n  ';
+        nextAction = edit === 'empty' ? '' : edit === 'whitespace-only' ? '\n \t ' : '\t Edited next action\n界  ';
+        h.get('taskCheckpoint').value = checkpoint;
+        h.get('taskNextAction').value = nextAction;
+      }
+      const checkbox = h.get('taskCriteriaEvidence').querySelector('input');
+      checkbox.checked = true;
+      checkbox.dispatchEvent(new h.dom.window.Event('change', { bubbles: true }));
+      h.get('taskProgressOutcome').value = 'blocked';
+      await h.app.saveTaskProgress();
+      const request = h.app._apiJson.mock.calls[1];
+      expect(request[0]).toBe('/api/sessions/a/task/progress');
+      expect(request[1].body).toEqual({ outcome: 'blocked', checkpoint, nextAction, verifiedCriteria: ['manual-a'] });
+    }
+  );
+  it('failed progress keeps original CRLF evidence through an exact retry', async () => {
+    const initial = { ...state(), checkpoint: '  Checkpoint\r\n界  ', nextAction: '\r\n  Owner next action\t ' };
+    const h = harness(initial);
+    await h.open();
+    h.app._apiJson.mockResolvedValueOnce(null);
+    await h.app.saveTaskProgress();
+    expect(h.app._taskView.dirty).toBe(true);
+    await h.app.saveTaskProgress();
+    expect(h.app._apiJson.mock.calls[1][1].body).toEqual(h.app._apiJson.mock.calls[2][1].body);
+    expect(h.app._apiJson.mock.calls[2][1].body).toMatchObject({
+      checkpoint: initial.checkpoint,
+      nextAction: initial.nextAction,
+    });
+  });
+});
