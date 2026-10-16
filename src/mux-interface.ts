@@ -104,6 +104,8 @@ export interface MuxSessionWithStats extends MuxSession {
 
 /** Options for creating a new multiplexer session. */
 export interface RestoreLaunchGuard {
+  /** Original shared monotonic workspace budget, never renewed by native preparation. */
+  getWorkspaceDeadline?(): number;
   prepare(): Promise<void>;
   confirm(): boolean | Promise<boolean>;
   isCurrent(): boolean;
@@ -113,6 +115,8 @@ export interface RestoreLaunchGuard {
 }
 
 export interface CodexRestoreLaunchGuard {
+  /** Original shared monotonic workspace budget, never renewed by native preparation. */
+  getWorkspaceDeadline?(): number;
   prepare(): Promise<void>;
   confirm(): boolean | Promise<boolean>;
   /** Pure current-owner/configuration fence after the startup proof has been saved. */

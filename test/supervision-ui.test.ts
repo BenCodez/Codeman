@@ -162,9 +162,11 @@ describe('Task supervision UI', () => {
       const retryBody = JSON.parse(fetch.mock.calls[1][1].body);
       expect(retryBody).toEqual(firstBody);
       expect(h.app._taskView.state).toEqual(accepted);
-      expect(h.app._taskView.dirty).toBe(false);
-      expect(h.get('taskObjective').value).toBe(accepted.objective);
-      expect(h.get('taskCheckpoint').value).toBe(accepted.checkpoint);
+      expect(h.app._taskView.dirty).toBe(true);
+      expect(h.get('taskObjective').value).toBe(
+        action === 'configuration' ? accepted.objective : 'Unsaved owner objective'
+      );
+      expect(h.get('taskCheckpoint').value).toBe(action === 'progress' ? accepted.checkpoint : 'Unsaved checkpoint');
     }
   );
 
@@ -868,7 +870,7 @@ it('an unsaved criterion selection alone remains a draft through pause', async (
   expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
   expect(h.app._taskView.dirty).toBe(true);
 });
-it('a draft save may acknowledge the identical server event published before its response', async () => {
+it('a configuration save acknowledges matching SSE while retaining the independent progress draft', async () => {
   const h = harness();
   await h.open();
   enterControlDraft(h);
@@ -890,7 +892,8 @@ it('a draft save may acknowledge the identical server event published before its
   h.app._onSessionTask({ sessionId: 'a', state: structuredClone(accepted) });
   release(structuredClone(accepted));
   await pending;
-  expect(h.app._taskView.dirty).toBe(false);
+  expect(h.app._taskView.dirty).toBe(true);
+  expect(h.get('taskCheckpoint').value).toBe('  Unsaved checkpoint\n界  ');
   expect(h.app._taskView.state).toEqual(accepted);
   expect(h.get('taskObjective').value).toBe(accepted.objective);
 });
@@ -988,5 +991,109 @@ describe('owner objective preserves exact whitespace', () => {
     await h.app.saveTaskConfiguration();
     expect(h.app._apiJson.mock.calls[1][1].body.objective).toBe('Owner objective');
     expect(h.app._apiJson.mock.calls[2][1].body).toEqual(h.app._apiJson.mock.calls[1][1].body);
+  });
+});
+
+describe('task saves retain independent configuration and progress drafts', () => {
+  it.each(
+    (['configuration', 'progress'] as const).flatMap((first) =>
+      (['paused', 'blocked'] as const).map((phase) => ({ first, phase }))
+    )
+  )('saves $first first without losing the sibling draft while $phase', async ({ first, phase }) => {
+    let accepted = {
+      ...state(),
+      phase,
+      objective: '  Original objective\r\n界  ',
+      checkpoint: '  Original checkpoint\r\n界  ',
+      nextAction: 'Original action\r\n  ',
+    };
+    accepted.criteria[1].description = '  Original label\r\n界  ';
+    const h = harness(accepted);
+    await h.open();
+    const manual = h.get('taskCriteriaRows').children[0].querySelector('textarea');
+    const command = h.get('taskCriteriaRows').children[1].querySelector('[data-task-field="command"]');
+    const objective = '  Edited objective\n界  ',
+      description = '  Owner criterion draft\n界  ',
+      exactCommand = '  printf "界"\nnext command  ';
+    h.get('taskObjective').value = objective;
+    manual.value = description;
+    command.value = exactCommand;
+    h.get('taskMaxContinuations').value = '7';
+    h.get('taskEnabled').checked = true;
+    h.get('taskCheckpoint').value = '  Edited checkpoint\n界  ';
+    h.get('taskNextAction').value = '  Edited next action\n  ';
+    h.get('taskProgressOutcome').value = 'unfinished';
+    const check = h.get('taskCriteriaEvidence').querySelector('input');
+    check.checked = true;
+    check.dispatchEvent(new h.dom.window.Event('change', { bubbles: true }));
+    const writes: Array<{ method: string; body: any }> = [];
+    h.dom.window.fetch = vi.fn(async (_url, options) => {
+      const body = JSON.parse(options.body);
+      writes.push({ method: options.method, body });
+      if (options.method === 'PUT')
+        accepted = {
+          ...accepted,
+          ...body,
+          criteria: (body.criteria ?? accepted.criteria).map((criterion) => ({ ...criterion, verified: false })),
+        };
+      else
+        accepted = {
+          ...accepted,
+          checkpoint: body.checkpoint,
+          nextAction: body.nextAction,
+          outcome: body.outcome,
+          criteria: accepted.criteria.map((criterion) =>
+            body.verifiedCriteria.includes(criterion.id) ? { ...criterion, verified: true } : criterion
+          ),
+        };
+      return new Response(JSON.stringify({ success: true, data: accepted }), { status: 200 });
+    });
+    delete h.app._apiJson;
+    const save = (part: string) =>
+      part === 'configuration' ? h.app.saveTaskConfiguration() : h.app.saveTaskProgress();
+    await save(first);
+    expect(h.app._taskView.dirty).toBe(true);
+    expect(h.get('taskPhase').textContent).toBe(phase === 'blocked' ? 'Blocked' : 'Paused');
+    expect(h.get('taskObjective').value).toBe(objective);
+    expect(h.get('taskCriteriaRows').children[0].querySelector('textarea').value).toBe(description);
+    expect(h.get('taskCriteriaRows').children[1].querySelector('[data-task-field="command"]').value).toBe(exactCommand);
+    expect(h.get('taskCheckpoint').value).toBe('  Edited checkpoint\n界  ');
+    expect(h.get('taskNextAction').value).toBe('  Edited next action\n  ');
+    expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+    await save(first === 'configuration' ? 'progress' : 'configuration');
+    expect(h.app._taskView.dirty).toBe(false);
+    expect(writes).toHaveLength(2);
+    const config = writes.find((write) => write.method === 'PUT')!.body;
+    const progress = writes.find((write) => write.method === 'POST')!.body;
+    expect(config.objective).toBe(objective);
+    expect(config.criteria[0].description).toBe(description);
+    expect(config.criteria[1].command).toBe(exactCommand);
+    expect(config.criteria[1].description).toBe('  Original label\r\n界  ');
+    expect(progress).toEqual({
+      outcome: 'unfinished',
+      checkpoint: '  Edited checkpoint\n界  ',
+      nextAction: '  Edited next action\n  ',
+      verifiedCriteria: ['manual-a'],
+    });
+  });
+  it('keeps a checkbox-only progress draft through configuration save and preserves untouched CRLF at its later save', async () => {
+    const initial = { ...state(), checkpoint: '  Original\r\n界  ', nextAction: 'Next\r\n  ' };
+    const h = harness(initial);
+    await h.open();
+    h.get('taskObjective').value = 'New objective';
+    const check = h.get('taskCriteriaEvidence').querySelector('input');
+    check.checked = true;
+    check.dispatchEvent(new h.dom.window.Event('change', { bubbles: true }));
+    h.app._apiJson.mockResolvedValueOnce({ ...initial, objective: 'New objective' });
+    await h.app.saveTaskConfiguration();
+    expect(h.app._taskView.dirty).toBe(true);
+    expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+    await h.app.saveTaskProgress();
+    expect(h.app._apiJson.mock.calls[2][1].body).toMatchObject({
+      checkpoint: initial.checkpoint,
+      nextAction: initial.nextAction,
+      verifiedCriteria: ['manual-a'],
+    });
+    expect(h.app._taskView.dirty).toBe(false);
   });
 });
