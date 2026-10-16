@@ -75,12 +75,13 @@ export class TaskController {
   ) {
     // Reloaded unverified evidence must be observed anew after owner resume.
     // Keep this conservative floor private so durable/live task bytes agree.
-    this.evidenceFreshnessFloor = this.now();
+    this.evidenceFreshnessFloor = Math.max(this.now(), restored?.resumedAt ?? 0);
     this.state = structuredClone(restored ?? initialTaskState());
     // Command checks may have passed during a turn that is still running. Only
     // owner-certified manual-only work can infer completion without a terminal observation.
     if (
       !this.state.agentProgressVeto &&
+      this.state.resumedAt === undefined &&
       acceptanceCriteriaComplete(this.state) &&
       this.state.criteria.every((criterion) => criterion.kind === 'manual' && criterion.evidence?.source === 'owner')
     )
@@ -236,7 +237,7 @@ export class TaskController {
               !['identity-unverified', 'identity-changed'].includes(fresh.observation.reason) &&
               !['unknown', 'paused', 'blocked'].includes(fresh.observation.activity) &&
               (!requireCompletedTurn ||
-                (fresh.observation.activity === 'completed' &&
+                (this.completedTurnIsCurrent(fresh.observation) &&
                   fresh.observation.turnId === expected.observation.turnId)) &&
               proofs.every((proof) => {
                 const evidence = fresh.commands.get(proof.hash);
@@ -302,8 +303,20 @@ export class TaskController {
     }
     return invalidated;
   }
+  private completedTurnIsCurrent(observation: RecoveryObservation): boolean {
+    return (
+      observation.activity === 'completed' &&
+      Number.isFinite(observation.at) &&
+      observation.at > this.evidenceBoundary() &&
+      observation.at <= this.now() + 2000
+    );
+  }
   private evidenceBoundary(): number {
-    return Math.max(this.evidenceFreshnessFloor, this.state.configuredAt ?? this.state.startedAt ?? this.now());
+    return Math.max(
+      this.evidenceFreshnessFloor,
+      this.state.resumedAt ?? 0,
+      this.state.configuredAt ?? this.state.startedAt ?? this.now()
+    );
   }
   private actionIsCurrent(revision: number): boolean {
     return !this.stopped && this.revision === revision && !this.runtimeBudgetExpired();
@@ -668,6 +681,7 @@ export class TaskController {
     )
       throw new TaskValidationError('Task runtime origin is invalid');
     const revision = ++this.revision;
+    const resumedAt = this.now();
     return this.enqueue(async () => {
       this.requireCurrent(revision);
       if (this.state.inFlight) throw new TaskValidationError('Unresolved delivery requires reset');
@@ -698,6 +712,8 @@ export class TaskController {
         this.state.phase = 'blocked';
         return this.save('budget-exhausted');
       }
+      this.state.resumedAt = Math.max(this.state.resumedAt ?? 0, resumedAt);
+      this.evidenceFreshnessFloor = Math.max(this.evidenceFreshnessFloor, this.state.resumedAt);
       // Explicit Resume withdraws the old blocker, but does not certify a
       // continuation from its old checkpoint. New evidence must establish it.
       if (this.state.outcome === 'blocked') this.state.outcome = 'unknown';
@@ -923,9 +939,9 @@ export class TaskController {
               return this.recordAgentAttention(marker, 'task-evidence-unknown');
             // An agent report can precede more work in the same turn. Leave a
             // completion report unconsumed until the terminal observation arrives.
-            if (p.outcome === 'completed' && o.activity !== 'completed') return finishObservation();
+            if (p.outcome === 'completed' && !this.completedTurnIsCurrent(o)) return finishObservation();
             candidate.outcome =
-              acceptanceCriteriaComplete(candidate) && o.activity === 'completed' ? 'completed' : p.outcome;
+              acceptanceCriteriaComplete(candidate) && this.completedTurnIsCurrent(o) ? 'completed' : p.outcome;
             candidate.lastProgressAt = marker.at;
             candidate.checkpoint = p.outcome === 'unfinished' ? p.checkpoint! : (p.checkpoint ?? candidate.checkpoint);
             candidate.nextAction = p.outcome === 'unfinished' ? p.nextAction! : (p.nextAction ?? candidate.nextAction);
@@ -972,7 +988,7 @@ export class TaskController {
         } else return this.recordAgentAttention(marker, 'task-evidence-unknown');
       }
       if (
-        o.activity === 'completed' &&
+        this.completedTurnIsCurrent(o) &&
         (this.state.outcome === 'completed' || acceptanceCriteriaComplete(this.state))
       ) {
         if (this.state.phase === 'completed' && this.state.outcome === 'completed') return this.getStatus();

@@ -13,6 +13,8 @@ The prepared process uses a private restricted Codex profile and a credential bo
 - `supervisor_assign`: start a worker's configured task with its full `workerId` and a durable `requestId`.
 - `supervisor_retry`: request guarded crash recovery with the same bounded arguments.
 
+Codex also registers three built-in MCP resource helpers whenever an MCP server is configured. These are separate from the bridge's four tools: resource and template discovery return empty lists, and resource reads return a fixed unavailable response. They cannot read files, fetch URLs, inspect sessions or dispatch worker actions. The manager uses the four supervisor tools for its work.
+
 The manager objective is a real Codex turn delivered through the same task controller and per-session action arbiter used for supervised workers. Existing owner CLI clients retain their authenticated supervisor commands:
 
 ```bash

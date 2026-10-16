@@ -658,7 +658,8 @@ it.each(['owner-command', 'agent-command', 'agent-report', 'completed-turn'] as 
         expect(task.getStatus().checkpoint).toBe(restored.checkpoint);
         expect(effects).not.toHaveBeenCalled();
       }
-      at = 30_000;
+      // Agent completion must be strictly newer than the explicit Resume instant.
+      at = entry === 'agent-command' ? 30_001 : 30_000;
       now = 30_100;
       if (entry === 'owner-command') await task.progress({ outcome: 'completed', verifiedCriteria: ['test'] });
       else await task.refresh();

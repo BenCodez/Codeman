@@ -350,7 +350,9 @@ export interface TerminalMultiplexer extends EventEmitter {
     sessionId: string,
     serialized: string,
     witness: PrivateFileWitness,
-    panePid: number
+    panePid: number,
+    /** Historical host-reboot journals retain identity but cannot authorize owner input. */
+    live?: boolean
   ): CodexBrokerProof | undefined;
   isOwnedRemoteInputBrokerProofCurrent?(sessionId: string, proof: CodexBrokerProof): boolean;
   reserveOwnedRemoteInputBroker?(

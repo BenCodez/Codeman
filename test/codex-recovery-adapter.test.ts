@@ -278,16 +278,18 @@ function fixture() {
     confirmRemoteRecoveryAuthority: vi.fn(async () => true),
     isRemoteRecoveryAuthorityCurrent: vi.fn(() => true),
     getOwnedRemoteInputBroker: vi.fn(async () => (state.remoteBrokerAvailable ? { ...descriptor } : undefined)),
-    observeOwnedRemoteInputBroker: vi.fn((serialized: string, witness: PrivateFileWitness, panePid: number) => {
-      try {
-        signer ??= CodexInputBroker.fromRemoteMaterial(directory, material, JSON.parse(serialized));
-        latestProof = signer?.observeRemote(serialized, witness, panePid);
-        return latestProof;
-      } catch {
-        latestProof = undefined;
-        return undefined;
+    observeOwnedRemoteInputBroker: vi.fn(
+      (serialized: string, witness: PrivateFileWitness, panePid: number, live = true) => {
+        try {
+          signer ??= CodexInputBroker.fromRemoteMaterial(directory, material, JSON.parse(serialized));
+          latestProof = signer?.observeRemote(serialized, witness, panePid, live);
+          return latestProof;
+        } catch {
+          latestProof = undefined;
+          return undefined;
+        }
       }
-    }),
+    ),
     isOwnedRemoteInputBrokerProofCurrent: vi.fn(
       (proof: CodexBrokerProof) =>
         state.remoteBrokerAvailable && proof === latestProof && signer?.authority(proof)?.proof === proof
@@ -353,7 +355,7 @@ function fixture() {
   };
   const adapter = new CodexRecoveryAdapter(session as unknown as Session, persist, deps);
   resolver.mockImplementation(async () => structuredClone(state.identity));
-  return Object.assign(state, { session, adapter, persist, deps });
+  return Object.assign(state, { session, adapter, persist, deps, getRemoteSigner: () => signer });
 }
 
 describe('fresh process readiness provenance', () => {
@@ -1551,8 +1553,8 @@ describe('owned remote evidence and mutation', () => {
     };
     await replace();
     f.session.getOwnedRemoteInputBroker.mockImplementation(async () => cache.get(scope, descriptor.incarnation));
-    f.session.observeOwnedRemoteInputBroker.mockImplementation((serialized, witness, panePid) => {
-      latest = cache.observe(scope, descriptor.incarnation, serialized, witness, panePid);
+    f.session.observeOwnedRemoteInputBroker.mockImplementation((serialized, witness, panePid, live) => {
+      latest = cache.observe(scope, descriptor.incarnation, serialized, witness, panePid, live);
       return latest;
     });
     f.session.isOwnedRemoteInputBrokerProofCurrent.mockImplementation(
@@ -1752,6 +1754,43 @@ describe('owned remote evidence and mutation', () => {
         await controller.drain();
         await owned.dispose();
       }
+    }
+  );
+
+  it.each([false, true])(
+    'historical missing-worker proof retains restore identity without live owner framing (previous live=%s)',
+    async (previousLive) => {
+      const f = remoteFixture();
+      if (previousLive) {
+        await f.adapter.observe();
+        expect(f.getRemoteSigner()?.canFrame).toBe(true);
+      }
+      f.remoteEvidence = {
+        transport: 'reachable',
+        session: 'missing',
+        clock: clockAt(),
+        identity: {
+          reason: 'verified',
+          conversationId: THREAD,
+          tail: completedTail(),
+          tailTruncated: false,
+          changedAt: NOW - 1000,
+        },
+      };
+      expect(await f.adapter.observe()).toMatchObject({
+        reason: 'remote-session-missing',
+        conversationId: THREAD,
+        safeToAct: false,
+      });
+      const signer = f.getRemoteSigner();
+      expect(signer).toBeDefined();
+      const proof = f.session.observeOwnedRemoteInputBroker.mock.results.at(-1)!.value;
+      expect(proof).toMatchObject({ closed: false });
+      expect(f.session.isOwnedRemoteInputBrokerProofCurrent(proof)).toBe(true);
+      expect(signer!.canFrame).toBe(false);
+      expect(signer!.frame('owner-pty', 'unsent owner draft')).toBeUndefined();
+      expect(await f.adapter.restoreMissingRemote()).toBe('sent');
+      expect(f.session.restoreMissingRemoteWorker).toHaveBeenCalledOnce();
     }
   );
 

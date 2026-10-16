@@ -111,6 +111,28 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
         });
       }
       if (method === 'ping') return send({ jsonrpc: '2.0', id, result: {} });
+      // Codex registers core resource helpers whenever an MCP server exists,
+      // independently of enabled_tools. This bridge exposes no resources: keep
+      // discovery inert, and never interpret a URI as a path or API request.
+      if (method === 'resources/list' || method === 'resources/templates/list') {
+        if (params !== undefined && !Empty.safeParse(params).success)
+          return fail(id, -32602, 'Invalid resource discovery request');
+        return send({
+          jsonrpc: '2.0',
+          id,
+          result: method === 'resources/list' ? { resources: [] } : { resourceTemplates: [] },
+        });
+      }
+      if (method === 'resources/read') {
+        if (
+          !z
+            .object({ uri: z.string().min(1).max(2048) })
+            .strict()
+            .safeParse(params).success
+        )
+          return fail(id, -32602, 'Invalid resource request');
+        return fail(id, -32002, 'The supervisor bridge exposes no resources; use the supervisor tools');
+      }
       if (method === 'tools/list') {
         if (params !== undefined && !Empty.safeParse(params).success) return fail(id, -32602, 'Invalid tools request');
         return send({ jsonrpc: '2.0', id, result: { tools } });

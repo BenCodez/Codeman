@@ -128,6 +128,49 @@ it('initializes and lists only four tools, then invokes exact owner-selected ope
   expect(f.generic).not.toHaveBeenCalled();
 });
 
+it('keeps implicit resource discovery empty and never dispatches a resource URI', async () => {
+  const f = await fixture();
+  for (const method of ['resources/list', 'resources/templates/list']) {
+    const response = await f.rpc(method);
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      jsonrpc: '2.0',
+      id: 1,
+      result: method === 'resources/list' ? { resources: [] } : { resourceTemplates: [] },
+    });
+    expect((await f.rpc(method, { cursor: 'foreign' })).json().error.code).toBe(-32602);
+  }
+  for (const uri of ['file:///private/credential.json', 'http://127.0.0.1/api/sessions', WORKER, '../state.json']) {
+    const response = await f.rpc('resources/read', { uri });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      jsonrpc: '2.0',
+      id: 1,
+      error: { code: -32002, message: 'The supervisor bridge exposes no resources; use the supervisor tools' },
+    });
+  }
+  expect(f.resolve).not.toHaveBeenCalled();
+  expect(f.generic).not.toHaveBeenCalled();
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.retry).not.toHaveBeenCalled();
+  expect((await f.rpc('tools/list')).json().result.tools).toHaveLength(4);
+  f.revoke();
+  for (const method of ['resources/list', 'resources/templates/list', 'resources/read'])
+    expect((await f.rpc(method, method === 'resources/read' ? { uri: 'file:///private' } : undefined)).statusCode).toBe(
+      401
+    );
+});
+
+it.each([undefined, {}, { uri: '' }, { uri: 1 }, { uri: 'x', path: '/private' }, { uri: 'x'.repeat(2049) }])(
+  'refuses malformed resource reads without effects: %j',
+  async (params) => {
+    const f = await fixture();
+    expect((await f.rpc('resources/read', params)).json().error.code).toBe(-32602);
+    expect(f.resolve).not.toHaveBeenCalled();
+    expect(f.generic).not.toHaveBeenCalled();
+  }
+);
+
 it.each([false, true])('denies every generic endpoint with valid manager token, attribution=%s', async (attributed) => {
   const f = await fixture();
   for (const url of [

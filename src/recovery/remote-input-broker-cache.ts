@@ -1250,7 +1250,8 @@ export class OwnedRemoteBrokerCache {
     incarnation: string,
     serialized: string,
     witness: PrivateFileWitness,
-    panePid: number
+    panePid: number,
+    live = true
   ) {
     if (!this.get(scope, incarnation)) return undefined;
     const entry = this.entries.get(scope.sessionId + ':' + incarnation)!;
@@ -1263,13 +1264,13 @@ export class OwnedRemoteBrokerCache {
       }
       const signer = CodexInputBroker.fromRemoteMaterial(entry.descriptor.directory, entry.material, state);
       if (!signer) return undefined;
-      const proof = signer.observeRemote(serialized, witness, panePid);
+      const proof = signer.observeRemote(serialized, witness, panePid, live);
       // Retain witnessed live or certified closed signers. Once retained,
       // failed refreshes never recreate their existing reservation counters.
       if (signer.canFrame || proof) entry.signer = signer;
       return proof;
     }
-    return entry.signer.observeRemote(serialized, witness, panePid);
+    return entry.signer.observeRemote(serialized, witness, panePid, live);
   }
 }
 
