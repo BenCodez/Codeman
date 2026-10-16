@@ -10,6 +10,7 @@ import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { queueInputDispatch } from '../../src/web/input-dispatch-queue.js';
 import { httpStatusForErrorCode, type ApiErrorCode } from '../../src/types.js';
 import { createMockRouteContext } from '../mocks/index.js';
+import { browserInputJournal, settleInput } from '../mocks/browser-input-journal.js';
 
 const SID = 'fixture-wake-input';
 const CID = 'fixture-original-client';
@@ -137,6 +138,98 @@ async function harness(options: { partial?: boolean; authenticated?: boolean } =
     ensureAwakeForInput,
   };
 }
+
+it.each(['reattach', 'broker'] as const)(
+  'retains failed %s admission after wake settings removal across HTTP, WS and native input',
+  async (failure) => {
+    const h = await harness();
+    const proof = vi.spyOn(h.session, 'confirmRemoteWakeReady').mockResolvedValue(failure !== 'broker');
+    if (failure === 'reattach') h.reattach.mockResolvedValue(false);
+    h.readiness.resolve(true);
+    expect(await h.registry.wake(h.session)).toBe(false);
+    h.session.remote!.wakeCommand = undefined;
+    // A later successful TCP probe cannot certify the old local SSH attachment.
+    Reflect.get(h.registry, 'deps').probe = async () => true;
+    expect(await h.registry.checkReachable(h.session, { force: true })).toBe(true);
+    expect(await h.registry.hasWakeTarget(h.session)).toBe(false);
+
+    const journal = browserInputJournal();
+    const document = journal.open();
+    const cid = document.app._clientId;
+    const replies: number[] = [];
+    const requests: Array<{ input: string; clientId: string; seq: number }> = [];
+    const transport: typeof fetch = vi.fn(async (url, options) => {
+      const payload = JSON.parse(String(options?.body));
+      requests.push(payload);
+      const response = await h.app.inject({ method: 'POST', url: String(url), payload });
+      replies.push(response.statusCode);
+      const headers = new Headers();
+      const ack = response.headers['x-codeman-input-ack'];
+      if (typeof ack === 'string') headers.set('x-codeman-input-ack', ack);
+      return new Response(response.body, { status: response.statusCode, headers });
+    });
+    document.transport(transport);
+    document.app._sendInputAsync(SID, 'retained-head');
+    document.app._sendInputAsync(SID, 'retained-tail');
+    await settleInput(document.app);
+    expect(journal.records().map(({ value }) => [value.cid, value.seq, value.data])).toEqual([
+      [cid, 1, 'retained-head'],
+      [cid, 2, 'retained-tail'],
+    ]);
+    expect(replies).toEqual([422]);
+    expect(h.session.hasAppliedInputSeq(cid, 1)).toBe(false);
+    h.socket.emit('message', JSON.stringify({ t: 'i', d: 'retained-head', cid, seq: 1 }));
+    await queueInputDispatch(h.session, 0, async () => {});
+    expect(h.acknowledgements).toEqual([]);
+    expect(h.session.write('direct-native')).toBe(false);
+    expect(await h.session.writeAsync('async-native')).toBe(false);
+    vi.mocked(h.session.writeViaMux).mockRestore();
+    expect(await h.session.writeViaMux('mux-native')).toBe(false);
+    const key = vi.fn(async () => {});
+    expect(await h.session.sendNamedKey('\n', key)).toBe(false);
+    expect(key).not.toHaveBeenCalled();
+    const handoff = await h.app.inject({
+      method: 'POST',
+      url: `/api/sessions/${SID}/direct-attach-fence`,
+      payload: {},
+    });
+    expect(handoff.statusCode).toBe(422);
+    expect(h.written).toEqual([]);
+
+    // Only a fresh successful attachment/proof releases the native veto; the
+    // original durable browser identities then retry once in their FIFO order.
+    h.session.remote!.wakeCommand = 'fixture-wake';
+    h.reattach.mockResolvedValue(true);
+    proof.mockResolvedValue(true);
+    expect(await h.registry.ensureAwake(h.session)).toBe(true);
+    const restored = journal.open();
+    restored.transport(transport);
+    restored.app._drainSession(SID);
+    await settleInput(restored.app);
+    expect(requests).toEqual([
+      { input: 'retained-head', clientId: cid, seq: 1 },
+      { input: 'retained-head', clientId: cid, seq: 1 },
+      { input: 'retained-tail', clientId: cid, seq: 2 },
+    ]);
+    expect(h.written).toEqual(['retained-head', 'retained-tail']);
+    expect(journal.records()).toEqual([]);
+    expect(restored.app._pendingDeliveries.has(SID)).toBe(false);
+    h.socket.emit('message', JSON.stringify({ t: 'i', d: 'retained-head', cid, seq: 1 }));
+    await queueInputDispatch(h.session, 0, async () => {});
+    expect(h.acknowledgements).toEqual([{ t: 'ia', seq: 1, dup: true, last: 2 }]);
+    expect(h.written).toEqual(['retained-head', 'retained-tail']);
+  }
+);
+
+it('preserves ordinary remote input with no wake target and no failed attachment state', async () => {
+  const h = await harness();
+  h.session.remote!.wakeCommand = undefined;
+  expect(await h.registry.requiresInputReadiness(h.session)).toBe(false);
+  expect(h.session.inputDispatchAllowed).toBe(true);
+  expect((await h.send(1, 'healthy-ordinary')).statusCode).toBe(200);
+  expect(h.written).toEqual(['healthy-ordinary']);
+  expect(h.reattach).not.toHaveBeenCalled();
+});
 
 it.each([false, true].flatMap((useMux) => [2500, 5000].map((bytes) => ({ useMux, bytes }))))(
   'ACKs a tagged $bytes-byte wake input only after actual dispatch (mux=$useMux)',

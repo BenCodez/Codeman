@@ -241,6 +241,8 @@ export interface WakeableSession {
   confirmRemoteWakeReady?(): Promise<boolean>;
   /** Pure scope check for the last accepted private target proof. */
   isRemoteWakeReadyCurrent?(): boolean;
+  /** Retain failed attachment admission across HTTP, WS and direct/native input. */
+  setRemoteWakeAttachmentReady?(ready: boolean): void;
   /** Stable owner/configuration/incarnation scope across acknowledged buffered writes. */
   remoteWakeScope?(): string;
   /** Logical input target, allowing same-conversation broker restore without rebinding buffered bytes. */
@@ -402,6 +404,20 @@ export class RemoteWakeRegistry {
   /** Whether this session's host has any wake path configured at all. */
   async hasWakeTarget(session: WakeableSession): Promise<boolean> {
     return resolveWakeTarget(await this._effectiveRemote(session)) !== null;
+  }
+
+  /** Removing wake settings cannot release an existing unverified attachment or FIFO. */
+  async requiresInputReadiness(session: WakeableSession): Promise<boolean> {
+    const retained = () => {
+      const state = this.states.get(session.id);
+      return (
+        state?.attachmentReady === false ||
+        state?.waking != null ||
+        state?.pendingScope !== undefined ||
+        state?.inFlightBytes !== undefined
+      );
+    };
+    return retained() || (await this.hasWakeTarget(session)) || retained();
   }
 
   /** Which wake path is configured (`'none'` when the UI should offer configuration). */
@@ -654,6 +670,13 @@ export class RemoteWakeRegistry {
     const state = this._state(session.id);
     if (state.waking) return state.waking;
 
+    const attachmentReady = (ready: boolean) => {
+      state.attachmentReady = ready;
+      session.setRemoteWakeAttachmentReady?.(ready);
+    };
+    // TCP/wake completion alone does not permit input into the old SSH pane.
+    attachmentReady(false);
+
     state.waking = (async (): Promise<boolean> => {
       const id = session.id;
       const remoteScope = JSON.stringify(session.remote);
@@ -661,7 +684,6 @@ export class RemoteWakeRegistry {
       try {
         const ready = await this._wakeAndWait(remote, state, { sessionId: id, timeoutMs: opts.timeoutMs });
         if (!ready || this.stopped || this.states.get(id) !== state) return false;
-        state.attachmentReady = false;
 
         const before = session.paneStartedAt;
         const reattached = await session.reattachRemote();
@@ -684,9 +706,9 @@ export class RemoteWakeRegistry {
         // worker may have disappeared while the host was asleep.
         if ((session.confirmRemoteWakeReady && (await session.confirmRemoteWakeReady()) !== true) || !current())
           return false;
-        state.attachmentReady = true;
+        attachmentReady(true);
         if (!(await this._flush(state, session, current, scopeCurrent))) {
-          state.attachmentReady = false;
+          attachmentReady(false);
           return false;
         }
         this.reattachments.set(session, { before, after });
@@ -697,7 +719,7 @@ export class RemoteWakeRegistry {
         this.deps.log?.(`[RemoteWake] ${remote.label} reattached for session ${id}`);
         return true;
       } catch (err) {
-        state.attachmentReady = false;
+        attachmentReady(false);
         this.deps.log?.(`[RemoteWake] unexpected failure: ${err instanceof Error ? err.message : String(err)}`);
         return false;
       } finally {

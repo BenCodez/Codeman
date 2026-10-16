@@ -371,6 +371,26 @@ describe('Codex supervisor UI', () => {
     }
   );
 
+  it.each(['en', 'zh-CN'] as const)(
+    'explains refused startup owner inspection in %s without starting or restarting',
+    async (language) => {
+      const h = harness();
+      vm.runInContext(read('i18n.js'), h.ctx);
+      h.dom.window.CodemanI18n.configure({ language });
+      h.app.openSupervisorOptions(SID);
+      await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+      vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
+      h.app._apiJson.mockImplementation(async (url: string) => (url.endsWith('/prepare-manager') ? null : state()));
+      await h.app.prepareSupervisorManager();
+      expect(h.app.showToast).toHaveBeenCalledWith(
+        expect.stringContaining(language === 'en' ? 'owner Restart after inspection' : '检查后使用所有者重启'),
+        'error'
+      );
+      expect(h.app._apiJson.mock.calls.some(([url]: [string]) => /\/(start|restart)$/.test(url))).toBe(false);
+      expect(h.app._supervisorView.state.phase).toBe('disabled');
+    }
+  );
+
   it.each([null, {}, { managerReady: false }])('never treats uncertain preparation %j as ready', async (result) => {
     const h = harness();
     h.app.openSupervisorOptions(SID);

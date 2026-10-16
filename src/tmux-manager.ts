@@ -4225,7 +4225,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const managerProfile = options.supervisorManager;
     if (
       managerProfile &&
-      (remote || docker || options.onlyIfDead || guard || !localCodex || !(await managerProfile.confirm()))
+      (remote ||
+        docker ||
+        options.onlyIfDead ||
+        guard ||
+        !localCodex ||
+        managerProfile.conversationId !== codexConfig?.resumeSessionId ||
+        normalizedCodexHome(managerProfile.home) !== recoveryCodexHome ||
+        !(await managerProfile.confirm()))
     )
       return null;
     const baseCmd = managerProfile ? supervisorManagerCommand(managerProfile, codexConfig) : ordinaryCmd;
@@ -4249,7 +4256,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           })
         : localFullCmd;
     const originalLaunch = remote || docker ? fullCmd : `cd ${shellescape(workingDir)} && ${fullCmd}`;
-    const inputBroker =
+    let inputBroker =
       localCodex && codexConfig?.noDaemon === true
         ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!guard || !!managerProfile)
         : undefined;
@@ -4289,6 +4296,52 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
     };
     let brokerDispatchStarted = false;
+    let managerOrdinaryRestored = false;
+    const restoreOrdinaryManager = async (
+      refusedPid: number,
+      native: ReturnType<TmuxManager['optionalBrokerDispatchReceipt']>
+    ): Promise<{ pid: number; broker: CodexInputBroker } | undefined> => {
+      if (!managerProfile || !native || !canDispatch() || !(await managerProfile.confirm()) || !canDispatch())
+        return undefined;
+      const ordinaryLaunch = `cd ${shellescape(workingDir)} && ${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${wrapWithNice(ordinaryCmd, config)}`;
+      const broker = await this.createInputBroker(sessionId, ordinaryLaunch, recoveryCodexHome!, true);
+      if (!broker) return undefined;
+      let dispatched = false;
+      try {
+        // Ordinary privileges require the same final owner/config/child-work
+        // witnesses. Never turn a changed preparation witness into a raw launch.
+        await broker.setStartupAuthority(
+          managerProfile.files,
+          undefined,
+          undefined,
+          managerProfile.missing,
+          Number(process.hrtime.bigint() / 1_000_000n) + 2_000
+        );
+        if (!canDispatch() || !(await managerProfile.confirm()) || !canDispatch()) return undefined;
+        session.recoveryInputBrokerPending = broker.incarnation;
+        session.recoveryInputBroker = broker.incarnation;
+        session.codexRestoreUncertain = true;
+        this.inputBrokers.set(sessionId, broker);
+        await this.flushSessionsDurably(canDispatch);
+        if (!canDispatch()) return undefined;
+        const restoredPid = await this.fallbackOptionalBroker(
+          muxName,
+          refusedPid,
+          this.brokerCommand(broker),
+          canDispatch,
+          native,
+          () => {
+            dispatched = true;
+          }
+        );
+        if (!restoredPid || !canDispatch() || this.sessions.get(sessionId) !== session) return undefined;
+        session.pid = restoredPid;
+        if ((await broker.startupReceipt(restoredPid)) !== 'started' || !canDispatch()) return undefined;
+        return { pid: restoredPid, broker };
+      } finally {
+        if (!dispatched) await broker.rollbackUnlaunchedProvisioning?.();
+      }
+    };
     try {
       if (!canDispatch()) return null;
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
@@ -4415,7 +4468,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // The server evaluates this exact dead-process fence before queuing a no-k
       // respawn. A refused or lost response remains uncertainty-sealed by Session.
       const optionalDispatch = !!inputBroker && !guard && !options.onlyIfDead;
-      if (optionalDispatch) {
+      if (optionalDispatch && inputBroker) {
         // A lost dispatch ACK cannot restore a numeric PID or the previous incarnation.
         session.pid = 0;
         session.recoveryInputBroker = inputBroker.incarnation;
@@ -4460,7 +4513,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           const receipt = await inputBroker.startupReceipt(pid);
           if (receipt === 'not-sent') guard?.noteBrokerRefusal?.();
           if (receipt === 'started') guard?.noteBrokerSent?.();
-          if (receipt === 'not-sent' && !guard && !options.onlyIfDead && !managerProfile) {
+          if (receipt === 'not-sent' && managerProfile) {
+            const restored = await restoreOrdinaryManager(pid, dispatchReceipt);
+            if (!restored) return null;
+            pid = restored.pid;
+            inputBroker = restored.broker;
+            managerOrdinaryRestored = true;
+          } else if (receipt === 'not-sent' && !guard && !options.onlyIfDead && !managerProfile) {
             const fallbackPid = await this.fallbackOptionalBroker(
               muxName,
               pid,
@@ -4489,6 +4548,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
       if (
         managerProfile &&
+        !managerOrdinaryRestored &&
         pid &&
         inputBroker &&
         this.sessions.get(sessionId) === session &&

@@ -262,6 +262,8 @@
       '使用 --no-alt-screen 启动新的本地 Codex 会话，使对话输出保留在终端回滚记录中。',
     'Manager readiness is uncertain. The restricted conversation remains available for status and worker inspection only. Check the conversation, then select Prepare to recheck without restarting it; owner controls remain available.':
       '主管就绪状态不确定。受限会话仍可查询状态和查看工作会话，但不能执行操作。请检查会话，然后选择“准备”重新验证（不会重启会话）；所有者控制仍然可用。',
+    'Manager preparation was refused or is uncertain. Inspect the pane and verify authentication, exact conversation, settings and idle state before trying again. If the pane exited, use owner Restart after inspection; automatic recovery remains fenced.':
+      '主管准备被拒绝或状态不确定。重试前，请检查窗格并核实身份验证、原会话、设置和空闲状态。如果窗格已退出，请在检查后使用所有者重启；自动恢复仍受安全限制。',
     'Supervisor is off': '主管已关闭',
     'Supervisor configuration saved': '主管配置已保存',
     'Manager start reserved': '已保留管理器启动操作',

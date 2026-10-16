@@ -1037,6 +1037,147 @@ it('allows inspection-only attachment of a retained uncertain pane without anoth
   }
 });
 
+it.each([
+  'healthy',
+  'config-changed',
+  'rollout-changed',
+  'owner-cancelled',
+  'replaced-pane',
+  'live-broker',
+  'second-not-sent',
+  'second-unknown',
+  'unknown-primary',
+] as const)(
+  'restores the exact ordinary worker only after positively fenced manager startup refusal (%s)',
+  async (change) => {
+    const { prepareSupervisorManagerLaunch } = await import('../src/supervisor/manager-launch.js');
+    const root = await fsPromises.mkdtemp(join(homedir(), 'manager-ordinary-rollback-'));
+    provisioningRoots.push(root);
+    const home = join(root, 'home'),
+      work = join(root, 'work'),
+      rollout = join(root, 'rollout.jsonl');
+    await fsPromises.mkdir(home, { mode: 0o700 });
+    await fsPromises.mkdir(work);
+    const text = '{"type":"event_msg","payload":{"type":"task_complete"}}\n';
+    await fsPromises.writeFile(rollout, text, { mode: 0o600 });
+    const stat = await fsPromises.lstat(rollout);
+    const { createHash } = await import('node:crypto');
+    let current = true;
+    const profile = (await prepareSupervisorManagerLaunch({
+      home,
+      workingDir: work,
+      conversationId: options.codexConfig.resumeSessionId,
+      expectedPane: { paneId: '%7', panePid: 600 },
+      token: `codeman-manager-v1.${'a'.repeat(64)}`,
+      endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp',
+      bridgeCommand: 'codeman',
+      bridgeArgs: ['agent', 'supervisor-mcp'],
+      isCurrent: () => current,
+      additionalFiles: [
+        {
+          path: rollout,
+          dev: stat.dev,
+          ino: stat.ino,
+          size: stat.size,
+          mtimeMs: stat.mtimeMs,
+          ctimeMs: stat.ctimeMs,
+          hash: createHash('sha256').update(text).digest('hex'),
+          maxBytes: 262144,
+        },
+      ],
+    }))!;
+    expect(profile).toBeDefined();
+    registerOrdinary();
+    const primary = certifiedRefusal();
+    Reflect.set(
+      primary,
+      'setStartupAuthority',
+      vi.fn(async () => {})
+    );
+    vi.mocked(primary.startupReceipt).mockImplementation(async () => {
+      if (change === 'config-changed') await fsPromises.appendFile(profile.file, '\n# changed');
+      if (change === 'rollout-changed') await fsPromises.appendFile(rollout, '{"pending_child":true}\n');
+      if (change === 'owner-cancelled') current = false;
+      return change === 'unknown-primary' ? 'unknown' : 'not-sent';
+    });
+    const ordinary = successfulBroker();
+    Reflect.set(ordinary, 'directory', join(root, 'ordinary-broker'));
+    Reflect.set(ordinary, 'incarnation', 'cccccccc-dddd-eeee-ffff-aaaaaaaaaaaa');
+    Reflect.set(
+      ordinary,
+      'setStartupAuthority',
+      vi.fn(async () => {})
+    );
+    vi.mocked(ordinary.startupReceipt).mockResolvedValue(
+      change === 'second-not-sent' ? 'not-sent' : change === 'second-unknown' ? 'unknown' : 'started'
+    );
+    vi.mocked(CodexInputBroker.create).mockReset().mockResolvedValueOnce(primary).mockResolvedValueOnce(ordinary);
+    vi.spyOn(manager, 'inspectPaneForRecovery').mockResolvedValue({
+      dead: false,
+      paneId: '%7',
+      panePid: 600,
+      screen: '› ',
+    } as never);
+    if (change === 'replaced-pane' || change === 'live-broker') {
+      const exec = effects.exec.getMockImplementation()!;
+      effects.exec.mockImplementation(async (command: string) =>
+        command.includes(' list-panes -s ')
+          ? { stdout: change === 'replaced-pane' ? '$1|%8|700|1|800\n' : '$1|%7|700|0|800\n', stderr: '' }
+          : exec(command)
+      );
+    }
+    try {
+      const result = await manager.respawnPane({
+        ...options,
+        workingDir: work,
+        codexConfig: { ...options.codexConfig, model: 'fixture', reasoningEffort: 'high' },
+        envOverrides: { CODEX_HOME: home },
+        supervisorManager: profile,
+        ownerLaunchIsCurrent: () => current,
+      });
+      const restored = change === 'healthy';
+      expect(result).toBe(restored ? 701 : null);
+      expect(manager.isSupervisorManagerLaunchCurrent(SID, profile)).toBe(false);
+      const launches = vi.mocked(CodexInputBroker.create).mock.calls;
+      if (launches.length === 2) {
+        expect(launches[1][2]).toContain(options.codexConfig.resumeSessionId);
+        expect(launches[1][2]).toContain('--no-daemon');
+        expect(launches[1][2]).toContain('fixture');
+        expect(launches[1][2]).toContain('high');
+        expect(launches[1][2]).not.toContain(profile.name);
+        expect(launches[1][3]).toBe(home);
+        expect(ordinary.setStartupAuthority).toHaveBeenCalledWith(
+          profile.files,
+          undefined,
+          undefined,
+          profile.missing,
+          expect.any(Number)
+        );
+      }
+      const fallback = commands().find((command) => command.includes('CODEMAN_OPTIONAL_FALLBACK_STARTED'));
+      if (restored || change.startsWith('second-')) {
+        expect(fallback).toContain('ordinary-broker');
+        expect(fallback).toContain('#{pane_dead},1');
+        expect(fallback).not.toContain('respawn-pane -k');
+      } else expect(fallback).toBeUndefined();
+      expect(vi.mocked(CodexInputBroker.create).mock.calls.length).toBeLessThanOrEqual(2);
+      if (['config-changed', 'rollout-changed', 'owner-cancelled', 'unknown-primary'].includes(change))
+        expect(CodexInputBroker.create).toHaveBeenCalledOnce();
+      if (restored)
+        expect(manager.getSession(SID)).toMatchObject({
+          pid: 701,
+          recoveryInputBroker: ordinary.incarnation,
+          recoveryCodexHome: home,
+          recoveryIsolated: true,
+        });
+      else expect(manager.getSession(SID)?.codexRestoreUncertain).toBe(true);
+    } finally {
+      current = false;
+      await profile.revoke();
+    }
+  }
+);
+
 it.each(['started', 'not-sent', 'unknown', 'owner-draft'] as const)(
   'requires the restricted manager broker receipt (%s) without any raw fallback',
   async (receipt) => {

@@ -455,7 +455,7 @@ Object.assign(CodemanApp.prototype, {
     else
       this.showToast(
         supervisorUiTranslate(
-          'Manager preparation was refused or is uncertain. Check server authentication, session identity and idle state before trying again.'
+          'Manager preparation was refused or is uncertain. Inspect the pane and verify authentication, exact conversation, settings and idle state before trying again. If the pane exited, use owner Restart after inspection; automatic recovery remains fenced.'
         ),
         'error'
       );

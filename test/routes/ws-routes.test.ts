@@ -156,7 +156,9 @@ describe('ws-routes', () => {
 
     ctx = createMockRouteContext({ sessionId: 'ws-test-session' });
     registerWsRoutes(app, ctx as never, () => ({ bindHost: '127.0.0.1', allowedHosts: [], tunnelHost: null }));
-    registerSessionRoutes(app, ctx as never, { remoteWake: { hasWakeTarget: async () => false } as never });
+    registerSessionRoutes(app, ctx as never, {
+      remoteWake: { hasWakeTarget: async () => false, requiresInputReadiness: async () => false } as never,
+    });
     childProcess.execFile.mockReset();
 
     await app.listen({ port: 0, host: '127.0.0.1' });

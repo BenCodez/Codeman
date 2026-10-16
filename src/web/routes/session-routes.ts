@@ -1990,7 +1990,7 @@ export function registerSessionRoutes(
         // known reachable inside the probe throttle window; the probe itself is a bare
         // TCP connect on wake-enabled hosts only, at most once per
         // REMOTE_WAKE_PROBE_MIN_INTERVAL_MS.
-        if (!duplicate && (await remoteWake.hasWakeTarget(session))) {
+        if (!duplicate && (await remoteWake.requiresInputReadiness(session))) {
           if (inputAbort.signal.aborted)
             return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input was not delivered; retry the input');
           if (wantsWait || tagged) {
@@ -2293,7 +2293,7 @@ export function registerSessionRoutes(
     const { id } = req.params as { id: string };
     const session = findSessionOrFail(ctx, id, req);
     const abort = abortOnClientHangUp(reply);
-    if (session.paneLifecycleInFlight || session.recoveryInputReserved) {
+    if (session.inputDispatchAllowed === false || session.paneLifecycleInFlight || session.recoveryInputReserved) {
       return {
         ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Pane input is still in progress; retry attachment'),
         retryable: true,
@@ -2308,6 +2308,7 @@ export function registerSessionRoutes(
       ctx.sessions.get(id) === session &&
       !req.raw.aborted &&
       !abort.signal.aborted &&
+      session.inputDispatchAllowed !== false &&
       canAccessOwned(getAuthUser(req), session.owner);
     try {
       await session.fenceUntrackedInput(current);
