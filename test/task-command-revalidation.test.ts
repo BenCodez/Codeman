@@ -1,4 +1,4 @@
-/** Actual rollout command/marker parsing and controller completion; no worker effects. */
+/** @fileoverview Actual rollout command/marker parsing and controller completion; no worker effects. */
 import { createHash } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { TaskController } from '../src/supervision/controller.js';
@@ -17,6 +17,7 @@ async function fixture() {
   const submission = line(10000, { type: 'user_message', message: 'Run the authorized acceptance checks' });
   const submissionKey = createHash('sha256').update(submission.trimEnd()).digest('hex');
   let tail = submission;
+  let activity: 'working' | 'completed' = 'working';
   let saved: TaskState | undefined;
   const act = vi.fn(async () => 'sent' as const);
   const recover = vi.fn(async () => 'sent' as const);
@@ -24,7 +25,7 @@ async function fixture() {
     now: () => now,
     observe: async () => ({
       observation: {
-        activity: 'working',
+        activity,
         reason: 'turn-running',
         at: now,
         conversationId: CID,
@@ -61,6 +62,9 @@ async function fixture() {
   expect(controller.getStatus().criteria.map((criterion) => criterion.verified)).toEqual([true, false, true]);
   return {
     controller,
+    finish: () => {
+      activity = 'completed';
+    },
     act,
     recover,
     append: (text: string) => {
@@ -132,6 +136,7 @@ describe('previously verified command criteria follow current execution evidence
         f.clock(21000);
         expect(f.commands().get(commandHash('check A'))).toEqual({ startedAt: 15000, completedAt: 16000 });
         if (entry === 'agent-marker') {
+          f.finish();
           f.append(
             line(20000, {
               type: 'agent_message',
