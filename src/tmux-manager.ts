@@ -3982,6 +3982,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   /** Recovered metadata cannot mint authority to cancel an acknowledged local launch. */
   async cancelAcknowledgedRebootLaunch(record: MuxSession, isCurrent: () => boolean): Promise<boolean> {
     const acknowledged = this.acknowledgedRebootLaunches?.get(record);
+    const codexRestore = getCli(record.mode)?.capabilities.recovery === 'codex-rollout';
     const current = () =>
       acknowledged !== undefined &&
       this.sessions.get(record.sessionId) === record &&
@@ -3991,7 +3992,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       isCurrent() === true;
     try {
       if (!current()) return false;
-      if (record.mode !== 'codex' && record.restoreUncertain !== true) {
+      if (!codexRestore && record.restoreUncertain !== true) {
         // A completed generic launch has no identity-fence file. Reserve its
         // uncertainty durably before a cancellation whose native ACK may be lost.
         record.restoreUncertain = true;
@@ -4037,7 +4038,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       } catch {
         // A lost metadata acknowledgement cannot retire the retained uncertainty.
         if (!this.sessions.has(record.sessionId)) {
-          if (record.mode === 'codex') record.codexRestoreUncertain = true;
+          if (codexRestore) record.codexRestoreUncertain = true;
           else record.restoreUncertain = true;
           this.sessions.set(record.sessionId, record);
           this.saveSessions();
