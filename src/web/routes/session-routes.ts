@@ -1881,31 +1881,47 @@ export function registerSessionRoutes(
       // TCP connect on wake-enabled hosts only, at most once per
       // REMOTE_WAKE_PROBE_MIN_INTERVAL_MS.
       if (!duplicate && (await remoteWake.hasWakeTarget(session))) {
-        if (wantsWait) {
-          // Send-and-wait keeps the response open anyway, so blocking on the wake is
-          // simpler and more correct than buffering (buffering would break the wait).
+        if (wantsWait || tagged) {
+          // A tagged response is a delivery ACK. The bounded wake buffer may not
+          // own it: flushing can fail after an uncertain partial write. Keep the
+          // browser's exact identity pending until guarded dispatch actually runs.
+          // Send-and-wait also needs a live pane before registering its waiter.
           // A host that never comes back is an error here, as on the create/attach
           // paths: writing into the stalled pane would answer `delivered:true` plus a
           // timeout, which is the combination the API docs send callers to the wrong
           // recovery for.
-          if (!(await remoteWake.ensureAwake(session))) {
+          if (
+            !(await remoteWake.ensureAwake(session, tagged ? { timeoutMs: REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS } : {}))
+          ) {
             return createErrorResponse(
               ApiErrorCode.OPERATION_FAILED,
               `${session.remote?.label ?? 'the remote host'} did not come back after a wake-on-LAN request — nothing was sent`
             );
           }
+          // Session deletion, replacement, ownership changes and a disconnected
+          // requester can happen while wake/reattach is awaited. None authorizes
+          // sending into a retained object after its owner cancelled the request.
+          if (ctx.sessions.get(id) !== session || reply.raw.destroyed) {
+            return reply.code(409).send({
+              ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Input target changed; nothing was sent'),
+              retryable: true,
+              notSent: true,
+            });
+          }
+          findSessionOrFail(ctx, id, req);
         } else {
           const outcome = await remoteWake.handleInput(session, inputStr);
           // The registry holds the bytes and flushes them in order once the pane is
-          // reattached. The client's ACK is this 200 — a tagged retry is deduped
-          // (its admitted identity is committed with buffer ownership), so nothing is lost.
-          // `buffered` is additive to the historical bare `{}`; `dropped` says the chunk
-          // was over the wake buffer's cap and is GONE (a 200 with no field could not
-          // tell delivered from buffered from dropped).
-          if (outcome === 'buffered' || outcome === 'dropped') {
-            if (tagged) session.commitInputSeq(clientId as string, seq as number);
-            return outcome === 'buffered' ? { buffered: true } : { buffered: true, dropped: true };
+          // reattached. Only legacy untagged requests use this best-effort buffer.
+          // Refusing capacity must not evict any previously accepted input.
+          if (outcome === 'dropped') {
+            return reply.code(429).send({
+              ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Wake input backlog is full; retry the input'),
+              retryable: true,
+              notSent: true,
+            });
           }
+          if (outcome === 'buffered') return { buffered: true };
         }
       }
 
