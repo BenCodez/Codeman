@@ -1,4 +1,4 @@
-/** Real-browser responsive layout coverage for Session Options. */
+/** @fileoverview Real-browser responsive layout coverage for Session Options. */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -303,4 +303,141 @@ describe('Session Options responsive layout in Chromium', () => {
       await page.evaluate(() => (window as any).app.closeTaskOptions());
     }
   );
+  it.each([390, 1280])('preserves every unsaved task field through successful Pause/Resume at %spx', async (width) => {
+    await page.close();
+    page = await browser.newPage();
+    await renderAt(width);
+    await page.addScriptTag({ content: 'window.CodemanApp = class {};' });
+    for (const file of ['api-client.js', 'recovery-ui.js', 'supervision-ui.js'])
+      await page.addScriptTag({ content: readFileSync(resolve(publicDir, file), 'utf8') });
+    await page.evaluate(async () => {
+      const w = window as any;
+      document.getElementById('context-tab')!.classList.add('hidden');
+      document.getElementById('task-tab')!.classList.remove('hidden');
+      w.__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
+      w.app = new w.CodemanApp();
+      w.app.sessions = new Map([['a', { mode: 'codex', taskSupported: true }]]);
+      w.app.editingSessionId = 'a';
+      w.app.showToast = (message: string) => (w.lastTaskError = message);
+      w.taskState = {
+        version: 1,
+        objective: 'Saved objective',
+        criteria: [
+          { id: 'manual', kind: 'manual', description: 'Saved manual criterion', verified: false },
+          {
+            id: 'command',
+            kind: 'command',
+            description: 'Saved command label',
+            command: 'saved check',
+            verified: false,
+          },
+        ],
+        config: { enabled: true, maxContinuations: 3, maxRuntimeMs: 900000 },
+        phase: 'watching',
+        outcome: 'unfinished',
+        reason: 'configured',
+        continuations: 0,
+        checkpoint: 'Saved checkpoint',
+        nextAction: 'Saved action',
+        history: [],
+      };
+      w.taskRequests = [];
+      w.failTaskControl = false;
+      w.fetch = async (url: string, options?: { method?: string; body?: string }) => {
+        if (options?.method !== 'GET') {
+          w.taskRequests.push({
+            url,
+            method: options?.method,
+            body: options?.body === undefined ? null : JSON.parse(options.body),
+          });
+          if (w.failTaskControl) return new Response(JSON.stringify({ success: false }), { status: 500 });
+          if (url.endsWith('/pause')) w.taskState = { ...w.taskState, phase: 'paused', reason: 'owner-paused' };
+          if (url.endsWith('/resume')) w.taskState = { ...w.taskState, phase: 'watching', reason: 'owner-resumed' };
+          if (options?.method === 'PUT') {
+            const patch = JSON.parse(options.body!);
+            w.taskState = {
+              ...w.taskState,
+              ...patch,
+              phase: patch.config.enabled ? 'watching' : 'disabled',
+              reason: 'configured',
+              config: { ...w.taskState.config, ...patch.config },
+              criteria: patch.criteria.map((criterion: any) => ({ ...criterion, verified: false })),
+            };
+          }
+        }
+        return new Response(JSON.stringify({ success: true, data: w.taskState }), { status: 200 });
+      };
+      w.app.openTaskOptions('a');
+      await w.app.loadTaskStatus();
+    });
+    const rows = page.locator('#taskCriteriaRows > [data-task-criterion-row]');
+    await page.locator('#taskObjective').fill('  Unsaved objective\n界  ');
+    await rows.first().locator('textarea').fill('  Unsaved manual criterion\n界  ');
+    await rows.nth(1).locator('[data-task-field="description"]').fill('Unsaved command label');
+    await rows.nth(1).locator('[data-task-field="command"]').fill('  printf "界"\nnext check  ');
+    await page.locator('#taskAddManualCriterion').click();
+    await rows.last().locator('textarea').fill('Added manual acceptance');
+    await page.locator('#taskEnabled').uncheck();
+    await page.locator('#taskMaxContinuations').fill('7');
+    await page.locator('#taskMaxRuntime').fill('321');
+    await page.locator('#taskCheckpoint').fill('  Unsaved checkpoint\n界  ');
+    await page.locator('#taskNextAction').fill('  Unsaved next action\n界  ');
+    await page.locator('#taskProgressOutcome').selectOption('blocked');
+    await page.locator('#taskCriteriaEvidence input').first().check();
+    const snapshot = () =>
+      page.evaluate(() => {
+        const input = (id: string) => (document.getElementById(id) as HTMLInputElement).value;
+        return {
+          objective: input('taskObjective'),
+          enabled: (document.getElementById('taskEnabled') as HTMLInputElement).checked,
+          max: input('taskMaxContinuations'),
+          runtime: input('taskMaxRuntime'),
+          checkpoint: input('taskCheckpoint'),
+          nextAction: input('taskNextAction'),
+          outcome: input('taskProgressOutcome'),
+          rows: [...document.querySelectorAll<HTMLElement>('#taskCriteriaRows [data-task-criterion-row]')].map(
+            (row) => ({
+              id: row.dataset.criterionId,
+              fields: [...row.querySelectorAll('textarea')].map((field) => field.value),
+            })
+          ),
+          selected: [...document.querySelectorAll<HTMLInputElement>('#taskCriteriaEvidence input:checked')].map(
+            (field) => field.value
+          ),
+        };
+      });
+    const draft = await snapshot();
+    for (const action of ['pause', 'resume']) {
+      await page.locator(action === 'pause' ? '#taskPauseBtn' : '#taskResumeBtn').click();
+      await expect
+        .poll(() => page.locator('#taskPhase').textContent())
+        .toBe(action === 'pause' ? 'Paused' : 'Monitoring');
+      expect(await snapshot()).toEqual(draft);
+      expect(await page.evaluate(() => (window as any).app._taskView.dirty)).toBe(true);
+      expect(await page.locator('#taskPauseBtn').isEnabled()).toBe(true);
+      expect(await page.locator('#taskResumeBtn').isEnabled()).toBe(true);
+    }
+    await page.evaluate(() => {
+      (window as any).failTaskControl = true;
+    });
+    await page.locator('#taskPauseBtn').click();
+    await expect.poll(() => page.evaluate(() => (window as any).lastTaskError)).toContain('Task action failed');
+    expect(await snapshot()).toEqual(draft);
+    expect(await page.locator('#taskPhase').textContent()).toBe('Monitoring');
+    await page.evaluate(() => {
+      (window as any).failTaskControl = false;
+    });
+    await page.getByRole('button', { name: 'Save task configuration', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).taskRequests.length)).toBe(4);
+    const requests = await page.evaluate(() => (window as any).taskRequests);
+    expect(requests.slice(0, 3).map((request: any) => request.body)).toEqual([null, null, null]);
+    expect(requests[3].body).toMatchObject({
+      objective: draft.objective.trim(),
+      config: { enabled: false, maxContinuations: 7, maxRuntimeMs: 321000 },
+    });
+    expect(requests[3].body.criteria.map((criterion: any) => criterion.id)).toEqual(draft.rows.map((row) => row.id));
+    expect(requests[3].body.criteria[1].command).toBe(draft.rows[1].fields[1]);
+    await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
+    await page.evaluate(() => (window as any).app.closeTaskOptions());
+  });
 });

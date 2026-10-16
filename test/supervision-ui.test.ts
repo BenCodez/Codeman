@@ -1,4 +1,4 @@
-/** Task view tests use real markup and isolated owner-bound API fixtures. */
+/** @fileoverview Task view tests use real markup and isolated owner-bound API fixtures. */
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
@@ -726,4 +726,171 @@ describe('Task supervision UI', () => {
     translator.configure({ language: 'en' });
     expect([...labels].filter((label) => translator.t(label) !== label)).toEqual([]);
   });
+});
+
+function enterControlDraft(h: ReturnType<typeof harness>) {
+  const rows = [...h.get('taskCriteriaRows').children];
+  const manual = rows[0].querySelector('textarea') as HTMLTextAreaElement;
+  const command = rows[1].querySelector('[data-task-field="command"]') as HTMLTextAreaElement;
+  manual.value = '  Unsaved manual acceptance\n保留  ';
+  manual.dispatchEvent(new h.dom.window.Event('input', { bubbles: true }));
+  command.value = '  printf "界"\nnext command  ';
+  command.dispatchEvent(new h.dom.window.Event('input', { bubbles: true }));
+  h.get('taskObjective').value = '  Unsaved objective\nsecond line  ';
+  h.get('taskEnabled').checked = false;
+  h.get('taskMaxContinuations').value = '7';
+  h.get('taskMaxRuntime').value = '321';
+  h.get('taskCheckpoint').value = '  Unsaved checkpoint\n界  ';
+  h.get('taskNextAction').value = '  Unsaved next action\n界  ';
+  h.get('taskProgressOutcome').value = 'blocked';
+  h.get('taskCriteriaEvidence').querySelector('input').checked = true;
+  return { rows, manual, command };
+}
+function expectControlDraft(h: ReturnType<typeof harness>, draft: ReturnType<typeof enterControlDraft>) {
+  expect([...h.get('taskCriteriaRows').children]).toEqual(draft.rows);
+  expect(draft.manual.value).toBe('  Unsaved manual acceptance\n保留  ');
+  expect(draft.command.value).toBe('  printf "界"\nnext command  ');
+  expect(h.get('taskObjective').value).toBe('  Unsaved objective\nsecond line  ');
+  expect(h.get('taskEnabled').checked).toBe(false);
+  expect(h.get('taskMaxContinuations').value).toBe('7');
+  expect(h.get('taskMaxRuntime').value).toBe('321');
+  expect(h.get('taskCheckpoint').value).toBe('  Unsaved checkpoint\n界  ');
+  expect(h.get('taskNextAction').value).toBe('  Unsaved next action\n界  ');
+  expect(h.get('taskProgressOutcome').value).toBe('blocked');
+  expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+  expect(h.app._taskView.dirty).toBe(true);
+  expect(h.app._taskView.busy).toBe(false);
+}
+it.each(['pause', 'resume', 'reset'] as const)(
+  'successful bodyless %s updates current controls while preserving every unsaved editor field',
+  async (action) => {
+    const initial = {
+      ...state(),
+      config: { ...state().config, enabled: true },
+      phase: action === 'resume' ? 'paused' : 'watching',
+    };
+    const h = harness(initial);
+    await h.open();
+    const draft = enterControlDraft(h);
+    const accepted = {
+      ...initial,
+      phase: action === 'resume' ? 'watching' : action === 'reset' ? 'disabled' : 'paused',
+      config: { ...initial.config, enabled: action !== 'reset' },
+      reason: { pause: 'owner-paused', resume: 'owner-resumed', reset: 'owner-reset' }[action],
+    };
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ success: true, data: accepted }), { status: 200 }));
+    h.dom.window.fetch = fetch;
+    delete h.app._apiJson;
+    await h.app.taskAction(action);
+    expect(fetch).toHaveBeenCalledOnce();
+    expect(fetch.mock.calls[0][0]).toBe(`/api/sessions/a/task/${action}`);
+    expect(fetch.mock.calls[0][1].body).toBeUndefined();
+    expectControlDraft(h, draft);
+    expect(h.get('taskPhase').textContent).toBe(
+      action === 'resume' ? 'Monitoring' : action === 'reset' ? 'Off' : 'Paused'
+    );
+    expect(h.get('taskPauseBtn').disabled).toBe(action === 'reset');
+    expect(h.get('taskResumeBtn').disabled).toBe(false);
+    expect(h.app._taskView.state).toEqual(accepted);
+  }
+);
+it.each(['network', '500', 'malformed'] as const)(
+  'failed bodyless pause preserves the complete draft after %s',
+  async (failure) => {
+    const initial = { ...state(), config: { ...state().config, enabled: true }, phase: 'watching' };
+    const h = harness(initial);
+    await h.open();
+    const draft = enterControlDraft(h);
+    h.dom.window.fetch = vi.fn(async () => {
+      if (failure === 'network') throw new Error('Fixture offline');
+      return new Response(failure === 'malformed' ? '{' : JSON.stringify({ success: false }), {
+        status: failure === '500' ? 500 : 200,
+      });
+    });
+    delete h.app._apiJson;
+    await h.app.taskAction('pause');
+    expectControlDraft(h, draft);
+    expect(h.get('taskPhase').textContent).toBe('Monitoring');
+    expect(h.app.showToast).toHaveBeenCalledWith('Task action failed. Refresh status before trying again.', 'error');
+  }
+);
+it.each(['control', 'save'] as const)(
+  'a stale successful %s reply cannot clear a newer draft or replace current server controls',
+  async (action) => {
+    const initial = { ...state(), config: { ...state().config, enabled: true }, phase: 'watching' };
+    const h = harness(initial);
+    await h.open();
+    const draft = enterControlDraft(h);
+    let release!: (value: unknown) => void;
+    h.app._apiJson = vi.fn(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        })
+    );
+    const pending = action === 'control' ? h.app.taskAction('pause') : h.app.saveTaskConfiguration();
+    const latest = { ...initial, phase: 'blocked', reason: 'task-evidence-unknown' };
+    h.app._onSessionTask({ sessionId: 'a', state: latest });
+    release({ ...initial, phase: 'paused', reason: 'owner-paused' });
+    await pending;
+    expectControlDraft(h, draft);
+    expect(h.app._taskView.state).toEqual(latest);
+    expect(h.get('taskPhase').textContent).toBe('Blocked');
+  }
+);
+it('clean control replies refresh saved fields without manufacturing a draft', async () => {
+  const h = harness({ ...state(), config: { ...state().config, enabled: true }, phase: 'watching' });
+  await h.open();
+  const accepted = {
+    ...state(),
+    config: { ...state().config, enabled: true },
+    phase: 'paused',
+    objective: 'Current server objective',
+    checkpoint: 'Current server checkpoint',
+  };
+  h.app._apiJson.mockResolvedValueOnce(accepted);
+  await h.app.taskAction('pause');
+  expect(h.app._taskView.dirty).toBe(false);
+  expect(h.get('taskObjective').value).toBe(accepted.objective);
+  expect(h.get('taskCheckpoint').value).toBe(accepted.checkpoint);
+  expect(h.get('taskPhase').textContent).toBe('Paused');
+});
+it('an unsaved criterion selection alone remains a draft through pause', async () => {
+  const initial = { ...state(), config: { ...state().config, enabled: true }, phase: 'watching' };
+  const h = harness(initial);
+  await h.open();
+  const checkbox = h.get('taskCriteriaEvidence').querySelector('input');
+  checkbox.checked = true;
+  checkbox.dispatchEvent(new h.dom.window.Event('change', { bubbles: true }));
+  expect(h.app._taskView.dirty).toBe(true);
+  h.app._apiJson.mockResolvedValueOnce({ ...initial, phase: 'paused' });
+  await h.app.taskAction('pause');
+  expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+  expect(h.app._taskView.dirty).toBe(true);
+});
+it('a draft save may acknowledge the identical server event published before its response', async () => {
+  const h = harness();
+  await h.open();
+  enterControlDraft(h);
+  let release!: (value: unknown) => void;
+  h.app._apiJson = vi.fn(
+    () =>
+      new Promise((resolve) => {
+        release = resolve;
+      })
+  );
+  const pending = h.app.saveTaskConfiguration();
+  const body = h.app._apiJson.mock.calls[0][1].body;
+  const accepted = {
+    ...state(),
+    ...body,
+    criteria: body.criteria.map((criterion: any) => ({ ...criterion, verified: false })),
+    reason: 'configured',
+  };
+  h.app._onSessionTask({ sessionId: 'a', state: structuredClone(accepted) });
+  release(structuredClone(accepted));
+  await pending;
+  expect(h.app._taskView.dirty).toBe(false);
+  expect(h.app._taskView.state).toEqual(accepted);
+  expect(h.get('taskObjective').value).toBe(accepted.objective);
 });
