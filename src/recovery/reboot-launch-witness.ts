@@ -199,7 +199,10 @@ export async function captureRebootBrokerBindings(
   deadline?: number
 ): Promise<Map<string, string | null> | undefined> {
   const dataDir = getDataDirPath();
-  const states = Object.values(persisted).filter((state) => state.mode === 'codex' && !state.remote && !state.docker);
+  const states = Object.values(persisted).filter(
+    (state) =>
+      getCli(state.mode ?? 'claude')?.capabilities.recovery === 'codex-rollout' && !state.remote && !state.docker
+  );
   if (states.length > 1_000) return undefined;
   return run(
     hash(
@@ -208,6 +211,7 @@ export async function captureRebootBrokerBindings(
         dataDir,
         states.map((state) => [
           state.id,
+          state.mode ?? 'claude',
           state.owner,
           state.workingDir,
           state.codexConfig,
@@ -253,7 +257,7 @@ export async function captureRebootBrokerBindings(
         if (row?.codexRestoreUncertain === true || row?.recoveryInputBrokerPending !== undefined) continue;
         if (
           row &&
-          (row.mode !== 'codex' ||
+          (row.mode !== (state.mode ?? 'claude') ||
             row.remote ||
             row.docker ||
             row.owner !== state.owner ||

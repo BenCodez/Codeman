@@ -40,6 +40,11 @@ export class SupervisorStore {
     this.loadFailed = failed;
   }
 
+  /** Membership only; an absent role must not be confused with its default state. */
+  has(id: string): boolean {
+    return Object.hasOwn(this.records, id);
+  }
+
   get(id: string): SupervisorState {
     const state = structuredClone(this.records[id] ?? initialSupervisorState(id));
     if (this.loadFailed || this.writeUncertain) {

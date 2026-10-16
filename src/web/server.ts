@@ -2487,6 +2487,13 @@ export class WebServer extends EventEmitter {
       respawn: controller?.getStatus() ?? null,
       recovery: this.recoveryControllers.get(session.id)?.getStatus(),
       task: this.taskControllers.get(session.id)?.getStatus(),
+      supervisorAvailable:
+        !this.recoveryStopping &&
+        !this.cleaningUp.has(session.id) &&
+        this.sessions.get(session.id) === session &&
+        (this.supervisorControllers.has(session.id) ||
+          this.supervisorStore.has(session.id) ||
+          this.supervisorManagerIsEligible(session)),
     };
   }
 
@@ -2750,6 +2757,17 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  private supervisorManagerIsEligible(session: Session): boolean {
+    const context = session.getRecoveryContext();
+    return (
+      getCli(session.mode)?.capabilities.recovery === 'codex-rollout' &&
+      !session.remote &&
+      !session.docker &&
+      context.managed &&
+      context.noDaemon
+    );
+  }
+
   private getSupervisorController(session: Session): SupervisorController | undefined {
     if (this.recoveryStopping || this.cleaningUp.has(session.id) || this.sessions.get(session.id) !== session)
       return undefined;
@@ -2760,12 +2778,7 @@ export class WebServer extends EventEmitter {
     // Rebuild an existing durable role for owner inspection and lease release
     // even when a failed rebuild removed its live controller and launch rights.
     const restored = this.supervisorStore.all().find((state) => state.supervisorSessionId === session.id);
-    const managerIsEligible = () =>
-      getCli(session.mode)?.capabilities.recovery === 'codex-rollout' &&
-      !session.remote &&
-      !session.docker &&
-      session.getRecoveryContext().managed &&
-      session.getRecoveryContext().noDaemon;
+    const managerIsEligible = () => this.supervisorManagerIsEligible(session);
     if (!restored && !managerIsEligible()) return undefined;
     const managerAdapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
     const managerScope = () => {

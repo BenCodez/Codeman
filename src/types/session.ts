@@ -742,6 +742,8 @@ export interface SessionState {
   task?: import('./task.js').SupervisionTaskState;
   /** Computed launch-shape eligibility; never restored as authority from persisted state. */
   taskSupported?: boolean;
+  /** Computed by the server for creating or inspecting an owner-controlled supervisor role. */
+  supervisorAvailable?: boolean;
   /** Unique session identifier */
   id: string;
   /** Process ID of the PTY process, null if not running */

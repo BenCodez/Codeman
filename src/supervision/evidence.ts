@@ -15,6 +15,11 @@ const SUPPORTED_POSIX_SHELLS = new Set([
 export function commandHash(command: string): string {
   return createHash('sha256').update(command).digest('hex');
 }
+// Keep exact execution attribution private and out of the durable/public criterion DTO.
+const executionIdentities = new WeakMap<CommandSuccessEvidence, string>();
+export function commandEvidenceIdentity(evidence: CommandSuccessEvidence): string | undefined {
+  return executionIdentities.get(evidence);
+}
 /** Paired execution timestamps; a fresh end alone cannot prove post-configuration state. */
 export interface CommandSuccessEvidence {
   startedAt: number;
@@ -87,8 +92,11 @@ export function successfulCommands(tail: string, since: number, now: number): Ma
         const hash = commandHash(begin.command);
         const prior = result.get(hash);
         // A late completion of older work must not erase a newer execution's freshness proof.
-        if (!prior || begin.at > prior.startedAt || (begin.at === prior.startedAt && at > prior.completedAt))
-          result.set(hash, { startedAt: begin.at, completedAt: at });
+        if (!prior || begin.at > prior.startedAt || (begin.at === prior.startedAt && at > prior.completedAt)) {
+          const evidence = { startedAt: begin.at, completedAt: at };
+          executionIdentities.set(evidence, createHash('sha256').update(p.call_id).digest('hex'));
+          result.set(hash, evidence);
+        }
       }
       // Every completed call releases its pending execution slot.
       pending.delete(p.call_id);

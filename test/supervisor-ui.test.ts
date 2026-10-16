@@ -48,7 +48,7 @@ function harness() {
   vm.runInContext('class CodemanApp {}', ctx);
   vm.runInContext(read('supervisor-ui.js'), ctx);
   const app = vm.runInContext('new CodemanApp()', ctx) as any;
-  app.sessions = new Map([[SID, { mode: 'codex', codexConfig: { noAltScreen: true } }]]);
+  app.sessions = new Map([[SID, { mode: 'codex', supervisorAvailable: true, codexConfig: { noAltScreen: true } }]]);
   app.supportsSessionRecovery = () => true;
   app.showToast = vi.fn();
   app._apiJson = vi.fn(async () => state());
@@ -61,7 +61,37 @@ afterEach(() => {
 
 describe('Codex supervisor UI', () => {
   it.each([
-    { label: 'local manager', session: { mode: 'codex' }, capability: true, supported: true },
+    {
+      label: 'local manager',
+      session: { mode: 'codex', supervisorAvailable: true },
+      capability: true,
+      supported: true,
+    },
+    {
+      label: 'daemon session',
+      session: { mode: 'codex', supervisorAvailable: false, codexConfig: { noDaemon: false } },
+      capability: true,
+      supported: false,
+    },
+    {
+      label: 'unverified isolation',
+      session: { mode: 'codex', supervisorAvailable: false, taskSupported: true, codexConfig: { noDaemon: true } },
+      capability: true,
+      supported: false,
+    },
+    { label: 'missing eligibility', session: { mode: 'codex' }, capability: true, supported: false },
+    {
+      label: 'durable ineligible role',
+      session: { mode: 'codex', supervisorAvailable: false, supervisor: state() },
+      capability: true,
+      supported: true,
+    },
+    {
+      label: 'malformed role',
+      session: { mode: 'codex', supervisor: { ...state(), supervisorSessionId: WID } },
+      capability: true,
+      supported: false,
+    },
     {
       label: 'owned SSH worker',
       session: { mode: 'codex', remote: { owned: true } },
@@ -94,6 +124,18 @@ describe('Codex supervisor UI', () => {
     expect(!!h.app._supervisorView).toBe(supported);
     expect(load).toHaveBeenCalledTimes(supported ? 1 : 0);
     expect(h.app._apiJson).not.toHaveBeenCalled();
+  });
+
+  it('keeps a returned role inspectable after isolation is revoked and the panel is reopened', async () => {
+    const h = harness();
+    expect(h.app.openSupervisorOptions(SID)).toBe(true);
+    await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+    h.app.sessions.get(SID).supervisorAvailable = false;
+    h.app.sessions.get(SID).codexConfig.noDaemon = false;
+    h.app.closeSupervisorOptions();
+    expect(h.app.openSupervisorOptions(SID)).toBe(true);
+    await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+    expect(h.app._apiJson).toHaveBeenCalledTimes(2);
   });
 
   it.each(

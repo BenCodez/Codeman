@@ -107,6 +107,37 @@ it.each([4, 5])('bounds the total restored UTF-8 byte budget for %s individually
     expect(browser.app.showToast).toHaveBeenCalledWith(expect.stringContaining('could not be verified'), 'warning');
 });
 
+it.each([4, 5, 8])(
+  'persists a reloadable UTF-8 prefix of %s queued emoji frames without losing live pending input',
+  async (count) => {
+    const h = browserInputJournal();
+    const browser = h.open();
+    browser.transport(vi.fn(async () => new Response('{}', { status: 503 })));
+    const frame = '🧭'.repeat(LIMIT / 4);
+    for (let index = 0; index < count; index++) browser.app._sendInputAsync(SID, frame);
+    await flush();
+    expect(browser.app._pendingDeliveries.get(SID)).toHaveLength(count);
+    const stored = h.records();
+    expect(stored).toHaveLength(Math.min(count, 4));
+    expect(stored.reduce((bytes, rec) => bytes + Buffer.byteLength(rec.value.data), 0)).toBe(
+      Math.min(count, 4) * LIMIT
+    );
+    expect(stored.map(({ value }) => value.seq)).toEqual(
+      Array.from({ length: Math.min(count, 4) }, (_, index) => index + 1)
+    );
+    if (count > 4)
+      expect(browser.app.showToast).toHaveBeenCalledWith(expect.stringContaining('keep this window open'), 'warning');
+    else expect(browser.app.showToast).not.toHaveBeenCalled();
+    const restored = h.open();
+    expect(restored.app._pendingDeliveries.get(SID)).toHaveLength(Math.min(count, 4));
+    expect(restored.app.showToast).not.toHaveBeenCalled();
+    expect(h.records()).toEqual(stored);
+    expect(restored.app._pendingDeliveries.get(SID)?.map((rec) => [rec.cid, rec.seq, rec.data])).toEqual(
+      stored.map(({ value }) => [value.cid, value.seq, value.data])
+    );
+  }
+);
+
 it('a timed-out ordinary POST releases the drainer but keeps exact identity and FIFO through reload and acceptance', async () => {
   const h = browserInputJournal();
   const browser = h.open();

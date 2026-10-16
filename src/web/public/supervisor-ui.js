@@ -221,7 +221,12 @@ Object.assign(CodemanApp.prototype, {
     this.closeSupervisorOptions();
     const session = this.sessions.get(sessionId);
     const supported =
-      !!session && this.supportsSessionRecovery?.(session) === true && !session.remote && !session.docker;
+      !!session &&
+      (supervisorUiStateValid(session.supervisor, sessionId) ||
+        (session.supervisorAvailable === true &&
+          this.supportsSessionRecovery?.(session) === true &&
+          !session.remote &&
+          !session.docker));
     const rail = document.querySelector('#sessionOptionsModal [data-tab="supervisor"]');
     if (rail) rail.style.display = supported ? '' : 'none';
     if (!supported) return false;
@@ -241,7 +246,11 @@ Object.assign(CodemanApp.prototype, {
     if (this._supervisorView !== view) return;
     view.busy = false;
     view.state = supervisorUiStateValid(state, view.sessionId) ? state : null;
-    if (view.state) supervisorUiReconcileRequests(view.state, view.sessionId);
+    if (view.state) {
+      const session = this.sessions.get(view.sessionId);
+      if (session) session.supervisor = view.state;
+      supervisorUiReconcileRequests(view.state, view.sessionId);
+    }
     this._renderSupervisorStatus(true);
     if (view.state?.phase === 'active') await this.loadSupervisorWorkers();
   },
@@ -461,7 +470,11 @@ Object.assign(CodemanApp.prototype, {
     if (this._supervisorView !== view) return;
     view.busy = false;
     view.state = supervisorUiStateValid(state, view.sessionId) ? state : null;
-    if (view.state) supervisorUiReconcileRequests(view.state, view.sessionId);
+    if (view.state) {
+      const session = this.sessions.get(view.sessionId);
+      if (session) session.supervisor = view.state;
+      supervisorUiReconcileRequests(view.state, view.sessionId);
+    }
     if (!view.state)
       this.showToast(supervisorUiTranslate('Supervisor action failed. Refresh status before trying again.'), 'error');
     this._renderSupervisorStatus(true);

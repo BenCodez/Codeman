@@ -70,7 +70,7 @@ describe('Codex supervisor UI in Chromium', () => {
         let managerReady = false;
         const calls: unknown[] = [];
         const app = new (window as any).CodemanApp();
-        app.sessions = new Map([[sid, { mode: 'codex', codexConfig: {} }]]);
+        app.sessions = new Map([[sid, { mode: 'codex', supervisorAvailable: true, codexConfig: {} }]]);
         app.supportsSessionRecovery = () => true;
         app.showToast = () => undefined;
         app._apiJson = async (url: string, options?: any) => {
@@ -143,7 +143,7 @@ describe('Codex supervisor UI in Chromium', () => {
               { mode: 'codex', remote: { owned: true } },
               { mode: 'codex', remote: { owned: false } },
               { mode: 'codex', docker: { containerId: 'fixture' } },
-              { mode: 'codex' },
+              { mode: 'codex', supervisorAvailable: true },
             ].map((session) => {
               app.sessions.set(sid, session);
               const before = calls.length;
@@ -163,6 +163,48 @@ describe('Codex supervisor UI in Chromium', () => {
         );
         expect(results[3]).toMatchObject({ supported: true, display: '' });
         expect(results[3].calls).toBeGreaterThan(0);
+      } finally {
+        await page.close();
+      }
+    });
+
+    it(`gates new roles on isolation and preserves returned roles at ${width}px`, async () => {
+      const page = await render(width);
+      try {
+        const result = await page.evaluate(
+          async ({ sid }) => {
+            const w = window as any;
+            const app = w.app;
+            const returned = structuredClone(app.sessions.get(sid).supervisor);
+            const negative = [
+              { mode: 'codex', supervisorAvailable: false, codexConfig: { noDaemon: false } },
+              { mode: 'codex', supervisorAvailable: false, taskSupported: true, codexConfig: { noDaemon: true } },
+              { mode: 'codex' },
+              { mode: 'codex', supervisor: { ...returned, supervisorSessionId: 'different-session' } },
+            ].map((session) => {
+              app.sessions.set(sid, session);
+              const before = w.supervisorCalls.length;
+              const supported = app.openSupervisorOptions(sid);
+              return {
+                supported,
+                calls: w.supervisorCalls.length - before,
+                display: (document.querySelector('#sessionOptionsModal [data-tab="supervisor"]') as HTMLElement).style
+                  .display,
+              };
+            });
+            app.sessions.set(sid, { mode: 'codex', supervisorAvailable: false, supervisor: returned });
+            const supported = app.openSupervisorOptions(sid);
+            await app.loadSupervisorStatus();
+            app.closeSupervisorOptions();
+            return { negative, supported, reopened: app.openSupervisorOptions(sid) };
+          },
+          { sid: SID }
+        );
+        expect(result.negative).toEqual(
+          Array.from({ length: 4 }, () => ({ supported: false, calls: 0, display: 'none' }))
+        );
+        expect(result.supported).toBe(true);
+        expect(result.reopened).toBe(true);
       } finally {
         await page.close();
       }

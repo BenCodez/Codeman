@@ -4633,7 +4633,8 @@ class CodemanApp {
     for (const [sid, list] of this._pendingDeliveries) {
       let prefixStored = true;
       for (const rec of list) {
-        bytes += rec.data.length;
+        const dataBytes = window.CodemanInputLimit?.bytes?.(rec.data);
+        bytes += Number.isSafeInteger(dataBytes) && dataBytes >= 0 ? dataBytes : Infinity;
         count++;
         if (!rec._durableAttempted && prefixStored && bytes <= this._reliableMaxBytes && count <= 4096) {
           // One immutable write per occurrence, including a failed storage call.

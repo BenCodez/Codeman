@@ -45,7 +45,7 @@ type Preparation = {
   removed?: boolean;
 };
 type CleanupIntent = {
-  version: 1;
+  version: 1 | 2;
   sessionId: string;
   retiredHash: string;
   rootDev: number;
@@ -326,7 +326,7 @@ export class OwnedRemoteBrokerCache {
         ]
           .sort()
           .join(',') ||
-      value.version !== 1 ||
+      (value.version !== 1 && value.version !== 2) ||
       value.sessionId !== sessionId ||
       !/^[a-f0-9]{64}$/.test(value.retiredHash) ||
       (value.target !== undefined && !validCleanupTarget(value.target)) ||
@@ -376,7 +376,7 @@ export class OwnedRemoteBrokerCache {
       }
       if (parents.some((parent) => !privateStat(parent, true))) throw Error('Unknown cleanup parents');
       const value: CleanupIntent = {
-        version: 1,
+        version: 2,
         sessionId,
         retiredHash: digest(JSON.stringify(retiredState ?? null)),
         rootDev: parents[0].dev,
@@ -462,19 +462,19 @@ export class OwnedRemoteBrokerCache {
       return false;
     }
     if (intent.value.retiredHash !== expectedHash) return false;
+    // Legacy SSH intents allowed discarding the last incarnation before remote
+    // parent retirement. Their empty/absent source path cannot certify that ACK.
+    if (intent.value.version === 1 && intent.value.target) return false;
+    const sessionRoot = join(this.root, sessionId);
     const current = () => {
       try {
         const root = lstatSync(this.root),
-          session = lstatSync(join(this.root, sessionId)),
           marker = lstatSync(this.cleanupPath(sessionId));
         return (
           isCurrent() === true &&
           privateStat(root, true) &&
           root.dev === intent.value.rootDev &&
           root.ino === intent.value.rootIno &&
-          privateStat(session, true) &&
-          session.dev === intent.value.sessionDev &&
-          session.ino === intent.value.sessionIno &&
           privateStat(marker) &&
           same(marker, intent.stat)
         );
@@ -482,9 +482,58 @@ export class OwnedRemoteBrokerCache {
         return false;
       }
     };
-    if (!(await this.retireAndDelete(sessionId, current, intent.value.target))) return false;
+    const sessionCurrent = () => {
+      try {
+        const session = lstatSync(sessionRoot);
+        return (
+          current() &&
+          privateStat(session, true) &&
+          session.dev === intent.value.sessionDev &&
+          session.ino === intent.value.sessionIno
+        );
+      } catch {
+        return false;
+      }
+    };
+    const absent = () => {
+      try {
+        lstatSync(sessionRoot);
+        return false;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'ENOENT';
+      }
+    };
+    // The absent-parent retry must drain late cache I/O too: a timed-out
+    // preparation can otherwise recreate private material after marker ACK.
+    await Promise.all(
+      [...pending]
+        .filter(([key]) => ['write:', 'read:'].some((prefix) => key.startsWith(prefix + sessionRoot + '/')))
+        .map(([, job]) => job.work)
+    );
+    if (!current()) return false;
+    if (!absent()) {
+      if (!sessionCurrent() || !(await this.retireAndDelete(sessionId, sessionCurrent, intent.value.target)))
+        return false;
+      // The nonrecursive remove itself vetoes new/foreign entries. A replacement
+      // empty directory cannot inherit the original intent's inode authority.
+      if (!sessionCurrent()) return false;
+      try {
+        await fs.rmdir(sessionRoot);
+      } catch {
+        return false;
+      }
+    }
+    // Retry an already-removed parent after a lost fsync/ACK, without requiring
+    // that inode to exist again or adopting a new directory at the same path.
+    const root = await fs.open(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+    try {
+      await root.sync();
+    } finally {
+      await root.close();
+    }
     const acknowledged = await this.readCleanupIntent(sessionId);
-    if (!current() || !same(acknowledged.stat, intent.stat) || acknowledged.text !== intent.text) return false;
+    if (!current() || !absent() || !same(acknowledged.stat, intent.stat) || acknowledged.text !== intent.text)
+      return false;
     await fs.unlink(this.cleanupPath(sessionId));
     const parent = await fs.open(this.root, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
     try {
@@ -636,6 +685,63 @@ export class OwnedRemoteBrokerCache {
                     throw Error('Unknown private material');
                   // The local source template is the last exact remote identity
                   // witness. Retain it and the durable intent until remote ACK.
+                  let finalSession = true;
+                  if (target) {
+                    const siblings = await fs.opendir(sessionRoot);
+                    try {
+                      for (let index = 0; index < 2; index++) {
+                        const sibling = await siblings.read();
+                        if (!sibling) break;
+                        if (sibling.name === item.name) continue;
+                        // Only another positively retained incarnation can own
+                        // the later parent ACK. Unknown entries must leave this
+                        // incarnation's retry material in place instead.
+                        if (UUID.test(sibling.name) && sibling.isDirectory() && !sibling.isSymbolicLink()) {
+                          const siblingDir = join(sessionRoot, sibling.name),
+                            siblingPath = join(siblingDir, 'private.json');
+                          let handle: Awaited<ReturnType<typeof fs.open>> | undefined;
+                          try {
+                            const parent = await fs.lstat(siblingDir);
+                            if (!privateStat(parent, true)) break;
+                            handle = await fs.open(
+                              siblingPath,
+                              constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+                            );
+                            const stat = await handle.stat();
+                            if (!privateStat(stat) || stat.size > MAX_BYTES) break;
+                            const bytes = Buffer.alloc(stat.size + 1),
+                              read = await handle.read(bytes, 0, bytes.length, 0);
+                            if (read.bytesRead !== stat.size || !same(stat, await handle.stat())) break;
+                            await handle.close();
+                            handle = undefined;
+                            const candidate = JSON.parse(
+                              new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(0, read.bytesRead))
+                            );
+                            finalSession = !(
+                              candidate &&
+                              privateMaterialKeys(candidate) &&
+                              candidate.version === 1 &&
+                              candidate.scope === value.scope &&
+                              !!candidate.scopeData &&
+                              validStoredScope(candidate, sessionId) &&
+                              posix.dirname(candidate.directory) === posix.dirname(value.directory) &&
+                              descriptor({ sessionId }, candidate.material, candidate.directory)?.incarnation ===
+                                sibling.name &&
+                              same(stat, await fs.lstat(siblingPath)) &&
+                              same(parent, await fs.lstat(siblingDir))
+                            );
+                          } catch {
+                            /* Unknown sibling cannot take ownership of final retirement. */
+                          } finally {
+                            await handle?.close();
+                          }
+                        }
+                        break;
+                      }
+                    } finally {
+                      await siblings.close();
+                    }
+                  }
                   if (
                     target &&
                     (!value.scopeData ||
@@ -644,7 +750,8 @@ export class OwnedRemoteBrokerCache {
                         target,
                         value.directory,
                         value.material,
-                        current
+                        current,
+                        { finalSession }
                       )))
                   ) {
                     complete = false;
