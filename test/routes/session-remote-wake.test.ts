@@ -335,20 +335,26 @@ describe('POST /api/sessions + attachRemoteSession — authorization before the 
 });
 
 describe('POST /api/sessions/:id/input — what the caller is told', () => {
-  it('says buffered, and dropped for a chunk over the wake buffer cap', async () => {
+  it('refuses an oversized chunk without acknowledging or evicting earlier accepted input', async () => {
     // The non-wait branch always answered a bare `{}`; these fields are additive. Without
     // them a prompt over 4 KB posted to a sleeping host was accepted and silently lost.
     const h = await harness({ hostUp: false, holdWake: true });
-    const small = await send(h.app, { input: 'hallo', useMux: true });
+    const accepted = 'x'.repeat(4096);
+    const small = await send(h.app, { input: accepted, useMux: true });
     expect(small.statusCode).toBe(200);
     expect(small.json()).toEqual({ success: true, data: { buffered: true } });
 
     const big = await send(h.app, { input: 'x'.repeat(5000), useMux: true });
-    expect(big.statusCode).toBe(200);
-    expect(big.json()).toEqual({ success: true, data: { buffered: true, dropped: true } });
-    expect(h.registry.pendingBytes(SESSION_ID)).toBe(5);
+    expect(big.statusCode).toBe(429);
+    expect(big.json()).toMatchObject({ success: false, retryable: true, notSent: true });
+    const overflow = await send(h.app, { input: 'suffix', useMux: true });
+    expect(overflow.statusCode).toBe(429);
+    expect(overflow.json()).toMatchObject({ success: false, retryable: true, notSent: true });
+    expect(h.registry.pendingBytes(SESSION_ID)).toBe(4096);
     h.releaseWake();
-    await h.registry.wake(h.ctx.sessions.get(SESSION_ID)!);
+    const session = h.ctx.sessions.get(SESSION_ID)!;
+    await h.registry.wake(session);
+    expect(session.writeBuffer).toEqual([accepted]);
   });
 
   it('fails the send-and-wait path when the host never comes back, instead of writing into the stalled pane', async () => {

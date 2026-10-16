@@ -1,4 +1,4 @@
-/** Durable continuation reconciliation must yield to newer owner input. */
+/** @fileoverview Durable continuation reconciliation must yield to newer owner input. */
 import { mkdtemp, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -52,13 +52,13 @@ it.each(
     observe: async () => observation,
     act,
     changed: () => {},
-    persist: async (state) => {
+    persist: async (state, authority) => {
       if (holdPersistence && state.reason === pauseAt) {
         reached();
         await barrier;
       }
       persistedReasons.push(state.reason);
-      await store.save('worker', state);
+      await store.save('worker', state, authority);
     },
   });
   try {
@@ -103,7 +103,7 @@ it.each(
       expect(current.agentProgressVeto).toBeUndefined();
       // An older refresh cannot record a completion after newer owner intent.
       expect(persistedReasons).not.toContain('completed');
-      if (pauseAt === 'continuation-accepted') {
+      if (pauseAt === 'continuation-accepted' || name === 'completed') {
         expect(current).toMatchObject({
           outcome: 'unknown',
           checkpoint: 'Owner checkpoint',
