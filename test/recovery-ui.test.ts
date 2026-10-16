@@ -13,7 +13,7 @@ const INDEX = read('index.html');
 const RECOVERY = read('recovery-ui.js');
 const openDoms: JSDOM[] = [];
 
-function harness(initial = initialRecoveryState()) {
+function harness(initial = initialRecoveryState(), settings = false) {
   const dom = new JSDOM(INDEX, { runScripts: 'outside-only', url: 'http://localhost/' });
   openDoms.push(dom);
   const context = dom.getInternalVMContext();
@@ -38,7 +38,13 @@ function harness(initial = initialRecoveryState()) {
     return { ok: true, json: async () => ({ success: true, data: structuredClone(state) }) };
   });
   browser.fetch = fetchMock;
-  for (const file of ['api-client.js', 'recovery-ui.js', 'respawn-ui.js', 'session-ui.js']) {
+  for (const file of [
+    ...(settings ? ['constants.js', 'settings-ui.js'] : []),
+    'api-client.js',
+    'recovery-ui.js',
+    'respawn-ui.js',
+    'session-ui.js',
+  ]) {
     vm.runInContext(read(file), context, { filename: file });
   }
   // Plain browser UI modules deliberately have no TS declarations.
@@ -87,6 +93,64 @@ function enabledState(): RecoveryState {
 }
 
 describe('Recovery Session Options', () => {
+  it.each([
+    { name: 'served recovery capability', served: { recovery: 'codex-rollout' }, supported: true },
+    { name: 'nested served capability', served: { capabilities: { recovery: 'codex-rollout' } }, supported: true },
+    { name: 'unknown capability', served: { recovery: 'unsupported-recovery' }, supported: false },
+    {
+      name: 'disabled capability',
+      served: { recovery: false, capabilities: { recovery: 'codex-rollout' } },
+      supported: false,
+    },
+    { name: 'missing capability', served: {}, supported: false },
+  ])('retains $name through the actual App Settings list refresh', async ({ served, supported }) => {
+    const h = harness(initialRecoveryState(), true);
+    h.browser.__codemanCliCatalog = [{ id: 'codex', external: true, ...served }];
+    h.app.runMode = 'codex';
+    for (const name of [
+      'applyWelcomeCliVisibility',
+      'renderRegistryRunOptions',
+      'renderMobileOverview',
+      '_refreshRunModeAvailability',
+    ])
+      h.app[name] = vi.fn();
+    // This management response deliberately has no authority over capabilities,
+    // including a spurious recovery value on an otherwise unsupported entry.
+    h.fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        success: true,
+        data: [
+          {
+            id: 'codex',
+            label: 'Codex',
+            shortBadge: 'CX',
+            kind: 'agent',
+            stock: true,
+            enabled: true,
+            installed: true,
+            recovery: 'codex-rollout',
+          },
+        ],
+      }),
+    });
+    await h.app.loadCliListForSettings();
+    expect(h.get('cliListRows').textContent).toContain('Codex');
+    expect(h.app.supportsSessionRecovery(h.app.sessions.get('session-a'))).toBe(supported);
+    h.app.openSessionOptions('session-a');
+    expect(h.doc.querySelector<HTMLElement>('[data-tab="recovery"]')!.style.display).toBe(supported ? '' : 'none');
+    if (supported) {
+      await vi.waitFor(() => expect(h.app._recoveryView?.loading).toBe(false));
+      expect(h.get('recovery-tab').classList.contains('hidden')).toBe(false);
+      expect(h.fetchMock.mock.calls.filter(([url]) => url.endsWith('/recovery')).map(([url]) => url)).toEqual([
+        '/api/sessions/session-a/recovery',
+      ]);
+    } else {
+      expect(h.app._recoveryView).toBeNull();
+      expect(h.fetchMock.mock.calls.filter(([url]) => url.endsWith('/recovery'))).toEqual([]);
+    }
+  });
+
   it('gates the tab on catalog capability and does not fetch unsupported modes', () => {
     const h = harness();
     h.browser.__codemanCliCatalog = [{ id: 'codex', external: true }];

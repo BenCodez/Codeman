@@ -1984,6 +1984,7 @@ export class Session extends EventEmitter {
       cliLatestVersion: this._cliLatestVersion || undefined,
       openCodeConfig: this._openCodeConfig,
       codexConfig: this._codexConfig,
+      taskSupported: this.taskSupervisionSupported,
       geminiConfig: this._geminiConfig,
       antigravityConfig: this._antigravityConfig,
       piConfig: this._piConfig,
@@ -2898,6 +2899,18 @@ export class Session extends EventEmitter {
       this._preparedRecoveryInput = undefined;
       if (this._namedKeyAbort === abort) this._namedKeyAbort = null;
     }
+  }
+
+  /** Launch-shape eligibility only; admission still verifies current identity and permission evidence. */
+  get taskSupervisionSupported(): boolean {
+    return (
+      getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
+      (!this._remote || this._remote.owned !== false) &&
+      !this._docker &&
+      !this._discoveredMuxSession &&
+      this._useMux &&
+      this._codexConfig?.noDaemon === true
+    );
   }
 
   /** Private recovery evidence; raw prompts and environment values never enter the public session state. */

@@ -1693,7 +1693,8 @@ export class WebServer extends EventEmitter {
         await ownedRemoteBrokerCache.stageFinalCleanup(
           sessionId,
           before?.pinned ? { ...before, status: 'stopped', pid: null } : undefined,
-          current
+          current,
+          session.remote && session.remote.owned !== false ? { remote: session.remote, owner } : undefined
         );
         if (!current()) throw Error('Session changed while preparing final cleanup');
       }
@@ -2508,9 +2509,7 @@ export class WebServer extends EventEmitter {
       this.recoveryStopping ||
       this.cleaningUp.has(session.id) ||
       this.sessions.get(session.id) !== session ||
-      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout' ||
-      (!!session.remote && session.remote.owned === false) ||
-      !!session.docker
+      !session.taskSupervisionSupported
     )
       return undefined;
     const existing = this.taskControllers.get(session.id);

@@ -125,8 +125,8 @@ describe('Session Options responsive layout in Chromium', () => {
         w.app = new w.CodemanApp();
         const app = w.app;
         app.sessions = new Map([
-          ['a', { mode: 'codex' }],
-          ['b', { mode: 'codex' }],
+          ['a', { mode: 'codex', taskSupported: true }],
+          ['b', { mode: 'codex', taskSupported: true }],
         ]);
         app.editingSessionId = 'a';
         app.showToast = () => {};
@@ -228,7 +228,7 @@ describe('Session Options responsive layout in Chromium', () => {
         document.getElementById('task-tab')!.classList.remove('hidden');
         w.__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
         w.app = new w.CodemanApp();
-        w.app.sessions = new Map([['a', { mode: 'codex' }]]);
+        w.app.sessions = new Map([['a', { mode: 'codex', taskSupported: true }]]);
         w.app.editingSessionId = 'a';
         w.app.showToast = (message: string) => (w.lastTaskError = message);
         w.taskState = {

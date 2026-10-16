@@ -64,6 +64,7 @@ Object.assign(CodemanApp.prototype, {
   supportsSessionTask(session) {
     return (
       this.supportsSessionRecovery?.(session) === true &&
+      session.taskSupported === true &&
       !session.docker &&
       (!session.remote || session.remote.owned !== false)
     );

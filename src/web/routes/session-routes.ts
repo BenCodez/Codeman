@@ -1508,7 +1508,8 @@ export function registerSessionRoutes(
         await ownedRemoteBrokerCache.stageFinalCleanup(
           id,
           before.pinned ? { ...before, status: 'stopped', pid: null } : undefined,
-          () => !ctx.sessions.has(id) && ctx.store.getSession(id) === before && JSON.stringify(before) === beforeText
+          () => !ctx.sessions.has(id) && ctx.store.getSession(id) === before && JSON.stringify(before) === beforeText,
+          before.remote && before.remote.owned !== false ? { remote: before.remote, owner: before.owner } : undefined
         );
         if (ctx.sessions.has(id) || ctx.store.getSession(id) !== before || JSON.stringify(before) !== beforeText)
           throw Error('Session changed while preparing final cleanup');
