@@ -242,8 +242,9 @@ describe('Task supervision UI', () => {
       },
     ];
     restored.config = { enabled: true, maxContinuations: 3, maxRuntimeMs: 900000 };
-    restored.outcome = 'unfinished';
-    restored.phase = 'watching';
+    // This case starts from a durable completion, not unvalidated retained checks.
+    restored.outcome = 'completed';
+    restored.phase = 'completed';
     restored.startedAt = 9000;
     restored.configuredAt = 9000;
     restored.kickoffAt = 9500;
@@ -1060,7 +1061,7 @@ describe('task saves retain independent configuration and progress drafts', () =
     expect(h.get('taskCriteriaRows').children[1].querySelector('[data-task-field="command"]').value).toBe(exactCommand);
     expect(h.get('taskCheckpoint').value).toBe('  Edited checkpoint\n界  ');
     expect(h.get('taskNextAction').value).toBe('  Edited next action\n  ');
-    expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+    expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(first === 'progress');
     await save(first === 'configuration' ? 'progress' : 'configuration');
     expect(h.app._taskView.dirty).toBe(false);
     expect(writes).toHaveLength(2);
@@ -1074,10 +1075,10 @@ describe('task saves retain independent configuration and progress drafts', () =
       outcome: 'unfinished',
       checkpoint: '  Edited checkpoint\n界  ',
       nextAction: '  Edited next action\n  ',
-      verifiedCriteria: ['manual-a'],
+      verifiedCriteria: first === 'progress' ? ['manual-a'] : [],
     });
   });
-  it('keeps a checkbox-only progress draft through configuration save and preserves untouched CRLF at its later save', async () => {
+  it('clears an old checkbox on objective replacement while preserving untouched CRLF at its later save', async () => {
     const initial = { ...state(), checkpoint: '  Original\r\n界  ', nextAction: 'Next\r\n  ' };
     const h = harness(initial);
     await h.open();
@@ -1088,12 +1089,12 @@ describe('task saves retain independent configuration and progress drafts', () =
     h.app._apiJson.mockResolvedValueOnce({ ...initial, objective: 'New objective' });
     await h.app.saveTaskConfiguration();
     expect(h.app._taskView.dirty).toBe(true);
-    expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+    expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(false);
     await h.app.saveTaskProgress();
     expect(h.app._apiJson.mock.calls[2][1].body).toMatchObject({
       checkpoint: initial.checkpoint,
       nextAction: initial.nextAction,
-      verifiedCriteria: ['manual-a'],
+      verifiedCriteria: [],
     });
     expect(h.app._taskView.dirty).toBe(false);
   });
@@ -1145,7 +1146,7 @@ describe('task server events refresh clean sibling sections', () => {
       } else {
         expect(h.get('taskCheckpoint').value).toBe('Unsaved owner checkpoint');
         expect(h.get('taskNextAction').value).toBe('Unsaved owner action');
-        expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+        expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(false);
         expect(h.get('taskObjective').value).toBe(latest.objective.replace(/\r\n/g, '\n'));
         expect(h.get('taskCriteriaRows').children[0].querySelector('textarea').value).toBe('Latest server manual-a');
         expect(h.get('taskMaxContinuations').value).toBe('7');
@@ -1195,4 +1196,70 @@ it('disables Pause for a completed enabled task while preserving Pause for unfin
   await h.app.taskAction('pause');
   expect(h.app._apiJson).toHaveBeenLastCalledWith('/api/sessions/a/task/pause', { method: 'POST' });
   expect(h.get('taskPhase').textContent).toBe('Paused');
+});
+
+describe('owner selections bind to the rendered task evidence generation', () => {
+  it.each(['objective', 'criterion', 'other-criterion', 'generation', 'unchanged'] as const)(
+    'preserves raw progress but carries selected IDs only across an unchanged task: %s',
+    async (change) => {
+      const initial = {
+        ...state(),
+        objective: 'Owner objective',
+        configuredAt: 1000,
+        checkpoint: 'Original checkpoint',
+        nextAction: 'Original action',
+      };
+      const h = harness(initial);
+      await h.open();
+      const checkpoint = '  Unsaved checkpoint\n界  ',
+        nextAction = '  Unsaved action\n  ';
+      h.get('taskCheckpoint').value = checkpoint;
+      h.get('taskNextAction').value = nextAction;
+      const check = h.get('taskCriteriaEvidence').querySelector('input');
+      check.checked = true;
+      check.dispatchEvent(new h.dom.window.Event('change', { bubbles: true }));
+      const next = structuredClone(initial);
+      if (change === 'objective') next.objective = 'Replacement objective';
+      if (change === 'criterion') next.criteria[0].description = 'Replacement manual acceptance';
+      if (change === 'other-criterion') next.criteria[1].command = 'different command';
+      if (change === 'generation') next.configuredAt = 2000;
+      next.config.maxContinuations = 5;
+      h.app._onSessionTask({ sessionId: 'a', state: next });
+      expect(h.get('taskCheckpoint').value).toBe(checkpoint);
+      expect(h.get('taskNextAction').value).toBe(nextAction);
+      expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(change === 'unchanged');
+      h.app._apiJson.mockResolvedValueOnce(next);
+      await h.app.saveTaskProgress();
+      expect(h.app._apiJson.mock.calls[1][1].body).toMatchObject({
+        checkpoint,
+        nextAction,
+        verifiedCriteria: change === 'unchanged' ? ['manual-a'] : [],
+      });
+    }
+  );
+  it('a previously server-verified checkbox is not an unsaved owner certification after evidence is withdrawn', async () => {
+    const initial = state();
+    initial.criteria[0] = { ...initial.criteria[0], verified: true };
+    const h = harness(initial);
+    await h.open();
+    h.get('taskCheckpoint').value = 'Unsaved checkpoint';
+    h.app.markTaskDraft();
+    h.app._onSessionTask({ sessionId: 'a', state: state() });
+    expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(false);
+    expect(h.get('taskCheckpoint').value).toBe('Unsaved checkpoint');
+  });
+  it('allows a new explicit owner selection after replacement configuration has rendered', async () => {
+    const h = harness();
+    await h.open();
+    h.get('taskCheckpoint').value = 'Unsaved checkpoint';
+    h.app.markTaskDraft();
+    const changed = { ...state(), objective: 'Replacement objective' };
+    h.app._onSessionTask({ sessionId: 'a', state: changed });
+    const check = h.get('taskCriteriaEvidence').querySelector('input');
+    check.checked = true;
+    check.dispatchEvent(new h.dom.window.Event('change', { bubbles: true }));
+    h.app._apiJson.mockResolvedValueOnce(changed);
+    await h.app.saveTaskProgress();
+    expect(h.app._apiJson.mock.calls[1][1].body.verifiedCriteria).toEqual(['manual-a']);
+  });
 });
