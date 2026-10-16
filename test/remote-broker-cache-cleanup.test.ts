@@ -1,4 +1,4 @@
-/** Actual Session/WebServer final cleanup with inert mux methods; no start/socket/PTY/SSH. */
+/** @fileoverview Actual Session/WebServer final cleanup with inert mux methods; no start/socket/PTY/SSH. */
 import fs from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
 import Fastify from 'fastify';
 import { Session } from '../src/session.js';
+import { rehydrateRemoteHostFields } from '../src/remote-hosts.js';
+import type { RemoteHost } from '../src/types.js';
 import { WebServer } from '../src/web/server.js';
 import { StateStore } from '../src/state-store.js';
 import { subagentWatcher } from '../src/subagent-watcher.js';
@@ -56,6 +58,8 @@ async function fixture(
     label: 'Fixture',
     remotePath: '/worker/work',
     owned: true,
+    wakeCommand: 'old-wake',
+    wakeMac: '02:00:00:00:00:01',
   };
   const session = new Session({
     id: randomUUID(),
@@ -605,5 +609,41 @@ it.each(['live', 'persisted'] as const)(
       } finally {
         await stop();
       }
+    })
+);
+
+it.each(['changed', 'removed'] as const)(
+  'final Session deletion retires original cache after restart rehydrates %s wake settings',
+  async (kind) =>
+    fixture(async ({ internal, session, scope, material }) => {
+      const remote = rehydrateRemoteHostFields(
+        session.remote,
+        new Map([
+          [
+            scope.remote.hostId,
+            {
+              ...scope.remote,
+              id: scope.remote.hostId,
+              wakeCommand: kind === 'changed' ? 'new-wake' : undefined,
+              wakeMac: kind === 'changed' ? '02:00:00:00:00:02' : undefined,
+            } as RemoteHost,
+          ],
+        ])
+      );
+      expect(remote).not.toBe(session.remote);
+      Reflect.set(session, '_remote', remote);
+      internal.store.setSession(session.id, session.toState());
+      await internal.cleanupSession(session.id, true);
+      expect(remoteCleanup.cleanupRemoteBroker).toHaveBeenCalledOnce();
+      expect(remoteCleanup.cleanupRemoteBroker).toHaveBeenCalledWith(
+        { remote, owner: session.owner },
+        expect.any(String),
+        material,
+        expect.any(Function),
+        { finalSession: true }
+      );
+      expect(internal.sessions.has(session.id)).toBe(false);
+      expect(internal.store.getSession(session.id)).toBeNull();
+      expect(await cache.load(scope, material.config.incarnation)).toBeUndefined();
     })
 );

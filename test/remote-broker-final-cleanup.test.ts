@@ -355,28 +355,47 @@ it('does not discard local authority on a canceled/lost remote ACK, and retries 
   expect(await f.makeCache().finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
 });
 
-it.each(['host', 'owner', 'legacy-unbound'] as const)(
-  'never transmits old incarnation credentials using a changed or missing %s scope',
-  async (kind) => {
-    const f = await fixture();
-    const run = vi.fn(transport().run);
-    const cache = f.makeCache({ run });
-    expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
-    if (kind === 'legacy-unbound') {
-      const value = JSON.parse(await fs.readFile(f.privateFile, 'utf8'));
-      delete value.scopeData;
-      await fs.writeFile(f.privateFile, JSON.stringify(value));
-    }
-    const target = structuredClone(f.target);
-    if (kind === 'host') target.remote.host = 'other-worker.invalid';
-    if (kind === 'owner') target.owner = 'other-owner';
-    await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, target);
-    expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
-    expect(run).not.toHaveBeenCalled();
-    expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
-    expect(await fs.readFile(join(f.directory, 'config.json'), 'utf8')).toContain(f.material.config.secret);
+it.each([
+  'host',
+  'hostId',
+  'username',
+  'port',
+  'identityFile',
+  'jumpHost',
+  'extraSshOptions',
+  'remotePath',
+  'owner',
+  'legacy-unbound',
+  'tampered-scope',
+] as const)('never transmits old incarnation credentials using a changed or missing %s scope', async (kind) => {
+  const f = await fixture();
+  const run = vi.fn(transport().run);
+  const cache = f.makeCache({ run });
+  expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+  if (kind === 'legacy-unbound' || kind === 'tampered-scope') {
+    const value = JSON.parse(await fs.readFile(f.privateFile, 'utf8'));
+    if (kind === 'legacy-unbound') delete value.scopeData;
+    else value.scopeData.remote.wakeCommand = 'tampered-wake';
+    await fs.writeFile(f.privateFile, JSON.stringify(value));
   }
-);
+  const target = structuredClone(f.target);
+  if (kind === 'host') target.remote.host = 'other-worker.invalid';
+  if (kind === 'hostId') target.remote.hostId = 'other-host';
+  if (kind === 'username') target.remote.username = 'other-user';
+  if (kind === 'port') target.remote.port = 2222;
+  if (kind === 'identityFile') target.remote.identityFile = '/fixture/other-key';
+  if (kind === 'jumpHost') target.remote.jumpHost = 'other-jump.invalid';
+  if (kind === 'extraSshOptions') target.remote.extraSshOptions = ['ConnectTimeout=9'];
+  if (kind === 'remotePath') target.remote.remotePath = '/other/work';
+  if (kind === 'owner') target.owner = 'other-owner';
+  target.remote.wakeCommand = 'changed-wake';
+  target.remote.wakeMac = '02:00:00:00:00:02';
+  await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, target);
+  expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(false);
+  expect(run).not.toHaveBeenCalled();
+  expect((await fs.lstat(f.privateFile)).isFile()).toBe(true);
+  expect(await fs.readFile(join(f.directory, 'config.json'), 'utf8')).toContain(f.material.config.secret);
+});
 
 it.each(['missing', 'disabled', 'regular-owner'] as const)(
   'revalidates current %s authority before offline cleanup retry can open SSH',
@@ -703,3 +722,35 @@ it('rechecks native absence before unlinking when a pane appears after the initi
   expect(await fs.readFile(join(f.directory, 'config.json'))).toEqual(original);
   expect((await fs.lstat(dirname(f.directory))).isDirectory()).toBe(true);
 });
+
+it.each(['changed', 'removed', 'reloaded-janitor'] as const)(
+  'retires launch-bound private material after wake-only settings are %s',
+  async (kind) => {
+    const f = await fixture(),
+      cache = f.makeCache();
+    f.scope.remote.wakeCommand = 'old-wake';
+    f.scope.remote.wakeMac = '02:00:00:00:00:01';
+    expect(await cache.prepare(f.scope, f.material, f.directory)).toBeDefined();
+    const target = structuredClone(f.target);
+    if (kind === 'removed') {
+      delete target.remote.wakeCommand;
+      delete target.remote.wakeMac;
+    } else {
+      target.remote.wakeCommand = 'new-wake';
+      target.remote.wakeMac = '02:00:00:00:00:02';
+    }
+    await cache.stageFinalCleanup(f.scope.sessionId, undefined, () => true, target);
+    if (kind === 'reloaded-janitor') {
+      // Reload the unchanged old-format full launch hash and persisted cleanup
+      // intent; no in-memory scope or newly minted authority can help this pass.
+      const stop = f.makeCache().startFinalCleanupRetries(() => ({ live: false }));
+      try {
+        await vi.waitFor(async () => expect(await fs.readdir(f.cacheRoot)).toEqual([]));
+      } finally {
+        await stop();
+      }
+    } else expect(await cache.finishFinalCleanup(f.scope.sessionId, () => true)).toBe(true);
+    await expect(fs.lstat(f.privateFile)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
+  }
+);
