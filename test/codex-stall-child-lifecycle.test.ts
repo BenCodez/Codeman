@@ -321,7 +321,7 @@ describe('actual local stall controller with an abnormally dead owned pane', () 
       });
       await f.controller.inspect();
       expect(f.controller.getStatus().activity).toBe(
-        policy.detectStalls && policy.restartStalls ? 'working' : 'crashed'
+        policy.detectStalls && (policy.restartStalls || !policy.recoverCrashes) ? 'working' : 'crashed'
       );
       await f.controller.refresh();
       vi.setSystemTime(CHILD_NOW + 2000);
@@ -1363,3 +1363,79 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
     }
   });
 });
+
+it.each([false, true].flatMap((remote) => [false, true].map((dead) => ({ remote, dead }))))(
+  'raises durable attention without any restart consent for actual owned silence (SSH=$remote dead=$dead)',
+  async ({ remote, dead }) => {
+    const remoteCase = remote
+      ? await remoteFixture('collab_resume_end', { completed: null }, dead, true, true)
+      : undefined;
+    const f =
+      remoteCase ??
+      (await createChildLifecycleFixture(returnedChildTail('collab_resume_end', 'completed'), dead, false));
+    let reloaded: RecoveryController | undefined;
+    try {
+      if (!remote && dead) expect(f.session.setPaneExit({ at: CHILD_NOW - 1000, status: 9 })).toBe(true);
+      await f.controller.updateConfig({
+        detectStalls: true,
+        restartStalls: false,
+        recoverCrashes: false,
+        stalledAfterMs: 10_000,
+      });
+      const observed = await f.adapter.observe();
+      expect(observed).toMatchObject(
+        dead
+          ? { activity: 'crashed', reason: 'process-crashed', stallRestartable: true }
+          : { activity: 'working', reason: 'turn-running' }
+      );
+      expect(observed.stallEvidenceKey).toBeDefined();
+      await f.controller.inspect(); // reads never supply an action/attention confirmation
+      await f.controller.refresh();
+      vi.setSystemTime(CHILD_NOW + 1999);
+      await f.controller.refresh();
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      vi.setSystemTime(CHILD_NOW + 2000);
+      await f.controller.refresh();
+      const status = f.controller.getStatus();
+      expect(status).toMatchObject({
+        phase: 'paused',
+        needsAttention: true,
+        lastReason: 'stall-unverified',
+        attempts: 0,
+        config: { detectStalls: true, restartStalls: false, recoverCrashes: false },
+        stallAlert: { key: observed.stallEvidenceKey, conversationId: observed.conversationId },
+      });
+      expect(status.pending).toBeUndefined();
+      expect(status.inFlight).toBeUndefined();
+      const stored = new RecoveryStore(Reflect.get(f.store, 'path')).get(f.session.id);
+      expect(stored.stallAlert).toEqual(status.stallAlert);
+      expect(stored.history.filter((event) => event.kind === 'attention')).toHaveLength(1);
+      f.controller.stop();
+      await f.controller.drain();
+      reloaded = new RecoveryController(Reflect.get(f.controller, 'deps'), stored);
+      for (const delta of [4000, 6000]) {
+        vi.setSystemTime(CHILD_NOW + delta);
+        await reloaded.inspect();
+        await reloaded.refresh();
+        await reloaded.retry();
+        expect(reloaded.getStatus()).toMatchObject({
+          needsAttention: true,
+          lastReason: 'stall-unverified',
+          attempts: 0,
+        });
+        expect(reloaded.getStatus().pending).toBeUndefined();
+        expect(reloaded.getStatus().inFlight).toBeUndefined();
+      }
+      expect(reloaded.getStatus().history.filter((event) => event.kind === 'attention')).toHaveLength(1);
+      expect(f.delivered).not.toHaveBeenCalled();
+      if (remoteCase) {
+        expect(remoteCase.deps.restartRemote).not.toHaveBeenCalled();
+        expect(remoteCase.deps.deliverRemote).not.toHaveBeenCalled();
+      }
+    } finally {
+      reloaded?.stop();
+      await reloaded?.drain();
+      await f.cleanup();
+    }
+  }
+);

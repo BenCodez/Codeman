@@ -487,7 +487,7 @@ export class RecoveryController {
   private applyStallPolicy(observation: RecoveryObservation): RecoveryObservation {
     if (
       this.state.config.detectStalls &&
-      this.state.config.restartStalls &&
+      (this.state.config.restartStalls || !this.state.config.recoverCrashes) &&
       observation.activity === 'crashed' &&
       observation.reason === 'process-crashed' &&
       observation.stallEvidenceKey
@@ -495,8 +495,8 @@ export class RecoveryController {
       // An owner stop or incomplete stall proof must not become live silence,
       // nor fall back to ordinary crash recovery under the selected stall policy.
       if (observation.stallRestartable !== true) return { ...observation, safeToAct: false };
-      // A watcher timestamp must not turn an unfinished turn into an immediate
-      // crash retry when the owner selected repeated, quiet-time stall recovery.
+      // A watcher timestamp must not bypass quiet-time confirmation. Detection
+      // without either restart policy still owns the attention-only path.
       return { ...observation, activity: 'working', reason: 'turn-running', safeToAct: false };
     }
     return observation;
@@ -569,11 +569,7 @@ export class RecoveryController {
     const confirmation = this.confirmation;
     if (!confirmation) return;
     const stall = this.detectsStall(observation);
-    const kind = stall
-      ? this.state.config.restartStalls === true && observation.stallRestartable === true
-        ? 'dead-stall'
-        : 'live-stall'
-      : 'failure';
+    const kind = stall ? (observation.stallRestartable === true ? 'dead-stall' : 'live-stall') : 'failure';
     const failure = observation.activity === 'interrupted' || observation.activity === 'crashed';
     if (
       (!stall && (!failure || !observation.safeToAct)) ||
@@ -790,14 +786,25 @@ export class RecoveryController {
         if (this.confirmation?.key !== key || age > STALL_CONFIRM_MAX_MS)
           this.confirmation = {
             key,
-            kind: 'live-stall',
+            kind: observation.stallRestartable === true ? 'dead-stall' : 'live-stall',
             at: this.now(),
             progressAt: observation.progressAt ?? observation.at,
             progressEvidenceKey: observation.progressEvidenceKey,
+            ...(observation.stallRestartable === true
+              ? {
+                  processKey: observation.processProofKey ?? observation.evidenceKey,
+                  observedAt: observation.stallObservedAt,
+                }
+              : {}),
           };
-        else if (age >= CONFIRM_MS) {
-          // Repeated silence cannot prove a live Codex turn stopped. Ask the owner to
-          // inspect/retry it; never send Escape, continuation input, or kill the pane.
+        else if (
+          age >= CONFIRM_MS &&
+          (observation.stallRestartable !== true ||
+            observation.stallObservedAt === undefined ||
+            observation.stallObservedAt > (this.confirmation.observedAt ?? Infinity))
+        ) {
+          // A live quiet turn, or a dead worker without restart consent, only
+          // asks for owner attention. Neither path dispatches worker input.
           this.state.stallAlert = {
             key,
             conversationId: observation.conversationId!,

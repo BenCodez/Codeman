@@ -431,3 +431,95 @@ it.each(
     expect(f.effects.mock.calls[0]?.[0]).toMatchObject({ action: 'restart', reason: 'stalled' });
   }
 );
+
+it.each([false, true].flatMap((remote) => ['same-probe', 'new-process'].map((change) => ({ remote, change }))))(
+  'requires a fresh matching second abnormal-dead attention probe (SSH=$remote change=$change)',
+  async ({ remote, change }) => {
+    const f = await fixture(remote, false, false);
+    Object.assign(f.observation, {
+      activity: 'crashed',
+      reason: 'process-crashed',
+      at: NOW - 1000,
+      evidenceKey: 'dead-worker',
+      safeToAct: true,
+    });
+    const deps = Reflect.get(f.controller, 'deps'),
+      observe = deps.observe;
+    let observedAt = NOW;
+    deps.observe = async () => ({ ...(await observe()), stallObservedAt: observedAt });
+    await f.controller.refresh();
+    if (change === 'new-process') f.observation.processProofKey = 'replacement-native-worker';
+    vi.setSystemTime(NOW + 2000);
+    if (change === 'new-process') observedAt = Date.now();
+    await f.controller.refresh();
+    expect(f.controller.getStatus().stallAlert).toBeUndefined();
+    expect(f.effects).not.toHaveBeenCalled();
+    vi.setSystemTime(NOW + 4000);
+    observedAt = Date.now();
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({
+      needsAttention: true,
+      lastReason: 'stall-unverified',
+      attempts: 0,
+    });
+    expect(f.controller.getStatus().pending).toBeUndefined();
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    expect(f.effects).not.toHaveBeenCalled();
+  }
+);
+
+it.each(
+  [false, true].flatMap((remote) =>
+    [
+      'detection-disabled',
+      'owner-stop',
+      'child-work',
+      'approval',
+      'authentication',
+      'clean-exit',
+      'missing-identity',
+      'missing-progress',
+      'future-progress',
+      'stale-probe',
+    ].map((veto) => ({ remote, veto }))
+  )
+)(
+  'retains the $veto veto without manufacturing dead-stall attention or action (SSH=$remote)',
+  async ({ remote, veto }) => {
+    const f = await fixture(remote, false, false);
+    Object.assign(f.observation, {
+      activity: 'crashed',
+      reason: 'process-crashed',
+      at: NOW - 1000,
+      evidenceKey: 'dead-worker',
+      safeToAct: true,
+    });
+    if (veto === 'detection-disabled') await f.controller.updateConfig({ detectStalls: false });
+    if (veto === 'owner-stop') f.observation.stallRestartable = false;
+    if (veto === 'child-work') Object.assign(f.observation, { activity: 'watching', reason: 'background-work' });
+    if (veto === 'approval') Object.assign(f.observation, { activity: 'blocked', reason: 'approval-required' });
+    if (veto === 'authentication')
+      Object.assign(f.observation, { activity: 'blocked', reason: 'authentication-required' });
+    if (veto === 'clean-exit') Object.assign(f.observation, { activity: 'paused', reason: 'clean-exit' });
+    if (veto === 'missing-identity') delete f.observation.conversationId;
+    if (veto === 'missing-progress') delete f.observation.progressAt;
+    if (veto === 'future-progress') f.observation.progressAt = NOW + 60_000;
+    if (veto === 'stale-probe') {
+      const deps = Reflect.get(f.controller, 'deps'),
+        observe = deps.observe;
+      deps.observe = async () => ({ ...(await observe()), stallObservedAt: NOW - 20_000 });
+    }
+    for (const delta of [0, 2000, 4000]) {
+      vi.setSystemTime(NOW + delta);
+      await f.controller.inspect();
+      await f.controller.refresh();
+      await f.controller.retry();
+      expect(f.controller.getStatus().stallAlert).toBeUndefined();
+      expect(f.controller.getStatus().pending).toBeUndefined();
+      expect(f.controller.getStatus().inFlight).toBeUndefined();
+      expect(f.controller.getStatus().attempts).toBe(0);
+    }
+    expect(f.controller.getStatus().history.some((event) => event.reason === 'stall-unverified')).toBe(false);
+    expect(f.effects).not.toHaveBeenCalled();
+  }
+);

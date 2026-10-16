@@ -1395,7 +1395,8 @@ export class WebServer extends EventEmitter {
     )?.__codexInputBroker;
     const brokerBinding = native
       ? native.sessionId === session.id &&
-        native.mode === 'codex' &&
+        getCli(native.mode)?.capabilities.recovery === 'codex-rollout' &&
+        native.mode === session.mode &&
         native.owner === session.owner &&
         native.workingDir === session.workingDir &&
         native.recoveryCodexHome === session.getRecoveryContext().codexHome
