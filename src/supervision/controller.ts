@@ -8,7 +8,12 @@ import {
   type TaskUpdate,
   type TaskProgress,
 } from './schema.js';
-import { commandHash, type CommandSuccessEvidence, type TaskProgressMarker } from './evidence.js';
+import {
+  commandEvidenceIdentity,
+  commandHash,
+  type CommandSuccessEvidence,
+  type TaskProgressMarker,
+} from './evidence.js';
 import { formatTaskPrompt, taskPromptFits } from './prompt.js';
 import { earliestActionDeadline } from '../recovery/action-deadline.js';
 import type { TaskSaveAuthority } from './store.js';
@@ -47,6 +52,8 @@ export interface TaskDependencies {
 export class TaskValidationError extends Error {}
 /** No task configuration reached its durable commit before authority was revoked. */
 export class TaskConfigurationCancelledError extends TaskValidationError {}
+/** A completion candidate never committed because its exact command proof changed. */
+export class TaskCompletionEvidenceCancelledError extends TaskConfigurationCancelledError {}
 function acceptanceCriteriaComplete(state: TaskState): boolean {
   return state.criteria.length > 0 && state.criteria.every((criterion) => criterion.verified);
 }
@@ -120,34 +127,42 @@ export class TaskController {
     this.deps.changed(this.getStatus());
     return this.getStatus();
   }
-  /** Delegated configuration stays private until the journal's authorized commit. */
+  /** Guarded task changes stay private until the journal's authorized commit. */
   private async saveGuardedUpdate(
     candidate: TaskState,
     reason: string,
     isCurrent: () => boolean,
-    renewEvidence: boolean
+    renewEvidence: boolean,
+    prepareCommit?: (commit: () => void) => Promise<void>,
+    cancelled = () => new TaskConfigurationCancelledError('Task configuration authority was cancelled')
   ): Promise<TaskState> {
     candidate.reason = reason;
     candidate.history = [...candidate.history, { at: this.now(), reason }].slice(-100);
     const snapshot = structuredClone(candidate);
     let committed = false;
     const commit = () => {
+      if (!isCurrent()) throw cancelled();
+      if (committed) throw new Error('Task state was already committed');
       this.state = candidate;
       if (renewEvidence) this.evidenceFreshnessFloor = this.now();
       committed = true;
     };
     try {
-      if (!isCurrent()) throw new TaskConfigurationCancelledError('Task configuration authority was cancelled');
+      if (!isCurrent()) throw cancelled();
       await this.deps.persist(snapshot, {
         isCurrent,
-        cancelled: () => new TaskConfigurationCancelledError('Task configuration authority was cancelled'),
+        cancelled,
+        prepareCommit,
         commit,
       });
       // In-memory persistence implementations commit when their promise settles.
       // The real store invokes commit at its atomic pathname replacement instead.
       if (!committed) {
-        if (!isCurrent()) throw new TaskConfigurationCancelledError('Task configuration authority was cancelled');
-        commit();
+        if (prepareCommit) await prepareCommit(commit);
+        else {
+          if (!isCurrent()) throw cancelled();
+          commit();
+        }
       }
       this.lastPersisted = snapshot;
     } catch (error) {
@@ -166,6 +181,59 @@ export class TaskController {
     }
     this.deps.changed(this.getStatus());
     return this.getStatus();
+  }
+  /** Command completion is proved again after journal preparation, at its final commit. */
+  private saveCompletion(
+    candidate: TaskState,
+    reason: string,
+    revision: number,
+    expected: TaskObservation
+  ): Promise<TaskState> {
+    const proofs = candidate.criteria
+      .filter((criterion) => criterion.kind === 'command' && criterion.verified)
+      .map((criterion) => {
+        const hash = commandHash(criterion.command!);
+        const evidence = expected.commands.get(hash);
+        return {
+          hash,
+          startedAt: evidence?.startedAt,
+          completedAt: evidence?.completedAt,
+          identity: evidence && commandEvidenceIdentity(evidence),
+        };
+      });
+    const conversationId = candidate.conversationId;
+    const submissionKey = expected.observation.submissionKey;
+    const markerKey = expected.marker?.key;
+    let evidenceCurrent = true;
+    const isCurrent = () => !this.stopped && this.revision === revision && evidenceCurrent;
+    const prepareCommit = proofs.length
+      ? async (commit: () => void) => {
+          const fresh = await this.deps.observe();
+          evidenceCurrent =
+            fresh.observation.conversationId === conversationId &&
+            fresh.observation.submissionKey === submissionKey &&
+            fresh.marker?.key === markerKey &&
+            !['identity-unverified', 'identity-changed'].includes(fresh.observation.reason) &&
+            !['unknown', 'paused', 'blocked'].includes(fresh.observation.activity) &&
+            proofs.every((proof) => {
+              const evidence = fresh.commands.get(proof.hash);
+              return (
+                this.commandEvidenceIsCurrent(evidence) &&
+                evidence.startedAt === proof.startedAt &&
+                evidence.completedAt === proof.completedAt &&
+                commandEvidenceIdentity(evidence) === proof.identity
+              );
+            });
+          // TaskStore's callback performs its final guard and atomic replacement
+          // synchronously here, before this evidence preparation promise settles.
+          commit();
+        }
+      : undefined;
+    return this.saveGuardedUpdate(candidate, reason, isCurrent, false, prepareCommit, () =>
+      evidenceCurrent
+        ? new TaskConfigurationCancelledError('Task progress authority was cancelled')
+        : new TaskCompletionEvidenceCancelledError('Command success evidence changed before completion committed')
+    );
   }
   private arm(): void {
     if (this.timer) clearTimeout(this.timer);
@@ -535,8 +603,12 @@ export class TaskController {
           });
         this.requireCurrent(revision);
       }
-      this.state = candidate;
-      await this.save('progress-recorded');
+      if (candidate.outcome === 'completed')
+        await this.saveCompletion(candidate, 'progress-recorded', revision, { observation, commands, marker });
+      else {
+        this.state = candidate;
+        await this.save('progress-recorded');
+      }
       if (this.state.inFlight?.accepted) {
         const settled = await this.settleAcceptedFlight();
         if (
@@ -807,15 +879,15 @@ export class TaskController {
           if (!valid) return this.recordAgentAttention(marker, 'criterion-evidence-unverified');
           if (valid) {
             if (p.outcome === 'blocked') return this.recordAgentAttention(marker, 'task-blocked', 'blocked');
+            const candidate = this.getStatus();
             for (const id of p.verifiedCriteria ?? []) {
-              const c = this.state.criteria.find((c) => c.id === id)!;
+              const c = candidate.criteria.find((c) => c.id === id)!;
               const hash = commandHash(c.command!);
               c.verified = true;
               c.evidence = { source: 'command', at: commands.get(hash)!.completedAt, commandHash: hash };
             }
-            if (p.outcome === 'completed' && !acceptanceCriteriaComplete(this.state))
+            if (p.outcome === 'completed' && !acceptanceCriteriaComplete(candidate))
               return this.recordAgentAttention(marker, 'task-evidence-unknown');
-            const candidate = this.getStatus();
             candidate.outcome = acceptanceCriteriaComplete(candidate) ? 'completed' : p.outcome;
             candidate.lastProgressAt = marker.at;
             candidate.checkpoint = p.outcome === 'unfinished' ? p.checkpoint! : (p.checkpoint ?? candidate.checkpoint);
@@ -834,17 +906,38 @@ export class TaskController {
               }
               if (this.stopped || revision !== this.revision) return this.getStatus();
             }
-            this.state = candidate;
-            this.state.handledEvidence = [...this.state.handledEvidence, marker.key].slice(-32);
-            await this.save('progress-recorded');
+            candidate.handledEvidence = [...candidate.handledEvidence, marker.key].slice(-32);
+            if (candidate.outcome === 'completed') {
+              candidate.phase = 'completed';
+              try {
+                await this.saveCompletion(candidate, 'progress-recorded', revision, {
+                  observation: o,
+                  commands,
+                  marker,
+                });
+              } catch (error) {
+                if (error instanceof TaskConfigurationCancelledError) return this.getStatus();
+                throw error;
+              }
+            } else {
+              this.state = candidate;
+              await this.save('progress-recorded');
+            }
             if (this.stopped || revision !== this.revision) return this.getStatus();
           }
         } else return this.recordAgentAttention(marker, 'task-evidence-unknown');
       }
       if (this.state.outcome === 'completed' || acceptanceCriteriaComplete(this.state)) {
-        this.state.outcome = 'completed';
-        this.state.phase = 'completed';
-        return this.save('completed');
+        if (this.state.phase === 'completed' && this.state.outcome === 'completed') return this.getStatus();
+        const candidate = this.getStatus();
+        candidate.outcome = 'completed';
+        candidate.phase = 'completed';
+        try {
+          return await this.saveCompletion(candidate, 'completed', revision, { observation: o, commands, marker });
+        } catch (error) {
+          if (error instanceof TaskConfigurationCancelledError) return this.getStatus();
+          throw error;
+        }
       }
       if (
         this.deps.recover &&

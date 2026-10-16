@@ -6758,7 +6758,7 @@ export class Session extends EventEmitter {
     return true;
   }
 
-  /** Confirm completed delivery (or accepted remote-buffer ownership), then ACK. */
+  /** Confirm completed delivery (or seal an uncertain dispatched write), then ACK. */
   commitInputSeq(clientId: string, seq: number): void {
     const state = this._appliedInputSeq.get(clientId);
     if (!state?.pending.delete(seq)) return;

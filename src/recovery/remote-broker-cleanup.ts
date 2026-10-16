@@ -66,18 +66,99 @@ def main():
     raw=sys.stdin.buffer.read(524289)
     if len(raw)>524288: raise ValueError('request')
     q=strict_json(raw.decode('utf-8','strict'))
-    if not isinstance(q,dict) or set(q)!={'directory','material'}: raise ValueError('request')
+    if not isinstance(q,dict) or set(q)!={'directory','material','finalSession'} or type(q.get('finalSession')) is not bool: raise ValueError('request')
     path=q['directory'];m=q['material'];expected=m['config'];sid=expected['sessionId'];inc=expected['incarnation']
     if not UUID.fullmatch(sid) or not UUID.fullmatch(inc) or not canonical(path) or not path.endswith('/'+sid+'/'+inc): raise ValueError('scope')
     if not mux_absent(sid): raise ValueError('native session')
     # Pin every ancestor, including the complete private remote root/session.
     parents=[];current='/'
+    session_path=os.path.dirname(path);root_path=os.path.dirname(session_path)
+    receipt_name='.cleanup-'+sid+'-'+inc+'.json'
+    material_hash=hashlib.sha256(json.dumps(m,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
+    def ancestors_current():
+        check()
+        for p,before,mode,uid in parents:
+            if p in (session_path,path): continue
+            now=os.lstat(p)
+            if (now.st_dev,now.st_ino)!=(before[0],before[1]) or now.st_mode!=mode or now.st_uid!=uid or not stat.S_ISDIR(now.st_mode) or stat.S_ISLNK(now.st_mode): raise ValueError('ancestor changed')
+    def parent_receipt(create=False):
+        ancestors_current()
+        rootfd=directory(root_path)
+        try:
+            rootstat=os.fstat(rootfd)
+            for p,signature_before,mode,uid in parents:
+                if p==root_path and ((rootstat.st_dev,rootstat.st_ino)!=(signature_before[0],signature_before[1]) or rootstat.st_mode!=mode or rootstat.st_uid!=uid): raise ValueError('root changed')
+            try:
+                data,witness,_=readat(rootfd,receipt_name,2048)
+                value=strict_json(data.decode('utf-8','strict'))
+            except FileNotFoundError:
+                if not create: return None
+                parent=os.lstat(session_path)
+                if not private(parent,True): raise ValueError('session parent')
+                for p,before,mode,uid in parents:
+                    if p==session_path and ((parent.st_dev,parent.st_ino)!=(before[0],before[1]) or parent.st_mode!=mode or parent.st_uid!=uid): raise ValueError('session replaced')
+                value={'version':1,'sessionId':sid,'incarnation':inc,'materialHash':material_hash,'rootDev':rootstat.st_dev,'rootIno':rootstat.st_ino,'sessionDev':parent.st_dev,'sessionIno':parent.st_ino}
+                fd=os.open(receipt_name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=rootfd)
+                try:
+                    data=json.dumps(value,separators=(',',':')).encode();offset=0
+                    while offset<len(data):
+                        check();written=os.write(fd,data[offset:])
+                        if written<=0: raise ValueError('short receipt write')
+                        offset+=written
+                    os.fsync(fd);witness=signature(os.fstat(fd))
+                finally: os.close(fd)
+                os.fsync(rootfd)
+            if not isinstance(value,dict) or set(value)!={'version','sessionId','incarnation','materialHash','rootDev','rootIno','sessionDev','sessionIno'} or type(value['version']) is not int or value['version']!=1 or value['sessionId']!=sid or value['incarnation']!=inc or value['materialHash']!=material_hash or any(type(value[k]) is not int or value[k]<0 for k in ('rootDev','rootIno','sessionDev','sessionIno')) or (value['rootDev'],value['rootIno'])!=(rootstat.st_dev,rootstat.st_ino): raise ValueError('unknown parent receipt')
+            if create:
+                parent=os.lstat(session_path)
+                if not private(parent,True) or (parent.st_dev,parent.st_ino)!=(value['sessionDev'],value['sessionIno']): raise ValueError('session replaced')
+            ancestors_current()
+            return value,witness
+        finally: os.close(rootfd)
+    def finish_parent():
+        check()
+        receipt=parent_receipt()
+        try: parent=os.lstat(session_path)
+        except FileNotFoundError: parent=None
+        if receipt is None:
+            # Already absent needs no deletion authority. A still-present empty
+            # replacement never inherits an old incarnation's path alone.
+            return parent is None or (not q['finalSession'] and private(parent,True))
+        value,witness=receipt
+        if parent is not None:
+            if not private(parent,True) or (parent.st_dev,parent.st_ino)!=(value['sessionDev'],value['sessionIno']): raise ValueError('session replaced')
+            parentfd=directory(session_path)
+            try:
+                if (os.fstat(parentfd).st_dev,os.fstat(parentfd).st_ino)!=(parent.st_dev,parent.st_ino): raise ValueError('session changed')
+                with os.scandir(parentfd) as entries: nonempty=next(entries,None) is not None
+            finally: os.close(parentfd)
+            if nonempty and q['finalSession']: return False
+            if not nonempty:
+                if not mux_absent(sid): raise ValueError('native session')
+                ancestors_current()
+                if signature(os.lstat(session_path))!=signature(parent): raise ValueError('session changed')
+                check()
+                os.rmdir(session_path)
+        ancestors_current()
+        rootfd=directory(root_path)
+        try:
+            check()
+            if (os.fstat(rootfd).st_dev,os.fstat(rootfd).st_ino)!=(value['rootDev'],value['rootIno']) or signature(os.stat(receipt_name,dir_fd=rootfd,follow_symlinks=False))!=witness: raise ValueError('parent receipt changed')
+            # Retain the receipt through the directory ACK. A lost fsync or SSH
+            # result can retry even after the whole session path disappeared.
+            os.fsync(rootfd)
+            ancestors_current()
+            if signature(os.stat(receipt_name,dir_fd=rootfd,follow_symlinks=False))!=witness: raise ValueError('replaced parent receipt')
+            os.unlink(receipt_name,dir_fd=rootfd);os.fsync(rootfd)
+        finally: os.close(rootfd)
+        return True
     for part in path.split('/')[1:]:
         check();current=os.path.join(current,part)
         try: st=os.lstat(current)
         except FileNotFoundError:
             for p,s,mode,uid in parents:
                 if signature(os.lstat(p))!=s or os.lstat(p).st_mode!=mode or os.lstat(p).st_uid!=uid: raise ValueError('parent')
+            if current in (session_path,path): return finish_parent()
             return True
         if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode): raise ValueError('parent')
         if current in (path,os.path.dirname(path),os.path.dirname(os.path.dirname(path))) and not private(st,True): raise ValueError('private parent')
@@ -87,14 +168,16 @@ def main():
         names=set(namesat(fd,5)); marker='.cleanup.json'
         if not names<={'broker.py','config.json','state.json','lock',marker}: raise ValueError('foreign')
         if not names:
+            parent_receipt(True)
             check()
             for p,s,mode,uid in parents:
-                if signature(os.lstat(p))!=s or os.lstat(p).st_mode!=mode or os.lstat(p).st_uid!=uid: raise ValueError('parent')
+                now=os.lstat(p)
+                if (signature(now)!=s if p!=root_path else (now.st_dev,now.st_ino)!=(s[0],s[1])) or now.st_mode!=mode or now.st_uid!=uid: raise ValueError('parent')
             os.rmdir(path)
             parent=directory(os.path.dirname(path))
             try: os.fsync(parent)
             finally: os.close(parent)
-            return True
+            return finish_parent()
         if marker in names:
             markerbytes,markersig,_=readat(fd,marker,524288)
             plan=strict_json(markerbytes.decode('utf-8','strict'))
@@ -124,6 +207,7 @@ def main():
             lock=os.open('lock',os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd)
             if list(signature(os.fstat(lock)))!=files['lock']: raise ValueError('lock')
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        parent_receipt(True)
         if marker not in names:
             out=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=fd)
             try:
@@ -154,7 +238,7 @@ def main():
         parent=directory(os.path.dirname(path))
         try: os.fsync(parent)
         finally: os.close(parent)
-        return True
+        return finish_parent()
     finally:
         if lock is not None: os.close(lock)
         os.close(fd)
@@ -167,7 +251,7 @@ export async function cleanupRemoteBroker(
   directory: string,
   material: BrokerProvisioningMaterial,
   isCurrent: () => boolean,
-  options: { transport?: RemoteBrokerTransport } = {}
+  options: { transport?: RemoteBrokerTransport; finalSession?: boolean } = {}
 ): Promise<boolean> {
   const deadline = performance.now() + 1800;
   try {
@@ -175,7 +259,7 @@ export async function cleanupRemoteBroker(
       text = JSON.stringify(target);
     const current = () => performance.now() < deadline && isCurrent() === true && JSON.stringify(target) === text;
     if (snapshot.remote.owned === false || !current()) return false;
-    const input = JSON.stringify({ directory, material });
+    const input = JSON.stringify({ directory, material, finalSession: options.finalSession !== false });
     if (Buffer.byteLength(input) > 524288) return false;
     return await runWithRemoteSshLimit(
       async (retain) => {

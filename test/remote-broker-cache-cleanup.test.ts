@@ -263,7 +263,7 @@ it.each(['live', 'persisted'] as const)(
         restarted = new OwnedRemoteBrokerCache(cacheRoot),
         stop = restarted.startFinalCleanupRetries((id) => ({ live: false, state: restartedStore.getSession(id) }));
       try {
-        await vi.waitFor(async () => expect(await fs.readdir(sessionRoot)).toEqual([]));
+        await vi.waitFor(async () => await expect(fs.lstat(sessionRoot)).rejects.toMatchObject({ code: 'ENOENT' }));
         await expect(fs.lstat(marker)).rejects.toMatchObject({ code: 'ENOENT' });
         expect(await restarted.load(scope, material.config.incarnation)).toBeUndefined();
       } finally {
@@ -292,7 +292,9 @@ it('keeps unsafe material and its durable cleanup request until a later certifie
       expect((await fs.lstat(marker)).isFile()).toBe(true);
       await fs.chmod(file, 0o600);
       await vi.advanceTimersByTimeAsync(15_000);
-      await vi.waitFor(async () => expect(await fs.readdir(join(cacheRoot, session.id))).toEqual([]));
+      await vi.waitFor(
+        async () => await expect(fs.lstat(join(cacheRoot, session.id))).rejects.toMatchObject({ code: 'ENOENT' })
+      );
       await expect(fs.lstat(marker)).rejects.toMatchObject({ code: 'ENOENT' });
     } finally {
       await route.stop();
@@ -433,7 +435,9 @@ it('retains the actual route cleanup intent when both shared cache slots are hel
       release.resolve();
       await Promise.all(loads);
       await vi.advanceTimersByTimeAsync(15_000);
-      await vi.waitFor(async () => expect(await fs.readdir(join(cacheRoot, session.id))).toEqual([]));
+      await vi.waitFor(
+        async () => await expect(fs.lstat(join(cacheRoot, session.id))).rejects.toMatchObject({ code: 'ENOENT' })
+      );
       await expect(fs.lstat(marker)).rejects.toMatchObject({ code: 'ENOENT' });
     } finally {
       release.resolve();
@@ -484,7 +488,7 @@ it('retains a timed-out cleanup until its actual proof closes, then retries with
       await vi.advanceTimersToNextTimerAsync();
       await vi.waitFor(async () => {
         await expect(fs.lstat(marker)).rejects.toMatchObject({ code: 'ENOENT' });
-        expect(await fs.readdir(join(cacheRoot, session.id))).toEqual([]);
+        await expect(fs.lstat(join(cacheRoot, session.id))).rejects.toMatchObject({ code: 'ENOENT' });
       });
     } finally {
       release.resolve();
@@ -594,7 +598,9 @@ it.each(['live', 'persisted'] as const)(
       const reopened = new OwnedRemoteBrokerCache(cacheRoot);
       const stop = reopened.startFinalCleanupRetries(() => ({ live: false }));
       try {
-        await vi.waitFor(async () => expect(await fs.readdir(join(cacheRoot, session.id))).toEqual([]));
+        await vi.waitFor(
+          async () => await expect(fs.lstat(join(cacheRoot, session.id))).rejects.toMatchObject({ code: 'ENOENT' })
+        );
         await expect(fs.lstat(join(cacheRoot, session.id + '.cleanup.json'))).rejects.toMatchObject({ code: 'ENOENT' });
       } finally {
         await stop();
