@@ -1097,3 +1097,79 @@ describe('task saves retain independent configuration and progress drafts', () =
     expect(h.app._taskView.dirty).toBe(false);
   });
 });
+
+describe('task server events refresh clean sibling sections', () => {
+  it.each(['configuration', 'progress'] as const)(
+    'refreshes clean fields while preserving the %s draft before saving the clean sibling',
+    async (dirtySection) => {
+      const initial = { ...state(), phase: 'paused', checkpoint: 'Original checkpoint', nextAction: 'Original action' };
+      const h = harness(initial);
+      await h.open();
+      if (dirtySection === 'configuration') {
+        h.get('taskObjective').value = 'Unsaved owner objective';
+        h.get('taskCriteriaRows').children[0].querySelector('textarea').value = 'Unsaved owner criterion';
+      } else {
+        h.get('taskCheckpoint').value = 'Unsaved owner checkpoint';
+        h.get('taskNextAction').value = 'Unsaved owner action';
+        h.get('taskCriteriaEvidence').querySelector('input').checked = true;
+      }
+      h.app.markTaskDraft();
+      const latest = {
+        ...initial,
+        phase: 'blocked',
+        reason: 'task-blocked',
+        outcome: 'unfinished',
+        objective: '  Latest server objective\r\n界  ',
+        checkpoint: '  Latest server checkpoint\r\n界  ',
+        nextAction: 'Latest server action\r\n  ',
+        config: { ...initial.config, maxContinuations: 7 },
+        criteria: initial.criteria.map((criterion) => ({ ...criterion, description: 'Latest server ' + criterion.id })),
+      };
+      h.app._onSessionTask({ sessionId: 'a', state: latest });
+      expect(h.get('taskPhase').textContent).toBe('Blocked');
+      h.app._apiJson.mockResolvedValueOnce(latest);
+      if (dirtySection === 'configuration') {
+        expect(h.get('taskObjective').value).toBe('Unsaved owner objective');
+        expect(h.get('taskCriteriaRows').children[0].querySelector('textarea').value).toBe('Unsaved owner criterion');
+        expect(h.get('taskCheckpoint').value).toBe(latest.checkpoint.replace(/\r\n/g, '\n'));
+        expect(h.get('taskNextAction').value).toBe(latest.nextAction.replace(/\r\n/g, '\n'));
+        h.get('taskCriteriaEvidence').querySelector('input').checked = true;
+        await h.app.saveTaskProgress();
+        expect(h.app._apiJson.mock.calls[1][1].body).toMatchObject({
+          checkpoint: latest.checkpoint,
+          nextAction: latest.nextAction,
+          verifiedCriteria: ['manual-a'],
+        });
+        expect(h.get('taskObjective').value).toBe('Unsaved owner objective');
+      } else {
+        expect(h.get('taskCheckpoint').value).toBe('Unsaved owner checkpoint');
+        expect(h.get('taskNextAction').value).toBe('Unsaved owner action');
+        expect(h.get('taskCriteriaEvidence').querySelector('input').checked).toBe(true);
+        expect(h.get('taskObjective').value).toBe(latest.objective.replace(/\r\n/g, '\n'));
+        expect(h.get('taskCriteriaRows').children[0].querySelector('textarea').value).toBe('Latest server manual-a');
+        expect(h.get('taskMaxContinuations').value).toBe('7');
+        await h.app.saveTaskConfiguration();
+        const body = h.app._apiJson.mock.calls[1][1].body;
+        expect(Object.hasOwn(body, 'objective')).toBe(false);
+        expect(Object.hasOwn(body, 'criteria')).toBe(false);
+        expect(body.config.maxContinuations).toBe(7);
+        expect(h.get('taskCheckpoint').value).toBe('Unsaved owner checkpoint');
+      }
+      expect(h.app._taskView.dirty).toBe(true);
+    }
+  );
+  it('preserves both edited sections while updating current server controls', async () => {
+    const h = harness();
+    await h.open();
+    h.get('taskObjective').value = 'Unsaved objective';
+    h.get('taskCheckpoint').value = 'Unsaved checkpoint';
+    h.app.markTaskDraft();
+    h.app._onSessionTask({
+      sessionId: 'a',
+      state: { ...state(), phase: 'blocked', objective: 'Server objective', checkpoint: 'Server checkpoint' },
+    });
+    expect(h.get('taskObjective').value).toBe('Unsaved objective');
+    expect(h.get('taskCheckpoint').value).toBe('Unsaved checkpoint');
+    expect(h.get('taskPhase').textContent).toBe('Blocked');
+  });
+});

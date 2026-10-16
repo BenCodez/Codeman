@@ -713,4 +713,115 @@ describe('Session Options responsive layout in Chromium', () => {
     expect(await page.locator('#taskObjective').inputValue()).toBe(' \t\n ');
     await page.evaluate(() => (window as any).app.closeTaskOptions());
   });
+  it.each([390, 1280].flatMap((width) => ['configuration', 'progress'].map((dirty) => ({ width, dirty }))))(
+    'refreshes the clean sibling from SSE while $dirty stays edited at $width px',
+    async ({ width, dirty }) => {
+      await page.close();
+      page = await browser.newPage();
+      await renderAt(width);
+      await page.addScriptTag({ content: 'window.CodemanApp = class {};' });
+      for (const file of ['api-client.js', 'recovery-ui.js', 'supervision-ui.js'])
+        await page.addScriptTag({ content: readFileSync(resolve(publicDir, file), 'utf8') });
+      await page.evaluate(async () => {
+        const w = window as any;
+        document.getElementById('context-tab')!.classList.add('hidden');
+        document.getElementById('task-tab')!.classList.remove('hidden');
+        w.__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
+        w.app = new w.CodemanApp();
+        w.app.sessions = new Map([['a', { mode: 'codex', taskSupported: true }]]);
+        w.app.editingSessionId = 'a';
+        w.app.showToast = () => {};
+        w.taskState = {
+          version: 1,
+          objective: 'Original objective',
+          checkpoint: 'Original checkpoint',
+          nextAction: 'Original action',
+          criteria: [{ id: 'owner', kind: 'manual', description: 'Owner acceptance', verified: false }],
+          config: { enabled: false, maxContinuations: 3, maxRuntimeMs: 900000 },
+          phase: 'paused',
+          outcome: 'unknown',
+          reason: 'configured',
+          continuations: 0,
+          history: [],
+        };
+        w.writes = [];
+        w.fetch = async (_url: string, options?: { method?: string; body?: string }) => {
+          if (options?.body) {
+            const body = JSON.parse(options.body);
+            w.writes.push(body);
+            w.taskState =
+              options.method === 'PUT'
+                ? { ...w.taskState, ...body }
+                : {
+                    ...w.taskState,
+                    checkpoint: body.checkpoint,
+                    nextAction: body.nextAction,
+                    outcome: body.outcome,
+                    criteria: w.taskState.criteria.map((criterion: any) =>
+                      body.verifiedCriteria.includes(criterion.id) ? { ...criterion, verified: true } : criterion
+                    ),
+                  };
+          }
+          return new Response(JSON.stringify({ success: true, data: w.taskState }), { status: 200 });
+        };
+        w.app.openTaskOptions('a');
+        await w.app.loadTaskStatus();
+      });
+      if (dirty === 'configuration') {
+        await page.locator('#taskObjective').fill('Unsaved owner objective');
+        await page.locator('#taskCriteriaRows textarea').fill('Unsaved owner criterion');
+      } else {
+        await page.locator('#taskCheckpoint').fill('Unsaved owner checkpoint');
+        await page.locator('#taskNextAction').fill('Unsaved owner action');
+        await page.locator('#taskCriteriaEvidence input').check();
+      }
+      const latest = {
+        objective: '  Server objective\r\n界  ',
+        checkpoint: '  Server checkpoint\r\n界  ',
+        nextAction: 'Server action\r\n  ',
+      };
+      await page.evaluate((text) => {
+        const w = window as any;
+        w.taskState = {
+          ...w.taskState,
+          ...text,
+          phase: 'blocked',
+          reason: 'task-blocked',
+          criteria: [{ id: 'owner', kind: 'manual', description: 'Latest server owner criterion', verified: false }],
+          config: { ...w.taskState.config, maxContinuations: 7 },
+        };
+        w.app._onSessionTask({ sessionId: 'a', state: w.taskState });
+      }, latest);
+      expect(await page.locator('#taskPhase').textContent()).toBe('Blocked');
+      if (dirty === 'configuration') {
+        expect(await page.locator('#taskObjective').inputValue()).toBe('Unsaved owner objective');
+        expect(await page.locator('#taskCriteriaRows textarea').inputValue()).toBe('Unsaved owner criterion');
+        expect(await page.locator('#taskCheckpoint').inputValue()).toBe(latest.checkpoint.replace(/\r\n/g, '\n'));
+        await page.locator('#taskCriteriaEvidence input').check();
+        await page.getByRole('button', { name: 'Save checkpoint / verification', exact: true }).click();
+      } else {
+        expect(await page.locator('#taskObjective').inputValue()).toBe(latest.objective.replace(/\r\n/g, '\n'));
+        expect(await page.locator('#taskCriteriaRows textarea').inputValue()).toBe('Latest server owner criterion');
+        expect(await page.locator('#taskMaxContinuations').inputValue()).toBe('7');
+        expect(await page.locator('#taskCheckpoint').inputValue()).toBe('Unsaved owner checkpoint');
+        expect(await page.locator('#taskCriteriaEvidence input').isChecked()).toBe(true);
+        await page.getByRole('button', { name: 'Save task configuration', exact: true }).click();
+      }
+      await expect.poll(() => page.evaluate(() => (window as any).writes.length)).toBe(1);
+      const body = await page.evaluate(() => (window as any).writes[0]);
+      if (dirty === 'configuration') {
+        expect(body).toMatchObject({
+          checkpoint: latest.checkpoint,
+          nextAction: latest.nextAction,
+          verifiedCriteria: ['owner'],
+        });
+        expect(await page.locator('#taskObjective').inputValue()).toBe('Unsaved owner objective');
+      } else {
+        expect(body).toEqual({ config: { enabled: false, maxContinuations: 7, maxRuntimeMs: 900000 } });
+        expect(await page.locator('#taskCheckpoint').inputValue()).toBe('Unsaved owner checkpoint');
+      }
+      expect(await page.evaluate(() => (window as any).app._taskView.dirty)).toBe(true);
+      await page.evaluate(() => (window as any).app.closeTaskOptions());
+    }
+  );
 });

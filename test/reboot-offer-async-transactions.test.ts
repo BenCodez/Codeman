@@ -578,3 +578,79 @@ it.each(['workspace-missing', 'already-live'])(
     }
   }
 );
+
+async function mixedAgeExpiryFailure(useRouteRegistry = false) {
+  if (useRouteRegistry) {
+    rebootRestoreRegistry.reset();
+    await rebootRestoreRegistry.configurePersistence(path);
+    registry = rebootRestoreRegistry;
+  }
+  const oldAt = JSON.parse(await fs.readFile(path, 'utf8')).builtAt;
+  const now = vi.spyOn(Date, 'now').mockReturnValue(oldAt + 86_400_000 - 60_000);
+  const fresh = entry('fresh');
+  fresh.workingDir = join(root, 'missing-fresh-workspace');
+  fresh.state.workingDir = fresh.workingDir;
+  const merge = await registry.preparePlanMerge();
+  expect(await merge([fresh], () => true, ['fresh'])).toBe(true);
+  now.mockReturnValue(oldAt + 86_400_000 + 60_000);
+  io.failPrimaryAck = true;
+  expect(registry.list(() => true).map((offer) => offer.sessionId)).toEqual(['fresh']);
+  await registry.flush();
+  expect(Reflect.get(registry, 'persistenceWriteFailed')).toBe(true);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  return { fresh, now, oldAt };
+}
+it('the first actual Restore click waits for its own failed mixed-age expiry cleanup retry', async () => {
+  await mixedAgeExpiryFailure(true);
+  const h = await createRouteTestHarness(registerRebootRestoreRoutes);
+  try {
+    const entered = hold('primary-file-sync');
+    const restoring = Promise.resolve(
+      h.app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })
+    );
+    await reached(entered, restoring);
+    expect(registry.take(() => true, undefined, undefined)).toEqual([]);
+    expect(h.ctx.addSession).not.toHaveBeenCalled();
+    const second = Promise.resolve(h.app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} }));
+    release!();
+    const response = await restoring;
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ restored: [], skipped: [{ sessionId: 'fresh', reason: 'workspace-missing' }] });
+    expect((await second).statusCode).toBe(409);
+    expect(h.ctx.addSession).not.toHaveBeenCalled();
+    expect(registry.list(() => true).map((offer) => offer.sessionId)).toEqual(['fresh']);
+    expect(await restoredIds()).toEqual(['fresh']);
+  } finally {
+    release?.();
+    await h.app.close();
+  }
+});
+it('a repeated mixed-age expiry ACK failure refuses this click without silently retrying again', async () => {
+  await mixedAgeExpiryFailure();
+  io.failPrimaryAck = true;
+  expect(await registry.beginSpendingAfterRepair('alice')).toBe(false);
+  expect(registry.take(alice, undefined, 'alice')).toEqual([]);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  expect(await registry.beginSpendingAfterRepair('alice')).toBe(true);
+  const held = registry.take(alice, undefined, 'alice');
+  expect(held.map((offer) => offer.sessionId)).toEqual(['fresh']);
+  await registry.releaseFlight('alice', held);
+  registry.endSpending('alice');
+});
+it.each(['dismiss', 'reconfigure', 'expires'] as const)(
+  'a %s while awaiting expiry repair cannot admit stale work',
+  async (change) => {
+    const { now } = await mixedAgeExpiryFailure();
+    const entered = hold('primary-file-sync');
+    const spending = registry.beginSpendingAfterRepair('alice');
+    await reached(entered, spending);
+    let changed: Promise<unknown> | undefined;
+    if (change === 'dismiss') changed = registry.clear(() => true);
+    if (change === 'reconfigure') changed = registry.configurePersistence(join(root, 'new-offer.json'));
+    if (change === 'expires') now.mockReturnValue(Date.now() + 86_400_000);
+    release!();
+    expect(await spending).toBe(false);
+    await changed;
+    expect(registry.take(alice, undefined, 'alice')).toEqual([]);
+  }
+);
