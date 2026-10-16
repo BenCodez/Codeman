@@ -99,6 +99,17 @@ const tools = toolNames.map((name) => ({
           },
           required: ['mode'],
           additionalProperties: false,
+          allOf: [
+            {
+              if: { properties: { mode: { const: 'append' } }, required: ['mode'] },
+              then: { required: ['requestId', 'note', 'ifMatch'] },
+              else: {
+                not: {
+                  anyOf: [{ required: ['requestId'] }, { required: ['note'] }, { required: ['ifMatch'] }],
+                },
+              },
+            },
+          ],
         }
       : name === 'supervisor_assign' || name === 'supervisor_retry' || name === 'supervisor_message'
         ? {

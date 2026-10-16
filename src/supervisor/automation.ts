@@ -190,6 +190,14 @@ export class SupervisorAutomationController {
     requestId: string,
     callerCurrent: () => boolean = () => true
   ): Promise<SupervisorAutomationStatus> {
+    return this.runInstruction(taskId, requestId, callerCurrent, false);
+  }
+  private runInstruction(
+    taskId: string,
+    requestId: string,
+    callerCurrent: () => boolean,
+    automatic: boolean
+  ): Promise<SupervisorAutomationStatus> {
     SupervisorAutomationRequestSchema.parse({ requestId });
     const revision = this.revision;
     return this.enqueue(async () => {
@@ -224,6 +232,9 @@ export class SupervisorAutomationController {
         phase: 'reserved',
       };
       if (run.attempts >= plan.maxRuns || !this.available()) {
+        // Timer readiness is only a hint. A known-unsent race is not an admitted
+        // request and must leave its deterministic ID, due time and receipt budget unused.
+        if (automatic) return this.getStatus();
         // A refused manual request must not consume the slots already allocated to future work.
         if (this.receiptCapacity().remaining === 0)
           throw new SupervisorAutomationError(
@@ -292,17 +303,27 @@ export class SupervisorAutomationController {
       for (const run of due) {
         const plan = this.plan(run.taskId);
         if (!plan?.enabled || run.attempts >= plan.maxRuns) continue;
-        const requestId =
+        let requestId =
           'automation:' +
           createHash('sha256').update(`${this.state.supervisorSessionId}:${run.taskId}:${run.attempts}`).digest('hex');
+        const previous = this.state.handled.find((receipt) => receipt.requestId === requestId);
+        if (previous) {
+          // Older versions durably refused a pre-reservation readiness race. Keep
+          // that exact receipt sealed, but permit a new ID only for certified unsent work.
+          if (previous.phase !== 'refused' || previous.taskId !== run.taskId) continue;
+          requestId =
+            'automation:' +
+            createHash('sha256').update(`${requestId}:retry:${this.state.handled.length}`).digest('hex');
+        }
         const revision = this.revision;
-        await this.runTask(
+        await this.runInstruction(
           run.taskId,
           requestId,
           () =>
             revision === this.revision &&
             this.plan(run.taskId)?.enabled === true &&
-            this.plan(run.taskId)?.hash === plan.hash
+            this.plan(run.taskId)?.hash === plan.hash,
+          true
         );
         break;
       }

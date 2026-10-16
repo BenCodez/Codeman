@@ -1,4 +1,5 @@
 /** @fileoverview Fake-clock management schedules with real durable reservations and no worker effects. */
+import { createHash } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -506,4 +507,86 @@ it('rejects malformed journals that put the same request in handled and unresolv
   record.handled = Array.from({ length: 128 }, (_, index) => ({ ...receipt, requestId: 'handled-request-' + index }));
   record.inFlight.requestId = 'different-flight-id';
   expect(SupervisorAutomationRecordSchema.safeParse(record).success).toBe(false);
+});
+
+it('retries an automatic pre-reservation readiness race without consuming receipts and then reaches the later due task', async () => {
+  const f = await fixture(),
+    cfg = config();
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', instructions: 'Inspect later work' });
+  await f.controller.configure(cfg);
+  const canRun = vi.spyOn(f.deps, 'canRun');
+  canRun.mockReturnValueOnce(true).mockReturnValueOnce(false).mockReturnValue(true);
+  await f.controller.tick();
+  expect(f.dispatch).not.toHaveBeenCalled();
+  expect(f.store.get(ID).handled).toEqual([]);
+  expect(f.store.get(ID).runs).toEqual(cfg.tasks.map((task) => ({ taskId: task.id, attempts: 0, nextRunAt: NOW })));
+  await f.controller.tick();
+  await f.controller.tick();
+  expect(f.dispatch.mock.calls.map((call) => call[0])).toEqual(cfg.tasks.map((task) => task.instructions));
+  expect(f.store.get(ID).handled).toHaveLength(2);
+  expect(f.store.get(ID).runs.every((run) => run.attempts === 1)).toBe(true);
+});
+
+it('retries the same automatic readiness race even when all receipt slots are allocated', async () => {
+  const f = await fixture(),
+    cfg = config('recurring');
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', maxRuns: 28 });
+  await f.controller.configure(cfg);
+  f.setTime(NOW + HOUR);
+  vi.spyOn(f.deps, 'canRun').mockReturnValueOnce(true).mockReturnValueOnce(false).mockReturnValue(true);
+  await f.controller.tick();
+  expect(f.store.get(ID).handled).toEqual([]);
+  await f.controller.tick();
+  await f.controller.tick();
+  expect(f.dispatch).toHaveBeenCalledTimes(2);
+});
+
+it('preserves a legacy automatic refused receipt on reload while issuing fresh IDs for certified unsent retries', async () => {
+  const f = await fixture(),
+    cfg = config();
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task' });
+  await f.controller.configure(cfg);
+  const record = f.store.get(ID);
+  const task = cfg.tasks[0],
+    requestId = 'automation:' + createHash('sha256').update(`${ID}:${task.id}:0`).digest('hex');
+  record.handled = [
+    {
+      requestId,
+      taskId: task.id,
+      payloadHash: createHash('sha256')
+        .update(JSON.stringify({ taskId: task.id, task, instructions: task.instructions }))
+        .digest('hex'),
+      startedAt: NOW,
+      phase: 'refused',
+    },
+  ];
+  await f.store.save(ID, record);
+  const reloaded = f.reload();
+  await reloaded.tick();
+  await reloaded.tick();
+  expect(f.dispatch).toHaveBeenCalledTimes(2);
+  expect(f.store.get(ID).handled).toHaveLength(3);
+  expect(f.store.get(ID).handled[0]).toEqual(record.handled[0]);
+  expect(f.store.get(ID).handled[1].requestId).not.toBe(requestId);
+  await reloaded.runTask(task.id, requestId);
+  expect(f.dispatch).toHaveBeenCalledTimes(2);
+});
+
+it('retains manual readiness refusals and post-reservation unknown seals while automatic readiness races stay unadmitted', async () => {
+  const f = await fixture();
+  await f.controller.configure(config());
+  f.setAvailable(false);
+  await f.controller.runTask('owner-task', 'manual-not-ready-id');
+  expect(f.store.get(ID).handled[0].phase).toBe('refused');
+  f.setAvailable(true);
+  f.dispatch.mockResolvedValue('unknown');
+  await f.controller.tick();
+  const saved = f.store.get(ID);
+  expect(saved.inFlight?.phase).toBe('unknown');
+  expect(saved.runs[0].attempts).toBe(1);
+  await f.controller.tick();
+  await f.reload().tick();
+  expect(f.dispatch).toHaveBeenCalledOnce();
+  expect(f.store.get(ID)).toEqual(saved);
 });

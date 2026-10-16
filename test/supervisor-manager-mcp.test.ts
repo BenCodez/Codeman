@@ -1,6 +1,7 @@
 /** Real authentication hooks and MCP routes via inject; no socket or native/worker effects. */
 import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
+import Ajv from 'ajv';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ManagerCredentialRegistry } from '../src/supervisor/manager-credentials.js';
 import { registerAuthMiddleware, registerHostGuard } from '../src/web/middleware/auth.js';
@@ -475,6 +476,34 @@ it('permits scoped owner teaching while paused without granting worker actions',
   expect(assigning.json().error.code).toBe(-32000);
   expect(f.controller.getStatus().phase).toBe('paused');
   expect(f.generic).not.toHaveBeenCalled();
+});
+
+it('advertises brain read and append arguments that match runtime admission', async () => {
+  const f = await fixture();
+  const tools = (await f.rpc('tools/list')).json().result.tools;
+  const schema = tools.find((tool: { name: string }) => tool.name === 'supervisor_brain').inputSchema;
+  const validate = new Ajv({ allErrors: true }).compile(schema);
+  const append = { mode: 'append', requestId: REQUEST, note: 'Owner checkpoint', ifMatch: REVISION };
+  const cases: { args: Record<string, unknown>; valid: boolean }[] = [
+    { args: { mode: 'read' }, valid: true },
+    { args: append, valid: true },
+    ...['requestId', 'note', 'ifMatch'].flatMap((field) => [
+      { args: Object.fromEntries(Object.entries(append).filter(([key]) => key !== field)), valid: false },
+      { args: { mode: 'read', [field]: append[field as keyof typeof append] }, valid: false },
+    ]),
+    { args: { ...append, ifMatch: 'unknown' }, valid: false },
+    { args: { ...append, note: '' }, valid: false },
+    { args: { ...append, path: '/private' }, valid: false },
+    { args: { mode: 'unknown' }, valid: false },
+  ];
+  for (const { args, valid } of cases) {
+    expect(validate(args), JSON.stringify(args)).toBe(valid);
+    const result = (await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json();
+    if (valid) expect(result.error).toBeUndefined();
+    else expect(result.error).toMatchObject({ code: -32602 });
+  }
+  expect(f.brain.read).toHaveBeenCalledOnce();
+  expect(f.brain.append).toHaveBeenCalledOnce();
 });
 
 it('rechecks credential authority after held brain authorization before appending', async () => {
