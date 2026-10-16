@@ -1591,6 +1591,11 @@ describe('manager authority at the real server boundary', () => {
       }
       record.remote = worker.remote;
       record.recoveryCodexHome = managerSession.getRecoveryContext().codexHome;
+      // A remote scope alone cannot turn a local fixture into a controlled SSH worker.
+      expect(worker.taskSupervisionSupported).toBe(false);
+      expect(() => managerDeps.validateWorkers([WORKER])).toThrow(/eligible/);
+      record.recoveryInputBroker = inputProofs.get(worker)!.incarnation;
+      expect(worker.taskSupervisionSupported).toBe(owned);
 
       if (owned) expect(() => managerDeps.validateWorkers([WORKER])).not.toThrow();
       else expect(() => managerDeps.validateWorkers([WORKER])).toThrow(/eligible/);

@@ -17,6 +17,7 @@ import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import { MAX_INPUT_LENGTH } from '../src/config/terminal-limits.js';
 import { SessionInputWithLimitSchema } from '../src/web/schemas.js';
+import { browserInputJournal, recordKey } from './mocks/browser-input-journal.js';
 
 const pub = (f: string) => readFileSync(resolve(import.meta.dirname, '../src/web/public', f), 'utf8');
 const appSource = pub('app.js');
@@ -142,8 +143,25 @@ describe('the client never queues or keeps an undeliverable frame', () => {
     expect(handler.slice(0, 600)).toMatch(/if \(msg && msg\.err\)/);
   });
 
-  it('prunes oversized frames persisted by an older build on load', () => {
-    const load = appSource.slice(appSource.indexOf('_loadReliableState() {'));
-    expect(load.slice(0, 4000)).toMatch(/rec\.data\.length > \(window\.CodemanInputLimit\?\.FRAME_MAX_CHARS/);
+  it('keeps only the safe prefix when older persisted frames exceed the UTF-8 limit', () => {
+    const cid = 'previous-client';
+    const sid = 'restored-session';
+    const frames = ['prefix', '🧭'.repeat(MAX_INPUT_LENGTH / 4 + 1), 'suffix\r'];
+    const journal = browserInputJournal(
+      frames.map((data, index) => [
+        recordKey(cid, sid, index + 1),
+        JSON.stringify({ version: 3, cid, sessionId: sid, seq: index + 1, data }),
+      ])
+    );
+    const browser = journal.open();
+    expect(browser.app._pendingDeliveries.get(sid)?.map((frame) => frame.data)).toEqual(['prefix']);
+    // Refused input stays durable, so another load cannot silently lose its causal barrier.
+    expect(journal.records()).toHaveLength(3);
+    expect(
+      journal
+        .open()
+        .app._pendingDeliveries.get(sid)
+        ?.map((frame) => frame.data)
+    ).toEqual(['prefix']);
   });
 });
