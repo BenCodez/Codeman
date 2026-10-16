@@ -22,7 +22,7 @@ vi.mock('../src/supervisor/manager-catalog.js', async (importOriginal) => ({
   readSupervisorManagerCatalog: catalogRead,
 }));
 const SAFE_CATALOG = JSON.stringify({
-  models: [{ slug: 'owner-model', description: 'é', apply_patch_tool_type: null }],
+  models: [{ slug: 'owner-model', description: 'é', apply_patch_tool_type: null, tool_mode: 'direct' }],
 });
 beforeEach(() => catalogRead.mockReset().mockResolvedValue(SAFE_CATALOG));
 

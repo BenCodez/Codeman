@@ -9,6 +9,14 @@ import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 
 const durableSnapshots: Array<{ recoveryInputBrokerPending?: string; codexRestoreUncertain?: boolean }> = [];
 
+// All native processes are forbidden in this fixture, including the offline catalog reader.
+vi.mock('../src/supervisor/manager-catalog.js', async (original) => ({
+  ...(await original<typeof import('../src/supervisor/manager-catalog.js')>()),
+  readSupervisorManagerCatalog: vi.fn(async () =>
+    JSON.stringify({ models: [{ slug: 'fixture', apply_patch_tool_type: null, tool_mode: 'direct' }] })
+  ),
+}));
+
 function nativeReply(command: string): string {
   if (command.includes('new-session') && command.includes('-P -F')) return '$1|%7|650|800\n';
   if (command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED')) return nativeDispatchReceipt(command);

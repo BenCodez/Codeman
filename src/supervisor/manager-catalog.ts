@@ -9,7 +9,7 @@ import { performance } from 'node:perf_hooks';
 export const MAX_SUPERVISOR_CATALOG_BYTES = 1_048_576;
 let active = 0;
 
-/** Preserve native metadata, changing only the known patch-tool selector. */
+/** Preserve native metadata while pinning the restricted manager's tool selectors. */
 export function sanitizeSupervisorManagerCatalog(raw: string): string | undefined {
   if (typeof raw !== 'string' || Buffer.byteLength(raw) > MAX_SUPERVISOR_CATALOG_BYTES) return undefined;
   try {
@@ -37,11 +37,15 @@ export function sanitizeSupervisorManagerCatalog(raw: string): string | undefine
         !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(model.slug) ||
         slugs.has(model.slug) ||
         !Object.hasOwn(model, 'apply_patch_tool_type') ||
-        (model.apply_patch_tool_type !== null && model.apply_patch_tool_type !== 'freeform')
+        (model.apply_patch_tool_type !== null && model.apply_patch_tool_type !== 'freeform') ||
+        (model.tool_mode !== undefined &&
+          model.tool_mode !== null &&
+          !['direct', 'code_mode', 'code_mode_only'].includes(model.tool_mode))
       )
         return undefined;
       slugs.add(model.slug);
       model.apply_patch_tool_type = null;
+      model.tool_mode = 'direct';
     }
     const result = JSON.stringify(value);
     return Buffer.byteLength(result) <= MAX_SUPERVISOR_CATALOG_BYTES ? result : undefined;

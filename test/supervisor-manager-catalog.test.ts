@@ -32,6 +32,7 @@ const catalog = () => ({
     {
       slug: 'fixture-sol',
       apply_patch_tool_type: 'freeform',
+      tool_mode: 'code_mode_only',
       context_window: 200000,
       instructions: 'Private fixture café 🧭',
       reasoning: { supported: ['low', 'high'] },
@@ -99,10 +100,31 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-it('clears every patch selector and preserves all other bundled settings', () => {
-  const expected = catalog();
-  expected.models[0].apply_patch_tool_type = null;
+it('clears patch selectors, pins direct mode and preserves other bundled settings', () => {
+  const expected = JSON.parse(raw());
+  for (const model of expected.models) {
+    model.apply_patch_tool_type = null;
+    model.tool_mode = 'direct';
+  }
   expect(JSON.parse(sanitizeSupervisorManagerCatalog(raw())!)).toEqual(expected);
+});
+it.each(['direct', 'code_mode', 'code_mode_only', null, undefined])(
+  'pins direct tools despite the model-selected mode %s',
+  (tool_mode) => {
+    const value = { models: [{ slug: 'fixture', apply_patch_tool_type: null, tool_mode }] };
+    expect(JSON.parse(sanitizeSupervisorManagerCatalog(JSON.stringify(value))!).models[0]).toEqual({
+      slug: 'fixture',
+      apply_patch_tool_type: null,
+      tool_mode: 'direct',
+    });
+  }
+);
+it.each(['future-mode', '', false, 0, {}, []])('refuses an unknown model tool selector %#', (tool_mode) => {
+  expect(
+    sanitizeSupervisorManagerCatalog(
+      JSON.stringify({ models: [{ slug: 'fixture', apply_patch_tool_type: null, tool_mode }] })
+    )
+  ).toBeUndefined();
 });
 it.each([
   'not json',
@@ -158,6 +180,7 @@ it('reads only the bundled offline command in a new credential-free HOME/cwd', a
   expect(result.models.every((model: { apply_patch_tool_type: unknown }) => model.apply_patch_tool_type === null)).toBe(
     true
   );
+  expect(result.models.every((model: { tool_mode: unknown }) => model.tool_mode === 'direct')).toBe(true);
   expect(result.models[0].instructions).toBe(catalog().models[0].instructions);
 });
 it.each([NaN, Infinity, -1, 1000])('refuses an invalid/expired deadline %s without spawning', async (deadline) => {

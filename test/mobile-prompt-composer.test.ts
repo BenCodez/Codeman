@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { JSDOM } from 'jsdom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { browserInputJournal, settleInput } from './mocks/browser-input-journal.js';
 
 const accessorySource = readFileSync(resolve('src/web/public/keyboard-accessory.js'), 'utf8');
 const appSource = readFileSync(resolve('src/web/public/app.js'), 'utf8');
@@ -124,9 +125,85 @@ describe('mobile prompt composer', () => {
     (document.querySelector('.paste-send') as HTMLButtonElement).click();
     runTimers();
     expect(app._sendInputAsync.mock.calls).toEqual([
-      ['session-1', 'fixture command', { useMux: true }],
+      ['session-1', 'fixture command'],
       ['session-1', '\r', { useMux: true }],
     ]);
+  });
+
+  it.each(['  first line\nsecond line  \t', ' \t\n\n \t', 'λ🙂\n尾 \t'])(
+    'preserves shell paste %j through HTTP fallback, durable reload and a separate Enter',
+    async (text) => {
+      const journal = browserInputJournal();
+      const browser = journal.open(); // No WebSocket: actual POST fallback.
+      const { app, bar, document, runTimers } = loadComposer();
+      app.sessions.set('session-1', { mode: 'shell' });
+      app._sendInputAsync.mockImplementation((...args) =>
+        Reflect.apply(browser.app._sendInputAsync, browser.app, args)
+      );
+      bar.pasteFromClipboard();
+      (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = text;
+      (document.querySelector('.paste-send') as HTMLButtonElement).click();
+      await settleInput(browser.app);
+      expect(browser.fetches.map(({ body }) => body)).toEqual([
+        { clientId: browser.app._clientId, seq: 1, input: text },
+      ]);
+      expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
+        { data: text, useMux: false },
+      ]);
+      // A failed prefix remains durable; the delayed Enter cannot overtake it.
+      app.activeSessionId = 'session-2';
+      runTimers();
+      await settleInput(browser.app);
+      const records = journal.records().map(({ value }) => value);
+      expect(records.map(({ data, useMux }) => ({ data, useMux }))).toEqual([
+        { data: text, useMux: false },
+        { data: '\r', useMux: true },
+      ]);
+      expect(records[1].after).toEqual({ cid: records[0].cid, seq: records[0].seq });
+      const reloaded = journal.open();
+      reloaded.transport(vi.fn(async () => new Response('{}', { status: 200 })));
+      reloaded.app._drainSession('session-1');
+      await settleInput(reloaded.app);
+      expect(reloaded.fetches).toEqual([
+        { sid: 'session-1', body: { clientId: records[0].cid, seq: records[0].seq, input: text } },
+        { sid: 'session-1', body: { clientId: records[1].cid, seq: records[1].seq, input: '\r', useMux: true } },
+      ]);
+      expect(journal.records()).toEqual([]);
+      expect(app._sendInputAsync.mock.calls.map(([sid]) => sid)).toEqual(['session-1', 'session-1']);
+    }
+  );
+
+  it('keeps connected shell paste byte-exact while Enter remains a separate durable occurrence', () => {
+    const journal = browserInputJournal();
+    const browser = journal.open();
+    browser.socket('session-1');
+    const { app, bar, document, runTimers } = loadComposer();
+    app.sessions.set('session-1', { mode: 'shell' });
+    app._sendInputAsync.mockImplementation((...args) => Reflect.apply(browser.app._sendInputAsync, browser.app, args));
+    const text = '  first\nlast \t';
+    bar.pasteFromClipboard();
+    (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = text;
+    (document.querySelector('.paste-send') as HTMLButtonElement).click();
+    expect(browser.frames.map(({ d }) => d)).toEqual([text]);
+    runTimers();
+    expect(browser.frames.map(({ d }) => d)).toEqual([text, '\r']);
+    expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
+      { data: text, useMux: false },
+      { data: '\r', useMux: true },
+    ]);
+    expect(browser.fetches).toEqual([]);
+  });
+
+  it.each(['cancel', 'empty'] as const)('does not enqueue shell text or Enter for %s paste', (action) => {
+    const { app, bar, document, runTimers } = loadComposer();
+    app.sessions.set('session-1', { mode: 'shell' });
+    bar.pasteFromClipboard();
+    if (action === 'cancel')
+      (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = 'cancelled\ntext';
+    (document.querySelector(action === 'cancel' ? '.paste-cancel' : '.paste-send') as HTMLButtonElement).click();
+    runTimers();
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    expect(document.querySelector('.paste-overlay')).toBeNull();
   });
 
   beforeEach(() => vi.restoreAllMocks());

@@ -1438,7 +1438,7 @@ const KeyboardAccessoryBar = {
       const text = textarea.value;
       close();
       if (text) {
-        app._sendInputAsync(sessionId, text, { useMux: true });
+        app._sendInputAsync(sessionId, text);
         setTimeout(() => app._sendInputAsync(sessionId, '\r', { useMux: true }), 80);
       }
     };
