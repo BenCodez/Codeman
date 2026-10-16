@@ -2487,3 +2487,114 @@ describe('registered Codex-compatible live-pane restart configuration', () => {
     ).toBe(false);
   });
 });
+
+describe('registered Codex-compatible uncertain launch adoption', () => {
+  beforeEach(() => {
+    const codex = getCli('codex')!;
+    writeFileSync(
+      join(root, 'clis.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        clis: {
+          'adopt-codex': { ...codex, id: 'adopt-codex', label: 'Adopt Codex', order: 990 },
+          'other-adopt-codex': { ...codex, id: 'other-adopt-codex', label: 'Other Codex', order: 991 },
+          'unsupported-adopt': {
+            ...codex,
+            id: 'unsupported-adopt',
+            label: 'Unsupported adoption',
+            order: 992,
+            capabilities: { ...codex.capabilities, recovery: undefined },
+          },
+        },
+      }),
+      { mode: 0o600 }
+    );
+    reloadCliRegistry();
+  });
+  afterEach(() => {
+    rmSync(join(root, 'clis.json'), { force: true });
+    reloadCliRegistry();
+  });
+
+  it.each(
+    (['throw', 'timeout'] as const).flatMap((failure) =>
+      (
+        [
+          'exact',
+          'stock-mode',
+          'other-capable-mode',
+          'unsupported-mode',
+          'unknown-mode',
+          'different-owner',
+          'different-session',
+          'different-directory',
+          'different-home',
+          'different-config',
+          'absent',
+        ] as const
+      ).map((metadataKind) => ({ failure, metadataKind }))
+    )
+  )('adopts only our exact custom worker after $failure: $metadataKind', async ({ failure, metadataKind }) => {
+    const { manager, home, getBroker } = fixture();
+    if (failure === 'throw') {
+      effects.sync.mockImplementation((command: string) => {
+        if (command.includes('respawn-pane ')) throw new Error('Fixture dispatch receipt lost');
+        return nativeOutput(command);
+      });
+    } else {
+      const broker = await getBroker();
+      // A bounded startup-receipt timeout cannot establish whether the child started.
+      vi.mocked(broker.startupReceipt).mockResolvedValue('unknown');
+    }
+    const session = new Session({
+      id: ID,
+      mode: 'adopt-codex',
+      owner: 'worker',
+      name: 'Original custom worker',
+      workingDir: root,
+      useMux: true,
+      mux: manager,
+      codexConfig: config,
+      recoveryCodexHome: home,
+    });
+    sessions.push(session);
+    session.setCodexRestoreLaunchGuard(healthyGuard());
+    await expect(session.startInteractive()).rejects.toThrow();
+    expect(session.codexRestoreWorkerMayExist).toBe(true);
+    const record = manager.getSession(ID)!;
+    expect(record).toMatchObject({ mode: 'adopt-codex', owner: 'worker', codexRestoreUncertain: true });
+    if (metadataKind === 'stock-mode') record.mode = 'codex';
+    if (metadataKind === 'other-capable-mode') record.mode = 'other-adopt-codex';
+    if (metadataKind === 'unsupported-mode') record.mode = 'unsupported-adopt';
+    if (metadataKind === 'unknown-mode') record.mode = 'unknown-adopt';
+    if (metadataKind === 'different-owner') record.owner = 'another-owner';
+    if (metadataKind === 'different-session') record.sessionId = randomUUID();
+    if (metadataKind === 'different-directory') record.workingDir = join(root, 'other-directory');
+    if (metadataKind === 'different-home') record.recoveryCodexHome = join(root, 'other-home');
+    if (metadataKind === 'different-config') record.codexRestoreConfig = { ...config, model: 'other-model' };
+    if (metadataKind === 'absent') Reflect.get(manager, 'sessions').delete(ID);
+    expect(session.adoptUncertainCodexRestore()).toBe(metadataKind === 'exact');
+    expect(session.getRecoveryContext().managed).toBe(false);
+    if (metadataKind === 'exact') {
+      expect(session.getRecoveryContext()).toMatchObject({ switchPending: true, untrackedInput: true });
+      expect(manager.getSession(ID)).toMatchObject({
+        sessionId: ID,
+        mode: 'adopt-codex',
+        owner: 'worker',
+        workingDir: root,
+        recoveryCodexHome: home,
+        codexRestoreConfig: config,
+        codexRestoreUncertain: true,
+      });
+      vi.spyOn(manager, 'muxSessionExists').mockReturnValue(true);
+      vi.spyOn(manager, 'isPaneDead').mockReturnValue(false);
+      await session.startInteractive();
+      expect(effects.attach).toHaveBeenCalledOnce();
+    } else {
+      await expect(session.startInteractive()).rejects.toThrow();
+      expect(effects.attach).not.toHaveBeenCalled();
+    }
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(1);
+    expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-pane '))).toBe(false);
+  });
+});

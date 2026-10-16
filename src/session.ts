@@ -3604,7 +3604,8 @@ export class Session extends EventEmitter {
     if (
       !record ||
       record.sessionId !== this.id ||
-      record.mode !== 'codex' ||
+      getCli(record.mode)?.capabilities.recovery !== 'codex-rollout' ||
+      record.mode !== this.mode ||
       record.owner !== this.owner ||
       record.workingDir !== this.workingDir ||
       !normalizedCodexHome(record.recoveryCodexHome) ||
