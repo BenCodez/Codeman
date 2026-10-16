@@ -432,7 +432,7 @@ describe('Session Options responsive layout in Chromium', () => {
     const requests = await page.evaluate(() => (window as any).taskRequests);
     expect(requests.slice(0, 3).map((request: any) => request.body)).toEqual([null, null, null]);
     expect(requests[3].body).toMatchObject({
-      objective: draft.objective.trim(),
+      objective: draft.objective,
       config: { enabled: false, maxContinuations: 7, maxRuntimeMs: 321000 },
     });
     expect(requests[3].body.criteria.map((criterion: any) => criterion.id)).toEqual(draft.rows.map((row) => row.id));
@@ -510,6 +510,69 @@ describe('Session Options responsive layout in Chromium', () => {
     expect(second).toMatchObject({ checkpoint: edited, nextAction: original.nextAction, outcome: 'unknown' });
     expect(await page.locator('#taskCheckpoint').inputValue()).toBe(edited);
     expect(await page.evaluate(() => (window as any).app._taskView.state.nextAction)).toBe(original.nextAction);
+    await page.evaluate(() => (window as any).app.closeTaskOptions());
+  });
+  it.each([390, 1280])('preserves exact objective edits and untouched CRLF at %spx', async (width) => {
+    await page.close();
+    page = await browser.newPage();
+    await renderAt(width);
+    await page.addScriptTag({ content: 'window.CodemanApp = class {};' });
+    for (const file of ['api-client.js', 'recovery-ui.js', 'supervision-ui.js'])
+      await page.addScriptTag({ content: readFileSync(resolve(publicDir, file), 'utf8') });
+    const original = '  Owner objective\r\n界  ';
+    await page.evaluate(async (objective) => {
+      const w = window as any;
+      document.getElementById('context-tab')!.classList.add('hidden');
+      document.getElementById('task-tab')!.classList.remove('hidden');
+      w.__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
+      w.app = new w.CodemanApp();
+      w.app.sessions = new Map([['a', { mode: 'codex', taskSupported: true }]]);
+      w.app.editingSessionId = 'a';
+      w.app.showToast = () => {};
+      w.taskState = {
+        version: 1,
+        objective,
+        criteria: [{ id: 'owner', kind: 'manual', description: 'Owner acceptance', verified: false }],
+        config: { enabled: false, maxContinuations: 3, maxRuntimeMs: 900000 },
+        phase: 'paused',
+        outcome: 'unknown',
+        reason: 'configured',
+        continuations: 0,
+        history: [],
+      };
+      w.configurationWrites = [];
+      w.fetch = async (_url: string, options?: { method?: string; body?: string }) => {
+        if (options?.method === 'PUT') {
+          const patch = JSON.parse(options.body!);
+          w.configurationWrites.push(patch);
+          w.taskState = { ...w.taskState, ...patch };
+        }
+        return new Response(JSON.stringify({ success: true, data: w.taskState }), { status: 200 });
+      };
+      w.app.openTaskOptions('a');
+      await w.app.loadTaskStatus();
+    }, original);
+    const save = async (count: number) => {
+      await page.getByRole('button', { name: 'Save task configuration', exact: true }).click();
+      await expect.poll(() => page.evaluate(() => (window as any).configurationWrites.length)).toBe(count);
+      await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
+    };
+    await page.locator('#taskMaxContinuations').fill('5');
+    await save(1);
+    expect(await page.evaluate(() => Object.hasOwn((window as any).configurationWrites[0], 'objective'))).toBe(false);
+    expect(await page.evaluate(() => (window as any).taskState.objective)).toBe(original);
+    await page.locator('#taskObjective').fill('Owner objective\n界');
+    await save(2);
+    expect(await page.evaluate(() => (window as any).configurationWrites[1].objective)).toBe('Owner objective\n界');
+    const padded = ' \tOwner objective\n界  \n ';
+    await page.locator('#taskObjective').fill(padded);
+    await save(3);
+    expect(await page.evaluate(() => (window as any).configurationWrites[2].objective)).toBe(padded);
+    expect(await page.locator('#taskObjective').inputValue()).toBe(padded);
+    await page.locator('#taskObjective').fill(' \t\n ');
+    await page.getByRole('button', { name: 'Save task configuration', exact: true }).click();
+    expect(await page.evaluate(() => (window as any).configurationWrites.length)).toBe(3);
+    expect(await page.locator('#taskObjective').inputValue()).toBe(' \t\n ');
     await page.evaluate(() => (window as any).app.closeTaskOptions());
   });
 });

@@ -2472,70 +2472,85 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     if (planned.status !== 'planned') throw new Error('Owned SSH launch needs owner inspection');
     const scope: OwnedRemoteBrokerScope = {
       sessionId: options.sessionId,
-      remote,
+      remote: structuredClone(remote),
       workingDir: remote.remotePath,
       codexHome,
       owner: options.owner,
     };
     if (before) throw new Error('Owned SSH launch already has a local registration');
     const descriptor = await ownedRemoteBrokerCache.prepare(scope, material, planned.directory);
-    if (!descriptor || !current()) throw new Error('Owned SSH launch material unavailable');
-    // An owner launch has no local SSH wrapper yet. Save its exact pending
-    // incarnation before the remote child can start; never rediscover a latest file.
-    const reservation: MuxSession = {
-      sessionId: options.sessionId,
-      muxName: `codeman-${options.sessionId.slice(0, 8)}`,
-      pid: 0,
-      createdAt: Date.now(),
-      workingDir: options.workingDir,
-      mode: options.mode,
-      attached: false,
-      remote,
-      owner: options.owner,
-      recoveryCodexHome: codexHome,
-      recoveryIsolated: true,
-      codexRestoreConfig: options.codexConfig && structuredClone(options.codexConfig),
-    };
-    this.sessions.set(options.sessionId, reservation);
-    before = reservation;
-    if (!(await this.reserveOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) || !current())
-      throw new Error('Owned SSH launch reservation needs owner inspection');
-    const provisioned = await provisionRemoteInputBroker(
-      remote,
-      {
+    let reservationAttempted = false;
+    try {
+      if (!descriptor || !current()) throw new Error('Owned SSH launch material unavailable');
+      // An owner launch has no local SSH wrapper yet. Save its exact pending
+      // incarnation before the remote child can start; never rediscover a latest file.
+      const reservation: MuxSession = {
         sessionId: options.sessionId,
-        incarnation: material.config.incarnation,
-        source: material.helper,
-        configJson: JSON.stringify(material.config),
-      },
-      authority,
-      { root: posix.dirname(posix.dirname(planned.directory)), ownerInitialLaunch: true }
-    );
-    if (provisioned.status !== 'provisioned' || provisioned.directory !== descriptor.directory || !current())
-      throw new Error('Owned SSH launch provisioning needs owner inspection');
-    const observed = await observeOwnedRemoteBroker(
-      remote,
-      { sessionId: options.sessionId, descriptor, codexHome, pane: provisioned.pane },
-      authority
-    );
-    if (observed.status !== 'observed' || !current())
-      throw new Error('Owned SSH launch receipt needs owner inspection');
-    ownedRemoteBrokerCache.observe(
-      scope,
-      descriptor.incarnation,
-      observed.serialized,
-      observed.witness,
-      observed.panePid
-    );
-    if (!ownedRemoteBrokerCache.signer(scope, descriptor.incarnation)?.canFrame)
-      throw new Error('Owned SSH launch input provenance unavailable');
-    if (!(await this.commitOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) || !current())
-      throw new Error('Owned SSH launch commit needs owner inspection');
-    return {
-      command: buildOwnedRemoteAttachCommand(remote, options.sessionId),
-      incarnation: descriptor.incarnation,
-      isCurrent: current,
-    };
+        muxName: `codeman-${options.sessionId.slice(0, 8)}`,
+        pid: 0,
+        createdAt: Date.now(),
+        workingDir: options.workingDir,
+        mode: options.mode,
+        attached: false,
+        remote,
+        owner: options.owner,
+        recoveryCodexHome: codexHome,
+        recoveryIsolated: true,
+        codexRestoreConfig: options.codexConfig && structuredClone(options.codexConfig),
+      };
+      this.sessions.set(options.sessionId, reservation);
+      before = reservation;
+      // A lost reservation ACK must retain this exact launch material.
+      reservationAttempted = true;
+      ownedRemoteBrokerCache.sealPreparation(descriptor);
+      if (
+        !(await this.reserveOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) ||
+        !current()
+      )
+        throw new Error('Owned SSH launch reservation needs owner inspection');
+      const provisioned = await provisionRemoteInputBroker(
+        remote,
+        {
+          sessionId: options.sessionId,
+          incarnation: material.config.incarnation,
+          source: material.helper,
+          configJson: JSON.stringify(material.config),
+        },
+        authority,
+        { root: posix.dirname(posix.dirname(planned.directory)), ownerInitialLaunch: true }
+      );
+      if (provisioned.status !== 'provisioned' || provisioned.directory !== descriptor.directory || !current())
+        throw new Error('Owned SSH launch provisioning needs owner inspection');
+      const observed = await observeOwnedRemoteBroker(
+        remote,
+        { sessionId: options.sessionId, descriptor, codexHome, pane: provisioned.pane },
+        authority
+      );
+      if (observed.status !== 'observed' || !current())
+        throw new Error('Owned SSH launch receipt needs owner inspection');
+      ownedRemoteBrokerCache.observe(
+        scope,
+        descriptor.incarnation,
+        observed.serialized,
+        observed.witness,
+        observed.panePid
+      );
+      if (!ownedRemoteBrokerCache.signer(scope, descriptor.incarnation)?.canFrame)
+        throw new Error('Owned SSH launch input provenance unavailable');
+      if (
+        !(await this.commitOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) ||
+        !current()
+      )
+        throw new Error('Owned SSH launch commit needs owner inspection');
+      return {
+        command: buildOwnedRemoteAttachCommand(remote, options.sessionId),
+        incarnation: descriptor.incarnation,
+        isCurrent: current,
+      };
+    } finally {
+      if (descriptor && !reservationAttempted)
+        await ownedRemoteBrokerCache.discardUnreservedPreparation(scope, descriptor);
+    }
   }
   private optionalBrokerDispatchReceipt(
     output: unknown

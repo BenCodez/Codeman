@@ -316,6 +316,8 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
     expect(command).toContain(`--disable ${feature}`);
   expect(command).not.toContain('--disable view_image');
   expect(command).toContain('--config tools.view_image=false');
+  expect(command).toContain('--config features.view_image=false');
+  expect((parsed.features as Record<string, unknown>).view_image).toBe(false);
   expect(parsed.tools).toEqual({ view_image: false });
   expect(parsed.agents).toEqual({ enabled: false });
   expect((parsed.features as Record<string, unknown>).multi_agent_v2).toEqual({ enabled: false });
@@ -328,27 +330,31 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
   expect(await fs.readFile(join(p.home, 'config.toml'), 'utf8')).toBe(base);
 });
 
-it('the emitted command passes a fake CLI with the registered feature inventory and disables the image tool separately', async () => {
-  const p = await profile();
-  const bin = join(p.root, 'bin');
-  await fs.mkdir(bin);
-  await fs.writeFile(
-    join(bin, 'codex'),
-    `#!${process.execPath}\nconst a=process.argv.slice(2);\nconst known=new Set(['shell_tool','apply_patch_freeform','apps','multi_agent','plugins','hooks','remote_plugin','skill_mcp_dependency_install','code_mode']);\nfor(let i=0;i<a.length;i++) if(a[i]==='--disable'&&!known.has(a[++i])) { console.error('Unknown feature flag: '+a[i]); process.exit(2); }\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='tools.view_image=false'))process.exit(3);\nif(!a.includes('${CID}'))process.exit(4);\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='agents.enabled=false'))process.exit(5);\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='features.multi_agent_v2.enabled=false'))process.exit(6);\n`,
-    { mode: 0o700 }
-  );
-  const command = supervisorManagerCommand(p.profile, { noDaemon: true, resumeSessionId: CID });
-  await expect(
-    promisify(execFile)('/bin/sh', ['-c', command], {
-      cwd: p.work,
-      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CODEX_HOME: p.home, HOME: p.root },
-      timeout: 2000,
-    })
-  ).resolves.toMatchObject({ stdout: '', stderr: '' });
-  await expect(
-    promisify(execFile)(join(bin, 'codex'), ['--disable', 'view_image'], { timeout: 2000 })
-  ).rejects.toMatchObject({ code: 2 });
-});
+it.each(['0.152.1', '0.162.1'])(
+  'the emitted command disables the image tool with the %s configuration contract',
+  async (version) => {
+    const p = await profile();
+    const bin = join(p.root, 'bin');
+    await fs.mkdir(bin);
+    await fs.writeFile(
+      join(bin, 'codex'),
+      `#!${process.execPath}\nconst a=process.argv.slice(2);\nconst known=new Set(['shell_tool','apply_patch_freeform','apps','multi_agent','plugins','hooks','remote_plugin','skill_mcp_dependency_install','code_mode']);\nif('${version}'==='0.152.1')known.add('view_image');\nfor(let i=0;i<a.length;i++) if(a[i]==='--disable'&&!known.has(a[++i])) { console.error('Unknown feature flag: '+a[i]); process.exit(2); }\nconst imageKey='${version}'==='0.152.1'?'features.view_image=false':'tools.view_image=false';\nif(!a.some((v,i)=>v==='--config'&&a[i+1]===imageKey))process.exit(3);\nif(!a.includes('${CID}'))process.exit(4);\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='agents.enabled=false'))process.exit(5);\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='features.multi_agent_v2.enabled=false'))process.exit(6);\n`,
+      { mode: 0o700 }
+    );
+    const command = supervisorManagerCommand(p.profile, { noDaemon: true, resumeSessionId: CID });
+    await expect(
+      promisify(execFile)('/bin/sh', ['-c', command], {
+        cwd: p.work,
+        env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, CODEX_HOME: p.home, HOME: p.root },
+        timeout: 2000,
+      })
+    ).resolves.toMatchObject({ stdout: '', stderr: '' });
+    if (version === '0.162.1')
+      await expect(
+        promisify(execFile)(join(bin, 'codex'), ['--disable', 'view_image'], { timeout: 2000 })
+      ).rejects.toMatchObject({ code: 2 });
+  }
+);
 
 it('revokes immediately and retires exactly the issued profile and credential directory, retaining owner files', async () => {
   const p = await profile();

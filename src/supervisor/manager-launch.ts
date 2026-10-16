@@ -58,6 +58,8 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
     '--config',
     'tools.view_image=false',
     '--config',
+    'features.view_image=false',
+    '--config',
     'agents.enabled=false',
     '--config',
     'features.multi_agent_v2.enabled=false',
@@ -270,6 +272,8 @@ export async function prepareSupervisorManagerLaunch(options: {
       // The bridge gets a path, never the credential in its process arguments.
       const profile = (profileText = stringify({
         features: {
+          // The pinned server CLI uses this flag; newer CLIs use tools.view_image.
+          view_image: false,
           shell_tool: false,
           apply_patch_freeform: false,
           apps: false,
