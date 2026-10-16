@@ -77,7 +77,14 @@ export class TaskController {
     // Keep this conservative floor private so durable/live task bytes agree.
     this.evidenceFreshnessFloor = this.now();
     this.state = structuredClone(restored ?? initialTaskState());
-    if (!this.state.agentProgressVeto && acceptanceCriteriaComplete(this.state)) this.state.outcome = 'completed';
+    // Command checks may have passed during a turn that is still running. Only
+    // owner-certified manual-only work can infer completion without a terminal observation.
+    if (
+      !this.state.agentProgressVeto &&
+      acceptanceCriteriaComplete(this.state) &&
+      this.state.criteria.every((criterion) => criterion.kind === 'manual' && criterion.evidence?.source === 'owner')
+    )
+      this.state.outcome = 'completed';
     if (this.state.config.enabled && this.state.inFlight) {
       this.state.phase = 'paused';
       this.state.reason = 'restart-in-flight';
@@ -187,7 +194,8 @@ export class TaskController {
     candidate: TaskState,
     reason: string,
     revision: number,
-    expected: TaskObservation
+    expected: TaskObservation,
+    requireCompletedTurn = false
   ): Promise<TaskState> {
     const proofs = candidate.criteria
       .filter((criterion) => criterion.kind === 'command' && criterion.verified)
@@ -206,31 +214,35 @@ export class TaskController {
     const markerKey = expected.marker?.key;
     let evidenceCurrent = true;
     const isCurrent = () => !this.stopped && this.revision === revision && evidenceCurrent;
-    const prepareCommit = proofs.length
-      ? async (commit: () => void) => {
-          const fresh = await this.deps.observe();
-          evidenceCurrent =
-            fresh.observation.conversationId === conversationId &&
-            fresh.observation.submissionKey === submissionKey &&
-            fresh.marker?.key === markerKey &&
-            !['identity-unverified', 'identity-changed'].includes(fresh.observation.reason) &&
-            !['unknown', 'paused', 'blocked'].includes(fresh.observation.activity) &&
-            proofs.every((proof) => {
-              const evidence = fresh.commands.get(proof.hash);
-              return (
-                this.commandEvidenceIsCurrent(evidence) &&
-                (proof.identity !== undefined
-                  ? commandEvidenceIdentity(evidence) === proof.identity
-                  : commandEvidenceIdentity(evidence) === undefined &&
-                    evidence.startedAt === proof.startedAt &&
-                    evidence.completedAt === proof.completedAt)
-              );
-            });
-          // TaskStore's callback performs its final guard and atomic replacement
-          // synchronously here, before this evidence preparation promise settles.
-          commit();
-        }
-      : undefined;
+    const prepareCommit =
+      proofs.length || requireCompletedTurn
+        ? async (commit: () => void) => {
+            const fresh = await this.deps.observe();
+            evidenceCurrent =
+              fresh.observation.conversationId === conversationId &&
+              fresh.observation.submissionKey === submissionKey &&
+              fresh.marker?.key === markerKey &&
+              !['identity-unverified', 'identity-changed'].includes(fresh.observation.reason) &&
+              !['unknown', 'paused', 'blocked'].includes(fresh.observation.activity) &&
+              (!requireCompletedTurn ||
+                (fresh.observation.activity === 'completed' &&
+                  fresh.observation.turnId === expected.observation.turnId)) &&
+              proofs.every((proof) => {
+                const evidence = fresh.commands.get(proof.hash);
+                return (
+                  this.commandEvidenceIsCurrent(evidence) &&
+                  (proof.identity !== undefined
+                    ? commandEvidenceIdentity(evidence) === proof.identity
+                    : commandEvidenceIdentity(evidence) === undefined &&
+                      evidence.startedAt === proof.startedAt &&
+                      evidence.completedAt === proof.completedAt)
+                );
+              });
+            // TaskStore's callback performs its final guard and atomic replacement
+            // synchronously here, before this evidence preparation promise settles.
+            commit();
+          }
+        : undefined;
     return this.saveGuardedUpdate(candidate, reason, isCurrent, false, prepareCommit, () =>
       evidenceCurrent
         ? new TaskConfigurationCancelledError('Task progress authority was cancelled')
@@ -898,7 +910,11 @@ export class TaskController {
             }
             if (p.outcome === 'completed' && !acceptanceCriteriaComplete(candidate))
               return this.recordAgentAttention(marker, 'task-evidence-unknown');
-            candidate.outcome = acceptanceCriteriaComplete(candidate) ? 'completed' : p.outcome;
+            // An agent report can precede more work in the same turn. Leave a
+            // completion report unconsumed until the terminal observation arrives.
+            if (p.outcome === 'completed' && o.activity !== 'completed') return finishObservation();
+            candidate.outcome =
+              acceptanceCriteriaComplete(candidate) && o.activity === 'completed' ? 'completed' : p.outcome;
             candidate.lastProgressAt = marker.at;
             candidate.checkpoint = p.outcome === 'unfinished' ? p.checkpoint! : (p.checkpoint ?? candidate.checkpoint);
             candidate.nextAction = p.outcome === 'unfinished' ? p.nextAction! : (p.nextAction ?? candidate.nextAction);
@@ -920,11 +936,17 @@ export class TaskController {
             if (candidate.outcome === 'completed') {
               candidate.phase = 'completed';
               try {
-                await this.saveCompletion(candidate, 'progress-recorded', revision, {
-                  observation: o,
-                  commands,
-                  marker,
-                });
+                await this.saveCompletion(
+                  candidate,
+                  'progress-recorded',
+                  revision,
+                  {
+                    observation: o,
+                    commands,
+                    marker,
+                  },
+                  true
+                );
               } catch (error) {
                 if (error instanceof TaskConfigurationCancelledError) return this.getStatus();
                 throw error;
@@ -938,13 +960,22 @@ export class TaskController {
           }
         } else return this.recordAgentAttention(marker, 'task-evidence-unknown');
       }
-      if (this.state.outcome === 'completed' || acceptanceCriteriaComplete(this.state)) {
+      if (
+        o.activity === 'completed' &&
+        (this.state.outcome === 'completed' || acceptanceCriteriaComplete(this.state))
+      ) {
         if (this.state.phase === 'completed' && this.state.outcome === 'completed') return this.getStatus();
         const candidate = this.getStatus();
         candidate.outcome = 'completed';
         candidate.phase = 'completed';
         try {
-          return await this.saveCompletion(candidate, 'completed', revision, { observation: o, commands, marker });
+          return await this.saveCompletion(
+            candidate,
+            'completed',
+            revision,
+            { observation: o, commands, marker },
+            true
+          );
         } catch (error) {
           if (error instanceof TaskConfigurationCancelledError) return this.getStatus();
           throw error;

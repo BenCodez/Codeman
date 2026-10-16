@@ -37,6 +37,8 @@ async function fixture(manualOnly = false, priorCommand = false) {
   let now = 10_000;
   let tail = submission;
   let identity = CID;
+  let activity: 'working' | 'completed' | 'watching' = 'working';
+  let turnId = 'fixture-turn';
   const initial: TaskState = {
     ...initialTaskState(),
     config: { ...initialTaskState().config, enabled: true },
@@ -83,8 +85,9 @@ async function fixture(manualOnly = false, priorCommand = false) {
         observation: {
           conversationId: identity,
           submissionKey,
-          activity: 'working',
-          reason: 'turn-running',
+          activity,
+          turnId,
+          reason: activity === 'completed' ? 'turn-completed' : 'turn-running',
           at: now,
           safeToAct: false,
         },
@@ -105,6 +108,10 @@ async function fixture(manualOnly = false, priorCommand = false) {
   return {
     task,
     store,
+    setActivity: (next: typeof activity, turn = 'fixture-turn') => {
+      activity = next;
+      turnId = turn;
+    },
     path,
     act,
     append: (text: string) => {
@@ -181,7 +188,10 @@ describe('command completion is authorized at durable publication', () => {
   )('$entry refuses $change during temporary $phase', async ({ entry, phase, change }) => {
     const f = await fixture();
     const before = await f.bytes();
-    if (entry === 'agent') f.append(marker);
+    if (entry === 'agent') {
+      f.append(marker);
+      f.setActivity('completed');
+    }
     const barrier = await holdTemporary(f.path, phase);
     const pending =
       entry === 'owner' ? f.task.progress({ outcome: 'completed', verifiedCriteria: ['check'] }) : f.task.refresh();
@@ -219,7 +229,10 @@ describe('command completion is authorized at durable publication', () => {
     )
   )('commits unchanged $entry healthy proof after temporary $phase', async ({ entry, phase }) => {
     const f = await fixture();
-    if (entry === 'agent') f.append(marker);
+    if (entry === 'agent') {
+      f.append(marker);
+      f.setActivity('completed');
+    }
     const barrier = await holdTemporary(f.path, phase);
     const pending =
       entry === 'owner' ? f.task.progress({ outcome: 'completed', verifiedCriteria: ['check'] }) : f.task.refresh();
@@ -340,6 +353,149 @@ describe('command completion is authorized at durable publication', () => {
     } finally {
       barrier.release();
       await result;
+      await f.cleanup();
+    }
+  });
+});
+
+describe('agent completion waits for a terminal turn observation', () => {
+  it.each(['healthy', 'pending', 'failed', 'malformed'] as const)(
+    'keeps an early completion marker observable until the terminal %s evidence',
+    async (change) => {
+      const f = await fixture();
+      try {
+        f.append(marker);
+        const before = await f.bytes();
+        await f.task.refresh();
+        expect(f.task.getStatus()).toMatchObject({ phase: 'watching', outcome: 'unfinished' });
+        expect(f.task.getStatus().handledEvidence).not.toContain(
+          'progress:' + createHash('sha256').update(marker.trimEnd()).digest('hex')
+        );
+        expect(await f.bytes()).toEqual(before);
+        if (change !== 'healthy') f.append(invalid[change]);
+        f.setActivity('completed');
+        await f.task.refresh();
+        if (change === 'healthy') {
+          expect(f.task.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed' });
+          expect((await f.bytes()).criteria[0].verified).toBe(true);
+        } else {
+          expect(f.task.getStatus().outcome).not.toBe('completed');
+          expect((await f.bytes()).criteria[0].verified).toBe(false);
+        }
+        expect(f.act).not.toHaveBeenCalled();
+      } finally {
+        await f.cleanup();
+      }
+    }
+  );
+  it('preserves unfinished working progress when its command criterion becomes verified', async () => {
+    const f = await fixture();
+    try {
+      f.append(
+        line(13_000, {
+          type: 'agent_message',
+          message:
+            'CODEMAN_TASK_PROGRESS {"outcome":"unfinished","checkpoint":"Accepted check passed","nextAction":"Finish current edits","verifiedCriteria":["check"]}',
+        })
+      );
+      await f.task.refresh();
+      expect(f.task.getStatus()).toMatchObject({
+        phase: 'watching',
+        outcome: 'unfinished',
+        checkpoint: 'Accepted check passed',
+        nextAction: 'Finish current edits',
+      });
+      expect(f.task.getStatus().criteria.every((criterion) => criterion.verified)).toBe(true);
+      expect(await f.bytes()).toEqual(f.task.getStatus());
+      const restarted = new TaskController(
+        { observe: vi.fn(), act: vi.fn(), persist: async () => {}, changed: () => {} },
+        new TaskStore(f.path).get(SID)
+      );
+      expect(restarted.getStatus()).toMatchObject({
+        phase: 'paused',
+        outcome: 'unfinished',
+        reason: 'restart-requires-resume',
+      });
+      restarted.stop();
+      f.append(invalid.failed);
+      await f.task.refresh();
+      expect(f.task.getStatus()).toMatchObject({ phase: 'watching', outcome: 'unfinished' });
+      expect((await f.bytes()).criteria[0].verified).toBe(false);
+      f.setActivity('completed');
+      await f.task.refresh();
+      expect(f.task.getStatus().outcome).not.toBe('completed');
+      expect(f.act).not.toHaveBeenCalled();
+    } finally {
+      await f.cleanup();
+    }
+  });
+  it('settles already verified unfinished progress after a healthy terminal observation', async () => {
+    const f = await fixture();
+    try {
+      f.append(
+        line(13_000, {
+          type: 'agent_message',
+          message:
+            'CODEMAN_TASK_PROGRESS {"outcome":"unfinished","checkpoint":"Accepted check passed","nextAction":"Finish current edits","verifiedCriteria":["check"]}',
+        })
+      );
+      await f.task.refresh();
+      expect(f.task.getStatus().outcome).toBe('unfinished');
+      f.setActivity('completed');
+      await f.task.refresh();
+      expect(f.task.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed' });
+      expect(await f.bytes()).toEqual(f.task.getStatus());
+      expect(f.act).not.toHaveBeenCalled();
+    } finally {
+      await f.cleanup();
+    }
+  });
+  it.each(['write', 'sync', 'close'] as const)(
+    'rechecks agent terminal activity at the final commit after temporary %s',
+    async (phase) => {
+      const f = await fixture();
+      f.append(marker);
+      f.setActivity('completed');
+      const before = await f.bytes();
+      const barrier = await holdTemporary(f.path, phase);
+      const pending = f.task.refresh();
+      try {
+        await barrier.held;
+        f.setActivity('working');
+        barrier.release();
+        await pending;
+        expect(f.task.getStatus().outcome).not.toBe('completed');
+        expect(await f.bytes()).toEqual(before);
+        expect(f.store.getBrokerCleanupState()).toBeDefined();
+        f.setActivity('completed');
+        await f.task.refresh();
+        expect(f.task.getStatus()).toMatchObject({ phase: 'completed', outcome: 'completed' });
+        expect(f.act).not.toHaveBeenCalled();
+      } finally {
+        barrier.release();
+        await pending.catch(() => {});
+        await f.cleanup();
+      }
+    }
+  );
+  it('refuses proof borrowed from a different terminal turn during journal preparation', async () => {
+    const f = await fixture();
+    f.append(marker);
+    f.setActivity('completed');
+    const before = await f.bytes();
+    const barrier = await holdTemporary(f.path, 'sync');
+    const pending = f.task.refresh();
+    try {
+      await barrier.held;
+      f.setActivity('completed', 'different-turn');
+      barrier.release();
+      await pending;
+      expect(f.task.getStatus().outcome).not.toBe('completed');
+      expect(await f.bytes()).toEqual(before);
+      expect(f.act).not.toHaveBeenCalled();
+    } finally {
+      barrier.release();
+      await pending.catch(() => {});
       await f.cleanup();
     }
   });
