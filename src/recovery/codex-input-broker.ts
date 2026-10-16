@@ -595,27 +595,60 @@ export class CodexInputBroker {
     const data = JSON.stringify(planned);
     if (Buffer.byteLength(data) > MAX_FILE) throw new Error('Input startup configuration oversized');
     const path = join(this.directory, 'config.json');
-    await fs.writeFile(`${path}.next`, data, { mode: 0o600, flag: 'wx' });
-    const handle = await fs.open(`${path}.next`, constants.O_RDONLY | constants.O_NOFOLLOW);
-    let replacement: Stats;
-    try {
-      replacement = await handle.stat();
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    await fs.rename(`${path}.next`, path);
-    const directory = await fs.open(this.directory, constants.O_RDONLY);
-    try {
-      await directory.sync();
-    } finally {
-      await directory.close();
-    }
-    Object.assign(this.config, planned);
-    this.startupConfigurationDigest = createHash('sha256').update(data).digest('hex');
-    if (this.unlaunchedRollback && privateFile(replacement) && replacement.size === Buffer.byteLength(data)) {
-      const previous = this.unlaunchedRollback.files.findIndex((file) => file.name === 'config.json');
-      if (previous >= 0)
+    const next = `${path}.next`,
+      bytes = Buffer.from(data),
+      directoryBefore = await fs.lstat(this.directory);
+    const directoryCurrent = async () => {
+      const current = await fs.lstat(this.directory);
+      return (
+        current.isDirectory() &&
+        !current.isSymbolicLink() &&
+        current.dev === directoryBefore.dev &&
+        current.ino === directoryBefore.ino &&
+        (current.mode & 0o077) === 0 &&
+        (process.getuid === undefined || current.uid === process.getuid()) &&
+        (await fs.realpath(this.directory)) === this.directory
+      );
+    };
+    if (!(await directoryCurrent())) throw new Error('Input startup directory changed');
+    let created: Stats | undefined,
+      renamed = false,
+      renameAttempted = false;
+    // Even a partial failed write belongs to this invocation only while its
+    // inode, private directory and observed bytes still match the owned prefix.
+    const ownedStaging = async (name: string): Promise<Stats | undefined> => {
+      if (!created || !(await directoryCurrent())) return undefined;
+      const handle = await fs.open(name, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const before = await handle.stat();
+        if (
+          !privateFile(before) ||
+          before.dev !== created.dev ||
+          before.ino !== created.ino ||
+          before.size > bytes.length
+        )
+          return undefined;
+        const buffer = Buffer.alloc(before.size + 1);
+        const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+        if (
+          bytesRead !== before.size ||
+          !buffer.subarray(0, bytesRead).equals(bytes.subarray(0, bytesRead)) ||
+          !sameFile(before, await handle.stat()) ||
+          !sameFile(before, await fs.lstat(name))
+        )
+          return undefined;
+        return before;
+      } finally {
+        await handle.close();
+      }
+    };
+    const acknowledgeReplacement = (replacement: Stats) => {
+      // Rename has replaced config.json, even when the following directory
+      // fsync/close fails. Keep the exact owned rollback receipt current now.
+      Object.assign(this.config, planned);
+      this.startupConfigurationDigest = createHash('sha256').update(bytes).digest('hex');
+      const previous = this.unlaunchedRollback?.files.findIndex((file) => file.name === 'config.json') ?? -1;
+      if (this.unlaunchedRollback && previous >= 0)
         this.unlaunchedRollback.files[previous] = {
           name: 'config.json',
           dev: replacement.dev,
@@ -623,6 +656,67 @@ export class CodexInputBroker {
           size: replacement.size,
           hash: this.startupConfigurationDigest,
         };
+    };
+    try {
+      const handle = await fs.open(next, 'wx', 0o600);
+      try {
+        created = await handle.stat();
+        if (!privateFile(created) || created.size !== 0) throw new Error('Input startup staging changed');
+        await handle.writeFile(bytes);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+      const replacement = await ownedStaging(next);
+      const original = await readPrivateJson(path);
+      if (
+        !replacement ||
+        replacement.size !== bytes.length ||
+        JSON.stringify(original.witness) !== JSON.stringify(current.witness) ||
+        !(await directoryCurrent()) ||
+        !sameFile(replacement, await fs.lstat(next))
+      )
+        throw new Error('Input startup configuration changed');
+      renameAttempted = true;
+      await fs.rename(next, path);
+      renamed = true;
+      acknowledgeReplacement(replacement);
+      const directory = await fs.open(this.directory, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const opened = await directory.stat();
+        if (!opened.isDirectory() || opened.dev !== directoryBefore.dev || opened.ino !== directoryBefore.ino)
+          throw new Error('Input startup directory changed');
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    } catch (error) {
+      if (renameAttempted && !renamed) {
+        try {
+          // A lost rename receipt is not a launch authorization. Only the exact
+          // owned destination plus an absent staging name can refresh rollback.
+          const replacement = await ownedStaging(path);
+          const absent = await fs.lstat(next).then(
+            () => false,
+            (failure: NodeJS.ErrnoException) => failure.code === 'ENOENT'
+          );
+          if (replacement?.size === bytes.length && absent && (await directoryCurrent())) {
+            renamed = true;
+            acknowledgeReplacement(replacement);
+          }
+        } catch {
+          /* Uncertain replacement remains protected by the original receipt. */
+        }
+      }
+      if (!renamed) {
+        try {
+          const staging = await ownedStaging(next);
+          if (staging && (await directoryCurrent()) && sameFile(staging, await fs.lstat(next))) await fs.unlink(next);
+        } catch {
+          /* Preserve every unproved, replaced or unreadable staging file. */
+        }
+      }
+      throw error;
     }
   }
   async startupReceipt(panePid: number): Promise<'started' | 'not-sent' | 'unknown'> {
