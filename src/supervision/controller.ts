@@ -278,14 +278,17 @@ export class TaskController {
       evidence.completedAt <= this.now() + 2000
     );
   }
-  private invalidateCommandCriteria(state: TaskState, commands: Map<string, CommandSuccessEvidence>): void {
+  private invalidateCommandCriteria(state: TaskState, commands: Map<string, CommandSuccessEvidence>): boolean {
+    let invalidated = false;
     for (const criterion of state.criteria) {
       if (criterion.kind !== 'command' || !criterion.verified) continue;
       const evidence = criterion.command ? commands.get(commandHash(criterion.command)) : undefined;
       if (this.commandEvidenceIsCurrent(evidence)) continue;
       criterion.verified = false;
       delete criterion.evidence;
+      invalidated = true;
     }
+    return invalidated;
   }
   private evidenceBoundary(): number {
     return Math.max(this.evidenceFreshnessFloor, this.state.configuredAt ?? this.state.startedAt ?? this.now());
@@ -850,7 +853,9 @@ export class TaskController {
       // disable or reload. It grants only exact cleanup, never another action or
       // progress update, and must preserve the owner's terminal phase and vetoes.
       if (receiptOnly) return this.getStatus();
-      this.invalidateCommandCriteria(this.state, commands);
+      let commandCriteriaInvalidated = this.invalidateCommandCriteria(this.state, commands);
+      const finishObservation = () =>
+        commandCriteriaInvalidated ? this.save('command-evidence-invalidated') : this.getStatus();
       const markerIsCurrent =
         marker &&
         !!marker.submissionKey &&
@@ -938,6 +943,7 @@ export class TaskController {
             } else {
               this.state = candidate;
               await this.save('progress-recorded');
+              commandCriteriaInvalidated = false;
             }
             if (this.stopped || revision !== this.revision) return this.getStatus();
           }
@@ -1040,7 +1046,7 @@ export class TaskController {
       }
       // Limits prevent another dispatch; keep observing work already in progress
       // so its completion and verification evidence can still settle the task.
-      if (o.activity === 'working' || o.activity === 'watching') return this.getStatus();
+      if (o.activity === 'working' || o.activity === 'watching') return finishObservation();
       if (this.runtimeBudgetExpired() || this.state.continuations >= this.state.config.maxContinuations) {
         this.state.phase = 'blocked';
         return this.save('budget-exhausted');
@@ -1049,9 +1055,9 @@ export class TaskController {
         this.state.phase = 'paused';
         return this.save('task-evidence-unknown');
       }
-      if (o.activity !== 'completed' || !o.turnId || !o.conversationId || !o.processReady) return this.getStatus();
+      if (o.activity !== 'completed' || !o.turnId || !o.conversationId || !o.processReady) return finishObservation();
       const key = `${o.conversationId}:task:${o.turnId}`;
-      if (o.at < this.evidenceBoundary() || this.state.handledEvidence.includes(key)) return this.getStatus();
+      if (o.at < this.evidenceBoundary() || this.state.handledEvidence.includes(key)) return finishObservation();
       if (!taskPromptFits(this.state)) {
         this.retainFinalEvidenceRefusal();
         this.state.phase = 'paused';

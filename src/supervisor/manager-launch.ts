@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { parse, stringify } from 'smol-toml';
 import type { CodexConfig } from '../types.js';
+import { readSupervisorManagerCatalog, MAX_SUPERVISOR_CATALOG_BYTES } from './manager-catalog.js';
 import type { PrivateFileWitness } from '../recovery/private-file-witness.js';
 import { checkPrivateFileWitnesses } from '../recovery/codex-witness-check.js';
 
@@ -64,6 +65,8 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
     '--config',
     'features.multi_agent_v2.enabled=false',
     '--config',
+    `model_catalog_json=${JSON.stringify(join(profile.home, `.${profile.name}`, 'models.json'))}`,
+    '--config',
     'cli_auth_credentials_store="file"',
     '--config',
     'web_search="disabled"',
@@ -110,8 +113,12 @@ export async function prepareSupervisorManagerLaunch(options: {
   const file = join(home, `${name}.config.toml`);
   const privateDirectory = join(home, `.${name}`);
   const credentialFile = join(privateDirectory, 'credential.json');
+  const catalogFile = join(privateDirectory, 'models.json');
   let owned: Stats | undefined;
   let credentialOwned: Stats | undefined;
+  let catalogOwned: Stats | undefined;
+  let catalogText: string | undefined;
+  let catalogCleanupBytes: Buffer | undefined;
   let directoryOwned: Stats | undefined;
   let homeOwned: Stats | undefined;
   let successful = false;
@@ -122,7 +129,7 @@ export async function prepareSupervisorManagerLaunch(options: {
     const files: PrivateFileWitness[] = (options.additionalFiles ?? []).map((value) => ({ ...value })),
       missing: string[] = [];
     if (files.length > 4) return undefined;
-    const read = async (path: string): Promise<string | undefined> => {
+    const read = async (path: string, maxBytes = MAX_FILE): Promise<string | undefined> => {
       if (!current()) throw new Error('Manager preparation cancelled');
       let before: Stats;
       try {
@@ -134,7 +141,7 @@ export async function prepareSupervisorManagerLaunch(options: {
         }
         throw error;
       }
-      if (!before.isFile() || before.isSymbolicLink() || before.size > MAX_FILE)
+      if (!before.isFile() || before.isSymbolicLink() || before.size > maxBytes)
         throw new Error('Manager configuration is unverifiable');
       const fd = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
       let bytes: Buffer;
@@ -142,7 +149,7 @@ export async function prepareSupervisorManagerLaunch(options: {
         const stat = await fd.stat();
         if (!same(before, stat)) throw new Error('Manager configuration changed');
         bytes = await fd.readFile();
-        if (bytes.length > MAX_FILE || !same(stat, await fd.stat())) throw new Error('Manager configuration changed');
+        if (bytes.length > maxBytes || !same(stat, await fd.stat())) throw new Error('Manager configuration changed');
       } finally {
         await fd.close();
       }
@@ -155,7 +162,7 @@ export async function prepareSupervisorManagerLaunch(options: {
         mtimeMs: before.mtimeMs,
         ctimeMs: before.ctimeMs,
         hash: createHash('sha256').update(bytes).digest('hex'),
-        maxBytes: MAX_FILE,
+        maxBytes,
       });
       return bytes.toString('utf8');
     };
@@ -192,6 +199,7 @@ export async function prepareSupervisorManagerLaunch(options: {
         const config = parse(base);
         if (
           [
+            'model_catalog_json',
             'mcp_servers',
             'plugins',
             'apps',
@@ -253,9 +261,46 @@ export async function prepareSupervisorManagerLaunch(options: {
         if (parent === directory) break;
         directory = parent;
       }
+      // Model metadata can select apply_patch independently of feature toggles.
+      // Use only this CLI's bounded, offline bundled catalog with patch tools removed.
+      catalogText = await readSupervisorManagerCatalog({ deadline, isCurrent: current });
+      if (catalogText === undefined || !current()) return undefined;
       await fs.mkdir(privateDirectory, { mode: 0o700 });
       directoryOwned = await fs.lstat(privateDirectory);
       if (!directoryOwned.isDirectory() || directoryOwned.isSymbolicLink() || !current()) return undefined;
+      const catalogFd = await fs.open(
+        catalogFile,
+        constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        0o600
+      );
+      try {
+        catalogOwned = await catalogFd.stat();
+        try {
+          await catalogFd.writeFile(catalogText);
+          await catalogFd.sync();
+        } catch (error) {
+          // A short write owns only its exact known prefix; never guess foreign bytes.
+          const partial = await catalogFd.stat();
+          if (
+            partial.dev === catalogOwned.dev &&
+            partial.ino === catalogOwned.ino &&
+            partial.size <= Buffer.byteLength(catalogText)
+          ) {
+            const bytes = Buffer.alloc(partial.size);
+            const result = await catalogFd.read(bytes, 0, bytes.length, 0);
+            if (
+              result.bytesRead === bytes.length &&
+              same(partial, await catalogFd.stat()) &&
+              Buffer.from(catalogText).subarray(0, bytes.length).equals(bytes)
+            )
+              catalogCleanupBytes = bytes;
+          }
+          throw error;
+        }
+      } finally {
+        await catalogFd.close();
+      }
+      await read(catalogFile, MAX_SUPERVISOR_CATALOG_BYTES);
       const credentialFd = await fs.open(
         credentialFile,
         constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
@@ -271,6 +316,7 @@ export async function prepareSupervisorManagerLaunch(options: {
       await read(credentialFile);
       // The bridge gets a path, never the credential in its process arguments.
       const profile = (profileText = stringify({
+        model_catalog_json: catalogFile,
         features: {
           // The pinned server CLI uses this flag; newer CLIs use tools.view_image.
           view_image: false,
@@ -318,15 +364,17 @@ export async function prepareSupervisorManagerLaunch(options: {
       await read(file);
       const privateOwned = await fs.lstat(privateDirectory);
       const preparedHome = homeOwned;
-      const artifactFiles = files.filter((value) => value.path === file || value.path === credentialFile);
+      const artifactFiles = files.filter((value) => [file, credentialFile, catalogFile].includes(value.path));
       if (
         !owned ||
         !credentialOwned ||
+        !catalogOwned ||
+        files.length > 8 ||
         !directoryOwned ||
         privateOwned.dev !== directoryOwned.dev ||
         privateOwned.ino !== directoryOwned.ino ||
         artifactFiles.some((value) => {
-          const created = value.path === file ? owned! : credentialOwned!;
+          const created = value.path === file ? owned! : value.path === catalogFile ? catalogOwned! : credentialOwned!;
           return value.dev !== created.dev || value.ino !== created.ino;
         })
       )
@@ -366,17 +414,17 @@ export async function prepareSupervisorManagerLaunch(options: {
                 return current();
               };
               try {
-                if (!current() || artifactFiles.length !== 2 || !(await directoriesCurrent())) return false;
+                if (!current() || artifactFiles.length !== 3 || !(await directoriesCurrent())) return false;
                 if (!(await checkPrivateFileWitnesses(artifactFiles, limit))) return false;
                 if (!(await directoriesCurrent())) return false;
-                // All file proof descriptors have closed. Recheck both leaves in a
+                // All file proof descriptors have closed. Recheck all three files in a
                 // common final scan before removing anything; replacements survive.
                 for (const witness of artifactFiles) {
                   const now = await fs.lstat(witness.path);
                   if (!same(now, witness) || now.isSymbolicLink() || !now.isFile()) return false;
                 }
                 if (!current()) return false;
-                for (const path of [credentialFile, file]) {
+                for (const path of [credentialFile, file, catalogFile]) {
                   if (!(await directoriesCurrent())) return false;
                   const witness = artifactFiles.find((value) => value.path === path)!;
                   const now = await fs.lstat(path);
@@ -493,6 +541,7 @@ export async function prepareSupervisorManagerLaunch(options: {
           for (const [path, created, text] of [
             [file, owned, profileText],
             [credentialFile, credentialOwned, credentialText],
+            [catalogFile, catalogOwned, catalogCleanupBytes ?? catalogText],
           ] as const) {
             if (!created) continue; // A failed exclusive open never owns its collision.
             if (text === undefined) return;
@@ -513,7 +562,7 @@ export async function prepareSupervisorManagerLaunch(options: {
               mtimeMs: stat.mtimeMs,
               ctimeMs: stat.ctimeMs,
               hash: createHash('sha256').update(text).digest('hex'),
-              maxBytes: MAX_FILE,
+              maxBytes: path === catalogFile ? MAX_SUPERVISOR_CATALOG_BYTES : MAX_FILE,
             });
           }
           if (artifacts.length && !(await checkPrivateFileWitnesses(artifacts, limit))) return;

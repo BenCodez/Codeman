@@ -5,7 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { parse } from 'smol-toml';
 import { Session } from '../src/session.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
@@ -15,6 +15,16 @@ import {
   type SupervisorManagerLaunch,
 } from '../src/supervisor/manager-launch.js';
 import { createDeferred } from './mocks/index.js';
+
+const catalogRead = vi.hoisted(() => vi.fn());
+vi.mock('../src/supervisor/manager-catalog.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/supervisor/manager-catalog.js')>()),
+  readSupervisorManagerCatalog: catalogRead,
+}));
+const SAFE_CATALOG = JSON.stringify({
+  models: [{ slug: 'owner-model', description: 'é', apply_patch_tool_type: null }],
+});
+beforeEach(() => catalogRead.mockReset().mockResolvedValue(SAFE_CATALOG));
 
 const SID = '11111111-1111-4111-8111-111111111111';
 const CID = '22222222-2222-4222-8222-222222222222';
@@ -356,6 +366,59 @@ it.each(['0.152.1', '0.162.1'])(
   }
 );
 
+it('pins the exact private catalog in both the profile and command and witnesses its bytes', async () => {
+  const p = await profile(),
+    parsed = parse(await fs.readFile(p.profile.file, 'utf8')),
+    catalog = String(parsed.model_catalog_json);
+  expect(catalog).toBe(join(p.home, `.${p.profile.name}`, 'models.json'));
+  expect(await fs.readFile(catalog, 'utf8')).toBe(SAFE_CATALOG);
+  expect((await fs.stat(catalog)).mode & 0o777).toBe(0o600);
+  expect(p.profile.files.find((witness) => witness.path === catalog)?.maxBytes).toBe(1_048_576);
+  expect(supervisorManagerCommand(p.profile, { noDaemon: true })).toContain(
+    `model_catalog_json=${JSON.stringify(catalog)}`
+  );
+  expect(await p.profile.confirm()).toBe(true);
+  await fs.rename(catalog, catalog + '.original');
+  await fs.writeFile(catalog, SAFE_CATALOG, { mode: 0o600 });
+  expect(await p.profile.confirm()).toBe(false);
+  expect(await p.profile.revoke()).toBe(false);
+  expect(await fs.readFile(catalog, 'utf8')).toBe(SAFE_CATALOG);
+});
+
+it.each(['unavailable', 'cancelled', 'expired'] as const)(
+  'does not issue artifacts after a %s model catalog proof',
+  async (fault) => {
+    const p = await paths();
+    let current = true;
+    catalogRead.mockImplementationOnce(async ({ deadline }: { deadline: number }) => {
+      if (fault === 'cancelled') current = false;
+      if (fault === 'expired') vi.spyOn(performance, 'now').mockReturnValue(deadline + 1);
+      return fault === 'unavailable' ? undefined : SAFE_CATALOG;
+    });
+    expect(await prepareAt(p, () => current)).toBeUndefined();
+    expect(await fs.readdir(p.home)).toEqual([]);
+  }
+);
+
+it.each([0, 1])('retires a failed model catalog write, including a split UTF-8 prefix (%s)', async (partial) => {
+  const p = await paths(),
+    original = fs.open.bind(fs),
+    cut = partial ? Buffer.from(SAFE_CATALOG).indexOf(Buffer.from('é')) + 1 : 0;
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const fd = await original(...args);
+    if (String(args[0]).endsWith('/models.json') && (Number(args[1]) & constants.O_EXCL) !== 0) {
+      const write = fd.writeFile.bind(fd);
+      vi.spyOn(fd, 'writeFile').mockImplementation(async () => {
+        await write(Buffer.from(SAFE_CATALOG).subarray(0, cut));
+        throw Object.assign(new Error('synthetic short catalog write'), { code: 'ENOSPC' });
+      });
+    }
+    return fd;
+  });
+  expect(await prepareAt(p)).toBeUndefined();
+  expect(await fs.readdir(p.home)).toEqual([]);
+});
+
 it('revokes immediately and retires exactly the issued profile and credential directory, retaining owner files', async () => {
   const p = await profile();
   const ownerFile = join(p.home, 'owner.txt');
@@ -532,7 +595,7 @@ it('bounds a held cleanup, retains its actual-work fence, and preserves artifact
   expect(await fs.readFile(p.profile.file, 'utf8')).toContain('[mcp_servers.codeman_supervisor]');
 });
 
-it.each(['mcp_servers', 'plugins', 'apps', 'hooks', 'notify', 'profiles', 'profile'])(
+it.each(['model_catalog_json', 'mcp_servers', 'plugins', 'apps', 'hooks', 'notify', 'profiles', 'profile'])(
   'refuses an unknown existing %s catalog without rewriting owner config',
   async (key) => {
     const p = await paths(),

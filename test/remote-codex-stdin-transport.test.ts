@@ -27,6 +27,7 @@ import { deliverRemoteCodexInput, inspectRemoteCodex, runRemoteCodexStdin } from
 import { getActiveRemoteSshCount, getQueuedRemoteSshCount, getRemoteSshLimit } from '../src/remote-ssh-limiter.js';
 import type { SessionRemote } from '../src/types.js';
 import { performance } from 'node:perf_hooks';
+import { sampleRemoteCodexClock } from '../src/recovery/remote-clock.js';
 
 const remote: SessionRemote = {
   hostId: 'fixture',
@@ -36,19 +37,20 @@ const remote: SessionRemote = {
   remotePath: '/private/work',
   owned: true,
 };
-const clock = () => ({
-  localBefore: Date.now(),
-  localAfter: Date.now(),
-  remoteBefore: Date.now(),
-  remoteAfter: Date.now(),
-});
+const clock = () => {
+  // This fake models a single point in both domains. Separate wall reads can
+  // invent an offset/negative uncertainty when one crosses a millisecond tick.
+  const at = Date.now();
+  return { localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at };
+};
 const prompt = 'Private fixture request café 🧭';
 function request() {
+  const submitted = clock();
   return {
     sessionId: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
     workingDir: remote.remotePath,
     codexHome: '/private/home',
-    submission: { at: Date.now(), hash: 'a'.repeat(64), clockDomain: 'remote' as const, clock: clock() },
+    submission: { at: submitted.remoteAfter, hash: 'a'.repeat(64), clockDomain: 'remote' as const, clock: submitted },
     expected: {
       conversationId: '11111111-2222-3333-4444-555555555555',
       tailHash: 'b'.repeat(64),
@@ -94,33 +96,63 @@ function fakeChild() {
   });
   return Object.assign(emitter, { stdin, stdout, stderr, kill, input: () => Buffer.concat(chunks).toString('utf8') });
 }
-it('passes the complete private request only to stdin for inspection', async () => {
-  const f = child((f) => {
-    const now = Date.now();
-    f.stdout.write(
-      'CODEMAN_REMOTE_CODEX_V1:' +
-        Buffer.from(
-          JSON.stringify({
-            v: 1,
-            session: 'missing',
-            identity: { reason: 'unverified' },
-            clock: { remoteBefore: now, remoteAfter: now },
-          })
-        ).toString('base64') +
-        '\n'
-    );
-    f.emit('close', 0);
+it.each(['steady', 'millisecond-boundary'] as const)(
+  'passes the complete private request only to stdin for inspection: %s',
+  async (timing) => {
+    if (timing === 'millisecond-boundary') {
+      let reads = 0;
+      const at = Date.now();
+      vi.spyOn(Date, 'now').mockImplementation(() => at + (++reads <= 3 ? 0 : reads <= 5 ? 1 : 2));
+      vi.spyOn(performance, 'now').mockReturnValue(0);
+    }
+    const f = child((f) => {
+      const now = Date.now();
+      f.stdout.write(
+        'CODEMAN_REMOTE_CODEX_V1:' +
+          Buffer.from(
+            JSON.stringify({
+              v: 1,
+              session: 'missing',
+              identity: { reason: 'unverified' },
+              clock: { remoteBefore: now, remoteAfter: now },
+            })
+          ).toString('base64') +
+          '\n'
+      );
+      f.emit('close', 0);
+    });
+    expect(await fixtureIo(() => inspectRemoteCodex(remote, request()))).toMatchObject({
+      transport: 'reachable',
+      session: 'missing',
+    });
+    const [command, options] = effects.spawn.mock.calls[0];
+    expect(options).toEqual({ shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
+    expect(command).not.toContain(prompt);
+    expect(command).not.toContain(Buffer.from(f.input()).toString('base64'));
+    expect(command).not.toContain('/private/home');
+    expect(JSON.parse(f.input())).toMatchObject({ sessionId: request().sessionId, codexHome: '/private/home' });
+  }
+);
+it('keeps contradictory injected clock evidence unknown before spawning the transport', async () => {
+  const at = Date.now();
+  const q = request();
+  q.submission = {
+    ...q.submission,
+    at,
+    clock: { localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at },
+  };
+  vi.mocked(sampleRemoteCodexClock).mockResolvedValueOnce({
+    localBefore: at + 10,
+    localAfter: at + 10,
+    remoteBefore: at + 11,
+    remoteAfter: at + 11,
   });
-  expect(await fixtureIo(() => inspectRemoteCodex(remote, request()))).toMatchObject({
+  expect(await fixtureIo(() => inspectRemoteCodex(remote, q))).toEqual({
     transport: 'reachable',
-    session: 'missing',
+    session: 'unknown',
+    identity: { reason: 'unreadable' },
   });
-  const [command, options] = effects.spawn.mock.calls[0];
-  expect(options).toEqual({ shell: true, stdio: ['pipe', 'pipe', 'pipe'] });
-  expect(command).not.toContain(prompt);
-  expect(command).not.toContain(Buffer.from(f.input()).toString('base64'));
-  expect(command).not.toContain('/private/home');
-  expect(JSON.parse(f.input())).toMatchObject({ sessionId: request().sessionId, codexHome: '/private/home' });
+  expect(effects.spawn).not.toHaveBeenCalled();
 });
 it.each(['stdin-error', 'stdout-error', 'stderr-error', 'stdout-overflow', 'stderr-overflow'] as const)(
   'seals a dispatched request after %s',
