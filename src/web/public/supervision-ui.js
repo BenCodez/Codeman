@@ -141,6 +141,31 @@ Object.assign(CodemanApp.prototype, {
   markTaskDraft() {
     if (this._taskView) this._taskView.dirty = true;
   },
+  _taskDraftSnapshot(section) {
+    const value = (id) => document.getElementById(id).value;
+    return JSON.stringify(
+      section === 'configuration'
+        ? {
+            objective: value('taskObjective'),
+            enabled: document.getElementById('taskEnabled').checked,
+            maxContinuations: value('taskMaxContinuations'),
+            maxRuntime: value('taskMaxRuntime'),
+            criteria: (this._taskView?.criterionRows ?? []).map((row) => ({
+              id: row.id,
+              kind: row.kind,
+              fields: Object.fromEntries(Object.entries(row.fields).map(([key, field]) => [key, field.input.value])),
+            })),
+          }
+        : {
+            checkpoint: value('taskCheckpoint'),
+            nextAction: value('taskNextAction'),
+            outcome: value('taskProgressOutcome'),
+            verifiedCriteria: [...document.querySelectorAll('#taskCriteriaEvidence input:checked')]
+              .filter((input) => input.dataset.taskVerified !== 'true')
+              .map((input) => input.value),
+          }
+    );
+  },
   _appendTaskCriterion(view, criterion, added = false) {
     const element = document.createElement('div');
     element.className = 'task-criterion-editor';
@@ -223,7 +248,7 @@ Object.assign(CodemanApp.prototype, {
     this._updateTaskCriterionButtons();
     view.criterionRows.at(-1).fields[kind === 'command' ? 'command' : 'description'].input.focus();
   },
-  _renderTaskStatus(force = false) {
+  _renderTaskStatus(force = false, savedSection) {
     const view = this._taskView;
     if (!view || this.editingSessionId !== view.sessionId) return;
     const state = view.state;
@@ -277,7 +302,9 @@ Object.assign(CodemanApp.prototype, {
       !state?.criteria.length;
     document.getElementById('taskPauseBtn').disabled = !available || !state?.config.enabled;
     document.getElementById('taskResetBtn').disabled = !available;
-    if (force || !view.dirty) {
+    const renderConfiguration = force || !view.dirty || savedSection === 'configuration';
+    const renderProgress = force || !view.dirty || savedSection === 'progress';
+    if (renderConfiguration) {
       const objectiveInput = document.getElementById('taskObjective');
       const originalObjective = state?.objective ?? '';
       objectiveInput.value = originalObjective;
@@ -300,6 +327,9 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('taskEnabled').checked = state?.config.enabled ?? false;
       document.getElementById('taskMaxContinuations').value = state?.config.maxContinuations ?? '';
       document.getElementById('taskMaxRuntime').value = state ? state.config.maxRuntimeMs / 1000 : '';
+      view.configurationDraftBaseline = this._taskDraftSnapshot('configuration');
+    }
+    if (renderProgress) {
       view.progressTextBaseline = {};
       for (const [id, key] of [
         ['taskCheckpoint', 'checkpoint'],
@@ -313,7 +343,7 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('taskProgressOutcome').value = state?.outcome ?? 'unknown';
     }
     const evidence = document.getElementById('taskCriteriaEvidence');
-    const selected = force
+    const selected = renderProgress
       ? new Set()
       : new Set([...evidence.querySelectorAll('input:checked')].map((input) => input.value));
     evidence.replaceChildren();
@@ -326,6 +356,7 @@ Object.assign(CodemanApp.prototype, {
       input.checked = criterion.verified || selected.has(criterion.id);
       input.disabled = !available || criterion.verified;
       input.dataset.taskCriterion = '';
+      input.dataset.taskVerified = String(criterion.verified === true);
       input.addEventListener('change', () => {
         if (this._taskView === view) this.markTaskDraft();
       });
@@ -335,6 +366,7 @@ Object.assign(CodemanApp.prototype, {
       row.append(input, text);
       evidence.appendChild(row);
     }
+    if (renderProgress) view.progressDraftBaseline = this._taskDraftSnapshot('progress');
     const history = document.getElementById('taskHistory');
     history.replaceChildren();
     for (const event of (state?.history ?? []).slice(-20).reverse()) {
@@ -452,12 +484,17 @@ Object.assign(CodemanApp.prototype, {
     });
     if (this._taskView !== view || this.editingSessionId !== view.sessionId) return;
     view.busy = false;
+    let savedSection;
     if (state?.version === 1 && state.config && Array.isArray(state.criteria)) {
       const current = view.revision === revision;
       if (current) view.state = state;
       // Controls persist no draft. A save may acknowledge its matching SSE
       // publication, but an older response cannot clear a newer server view.
-      if (body !== undefined && (current || JSON.stringify(state) === JSON.stringify(view.state))) view.dirty = false;
+      if (body !== undefined && (current || JSON.stringify(state) === JSON.stringify(view.state))) {
+        savedSection = path === '/progress' ? 'progress' : 'configuration';
+        const otherSection = savedSection === 'progress' ? 'configuration' : 'progress';
+        view.dirty = this._taskDraftSnapshot(otherSection) !== view[`${otherSection}DraftBaseline`];
+      }
     } else {
       this.showToast('Task action failed. Refresh status before trying again.', 'error');
       this._renderTaskStatus();
@@ -467,6 +504,6 @@ Object.assign(CodemanApp.prototype, {
       }
       return;
     }
-    this._renderTaskStatus(!view.dirty);
+    this._renderTaskStatus(!view.dirty, savedSection);
   },
 });
