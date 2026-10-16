@@ -446,7 +446,24 @@ def rollback_unlaunched(receipt):
     rootfd=directory(root); fd=lock=None
     try:
         if not private(os.fstat(rootfd),True): return
-        fd=os.open(inc,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=rootfd)
+        try: fd=os.open(inc,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=rootfd)
+        except FileNotFoundError:
+            # A previous deletion may have lost its completion receipt. Absence
+            # is positive only under the exact captured canonical parent chain.
+            def still_absent():
+                check()
+                for parent in parents:
+                    st=os.stat(parent['path'],follow_symlinks=False)
+                    if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode & 0o022 or (st.st_dev,st.st_ino)!=(parent['dev'],parent['ino']): return False
+                try: os.stat(inc,dir_fd=rootfd,follow_symlinks=False)
+                except FileNotFoundError: return True
+                return False
+            if not still_absent(): return
+            print(json.dumps({'rollback':sid+'/'+inc}),flush=True)
+            if not select.select([sys.stdin],[],[],max(0,DEADLINE-time.monotonic()))[0] or sys.stdin.readline()!='ACK\n': return
+            if not still_absent(): return
+            print(json.dumps({'rolledBack':sid+'/'+inc}),flush=True)
+            return
         own=os.fstat(fd)
         if not private(own,True) or (own.st_dev,own.st_ino)!=(receipt['directory']['dev'],receipt['directory']['ino']): return
         names=namesat(fd,3)
@@ -491,6 +508,7 @@ def rollback_unlaunched(receipt):
         if not current(): return
         os.rmdir(inc,dir_fd=rootfd)
         os.fsync(rootfd)
+        print(json.dumps({'rolledBack':sid+'/'+inc}),flush=True)
     except (OSError,ValueError,TypeError,KeyError): return
     finally:
         if lock is not None: os.close(lock)

@@ -4038,6 +4038,19 @@ export class WebServer extends EventEmitter {
               (Object.hasOwn(muxSession, 'restoreUncertain') && muxSession.restoreUncertain !== false);
             // Restore session settings from state.json (single source of truth)
             const savedState = this.store.getSession(muxSession.sessionId);
+            const recoveredCli = getCli(muxSession.mode);
+            const usesCodexConfig =
+              recoveredCli?.capabilities.recovery === 'codex-rollout' ||
+              recoveredCli?.launch.legacyConfigField === 'codexConfig';
+            // Launch settings belong to this exact CLI. An uncertain native
+            // launch retains its own settings solely for fenced inspection.
+            const recoveredCodexConfig = usesCodexConfig
+              ? muxSession.codexRestoreUncertain === true
+                ? muxSession.codexRestoreConfig
+                : savedState?.mode === muxSession.mode
+                  ? savedState.codexConfig
+                  : undefined
+              : undefined;
             // Determine the correct session name (priority: savedState > muxSession > muxName)
             // This ensures renamed sessions keep their name after server restart
             const sessionName = savedState?.name || muxSession.name || muxSession.muxName;
@@ -4085,12 +4098,7 @@ export class WebServer extends EventEmitter {
               claudeMode: recoveryClaudeMode.claudeMode,
               allowedTools: recoveryClaudeMode.allowedTools,
               openCodeConfig: muxSession.mode === 'opencode' ? savedState?.openCodeConfig : undefined,
-              codexConfig:
-                muxSession.mode === 'codex'
-                  ? muxSession.codexRestoreUncertain === true
-                    ? muxSession.codexRestoreConfig
-                    : savedState?.codexConfig
-                  : undefined,
+              codexConfig: recoveredCodexConfig,
               preserveExitedPane:
                 getCli(muxSession.mode)?.capabilities.recovery === 'codex-rollout' &&
                 !muxSession.remote &&
