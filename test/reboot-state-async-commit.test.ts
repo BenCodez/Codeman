@@ -3,9 +3,13 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { StateStore } from '../src/state-store.js';
 import { Session } from '../src/session.js';
+import { WebServer } from '../src/web/server.js';
+import { createSessionListeners } from '../src/web/session-listener-wiring.js';
+import { attachmentRegistry } from '../src/attachment-registry.js';
 import type { SessionState } from '../src/types.js';
 
 const io = vi.hoisted(() => ({
@@ -293,6 +297,82 @@ it.each(
   }
 });
 
+it.each(
+  (['file-sync', 'directory-sync'] as const).flatMap((stage) =>
+    [
+      { mode: 'claude' as const, source: 'external' as const },
+      { mode: 'codex' as const, source: 'external' as const },
+      { mode: 'codex' as const, source: 'codex-generated' as const },
+    ].map((entry) => ({ stage, ...entry }))
+  )
+)(
+  'restages actual $mode $source attachment registration during $stage before restore ACK',
+  async ({ mode, source, stage }) => {
+    const priorData = process.env.CODEMAN_DATA_DIR;
+    process.env.CODEMAN_DATA_DIR = root;
+    const live = new Session({ id: ID, mode, workingDir: root, useMux: false });
+    const server = new WebServer(0, false, true);
+    Reflect.set(server, 'store', store);
+    const sessions = Reflect.get(server, 'sessions') as Map<string, Session>;
+    sessions.set(ID, live);
+    Reflect.get(server, 'tentativeSessionRegistrations').add(live);
+    vi.spyOn(Reflect.get(server, 'mux'), 'flushSessionsDurably').mockResolvedValue(undefined);
+    const registered = Promise.withResolvers<void>();
+    const port = server as unknown as {
+      registerAttachment(id: string, path: string, source: 'external' | 'codex-generated'): Promise<void>;
+    };
+    const register = port.registerAttachment.bind(port);
+    vi.spyOn(port, 'registerAttachment').mockImplementation((...args) => {
+      const operation = register(...args);
+      void operation.then(registered.resolve, registered.reject);
+      return operation;
+    });
+    const listeners = createSessionListeners(live, Reflect.get(server, 'buildSessionListenerDeps').call(server));
+    live.on('attachmentRequested', listeners.attachmentRequested);
+    const artifact = join(root, 'startup artifact.png');
+    await fsp.writeFile(artifact, 'Disposable attachment content');
+    const entered = hold(stage);
+    const committing: Promise<void> = Reflect.get(server, 'persistRebootRestoreDurably').call(server, live, () => true);
+    try {
+      await reached(entered, committing);
+      expect(store.getSession(ID)).toEqual(historical);
+      Reflect.get(live, '_handleTerminalOutput').call(
+        live,
+        source === 'external'
+          ? `codeman://attach?path=${encodeURIComponent(artifact)}\r\n`
+          : `Saved to: ${pathToFileURL(artifact).href}\r\n`
+      );
+      await registered.promise;
+      expect(port.registerAttachment).toHaveBeenCalledWith(ID, artifact, source);
+      const latest = Reflect.get(server, 'buildPersistedSessionState').call(server, live) as SessionState;
+      expect(latest.attachmentHistory).toHaveLength(1);
+      expect(JSON.stringify(latest.attachmentHistory)).not.toContain(artifact);
+      expect(Reflect.get(latest, '__attachmentHistory')).toEqual([
+        expect.objectContaining({ externalPath: artifact, fileName: 'startup artifact.png' }),
+      ]);
+      // Tentative listener persistence must not replace historical memory early.
+      expect(store.getSession(ID)).toEqual(historical);
+      release!();
+      await committing;
+      expect(store.getSession(ID)).toEqual(latest);
+      expect(reload().getSession(ID)).toEqual(latest);
+      expect(io.writes).toBeGreaterThan(1);
+      expect(Reflect.get(server, 'tentativeSessionRegistrations').has(live)).toBe(false);
+      expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(false);
+    } finally {
+      release!();
+      await committing.catch(() => {});
+      live.off('attachmentRequested', listeners.attachmentRequested);
+      sessions.delete(ID);
+      await live.stop(false);
+      await server.stop();
+      attachmentRegistry.clearSession(ID);
+      if (priorData === undefined) delete process.env.CODEMAN_DATA_DIR;
+      else process.env.CODEMAN_DATA_DIR = priorData;
+    }
+  }
+);
+
 it.each(['owner', 'config', 'conversation', 'home', 'broker', 'dismiss', 'model', 'custom-model', 'unknown'] as const)(
   'live output display/accounting drift cannot mask a changed %s restore authority',
   async (change) => {
@@ -320,6 +400,8 @@ it.each(['owner', 'config', 'conversation', 'home', 'broker', 'dismiss', 'model'
       cliAccountType: 'API',
       cliMouseTracking: true,
       displayModel: { model: 'Reported replacement', source: 'screen' },
+      attachmentHistory: [],
+      __attachmentHistory: [],
     });
     if (change === 'owner') record.owner = 'replacement-owner';
     if (change === 'config') record.codexConfig = { ...record.codexConfig, sandbox: 'workspace-write' };
