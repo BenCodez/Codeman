@@ -349,9 +349,22 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('taskProgressOutcome').value = state?.outcome ?? 'unknown';
     }
     const evidence = document.getElementById('taskCriteriaEvidence');
-    const selected = renderProgress
-      ? new Set()
-      : new Set([...evidence.querySelectorAll('input:checked')].map((input) => input.value));
+    // A configuration edit resets every criterion's evidence, even when IDs are reused.
+    // Preserve unsaved selections only for the exact objective and evidence generation.
+    const evidenceBinding = JSON.stringify([
+      state?.objective,
+      state?.configuredAt,
+      (state?.criteria ?? []).map(taskUiCriterionInput),
+    ]);
+    const selected =
+      renderProgress || view.progressEvidenceBinding !== evidenceBinding
+        ? new Set()
+        : new Set(
+            [...evidence.querySelectorAll('input:checked')]
+              .filter((input) => input.dataset.taskVerified !== 'true')
+              .map((input) => input.value)
+          );
+    view.progressEvidenceBinding = evidenceBinding;
     evidence.replaceChildren();
     for (const criterion of state?.criteria ?? []) {
       const row = document.createElement('label');

@@ -85,6 +85,8 @@
     'Maximum runtime (seconds)': '最大运行时间（秒）',
     'Save task configuration': '保存任务配置',
     'Checkpoints and completion evidence': '检查点和完成证据',
+    'Sign in with Codeman authentication to verify manual criteria. Anonymous or agent requests cannot certify them.':
+      '请通过 Codeman 身份验证登录后，再验证手动验收条件。匿名请求或代理请求不能认证这些条件。',
     'Select owner criteria you have independently verified, or request verification of command checks. Command checks require correlated successful execution evidence. Completed is accepted only when every criterion is verified.':
       '选择您已独立验证的所有者条件，或请求验证命令检查。命令检查需要关联的成功执行证据。仅在全部条件已验证后才接受完成状态。',
     Checkpoint: '检查点',

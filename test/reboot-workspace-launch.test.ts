@@ -81,6 +81,7 @@ function child(value: ReturnType<typeof payload>, afterStat?: () => void, clock?
   const executed = vi.fn();
   const cwd = vi.fn();
   const opened: number[] = [];
+  let observedStat = false;
   const effects = {
     ...nativeFs,
     openSync: (...args: Parameters<typeof nativeFs.openSync>) => {
@@ -90,7 +91,10 @@ function child(value: ReturnType<typeof payload>, afterStat?: () => void, clock?
     },
     fstatSync: (...args: Parameters<typeof nativeFs.fstatSync>) => {
       const result = nativeFs.fstatSync(...args);
-      afterStat?.();
+      if (!observedStat) {
+        observedStat = true;
+        afterStat?.();
+      }
       return result;
     },
     closeSync: (fd: number) => {
@@ -109,6 +113,7 @@ function child(value: ReturnType<typeof payload>, afterStat?: () => void, clock?
       },
       process: {
         argv: ['node', JSON.stringify(value)],
+        pid: 12345,
         env: { FIXTURE: '1' },
         hrtime: { bigint: clock ?? process.hrtime.bigint },
         exit,
@@ -285,4 +290,29 @@ it('keeps legacy-unowned and admin confinement semantics', async () => {
   expect(admin?.wrap('exact-command')).toContain(foreign);
   legacy?.release();
   admin?.release();
+});
+
+it('acknowledges only the child that completed the final cwd/deadline checks', async () => {
+  const lease = (await prepare())!;
+  const value = payload(lease);
+  expect(child(value).executed).toHaveBeenCalledOnce();
+  expect(await lease.confirmStartup!(12345)).toBe(true);
+  expect(await lease.confirmStartup!(54321)).toBe(false);
+});
+it('retains a delayed wrapper exit125 as unacknowledged startup', async () => {
+  const lease = (await prepare(() => true, performance.now() + 50))!;
+  const value = payload(lease);
+  lease.noteDispatch();
+  const result = child(value, undefined, () => BigInt(value.deadline) * 1000000n);
+  expect(result.executed).not.toHaveBeenCalled();
+  expect(await lease.confirmStartup!(12345)).toBe(false);
+});
+it('refuses a replaced startup receipt even with the same bytes', async () => {
+  const lease = (await prepare())!;
+  const value = payload(lease);
+  child(value);
+  const bytes = await fs.readFile(value.receipt.path);
+  await fs.rename(value.receipt.path, value.receipt.path + '.original');
+  await fs.writeFile(value.receipt.path, bytes, { mode: 0o600 });
+  expect(await lease.confirmStartup!(12345)).toBe(false);
 });
