@@ -1,5 +1,5 @@
 /** Recovery profile IO is bounded; unknown and late work never become absence or new launch authority. */
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync, constants } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -179,7 +179,11 @@ it('retains timed-out write ownership until actual close, then rebuilds only the
   });
   vi.spyOn(fs, 'open').mockImplementation(async (target, flags, mode) => {
     const handle = await open(target, flags, mode);
-    if (!held && String(target) === join(path, '.claude.json') && (Number(flags) & 1) === 1) {
+    if (
+      !held &&
+      String(target).startsWith(join(path, '.claude.json') + '.recovery-') &&
+      (Number(flags) & constants.O_CREAT) !== 0
+    ) {
       held = true;
       const write = handle.writeFile.bind(handle),
         close = handle.close.bind(handle);
@@ -289,5 +293,124 @@ it.each(['codex', 'pi', 'grok', 'omp'])(
     for (const file of recipe.files) expect(readFileSync(join(path, file.relPath), 'utf8')).toBe(file.content);
     expect(await removeCreatedRecoveryProfile(created!)).toBe(true);
     expect(existsSync(path)).toBe(false);
+  }
+);
+
+it.each(['cancel', 'deadline', 'partial-write', 'zero-write', 'sync-error'] as const)(
+  'an existing shorter profile stays byte-exact when its staged replacement fails: %s',
+  async (fault) => {
+    const path = customModelConfigDir('atomic-existing'),
+      target = join(path, 'settings.json');
+    mkdirSync(path, { recursive: true });
+    const prior = JSON.stringify(
+      { ownerField: 'keep', skipDangerousModePermissionPrompt: 'long prior value '.repeat(200) },
+      null,
+      2
+    );
+    writeFileSync(target, prior, { mode: 0o600 });
+    let allowed = true,
+      reached = false;
+    const deadline = performance.now() + 2000,
+      open = fs.open.bind(fs);
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const file = await open(...args);
+      if (
+        (String(args[0]) === target || String(args[0]).startsWith(target + '.recovery-')) &&
+        (Number(args[1]) & 3) !== 0
+      ) {
+        const write = file.writeFile.bind(file),
+          sync = file.sync.bind(file);
+        file.writeFile = async (...input) => {
+          reached = true;
+          if (fault === 'partial-write' || fault === 'zero-write') {
+            const bytes = Buffer.from(String(input[0]));
+            await write(bytes.subarray(0, fault === 'zero-write' ? 0 : bytes.length - 2));
+            throw Object.assign(Error('Partial disk write'), { code: 'ENOSPC' });
+          }
+          await write(...input);
+          if (fault === 'cancel') allowed = false;
+          if (fault === 'deadline') vi.spyOn(performance, 'now').mockReturnValue(deadline);
+        };
+        file.sync = async () => {
+          if (fault === 'sync-error') throw Error('Unacknowledged staged bytes');
+          return sync();
+        };
+      }
+      return file;
+    });
+    expect(
+      await rebuildPersistedCustomModelEnv('claude', 'atomic-existing', saved, root, {
+        isCurrent: () => allowed,
+        deadline,
+      })
+    ).toBeUndefined();
+    expect(reached).toBe(true);
+    expect(readFileSync(target, 'utf8')).toBe(prior);
+    expect(JSON.parse(readFileSync(target, 'utf8')).ownerField).toBe('keep');
+    expect((await fs.readdir(path)).filter((name) => name.includes('.recovery-'))).toEqual([]);
+  }
+);
+it('publishes an existing shorter JSON profile atomically with exact bytes and private permissions', async () => {
+  const path = customModelConfigDir('atomic-healthy'),
+    target = join(path, 'settings.json');
+  mkdirSync(path, { recursive: true });
+  writeFileSync(
+    target,
+    JSON.stringify({ ownerField: 'keep', skipDangerousModePermissionPrompt: 'long '.repeat(200) }),
+    { mode: 0o600 }
+  );
+  const before = await fs.lstat(target);
+  expect(await rebuildPersistedCustomModelEnv('claude', 'atomic-healthy', saved, root)).toMatchObject({
+    CLAUDE_CONFIG_DIR: path,
+  });
+  const text = readFileSync(target, 'utf8');
+  expect(text).toBe(JSON.stringify({ ownerField: 'keep', skipDangerousModePermissionPrompt: true }, null, 2));
+  expect((await fs.lstat(target)).ino).not.toBe(before.ino);
+  expect((await fs.lstat(target)).mode & 0o077).toBe(0);
+  expect((await fs.readdir(path)).filter((name) => name.includes('.recovery-'))).toEqual([]);
+});
+it.each(['primary', 'temporary', 'parent'] as const)(
+  'preserves a foreign %s replacement during staging',
+  async (fault) => {
+    const path = customModelConfigDir('atomic-foreign'),
+      target = join(path, 'settings.json');
+    mkdirSync(path, { recursive: true });
+    const prior = JSON.stringify({ ownerField: 'keep', skipDangerousModePermissionPrompt: false });
+    writeFileSync(target, prior, { mode: 0o600 });
+    const open = fs.open.bind(fs);
+    let stage = '',
+      changed = false;
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const file = await open(...args);
+      if (String(args[0]).startsWith(target + '.recovery-')) {
+        stage = String(args[0]);
+        const close = file.close.bind(file);
+        file.close = async () => {
+          await close();
+          if (changed) return;
+          changed = true;
+          if (fault === 'temporary') {
+            const text = await fs.readFile(stage);
+            await fs.rename(stage, stage + '.owned');
+            await fs.writeFile(stage, text, { mode: 0o600 });
+          } else if (fault === 'primary') {
+            await fs.rename(target, target + '.owned');
+            await fs.writeFile(target, 'foreign owner bytes', { mode: 0o600 });
+          } else {
+            await fs.rename(path, path + '.owned');
+            await fs.mkdir(path, { mode: 0o700 });
+            await fs.writeFile(target, 'foreign parent bytes', { mode: 0o600 });
+          }
+        };
+      }
+      return file;
+    });
+    expect(await rebuildPersistedCustomModelEnv('claude', 'atomic-foreign', saved, root)).toBeUndefined();
+    expect(changed).toBe(true);
+    if (fault === 'temporary') {
+      expect(readFileSync(target, 'utf8')).toBe(prior);
+      expect(await fs.readFile(stage, 'utf8')).toContain('skipDangerousModePermissionPrompt');
+    } else
+      expect(readFileSync(target, 'utf8')).toBe(fault === 'primary' ? 'foreign owner bytes' : 'foreign parent bytes');
   }
 );

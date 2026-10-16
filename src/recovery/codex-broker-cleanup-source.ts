@@ -383,9 +383,9 @@ def retire_empty_session(rootfd, datafd, sessionfd, sid, data_path):
         return True
     except (OSError,ValueError,TypeError,KeyError): return False
 
-def rollback_unlaunched(receipt):
-    # This receipt is sent only by create() before returning a broker. Never
-    # infer an unlaunched incarnation from an incomplete on-disk directory.
+def rollback_unlaunched(receipt, discovered=None):
+    # Only an exact invocation-owned receipt, captured before any dispatch,
+    # permits rollback. Incomplete files alone never prove an unlaunched worker.
     if not isinstance(receipt,dict) or set(receipt)!={'root','sessionId','incarnation','directory','parents','files'}: return
     root=receipt['root']; sid=receipt['sessionId']; inc=receipt['incarnation']
     if not canonical(root) or not isinstance(sid,str) or not UUID.fullmatch(sid) or not isinstance(inc,str) or not UUID.fullmatch(inc): return
@@ -406,12 +406,41 @@ def rollback_unlaunched(receipt):
     rootfd=directory(root); fd=lock=None
     try:
         if not private(os.fstat(rootfd),True): return
+        marker='.rollback-'+inc+'.json'
+        marker_capture=None
+        try:
+            raw,sig,digest=readat(rootfd,marker,262144)
+            if strict_json(raw.decode('utf-8','strict'))!=receipt: return
+            marker_capture=(sig,digest)
+        except FileNotFoundError:
+            if discovered is not None: return
+        def receipt_current():
+            if os.path.realpath(root)!=root: return False
+            for parent in parents:
+                st=os.stat(parent['path'],follow_symlinks=False)
+                if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode & 0o022 or (st.st_dev,st.st_ino)!=(parent['dev'],parent['ino']): return False
+            if (os.fstat(rootfd).st_dev,os.fstat(rootfd).st_ino)!=(parents[0]['dev'],parents[0]['ino']): return False
+            if marker_capture:
+                _,sig,digest=readat(rootfd,marker,262144)
+                if (sig,digest)!=marker_capture: return False
+            if discovered is not None and not same_metadata(discovered[0],discovered[1]): return False
+            return True
+        def finish_receipt():
+            if not receipt_current(): return False
+            if marker_capture:
+                os.unlink(marker,dir_fd=rootfd)
+                os.fsync(rootfd)
+            print(json.dumps({'rolledBack':sid+'/'+inc}),flush=True)
+            return True
+        def announce():
+            print(json.dumps({'ready' if discovered is not None else 'rollback':sid+'/'+inc}),flush=True)
         try: fd=os.open(inc,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=rootfd)
         except FileNotFoundError:
             # A previous deletion may have lost its completion receipt. Absence
             # is positive only under the exact captured canonical parent chain.
             def still_absent():
                 check()
+                if not receipt_current(): return False
                 for parent in parents:
                     st=os.stat(parent['path'],follow_symlinks=False)
                     if not stat.S_ISDIR(st.st_mode) or st.st_uid!=os.getuid() or st.st_mode & 0o022 or (st.st_dev,st.st_ino)!=(parent['dev'],parent['ino']): return False
@@ -419,15 +448,15 @@ def rollback_unlaunched(receipt):
                 except FileNotFoundError: return True
                 return False
             if not still_absent(): return
-            print(json.dumps({'rollback':sid+'/'+inc}),flush=True)
+            announce()
             if not select.select([sys.stdin],[],[],max(0,DEADLINE-time.monotonic()))[0] or sys.stdin.readline()!='ACK\n': return
             if not still_absent(): return
-            print(json.dumps({'rolledBack':sid+'/'+inc}),flush=True)
+            finish_receipt()
             return
         own=os.fstat(fd)
         if not private(own,True) or (own.st_dev,own.st_ino)!=(receipt['directory']['dev'],receipt['directory']['ino']): return
         names=namesat(fd,3)
-        if set(names)!=set(expected): return
+        if (not marker_capture and set(names)!=set(expected)) or not set(names)<=set(expected): return
         captures={}
         for name in names:
             _,sig,digest=readat(fd,name,262144)
@@ -439,6 +468,7 @@ def rollback_unlaunched(receipt):
             if not private(os.fstat(lock)) or signature(os.fstat(lock))!=captures['lock'][0]: return
             fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         def current():
+            if not receipt_current(): return False
             for name,(sig,digest) in captures.items():
                 _,now,hashed=readat(fd,name,262144)
                 if now!=sig or hashed!=digest: return False
@@ -454,7 +484,7 @@ def rollback_unlaunched(receipt):
             check()
             return True
         if not current(): return
-        print(json.dumps({'rollback':sid+'/'+inc}),flush=True)
+        announce()
         check()
         if not select.select([sys.stdin],[],[],max(0,DEADLINE-time.monotonic()))[0] or sys.stdin.readline()!='ACK\n': return
         if not current(): return
@@ -468,7 +498,7 @@ def rollback_unlaunched(receipt):
         if not current(): return
         os.rmdir(inc,dir_fd=rootfd)
         os.fsync(rootfd)
-        print(json.dumps({'rolledBack':sid+'/'+inc}),flush=True)
+        finish_receipt()
     except (OSError,ValueError,TypeError,KeyError): return
     finally:
         if lock is not None: os.close(lock)
@@ -480,7 +510,8 @@ def main():
     request=strict_json(sys.stdin.readline(2097153))
     if isinstance(request,dict) and set(request)=={'rollback'}:
         rollback_unlaunched(request['rollback']); return
-    data=request['dataDir']; refs=request['references']
+    data=request['dataDir']; refs=request['references']; offset=request.get('scanOffset',0)
+    if type(offset) is not int or not 0<=offset<=512: return
     if not isinstance(data,str) or not data.startswith('/') or os.path.normpath(data)!=data or '\x00' in data or not isinstance(refs,list) or len(refs)>32768 or any(not isinstance(v,str) or not UUID.fullmatch(v) for v in refs): return
     if os.path.realpath(data)!=data: return
     datafd=directory(data)
@@ -488,25 +519,42 @@ def main():
     try:
         rootfd=os.open('codex-input-brokers',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=datafd)
         if not private(os.fstat(rootfd),True): return
-        count=0; scanned=0
+        count=0; scanned=0; position=0
+        def scan_cursor(value):
+            print(json.dumps({'scanOffset':value}),flush=True)
         # scandir is streamed: a large/unknown tree never becomes an unbounded list.
         with os.scandir(rootfd) as sessions:
             for entry in sessions:
                 check(); scanned+=1
-                if scanned>512: return
-                if count>=128: return
+                if scanned>512: scan_cursor(0); return
+                if count>=128: scan_cursor(position); return
                 if not UUID.fullmatch(entry.name) or not entry.is_dir(follow_symlinks=False): continue
                 sfd=os.open(entry.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=rootfd)
                 try:
                     if not private(os.fstat(sfd),True): continue
                     with os.scandir(sfd) as children:
                         for child in children:
-                            check(); count+=1; scanned+=1
-                            if scanned>512: return
-                            if count>128: return
-                            if child.is_dir(follow_symlinks=False): retire(rootfd,datafd,entry.name,child.name,set(refs),data)
+                            check(); scanned+=1
+                            if scanned>512: scan_cursor(0); return
+                            if position<offset:
+                                position+=1
+                                continue
+                            if count>=128: scan_cursor(position); return
+                            position+=1; count+=1
+                            if child.name.startswith('.rollback-') and child.name.endswith('.json'):
+                                inc=child.name[10:-5]
+                                if not UUID.fullmatch(inc) or inc in refs: continue
+                                try:
+                                    raw,_,_=readat(sfd,child.name,262144)
+                                    receipt=strict_json(raw.decode('utf-8','strict'))
+                                    if not isinstance(receipt,dict) or receipt.get('root')!=os.path.join(data,'codex-input-brokers',entry.name) or receipt.get('sessionId')!=entry.name or receipt.get('incarnation')!=inc: continue
+                                    reference_files=metadata(datafd,inc)
+                                    rollback_unlaunched(receipt,(datafd,reference_files))
+                                except (OSError,ValueError,TypeError,KeyError): continue
+                            elif child.is_dir(follow_symlinks=False): retire(rootfd,datafd,entry.name,child.name,set(refs),data)
                     retire_empty_session(rootfd,datafd,sfd,entry.name,data)
                 finally: os.close(sfd)
+        scan_cursor(0)
     finally:
         if rootfd is not None: os.close(rootfd)
         os.close(datafd)

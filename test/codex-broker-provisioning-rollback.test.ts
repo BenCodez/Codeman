@@ -85,14 +85,16 @@ it.each(['spawn', 'error', 'timeout', 'ready-only', 'wrong-completion'] as const
     const broker = await f.create();
     const receipt = structuredClone(Reflect.get(broker, 'unlaunchedRollback'));
     if (failure === 'timeout') vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const attempted = vi.fn();
     hooks.transport = (() => {
+      attempted();
       if (failure === 'spawn') throw Error('fixture spawn unavailable');
       return fakeJanitor(failure === 'timeout' ? 'hold' : failure);
     }) as unknown as typeof spawn;
     const first = broker.rollbackUnlaunchedProvisioning();
     if (failure === 'timeout') {
-      await Promise.resolve();
-      await Promise.resolve();
+      // The durable receipt must finish publication before the helper starts.
+      await vi.waitFor(() => expect(attempted).toHaveBeenCalledOnce());
       await vi.advanceTimersByTimeAsync(2_000);
     }
     await first;
@@ -292,6 +294,13 @@ os.fsync=directory_sync_unsupported
         options
       )) as typeof spawn;
     await expect(f.create()).rejects.toThrow('fixture provisioning fsync failed');
+    const receipt = hooks.receipt!;
+    await expect(fs.lstat(join(f.session, receipt.incarnation))).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(f.session)).toEqual([`.rollback-${receipt.incarnation}.json`]);
+    const cleanup = await vi.importActual<typeof import('../src/recovery/codex-broker-cleanup.js')>(
+      '../src/recovery/codex-broker-cleanup.js'
+    );
+    expect(await cleanup.rollbackCodexBrokerProvisioning(receipt, spawn, false)).toBe(true);
     expect(await fs.readdir(f.session)).toEqual([]);
   }
 );
