@@ -3310,8 +3310,8 @@ Object.assign(CodemanApp.prototype, {
   /** Keep the launch surfaces in sync with Settings mutations without a reload. */
   _syncCliLaunchCatalog() {
     if (!Array.isArray(this._cliList) || this._cliList.length === 0) return;
-    // /api/clis rows carry no capabilities, so keep the served catalog's `external`
-    // (isExternalCliSession() reads it). A new custom CLI has none and falls back to `kind`.
+    // /api/clis rows carry no capabilities, so retain the served external and
+    // recovery capabilities. New custom entries cannot acquire them from this list.
     const previous = new Map(
       (Array.isArray(window.__codemanCliCatalog) ? window.__codemanCliCatalog : []).map((cli) => [cli.id, cli])
     );
@@ -3322,6 +3322,7 @@ Object.assign(CodemanApp.prototype, {
       order: cli.order,
       kind: cli.kind,
       external: previous.get(cli.id)?.external,
+      recovery: previous.get(cli.id)?.recovery ?? previous.get(cli.id)?.capabilities?.recovery,
       enabled: cli.enabled,
       available: cli.kind === 'shell' || (cli.enabled && cli.installed),
     }));

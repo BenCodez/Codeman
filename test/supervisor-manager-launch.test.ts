@@ -1,5 +1,6 @@
 /** Actual private profile files and Session conversion; all native effects are explicit fakes. */
 import fs from 'node:fs/promises';
+import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { execFile } from 'node:child_process';
@@ -54,6 +55,216 @@ async function profile() {
   expect(prepared).toBeDefined();
   return { ...p, profile: prepared! };
 }
+
+function prepareAt(p: { home: string; work: string }, isCurrent = () => true) {
+  return prepareSupervisorManagerLaunch({
+    home: p.home,
+    workingDir: p.work,
+    conversationId: CID,
+    expectedPane: { paneId: '%7', panePid: 600 },
+    token: TOKEN,
+    endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp',
+    bridgeCommand: 'codeman',
+    bridgeArgs: ['agent', 'supervisor-mcp'],
+    isCurrent,
+  });
+}
+
+it.each(['config.toml', 'requirements.toml', 'managed_config.toml'])(
+  'refuses an inherited system %s catalog before creating artifacts',
+  async (name) => {
+    const p = await paths(),
+      system = join(p.root, 'system');
+    await fs.mkdir(system);
+    await fs.writeFile(join(system, name), '[mcp_servers.foreign]\ncommand="unrestricted"\n');
+    const original = fs.lstat.bind(fs);
+    vi.spyOn(fs, 'lstat').mockImplementation((...args) =>
+      original(String(args[0]) === '/etc/codex' ? system : args[0], args[1])
+    );
+    expect(await prepareAt(p)).toBeUndefined();
+    expect(await fs.readdir(p.home)).toEqual([]);
+    expect(await fs.readFile(join(system, name), 'utf8')).toContain('unrestricted');
+  }
+);
+
+it.each(['managed_config.toml', 'cloud-config-bundle-cache.json'])(
+  'refuses unknown inherited %s evidence instead of merging it',
+  async (name) => {
+    const p = await paths(),
+      file = join(p.home, name),
+      bytes = 'unverified managed MCP bundle';
+    await fs.writeFile(file, bytes);
+    expect(await prepareAt(p)).toBeUndefined();
+    expect(await fs.readdir(p.home)).toEqual([name]);
+    expect(await fs.readFile(file, 'utf8')).toBe(bytes);
+  }
+);
+
+it('refuses unreadable system configuration evidence before any private artifacts', async () => {
+  const p = await paths(),
+    original = fs.lstat.bind(fs);
+  vi.spyOn(fs, 'lstat').mockImplementation((...args) =>
+    String(args[0]) === '/etc/codex'
+      ? Promise.reject(Object.assign(new Error('unreadable system policy'), { code: 'EACCES' }))
+      : original(...args)
+  );
+  expect(await prepareAt(p)).toBeUndefined();
+  expect(await fs.readdir(p.home)).toEqual([]);
+});
+
+it('pins the verified absent system parent and rejects its symlink or later replacement', async () => {
+  const p = await profile(),
+    system = join(p.root, 'managed'),
+    link = join(p.root, 'managed-link');
+  expect(p.profile.missing).toContain('/etc/codex');
+  await fs.mkdir(system);
+  await fs.symlink(system, link);
+  const original = fs.lstat.bind(fs);
+  vi.spyOn(fs, 'lstat').mockImplementation((...args) =>
+    original(String(args[0]) === '/etc/codex' ? link : args[0], args[1])
+  );
+  expect(await p.profile.confirm()).toBe(false);
+  await p.profile.revoke();
+  expect(await prepareAt(p)).toBeUndefined();
+  expect((await fs.lstat(link)).isSymbolicLink()).toBe(true);
+});
+
+it('admits and pins synthetic API-key-only file auth while excluding keyring and external managed identities', async () => {
+  const p = await paths(),
+    path = join(p.home, 'auth.json');
+  const bytes = JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: 'synthetic-not-a-real-key', tokens: null });
+  await fs.writeFile(path, bytes, { mode: 0o600 });
+  const prepared = await prepareAt(p);
+  expect(prepared).toBeDefined();
+  expect(prepared!.files.some((file) => file.path === path)).toBe(true);
+  expect(await prepared!.confirm()).toBe(true);
+  const command = supervisorManagerCommand(prepared!, { noDaemon: true });
+  expect(command).toContain('cli_auth_credentials_store="file"');
+  for (const key of [
+    'CODEX_ACCESS_TOKEN',
+    'OPENAI_FEDERATION_RULE_ID',
+    'OPENAI_IDENTITY_TOKEN_FILE',
+    'OPENAI_WORKLOAD_IDENTITY_CONTEXT',
+  ])
+    expect(command).toContain(`-u ${key}`);
+  expect(command).not.toContain('synthetic-not-a-real-key');
+  await fs.rename(path, path + '.old');
+  await fs.writeFile(path, bytes, { mode: 0o600 });
+  expect(await prepared!.confirm()).toBe(false);
+  await prepared!.revoke();
+  expect(await fs.readFile(path, 'utf8')).toBe(bytes);
+});
+
+it.each([
+  { auth_mode: 'chatgpt', tokens: { access_token: 'synthetic' } },
+  { auth_mode: 'apikey', OPENAI_API_KEY: 'synthetic', tokens: { access_token: 'synthetic' } },
+  { auth_mode: 'agentIdentity', agent_identity: 'synthetic' },
+  { OPENAI_API_KEY: 'synthetic', unknown_policy: {} },
+])('refuses incomplete or managed auth evidence without modifying it: %j', async (auth) => {
+  const p = await paths(),
+    path = join(p.home, 'auth.json'),
+    bytes = JSON.stringify(auth);
+  await fs.writeFile(path, bytes, { mode: 0o600 });
+  expect(await prepareAt(p)).toBeUndefined();
+  expect(await fs.readdir(p.home)).toEqual(['auth.json']);
+  expect(await fs.readFile(path, 'utf8')).toBe(bytes);
+});
+
+it.each(['credential', 'profile', 'directory'] as const)(
+  'cleans every unsuccessful preparation after %s IO fails while authority remains current',
+  async (stage) => {
+    const p = await paths(),
+      original = fs.open.bind(fs);
+    let failed = false;
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const fd = await original(...args),
+        path = String(args[0]);
+      if (
+        !failed &&
+        ((stage === 'credential' && path.endsWith('credential.json')) ||
+          (stage === 'profile' && path.endsWith('.config.toml')) ||
+          (stage === 'directory' && path === p.home))
+      ) {
+        vi.spyOn(fd, 'sync').mockImplementation(async () => {
+          failed = true;
+          throw Object.assign(new Error('fixture IO failure'), { code: 'EIO' });
+        });
+      }
+      return fd;
+    });
+    const current = vi.fn(() => true);
+    expect(await prepareAt(p, current)).toBeUndefined();
+    expect(failed).toBe(true);
+    expect(current()).toBe(true);
+    expect(await fs.readdir(p.home)).toEqual([]);
+  }
+);
+
+it('preserves a same-byte foreign profile replacement on failed preparation', async () => {
+  const p = await paths(),
+    original = fs.open.bind(fs);
+  let foreign: string | undefined,
+    inode = 0;
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const fd = await original(...args),
+      path = String(args[0]);
+    if (path.endsWith('.config.toml') && (Number(args[1]) & 1) !== 0) {
+      vi.spyOn(fd, 'sync').mockImplementation(async () => {
+        const bytes = await fs.readFile(path);
+        await fs.rename(path, path + '.original');
+        await fs.writeFile(path, bytes, { mode: 0o600 });
+        foreign = path;
+        inode = (await fs.lstat(path)).ino;
+        throw Object.assign(new Error('fixture IO failure'), { code: 'EIO' });
+      });
+    }
+    return fd;
+  });
+  expect(await prepareAt(p)).toBeUndefined();
+  expect(foreign).toBeDefined();
+  expect((await fs.lstat(foreign!)).ino).toBe(inode);
+  expect(await fs.readFile(foreign!, 'utf8')).toContain('mcp_servers.codeman_supervisor');
+});
+
+it('cleans its credential directory but never a foreign exclusive-open profile collision', async () => {
+  const p = await paths(),
+    original = fs.open.bind(fs);
+  let foreign: string | undefined;
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const path = String(args[0]);
+    if (!foreign && path.endsWith('.config.toml') && (Number(args[1]) & constants.O_EXCL) !== 0) {
+      foreign = path;
+      await fs.writeFile(path, 'foreign collision', { mode: 0o600 });
+    }
+    return original(...args);
+  });
+  expect(await prepareAt(p)).toBeUndefined();
+  expect(foreign).toBeDefined();
+  expect(await fs.readFile(foreign!, 'utf8')).toBe('foreign collision');
+  expect(await fs.readdir(p.home)).toEqual([foreign!.slice(p.home.length + 1)]);
+});
+
+it('retains failed-preparation files when their contents cannot be verified for cleanup', async () => {
+  const p = await paths(),
+    original = fs.open.bind(fs);
+  let failed = false;
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const path = String(args[0]);
+    if (failed && path.endsWith('.config.toml') && (Number(args[1]) & 1) === 0)
+      throw Object.assign(new Error('cleanup proof unavailable'), { code: 'EACCES' });
+    const fd = await original(...args);
+    if (path.endsWith('.config.toml') && (Number(args[1]) & 1) !== 0)
+      vi.spyOn(fd, 'sync').mockImplementation(async () => {
+        failed = true;
+        throw Object.assign(new Error('lost IO acknowledgement'), { code: 'EIO' });
+      });
+    return fd;
+  });
+  expect(await prepareAt(p)).toBeUndefined();
+  expect(failed).toBe(true);
+  expect((await fs.readdir(p.home)).filter((name) => name.startsWith('codeman-supervisor-'))).toHaveLength(1);
+  expect((await fs.readdir(p.home)).filter((name) => name.startsWith('.codeman-supervisor-'))).toHaveLength(1);
+});
 
 it('loads the exact adjacent named profile and keeps the only credential in its private JSON file', async () => {
   const p = await paths();

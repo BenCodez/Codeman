@@ -12,6 +12,7 @@ import { subagentWatcher } from '../src/subagent-watcher.js';
 import type { TerminalMultiplexer } from '../src/mux-interface.js';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 import { OwnedRemoteBrokerCache, ownedRemoteBrokerCache as cache } from '../src/recovery/remote-input-broker-cache.js';
+import * as remoteCleanup from '../src/recovery/remote-broker-cleanup.js';
 import { registerSessionRoutes } from '../src/web/routes/session-routes.js';
 import { installRouteErrorHandler } from '../src/web/route-error-handler.js';
 import { createMockRouteContext } from './mocks/index.js';
@@ -34,6 +35,9 @@ async function fixture(
     directory: string;
   }) => Promise<void>
 ) {
+  // This fixture owns only source-host files; remote cleanup has a separate
+  // real generated-script/fake-SSH suite. Never contact its synthetic host.
+  vi.spyOn(remoteCleanup, 'cleanupRemoteBroker').mockResolvedValue(true);
   const root = await fs.mkdtemp(join(homedir(), 'remote-cache-cleanup-'));
   const previousCacheRoot = Reflect.get(cache, 'root');
   Reflect.set(cache, 'root', join(root, 'private-brokers'));
@@ -559,3 +563,41 @@ it('does not use a different retired-state intent between ACK and the final rout
       await route.stop();
     }
   }));
+
+it.each(['live', 'persisted'] as const)(
+  'durably retains the original owned SSH target and source secret after offline %s final deletion',
+  async (kind) =>
+    fixture(async ({ internal, server, session, material, scope }) => {
+      const remote = vi.mocked(remoteCleanup.cleanupRemoteBroker).mockResolvedValue(false);
+      const cacheRoot = Reflect.get(cache, 'root') as string;
+      const privateFile = join(cacheRoot, session.id, material.config.incarnation, 'private.json');
+      const original = await fs.readFile(privateFile);
+      if (kind === 'persisted')
+        await server.discardPartiallyBuiltSession(session.id, session, { preserveMuxPane: true });
+      const route = await ownerDeleteApp(internal, session);
+      try {
+        expect((await route.app.inject({ method: 'DELETE', url: '/api/sessions/' + session.id })).statusCode).toBe(200);
+      } finally {
+        await route.stop();
+      }
+      expect(internal.store.getSession(session.id)).toBeNull();
+      expect(await fs.readFile(privateFile)).toEqual(original);
+      const intent = JSON.parse(await fs.readFile(join(cacheRoot, session.id + '.cleanup.json'), 'utf8'));
+      expect(intent.target).toEqual({ remote: scope.remote, owner: session.owner });
+      expect(remote).toHaveBeenCalled();
+      expect(remote.mock.calls.every(([target]) => JSON.stringify(target) === JSON.stringify(intent.target))).toBe(
+        true
+      );
+      // Recreated cache has no captured Session or request closure, yet the same
+      // bounded janitor still has the exact host/owner and every incarnation key.
+      remote.mockResolvedValue(true);
+      const reopened = new OwnedRemoteBrokerCache(cacheRoot);
+      const stop = reopened.startFinalCleanupRetries(() => ({ live: false }));
+      try {
+        await vi.waitFor(async () => expect(await fs.readdir(join(cacheRoot, session.id))).toEqual([]));
+        await expect(fs.lstat(join(cacheRoot, session.id + '.cleanup.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+      } finally {
+        await stop();
+      }
+    })
+);

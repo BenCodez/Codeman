@@ -78,7 +78,7 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
       return operationFailure(
         reply,
         error,
-        'Restricted manager requires authentication and a verified idle conversation without unresolved work'
+        'Restricted manager requires authentication, a verified idle conversation, and verifiable unmanaged Linux configuration with file-only API-key authentication'
       );
     }
   });

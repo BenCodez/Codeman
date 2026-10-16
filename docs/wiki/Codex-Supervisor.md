@@ -4,6 +4,8 @@ Codeman can assign one local Codex session as an optional manager for a bounded 
 
 Preparation explicitly restarts only the selected manager session in place, resuming its freshly verified conversation UUID with the same Codex home, model and effort. It requires fresh idle or completed evidence, an empty composer, no pending child work, and no unresolved task, recovery or supervisor operation. Unknown identity, stale evidence, active work and uncertain delivery refuse conversion. Codeman never falls back to a fresh conversation. Preparation alone does not start the supervisor objective.
 
+Restricted manager preparation currently supports unmanaged Linux configuration only. `/etc/codex` must be absent, and the selected Codex home must have no managed defaults or cloud configuration cache. Its `auth.json` must be absent or contain only API-key authentication; ChatGPT, enterprise, agent-identity and unknown authentication cannot establish that no additional managed MCP catalog will load. The restricted process uses file-only credential storage and excludes inherited access-token/workload-identity authentication. Existing authentication and configuration files are never rewritten. When this evidence is unavailable, preparation is refused; ordinary sessions and owner controls remain available.
+
 The prepared process uses a private restricted Codex profile and a credential bound to that exact launch. It has no ordinary command, patch, app, plugin or subagent tools, and exposes only these supervisor tools through a dedicated MCP bridge:
 
 - `supervisor_status`: inspect this manager role and durable operation receipts.

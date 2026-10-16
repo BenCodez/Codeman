@@ -58,6 +58,8 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
     '--config',
     'tools.view_image=false',
     '--config',
+    'cli_auth_credentials_store="file"',
+    '--config',
     'web_search="disabled"',
     '--profile',
     profile.name,
@@ -66,7 +68,7 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
   );
   // Unset after tmux's normal exports: neither inherited server credentials nor
   // hooks are available to this restricted process or its one trusted bridge.
-  return `env -u CODEMAN_PASSWORD -u CODEMAN_USERNAME -u CODEMAN_HOOK_SECRET -u CODEMAN_HOOK_SECRET_FILE -u CODEMAN_QR_TOKEN CODEMAN_SUPERVISOR_SCOPED=1 ${args.map(quote).join(' ')}`;
+  return `env -u CODEMAN_PASSWORD -u CODEMAN_USERNAME -u CODEMAN_HOOK_SECRET -u CODEMAN_HOOK_SECRET_FILE -u CODEMAN_QR_TOKEN -u CODEX_ACCESS_TOKEN -u OPENAI_FEDERATION_RULE_ID -u OPENAI_IDENTITY_TOKEN_FILE -u OPENAI_WORKLOAD_IDENTITY_CONTEXT CODEMAN_SUPERVISOR_SCOPED=1 ${args.map(quote).join(' ')}`;
 }
 
 export async function prepareSupervisorManagerLaunch(options: {
@@ -83,6 +85,7 @@ export async function prepareSupervisorManagerLaunch(options: {
 }): Promise<SupervisorManagerLaunch | undefined> {
   const { home, workingDir, conversationId } = options;
   if (
+    process.platform !== 'linux' ||
     !/^%(?:0|[1-9]\d{0,9})$/.test(options.expectedPane.paneId) ||
     !Number.isSafeInteger(options.expectedPane.panePid) ||
     options.expectedPane.panePid <= 0 ||
@@ -104,6 +107,10 @@ export async function prepareSupervisorManagerLaunch(options: {
   let owned: Stats | undefined;
   let credentialOwned: Stats | undefined;
   let directoryOwned: Stats | undefined;
+  let homeOwned: Stats | undefined;
+  let successful = false;
+  let profileText: string | undefined;
+  const credentialText = JSON.stringify({ version: 1, url: options.endpoint, token: options.token });
   pending.add(home);
   const work = (async (): Promise<SupervisorManagerLaunch | undefined> => {
     const files: PrivateFileWitness[] = (options.additionalFiles ?? []).map((value) => ({ ...value })),
@@ -147,7 +154,7 @@ export async function prepareSupervisorManagerLaunch(options: {
       return bytes.toString('utf8');
     };
     try {
-      const homeOwned = await fs.lstat(home);
+      homeOwned = await fs.lstat(home);
       if (
         (await fs.realpath(home)) !== home ||
         (await fs.realpath(workingDir)) !== resolve(workingDir) ||
@@ -156,15 +163,66 @@ export async function prepareSupervisorManagerLaunch(options: {
         !current()
       )
         return undefined;
+      // System/legacy/MDM policy can override CLI restrictions. The supported
+      // subset excludes those sources instead of guessing the merged catalog.
+      for (const path of [
+        '/etc/codex',
+        join(home, 'managed_config.toml'),
+        join(home, 'cloud-config-bundle-cache.json'),
+      ]) {
+        try {
+          await fs.lstat(path);
+          return undefined;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return undefined;
+          missing.push(path);
+        }
+        if (!current()) return undefined;
+      }
       // Existing MCP/plugin catalogs cannot be silently merged into this role.
       // Project config is deliberately refused; owner settings remain untouched.
       const base = await read(join(home, 'config.toml'));
       if (base !== undefined) {
         const config = parse(base);
         if (
-          ['mcp_servers', 'plugins', 'apps', 'hooks', 'notify', 'profiles', 'profile'].some(
-            (key) => config[key] !== undefined
-          )
+          [
+            'mcp_servers',
+            'plugins',
+            'apps',
+            'hooks',
+            'notify',
+            'profiles',
+            'profile',
+            'forced_login_method',
+            'forced_chatgpt_workspace_id',
+          ].some((key) => config[key] !== undefined)
+        )
+          return undefined;
+      }
+      // A new no-daemon process has no ephemeral auth. Force file-only storage
+      // and admit only no stored auth or the documented API-key-only shape.
+      // ChatGPT/PAT/agent-identity auth can fetch an enterprise bundle at launch.
+      const authText = await read(join(home, 'auth.json'));
+      if (authText !== undefined) {
+        const auth: unknown = JSON.parse(authText);
+        if (!auth || typeof auth !== 'object' || Array.isArray(auth)) return undefined;
+        const value = auth as Record<string, unknown>;
+        const allowed = new Set([
+          'auth_mode',
+          'OPENAI_API_KEY',
+          'tokens',
+          'last_refresh',
+          'agent_identity',
+          'personal_access_token',
+          'bedrock_api_key',
+          'bedrock_access_keys',
+        ]);
+        if (
+          Object.keys(value).some((key) => !allowed.has(key)) ||
+          (value.auth_mode !== undefined && value.auth_mode !== null && value.auth_mode !== 'apikey') ||
+          typeof value.OPENAI_API_KEY !== 'string' ||
+          !value.OPENAI_API_KEY.trim() ||
+          Object.keys(value).some((key) => !['auth_mode', 'OPENAI_API_KEY'].includes(key) && value[key] !== null)
         )
           return undefined;
       }
@@ -199,14 +257,14 @@ export async function prepareSupervisorManagerLaunch(options: {
       );
       try {
         credentialOwned = await credentialFd.stat();
-        await credentialFd.writeFile(JSON.stringify({ version: 1, url: options.endpoint, token: options.token }));
+        await credentialFd.writeFile(credentialText);
         await credentialFd.sync();
       } finally {
         await credentialFd.close();
       }
       await read(credentialFile);
       // The bridge gets a path, never the credential in its process arguments.
-      const profile = stringify({
+      const profile = (profileText = stringify({
         features: {
           shell_tool: false,
           apply_patch_freeform: false,
@@ -218,6 +276,7 @@ export async function prepareSupervisorManagerLaunch(options: {
         },
         web_search: 'disabled',
         tools: { view_image: false },
+        cli_auth_credentials_store: 'file',
         mcp_servers: {
           codeman_supervisor: {
             command: options.bridgeCommand,
@@ -226,7 +285,7 @@ export async function prepareSupervisorManagerLaunch(options: {
             required: true,
           },
         },
-      });
+      }));
       if (!current() || Buffer.byteLength(profile) > MAX_FILE) return undefined;
       const fd = await fs.open(
         file,
@@ -248,6 +307,7 @@ export async function prepareSupervisorManagerLaunch(options: {
       }
       await read(file);
       const privateOwned = await fs.lstat(privateDirectory);
+      const preparedHome = homeOwned;
       const artifactFiles = files.filter((value) => value.path === file || value.path === credentialFile);
       if (
         !owned ||
@@ -282,7 +342,7 @@ export async function prepareSupervisorManagerLaunch(options: {
             .then(async () => {
               const current = () => performance.now() < limit;
               const directories = [
-                [home, homeOwned],
+                [home, preparedHome],
                 [privateDirectory, privateOwned],
               ] as const;
               const directoriesCurrent = async () => {
@@ -390,31 +450,74 @@ export async function prepareSupervisorManagerLaunch(options: {
       });
       if (!current()) return undefined;
       issued.add(result);
+      successful = true;
       return result;
     } catch {
       return undefined;
     } finally {
-      // Failed preparation never deletes a foreign collision or replacement.
-      if (!current()) {
-        for (const [path, stat] of [
-          [file, owned],
-          [credentialFile, credentialOwned],
-        ] as const)
-          if (stat)
-            try {
-              const now = await fs.lstat(path);
-              if (now.dev === stat.dev && now.ino === stat.ino) await fs.unlink(path);
-            } catch {
-              /* Retain unknown material. */
+      // Every unsuccessful construction retires its known artifacts, including
+      // ordinary IO errors while owner authority is still current.
+      if (!successful && homeOwned && directoryOwned)
+        await (async () => {
+          const limit = performance.now() + 2_000;
+          const directoriesCurrent = async () => {
+            for (const [path, expected] of [
+              [home, homeOwned!],
+              [privateDirectory, directoryOwned!],
+            ] as const) {
+              const stat = await fs.lstat(path);
+              if (
+                !stat.isDirectory() ||
+                stat.isSymbolicLink() ||
+                stat.dev !== expected.dev ||
+                stat.ino !== expected.ino
+              )
+                return false;
             }
-        if (directoryOwned)
-          try {
-            const now = await fs.lstat(privateDirectory);
-            if (now.dev === directoryOwned.dev && now.ino === directoryOwned.ino) await fs.rmdir(privateDirectory);
-          } catch {
-            /* Never recurse. */
+            return performance.now() < limit;
+          };
+          if (!(await directoriesCurrent())) return;
+          const artifacts: PrivateFileWitness[] = [];
+          for (const [path, created, text] of [
+            [file, owned, profileText],
+            [credentialFile, credentialOwned, credentialText],
+          ] as const) {
+            if (!created) continue; // A failed exclusive open never owns its collision.
+            if (text === undefined) return;
+            const stat = await fs.lstat(path);
+            if (
+              !stat.isFile() ||
+              stat.isSymbolicLink() ||
+              stat.dev !== created.dev ||
+              stat.ino !== created.ino ||
+              stat.size !== Buffer.byteLength(text)
+            )
+              return;
+            artifacts.push({
+              path,
+              dev: stat.dev,
+              ino: stat.ino,
+              size: stat.size,
+              mtimeMs: stat.mtimeMs,
+              ctimeMs: stat.ctimeMs,
+              hash: createHash('sha256').update(text).digest('hex'),
+              maxBytes: MAX_FILE,
+            });
           }
-      }
+          if (artifacts.length && !(await checkPrivateFileWitnesses(artifacts, limit))) return;
+          if (!(await directoriesCurrent())) return;
+          for (const witness of artifacts) if (!same(await fs.lstat(witness.path), witness)) return;
+          for (const witness of artifacts) {
+            if (
+              !(await directoriesCurrent()) ||
+              !same(await fs.lstat(witness.path), witness) ||
+              performance.now() >= limit
+            )
+              return;
+            await fs.unlink(witness.path);
+          }
+          if (await directoriesCurrent()) await fs.rmdir(privateDirectory); // Never recurse.
+        })().catch(() => {}); // Unknown IO/inodes/bytes are retained.
     }
   })();
   pendingWork.set(home, work);
