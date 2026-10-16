@@ -1,4 +1,4 @@
-/** Private source-host material for controlled owned-SSH launches; never remote adoption. */
+/** @fileoverview Private source-host material for controlled owned-SSH launches; never remote adoption. */
 import { createHash, randomUUID } from 'node:crypto';
 import { constants, lstatSync, type Dir, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -118,6 +118,21 @@ function scopeKey(scope: OwnedRemoteBrokerScope): string | undefined {
   } catch {
     return undefined;
   }
+}
+// Wake settings are refreshed from host configuration on restart, but are not
+// SSH authority. Keep the complete launch-scope hash for cache authentication;
+// only final retirement may disregard these two mutable wake-only fields.
+function cleanupScopeKey(scope: OwnedRemoteBrokerScope): string | undefined {
+  const remote = { ...scope.remote };
+  delete remote.wakeCommand;
+  delete remote.wakeMac;
+  return scopeKey({ ...scope, remote });
+}
+function matchesCleanupTarget(scope: OwnedRemoteBrokerScope, target: RemoteBrokerCleanupTarget): boolean {
+  const expected = cleanupScopeKey(scope);
+  return (
+    expected !== undefined && cleanupScopeKey({ ...scope, remote: target.remote, owner: target.owner }) === expected
+  );
 }
 function privateStat(value: Stats, directory = false): boolean {
   return (
@@ -763,7 +778,7 @@ export class OwnedRemoteBrokerCache {
                   if (
                     target &&
                     (!value.scopeData ||
-                      scopeKey({ ...value.scopeData, remote: target.remote, owner: target.owner }) !== value.scope ||
+                      !matchesCleanupTarget(value.scopeData, target) ||
                       !(await (this.remoteCleanup ?? cleanupRemoteBroker)(
                         target,
                         value.directory,
