@@ -1899,6 +1899,17 @@ export function registerSessionRoutes(
           notSent: true,
         });
       }
+      const deadInputResponse = (notSent: boolean) =>
+        reply.code(409).send({
+          ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'The worker has exited; retry input after it restarts'),
+          retryable: true,
+          ...(notSent ? { notSent: true } : {}),
+        });
+      const inputKnownUnsent = () =>
+        !session.hasAppliedInputSeq(clientId as string, seq as number) && !session.paneLifecycleInFlight;
+      // Cached local-worker observations do not probe tmux per browser frame.
+      // Keep the FIFO slot without admission, input side effects or an ACK.
+      if (tagged && session.paneExit) return deadInputResponse(inputKnownUnsent());
       if (session.recoveryInputReserved) {
         return createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Recovery is delivering input; retry the input');
       }
@@ -1983,9 +1994,13 @@ export function registerSessionRoutes(
           }
         }
 
+        // Wake and identity work may yield while a cached exit is observed.
+        if (tagged && session.paneExit) return deadInputResponse(inputKnownUnsent());
+
         // Only a waiting request pays for the tmux probe: the browser's plain input path
         // (thousands of calls per session) must stay exec-free.
         const workerDead = wantsWait && workerIsDead(ctx.mux, session);
+        if (tagged && workerDead) return deadInputResponse(inputKnownUnsent());
 
         const timeoutMs = clampWaitMs(waitTimeout ?? undefined);
         // Same slot leak as the GET routes: a client that gives up mid-wait would
@@ -2123,6 +2138,7 @@ export function registerSessionRoutes(
           }
         }
 
+        if (tagged && session.paneExit) return deadInputResponse(!delivered && !duplicate && inputKnownUnsent());
         if (!duplicate && tagged && delivered && !workerDead) session.commitInputSeq(clientId as string, seq as number);
 
         releaseInputDispatch();
