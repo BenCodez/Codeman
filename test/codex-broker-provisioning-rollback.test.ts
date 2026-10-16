@@ -6,6 +6,8 @@ import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { BrokerProvisioningRollback } from '../src/recovery/codex-broker-cleanup.js';
 
@@ -13,6 +15,7 @@ const hooks = vi.hoisted(() => ({
   before: undefined as ((receipt: BrokerProvisioningRollback) => Promise<void>) | undefined,
   transport: undefined as typeof spawn | undefined,
   receipt: undefined as BrokerProvisioningRollback | undefined,
+  retry: false,
 }));
 vi.mock('../src/recovery/codex-broker-cleanup.js', async (original) => {
   const actual = await original<typeof import('../src/recovery/codex-broker-cleanup.js')>();
@@ -22,7 +25,7 @@ vi.mock('../src/recovery/codex-broker-cleanup.js', async (original) => {
     rollbackCodexBrokerProvisioning: vi.fn(async (receipt: BrokerProvisioningRollback) => {
       hooks.receipt = structuredClone(receipt);
       await hooks.before?.(receipt);
-      await actual.rollbackCodexBrokerProvisioning(receipt, hooks.transport ?? spawn);
+      return actual.rollbackCodexBrokerProvisioning(receipt, hooks.transport ?? spawn, hooks.retry);
     }),
   };
 });
@@ -34,8 +37,11 @@ beforeEach(() => {
   hooks.before = undefined;
   hooks.transport = undefined;
   hooks.receipt = undefined;
+  hooks.retry = false;
 });
 afterEach(async () => {
+  if (vi.isFakeTimers()) vi.clearAllTimers();
+  vi.useRealTimers();
   vi.restoreAllMocks();
   for (const holder of holders.splice(0)) {
     if (holder.exitCode === null) {
@@ -46,6 +52,169 @@ afterEach(async () => {
   }
   for (const root of roots.splice(0)) await fs.rm(root, { recursive: true, force: true });
 });
+
+function fakeJanitor(outcome: 'hold' | 'error' | 'ready-only' | 'wrong-completion') {
+  const child = Object.assign(new EventEmitter(), {
+    stdin: new PassThrough(),
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    kill: vi.fn(() => {
+      queueMicrotask(() => child.emit('close', 137));
+      return true;
+    }),
+  });
+  child.stdin.on('data', (raw) => {
+    const text = String(raw).trim();
+    if (text === 'ACK') {
+      if (outcome === 'wrong-completion') child.stdout.write('{"rolledBack":"unrelated"}\n');
+      else if (outcome === 'ready-only') queueMicrotask(() => child.emit('close', 0));
+    } else if (outcome === 'error') queueMicrotask(() => child.emit('error', Error('fixture janitor error')));
+    else if (outcome === 'ready-only' || outcome === 'wrong-completion') {
+      const receipt = JSON.parse(text).rollback as BrokerProvisioningRollback;
+      child.stdout.write(JSON.stringify({ rollback: `${receipt.sessionId}/${receipt.incarnation}` }) + '\n');
+    }
+  });
+  return child;
+}
+
+it.each(['spawn', 'error', 'timeout', 'ready-only', 'wrong-completion'] as const)(
+  'retains the exact rollback receipt after %s and clears it only after confirmed deletion',
+  async (failure) => {
+    const f = await fixture();
+    f.fail('none');
+    const broker = await f.create();
+    const receipt = structuredClone(Reflect.get(broker, 'unlaunchedRollback'));
+    if (failure === 'timeout') vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    hooks.transport = (() => {
+      if (failure === 'spawn') throw Error('fixture spawn unavailable');
+      return fakeJanitor(failure === 'timeout' ? 'hold' : failure);
+    }) as unknown as typeof spawn;
+    const first = broker.rollbackUnlaunchedProvisioning();
+    if (failure === 'timeout') {
+      await Promise.resolve();
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2_000);
+    }
+    await first;
+    expect(Reflect.get(broker, 'unlaunchedRollback')).toEqual(receipt);
+    expect(await fs.readdir(broker.directory)).toEqual(['broker.py', 'config.json', 'lock']);
+    hooks.transport = undefined;
+    await broker.rollbackUnlaunchedProvisioning();
+    expect(Reflect.get(broker, 'unlaunchedRollback')).toBeUndefined();
+    expect(hooks.receipt).toEqual(receipt);
+    expect(await fs.readdir(f.session)).toEqual([]);
+  }
+);
+
+it('retries an exact capacity-refused receipt after other janitors release their slots', async () => {
+  const f = await fixture();
+  f.fail('none');
+  const [first, second, pending] = [await f.create(), await f.create(), await f.create()];
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const held = [fakeJanitor('hold'), fakeJanitor('hold')];
+  let index = 0;
+  hooks.transport = (() => held[index++]) as unknown as typeof spawn;
+  const work = [first.rollbackUnlaunchedProvisioning(), second.rollbackUnlaunchedProvisioning()];
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
+  let closed!: Promise<unknown>;
+  const retried = vi.fn((...args: Parameters<typeof spawn>) => {
+    const child = spawn(...args);
+    closed = once(child, 'close');
+    return child;
+  });
+  hooks.transport = retried as typeof spawn;
+  hooks.retry = true;
+  await pending.rollbackUnlaunchedProvisioning();
+  expect(retried).not.toHaveBeenCalled();
+  expect(Reflect.get(pending, 'unlaunchedRollback')).toBeDefined();
+  for (const child of held) child.emit('close', 0);
+  await Promise.all(work);
+  await vi.advanceTimersByTimeAsync(2_100);
+  expect(retried).toHaveBeenCalledTimes(1);
+  await closed;
+  await expect(fs.stat(pending.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+  await pending.rollbackUnlaunchedProvisioning();
+  expect(Reflect.get(pending, 'unlaunchedRollback')).toBeUndefined();
+});
+
+it('bounds automatic retries while retaining the receipt for a later explicit retry', async () => {
+  const f = await fixture();
+  f.fail('none');
+  const broker = await f.create();
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  const unavailable = vi.fn(() => {
+    throw Error('fixture persistent spawn failure');
+  });
+  hooks.transport = unavailable as unknown as typeof spawn;
+  hooks.retry = true;
+  await broker.rollbackUnlaunchedProvisioning();
+  await vi.advanceTimersByTimeAsync(20_000);
+  expect(unavailable).toHaveBeenCalledTimes(3);
+  expect(Reflect.get(broker, 'unlaunchedRollback')).toBeDefined();
+  hooks.transport = undefined;
+  await broker.rollbackUnlaunchedProvisioning();
+  expect(Reflect.get(broker, 'unlaunchedRollback')).toBeUndefined();
+  expect(await fs.readdir(f.session)).toEqual([]);
+});
+
+it.each([false, true])(
+  'requires anchored absence when the terminal receipt was lost (parent replaced=%s)',
+  async (replaced) => {
+    const f = await fixture();
+    f.fail('none');
+    const broker = await f.create();
+    hooks.transport = ((command: string, args: readonly string[], options: Parameters<typeof spawn>[2]) =>
+      spawn(
+        command,
+        args.map((arg) =>
+          arg.replaceAll("print(json.dumps({'rolledBack':sid+'/'+inc}),flush=True)", 'pass # fixture lost completion')
+        ),
+        options
+      )) as typeof spawn;
+    await broker.rollbackUnlaunchedProvisioning();
+    expect(await fs.readdir(f.session)).toEqual([]);
+    expect(Reflect.get(broker, 'unlaunchedRollback')).toBeDefined();
+    if (replaced) {
+      await fs.rename(f.session, f.session + '.held');
+      await fs.mkdir(f.session, { mode: 0o700 });
+      await fs.writeFile(join(f.session, 'owner-file'), 'keep', { mode: 0o600 });
+    }
+    hooks.transport = undefined;
+    await broker.rollbackUnlaunchedProvisioning();
+    if (replaced) {
+      expect(Reflect.get(broker, 'unlaunchedRollback')).toBeDefined();
+      expect(await fs.readFile(join(f.session, 'owner-file'), 'utf8')).toBe('keep');
+    } else expect(Reflect.get(broker, 'unlaunchedRollback')).toBeUndefined();
+  }
+);
+
+it.each(['unknown-file', 'replacement', 'runtime-reservation'] as const)(
+  'retains the receipt and private files when %s appears before retry',
+  async (change) => {
+    const f = await fixture();
+    f.fail('none');
+    const broker = await f.create();
+    hooks.transport = (() => {
+      throw Error('fixture spawn failed');
+    }) as typeof spawn;
+    await broker.rollbackUnlaunchedProvisioning();
+    const config = join(broker.directory, 'config.json'),
+      bytes = await fs.readFile(config);
+    if (change === 'unknown-file') await fs.writeFile(join(broker.directory, 'owner-file'), 'keep', { mode: 0o600 });
+    else if (change === 'replacement') {
+      await fs.writeFile(config + '.owner', bytes, { mode: 0o600 });
+      await fs.rename(config + '.owner', config);
+    } else
+      await fs.writeFile(join(broker.directory, 'state.json'), '{"receipts":[{"status":"reserved"}]}', { mode: 0o600 });
+    hooks.transport = undefined;
+    await broker.rollbackUnlaunchedProvisioning();
+    expect(Reflect.get(broker, 'unlaunchedRollback')).toBeDefined();
+    expect(await fs.readFile(config)).toEqual(bytes);
+    expect(await fs.readdir(broker.directory)).toContain('lock');
+  }
+);
 async function fixture() {
   const root = await fs.mkdtemp(join(homedir(), 'broker-provision-rollback-'));
   roots.push(root);
