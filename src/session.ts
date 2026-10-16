@@ -2310,6 +2310,9 @@ export class Session extends EventEmitter {
     dispatch: (signal: AbortSignal) => Promise<void>,
     prepare?: () => boolean
   ): Promise<boolean> {
+    // A retained local pane can accept tmux keys after its worker has exited.
+    // Cached death is a pre-delivery refusal, without changing owner intent.
+    if (this.paneExit) return false;
     if (this._inputDeliveryInFlight || this._paneLifecycleOps > 0 || this._closing || this._isStopped) return false;
     const abort = new AbortController();
     this._namedKeyAbort = abort;
@@ -2331,10 +2334,12 @@ export class Session extends EventEmitter {
           return false;
         }
       }
+      if (this.paneExit) return false;
       const submitted = this._trackSubmit(data, { fromUser: true });
       if (abort.signal.aborted) return false;
       await dispatch(abort.signal);
       if (abort.signal.aborted) throw new Error('Named key dispatch cancelled');
+      if (this.paneExit) throw new Error('Named key worker exited during dispatch');
       this._emitSubmittedPrompt(submitted);
       return true;
     } catch (err) {

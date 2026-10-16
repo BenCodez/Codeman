@@ -49,6 +49,25 @@ afterEach(async () => {
 });
 
 describe('named-key input reservation', () => {
+  it('rejects direct named keys on a cached dead worker before preparation or owner intent', async () => {
+    const f = fixture();
+    f.session.setPaneExit({ at: Date.now(), status: 42 });
+    const before = f.session.getRecoveryContext().generation;
+    const intent = vi.fn();
+    f.session.on('recoveryUserInput', intent);
+    const prepare = vi.fn(() => true);
+    const dispatch = vi.fn(async () => {});
+    expect(await f.session.sendNamedKey('\n', dispatch, prepare)).toBe(false);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(intent).not.toHaveBeenCalled();
+    expect(f.session.getRecoveryContext().generation).toBe(before);
+    expect(f.session.lastSubmitAt).toBe(0);
+    f.session.setPaneExit(undefined);
+    expect(await f.session.sendNamedKey('\n', dispatch, prepare)).toBe(true);
+    expect(dispatch).toHaveBeenCalledOnce();
+  });
+
   it('cancels old authority before dispatch and excludes recovery, another key, and text until completion', async () => {
     const f = fixture();
     const done = createDeferred<void>();

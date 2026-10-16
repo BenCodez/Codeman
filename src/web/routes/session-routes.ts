@@ -2297,8 +2297,15 @@ export function registerSessionRoutes(
 
     const session = findSessionOrFail(ctx, id, req);
     const muxName = session.muxName;
+    if (session.paneExit) {
+      return {
+        ...createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'The worker has exited; retry the key after restoration'),
+        retryable: true,
+        notSent: true,
+      };
+    }
     if (session.recoveryInputReserved) {
-      // This is the only send-key failure that certifies no bytes were sent.
+      // Admission refusal certifies no bytes were sent.
       // Unlike ordinary input this endpoint has no seq deduplication, so the
       // browser must not replay a key after an ambiguous tmux/network failure.
       return {
