@@ -1,4 +1,4 @@
-/** Real boot assembly and private offer snapshots; no pane, socket or CLI effects. */
+/** @fileoverview Real boot assembly and private offer snapshots; no pane, socket or CLI effects. */
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -183,3 +183,73 @@ it('retains the old snapshot and fences spending when the merged write is not ac
   expect(local.list(() => true).map((e) => e.sessionId)).toEqual(['old']);
   expect(local.beginSpending('alice')).toBe(false);
 });
+
+it.each(['reload', 'replace-old', 'held-old', 'consume-old'] as const)(
+  'gives new offers their own TTL while retaining original expiry through %s',
+  async (kind) => {
+    const original = JSON.parse(await fs.readFile(path, 'utf8'));
+    const ttl = 86_400_000;
+    const now = vi.spyOn(Date, 'now').mockReturnValue(original.builtAt + ttl - 60_000);
+    const fresh = entry('fresh', 'bob');
+    await boot.call(context({ fresh: fresh.state }), ['fresh'], 0);
+    const merged = JSON.parse(await fs.readFile(path, 'utf8'));
+    expect(merged.builtAt).toBe(original.builtAt);
+    const freshAt = Date.now();
+    if (kind === 'replace-old') {
+      const rescanned = entry('old');
+      await boot.call(context({ old: rescanned.state }), ['old'], 0);
+    }
+    let held: RebootRestoreEntry[] = [];
+    if (kind === 'held-old' || kind === 'consume-old') {
+      expect(registry.beginSpending('alice')).toBe(true);
+      held = registry.take(() => true, ['old'], 'alice');
+      expect(held).toHaveLength(1);
+      if (kind === 'consume-old') {
+        await registry.releaseFlight('alice', []);
+        registry.endSpending('alice');
+      }
+    }
+    now.mockReturnValue(original.builtAt + ttl + 60_000);
+    expect(registry.list(() => true).map((offer) => offer.sessionId)).toEqual(['fresh']);
+    expect(merged.entryBuiltAt).toEqual({ old: original.builtAt, fresh: freshAt });
+    await registry.flush();
+    if (kind === 'held-old') {
+      expect(registry.isHeld(held[0], 'alice')).toBe(false);
+      await registry.releaseFlight('alice', held);
+      registry.endSpending('alice');
+    }
+    registry.reset();
+    await registry.configurePersistence(path);
+    expect(registry.list(() => true).map((offer) => offer.sessionId)).toEqual(['fresh']);
+    expect(registry.beginSpending('bob')).toBe(true);
+    registry.endSpending('bob');
+    now.mockReturnValue(freshAt + ttl + 1);
+    expect(registry.list(() => true)).toEqual([]);
+    await registry.flush();
+    const reopened = new RebootRestoreRegistry();
+    await reopened.configurePersistence(path);
+    expect(reopened.list(() => true)).toEqual([]);
+  }
+);
+it.each(['negative', 'future', 'missing', 'foreign', 'wrong-type', 'wrong-minimum'] as const)(
+  'preserves and refuses malformed per-entry offer ages: %s',
+  async (kind) => {
+    registry.reset();
+    await fs.rm(path + '.previous', { force: true });
+    const builtAt = Date.now() - 1000;
+    const ages: Record<string, unknown> = { old: builtAt };
+    if (kind === 'negative') ages.old = -1;
+    if (kind === 'future') ages.old = Date.now() + 1_000_000;
+    if (kind === 'missing') delete ages.old;
+    if (kind === 'foreign') ages.foreign = builtAt;
+    if (kind === 'wrong-type') ages.old = String(builtAt);
+    if (kind === 'wrong-minimum') ages.old = builtAt + 1;
+    const bytes = JSON.stringify({ version: 1, builtAt, entries: [entry('old')], entryBuiltAt: ages });
+    await fs.writeFile(path, bytes, { mode: 0o600 });
+    await registry.configurePersistence(path);
+    expect(registry.list(() => true)).toEqual([]);
+    expect(registry.getBrokerCleanupState()).toBeUndefined();
+    await expect(registry.set([entry('fresh')])).rejects.toThrow();
+    expect(await fs.readFile(path, 'utf8')).toBe(bytes);
+  }
+);

@@ -190,13 +190,18 @@ def rows_valid(name,value):
             if 'inFlight' in row or 'pending' in row: return False
         return True
     if name in ('reboot-restore-offer.json','reboot-restore-offer.json.previous'):
-        if not isinstance(value,dict) or set(value)!={'version','builtAt','entries'} or type(value['version']) is not int or value['version']!=1 or not nonnegative(value['builtAt']) or value['builtAt']>time.time()*1000 or not isinstance(value['entries'],list) or len(value['entries'])>1000 or (value['entries'] and value['builtAt']==0): return False
+        if not isinstance(value,dict) or not {'version','builtAt','entries'}<=set(value)<={'version','builtAt','entries','entryBuiltAt'} or type(value['version']) is not int or value['version']!=1 or not nonnegative(value['builtAt']) or value['builtAt']>time.time()*1000 or not isinstance(value['entries'],list) or len(value['entries'])>1000 or (value['entries'] and value['builtAt']==0): return False
         for e in value['entries']:
             required={'sessionId','workingDir','mode','resumeConversationId','state'}
             if not isinstance(e,dict) or not required<=set(e)<=required|{'name','owner'} or not identity(e['sessionId']) or not isinstance(e['mode'],str) or not e['mode'] or not isinstance(e['resumeConversationId'],str) or not e['resumeConversationId'] or any(k in e and not isinstance(e[k],str) for k in ('name','owner')): return False
             if not rows_valid('state.json',{'sessions':{e['sessionId']:e['state']}}): return False
             state=e['state']
             if state.get('remote') or state.get('docker') or state.get('owner')!=e.get('owner') or state.get('workingDir')!=e['workingDir'] or state.get('mode','claude')!=e['mode']: return False
+        if 'entryBuiltAt' in value:
+            ages=value['entryBuiltAt'];ids={e['sessionId'] for e in value['entries']}
+            if not isinstance(ages,dict) or len(ids)!=len(value['entries']) or set(ages)!=ids: return False
+            if any(not nonnegative(at) or at<=0 or at<value['builtAt'] or at>time.time()*1000 for at in ages.values()): return False
+            if ages and min(ages.values())!=value['builtAt']: return False
         return True
     return False
 

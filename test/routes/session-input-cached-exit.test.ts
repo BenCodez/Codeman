@@ -127,7 +127,9 @@ it.each([
     expect(session.lastSubmitAt).toBe(0);
     expect(written).not.toHaveBeenCalled();
     expect(sent).not.toHaveBeenCalled();
-    expect(intent).not.toHaveBeenCalled();
+    // Rejected owner input still withdraws automation authority during a launch.
+    expect(intent).toHaveBeenCalled();
+    intent.mockClear();
     release.resolve(654);
     expect(await restarting).toBe(true);
     expect(session.paneLifecycleInFlight).toBe(false);

@@ -1,4 +1,4 @@
-/** Every process is a disposable Python helper/child in the test-owned HOME. No native pane or SSH runs. */
+/** @fileoverview Every process is a disposable Python helper/child in the test-owned HOME. No native pane or SSH runs. */
 import fs from 'node:fs/promises';
 import { mkdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -803,4 +803,67 @@ it.each(['1.25e2', '125', '9007199254740993'])('allows ordinary finite JSON meta
   await fs.writeFile(join(f.root, 'state.json'), '{"sessions":{},"settings":{"unrelated":' + token + '}}');
   await f.prune();
   expect(await f.exists()).toBe(false);
+});
+
+it.each(
+  ['reboot-restore-offer.json', 'reboot-restore-offer.json.previous'].flatMap((name) =>
+    (
+      [
+        'healthy',
+        'referenced',
+        'negative',
+        'future',
+        'missing',
+        'foreign',
+        'string',
+        'boolean',
+        'null',
+        'nonfinite',
+        'wrong-minimum',
+        'unknown-field',
+      ] as const
+    ).map((kind) => ({ name, kind }))
+  )
+)('native janitor validates per-entry reboot offer age: $name $kind', async ({ name, kind }) => {
+  const f = await fixture();
+  const at = Date.now() - 1000;
+  const entry = (id: string) => ({
+    sessionId: id,
+    mode: 'codex',
+    workingDir: f.root,
+    resumeConversationId: SID,
+    state: {
+      id,
+      mode: 'codex',
+      workingDir: f.root,
+      status: 'error',
+      pid: 123,
+      createdAt: 1,
+      lastActivityAt: 1,
+      __codexPriorInputBroker: kind === 'referenced' ? f.broker.incarnation : randomUUID(),
+    },
+  });
+  const other = randomUUID();
+  const ages: Record<string, unknown> = { [SID]: at, [other]: at + 500 };
+  if (kind === 'negative') ages[SID] = -1;
+  if (kind === 'future') ages[other] = Date.now() + 60_000;
+  if (kind === 'missing') delete ages[SID];
+  if (kind === 'foreign') ages[randomUUID()] = at;
+  if (kind === 'string') ages[SID] = String(at);
+  if (kind === 'boolean') ages[SID] = true;
+  if (kind === 'null') ages[SID] = null;
+  if (kind === 'nonfinite') ages[SID] = Infinity;
+  if (kind === 'wrong-minimum') ages[SID] = at + 1;
+  const value = {
+    version: 1,
+    builtAt: at,
+    entries: [entry(SID), entry(other)],
+    entryBuiltAt: ages,
+    ...(kind === 'unknown-field' ? { futureSchema: true } : {}),
+  };
+  const text = JSON.stringify(value);
+  const bytes = kind === 'nonfinite' ? text.replace('"' + SID + '":null', '"' + SID + '":1e999') : text;
+  await fs.writeFile(join(f.root, name), bytes, { mode: 0o600 });
+  await f.prune();
+  expect(await f.exists()).toBe(kind !== 'healthy');
 });
