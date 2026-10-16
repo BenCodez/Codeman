@@ -121,6 +121,11 @@ Key points:
   (see [Respawn / reattach continuation](#respawn--reattach-continuation)), and
   because the claude arm is an `a || b` pair under `-c`, its pane PID is the
   **login shell**, not the agent.
+- **Owned Codex** has its own exact command builder. Quick-start accepts
+  `codexConfig` plus an absolute `CODEX_HOME` override and renders the model,
+  reasoning, isolation, approval, display and resume options inside the remote
+  login shell. A per-host `commands.codex` override cannot be combined with
+  these fields because Codeman could not prove what it launched.
 - The **whole tmux invocation is a single shell-quoted ssh argument**, and the
   pane command is independently quoted, so a `remotePath` with spaces is safe.
 - Connection options come from the **same `buildSshConnectionArgs(remote)`** as
@@ -250,6 +255,48 @@ success, so reading stdout would misclassify every live session as gone. An
 unreachable host answers "unknown", which also means do not revive. The answer
 is cached per session and cleared whenever the pane is next seen alive, so a
 stale `true` from one transport drop can never revive the NEXT clean exit.
+
+## Owned remote Codex recovery
+
+Remote recovery, task supervision and supervisor assignments require an explicit
+absolute per-session `envOverrides.CODEX_HOME` at launch. That non-secret path is
+persisted and reused for evidence, exact restart and reboot restoration. A worker
+launched with an ambient or default remote home remains ineligible because a
+remote login environment can change between observations. Codeman never guesses
+the home or rewrites an existing worker to make it eligible.
+
+Recovery treats the local SSH pane as transport only. Its exit status is never
+used as evidence that Codex crashed. A bounded SSH inspection independently
+reads the private remote tmux pane and the exact Codex rollout under the
+configured `CODEX_HOME`, using the same port, identity, jump host, proxy and
+extra SSH options as launch. The inspector requires `node` and `tmux` in the
+remote interactive-login PATH. A missing prerequisite is reported as unsupported
+or unreadable; recovery never installs it, wakes the host, or calls the host
+unreachable on that evidence. The rollout must match its filename/header UUID,
+cwd and an exact fresh ordinary submission in `history.jsonl`; originator or a
+saved resume id alone cannot authorize it. Symlinks, subagent rollouts, duplicate
+matches, incomplete reads and traversal-limit failures are non-actionable.
+
+A healthy remote tmux session is only reattached. A confirmed dead pane is
+respawned only when it has a non-zero status or signal, belongs to an owned
+recovery-isolated session, and a second observation matches its pane id, pid,
+status, signal and exact conversation. The guarded remote command checks those
+values again and uses `respawn-pane` without `-k`, so it cannot kill a pane that
+became live. Status zero is a clean exit and is never restarted. Discovered
+`owned:false` sessions and host command overrides are never mutated.
+
+If a host reboot removed the owned private tmux session, automatic recovery
+stops at `remote-session-missing`. The owner can use **Restore remote worker**;
+that route performs fresh identity and ownership checks, reserves the action in
+the durable recovery journal, and recreates the missing session with the exact
+pinned launch configuration. The final remote mutation rereads the exact complete
+rollout and current submission after its pane probes, then uses `new-session`
+without attach-or-replace flags. A worker created concurrently causes refusal;
+after remote creation, an uncertain acknowledgement or failed local attachment
+remains sealed against replay. Unreachable transport is reported separately and
+never authorizes recreation. The dead local SSH wrapper must also show an
+abnormal transport exit; its status-zero path is the clean `/exit` veto, not
+remote-agent crash evidence.
 
 ## File access over SSH
 
@@ -439,11 +486,14 @@ The invariants worth keeping:
   `hostId`, hold the request for the wake budget, and only then be refused for the
   workingDir. The quick-start path resolves its remote case through `canAccessOwned`
   first. Pinned in `test/routes/session-remote-wake.test.ts` (wake spy stays empty).
-- **The caller is told what happened to its bytes.** The non-wait input route answers
-  `{buffered:true}` when the registry took the chunk and `{buffered:true, dropped:true}`
-  when it was over the cap and is gone; the send-and-wait route answers `OPERATION_FAILED`
-  when the host never comes back, like the create and attach paths, instead of writing
-  into the stalled pane and reporting `delivered:true` plus a timeout. Flushed chunks are
+- **The caller is told what happened to its bytes.** Tagged reliable input waits for the
+  complete wake before guarded dispatch; buffer admission cannot seal its identity or
+  permit an ACK. A timed-out browser request retains that same identity for deduplication,
+  and an uncertain dispatched write stays sealed against replay.
+  Legacy untagged non-wait input answers `{buffered:true}` when the registry took the
+  chunk, or `429` with `retryable:true, notSent:true` when the whole chunk cannot fit.
+  Send-and-wait and tagged input answer `OPERATION_FAILED` when the host never comes back,
+  instead of writing into the stalled pane and reporting delivery. Flushed legacy chunks are
   written with `fromUser`, so a first prompt that was buffered through a wake can still
   name the tab.
 - **Only an EXPLICIT request may wake a host:** user input on an established session, the wake
@@ -466,17 +516,15 @@ The invariants worth keeping:
   which is exactly what a byte-threshold idle detector must not count as activity. A probe is
   ~200 bytes per 30 s, orders of magnitude below any such threshold, and the SYN alone cannot
   wake a host.
-- **Input is buffered while a wake is in flight** (`REMOTE_WAKE_PENDING_MAX_BYTES`,
-  oldest whole chunks dropped, bounded so user input cannot grow memory) and flushed in
+- **Legacy untagged input is buffered while a wake is in flight** (`REMOTE_WAKE_PENDING_MAX_BYTES`,
+  new chunks refused when full without evicting accepted input) and flushed in
   order after the reattach, with a settle delay so bytes cannot land in a still-connecting
-  pane. ⚠️ A chunk LARGER than the cap (one big paste is one `input` value) is dropped
-  **outright**, never trimmed: it was never typed character by character, so its tail is not
-  "what the user just typed" but a fragment of a command they never sent — the drop is logged
-  instead. ⚠️ Only the HTTP input route reaches the registry; the **WebSocket keystroke path
+  pane. A chunk larger than the cap is refused whole with a retryable not-sent response,
+  never trimmed into a fragment of a command. Only the HTTP input route reaches the registry; the **WebSocket keystroke path
   is deliberately NOT wake-aware**, so typing into a sleeping host sends nothing and queues
   nothing (the banner's Wake button is the recovery for that case, which is why it must not
-  promise queued input). The **send-and-wait** path blocks on the wake instead — its response
-  is open anyway, and buffering would break the wait contract. ⚠️ A flush write that FAILS
+  promise queued input). **Tagged reliable input and send-and-wait** block on the complete
+  wake instead, preserving the exact delivery reservation until dispatch. A legacy flush write that FAILS
   drops the whole remaining buffer (logged) rather than retaining it: the wake still resolves
   and marks the host reachable, so the next input takes the deliver path while a retained
   chunk would wait for the NEXT wake — replayed hours later, after everything typed since,

@@ -323,6 +323,10 @@ const CodexConfigSchema = z
       .optional(),
     dangerouslyBypassApprovals: z.boolean().optional(),
     animations: z.boolean().optional(),
+    noDaemon: z.boolean().optional(),
+    noAltScreen: z.boolean().optional(),
+    sandbox: z.enum(['read-only', 'workspace-write', 'danger-full-access']).optional(),
+    approvalPolicy: z.enum(['on-request', 'never']).optional(),
     renderMode: z
       .enum(['scrollback', 'hybrid'])
       .optional()
@@ -1500,6 +1504,8 @@ export const SettingsUpdateSchema = z
     codexReasoningEffort: z.enum(['', ...CODEX_REASONING_EFFORTS]).optional(),
     codexDangerouslyBypassApprovals: z.boolean().optional(),
     codexAnimationsEnabled: z.boolean().optional(),
+    codexNoDaemon: z.boolean().optional(),
+    codexNoAltScreen: z.boolean().optional(),
     // Terminal history and retention
     terminalScrollbackLines: z
       .number()

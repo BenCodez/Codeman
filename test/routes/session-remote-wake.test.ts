@@ -15,7 +15,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { getDataDir } from '../../src/config/instance.js';
 import fastifyCookie from '@fastify/cookie';
-import Fastify, { type FastifyInstance } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply } from 'fastify';
 import { registerSessionRoutes, _resetPaneLivenessState } from '../../src/web/routes/session-routes.js';
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { createMockRouteContext } from '../mocks/index.js';
@@ -23,6 +23,8 @@ import { httpStatusForErrorCode, type ApiErrorCode } from '../../src/types.js';
 import { sessionWaits } from '../../src/web/session-wait-registry.js';
 import { RemoteWakeRegistry, type RemoteWakeDeps } from '../../src/remote-wake.js';
 import type { SessionRemote } from '../../src/types.js';
+import { Session } from '../../src/session.js';
+import type { MuxSession, TerminalMultiplexer } from '../../src/mux-interface.js';
 
 const SESSION_ID = 'remote-wake-session';
 
@@ -78,12 +80,14 @@ async function harness(
     remote?: SessionRemote;
     hostUp?: boolean;
     holdWake?: boolean;
+    observeReply?: (reply: FastifyReply) => void;
     /** Stands in for the auth middleware (multi-user mode); absent = synthetic admin. */
     authUser?: { username: string; role: 'admin' | 'user' };
   } = {}
 ): Promise<Harness> {
   const app = Fastify({ logger: false });
   await app.register(fastifyCookie);
+  if (opts.observeReply) app.addHook('onRequest', async (_req, reply) => opts.observeReply?.(reply));
   if (opts.authUser) {
     const authUser = opts.authUser;
     app.addHook('onRequest', async (req) => {
@@ -203,6 +207,105 @@ describe('POST /api/sessions/:id/input — wake-on-LAN', () => {
     expect(h.wake).not.toHaveBeenCalled();
     expect(h.registry.pendingBytes(SESSION_ID)).toBe(0);
   });
+
+  it('delivers send-and-wait after the actual fake-mux wake advances the pane epoch', async () => {
+    const h = await harness({ hostUp: false });
+    const mux = { isAvailable: () => true, muxSessionExists: () => true, respawnPane: vi.fn(async () => 123) };
+    const session = new Session({
+      id: SESSION_ID,
+      workingDir: '/tmp',
+      mode: 'claude',
+      remote: remoteSession,
+      useMux: true,
+      mux: mux as unknown as TerminalMultiplexer,
+      muxSession: { muxName: 'wake-fixture' } as MuxSession,
+    });
+    const written = vi.fn(() => {
+      expect(sessionWaits.waiterCount(SESSION_ID)).toBe(1);
+      sessionWaits.notifySignal(SESSION_ID, 'stop');
+    });
+    Object.assign(session, { ptyProcess: { write: written } });
+    (h.ctx.sessions as unknown as Map<string, Session>).set(SESSION_ID, session);
+    const before = session.paneStartedAt;
+    try {
+      const res = await send(h.app, { input: 'hallo', useMux: false, wait: 'stop', waitTimeout: 100 });
+      expect(session.paneStartedAt).toBeGreaterThan(before);
+      expect(mux.respawnPane).toHaveBeenCalledTimes(1);
+      expect(written).toHaveBeenCalledWith('hallo');
+      expect(res.statusCode).toBe(200);
+      expect(res.json().data.delivered).toBe(true);
+    } finally {
+      await h.app.close();
+      await session.stop(false);
+    }
+  });
+
+  it.each(['before-reattach', 'after-reattach', 'session', 'owner', 'cancel', 'closing'] as const)(
+    'rejects unrelated %s changes while send-and-wait wakes',
+    async (change) => {
+      const previousMultiuser = process.env.CODEMAN_MULTIUSER;
+      process.env.CODEMAN_MULTIUSER = '1';
+      let cancelledReply: FastifyReply['raw'] | undefined;
+      const h = await harness({
+        hostUp: false,
+        holdWake: true,
+        authUser: { username: 'alice', role: 'user' },
+        observeReply: (reply) => {
+          cancelledReply = reply.raw;
+        },
+      });
+      const session = h.ctx.sessions.get(SESSION_ID)!;
+      Object.assign(session, { paneStartedAt: 10, owner: 'alice' });
+      const epochSession = session as unknown as {
+        paneStartedAt: number;
+        owner?: string;
+        inputDispatchAllowed?: boolean;
+      };
+      const reattach = vi.spyOn(session, 'reattachRemote').mockImplementation(async () => {
+        epochSession.paneStartedAt++;
+        return true;
+      });
+      // Inject the unrelated replacement in the post-reattach settle delay.
+      if (change === 'after-reattach') {
+        const registryDeps = (h.registry as unknown as { deps: RemoteWakeDeps }).deps;
+        registryDeps.delay = async () => {
+          epochSession.paneStartedAt++;
+        };
+      }
+      const request = send(h.app, { input: 'must not send', useMux: false, wait: 'stop', waitTimeout: 50 }).catch(
+        (error) => {
+          if (change === 'cancel' && String(error).includes('destroyed before completion')) return undefined;
+          throw error;
+        }
+      );
+      try {
+        await vi.waitFor(() => expect(h.registry.isWaking(SESSION_ID)).toBe(true));
+        if (change === 'before-reattach') epochSession.paneStartedAt++;
+        else if (change === 'session')
+          h.ctx.sessions.set(SESSION_ID, createMockRouteContext({ sessionId: SESSION_ID })._session);
+        else if (change === 'owner') epochSession.owner = 'bob';
+        else if (change === 'cancel') cancelledReply?.emit('close');
+        else if (change === 'closing') epochSession.inputDispatchAllowed = false;
+        h.releaseWake();
+        await h.registry.wake(session);
+        const res = await request;
+        expect(reattach).toHaveBeenCalledTimes(1);
+        expect(session.writeBuffer).toEqual([]);
+        expect(sessionWaits.waiterCount(SESSION_ID)).toBe(0);
+        if (change === 'cancel') expect(res).toBeUndefined();
+        else {
+          expect(res?.statusCode).toBe(change === 'session' ? 409 : change === 'owner' ? 404 : 422);
+          expect(res?.json().errorCode).toBe(change === 'owner' ? 'NOT_FOUND' : 'OPERATION_FAILED');
+        }
+      } finally {
+        h.releaseWake();
+        await request;
+        await h.app.close();
+        if (previousMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+        else process.env.CODEMAN_MULTIUSER = previousMultiuser;
+      }
+    }
+  );
 
   it('wakes before writing on the send-and-wait path (no buffering, the response waits anyway)', async () => {
     const h = await harness({ hostUp: false });
@@ -335,20 +438,26 @@ describe('POST /api/sessions + attachRemoteSession — authorization before the 
 });
 
 describe('POST /api/sessions/:id/input — what the caller is told', () => {
-  it('says buffered, and dropped for a chunk over the wake buffer cap', async () => {
+  it('refuses an oversized chunk without acknowledging or evicting earlier accepted input', async () => {
     // The non-wait branch always answered a bare `{}`; these fields are additive. Without
     // them a prompt over 4 KB posted to a sleeping host was accepted and silently lost.
     const h = await harness({ hostUp: false, holdWake: true });
-    const small = await send(h.app, { input: 'hallo', useMux: true });
+    const accepted = 'x'.repeat(4096);
+    const small = await send(h.app, { input: accepted, useMux: true });
     expect(small.statusCode).toBe(200);
     expect(small.json()).toEqual({ success: true, data: { buffered: true } });
 
     const big = await send(h.app, { input: 'x'.repeat(5000), useMux: true });
-    expect(big.statusCode).toBe(200);
-    expect(big.json()).toEqual({ success: true, data: { buffered: true, dropped: true } });
-    expect(h.registry.pendingBytes(SESSION_ID)).toBe(5);
+    expect(big.statusCode).toBe(429);
+    expect(big.json()).toMatchObject({ success: false, retryable: true, notSent: true });
+    const overflow = await send(h.app, { input: 'suffix', useMux: true });
+    expect(overflow.statusCode).toBe(429);
+    expect(overflow.json()).toMatchObject({ success: false, retryable: true, notSent: true });
+    expect(h.registry.pendingBytes(SESSION_ID)).toBe(4096);
     h.releaseWake();
-    await h.registry.wake(h.ctx.sessions.get(SESSION_ID)!);
+    const session = h.ctx.sessions.get(SESSION_ID)!;
+    await h.registry.wake(session);
+    expect(session.writeBuffer).toEqual([accepted]);
   });
 
   it('fails the send-and-wait path when the host never comes back, instead of writing into the stalled pane', async () => {

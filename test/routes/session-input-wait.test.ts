@@ -583,8 +583,10 @@ describe('POST /api/sessions/:id/input: the pane is dead', () => {
     const session = ctx.sessions.get(SESSION_ID)!;
     setPaneDead(ctx, true);
 
-    const dead = (await send(app, { input: 'x', useMux: true, clientId: 'c7', seq: 3, wait: 'stop' })).json();
-    expect(dead.data.delivered).toBe(false);
+    const dead = await send(app, { input: 'x', useMux: true, clientId: 'c7', seq: 3, wait: 'stop' });
+    expect(dead.statusCode).toBe(409);
+    expect(dead.json()).toMatchObject({ retryable: true, notSent: true });
+    expect(session.writeBuffer).toEqual([]);
 
     // Worker restarted.
     setPaneDead(ctx, false);

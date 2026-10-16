@@ -38,36 +38,80 @@ describe('Session Cleanup', () => {
     for (const sessionId of createdSessions) {
       try {
         await fetch(`${baseUrl}/api/sessions/${sessionId}`, { method: 'DELETE' });
-      } catch {}
+      } catch {
+        // The test may already have deleted this disposable session.
+      }
     }
     await server.stop();
     rmSync(testWorkingDir, { recursive: true, force: true });
   }, 60000);
 
   describe('Session Deletion', () => {
-    it('rejects before stopping the session when layout deletion preparation fails', async () => {
+    it('preserves live recovery state when layout deletion preparation fails', async () => {
       const createRes = await fetch(`${baseUrl}/api/sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ workingDir: testWorkingDir }),
       });
       const created = await createRes.json();
+      expect(createRes.status, JSON.stringify(created)).toBe(200);
       const id = created.data.session.id;
       createdSessions.push(id);
       const internals = server as unknown as {
-        tabLayouts: { runSessionDeletion: (...args: unknown[]) => Promise<unknown> };
+        tabLayouts: {
+          markRestorationComplete(): void;
+          markRestorationSkipped(): void;
+          deps: { readWebviews: () => Promise<unknown> };
+        };
+        sessions: Map<string, { mode: string; listeners(event: string): unknown[] }>;
+        getRecoveryController(session: { mode: string }): {
+          getStatus(): unknown;
+          updateConfig(patch: { maxRetries: number }): Promise<unknown>;
+        };
+        recoveryControllers: Map<
+          string,
+          { getStatus(): unknown; updateConfig(patch: { maxRetries: number }): Promise<unknown> }
+        >;
+        recoveryInputListeners: Map<string, () => void>;
+        recoveryStore: { get(sessionId: string): unknown };
       };
-      const deletionSpy = vi
-        .spyOn(internals.tabLayouts, 'runSessionDeletion')
+      const liveSession = internals.sessions.get(id)!;
+      // The CI fixture has no Codex binary, so promote this inert live session
+      // only after creation; recovery wiring itself does not launch a CLI.
+      liveSession.mode = 'codex';
+      const createdController = internals.getRecoveryController(liveSession);
+      await createdController.updateConfig({ maxRetries: 2 });
+      const controller = internals.recoveryControllers.get(id);
+      const inputListener = internals.recoveryInputListeners.get(id);
+      const recoveryState = controller?.getStatus();
+      const storedRecoveryState = internals.recoveryStore.get(id);
+      const inputListeners = liveSession.listeners('recoveryUserInput');
+      expect(controller).toBeDefined();
+      expect(inputListener).toBeDefined();
+      expect(inputListeners).toContain(inputListener);
+      expect(recoveryState).toMatchObject({ config: { maxRetries: 2 } });
+      expect(storedRecoveryState).toEqual(recoveryState);
+
+      internals.tabLayouts.markRestorationComplete();
+      const preparationSpy = vi
+        .spyOn(internals.tabLayouts.deps, 'readWebviews')
         .mockRejectedValueOnce(new Error('layout prune unavailable'));
       try {
         const deleteRes = await fetch(`${baseUrl}/api/sessions/${id}`, { method: 'DELETE' });
-        const getRes = await fetch(`${baseUrl}/api/sessions/${id}`);
 
         expect(deleteRes.status).toBe(500);
+        expect(internals.recoveryControllers.get(id)).toBe(controller);
+        expect(internals.recoveryInputListeners.get(id)).toBe(inputListener);
+        // Session-owned listeners and the recovery controller's exact callback
+        // all survive rejected deletion.
+        expect(internals.sessions.get(id)?.listeners('recoveryUserInput')).toEqual(inputListeners);
+        expect(controller?.getStatus()).toEqual(recoveryState);
+        expect(internals.recoveryStore.get(id)).toEqual(storedRecoveryState);
+        const getRes = await fetch(`${baseUrl}/api/sessions/${id}`);
         expect(getRes.status).toBe(200);
       } finally {
-        deletionSpy.mockRestore();
+        preparationSpy.mockRestore();
+        internals.tabLayouts.markRestorationSkipped();
       }
     });
 

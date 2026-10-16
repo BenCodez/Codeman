@@ -1,12 +1,10 @@
 /**
  * @fileoverview A lost input must stay retryable.
  *
- * POST /api/sessions/:id/input answers 200 BEFORE the write is attempted — the mux
- * write is fire-and-forget so the HTTP response never waits on a tmux child. The
- * dedup bookkeeping, however, recorded the (clientId, seq) pair as applied at that
- * same moment. A write that then failed left the client with a 200, no message in
- * the pane, and a seq the server would reject as a duplicate on retry: the input was
- * unrecoverable by the very mechanism meant to make delivery reliable.
+ * Tagged POST fallback input must stay retryable until a write actually lands. The
+ * dedup bookkeeping admits the (clientId, seq) pair before attempting the write;
+ * known unsent failures release admission without advancing the watermark, and recovery
+ * ownership has to return non-2xx so the browser retains the durable queue record.
  *
  * Observed in the wild: a prompt shown as sent in a chat client, a 200 in the proxy
  * log, and an empty prompt line in the pane.
@@ -48,8 +46,7 @@ async function createEnvelopeHarness(): Promise<{ app: FastifyInstance; ctx: Moc
   return { app, ctx };
 }
 
-type Internals = { _appliedInputSeq: Map<string, number> };
-const seqOf = (s: Session, client: string) => (s as unknown as Internals)._appliedInputSeq.get(client);
+const seqOf = (s: Session, client: string) => s.lastInputSeq(client);
 
 describe('input dedup bookkeeping', () => {
   const make = () => new Session({ workingDir: '/tmp', mode: 'claude' });
@@ -58,6 +55,7 @@ describe('input dedup bookkeeping', () => {
     const s = make();
     expect(s.shouldApplyInput('c1', 1)).toBe(true);
     expect(s.shouldApplyInput('c1', 1)).toBe(false);
+    s.commitInputSeq('c1', 1);
     expect(s.shouldApplyInput('c1', 2)).toBe(true);
   });
 
@@ -74,7 +72,9 @@ describe('input dedup bookkeeping', () => {
     // Rolling back blindly would let an old, already-superseded message replay.
     const s = make();
     s.shouldApplyInput('c1', 7);
+    s.commitInputSeq('c1', 7);
     s.shouldApplyInput('c1', 8);
+    s.commitInputSeq('c1', 8);
 
     s.forgetInputSeq('c1', 7);
 
@@ -124,6 +124,139 @@ describe('POST /api/sessions/:id/input rollback wiring', () => {
   const post = (body: Record<string, unknown>, id = 'test-session-1') =>
     harness.app.inject({ method: 'POST', url: `/api/sessions/${id}/input`, payload: body });
 
+  it('refuses UTF-8 overflow permanently before claiming or dispatching its original identity', async () => {
+    const session = harness.ctx._session;
+    const defer = vi.spyOn(session, 'deferInputSeq');
+    const write = vi.spyOn(session, 'write');
+    const body = { input: '🧭'.repeat(16_385), clientId: 'unicode-client', seq: 8 };
+    expect(body.input.length).toBeLessThan(65_536);
+    const refused = await post(body);
+    expect(refused.statusCode).toBe(413);
+    expect(refused.json()).toMatchObject({ success: false, notSent: true });
+    expect(defer).not.toHaveBeenCalled();
+    expect(write).not.toHaveBeenCalled();
+    expect(session.hasAppliedInputSeq(body.clientId, body.seq)).toBe(false);
+    const exact = { ...body, input: '🧭'.repeat(16_384) };
+    expect((await post(exact)).statusCode).toBe(200);
+    expect(session.writeBuffer).toEqual([exact.input]);
+    expect((await post(exact)).statusCode).toBe(200);
+    expect(session.writeBuffer).toEqual([exact.input]);
+  });
+
+  it('delivers the valid zero sequence once without mistaking its initial watermark for delivery', async () => {
+    const session = harness.ctx.sessions.get('test-session-1')!;
+    const body = { input: 'zero', clientId: 'zero', seq: 0 };
+    expect((await post(body)).statusCode).toBe(200);
+    expect((await post(body)).statusCode).toBe(200);
+    expect(session.writeBuffer).toEqual(['zero']);
+    expect(session.hasAppliedInputSeq('zero', 0)).toBe(true);
+  });
+
+  it('retains earlier lock-rejected HTTP identities so an unlock cannot admit a higher frame ahead of them', async () => {
+    const session = harness.ctx.sessions.get('test-session-1')!;
+    session.recoveryInputReserved = true;
+    for (const seq of [1, 2]) expect((await post({ input: `${seq}`, clientId: 'ordered', seq })).statusCode).toBe(422);
+    session.recoveryInputReserved = false;
+    expect((await post({ input: '3', clientId: 'ordered', seq: 3 })).statusCode).toBe(422);
+    expect(session.writeBuffer).toEqual([]);
+    expect(session.lastInputSeq('ordered')).toBe(0);
+    for (const seq of [1, 2, 3])
+      expect((await post({ input: `${seq}`, clientId: 'ordered', seq })).statusCode).toBe(200);
+    expect(session.writeBuffer).toEqual(['1', '2', '3']);
+    expect(session.lastInputSeq('ordered')).toBe(3);
+  });
+
+  it.each([false, true])('seals actual byte dispatch before a post-write listener throws (mux=%s)', async (useMux) => {
+    const mux = { isAvailable: () => true, sendInput: vi.fn(async () => true) };
+    const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'claude' });
+    const written = vi.fn();
+    Object.assign(session, {
+      ptyProcess: { write: written },
+      ...(useMux ? { _mux: mux, _muxSession: { muxName: 'fixture' } } : {}),
+    });
+    session.on('promptSubmitted', () => {
+      throw new Error('listener after bytes');
+    });
+    (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+    const body = { input: 'committed\r', useMux, clientId: 'committed', seq: 7 };
+    expect((await post(body)).statusCode).toBe(500);
+    expect(session.lastInputSeq('committed')).toBe(7);
+    const duplicate = await post(body);
+    expect(duplicate.statusCode).toBe(200);
+    expect(JSON.parse(String(duplicate.headers['x-codeman-input-ack']))).toEqual({ seq: 7, dup: true, last: 7 });
+    expect(useMux ? mux.sendInput : written).toHaveBeenCalledTimes(1);
+    if (useMux) expect(written).not.toHaveBeenCalled();
+    await session.stop(false);
+  });
+
+  it('does not replay or fall back after a mux reports a potentially partial dispatch', async () => {
+    const mux = { sendInput: vi.fn(async () => false) };
+    const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'claude' });
+    const written = vi.fn();
+    Object.assign(session, { ptyProcess: { write: written }, _mux: mux, _muxSession: { muxName: 'fixture' } });
+    (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+    const body = { input: 'potentially partial\r', useMux: true, clientId: 'partial', seq: 7 };
+    expect((await post(body)).statusCode).toBe(500);
+    expect(written).not.toHaveBeenCalled();
+    expect((await post(body)).statusCode).toBe(200);
+    expect(mux.sendInput).toHaveBeenCalledTimes(1);
+    expect(written).not.toHaveBeenCalled();
+    await session.stop(false);
+  });
+
+  it('withholds a duplicate delivery ACK while the original asynchronous write is uncommitted', async () => {
+    const session = harness.ctx.sessions.get('test-session-1')!;
+    let finish: (ok: boolean) => void = () => {};
+    const write = vi.spyOn(session, 'writeViaMux').mockImplementationOnce(
+      () =>
+        new Promise<boolean>((resolve) => {
+          finish = resolve;
+        })
+    );
+    const original = post({ input: 'pending', useMux: true, clientId: 'pending-client', seq: 7 }).then(
+      (response) => response
+    );
+    await vi.waitFor(() => expect(write).toHaveBeenCalledTimes(1));
+    let duplicateAcknowledged = false;
+    const pending = post({ input: 'pending', useMux: true, clientId: 'pending-client', seq: 7 }).then((response) => {
+      duplicateAcknowledged = true;
+      return response;
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(duplicateAcknowledged).toBe(false);
+    expect(session.lastInputSeq('pending-client')).toBe(0);
+    finish(true);
+    expect((await original).statusCode).toBe(200);
+    const acknowledged = await pending;
+    expect(acknowledged.statusCode).toBe(200);
+    expect(JSON.parse(String(acknowledged.headers['x-codeman-input-ack']))).toEqual({ seq: 7, dup: true, last: 7 });
+    expect(session.lastInputSeq('pending-client')).toBe(7);
+    const retry = await post({ input: 'pending', useMux: true, clientId: 'pending-client', seq: 7 });
+    expect(retry.statusCode).toBe(200);
+    expect(JSON.parse(String(retry.headers['x-codeman-input-ack']))).toEqual({ seq: 7, dup: true, last: 7 });
+    expect(write).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the actual duplicate watermark in an HTTP ACK header, retaining its successful envelope', async () => {
+    const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'codex' });
+    (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+    session.shouldApplyInput('two-tabs', 10);
+    session.commitInputSeq('two-tabs', 10);
+    const direct = vi.spyOn(session, 'writeAsync').mockResolvedValue(true);
+    const duplicate = await post({ input: 'before', clientId: 'two-tabs', seq: 1 });
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json()).toEqual({ success: true, data: {} });
+    expect(JSON.parse(String(duplicate.headers['x-codeman-input-ack']))).toEqual({ seq: 1, dup: true, last: 10 });
+    expect(direct).not.toHaveBeenCalled();
+    const corrected = await post({ input: 'before', clientId: 'two-tabs', seq: 11 });
+    expect(corrected.statusCode).toBe(200);
+    expect(corrected.headers['x-codeman-input-ack']).toBeUndefined();
+    expect(direct).toHaveBeenCalledTimes(1);
+    const retry = await post({ input: 'before', clientId: 'two-tabs', seq: 11 });
+    expect(JSON.parse(String(retry.headers['x-codeman-input-ack']))).toEqual({ seq: 11, dup: true, last: 11 });
+    expect(direct).toHaveBeenCalledTimes(1);
+  });
+
   it('rolls the seq back when both the mux write and the direct write fail', async () => {
     const session = harness.ctx.sessions.get('test-session-1')!;
     session.failWrites = true; // writeViaMux false AND write() false
@@ -144,16 +277,76 @@ describe('POST /api/sessions/:id/input rollback wiring', () => {
     expect(session.shouldApplyInput('c1', 1)).toBe(false);
   });
 
-  it('rolls the seq back on the non-mux path too', async () => {
-    // Still a 200: a session may legitimately have no PTY yet, and turning that
-    // into a failure status would be a contract change. Re-opening the seq is not.
+  it('keeps a failed tagged non-mux delivery retryable without inventing applied input', async () => {
+    // A tagged 2xx is a delivery ACK; untagged legacy input keeps its historical status.
     const session = harness.ctx.sessions.get('test-session-1')!;
     session.failWrites = true;
 
     const res = await post({ input: 'x\r', useMux: false, clientId: 'c2', seq: 5 });
 
-    expect(res.statusCode).toBe(200);
+    expect(res.statusCode).toBe(422);
+    expect(session.lastInputSeq('c2')).toBe(0);
     expect(session.shouldApplyInput('c2', 5)).toBe(true);
+  });
+
+  it('returns a retryable failure and re-opens the seq while recovery owns input', async () => {
+    const session = harness.ctx.sessions.get('test-session-1')!;
+    session.recoveryInputReserved = true;
+    const viaMux = vi.spyOn(session, 'writeViaMux');
+    const direct = vi.spyOn(session, 'write');
+
+    const blocked = await post({ input: 'keep me\r', useMux: true, clientId: 'browser-1', seq: 9 });
+
+    expect(blocked.statusCode).toBe(422);
+    expect(blocked.json()).toMatchObject({ success: false, errorCode: 'OPERATION_FAILED' });
+    expect(viaMux).not.toHaveBeenCalled();
+    expect(direct).not.toHaveBeenCalled();
+    expect(session.shouldApplyInput('browser-1', 9)).toBe(true);
+
+    session.forgetInputSeq('browser-1', 9);
+    session.recoveryInputReserved = false;
+    const retried = await post({ input: 'keep me\r', useMux: true, clientId: 'browser-1', seq: 9 });
+    expect(retried.statusCode).toBe(200);
+    expect(session.writeBuffer).toContain('keep me\r');
+  });
+
+  it('does not disturb real recovery ownership or input proof tracking when rejecting the frame', async () => {
+    const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'codex' });
+    (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+    const internals = session as unknown as { _recoveryDelivering: boolean; _recoveryGeneration: number };
+    internals._recoveryDelivering = true;
+    const generation = internals._recoveryGeneration;
+    const recoveryInput = vi.fn();
+    const promptSubmitted = vi.fn();
+    session.on('recoveryUserInput', recoveryInput);
+    session.on('promptSubmitted', promptSubmitted);
+    const viaMux = vi.spyOn(session, 'writeViaMux');
+    const direct = vi.spyOn(session, 'write');
+
+    const blocked = await post({ input: 'preserve exact input\r', clientId: 'browser-2', seq: 3 });
+
+    expect(blocked.statusCode).toBe(422);
+    expect(viaMux).not.toHaveBeenCalled();
+    expect(direct).not.toHaveBeenCalled();
+    expect(internals._recoveryGeneration).toBe(generation);
+    expect(recoveryInput).not.toHaveBeenCalled();
+    expect(promptSubmitted).not.toHaveBeenCalled();
+    expect(session.shouldApplyInput('browser-2', 3)).toBe(true);
+  });
+
+  it('returns a retryable failure when recovery acquires input during an awaited mux write', async () => {
+    const session = harness.ctx.sessions.get('test-session-1')!;
+    vi.spyOn(session, 'writeViaMux').mockImplementationOnce(async () => {
+      session.recoveryInputReserved = true;
+      return false;
+    });
+
+    const blocked = await post({ input: 'race-safe\r', useMux: true, clientId: 'browser-3', seq: 4 });
+
+    expect(blocked.statusCode).toBe(422);
+    expect(blocked.json()).toMatchObject({ success: false, errorCode: 'OPERATION_FAILED' });
+    expect(session.writeBuffer).not.toContain('race-safe\r');
+    expect(session.shouldApplyInput('browser-3', 4)).toBe(true);
   });
 });
 
@@ -191,7 +384,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
     const res = await post({ input: LONG_PROMPT });
 
     expect(res.statusCode).toBe(200);
-    expect(viaMux).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true });
+    expect(viaMux).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true, isCurrent: expect.any(Function) });
     expect(direct).not.toHaveBeenCalled();
   });
 
@@ -217,7 +410,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
 
     await post({ input: 'hello\r' });
 
-    expect(direct).toHaveBeenCalledWith('hello\r', { fromUser: true });
+    expect(direct).toHaveBeenCalledWith('hello\r', { fromUser: true, isCurrent: expect.any(Function) });
   });
 
   it('keeps the raw write for an explicit useMux: false', async () => {
@@ -225,7 +418,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
 
     await post({ input: LONG_PROMPT, useMux: false });
 
-    expect(direct).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true });
+    expect(direct).toHaveBeenCalledWith(LONG_PROMPT, { fromUser: true, isCurrent: expect.any(Function) });
     expect(viaMux).not.toHaveBeenCalled();
   });
 
@@ -242,7 +435,7 @@ describe('POST /api/sessions/:id/input plain-prompt routing', () => {
 
     await post({ input });
 
-    expect(direct).toHaveBeenCalledWith(input, { fromUser: true });
+    expect(direct).toHaveBeenCalledWith(input, { fromUser: true, isCurrent: expect.any(Function) });
     expect(viaMux).not.toHaveBeenCalled();
   });
 });

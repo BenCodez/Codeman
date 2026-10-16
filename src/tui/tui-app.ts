@@ -49,6 +49,7 @@ import { hostname as osHostname } from 'node:os';
 import chalk from 'chalk';
 import { palette, table, tint, type Tone } from '../cli-style.js';
 import { CODEMAN_INSTANCE, resolveTmuxSocketName } from '../config/instance.js';
+import { getCli } from '../config/cli-registry/registry.js';
 import { getErrorMessage } from '../types/api.js';
 import { dropSeveredEscape, foldPreviewGlyphs, toDisplayLines } from './tui-ansi.js';
 import { approvalAnswerForKey, newApprovalIds } from './tui-approvals.js';
@@ -56,6 +57,7 @@ import { composerScroll, composerStep, composerText, createComposer, type TuiCom
 import { formatAwayDigest } from './tui-digest.js';
 import {
   ATTACH_BANNER_MARKER,
+  isAttachSwitchBinding,
   TuiClient,
   type TuiSessionOptions,
   type TuiWindowSizing,
@@ -246,6 +248,12 @@ export function planAttach(muxName: string | undefined, context: TuiAttachContex
   };
 }
 
+/** Missing degraded metadata cannot prove that direct stdin is safe without an identity fence. */
+export function needsDirectAttachFence(session: Pick<TuiSessionRow, 'mode'>): boolean {
+  const cli = session.mode && getCli(session.mode);
+  return !cli || cli.capabilities.recovery === 'codex-rollout';
+}
+
 /**
  * tmux's prefix key as a human reads it: `C-b` → `Ctrl+B`, `M-a` → `Alt+A`.
  *
@@ -352,8 +360,6 @@ export function buildAttachBanner(options: {
   tabs?: readonly TuiAttachTab[];
   /** The attaching terminal's width, so the strip can be kept clear of the hint. */
   cols?: number;
-  /** Alt+1..9 really switch sessions, so the bar may say so. */
-  switchKeys?: boolean;
 }): Record<string, string> {
   const chord = escapeTmuxFormat(detachChord(options.prefix, options.detachKey));
   // Named on the bar because it is what people actually type: keeping Ctrl held
@@ -369,13 +375,9 @@ export function buildAttachBanner(options: {
   // left. tmux truncates a status line that overflows, and what it drops is the
   // RIGHT-aligned segment — which is the hint, the one thing on the bar a user
   // cannot do without. Every width tested lost it before this budget existed.
-  // ⚠️ The switch hint appears only when the keys were actually claimed, the
-  // same rule the way-out key follows. A bar naming a key that does nothing is
-  // the bug this whole series started with.
-  const switchHint = options.switchKeys ? 'alt+1-9 switch · ' : '';
   const hint = options.oneKey
-    ? ` ${switchHint}${options.oneKey} ${ATTACH_BANNER_MARKER} `
-    : ` ${switchHint}${chord}${alias} ${ATTACH_BANNER_MARKER} `;
+    ? ` ${options.oneKey} ${ATTACH_BANNER_MARKER} `
+    : ` ${chord}${alias} ${ATTACH_BANNER_MARKER} `;
   const budget = Math.max(0, (options.cols ?? Number.POSITIVE_INFINITY) - hint.length - 1);
   // The strip names the session it highlights, so the standalone label is only
   // a fallback for when there is no strip to draw (degraded mode has no list).
@@ -391,8 +393,8 @@ export function buildAttachBanner(options: {
     // ONLY instruction a user gets during an attach, so it names the simplest
     // thing that is known to work, never a menu of ways.
     'status-format[0]': options.oneKey
-      ? `#[align=left]${left}#[align=right] ${switchHint}#[bold]${escapeTmuxFormat(options.oneKey)}#[nobold] ${ATTACH_BANNER_MARKER} #[default]`
-      : `#[align=left]${left}#[align=right] ${switchHint}#[bold]${chord}#[nobold]${alias} ${ATTACH_BANNER_MARKER} #[default]`,
+      ? `#[align=left]${left}#[align=right] #[bold]${escapeTmuxFormat(options.oneKey)}#[nobold] ${ATTACH_BANNER_MARKER} #[default]`
+      : `#[align=left]${left}#[align=right] #[bold]${chord}#[nobold]${alias} ${ATTACH_BANNER_MARKER} #[default]`,
   };
 }
 
@@ -407,6 +409,10 @@ export interface TuiAttachTab {
   active: boolean;
   /** tmux session to switch to when its number is pressed inside a pane. */
   muxName?: string;
+  /** This target cannot receive direct stdin until its recovery identity is fenced. */
+  requiresDirectAttachFence?: boolean;
+  /** Present only when direct stdin requires a durable recovery-identity fence. */
+  directAttachFenceSessionId?: string;
 }
 
 /** Per-tab label cap. Eight of these plus separators still fit an 80-column terminal. */
@@ -525,6 +531,16 @@ export interface TuiAttachHandoff {
   restore(): Promise<void>;
 }
 
+/** A generated-looking global command is not proof of a dead owner's claim. */
+export async function assertSafeAttachSwitchControls(client: TuiClient): Promise<void> {
+  for (let index = 1; index <= 9; index++) {
+    const bound = await client.readAttachSwitchBinding(`M-${index}`);
+    if (bound !== null && isAttachSwitchBinding(bound)) {
+      throw new Error('Existing global attach switch controls require owner cleanup');
+    }
+  }
+}
+
 /**
  * Prepare a tmux window for a human terminal: let it follow the attaching
  * client's shape, and give it a status bar naming the way out. Both halves are
@@ -540,6 +556,18 @@ export async function beginAttachHandoff(
   cols?: number,
   rows?: number
 ): Promise<TuiAttachHandoff> {
+  // Root switch bindings affect every client on the socket. Without a client-
+  // scoped native lease, leave them untouched and refuse inherited generated
+  // controls: their owner and target authority cannot be inferred from syntax.
+  await assertSafeAttachSwitchControls(client);
+  const activeTab = tabs.find((tab) => tab.muxName === muxName);
+  if (activeTab?.requiresDirectAttachFence) {
+    const id = activeTab.directAttachFenceSessionId;
+    if (!id) throw new Error('Direct attach target has no session id');
+    await client.fenceDirectAttach(id);
+    await assertSafeAttachSwitchControls(client);
+  }
+  const handoffTabs = activeTab ? [activeTab] : [];
   const prefix = (await client.readPrefixKey(muxName)) ?? undefined;
   // Read, not assumed: see detachChord() for the `d` vs `D` mix-up this closes.
   const detachKey = (await client.readDetachKey()) ?? undefined;
@@ -568,18 +596,6 @@ export async function beginAttachHandoff(
       : existing === null
         ? await client.bindDetachKey(ONE_KEY_DETACH, 'root')
         : false;
-  // Alt+1..9 switch sessions from inside the pane, so the strip on the bar is
-  // usable rather than decorative. Only the first nine, only sessions that
-  // really have a pane, and only keys tmux reports as free — the same rule the
-  // way-out key follows, so a binding of the user's own is never shadowed.
-  const switchKeys: string[] = [];
-  for (const tab of tabs.slice(0, 9)) {
-    if (!tab.muxName) continue;
-    const key = `M-${tab.index}`;
-    const bound = await client.readPrefixBinding(key, 'root');
-    if (bound !== null && !bound.startsWith('switch-client')) continue;
-    if (await client.bindSwitchKey(key, tab.muxName)) switchKeys.push(key);
-  }
   const bannerFor = (activeMux: string, ownLabel: string): Record<string, string> =>
     buildAttachBanner({
       ...(prefix ? { prefix } : {}),
@@ -587,46 +603,29 @@ export async function beginAttachHandoff(
       ...(claimed && alias ? { heldAlias: alias } : {}),
       ...(oneKey ? { oneKey: ONE_KEY_DETACH } : {}),
       ...(cols ? { cols } : {}),
-      ...(switchKeys.length > 0 ? { switchKeys: true } : {}),
       label: ownLabel,
-      tabs: tabs.map((tab) => ({ ...tab, active: tab.muxName === activeMux })),
+      tabs: handoffTabs.map((tab) => ({ ...tab, active: tab.muxName === activeMux })),
     });
 
-  // ⚠️ The bar goes on EVERY session the strip can switch to, not just the one
-  // being attached. `switch-client` moves this client to another session, and
-  // that session draws its OWN status line: with the bar only on the first one,
-  // pressing Alt+2 landed the user in a pane with no strip and, worse, no way
-  // out on screen. Each copy highlights its own tab, so the strip tracks where
-  // you actually are.
+  // Only the selected session is decorated; other owners retain their options.
   const banner = bannerFor(muxName, label);
   const dressed: Array<{ muxName: string; options: TuiSessionOptions }> = [];
   const resized: Array<{ muxName: string; sizing: TuiWindowSizing }> = [];
   const targets = new Map<string, string>([[muxName, label]]);
-  for (const tab of tabs.slice(0, 9)) {
-    if (tab.muxName && !targets.has(tab.muxName)) targets.set(tab.muxName, tab.label);
-  }
   for (const [target, targetLabel] of targets) {
     const snapshot = await client.readSessionOptions(target, Object.keys(banner));
     if (snapshot) dressed.push({ muxName: target, options: snapshot });
     await client.applySessionOptions(target, bannerFor(target, targetLabel));
-    // ⚠️ Sizing for EVERY switchable session, not just the one being attached.
-    // Codeman pins each window `window-size manual` at the BROWSER's size, so a
-    // session switched into from inside a pane stays pinned and tmux pads the
-    // gap with dots — the pane filled half the terminal and the rest was a dot
-    // grid (reported from the beta, with a screenshot, after Alt+N switching
-    // shipped). `latest` makes each window follow whichever client is looking
-    // at it, which is the same reason the attached one gets it.
+    // The selected window follows the attaching terminal and is restored on detach.
     const sizing = await client.readWindowSizing(target);
     if (sizing) resized.push({ muxName: target, sizing });
-    // Pre-size to this terminal so a switch has nothing left to resize, then
-    // let the session we are actually opening follow the terminal live.
+    // Pre-size to this terminal, then let the selected window follow it live.
     if (cols && rows && rows > 1) await client.presizeWindow(target, cols, rows - 1);
     if (target === muxName) await client.followAttachingClient(target);
   }
   return {
     chord: oneKey ? ONE_KEY_DETACH : detachChord(prefix, detachKey),
     async restore(): Promise<void> {
-      for (const key of switchKeys) await client.unbindSwitchKey(key);
       if (oneKey) await client.unbindDetachKey(ONE_KEY_DETACH, 'root');
       if (claimed && alias) await client.unbindDetachKey(alias);
       // Options first, then the size: dropping the status bar gives its row
@@ -1623,11 +1622,18 @@ class TuiApp {
       if (row.group === 'recent') continue;
       index += 1;
       const muxName = (row.session.muxName ?? '').trim();
+      const sessionId = (row.session.sessionId ?? '').trim();
       tabs.push({
         index,
         label: rowLabel(row.session),
         active: row.session.sessionId === activeId,
         ...(muxName ? { muxName } : {}),
+        ...(needsDirectAttachFence(row.session)
+          ? {
+              requiresDirectAttachFence: true,
+              ...(sessionId ? { directAttachFenceSessionId: sessionId } : {}),
+            }
+          : {}),
       });
     }
     return tabs;
@@ -2239,13 +2245,23 @@ class TuiApp {
       return;
     }
 
-    // tmux is about to own this terminal. The dashboard is not on screen, and
-    // the pane the preview would keep re-reading is the one the user is now
-    // looking at directly, so the poll stops for the whole handoff (an attach
-    // can last hours).
-    this.stopPreview();
+    if (plan.kind === 'switch') {
+      try {
+        await assertSafeAttachSwitchControls(this.client);
+        if (needsDirectAttachFence(row.session)) await this.client.fenceDirectAttach(row.session.sessionId);
+        await assertSafeAttachSwitchControls(this.client);
+      } catch (error) {
+        this.message('err', `could not safely attach: ${getErrorMessage(error)}`);
+        this.paint();
+        return;
+      }
+    }
 
     if (plan.kind === 'switch') {
+      // tmux is about to own this terminal. The dashboard is not on screen, and
+      // the pane the preview would keep re-reading is the one the user is now
+      // looking at directly, so the poll stops for the whole handoff.
+      this.stopPreview();
       // Only the sizing, and no restore: this client keeps showing the other
       // session after the TUI exits, so snapping the window back to the
       // browser's size would put the dots on screen at the moment the user
@@ -2269,14 +2285,22 @@ class TuiApp {
     // The way OUT, set up before tmux takes the terminal: a status bar that
     // stays for the whole attach. The line written below is on a screen tmux
     // repaints a moment later, so it is not what the user reads.
-    const handoff = await beginAttachHandoff(
-      this.client,
-      muxName,
-      rowLabel(row.session),
-      this.attachTabs(row.session.sessionId),
-      this.currentLayout().cols,
-      this.currentLayout().rows
-    );
+    let handoff: TuiAttachHandoff;
+    try {
+      handoff = await beginAttachHandoff(
+        this.client,
+        muxName,
+        rowLabel(row.session),
+        this.attachTabs(row.session.sessionId),
+        this.currentLayout().cols,
+        this.currentLayout().rows
+      );
+    } catch (error) {
+      this.message('err', `could not safely attach: ${getErrorMessage(error)}`);
+      this.paint();
+      return;
+    }
+    this.stopPreview();
     this.detachChordLabel = handoff.chord;
     this.screen.leave();
     this.stdout.write(`${handoff.chord} detaches and brings you back here.\n`);
@@ -2676,6 +2700,14 @@ export async function runTuiAttach(position: number, options: TuiRunOptions = {}
     });
     if (plan.kind === 'refuse') {
       process.stderr.write(`${palette.warn(plan.message)}\n`);
+      return 1;
+    }
+    try {
+      await assertSafeAttachSwitchControls(client);
+      if (needsDirectAttachFence(row.session)) await client.fenceDirectAttach(row.session.sessionId);
+      await assertSafeAttachSwitchControls(client);
+    } catch (error) {
+      process.stderr.write(`${palette.err(`could not safely attach: ${getErrorMessage(error)}`)}\n`);
       return 1;
     }
     // Same handoff the dashboard does: the window follows this terminal and

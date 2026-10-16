@@ -22120,3 +22120,142 @@ html[data-header-stats='tiles'] .header-plan-usage:not(:has(.pu-row)) {
   border: 1px solid var(--control-border);
   color: var(--text-muted);
 }
+
+/* Structured recovery stays within the Session Options settings surface. */
+#sessionOptionsModal .recovery-state-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 16px;
+  margin: 0 0 12px;
+  padding: 12px;
+  border: 1px solid var(--control-border);
+  border-radius: 9px;
+  background: var(--control-bg);
+}
+
+#sessionOptionsModal .recovery-state-grid dt {
+  margin-bottom: 3px;
+  color: var(--text-muted);
+  font-size: 0.65rem;
+}
+
+#sessionOptionsModal .recovery-state-grid dd {
+  margin: 0;
+  color: var(--text);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+#sessionOptionsModal .recovery-state-reason {
+  grid-column: 1 / -1;
+}
+
+#sessionOptionsModal .recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+#sessionOptionsModal #recoveryRestoreRemoteBtn[hidden] {
+  display: none;
+}
+
+#sessionOptionsModal .recovery-actions-hint {
+  margin-bottom: 14px;
+}
+
+#sessionOptionsModal .recovery-settings {
+  min-width: 0;
+  margin: 0 0 14px;
+  padding: 0;
+  border: 0;
+}
+
+#sessionOptionsModal .recovery-settings:disabled {
+  opacity: 0.65;
+}
+
+#sessionOptionsModal .recovery-number {
+  width: 80px;
+  min-width: 65px;
+  flex-shrink: 0;
+}
+
+#sessionOptionsModal .recovery-notice {
+  padding: 10px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 0.74rem;
+}
+
+#sessionOptionsModal .recovery-history-wrap {
+  max-height: 260px;
+  overflow: auto;
+  border: 1px solid var(--control-border);
+  border-radius: 8px;
+}
+
+#sessionOptionsModal .recovery-history {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.67rem;
+  color: var(--text);
+}
+
+#sessionOptionsModal .recovery-history th,
+#sessionOptionsModal .recovery-history td {
+  padding: 7px 8px;
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid var(--control-border);
+}
+
+#sessionOptionsModal .recovery-history th {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+#sessionOptionsModal .recovery-notice[hidden],
+#sessionOptionsModal .recovery-history-wrap[hidden],
+#sessionOptionsModal #recoveryHistoryEmpty[hidden] {
+  display: none;
+}
+
+/* Task supervision stays readable inside the owner-bound options pane. */
+#task-tab .task-status-grid {
+  display: grid;
+  grid-template-columns: minmax(140px, 1fr) 2fr;
+  gap: 8px 16px;
+  font-size: 0.8rem;
+  margin: 16px 0;
+}
+#task-tab .task-status-grid dt { color: var(--text-muted); }
+#task-tab .task-status-grid dd { margin: 0; overflow-wrap: anywhere; }
+#task-tab .task-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+#task-tab .task-form { display: flex; flex-direction: column; gap: 10px; min-width: 0; border: 0; padding: 0; margin: 24px 0; }
+#task-tab .task-form legend { font-size: 0.85rem; font-weight: 600; padding: 0; margin-bottom: 14px; }
+#task-tab .task-form > label { font-size: 0.8rem; }
+#task-tab .task-form textarea { width: 100%; resize: vertical; box-sizing: border-box; }
+#task-tab .task-form > .btn-toolbar { align-self: flex-start; }
+#task-tab #taskCriteriaRows { display: flex; flex-direction: column; gap: 12px; min-width: 0; }
+#task-tab .task-criterion-editor { display: flex; flex-direction: column; gap: 8px; min-width: 0; border: 1px solid var(--border-light); border-radius: 8px; padding: 12px; }
+#task-tab .task-criterion-editor label { display: flex; flex-direction: column; gap: 6px; font-size: 0.8rem; }
+#task-tab .task-criterion-editor strong { font-size: 0.8rem; }
+#task-tab .task-criterion-editor > button { align-self: flex-end; }
+#task-tab .task-criterion { display: flex; gap: 8px; align-items: flex-start; padding: 8px 0; font-size: 0.8rem; overflow-wrap: anywhere; }
+#task-tab .task-history { max-height: 220px; overflow: auto; overflow-wrap: anywhere; padding-left: 24px; font-size: 0.8rem; }
+#task-tab .btn-toolbar:disabled { opacity: 0.45; cursor: default; }
+@media (max-width: 600px) {
+  /* mobile.css compacts all toolbar buttons with !important; task controls need full touch targets. */
+  #task-tab .btn-toolbar {
+    min-height: 44px !important;
+    max-height: none !important;
+    height: auto !important;
+    padding: 8px 12px !important;
+    font-size: 0.8rem !important;
+    line-height: 1.4;
+  }
+  #task-tab .task-criterion { min-height: 44px; align-items: center; }
+}

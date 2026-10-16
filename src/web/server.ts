@@ -28,6 +28,7 @@
  */
 
 import Fastify, { FastifyInstance } from 'fastify';
+import { createHash } from 'node:crypto';
 import fastifyCompress from '@fastify/compress';
 import fastifyCookie from '@fastify/cookie';
 import fastifyStatic from '@fastify/static';
@@ -41,7 +42,8 @@ import { existsSync, mkdirSync, readFileSync, chmodSync, statSync } from 'node:f
 import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { hostname as getHostname, uptime as osUptime } from 'node:os';
-import { looksLikeHostReboot, newestPersistedActivity, planRebootRestore } from '../reboot-restore.js';
+import { looksLikeHostReboot, newestPersistedActivity, planVerifiedRebootRestore } from '../reboot-restore.js';
+import { captureRebootBrokerBindings } from '../recovery/reboot-launch-witness.js';
 import { rebootRestoreRegistry } from './reboot-restore-registry.js';
 import { dataPath, getDataDir, CODEMAN_INSTANCE } from '../config/instance.js';
 import { WebhookNotifier, readWebhookConfig } from '../webhook-notify.js';
@@ -54,10 +56,15 @@ import { GLYPH, palette } from '../cli-style.js';
 import { getHookSecret } from '../config/hook-secret.js';
 import { EventEmitter } from 'node:events';
 import { Session, isExternalCliMode, type BackgroundTask } from '../session.js';
+import { normalizedCodexHome } from '../recovery/codex-home.js';
 import type { ClaudeMode, SessionAttachmentHistoryItem, SessionState, WorkflowRunInfo } from '../types.js';
 import { RespawnController, RespawnConfig } from '../respawn-controller.js';
 import type { TerminalMultiplexer } from '../mux-interface.js';
 import { createMultiplexer } from '../mux-factory.js';
+import {
+  captureBrokerCleanupReferences,
+  type BrokerCleanupReferenceSnapshot,
+} from '../recovery/codex-broker-cleanup.js';
 import { getStore } from '../state-store.js';
 import { TabLayoutService } from '../tab-layout-service.js';
 import { ownerLayoutKey } from '../tab-layout-persistence.js';
@@ -77,8 +84,8 @@ import { workflowRunWatcher, summarizeRun } from '../workflow-run-watcher.js';
 import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment } from '../attachment-registry.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
-import { readCustomModelHosts } from '../custom-model-hosts.js';
-import { applyCustomModelInjection, customModelConfigDir, removeConfigDir } from '../custom-model-injection-apply.js';
+import { customModelConfigDir, removeConfigDir } from '../custom-model-injection-apply.js';
+import { rebuildPersistedCustomModelEnv } from '../custom-model-recovery.js';
 import type { CustomModelBookkeeping } from '../types/session.js';
 import { registerGeneratedArtifactAttachment } from '../generated-artifact-attachments.js';
 import {
@@ -158,6 +165,27 @@ import { MAX_CONCURRENT_SESSIONS, MAX_SSE_CLIENTS } from '../config/map-limits.j
 import { MAX_PASTE_IMAGE_BYTES } from '../config/buffer-limits.js';
 import { resolveTerminalHistoryConfig } from '../config/terminal-history.js';
 import { SseEvent } from './sse-events.js';
+import { TaskConfigurationCancelledError, TaskController } from '../supervision/controller.js';
+import { TaskStore, taskJournalHasOwnership } from '../supervision/store.js';
+import { initialTaskState, TaskStateSchema, type TaskState } from '../supervision/schema.js';
+import { CodexTaskAdapter } from '../supervision/adapter.js';
+import { SessionActionArbiter } from '../supervision/action-arbiter.js';
+import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
+import { haveDistinctSupervisorHomes } from '../supervisor/home-identity.js';
+import { ManagerCredentialRegistry } from '../supervisor/manager-credentials.js';
+import { drainSupervisorManagerRetirements } from '../supervisor/manager-launch.js';
+import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
+import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
+import { SupervisorStore } from '../supervisor/store.js';
+import { SupervisorStateSchema } from '../supervisor/schema.js';
+import { RecoveryController } from '../recovery/controller.js';
+import { hasFreshProcessReady, isRecoveryEvidenceSourceCurrent, type RecoveryObservation } from '../recovery/types.js';
+import { RecoveryStore } from '../recovery/store.js';
+import { rebootStateBinding } from '../recovery/reboot-state-binding.js';
+import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
+import { currentLocalCodexHome } from '../recovery/codex-home.js';
+import { clampRecoveryLaunchForOwner } from '../session-env-clamp.js';
+import { ownedRemoteBrokerCache } from '../recovery/remote-input-broker-cache.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
@@ -170,6 +198,7 @@ import {
   sendLostWebviewFramePage,
 } from './middleware/auth.js';
 import { isMultiUserMode } from '../config/multiuser.js';
+import { registerSupervisorAgentBoundary } from './middleware/supervisor-agent-boundary.js';
 import { bootstrapInitialAdmin, hasUsers, resolveClaudeModeForUsername } from '../user-store.js';
 import { installRouteErrorHandler } from './route-error-handler.js';
 import { isExplicitlyEnabled, isLoopbackBindHost, buildHostPolicy, type HostPolicy } from './network-auth-policy.js';
@@ -189,6 +218,9 @@ import {
   registerCaseRoutes,
   registerSessionRoutes,
   registerRespawnRoutes,
+  registerRecoveryRoutes,
+  registerTaskRoutes,
+  registerSupervisorRoutes,
   registerRalphRoutes,
   registerPlanRoutes,
   registerClipboardRoutes,
@@ -301,6 +333,21 @@ export class WebServer extends EventEmitter {
   private app: FastifyInstance;
   private sessions: Map<string, Session> = new Map();
   private respawnControllers: Map<string, RespawnController> = new Map();
+  private taskControllers = new Map<string, TaskController>();
+  private taskInputListeners = new Map<string, () => void>();
+  private actionArbiters = new Map<string, SessionActionArbiter>();
+  private taskStore = new TaskStore();
+  private actionReservationStore = new TaskStore(dataPath('action-reservations.json'));
+  private supervisorManagerAuthReady = false;
+  private supervisorManagerCredentials = new ManagerCredentialRegistry();
+  private supervisorControllers = new Map<string, SupervisorController>();
+  private supervisorStore = new SupervisorStore();
+  private supervisorLeaseQueue: Promise<unknown> = Promise.resolve();
+  private recoveryControllers = new Map<string, RecoveryController>();
+  private recoveryInputListeners = new Map<string, () => void>();
+  private rebootIdentityListeners = new Map<string, () => void>();
+  private recoveryStore = new RecoveryStore();
+  private recoveryStopping = false;
   private respawnTimers: Map<string, { timer: NodeJS.Timeout; endAt: number; startedAt: number }> = new Map();
   private runSummaryTrackers: Map<string, RunSummaryTracker> = new Map();
   private transcriptWatchers: Map<string, TranscriptWatcher> = new Map();
@@ -355,6 +402,9 @@ export class WebServer extends EventEmitter {
   // Active plan orchestrators (for cancellation via API)
   private activePlanOrchestrators: Map<string, PlanOrchestrator> = new Map();
   private persistDeb = new KeyedDebouncer(100);
+  // Historical state belongs to disk until a rebuilt session commits. Weak
+  // instance ownership also fences late callbacks after discard/replacement.
+  private tentativeSessionRegistrations = new WeakSet<Session>();
   // Stored listener handlers for cleanup
   private subagentWatcherHandlers: {
     discovered: (info: SubagentInfo) => void;
@@ -708,15 +758,22 @@ export class WebServer extends EventEmitter {
     }
   }
 
-  /** Add a tentative session only after its owner layout accepts the creation. */
-  private async registerSessionWithLayout(session: Session): Promise<void> {
+  /** Register with the owner layout, deferring historical writes for tentative rebuilds. */
+  private async registerSessionWithLayout(session: Session, options?: { tentative?: boolean }): Promise<void> {
+    if (options?.tentative) this.tentativeSessionRegistrations.add(session);
     this.sessions.set(session.id, session);
     try {
       await this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner));
     } catch (error) {
-      this.sessions.delete(session.id);
+      if (this.sessions.get(session.id) === session) this.sessions.delete(session.id);
       throw error;
     }
+  }
+
+  /** End restore preparation only once every awaited finalization has succeeded. */
+  private commitSessionRegistration(session: Session): void {
+    if (this.sessions.get(session.id) !== session) throw new Error('Tentative session was replaced before commit');
+    this.tentativeSessionRegistrations.delete(session);
   }
 
   /**
@@ -730,14 +787,21 @@ export class WebServer extends EventEmitter {
       // SessionPort
       sessions: this.sessions as ReadonlyMap<string, Session>,
       addSession: this.registerSessionWithLayout.bind(this),
+      commitSessionRegistration: this.commitSessionRegistration.bind(this),
+      persistRebootRestoreDurably: this.persistRebootRestoreDurably.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
       persistSessionState: this.persistSessionState.bind(this),
       persistSessionStateNow: this._persistSessionStateNow.bind(this),
+      prepareRebootRestoreRecovery: this.prepareRebootRestoreRecovery.bind(this),
       reapplyPersistedSessionState: this.reapplyPersistedSessionState.bind(this),
       discardPartiallyBuiltSession: this.discardPartiallyBuiltSession.bind(this),
       getSessionStateWithRespawn: this.getSessionStateWithRespawn.bind(this),
+      getRecoveryController: this.getRecoveryController.bind(this),
+      getTaskController: this.getTaskController.bind(this),
+      getSupervisorController: this.getSupervisorController.bind(this),
+      prepareSupervisorManager: this.prepareSupervisorManager.bind(this),
       // EventPort
       broadcast: this.broadcast.bind(this),
       sendPushNotifications: this.sendPushNotifications.bind(this),
@@ -863,7 +927,8 @@ export class WebServer extends EventEmitter {
     registerHostGuard(this.app, () => this.getHostPolicy(), this.basePath);
 
     // Auth middleware (Basic Auth + session cookies + rate limiting)
-    const authState = registerAuthMiddleware(this.app, this.https, this.basePath);
+    const authState = registerAuthMiddleware(this.app, this.https, this.basePath, this.supervisorManagerCredentials);
+    this.supervisorManagerAuthReady = authState.authSessions !== null;
     if (authState) {
       this.authSessions = authState.authSessions;
       this.authFailures = authState.authFailures;
@@ -871,6 +936,7 @@ export class WebServer extends EventEmitter {
       this.hookSecretFailures = authState.hookSecretFailures;
       this.userFailures = authState.userFailures;
     }
+    registerSupervisorAgentBoundary(this.app, (candidate) => this.resolveSupervisorManagerAttribution(candidate));
 
     // WebSocket support (terminal I/O — low-latency bidirectional channel)
     await this.app.register(fastifyWebsocket);
@@ -1140,6 +1206,21 @@ export class WebServer extends EventEmitter {
     // cleanup path and resolves in-flight wakes on shutdown.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
     registerRespawnRoutes(this.app, ctx);
+    registerRecoveryRoutes(this.app, ctx);
+    registerTaskRoutes(this.app, ctx);
+    registerSupervisorRoutes(this.app, ctx);
+    registerSupervisorMcpRoutes(this.app, {
+      credentials: this.supervisorManagerCredentials,
+      resolveController: (scope) => {
+        const session = this.sessions.get(scope.sessionId);
+        return session &&
+          session.owner === scope.owner &&
+          session.isSupervisorManagerLaunchCurrent() &&
+          this.supervisorManagerCredentials.isCurrent(scope)
+          ? this.getSupervisorController(session)
+          : undefined;
+      },
+    });
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
     registerClipboardRoutes(this.app, ctx);
@@ -1261,9 +1342,10 @@ export class WebServer extends EventEmitter {
 
   /** Debounced wrapper — coalesces rapid persistSessionState calls per session */
   private persistSessionState(session: Session): void {
+    if (this.tentativeSessionRegistrations.has(session)) return;
     this.persistDeb.schedule(session.id, () => {
       // Session may have been removed during debounce
-      if (this.sessions.has(session.id)) {
+      if (this.sessions.get(session.id) === session) {
         this._persistSessionStateNow(session);
       }
     });
@@ -1280,23 +1362,10 @@ export class WebServer extends EventEmitter {
     session: Session,
     saved: CustomModelBookkeeping
   ): Promise<Record<string, string> | undefined> {
-    const entry = getCli(session.mode);
-    if (!entry) return undefined;
-    const endpoint = (await readCustomModelHosts(getDataDir())).find((h) => h.id === saved.endpointId);
-    if (!endpoint) {
-      console.warn(
-        `[WebServer] custom-model endpoint ${saved.endpointId} no longer exists; selection kept for clearing`
-      );
-      return undefined;
-    }
     try {
-      return applyCustomModelInjection(
-        entry,
-        endpoint,
-        saved.modelId,
-        session.id,
-        endpoint.modelContextLengths?.[saved.modelId]
-      )?.envOverrides;
+      const env = await rebuildPersistedCustomModelEnv(session.mode, session.id, saved, session.workingDir);
+      if (!env) console.warn('[WebServer] custom-model endpoint is unavailable; selection kept for clearing');
+      return env;
     } catch (err) {
       console.warn('[WebServer] Failed to rebuild custom-model env on recovery:', err);
       return undefined;
@@ -1305,9 +1374,71 @@ export class WebServer extends EventEmitter {
 
   /** Persists full session state including respawn config to state.json */
   private _persistSessionStateNow(session: Session): void {
+    // Recovery input persists synchronously, before dispatch can fail for a
+    // not-yet-created PTY. Its separate identity fence remains durable, while
+    // the tentative constructor snapshot must never replace historical state.
+    if (this.tentativeSessionRegistrations.has(session) || this.sessions.get(session.id) !== session) return;
+    this.store.setSession(session.id, this.buildPersistedSessionState(session));
+  }
+
+  private async persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void> {
+    const current = () =>
+      !this.recoveryStopping &&
+      isCurrent() &&
+      this.sessions.get(session.id) === session &&
+      this.tentativeSessionRegistrations.has(session);
+    if (!current()) throw new Error('Reboot restoration was cancelled before durable commit');
+    await this.mux.flushSessionsDurably(current);
+    const nativeRestorePending = session.codexRestoreWorkerMayExist;
+    const genericRestorePending = session.restoreLaunchMayExist;
+    try {
+      if (nativeRestorePending) {
+        // A successful offer must not reopen as uncertain on the next boot.
+        // Keep the Session's live veto until mux and historical state both acknowledge.
+        const binding = rebootStateBinding(this.buildPersistedSessionState(session));
+        if (!binding) throw new Error('Reboot state identity is incomplete');
+        session.prepareCodexRestoreLaunchCommit(binding);
+        await this.mux.flushSessionsDurably(current);
+      }
+      await this.store.persistSessionDurably(session.id, () => this.buildPersistedSessionState(session), current);
+      if (genericRestorePending) await session.completeRestoreLaunchCommit(current);
+      if (!current()) throw new Error('Reboot restoration was cancelled during durable commit');
+      this.persistDeb.cancelKey(session.id);
+      this.commitSessionRegistration(session);
+    } catch (error) {
+      if (genericRestorePending) {
+        session.retainRestoreLaunchUncertainty();
+        await this.mux.flushSessionsDurably().catch(() => {});
+      }
+      if (nativeRestorePending) {
+        session.retainCodexRestoreLaunchUncertainty();
+        // Even cancellation retains our own possibly running worker. Never delete
+        // it or publish a replacement historical record to make rollback look clean.
+        await this.mux.flushSessionsDurably().catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  /** Private complete snapshot; tentative restorations can serialize without overwriting historical memory. */
+  private buildPersistedSessionState(session: Session): SessionState {
     // See session-manager.updateSessionState: __envOverrides is an internal disk-only
     // field kept off SessionState to avoid leaking via API broadcasts.
     const base = session.toState();
+    const native = this.mux.getSession(session.id);
+    const previousBroker = (
+      this.store.getSession(session.id) as (SessionState & { __codexInputBroker?: unknown }) | null
+    )?.__codexInputBroker;
+    const brokerBinding = native
+      ? native.sessionId === session.id &&
+        getCli(native.mode)?.capabilities.recovery === 'codex-rollout' &&
+        native.mode === session.mode &&
+        native.owner === session.owner &&
+        native.workingDir === session.workingDir &&
+        native.recoveryCodexHome === session.getRecoveryContext().codexHome
+        ? (native.recoveryInputBroker ?? null)
+        : 'unknown'
+      : (previousBroker ?? null);
     const envOverrides = session.getEnvOverridesForPersist();
     // __attachmentHistory keeps the private (externalPath-bearing) history on disk,
     // separate from the sanitized public attachmentHistory in toState().
@@ -1317,6 +1448,21 @@ export class WebServer extends EventEmitter {
     const customModel = session.getCustomModelForPersist();
     const state = {
       ...base,
+      recovery: this.recoveryControllers.get(session.id)?.getStatus(),
+      ...(getCli(session.mode)?.capabilities.recovery === 'codex-rollout'
+        ? {
+            __codexRebootIdentity: {
+              switchPending: session.getRecoveryContext().switchPending,
+              submission: session.getRecoveryContext().submission,
+              untrackedInput: session.getRecoveryContext().untrackedInput,
+            },
+          }
+        : {}),
+      task: this.taskControllers.get(session.id)?.getStatus(),
+      ...(getCli(session.mode)?.capabilities.recovery === 'codex-rollout' ? { __codexInputBroker: brokerBinding } : {}),
+      ...(session.getRecoveryContext().codexHome
+        ? { __codexRecoveryHome: session.getRecoveryContext().codexHome }
+        : {}),
       ...(envOverrides ? { __envOverrides: envOverrides } : {}),
       ...(attachmentHistory ? { __attachmentHistory: attachmentHistory } : {}),
       ...(customModel ? { __customModel: customModel } : {}),
@@ -1341,7 +1487,7 @@ export class WebServer extends EventEmitter {
         state.respawnEnabled = false;
       }
     }
-    this.store.setSession(session.id, state);
+    return state;
   }
 
   private saveRespawnConfig(sessionId: string, config: RespawnConfig, durationMinutes?: number): void {
@@ -1362,6 +1508,8 @@ export class WebServer extends EventEmitter {
     // Guard against concurrent cleanup of the same session
     if (this.cleaningUp.has(sessionId)) return;
     this.cleaningUp.add(sessionId);
+    this.supervisorManagerCredentials.revokeSession(sessionId);
+    const managerRetirement = this.sessions.get(sessionId)?.revokeSupervisorManagerLaunch?.();
     if (killMux) this.killingSessions.add(sessionId);
     // Refuse a start or attach from here on (Ark0N/Codeman#446): a start that
     // raced this cleanup would launch a CLI in a tmux session whose record is
@@ -1372,6 +1520,7 @@ export class WebServer extends EventEmitter {
     try {
       await this._doCleanupSession(sessionId, killMux, reason);
     } finally {
+      await managerRetirement;
       this.cleaningUp.delete(sessionId);
       this.killingSessions.delete(sessionId);
       // A cleanup that failed leaves the session on the board, so it must be
@@ -1393,6 +1542,9 @@ export class WebServer extends EventEmitter {
         this._doCleanupSession(sessionId, killMux, reason, false)
       );
     }
+    // Layout preparation above may reject while the live session remains intact.
+    // Tear recovery down only after deletion has entered its irreversible action.
+    await this.stopRecoveryController(sessionId, killMux);
     const lifecycleLog = getLifecycleLog();
     lifecycleLog.log({
       event: killMux ? 'deleted' : 'detached',
@@ -1568,11 +1720,41 @@ export class WebServer extends EventEmitter {
         removeConfigDir(customModelConfigDir(sessionId));
       }
       await session.stop(killMux);
+      if (this.sessions.get(sessionId) !== session) return;
+      if (killMux) {
+        const before = this.store.getSessions()[sessionId],
+          beforeText = JSON.stringify(before),
+          owner = session.owner;
+        const current = () =>
+          this.sessions.get(sessionId) === session &&
+          session.owner === owner &&
+          this.store.getSessions()[sessionId] === before &&
+          JSON.stringify(before) === beforeText;
+        await ownedRemoteBrokerCache.stageFinalCleanup(
+          sessionId,
+          before?.pinned ? { ...before, status: 'stopped', pid: null } : undefined,
+          current,
+          session.remote && session.remote.owned !== false ? { remote: session.remote, owner } : undefined
+        );
+        if (!current()) throw Error('Session changed while preparing final cleanup');
+      }
       this.sessions.delete(sessionId);
       // Only remove from state.json if we're also killing the mux session.
       // When killMux=false (server shutdown), preserve state for recovery.
       if (killMux) {
         this.store.demoteOrRemoveSession(sessionId);
+        const retiredState = this.store.getSessions()[sessionId];
+        const retiredStateText = JSON.stringify(retiredState);
+        const retiredOwner = session.owner;
+        await ownedRemoteBrokerCache.finishFinalCleanup(
+          sessionId,
+          () =>
+            !this.sessions.has(sessionId) &&
+            session.owner === retiredOwner &&
+            this.store.getSessions()[sessionId] === retiredState &&
+            JSON.stringify(retiredState) === retiredStateText,
+          retiredState
+        );
       }
     }
 
@@ -1730,6 +1912,7 @@ export class WebServer extends EventEmitter {
           order: entry.order,
           kind: entry.kind,
           external: entry.capabilities.external,
+          recovery: entry.capabilities.recovery,
           enabled,
           available: enabled && installed,
         };
@@ -1843,6 +2026,8 @@ export class WebServer extends EventEmitter {
   }
 
   private async setupSessionListeners(session: Session): Promise<void> {
+    this.getRecoveryController(session);
+    this.getTaskController(session);
     // Idempotent: the wiring exit handler detaches ALL listeners on every PTY exit
     // (removeSessionListenerRefs), so the re-attach routes (/interactive,
     // /interactive-respawn, /shell) call this again to restore observability
@@ -2303,7 +2488,963 @@ export class WebServer extends EventEmitter {
       respawnEnabled: controller?.getConfig()?.enabled ?? false,
       respawnConfig: controller?.getConfig() ?? null,
       respawn: controller?.getStatus() ?? null,
+      recovery: this.recoveryControllers.get(session.id)?.getStatus(),
+      task: this.taskControllers.get(session.id)?.getStatus(),
+      supervisorAvailable:
+        !this.recoveryStopping &&
+        !this.cleaningUp.has(session.id) &&
+        this.sessions.get(session.id) === session &&
+        (this.supervisorControllers.has(session.id) ||
+          this.supervisorStore.has(session.id) ||
+          this.supervisorManagerIsEligible(session)),
     };
+  }
+
+  private async prepareRebootRestoreRecovery(sessionId: string): Promise<void> {
+    const state = this.recoveryStore.get(sessionId);
+    state.armedAt = Date.now();
+    state.pending = undefined;
+    state.nextRetryAt = undefined;
+    // Retain in-flight uncertainty, retry budgets, disabled settings and circuit breakers.
+    await this.recoveryStore.save(sessionId, state);
+  }
+
+  private getActionArbiter(id: string): SessionActionArbiter {
+    let arbiter = this.actionArbiters.get(id);
+    if (!arbiter) {
+      const restored = this.actionReservationStore.get(id);
+      let restoredKey = this.actionReservationStore.loadFailed ? 'legacy' : restored.inFlight?.key;
+      // Unknown journals cannot establish exclusive ownership of a legacy reservation.
+      if (
+        restoredKey &&
+        !restoredKey.includes(':') &&
+        !this.actionReservationStore.loadFailed &&
+        !this.taskStore.loadFailed &&
+        !this.recoveryStore.loadFailed
+      ) {
+        const taskOwnsReservation = !!this.taskStore.get(id).inFlight;
+        const recoveryOwnsReservation = !!this.recoveryStore.get(id).inFlight;
+        if (taskOwnsReservation !== recoveryOwnsReservation)
+          restoredKey = `${taskOwnsReservation ? 'task' : 'recovery'}:${restoredKey}`;
+      }
+      arbiter = new SessionActionArbiter(async (key) => {
+        const state = initialTaskState();
+        if (key) state.inFlight = { key, startedAt: Date.now() };
+        await this.actionReservationStore.save(id, state);
+      }, restoredKey);
+      this.actionArbiters.set(id, arbiter);
+    }
+    return arbiter;
+  }
+
+  private withSupervisorLeases<T>(fn: () => Promise<T>): Promise<T> {
+    const result = this.supervisorLeaseQueue.then(fn, fn);
+    this.supervisorLeaseQueue = result.catch(() => {});
+    return result;
+  }
+
+  private supervisorLeaseHolder(workerId: string, excludingSupervisor: string): string | undefined {
+    // A failed save may disable the live controller while disk still owns the
+    // lease. Release requires both durable and live states to relinquish it.
+    const states = [
+      ...this.supervisorStore.all(),
+      ...[...this.supervisorControllers.values()].map((controller) => controller.getStatus()),
+    ];
+    for (const state of states) {
+      if (
+        state.supervisorSessionId !== excludingSupervisor &&
+        state.enabled &&
+        // Keep the operation journal, including uncertain delivery, but an
+        // absent, pruned manager cannot hold an unreachable lease forever.
+        // Pinned/detached records and outstanding reboot restores retain it.
+        (this.sessions.has(state.supervisorSessionId) ||
+          this.store.getSession(state.supervisorSessionId) !== null ||
+          rebootRestoreRegistry.hasOutstanding(state.supervisorSessionId)) &&
+        state.workers.some((worker) => worker.sessionId === workerId)
+      )
+        return state.supervisorSessionId;
+    }
+    return undefined;
+  }
+
+  /** Explicit, authenticated conversion; a persisted role never grants a running CLI new API authority. */
+  private supervisorManagerPreparationChecks = new WeakMap<
+    Session,
+    ((isCurrent: () => boolean) => Promise<boolean | { inspectionOnly: true }>) & { canOperate?: () => boolean }
+  >();
+
+  private async prepareSupervisorManager(
+    session: Session,
+    callerCurrent: () => boolean
+  ): Promise<boolean | { inspectionOnly: true }> {
+    if (
+      !this.supervisorManagerEndpointAvailable() ||
+      !this.supervisorManagerAuthenticationAvailable() ||
+      this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
+      this.sessions.get(session.id) !== session
+    )
+      return false;
+    const retained = this.supervisorManagerPreparationChecks.get(session);
+    if (retained) {
+      const prepared = await retained(callerCurrent);
+      if (
+        prepared !== false ||
+        this.supervisorManagerPreparationChecks.has(session) ||
+        session.hasSupervisorManagerLaunch()
+      )
+        return prepared;
+      // A retired exact launch no longer owns this request. Re-enter all fresh
+      // admission checks; a pending callback or replacement profile never does.
+      return this.prepareSupervisorManager(session, callerCurrent);
+    }
+    // Serialize owner preparation/rechecks before their first asynchronous proof.
+    const pending = Object.assign(async () => false, { canOperate: () => false });
+    this.supervisorManagerPreparationChecks.set(session, pending);
+    try {
+      if (!(await session.ensureRecoveryIdentityFence())) return false;
+      const owner = session.owner;
+      const configuration = () =>
+        JSON.stringify([
+          session.owner,
+          session.mode,
+          session.workingDir,
+          session.codexConfig,
+          session.getEnvOverridesForPersist(),
+          session.remote,
+          session.docker,
+        ]);
+      const captured = configuration();
+      const authentication = JSON.stringify([
+        isMultiUserMode(),
+        process.env.CODEMAN_USERNAME,
+        process.env.CODEMAN_PASSWORD,
+      ]);
+      const clear = () =>
+        !this.taskStore.loadFailed &&
+        !this.recoveryStore.loadFailed &&
+        !this.supervisorStore.loadFailed &&
+        !this.controllerHasTaskFlight(session.id) &&
+        !this.controllerHasRecoveryFlight(session.id) &&
+        !this.supervisorControllers.get(session.id)?.getStatus().inFlight &&
+        !this.supervisorStore.get(session.id).inFlight &&
+        this.supervisorControllers.get(session.id)?.getStatus().phase !== 'active' &&
+        this.taskControllers.get(session.id)?.getStatus().phase !== 'watching';
+      const scopeCurrent = () => {
+        try {
+          return (
+            callerCurrent() === true &&
+            this.supervisorManagerEndpointAvailable() &&
+            !this.recoveryStopping &&
+            !this.cleaningUp.has(session.id) &&
+            this.sessions.get(session.id) === session &&
+            configuration() === captured &&
+            authentication ===
+              JSON.stringify([isMultiUserMode(), process.env.CODEMAN_USERNAME, process.env.CODEMAN_PASSWORD])
+          );
+        } catch {
+          return false;
+        }
+      };
+      const current = () => scopeCurrent() && clear();
+      const context = session.getRecoveryContext();
+      if (
+        !current() ||
+        session.mode !== 'codex' ||
+        session.remote ||
+        session.docker ||
+        session.paneLifecycleInFlight ||
+        !context.managed ||
+        !context.noDaemon ||
+        context.switchPending ||
+        context.untrackedInput ||
+        context.inputBrokerPending ||
+        !session.codexConfig?.resumeSessionId ||
+        !context.codexHome
+      )
+        return false;
+      const grant = await clampRecoveryLaunchForOwner(
+        owner,
+        { codexConfig: session.codexConfig },
+        session.getEnvOverridesForPersist()
+      );
+      if (
+        !current() ||
+        !grant.isCurrent() ||
+        JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(session.codexConfig) ||
+        JSON.stringify(grant.env) !== JSON.stringify(session.getEnvOverridesForPersist())
+      )
+        return false;
+      const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+      const observation = await adapter.observe();
+      const idle =
+        observation.processReady === true &&
+        ['idle', 'completed'].includes(observation.activity) &&
+        observation.conversationId === session.codexConfig.resumeSessionId &&
+        !session.isBusy() &&
+        !session.watching;
+      const source = adapter.getLocalEvidenceSource(
+        session.codexConfig.resumeSessionId,
+        session.getRecoveryContext().generation
+      );
+      if (
+        !idle ||
+        !source ||
+        !current() ||
+        !grant.isCurrent() ||
+        !(await adapter.confirmLocalEvidence(
+          session.codexConfig.resumeSessionId,
+          session.getRecoveryContext().generation
+        )) ||
+        !current()
+      )
+        return false;
+      const leaf = source.identity.witness?.paths.find(
+        (value) => value.path === source.identity.path && value.kind === 'file'
+      );
+      if (
+        !leaf ||
+        leaf.size === undefined ||
+        leaf.mtimeMs === undefined ||
+        leaf.ctimeMs === undefined ||
+        source.identity.tail === undefined ||
+        !source.identity.path
+      )
+        return false;
+      const files = [
+        {
+          path: source.identity.path,
+          dev: leaf.dev,
+          ino: leaf.ino,
+          size: leaf.size,
+          mtimeMs: leaf.mtimeMs,
+          ctimeMs: leaf.ctimeMs,
+          hash: createHash('sha256').update(source.identity.tail).digest('hex'),
+          maxBytes: 262_144,
+        },
+      ];
+      const grantFile = grant.getFileWitness?.() ?? grant.fileWitness;
+      if (grantFile) files.push(grantFile);
+      let converting = true,
+        acknowledged = false,
+        operationReady = false;
+      let launchAuthority: ReturnType<Session['captureSupervisorManagerLaunchAuthority']>;
+      const credential = this.supervisorManagerCredentials.issue({
+        canOperate: () => operationReady,
+        sessionId: session.id,
+        owner,
+        isCurrent: () =>
+          converting
+            ? current() && grant.isCurrent()
+            : scopeCurrent() && session.owner === owner && launchAuthority?.() === true && grant.isCurrent(),
+      });
+      const launchIsCurrent = () =>
+        acknowledged &&
+        scopeCurrent() &&
+        grant.isCurrent() &&
+        launchAuthority?.() === true &&
+        this.supervisorManagerCredentials.resolve(credential.token) !== undefined;
+      const refuse = async (): Promise<boolean | { inspectionOnly: true }> => {
+        converting = false;
+        if (launchIsCurrent()) {
+          // Readiness uncertainty cannot justify replacing a possibly working pane.
+          // Keep its exact restricted profile usable for inspection, with no actions.
+          this.supervisorManagerPreparationChecks.set(session, checkReadiness);
+          return { inspectionOnly: true };
+        }
+        this.supervisorManagerPreparationChecks.delete(session);
+        credential.revoke();
+        if (launchAuthority) await launchAuthority.revoke();
+        else if (!acknowledged) await session.revokeSupervisorManagerLaunch();
+        return false;
+      };
+      let launchStartedAt = 0,
+        checking = false;
+      const checkReadiness = async (requestCurrent: () => boolean): Promise<boolean | { inspectionOnly: true }> => {
+        if (requestCurrent() !== true) return scopeCurrent() ? false : refuse();
+        if (operationReady) return launchIsCurrent() ? true : refuse();
+        if (checking) return launchIsCurrent() ? { inspectionOnly: true } : false;
+        checking = true;
+        try {
+          let ready = false;
+          const readyDeadline = performance.now() + 5_000;
+          try {
+            while (
+              acknowledged &&
+              requestCurrent() === true &&
+              current() &&
+              grant.isCurrent() &&
+              session.isSupervisorManagerLaunchCurrent() &&
+              performance.now() < readyDeadline
+            ) {
+              const observed = await adapter.observe();
+              if (
+                requestCurrent() === true &&
+                current() &&
+                grant.isCurrent() &&
+                observed.conversationId === session.codexConfig?.resumeSessionId &&
+                ['idle', 'completed'].includes(observed.activity) &&
+                hasFreshProcessReady(observed, launchStartedAt, Date.now())
+              ) {
+                ready = true;
+                break;
+              }
+              if (!['unknown', 'idle', 'completed'].includes(observed.activity)) break;
+              const remaining = readyDeadline - performance.now();
+              if (remaining <= 0) break;
+              await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+            }
+            converting = false;
+            if (ready && requestCurrent() === true && launchIsCurrent() && current()) {
+              operationReady = true;
+              this.supervisorManagerPreparationChecks.set(session, checkReadiness);
+              return true;
+            }
+          } catch {
+            /* A failed observation never certifies readiness. */
+          }
+          // A cancelled recheck grants nothing and leaves the previous read-only proof intact.
+          if (requestCurrent() !== true && scopeCurrent()) return false;
+          return refuse();
+        } finally {
+          checking = false;
+        }
+      };
+      Object.assign(checkReadiness, { canOperate: () => operationReady && launchIsCurrent() });
+      try {
+        const scheme = this.https ? 'https' : 'http';
+        launchStartedAt = Date.now();
+        acknowledged =
+          (await session.prepareSupervisorManager({
+            token: credential.token,
+            endpoint: `${scheme}://127.0.0.1:${this.port}${this.basePath}/api/supervisor-mcp`,
+            files,
+            isCurrent: () => (converting ? current() : scopeCurrent()) && grant.isCurrent(),
+          })) === true;
+        if (acknowledged) launchAuthority = session.captureSupervisorManagerLaunchAuthority();
+        converting = false;
+        return await checkReadiness(callerCurrent);
+      } catch {
+        return refuse();
+      }
+    } finally {
+      if (this.supervisorManagerPreparationChecks.get(session) === pending)
+        this.supervisorManagerPreparationChecks.delete(session);
+    }
+  }
+
+  /** Only these numeric binds guarantee the bridge's IPv4 loopback endpoint. */
+  private supervisorManagerEndpointAvailable(): boolean {
+    return this.host === '127.0.0.1' || this.host === '0.0.0.0';
+  }
+
+  private supervisorManagerAuthenticationAvailable(): boolean {
+    return this.supervisorManagerAuthReady && (isMultiUserMode() || !!process.env.CODEMAN_PASSWORD);
+  }
+
+  private supervisorManagerIsEligible(session: Session): boolean {
+    const context = session.getRecoveryContext();
+    return (
+      this.supervisorManagerEndpointAvailable() &&
+      this.supervisorManagerAuthenticationAvailable() &&
+      getCli(session.mode)?.capabilities.recovery === 'codex-rollout' &&
+      !session.remote &&
+      !session.docker &&
+      context.managed &&
+      context.noDaemon
+    );
+  }
+
+  private getSupervisorController(session: Session): SupervisorController | undefined {
+    if (this.recoveryStopping || this.cleaningUp.has(session.id) || this.sessions.get(session.id) !== session)
+      return undefined;
+    // Revoked launch eligibility must not hide the owner's existing role or
+    // prevent its durable leases from being released through reset.
+    const existing = this.supervisorControllers.get(session.id);
+    if (existing) return existing;
+    // Rebuild an existing durable role for owner inspection and lease release
+    // even when a failed rebuild removed its live controller and launch rights.
+    const restored = this.supervisorStore.all().find((state) => state.supervisorSessionId === session.id);
+    const managerIsEligible = () => this.supervisorManagerIsEligible(session);
+    if (!restored && !managerIsEligible()) return undefined;
+    const managerAdapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+    const managerScope = () => {
+      const context = session.getRecoveryContext();
+      return JSON.stringify({
+        generation: context.generation,
+        codexHome: context.codexHome,
+        config: session.codexConfig,
+        env: session.getEnvOverridesForPersist(),
+        mode: session.mode,
+        owner: session.owner,
+      });
+    };
+    let managerGrant: { task: TaskController; state: TaskState; isCurrent: () => boolean; scope: string } | undefined;
+    let managerEvidence:
+      | {
+          conversationId: string;
+          generation: number;
+          observation: RecoveryObservation;
+          grantIsCurrent: () => boolean;
+          grantFile?: Readonly<import('../recovery/private-file-witness.js').PrivateFileWitness>;
+        }
+      | undefined;
+    const hasManagerTaskAuthority = () => {
+      const grant = managerGrant;
+      const context = session.getRecoveryContext();
+      if (
+        !grant ||
+        !session.isSupervisorManagerLaunchCurrent() ||
+        this.recoveryStopping ||
+        this.cleaningUp.has(session.id) ||
+        this.sessions.get(session.id) !== session ||
+        this.taskControllers.get(session.id) !== grant.task ||
+        this.taskStore.loadFailed ||
+        !context.managed ||
+        !context.noDaemon ||
+        !context.submission ||
+        context.switchPending ||
+        context.untrackedInput ||
+        session.paneLifecycleInFlight ||
+        session.paneExit !== undefined ||
+        session.remote ||
+        session.docker ||
+        session.codexConfig?.resumeSessionId !== grant.state.conversationId ||
+        managerScope() !== grant.scope
+      )
+        return false;
+      const live = grant.task.getStatus();
+      if (!TaskStateSchema.safeParse(live).success || !grant.isCurrent()) return false;
+      // A newer live veto and an older durable veto each retain authority until owner Start.
+      return [live, this.taskStore.get(session.id)].every((state) => {
+        if (!TaskStateSchema.safeParse(state).success) return false;
+        const elapsed = Date.now() - (state.startedAt ?? NaN);
+        return (
+          state.config.enabled &&
+          state.phase === 'watching' &&
+          !state.agentProgressVeto &&
+          !['blocked', 'completed'].includes(state.outcome) &&
+          !state.criteria.every((criterion) => criterion.verified) &&
+          state.continuations < state.config.maxContinuations &&
+          Number.isFinite(elapsed) &&
+          (state.startedAt ?? -1) >= 0 &&
+          elapsed >= 0 &&
+          elapsed < state.config.maxRuntimeMs &&
+          !!grant.state.conversationId &&
+          state.conversationId === grant.state.conversationId &&
+          state.objective === grant.state.objective &&
+          JSON.stringify(state.config) === JSON.stringify(grant.state.config) &&
+          state.criteria.length === grant.state.criteria.length &&
+          state.criteria.every((criterion, index) => {
+            const expected = grant.state.criteria[index];
+            return (
+              criterion.id === expected.id &&
+              criterion.description === expected.description &&
+              criterion.kind === expected.kind &&
+              criterion.command === expected.command
+            );
+          })
+        );
+      });
+    };
+    const hasManagerAuthority = () =>
+      hasManagerTaskAuthority() &&
+      !!managerEvidence &&
+      !!managerGrant &&
+      managerEvidence.grantIsCurrent() &&
+      hasManagerTaskAuthority() &&
+      hasFreshProcessReady(managerEvidence.observation, managerGrant.state.startedAt ?? NaN, Date.now());
+    const confirmManagerEvidence = async (
+      source?: import('../recovery/types.js').RecoveryEvidenceSource
+    ): Promise<boolean> => {
+      const expected = managerEvidence;
+      if (!expected || !hasManagerAuthority()) return false;
+      let verified = false;
+      try {
+        const managerSource = managerAdapter.getLocalEvidenceSource(expected.conversationId, expected.generation);
+        const jointSource = source ?? managerSource;
+        const coupledSource = jointSource && {
+          ...jointSource,
+          // A fresh ordered manager probe changes its own journal bytes.
+          // confirmLocalEvidence supplies that refreshed manager file witness;
+          // only a separate worker source keeps its previously captured files.
+          files: [...(source?.files ?? []), ...(expected.grantFile ? [expected.grantFile] : [])],
+        };
+        verified =
+          !!managerSource?.inputBroker &&
+          (await managerAdapter.confirmLocalEvidence(expected.conversationId, expected.generation, coupledSource)) ===
+            true;
+      } catch {
+        // A failed private read cannot authorize a worker effect.
+      }
+      const accepted = verified && managerEvidence === expected && hasManagerAuthority();
+      if (!accepted && managerEvidence === expected) managerEvidence = undefined;
+      return accepted;
+    };
+    const workerHasManagerRole = (worker: Session) =>
+      worker.hasSupervisorManagerLaunch() ||
+      !!this.supervisorControllers.get(worker.id)?.getStatus().enabled ||
+      !!this.supervisorStore.get(worker.id).enabled;
+    const validateWorkerHomes = async (workers: readonly Session[]) => {
+      const deadline = performance.now() + 2_000;
+      const scope = managerScope();
+      const managerHome = session.getRecoveryContext().codexHome;
+      for (const worker of workers) {
+        // An owned SSH worker has a separate filesystem namespace.
+        if (worker.remote) continue;
+        const home = worker.getRecoveryContext().codexHome;
+        const workerScope = JSON.stringify([
+          worker.owner,
+          worker.codexConfig,
+          worker.getEnvOverridesForPersist(),
+          worker.getRecoveryContext(),
+        ]);
+        const current = () =>
+          !this.recoveryStopping &&
+          !this.cleaningUp.has(session.id) &&
+          !this.cleaningUp.has(worker.id) &&
+          this.sessions.get(session.id) === session &&
+          this.sessions.get(worker.id) === worker &&
+          managerIsEligible() &&
+          managerScope() === scope &&
+          !worker.remote &&
+          !workerHasManagerRole(worker) &&
+          worker.owner === session.owner &&
+          JSON.stringify([
+            worker.owner,
+            worker.codexConfig,
+            worker.getEnvOverridesForPersist(),
+            worker.getRecoveryContext(),
+          ]) === workerScope;
+        if (!(await haveDistinctSupervisorHomes(managerHome, home, current, deadline)))
+          throw new SupervisorValidationError(
+            'Local manager and worker require verified distinct Codex homes for independent history'
+          );
+      }
+    };
+    const prepareManagerAuthority = async (
+      workerId: string,
+      source?: import('../recovery/types.js').RecoveryEvidenceSource
+    ): Promise<boolean> => {
+      const worker = this.sessions.get(workerId);
+      if (!worker || worker === session || worker.owner !== session.owner || worker.docker) return false;
+      const workerScope = () =>
+        JSON.stringify([
+          worker.owner,
+          worker.workingDir,
+          worker.codexConfig,
+          worker.getEnvOverridesForPersist(),
+          worker.getRecoveryContext(),
+          worker.remote,
+        ]);
+      const snapshot = workerScope();
+      const currentWorker = () => {
+        const context = worker.getRecoveryContext();
+        return (
+          this.sessions.get(workerId) === worker &&
+          worker.owner === session.owner &&
+          !worker.docker &&
+          !workerHasManagerRole(worker) &&
+          context.managed &&
+          context.noDaemon &&
+          !context.switchPending &&
+          !context.untrackedInput &&
+          workerScope() === snapshot &&
+          (worker.remote
+            ? worker.remote.owned !== false && source === undefined
+            : !!source &&
+              source.sessionId === worker.id &&
+              source.identity.conversationId === worker.codexConfig?.resumeSessionId &&
+              isRecoveryEvidenceSourceCurrent(source))
+        );
+      };
+      if (!currentWorker()) return false;
+      try {
+        await validateWorkerHomes([worker]);
+      } catch {
+        return false;
+      }
+      return currentWorker() && (await confirmManagerEvidence(source)) && currentWorker();
+    };
+    const controller = new SupervisorController(
+      {
+        validateWorkers: (ids) => {
+          const workers: Session[] = [];
+          for (const id of ids) {
+            const worker = this.sessions.get(id);
+            if (
+              !worker ||
+              worker === session ||
+              worker.owner !== session.owner ||
+              getCli(worker.mode)?.capabilities.recovery !== 'codex-rollout' ||
+              worker.remote?.owned === false ||
+              worker.docker ||
+              !worker.getRecoveryContext().managed ||
+              !worker.getRecoveryContext().noDaemon ||
+              !this.getTaskController(worker) ||
+              !this.getRecoveryController(worker)
+            )
+              throw new SupervisorValidationError('Worker is not an eligible owned isolated Codex session');
+            // A failed reset disables the live controller before the durable
+            // manager role is released. A restricted launch remains a manager
+            // even when its role settings are still disabled or readiness is uncertain.
+            if (workerHasManagerRole(worker)) throw new SupervisorValidationError('Supervisor cycles are not allowed');
+            workers.push(worker);
+          }
+          return validateWorkerHomes(workers);
+        },
+        worker: (id) => {
+          const worker = this.sessions.get(id);
+          if (!worker || worker.owner !== session.owner || workerHasManagerRole(worker)) return undefined;
+          const task = this.getTaskController(worker);
+          const recovery = this.getRecoveryController(worker);
+          return task && recovery
+            ? {
+                task,
+                recovery,
+                admitPrompt: (prompt, authority) =>
+                  new CodexTaskAdapter(worker, () => this._persistSessionStateNow(worker)).admitPrompt(
+                    prompt,
+                    authority
+                  ),
+                isCurrent: () =>
+                  !this.recoveryStopping &&
+                  !this.cleaningUp.has(id) &&
+                  this.sessions.get(id) === worker &&
+                  worker.owner === session.owner &&
+                  !workerHasManagerRole(worker) &&
+                  this.taskControllers.get(id) === task &&
+                  this.recoveryControllers.get(id) === recovery,
+              }
+            : undefined;
+        },
+        persist: (state) => this.supervisorStore.save(session.id, state),
+        withLeases: (fn) => this.withSupervisorLeases(fn),
+        leaseHolder: (workerId, excluding) => this.supervisorLeaseHolder(workerId, excluding),
+        agentProgressVeto: (id) =>
+          this.taskControllers.get(id)?.getStatus().agentProgressVeto === true ||
+          this.taskStore.get(id).agentProgressVeto === true,
+        hasManagerAuthority,
+        prepareManagerAuthority,
+        getInputIssuer: () => {
+          const evidence = managerEvidence;
+          if (!evidence || !hasManagerAuthority()) return undefined;
+          const issuer = managerAdapter.getLocalEvidenceSource(
+            evidence.conversationId,
+            evidence.generation
+          )?.inputBroker;
+          return (
+            issuer && {
+              ...issuer,
+              files: [...(issuer.files ?? []), ...(evidence.grantFile ? [evidence.grantFile] : [])],
+            }
+          );
+        },
+        validateManagerAuthority: async () => {
+          managerEvidence = undefined;
+          if (!hasManagerTaskAuthority()) return false;
+          const scope = managerScope();
+          const managerConfig = session.codexConfig;
+          const context = session.getRecoveryContext();
+          const persistedEnv = session.getEnvOverridesForPersist();
+          const env =
+            context.codexHome && context.codexHome !== currentLocalCodexHome()
+              ? { ...persistedEnv, CODEX_HOME: context.codexHome }
+              : persistedEnv;
+          const grant = await clampRecoveryLaunchForOwner(session.owner, { codexConfig: managerConfig }, env);
+          if (
+            !hasManagerTaskAuthority() ||
+            managerScope() !== scope ||
+            !grant.isCurrent() ||
+            JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(managerConfig) ||
+            JSON.stringify(grant.env) !== JSON.stringify(env)
+          )
+            return false;
+          const observation = await managerAdapter.observe();
+          const tail = observation.conversationId && managerAdapter.getVerifiedTail(observation.conversationId);
+          if (
+            hasManagerTaskAuthority() &&
+            managerScope() === scope &&
+            grant.isCurrent() &&
+            observation.conversationId === managerGrant?.state.conversationId &&
+            hasFreshProcessReady(observation, managerGrant?.state.startedAt ?? NaN, Date.now()) &&
+            tail !== undefined &&
+            !!managerGrant &&
+            managerProgressAllowsAction(managerGrant.task.getStatus(), observation, tail, Date.now())
+          ) {
+            managerEvidence = {
+              conversationId: observation.conversationId!,
+              generation: session.getRecoveryContext().generation,
+              observation: { ...observation },
+              grantIsCurrent: grant.isCurrent,
+              grantFile: grant.getFileWitness?.() ?? grant.fileWitness,
+            };
+            return confirmManagerEvidence();
+          }
+          return false;
+        },
+        startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
+          managerGrant = undefined;
+          managerEvidence = undefined;
+          if (
+            !managerIsEligible() ||
+            !session.isSupervisorManagerLaunchCurrent() ||
+            this.supervisorManagerPreparationChecks.get(session)?.canOperate?.() === false
+          )
+            throw new SupervisorValidationError('Prepare a restricted manager launch before Start');
+          const task = this.getTaskController(session);
+          if (!task) throw new Error('Supervisor task controller is unavailable');
+          const scope = managerScope();
+          const current = () =>
+            isCurrent() &&
+            !this.recoveryStopping &&
+            !this.cleaningUp.has(session.id) &&
+            this.sessions.get(session.id) === session &&
+            this.taskControllers.get(session.id) === task &&
+            managerIsEligible() &&
+            session.isSupervisorManagerLaunchCurrent() &&
+            this.supervisorManagerPreparationChecks.get(session)?.canOperate?.() !== false &&
+            managerScope() === scope;
+          try {
+            await task.update(buildSupervisorManagerTask(objective), current);
+          } catch (error) {
+            if (error instanceof TaskConfigurationCancelledError)
+              throw new SupervisorValidationError('Manager start was cancelled');
+            throw error;
+          }
+          if (!current()) return false;
+          const started = await task.resume(current, runtimeStartedAt);
+          if (!current()) {
+            if (started.inFlight) throw new Error('Manager task delivery may have started before cancellation');
+            return false;
+          }
+          const outcome = classifyTaskKickoff(started);
+          if (outcome === 'uncertain') throw new Error('Manager task delivery acceptance is uncertain');
+          if (outcome === 'accepted')
+            managerGrant = { task, state: started, isCurrent: task.captureActionAuthority(), scope: managerScope() };
+          return outcome === 'accepted';
+        },
+        pauseManager: async () => {
+          await this.getTaskController(session)?.pause();
+        },
+        revokeManager: () => {
+          this.supervisorManagerCredentials.revokeSession(session.id);
+          void session.revokeSupervisorManagerLaunch();
+        },
+        resetManager: async () => {
+          await session.revokeSupervisorManagerLaunch();
+          await this.getTaskController(session)?.reset();
+        },
+        changed: () => this.persistSessionState(session),
+      },
+      session.id,
+      restored ?? this.supervisorStore.get(session.id)
+    );
+    this.supervisorControllers.set(session.id, controller);
+    return controller;
+  }
+
+  private controllerHasTaskFlight(id: string): boolean {
+    return (
+      this.taskStore.loadFailed ||
+      !!(this.taskControllers.get(id)?.getStatus().inFlight ?? this.taskStore.get(id).inFlight)
+    );
+  }
+
+  private controllerHasRecoveryFlight(id: string): boolean {
+    return (
+      this.recoveryStore.loadFailed ||
+      !!(this.recoveryControllers.get(id)?.getStatus().inFlight ?? this.recoveryStore.get(id).inFlight)
+    );
+  }
+
+  private getTaskController(session: Session): TaskController | undefined {
+    if (
+      this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
+      this.sessions.get(session.id) !== session ||
+      !session.taskSupervisionSupported
+    )
+      return undefined;
+    const existing = this.taskControllers.get(session.id);
+    if (existing) return existing;
+    const adapter = new CodexTaskAdapter(session, () => this._persistSessionStateNow(session));
+    const controller = new TaskController(
+      {
+        observe: () => adapter.observe(),
+        admitPrompt: (prompt, authority, expected) => adapter.admitPrompt(prompt, authority, expected),
+        acceptReservation: (key) => this.getActionArbiter(session.id).accept('task', key),
+        resetReservation: () =>
+          this.getActionArbiter(session.id).reset('task', !this.controllerHasRecoveryFlight(session.id)),
+        recover: (observation, isCurrent) =>
+          this.getActionArbiter(session.id).run(
+            'task',
+            observation.evidenceKey ?? '',
+            () => {
+              if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
+              return adapter.recover(observation, isCurrent);
+            },
+            observation.activity === 'crashed'
+          ),
+        act: (key, conversationId, prompt, isCurrent) =>
+          this.getActionArbiter(session.id).run('task', key, () => {
+            if (this.controllerHasRecoveryFlight(session.id)) return Promise.resolve('not-sent');
+            return adapter.act(key, conversationId, prompt, isCurrent);
+          }),
+        persist: (state, authority) => this.taskStore.save(session.id, state, authority),
+        changed: (state) => {
+          if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;
+          this.broadcast(SseEvent.SessionTask, { sessionId: session.id, state });
+          this.persistSessionState(session);
+        },
+      },
+      this.taskStore.get(session.id)
+    );
+    this.taskControllers.set(session.id, controller);
+    const input = () => controller.noteUserInput();
+    this.taskInputListeners.set(session.id, input);
+    session.on('recoveryUserInput', input);
+    return controller;
+  }
+
+  private getRecoveryController(session: Session): RecoveryController | undefined {
+    if (
+      this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
+      this.sessions.get(session.id) !== session ||
+      getCli(session.mode)?.capabilities.recovery !== 'codex-rollout'
+    )
+      return undefined;
+    const existing = this.recoveryControllers.get(session.id);
+    if (existing) return existing;
+    const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+    let previousAttention = false;
+    let previousReason = '';
+    const taskBlocksRecovery = () => {
+      const task = this.taskControllers.get(session.id)?.getStatus();
+      const durableTask = this.taskStore.get(session.id);
+      // A failed or unfinished task-state save must not let the sibling recovery
+      // controller bypass an explicit agent uncertainty or block.
+      return (
+        task?.phase === 'watching' ||
+        task?.agentProgressVeto === true ||
+        durableTask.agentProgressVeto === true ||
+        this.controllerHasTaskFlight(session.id)
+      );
+    };
+    const controller: RecoveryController = new RecoveryController(
+      {
+        hasActionAuthority: () => !taskBlocksRecovery(),
+        observe: async () => {
+          const observation = await adapter.observe();
+          // Defer before RecoveryController reserves or charges an attempt. The task
+          // controller owns exact crash recovery while it is actively supervising,
+          // including dead-turn stalls whose authority is independent of safeToAct.
+          return taskBlocksRecovery() ? { ...observation, safeToAct: false, stallRestartable: false } : observation;
+        },
+        acceptReservation: (key) => this.getActionArbiter(session.id).accept('recovery', key),
+        resetReservation: () =>
+          this.getActionArbiter(session.id).reset('recovery', !this.controllerHasTaskFlight(session.id)),
+        act: (flight, isCurrent) =>
+          this.getActionArbiter(session.id).run('recovery', flight.key, () => {
+            // Retain the final veto for a task that acquires authority after observation.
+            if (!isCurrent() || taskBlocksRecovery()) return Promise.resolve('not-sent');
+            return adapter.act(flight, isCurrent);
+          }),
+        restoreMissingRemote: (isCurrent) =>
+          this.getActionArbiter(session.id).run('recovery', controller.getStatus().inFlight?.key ?? '', () => {
+            if (taskBlocksRecovery()) return Promise.resolve('not-sent');
+            return adapter.restoreMissingRemote(() => isCurrent() && !taskBlocksRecovery());
+          }),
+        persist: (state) => this.recoveryStore.save(session.id, state),
+        changed: (state) => {
+          if (this.recoveryStopping || this.sessions.get(session.id) !== session) return;
+          this.broadcast(SseEvent.SessionRecovery, { sessionId: session.id, state });
+          this.persistSessionState(session);
+          if (state.needsAttention && (!previousAttention || state.lastReason !== previousReason)) {
+            void this.sendPushNotifications(SseEvent.SessionRecovery, {
+              sessionId: session.id,
+              sessionName: session.name,
+              reason: state.lastReason,
+            });
+          }
+          previousAttention = state.needsAttention;
+          previousReason = state.lastReason;
+        },
+      },
+      this.recoveryStore.get(session.id)
+    );
+    this.recoveryControllers.set(session.id, controller);
+    const input = () => {
+      controller.noteUserInput();
+      this._persistSessionStateNow(session);
+    };
+    const identityChanged = () => {
+      // Session owns the awaited durable fence before dispatch. EventEmitter
+      // listeners remain pure bookkeeping and cannot conceal asynchronous I/O.
+      input();
+    };
+    this.rebootIdentityListeners.set(session.id, identityChanged);
+    this.recoveryInputListeners.set(session.id, input);
+    session.on('recoveryUserInput', input);
+    session.on('recoveryIdentityChanged', identityChanged);
+    return controller;
+  }
+
+  private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
+    const supervisor = this.supervisorControllers.get(id);
+    const supervisorMode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
+    const ownsSupervisorState =
+      !!supervisor ||
+      (supervisorMode !== undefined && getCli(supervisorMode)?.capabilities.recovery === 'codex-rollout');
+    const task = this.taskControllers.get(id);
+    const taskInput = this.taskInputListeners.get(id);
+    const controller = this.recoveryControllers.get(id);
+    const listener = this.recoveryInputListeners.get(id);
+    const identityListener = this.rebootIdentityListeners.get(id);
+    const taskMode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
+    const ownsTaskState =
+      !!task ||
+      !!taskInput ||
+      this.actionArbiters.has(id) ||
+      (taskMode !== undefined && getCli(taskMode)?.capabilities.recovery === 'codex-rollout');
+    const ownsRecoveryState =
+      !!controller ||
+      !!listener ||
+      !!identityListener ||
+      (taskMode !== undefined && getCli(taskMode)?.capabilities.recovery === 'codex-rollout');
+    if (taskInput) this.sessions.get(id)?.off('recoveryUserInput', taskInput);
+    if (listener) this.sessions.get(id)?.off('recoveryUserInput', listener);
+    if (identityListener) this.sessions.get(id)?.off('recoveryIdentityChanged', identityListener);
+    this.taskInputListeners.delete(id);
+    this.rebootIdentityListeners.delete(id);
+    this.recoveryInputListeners.delete(id);
+    // Worker and manager controllers may still be writing shared ownership.
+    // Revoke all synchronously, then finish every receipt before deletion.
+    supervisor?.stop();
+    task?.stop();
+    controller?.stop();
+    await Promise.all([supervisor?.drain(), task?.drain(), controller?.drain()]);
+    if (supervisor) this.supervisorControllers.delete(id);
+    if (task) this.taskControllers.delete(id);
+    if (controller) this.recoveryControllers.delete(id);
+    this.actionArbiters.delete(id);
+    if (drop) {
+      for (const [name, owned, journal] of [
+        ['Supervisor', ownsSupervisorState, this.supervisorStore],
+        ['Task', ownsTaskState, this.taskStore],
+        ['Action reservation', ownsTaskState, this.actionReservationStore],
+        ['Recovery', ownsRecoveryState, this.recoveryStore],
+      ] as const) {
+        if (!owned) continue;
+        try {
+          await journal.drop(id);
+        } catch (err) {
+          // The owner may delete a worker even when optional evidence cannot be removed.
+          console.warn(`[Server] ${name} journal deletion failed: ${getErrorMessage(err)}`);
+        }
+      }
+    }
   }
 
   /**
@@ -2358,11 +3499,94 @@ export class WebServer extends EventEmitter {
     const result = await this.tabLayouts.runStaleSessionCleanup(activeSessionIds, (ids) =>
       this.store.cleanupSessionsByIds(ids)
     );
+    // Prior boots may already have removed state.json rows. Prune the whole
+    // readable journal, retaining live/history/restore owners and reservations.
+    // This optional domain must not block unrelated state/layout cleanup.
+    for (const [name, journal] of [
+      ['Recovery', this.recoveryStore],
+      ['Task', this.taskStore],
+      ['Shared action', this.actionReservationStore],
+      ['Supervisor', this.supervisorStore],
+    ] as const) {
+      try {
+        await journal.pruneOrphans((id) => this.codexJournalHasOwner(id));
+      } catch (err) {
+        console.warn(`[Server] ${name} journal cleanup failed: ${getErrorMessage(err)}`);
+      }
+    }
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
     }
     return result.count;
+  }
+
+  private codexJournalHasOwner(id: string): boolean {
+    // Unknown sibling journals cannot establish that an action has no owner.
+    if (
+      this.recoveryStore.loadFailed ||
+      this.taskStore.loadFailed ||
+      this.actionReservationStore.loadFailed ||
+      this.supervisorStore.loadFailed
+    )
+      return true;
+    const recovery = this.recoveryStore.get(id);
+    return (
+      this.sessions.has(id) ||
+      this.store.getSession(id) !== null ||
+      this.recoveryControllers.has(id) ||
+      this.taskControllers.has(id) ||
+      this.actionArbiters.has(id) ||
+      this.supervisorControllers.has(id) ||
+      rebootRestoreRegistry.hasOutstanding(id) ||
+      !!recovery.inFlight ||
+      taskJournalHasOwnership(this.taskStore.get(id)) ||
+      taskJournalHasOwnership(this.actionReservationStore.get(id)) ||
+      this.supervisorJournalHasOwner(id)
+    );
+  }
+
+  private resolveSupervisorManagerAttribution(candidate: string): string | undefined {
+    if (candidate.length < 8 || candidate.length > 100) return undefined;
+    const matches = (id: string) => id === candidate || id.startsWith(candidate);
+    // A failed optional journal does not block unrelated non-Codex callers.
+    // A known Codex caller cannot establish that its manager role is absent.
+    if (this.supervisorStore.loadFailed) {
+      const uncertain = [...this.sessions.values()].find(
+        (session) => matches(session.id) && getCli(session.mode)?.capabilities.recovery === 'codex-rollout'
+      );
+      if (uncertain) return uncertain.id;
+    }
+    const states = [
+      ...this.supervisorStore.all(),
+      ...[...this.supervisorControllers.values()].map((controller) => controller.getStatus()),
+    ];
+    return states.find(
+      (state) =>
+        matches(state.supervisorSessionId) &&
+        (state.enabled || !!state.inFlight || !!state.objective.trim() || state.workers.length > 0)
+    )?.supervisorSessionId;
+  }
+
+  private supervisorJournalHasOwner(id: string): boolean {
+    const states = [
+      ...this.supervisorStore.all(),
+      ...[...this.supervisorControllers.values()].map((controller) => controller.getStatus()),
+    ];
+    return states.some((state) => {
+      const manager = state.supervisorSessionId;
+      const reachable =
+        this.sessions.has(manager) ||
+        this.store.getSession(manager) !== null ||
+        this.supervisorControllers.has(manager) ||
+        rebootRestoreRegistry.hasOutstanding(manager);
+      // An unreachable settled manager cannot hold a lease forever. An unresolved
+      // operation still owns its manager and exact worker without any live pane.
+      return (
+        ((state.enabled && reachable) || !!state.inFlight) &&
+        (manager === id || state.inFlight?.workerId === id || state.workers.some((worker) => worker.sessionId === id))
+      );
+    });
   }
 
   /**
@@ -2459,7 +3683,7 @@ export class WebServer extends EventEmitter {
     return result;
   }
 
-  // ========== SSE Delegates (SseStreamManager) ==========
+  // ========== SSE Delegates (SseStreamManager) ===  }
 
   private broadcast(event: string, data: unknown): void {
     // Invalidate caches on structural changes (creation/deletion)
@@ -2591,6 +3815,8 @@ export class WebServer extends EventEmitter {
       if (!session.setPaneExit(getPaneExit(muxName))) continue;
       this.persistSessionState(session);
       this.broadcastSessionStateDebounced(session.id);
+      const recovery = this.recoveryControllers.get(session.id);
+      if (recovery?.getStatus().config.enabled) void recovery.refresh().catch(() => {});
     }
     this.closeCleanlyExitedSessions();
   }
@@ -2651,7 +3877,7 @@ export class WebServer extends EventEmitter {
     }
   }
 
-  // ========== Web Push ==========
+  // ========== Web Push ===  }
 
   /** Map SSE event names to push notification payloads */
   private static readonly PUSH_EVENT_MAP: Record<
@@ -2672,6 +3898,7 @@ export class WebServer extends EventEmitter {
     [SseEvent.SessionError]: { title: 'Session Error', urgency: 'critical' },
     [SseEvent.RespawnBlocked]: { title: 'Respawn Blocked', urgency: 'critical' },
     [SseEvent.SessionRespawnBreakerTripped]: { title: 'Session crash loop stopped', urgency: 'critical' },
+    [SseEvent.SessionRecovery]: { title: 'Codex recovery needs attention', urgency: 'critical' },
     [SseEvent.SessionRalphCompletionDetected]: { title: 'Task Complete', urgency: 'warning' },
   };
 
@@ -2792,6 +4019,9 @@ export class WebServer extends EventEmitter {
     } else if (event === SseEvent.RespawnBlocked && data.reason) {
       body += body ? ' ' : '';
       body += String(data.reason);
+    } else if (event === SseEvent.SessionRecovery && data.reason) {
+      body += body ? ' ' : '';
+      body += String(data.reason);
     } else if (event === SseEvent.SessionRalphCompletionDetected && data.phrase) {
       body += body ? ' ' : '';
       body += String(data.phrase);
@@ -2846,6 +4076,43 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  /** Complete private references only; never installed before startup reconciliation. */
+  private captureInputBrokerCleanupReferences(): BrokerCleanupReferenceSnapshot | undefined {
+    return captureBrokerCleanupReferences(() => {
+      const recovery = this.recoveryStore.getCleanupSnapshot();
+      const reboot = rebootRestoreRegistry.getBrokerCleanupState();
+      const task = this.taskStore.getBrokerCleanupState();
+      const actions = this.actionReservationStore.getBrokerCleanupState();
+      const supervisors = this.supervisorStore.getBrokerCleanupState();
+      if (!recovery || !reboot || !task || !actions || !supervisors)
+        throw new Error('Recovery references are unavailable');
+      const supervisorControllers = Array.from(this.supervisorControllers.values(), (controller) =>
+        controller.getStatus()
+      );
+      for (const status of supervisorControllers) {
+        if (!SupervisorStateSchema.safeParse(status).success) {
+          // A future asynchronous status reader is unknown; drain its rejection
+          // without adopting it as an empty private reference domain.
+          void Promise.resolve(status).catch(() => {});
+          throw new Error('Supervisor references are unavailable');
+        }
+      }
+      return {
+        persisted: this.store.getState(),
+        mux: this.mux.getSessions(),
+        live: Array.from(this.sessions.values(), (session) => session.getRecoveryContext()),
+        recovery,
+        reboot,
+        task,
+        actions,
+        supervisors,
+        supervisorControllers,
+        taskControllers: Array.from(this.taskControllers.values(), (controller) => controller.getStatus()),
+        recoveryControllers: Array.from(this.recoveryControllers.values(), (controller) => controller.getStatus()),
+      };
+    });
+  }
+
   async start(): Promise<void> {
     // Multi-user first boot: create the initial admin from CODEMAN_USERNAME/PASSWORD
     // if there are no users yet, else refuse to start (there would be no way in).
@@ -2884,6 +4151,9 @@ export class WebServer extends EventEmitter {
     if (!this.testMode) {
       const restored = await this.restoreMuxSessions();
       await this.finalizeRestoredState(restored);
+      // Include every private board record and live scope; unknown/in-flight
+      // evidence disables retirement. The janitor also rechecks durable metadata.
+      this.mux.setBrokerCleanupReferenceProvider?.(() => this.captureInputBrokerCleanupReferences());
 
       // Instance-scoped reaper: after restore, `docker rm -f` managed containers of
       // THIS instance whose case is gone from docker-cases.json (best-effort, never
@@ -3250,7 +4520,12 @@ export class WebServer extends EventEmitter {
    *
    * @returns how many sessions are on offer.
    */
-  private planRebootRestoreOffer(dead: string[], livePaneCount: number): number {
+  private async planRebootRestoreOffer(
+    dead: string[],
+    livePaneCount: number,
+    bindings?: ReadonlyMap<string, string | null>
+  ): Promise<number> {
+    await rebootRestoreRegistry.configurePersistence(join(getDataDir(), 'reboot-restore-offer.json'));
     if (dead.length === 0) return 0;
 
     const persisted = this.store.getSessions();
@@ -3266,14 +4541,26 @@ export class WebServer extends EventEmitter {
       return 0;
     }
 
-    const { restore, skipped } = planRebootRestore(dead, persisted, (workingDir) => existsSync(workingDir));
+    const mergePlan = await rebootRestoreRegistry.preparePlanMerge();
+    const persistedSnapshot = JSON.stringify(persisted);
+    const { restore, skipped } = await planVerifiedRebootRestore(
+      dead,
+      persisted,
+      undefined,
+      bindings,
+      () => this.store.getSessions() === persisted
+    );
     if (skipped.length > 0) {
       console.log(`[Server] Reboot restore is passing over ${skipped.length} dead session(s):`);
       for (const rejection of skipped) {
         console.log(`[Server]   ${rejection.sessionId}: ${rejection.reason}`);
       }
     }
-    rebootRestoreRegistry.set(restore);
+    await mergePlan(
+      restore,
+      () => this.store.getSessions() === persisted && JSON.stringify(persisted) === persistedSnapshot,
+      dead
+    );
     if (restore.length > 0) {
       console.log(`[Server] Host reboot detected; offering ${restore.length} session(s) for restore`);
     }
@@ -3312,7 +4599,7 @@ export class WebServer extends EventEmitter {
     session: Session,
     saved: SessionState,
     phase: 'before-spawn' | 'after-spawn',
-    options?: { rearmAutoResumeSchedule?: boolean }
+    options?: { rearmAutoResumeSchedule?: boolean; rebootCustomModelEnv?: Record<string, string> }
   ): Promise<void> {
     if (phase === 'before-spawn') {
       // The custom-model env has to be rebuilt from the endpoint store: the persist
@@ -3320,7 +4607,12 @@ export class WebServer extends EventEmitter {
       // bookkeeping survives a restart and the values are re-derived here.
       const savedCustomModel = (saved as { __customModel?: CustomModelBookkeeping }).__customModel;
       if (savedCustomModel) {
-        session.setCustomModel(savedCustomModel, await this._rebuildCustomModelEnv(session, savedCustomModel));
+        // Reboot has already rebuilt and witnessed these exact files. A second
+        // rebuild would replace their inodes and invalidate that launch proof.
+        session.setCustomModel(
+          savedCustomModel,
+          options?.rebootCustomModelEnv ?? (await this._rebuildCustomModelEnv(session, savedCustomModel))
+        );
       }
       if (saved.niceEnabled !== undefined || saved.niceValue !== undefined) {
         session.setNice({ enabled: saved.niceEnabled, niceValue: saved.niceValue });
@@ -3384,10 +4676,48 @@ export class WebServer extends EventEmitter {
    * workspace's own files are left exactly as they were, so the session stays
    * restorable on the next attempt.
    */
-  async discardPartiallyBuiltSession(sessionId: string): Promise<void> {
+  async discardPartiallyBuiltSession(
+    sessionId: string,
+    expectedSession?: Session,
+    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean; retainForInspection?: boolean }
+  ): Promise<void> {
     const session = this.sessions.get(sessionId);
-    if (!session) return;
-    this.sessions.delete(sessionId);
+    // Reboot restore reuses a historical id. A late failure or cancellation may
+    // arrive after another path has replaced that map entry, so only unwind the
+    // exact tentative instance the caller owns.
+    if (!session || (expectedSession && session !== expectedSession)) return;
+    const ownsCleanupFence = !this.cleaningUp.has(sessionId);
+    this.cleaningUp.add(sessionId);
+    session.markClosing(true);
+    if (session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist) {
+      this.tentativeSessionRegistrations.add(session);
+      this.persistDeb.cancelKey(sessionId);
+    }
+    try {
+      await this.stopRecoveryController(sessionId, false);
+      if (this.sessions.get(sessionId) !== session) return;
+      if (session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist) {
+        this.tentativeSessionRegistrations.add(session);
+        if (session.codexRestoreWorkerMayExist) session.adoptUncertainCodexRestore();
+        else {
+          session.retainRestoreLaunchUncertainty();
+          session.adoptUncertainRestore();
+        }
+        this.persistDeb.cancelKey(sessionId);
+        // Keep tentative protection: the historical state record must remain intact.
+        await this.mux.flushSessionsDurably();
+        if (this.sessions.get(sessionId) !== session) return;
+        this.broadcast(SseEvent.SessionCreated, this.getSessionStateWithRespawn(session));
+        return;
+      }
+      this.sessions.delete(sessionId);
+    } finally {
+      if (ownsCleanupFence) {
+        this.cleaningUp.delete(sessionId);
+        // A failed drain leaves the tentative session registered and retryable.
+        if (this.sessions.get(sessionId) === session) session.markClosing(false);
+      }
+    }
 
     // --- the inverse of setupSessionListeners(), in reverse order ---
     // Listeners first: while they are attached, one of them can still reach a
@@ -3434,18 +4764,21 @@ export class WebServer extends EventEmitter {
     // `lastRecordedTokens` is deliberately NOT deleted: the `after-spawn` phase
     // seeds it as the daily-usage baseline for these restored totals, and the
     // retry reuses the id, so dropping it would count them as new usage.
-    // The per-session custom-model config dir carries the endpoint's API key, and
-    // `before-spawn` may already have written it. Nothing else would ever remove
-    // it: the stale sweep only touches state.json. A retry rewrites it.
-    removeConfigDir(customModelConfigDir(sessionId));
+    // The per-session custom-model config dir normally belongs to this tentative
+    // construction and carries endpoint credentials, so discard removes it. A
+    // reboot restore can instead REUSE the original session's existing CODEX_HOME,
+    // which also owns its rollout/history. The route snapshots that ownership
+    // before re-applying the endpoint and asks us to preserve the tree on failure.
+    if (!options?.preserveCustomModelConfigDir) removeConfigDir(customModelConfigDir(sessionId));
     try {
       session.removeAllListeners();
-      await session.stop(true);
+      await session.stop(!options?.preserveMuxPane);
     } catch (err) {
       console.warn(`[Server] stopping a partially built session failed: ${getErrorMessage(err)}`);
       // `stop()` kills the mux session in its last block, after destroying its
       // trackers, so a throw on the way there leaves the pane running.
-      await this.mux.killSession(sessionId).catch(() => {});
+      if (!options?.preserveMuxPane && !session.codexRestoreWorkerMayExist && !session.restoreLaunchMayExist)
+        await this.mux.killSession(sessionId).catch(() => {});
     }
     try {
       await this.tabLayouts.sessionsRemoved([{ id: sessionId, owner: session.owner }]);
@@ -3459,11 +4792,44 @@ export class WebServer extends EventEmitter {
 
   private async restoreMuxSessions(): Promise<boolean> {
     try {
+      // Capture durable prior broker bindings before reconciliation removes dead rows.
+      const priorBrokerBindings = await captureRebootBrokerBindings(this.store.getSessions());
       // Reconcile mux sessions to find which ones are still alive (also discovers unknown ones)
       const { alive, dead, discovered } = await this.mux.reconcileSessions();
 
       if (discovered.length > 0) {
         console.log(`[Server] Discovered ${discovered.length} unknown mux session(s)`);
+      }
+
+      for (const muxSession of this.mux.getSessions()) {
+        if (
+          getCli(muxSession.mode)?.capabilities.recovery !== 'codex-rollout' ||
+          muxSession.codexRestoreStateBinding === undefined
+        )
+          continue;
+        const savedState = this.store.getSession(muxSession.sessionId);
+        const nativeBinding = savedState
+          ? rebootStateBinding({
+              ...savedState,
+              id: muxSession.sessionId,
+              mode: muxSession.mode,
+              owner: muxSession.owner,
+              workingDir: muxSession.workingDir,
+              codexConfig: muxSession.codexRestoreConfig,
+              __codexRecoveryHome: muxSession.recoveryCodexHome,
+            })
+          : undefined;
+        if (
+          !/^[a-f0-9]{64}$/.test(muxSession.codexRestoreStateBinding) ||
+          rebootStateBinding(savedState) !== muxSession.codexRestoreStateBinding ||
+          nativeBinding !== muxSession.codexRestoreStateBinding
+        ) {
+          // A crash between mux and state acknowledgements leaves only the native
+          // launch's actual configuration trustworthy. Inspection cannot launch
+          // or recover it, and tentative state cannot overwrite its history.
+          muxSession.codexRestoreUncertain = true;
+          this.mux.registerSession(muxSession);
+        }
       }
 
       // Build the reboot-restore offer HERE: `dead` is only known after
@@ -3477,12 +4843,22 @@ export class WebServer extends EventEmitter {
       // failure of the thing it is supposed to help. An offer nobody gets is the
       // correct way for this to fail.
       try {
-        this.planRebootRestoreOffer(dead, alive.length);
+        await this.planRebootRestoreOffer(dead, alive.length, priorBrokerBindings ?? new Map());
       } catch (err) {
         console.error('[Server] Building the reboot-restore offer failed; continuing recovery:', err);
       }
 
-      if (alive.length > 0 || discovered.length > 0) {
+      if (
+        alive.length > 0 ||
+        discovered.length > 0 ||
+        this.mux
+          .getSessions()
+          .some(
+            (session) =>
+              session.codexRestoreUncertain === true ||
+              (Object.hasOwn(session, 'restoreUncertain') && session.restoreUncertain !== false)
+          )
+      ) {
         console.log(`[Server] Found ${alive.length + discovered.length} alive mux session(s) from previous run`);
 
         // For each alive mux session, create a Session object if it doesn't exist
@@ -3492,9 +4868,25 @@ export class WebServer extends EventEmitter {
         const remoteHostsById = new Map((await readRemoteHosts(getDataDir())).map((host) => [host.id, host]));
         for (const muxSession of muxSessions) {
           if (!this.sessions.has(muxSession.sessionId)) {
+            const inspectionOnly =
+              muxSession.discovered === true ||
+              muxSession.codexRestoreUncertain === true ||
+              (Object.hasOwn(muxSession, 'restoreUncertain') && muxSession.restoreUncertain !== false);
             // Restore session settings from state.json (single source of truth)
             const savedState = this.store.getSession(muxSession.sessionId);
-
+            const recoveredCli = getCli(muxSession.mode);
+            const usesCodexConfig =
+              recoveredCli?.capabilities.recovery === 'codex-rollout' ||
+              recoveredCli?.launch.legacyConfigField === 'codexConfig';
+            // Launch settings belong to this exact CLI. An uncertain native
+            // launch retains its own settings solely for fenced inspection.
+            const recoveredCodexConfig = usesCodexConfig
+              ? muxSession.codexRestoreUncertain === true
+                ? muxSession.codexRestoreConfig
+                : savedState?.mode === muxSession.mode
+                  ? savedState.codexConfig
+                  : undefined
+              : undefined;
             // Determine the correct session name (priority: savedState > muxSession > muxName)
             // This ensures renamed sessions keep their name after server restart
             const sessionName = savedState?.name || muxSession.name || muxSession.muxName;
@@ -3514,6 +4906,9 @@ export class WebServer extends EventEmitter {
             // session-manager (see updateSessionState). Cast to read the non-public field.
             // Note: a legacy CLAUDE_CODE_EFFORT_LEVEL entry is auto-migrated to `effort`
             // by the Session constructor (env var would hard-lock /effort switching).
+            // An attach does not change the existing process's launch policy or environment.
+            // Preserve its actual settings; the recovery adapter re-checks current owner
+            // grants and refuses action when those settings are no longer authorized.
             const savedEnvOverrides = (savedState as { __envOverrides?: Record<string, string> })?.__envOverrides;
             const savedCustomModel = (savedState as { __customModel?: CustomModelBookkeeping })?.__customModel;
             // Prefer the private (externalPath-bearing) history; fall back to the
@@ -3539,7 +4934,22 @@ export class WebServer extends EventEmitter {
               claudeMode: recoveryClaudeMode.claudeMode,
               allowedTools: recoveryClaudeMode.allowedTools,
               openCodeConfig: muxSession.mode === 'opencode' ? savedState?.openCodeConfig : undefined,
-              codexConfig: muxSession.mode === 'codex' ? savedState?.codexConfig : undefined,
+              codexConfig: recoveredCodexConfig,
+              preserveExitedPane:
+                getCli(muxSession.mode)?.capabilities.recovery === 'codex-rollout' &&
+                !muxSession.remote &&
+                !savedState?.remote &&
+                !muxSession.docker &&
+                !savedState?.docker &&
+                !muxSession.discovered &&
+                muxSession.recoveryIsolated === true &&
+                savedState?.codexConfig?.noDaemon === true &&
+                /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(muxSession.recoveryInputBroker ?? '') &&
+                normalizedCodexHome(muxSession.recoveryCodexHome) !== undefined &&
+                (savedEnvOverrides?.CODEX_HOME === undefined ||
+                  savedEnvOverrides.CODEX_HOME === '' ||
+                  normalizedCodexHome(savedEnvOverrides.CODEX_HOME) ===
+                    normalizedCodexHome(muxSession.recoveryCodexHome)),
               geminiConfig: muxSession.mode === 'gemini' ? savedState?.geminiConfig : undefined,
               antigravityConfig: muxSession.mode === 'antigravity' ? savedState?.antigravityConfig : undefined,
               piConfig: muxSession.mode === 'pi' ? savedState?.piConfig : undefined,
@@ -3596,6 +5006,8 @@ export class WebServer extends EventEmitter {
               parentSessionId: savedState?.parentSessionId,
             });
 
+            if (inspectionOnly) session.ralphTracker.disableAutoEnable();
+
             // Custom-model selection survives the restart. The tmux session still carries
             // the injected `setenv`s (that is what kept the pane on the endpoint across the
             // restart), but `_envOverrides` is rebuilt from a persist that deliberately
@@ -3603,7 +5015,10 @@ export class WebServer extends EventEmitter {
             // the isolated config dir; an endpoint that has since been deleted still gets
             // the bookkeeping restored, which is what a later clear needs to unset.
             if (savedCustomModel) {
-              session.setCustomModel(savedCustomModel, await this._rebuildCustomModelEnv(session, savedCustomModel));
+              session.setCustomModel(
+                savedCustomModel,
+                inspectionOnly ? undefined : await this._rebuildCustomModelEnv(session, savedCustomModel)
+              );
             }
 
             // Update session name if it was a "Restored:" placeholder or doesn't match saved name
@@ -3614,19 +5029,22 @@ export class WebServer extends EventEmitter {
               // Auto-compact
               if (savedState.autoCompactEnabled !== undefined || savedState.autoCompactThreshold !== undefined) {
                 session.setAutoCompact(
-                  savedState.autoCompactEnabled ?? false,
+                  !inspectionOnly && (savedState.autoCompactEnabled ?? false),
                   savedState.autoCompactThreshold,
                   savedState.autoCompactPrompt
                 );
               }
               // Auto-clear
               if (savedState.autoClearEnabled !== undefined || savedState.autoClearThreshold !== undefined) {
-                session.setAutoClear(savedState.autoClearEnabled ?? false, savedState.autoClearThreshold);
+                session.setAutoClear(
+                  !inspectionOnly && (savedState.autoClearEnabled ?? false),
+                  savedState.autoClearThreshold
+                );
               }
               // Auto-resume on usage limit (re-arms a pending schedule; an
               // overdue one fires shortly after boot — the limit footer won't
               // reprint on its own, so the pause would otherwise stall)
-              if (savedState.autoResumeEnabled) {
+              if (!inspectionOnly && savedState.autoResumeEnabled) {
                 session.restoreAutoResume(true, savedState.autoResumeAt);
               }
               // Token tracking
@@ -3653,7 +5071,7 @@ export class WebServer extends EventEmitter {
                 }
               }
               // Ralph / Todo tracker (not supported for external-CLI sessions)
-              if (!isExternalCliMode(session.mode)) {
+              if (!inspectionOnly && !isExternalCliMode(session.mode)) {
                 if (savedState.ralphAutoEnableDisabled) {
                   session.ralphTracker.disableAutoEnable();
                   console.log(`[Server] Restored Ralph auto-enable disabled for session ${session.id}`);
@@ -3683,7 +5101,12 @@ export class WebServer extends EventEmitter {
                 session.flickerFilterEnabled = savedState.flickerFilterEnabled;
               }
               // Respawn controller (not supported for external-CLI sessions)
-              if (!isExternalCliMode(session.mode) && savedState.respawnEnabled && savedState.respawnConfig) {
+              if (
+                !inspectionOnly &&
+                !isExternalCliMode(session.mode) &&
+                savedState.respawnEnabled &&
+                savedState.respawnConfig
+              ) {
                 try {
                   this.restoreRespawnController(session, savedState.respawnConfig, 'state.json');
                 } catch (err) {
@@ -3694,6 +5117,7 @@ export class WebServer extends EventEmitter {
 
             // Fallback: restore respawn from mux-sessions.json if state.json didn't have it (not supported for external CLIs)
             if (
+              !inspectionOnly &&
               !isExternalCliMode(session.mode) &&
               !this.respawnControllers.has(session.id) &&
               muxSession.respawnConfig?.enabled
@@ -3711,6 +5135,7 @@ export class WebServer extends EventEmitter {
             // Fallback: restore Ralph state from state-inner.json if not already set and not explicitly disabled
             // Ralph tracker is not supported for external-CLI sessions
             if (
+              !inspectionOnly &&
               !isExternalCliMode(session.mode) &&
               !session.ralphTracker.enabled &&
               !session.ralphTracker.autoEnableDisabled
@@ -3724,6 +5149,7 @@ export class WebServer extends EventEmitter {
 
             // Fallback: auto-detect completion phrase from CLAUDE.md (not supported for external CLIs)
             if (
+              !inspectionOnly &&
               !isExternalCliMode(session.mode) &&
               session.ralphTracker.enabled &&
               !session.ralphTracker.loopState.completionPhrase
@@ -3736,6 +5162,7 @@ export class WebServer extends EventEmitter {
               }
             }
 
+            if (inspectionOnly) this.tentativeSessionRegistrations.add(session);
             this.sessions.set(session.id, session);
             await this.setupSessionListeners(session);
 
@@ -3873,6 +5300,10 @@ export class WebServer extends EventEmitter {
     let ok = false;
     try {
       ok = await session.reattachRemote();
+      if (ok) {
+        const current = () => this.sessions.get(sessionId) === session;
+        ok = current() && (this.remoteWake ? await this.remoteWake.acceptVerifiedReattachment(session, current) : true);
+      }
     } catch (err) {
       console.error(`[Server] Remote reattach failed for ${sessionId}:`, err);
       ok = false;
@@ -3951,6 +5382,24 @@ export class WebServer extends EventEmitter {
   }
 
   async stop(): Promise<void> {
+    this.recoveryStopping = true;
+    this.supervisorManagerCredentials.revokeAll();
+    const managerRetirements = [...this.sessions.values()].map((session) => session.revokeSupervisorManagerLaunch?.());
+    for (const controller of this.supervisorControllers.values()) controller.stop();
+    for (const controller of this.recoveryControllers.values()) controller.stop();
+    for (const controller of this.taskControllers.values()) controller.stop();
+    const automationIds = new Set([
+      ...this.supervisorControllers.keys(),
+      ...this.recoveryControllers.keys(),
+      ...this.taskControllers.keys(),
+    ]);
+    await Promise.all([...automationIds].map((id) => this.stopRecoveryController(id, false)));
+    await Promise.all(managerRetirements);
+    await drainSupervisorManagerRetirements();
+    await this.recoveryStore.flush();
+    await this.taskStore.flush();
+    await this.actionReservationStore.flush();
+    await this.supervisorStore.flush();
     getLifecycleLog().log({ event: 'server_stopped', sessionId: '*' });
     // Set stopping flag to prevent new timer creation during shutdown
     this.sse.setStopping();
@@ -4057,7 +5506,8 @@ export class WebServer extends EventEmitter {
     // Don't delete sessions from the map or state.json — recovery needs them
 
     // Flush state store to prevent data loss from debounced saves
-    this.store.flushAll();
+    await rebootRestoreRegistry.flush();
+    await this.store.flushAllAsync();
 
     // Clean up watcher listeners to prevent memory leaks
     this.cleanupSubagentWatcherListeners();
@@ -4134,6 +5584,12 @@ export class WebServer extends EventEmitter {
     this.pushStore.dispose();
 
     await this.app.close();
+    // GET expiry can enqueue background cleanup until the last request closes.
+    await rebootRestoreRegistry.flush();
+    // Closing in-flight requests can enqueue late reservation/uncertainty writes.
+    await this.mux.drainSessionSaves?.();
+    // Closing requests may retire a profile after the first shutdown drain.
+    await drainSupervisorManagerRetirements();
   }
 }
 

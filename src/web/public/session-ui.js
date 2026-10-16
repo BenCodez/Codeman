@@ -44,6 +44,7 @@ const RUN_MODE_LAUNCH = {
       codexConfig: {
         dangerouslyBypassApprovals: globalSettings.codexDangerouslyBypassApprovals ?? false,
         animations: globalSettings.codexAnimationsEnabled ?? false,
+        // Unchosen isolation defaults come from the server's current synced settings.
         renderMode: 'hybrid',
       },
     }),
@@ -2577,6 +2578,11 @@ Object.assign(CodemanApp.prototype, {
       if (respawnTabBtn) respawnTabBtn.style.display = '';
     }
 
+    // Recovery is advertised by the CLI catalog, never inferred from the mode name.
+    if (this.openRecoveryOptions?.(sessionId)) this.switchOptionsTab('recovery');
+    this.openTaskOptions?.(sessionId);
+    this.openSupervisorOptions?.(sessionId);
+
     // Populate Ralph Wiggum form with current session values (skip for external CLI sessions)
     if (!isExternalCli) {
       const ralphState = this.ralphStates.get(sessionId);
@@ -2922,6 +2928,9 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('context-tab').classList.toggle('hidden', tabName !== 'context');
     document.getElementById('ralph-tab').classList.toggle('hidden', tabName !== 'ralph');
     document.getElementById('summary-tab').classList.toggle('hidden', tabName !== 'summary');
+    document.getElementById('recovery-tab')?.classList.toggle('hidden', tabName !== 'recovery');
+    document.getElementById('task-tab')?.classList.toggle('hidden', tabName !== 'task');
+    document.getElementById('supervisor-tab')?.classList.toggle('hidden', tabName !== 'supervisor');
 
     // A switched-to section starts at its own top, not at the scroll offset the
     // previous one was left at.

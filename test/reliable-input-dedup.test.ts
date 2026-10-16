@@ -10,7 +10,7 @@
  *
  * See docs/reliable-input-delivery.md.
  */
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import { Session } from '../src/session.js';
 
 function makeSession(): Session {
@@ -20,43 +20,208 @@ function makeSession(): Session {
   return new Session({ workingDir: '/tmp' });
 }
 
+function apply(s: Session, clientId: string, seq: number): boolean {
+  const accepted = s.shouldApplyInput(clientId, seq);
+  if (accepted) s.commitInputSeq(clientId, seq);
+  return accepted;
+}
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('abandoned known-unsent input admission', () => {
+  function clock() {
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    return (next: number) => {
+      now = next;
+    };
+  }
+
+  it('reclaims 256 abandoned never-dispatched clients after the monotonic lease', () => {
+    const setTime = clock();
+    const s = makeSession();
+    for (let i = 0; i < 256; i++) expect(s.deferInputSeq(`abandoned-${i}`, 1)).toBe(true);
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(false);
+    setTime(60_000);
+    expect(s.shouldApplyInput('fresh-client', 1)).toBe(true);
+    expect(s.hasAppliedInputSeq('fresh-client', 1)).toBe(false);
+    s.commitInputSeq('fresh-client', 1);
+    expect(s.hasAppliedInputSeq('fresh-client', 1)).toBe(true);
+  });
+
+  it('retires abandoned sparse identities under capacity pressure without replaying or acknowledging their holes', () => {
+    const setTime = clock();
+    const s = makeSession();
+    for (let i = 0; i < 256; i++) {
+      const client = `sparse-${i}`;
+      expect(s.shouldApplyInput(client, 10)).toBe(true);
+      expect(s.deferInputSeq(client, 3)).toBe(true);
+      s.commitInputSeq(client, 10);
+    }
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(false);
+    setTime(60_000);
+    expect(apply(s, 'fresh-client', 1)).toBe(true);
+    expect(s.shouldApplyInput('sparse-0', 3)).toBe(false);
+    expect(s.hasAppliedInputSeq('sparse-0', 3)).toBe(false);
+    expect(s.shouldApplyInput('sparse-0', 10)).toBe(false);
+    expect(s.shouldApplyInput('sparse-0', 11)).toBe(false);
+    expect(apply(s, 'fresh-client', 2)).toBe(true);
+  });
+
+  it('retires a full stale sparse identity during its own admission while keeping the entire identity sealed', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.shouldApplyInput('sparse', 5000)).toBe(true);
+    for (let seq = 1; seq <= 4095; seq++) expect(s.deferInputSeq('sparse', seq)).toBe(true);
+    s.commitInputSeq('sparse', 5000);
+    expect(s.deferInputSeq('sparse', 6000)).toBe(true);
+    setTime(60_000);
+    expect(s.shouldApplyInput('sparse', 6001)).toBe(false);
+    expect(s.hasAppliedInputSeq('sparse', 1)).toBe(false);
+    expect(s.shouldApplyInput('sparse', 1)).toBe(false);
+    expect(apply(s, 'replacement-document', 1)).toBe(true);
+  });
+
+  it('reclaims an expired 4096-frame unsent tail while retaining its committed watermark', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(apply(s, 'client', 7)).toBe(true);
+    for (let seq = 8; seq < 4104; seq++) expect(s.deferInputSeq('client', seq)).toBe(true);
+    expect(s.deferInputSeq('client', 4104)).toBe(false);
+    setTime(60_000);
+    expect(s.shouldApplyInput('client', 4104)).toBe(true);
+    expect(s.lastInputSeq('client')).toBe(7);
+    expect(s.hasAppliedInputSeq('client', 7)).toBe(true);
+    expect(s.hasAppliedInputSeq('client', 8)).toBe(false);
+  });
+
+  it('keeps actively retried known-unsent input ahead of later frames', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.deferInputSeq('active', 1)).toBe(true);
+    for (let i = 0; i < 255; i++) expect(s.deferInputSeq(`abandoned-${i}`, 1)).toBe(true);
+    for (const at of [30_000, 60_000, 90_000]) {
+      setTime(at);
+      expect(s.deferInputSeq('active', 1)).toBe(true);
+    }
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(true);
+    expect(s.shouldApplyInput('active', 2)).toBe(false);
+    expect(apply(s, 'active', 1)).toBe(true);
+    expect(apply(s, 'active', 2)).toBe(true);
+  });
+
+  it('retains a quiet known-unsent FIFO when no admission capacity needs reclaiming', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.deferInputSeq('quiet-client', 1)).toBe(true);
+    setTime(600_000);
+    expect(s.shouldApplyInput('quiet-client', 2)).toBe(false);
+    expect(s.hasAppliedInputSeq('quiet-client', 1)).toBe(false);
+    expect(apply(s, 'quiet-client', 1)).toBe(true);
+    expect(apply(s, 'quiet-client', 2)).toBe(true);
+  });
+
+  it.each(['failed', 'committed'] as const)('renews queued FIFO after a long pending delivery is %s', (outcome) => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.shouldApplyInput('active', 1)).toBe(true);
+    expect(s.deferInputSeq('active', 2)).toBe(true);
+    setTime(600_000);
+    if (outcome === 'failed') s.forgetInputSeq('active', 1);
+    else s.commitInputSeq('active', 1);
+    expect(s.shouldApplyInput('active', 3)).toBe(false);
+    if (outcome === 'failed') expect(apply(s, 'active', 1)).toBe(true);
+    expect(apply(s, 'active', 2)).toBe(true);
+    expect(apply(s, 'active', 3)).toBe(true);
+  });
+
+  it('never expires pending input or turns an earlier sparse unsent hole into an ACK', () => {
+    const setTime = clock();
+    const s = makeSession();
+    expect(s.shouldApplyInput('pending', 10)).toBe(true);
+    expect(s.deferInputSeq('pending', 3)).toBe(true);
+    setTime(600_000);
+    expect(s.shouldApplyInput('pending', 10)).toBe(false);
+    expect(s.shouldApplyInput('pending', 11)).toBe(false);
+    expect(s.hasAppliedInputSeq('pending', 10)).toBe(false);
+    s.commitInputSeq('pending', 10);
+    setTime(1_200_000);
+    expect(s.shouldApplyInput('pending', 11)).toBe(false);
+    expect(s.lastInputSeq('pending')).toBe(10);
+    expect(s.hasAppliedInputSeq('pending', 3)).toBe(false);
+    expect(apply(s, 'pending', 3)).toBe(true);
+    expect(apply(s, 'pending', 11)).toBe(true);
+  });
+
+  it('preserves all pending clients under pressure even after the lease', () => {
+    const setTime = clock();
+    const s = makeSession();
+    for (let i = 0; i < 256; i++) expect(s.shouldApplyInput(`pending-${i}`, 1)).toBe(true);
+    setTime(600_000);
+    expect(s.deferInputSeq('fresh-client', 1)).toBe(false);
+    expect(s.shouldApplyInput('pending-0', 1)).toBe(false);
+    s.commitInputSeq('pending-0', 1);
+    expect(s.hasAppliedInputSeq('pending-0', 1)).toBe(true);
+  });
+
+  it('does not expire known-unsent input after wall-clock changes or a backwards monotonic sample', () => {
+    const setTime = clock();
+    setTime(100);
+    const s = makeSession();
+    expect(s.deferInputSeq('active', 1)).toBe(true);
+    const wall = vi.spyOn(Date, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER);
+    setTime(99);
+    expect(s.shouldApplyInput('active', 2)).toBe(false);
+    expect(s.hasAppliedInputSeq('active', 1)).toBe(false);
+    wall.mockRestore();
+    expect(apply(s, 'active', 1)).toBe(true);
+  });
+});
+
 describe('Session.shouldApplyInput (exactly-once input dedup)', () => {
+  it('accepts and deduplicates the schema-valid initial zero sequence', () => {
+    const s = makeSession();
+    expect(s.hasAppliedInputSeq('zero', 0)).toBe(false);
+    expect(apply(s, 'zero', 0)).toBe(true);
+    expect(s.hasAppliedInputSeq('zero', 0)).toBe(true);
+    expect(apply(s, 'zero', 0)).toBe(false);
+  });
   it('applies a fresh (clientId, seq) exactly once', () => {
     const s = makeSession();
-    expect(s.shouldApplyInput('clientA', 1)).toBe(true);
+    expect(apply(s, 'clientA', 1)).toBe(true);
     // Same seq redelivered (lost ACK) — must NOT apply again.
-    expect(s.shouldApplyInput('clientA', 1)).toBe(false);
+    expect(apply(s, 'clientA', 1)).toBe(false);
   });
 
   it('applies strictly increasing seqs and rejects stale ones', () => {
     const s = makeSession();
-    expect(s.shouldApplyInput('c', 1)).toBe(true);
-    expect(s.shouldApplyInput('c', 2)).toBe(true);
-    expect(s.shouldApplyInput('c', 3)).toBe(true);
+    expect(apply(s, 'c', 1)).toBe(true);
+    expect(apply(s, 'c', 2)).toBe(true);
+    expect(apply(s, 'c', 3)).toBe(true);
     // Out-of-order / replayed lower seqs are duplicates.
-    expect(s.shouldApplyInput('c', 2)).toBe(false);
-    expect(s.shouldApplyInput('c', 1)).toBe(false);
+    expect(apply(s, 'c', 2)).toBe(false);
+    expect(apply(s, 'c', 1)).toBe(false);
     // The next genuinely-new seq still applies.
-    expect(s.shouldApplyInput('c', 4)).toBe(true);
+    expect(apply(s, 'c', 4)).toBe(true);
   });
 
   it('tracks each client independently', () => {
     const s = makeSession();
-    expect(s.shouldApplyInput('a', 5)).toBe(true);
+    expect(apply(s, 'a', 5)).toBe(true);
     // A different client at seq 1 is not shadowed by client a's higher seq.
-    expect(s.shouldApplyInput('b', 1)).toBe(true);
-    expect(s.shouldApplyInput('b', 1)).toBe(false);
-    expect(s.shouldApplyInput('a', 6)).toBe(true);
+    expect(apply(s, 'b', 1)).toBe(true);
+    expect(apply(s, 'b', 1)).toBe(false);
+    expect(apply(s, 'a', 6)).toBe(true);
   });
 
   it('tolerates a seq gap (skips never collapse a new seq to a duplicate)', () => {
     const s = makeSession();
-    expect(s.shouldApplyInput('c', 1)).toBe(true);
+    expect(apply(s, 'c', 1)).toBe(true);
     // Client jumped seq (e.g. resumed after a reload that kept the counter).
-    expect(s.shouldApplyInput('c', 100)).toBe(true);
-    expect(s.shouldApplyInput('c', 100)).toBe(false);
-    expect(s.shouldApplyInput('c', 50)).toBe(false);
-    expect(s.shouldApplyInput('c', 101)).toBe(true);
+    expect(apply(s, 'c', 100)).toBe(true);
+    expect(apply(s, 'c', 100)).toBe(false);
+    expect(apply(s, 'c', 50)).toBe(false);
+    expect(apply(s, 'c', 101)).toBe(true);
   });
 
   it('keeps recent clients dedup-correct past the eviction bound', () => {
@@ -64,22 +229,80 @@ describe('Session.shouldApplyInput (exactly-once input dedup)', () => {
     // Far exceed MAX_INPUT_DEDUP_CLIENTS (256) with one-shot clients, then prove
     // a freshly-active client is still deduped correctly (MRU eviction).
     for (let i = 0; i < 400; i++) {
-      expect(s.shouldApplyInput(`oneshot-${i}`, 1)).toBe(true);
+      expect(apply(s, `oneshot-${i}`, 1)).toBe(true);
     }
-    expect(s.shouldApplyInput('recent', 1)).toBe(true);
-    expect(s.shouldApplyInput('recent', 1)).toBe(false);
-    expect(s.shouldApplyInput('recent', 2)).toBe(true);
+    expect(apply(s, 'recent', 1)).toBe(true);
+    expect(apply(s, 'recent', 1)).toBe(false);
+    expect(apply(s, 'recent', 2)).toBe(true);
   });
 });
 
 describe('Session.lastInputSeq (the watermark a stuck client needs)', () => {
+  it('failed sparse and overlapping reservations retain only the genuinely applied watermark', () => {
+    const s = makeSession();
+    apply(s, 'c-1', 7);
+    expect(s.shouldApplyInput('c-1', 10)).toBe(true);
+    expect(s.shouldApplyInput('c-1', 100)).toBe(false);
+    expect(s.lastInputSeq('c-1')).toBe(7);
+    s.forgetInputSeq('c-1', 10);
+    s.forgetInputSeq('c-1', 100);
+    expect(s.lastInputSeq('c-1')).toBe(7);
+    expect(apply(s, 'c-1', 10)).toBe(true);
+    expect(apply(s, 'c-1', 100)).toBe(true);
+    expect(s.lastInputSeq('c-1')).toBe(100);
+    expect(apply(s, 'c-1', 100)).toBe(false);
+  });
+
+  it('failure of a later reservation keeps an older in-flight identity protected', () => {
+    const s = makeSession();
+    s.shouldApplyInput('c-1', 1);
+    expect(s.shouldApplyInput('c-1', 3)).toBe(false);
+    s.forgetInputSeq('c-1', 3);
+    expect(s.shouldApplyInput('c-1', 1)).toBe(false);
+    expect(s.lastInputSeq('c-1')).toBe(0);
+    s.commitInputSeq('c-1', 1);
+    expect(s.lastInputSeq('c-1')).toBe(1);
+    expect(apply(s, 'c-1', 3)).toBe(true);
+  });
+
+  it('keeps an earlier received identity undelivered when a higher in-flight sparse frame commits', () => {
+    const s = makeSession();
+    expect(s.shouldApplyInput('c-1', 7)).toBe(true);
+    expect(s.shouldApplyInput('c-1', 3)).toBe(false);
+    s.commitInputSeq('c-1', 7);
+    expect(s.lastInputSeq('c-1')).toBe(7);
+    expect(s.hasAppliedInputSeq('c-1', 3)).toBe(false);
+    expect(apply(s, 'c-1', 8)).toBe(false);
+    expect(apply(s, 'c-1', 3)).toBe(true);
+    expect(s.hasAppliedInputSeq('c-1', 3)).toBe(true);
+    expect(apply(s, 'c-1', 8)).toBe(true);
+  });
+
+  it('bounds deferred identities and reopens capacity after the earliest retry commits', () => {
+    const s = makeSession();
+    for (let seq = 1; seq <= 4096; seq++) expect(s.deferInputSeq('c-1', seq)).toBe(true);
+    expect(s.deferInputSeq('c-1', 4097)).toBe(false);
+    expect(s.lastInputSeq('c-1')).toBe(0);
+    expect(apply(s, 'c-1', 1)).toBe(true);
+    expect(s.deferInputSeq('c-1', 4097)).toBe(true);
+  });
+
+  it('never evicts received but undelivered identities to admit another client', () => {
+    const s = makeSession();
+    for (let i = 0; i < 256; i++) expect(s.deferInputSeq(`waiting-${i}`, 1)).toBe(true);
+    expect(s.deferInputSeq('overflow', 1)).toBe(false);
+    expect(apply(s, 'waiting-0', 1)).toBe(true);
+    expect(s.deferInputSeq('overflow', 1)).toBe(true);
+    expect(s.shouldApplyInput('waiting-1', 2)).toBe(false);
+    expect(apply(s, 'waiting-1', 1)).toBe(true);
+  });
   it('reports 0 for a client it has never seen', () => {
     expect(makeSession().lastInputSeq('c-new')).toBe(0);
   });
 
   it('reports the highest seq applied for that client', () => {
     const s = makeSession();
-    s.shouldApplyInput('c-1', 7);
+    apply(s, 'c-1', 7);
     expect(s.lastInputSeq('c-1')).toBe(7);
   });
 
@@ -89,21 +312,75 @@ describe('Session.lastInputSeq (the watermark a stuck client needs)', () => {
     // counting from below the watermark. Every later keystroke then lands at or
     // under it and is rejected — silently, because a rejected frame is ACKed too.
     const s = makeSession();
-    for (let i = 1; i <= 40; i++) s.shouldApplyInput('c-1', i);
+    for (let i = 1; i <= 40; i++) apply(s, 'c-1', i);
     // Restored counter starts over at 1: dropped, and every subsequent one too.
-    expect(s.shouldApplyInput('c-1', 1)).toBe(false);
-    expect(s.shouldApplyInput('c-1', 2)).toBe(false);
+    expect(apply(s, 'c-1', 1)).toBe(false);
+    expect(apply(s, 'c-1', 2)).toBe(false);
     // The watermark it is handed back is exactly what makes it recoverable.
     const watermark = s.lastInputSeq('c-1');
     expect(watermark).toBe(40);
-    expect(s.shouldApplyInput('c-1', watermark + 1)).toBe(true);
+    expect(apply(s, 'c-1', watermark + 1)).toBe(true);
   });
 
   it('does not resurrect a seq that forgetInputSeq rolled back', () => {
     const s = makeSession();
+    apply(s, 'c-1', 3);
     s.shouldApplyInput('c-1', 5);
     s.forgetInputSeq('c-1', 5);
-    expect(s.lastInputSeq('c-1')).toBe(4);
-    expect(s.shouldApplyInput('c-1', 5)).toBe(true);
+    expect(s.lastInputSeq('c-1')).toBe(3);
+    expect(apply(s, 'c-1', 5)).toBe(true);
+  });
+});
+
+describe('retired input client receipts', () => {
+  it('never re-applies a stale occurrence after committed client churn exceeds the live ledger', () => {
+    const s = makeSession();
+    expect(apply(s, 'old-document', 1)).toBe(true);
+    for (let i = 0; i < 400; i++) expect(apply(s, `new-document-${i}`, 1)).toBe(true);
+    // A lost ACK or undeletable browser record retains this exact original CID.
+    expect(s.deferInputSeq('old-document', 1)).toBe(false);
+    expect(s.shouldApplyInput('old-document', 1)).toBe(false);
+    expect(s.shouldApplyInput('old-document', 2)).toBe(false);
+    expect(s.hasAppliedInputSeq('old-document', 1)).toBe(false);
+    expect(apply(s, 'healthy-current-document', 1)).toBe(true);
+    expect(apply(s, 'healthy-current-document', 2)).toBe(true);
+  });
+
+  it('retains an evicted zero-sequence receipt without claiming an unknown sequence was applied', () => {
+    const s = makeSession();
+    expect(apply(s, 'zero-document', 0)).toBe(true);
+    for (let i = 0; i < 256; i++) expect(apply(s, `zero-churn-${i}`, 1)).toBe(true);
+    expect(s.shouldApplyInput('zero-document', 0)).toBe(false);
+    expect(s.hasAppliedInputSeq('zero-document', 0)).toBe(false);
+    expect(s.deferInputSeq('zero-document', 100)).toBe(false);
+  });
+
+  it('does not permanently retire certified never-dispatched admission after reclaiming its lease', () => {
+    let now = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const s = makeSession();
+    expect(s.deferInputSeq('abandoned-original', 1)).toBe(true);
+    for (let i = 0; i < 255; i++) expect(s.deferInputSeq(`abandoned-other-${i}`, 1)).toBe(true);
+    now = 60000;
+    expect(apply(s, 'owner-current', 1)).toBe(true);
+    expect(apply(s, 'abandoned-original', 1)).toBe(true);
+    expect(apply(s, 'abandoned-original', 1)).toBe(false);
+  });
+
+  it('uses a fixed lazy rejection filter and never clears earlier retirement evidence', () => {
+    const s = makeSession();
+    const filter = Reflect.get(s, '_retiredInputClients');
+    expect(Reflect.get(filter, 'bits')).toBeUndefined();
+    expect(apply(s, 'oldest-document', 1)).toBe(true);
+    for (let i = 0; i < 600; i++) expect(apply(s, `bounded-churn-${i}`, 1)).toBe(true);
+    const bits = Reflect.get(filter, 'bits') as Uint8Array;
+    expect(bits.byteLength).toBe(16384);
+    expect(s.deferInputSeq('oldest-document', 1)).toBe(false);
+    // A saturated filter can only refuse unknown identities. Existing live
+    // receipts and their future new input still use exact ledger evidence.
+    bits.fill(255);
+    expect(s.deferInputSeq('unknown-after-saturation', 1)).toBe(false);
+    expect(apply(s, 'bounded-churn-599', 2)).toBe(true);
+    expect(Reflect.get(filter, 'bits')).toBe(bits);
   });
 });

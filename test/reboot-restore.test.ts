@@ -153,7 +153,7 @@ describe('which dead sessions may be rebuilt', () => {
 
   it('skips a CLI whose history the claude transcript reader does not understand', () => {
     const persisted = { c: persistedSession({ id: 'c', mode: 'codex' }) };
-    expect(planRebootRestore(['c'], persisted, () => true).skipped[0].reason).toBe('unsupported-mode');
+    expect(planRebootRestore(['c'], persisted, () => true).skipped[0].reason).toBe('identity-unverified');
   });
 });
 
@@ -242,24 +242,24 @@ describe('the plan the banner spends', () => {
     state: persistedSession({ id: sessionId, owner }),
   });
 
-  it('hands an entry to the first caller and nothing to the second', () => {
+  it('hands an entry to the first caller and nothing to the second', async () => {
     const registry = new RebootRestoreRegistry();
-    registry.set([entryFor('a'), entryFor('b')]);
+    await registry.set([entryFor('a'), entryFor('b')]);
     expect(registry.take(all, undefined, undefined).map((e) => e.sessionId)).toEqual(['a', 'b']);
     // The double-click: two panes on one conversation is what this prevents.
     expect(registry.take(all, undefined, undefined)).toEqual([]);
   });
 
-  it('spends only the ids a caller asked for', () => {
+  it('spends only the ids a caller asked for', async () => {
     const registry = new RebootRestoreRegistry();
-    registry.set([entryFor('a'), entryFor('b')]);
+    await registry.set([entryFor('a'), entryFor('b')]);
     expect(registry.take(all, ['b'], undefined).map((e) => e.sessionId)).toEqual(['b']);
     expect(registry.list(all).map((e) => e.sessionId)).toEqual(['a']);
   });
 
-  it("shows a user their own sessions and leaves another owner's alone", () => {
+  it("shows a user their own sessions and leaves another owner's alone", async () => {
     const registry = new RebootRestoreRegistry();
-    registry.set([entryFor('mine', 'alice'), entryFor('theirs', 'bob')]);
+    await registry.set([entryFor('mine', 'alice'), entryFor('theirs', 'bob')]);
     const asAlice = (owner: string | undefined) => owner === 'alice';
     expect(registry.list(asAlice).map((e) => e.sessionId)).toEqual(['mine']);
     expect(registry.take(asAlice, undefined, 'alice').map((e) => e.sessionId)).toEqual(['mine']);
@@ -267,11 +267,11 @@ describe('the plan the banner spends', () => {
     expect(registry.list(() => true).map((e) => e.sessionId)).toEqual(['theirs']);
   });
 
-  it('puts back an entry that no pane was created for', () => {
+  it('puts back an entry that no pane was created for', async () => {
     const registry = new RebootRestoreRegistry();
-    registry.set([entryFor('a')]);
+    await registry.set([entryFor('a')]);
     const taken = registry.take(all, undefined, undefined);
-    registry.releaseFlight(undefined, taken);
+    await registry.releaseFlight(undefined, taken);
     expect(registry.list(all).map((e) => e.sessionId)).toEqual(['a']);
   });
 
@@ -283,16 +283,16 @@ describe('the plan the banner spends', () => {
     expect(registry.beginSpending()).toBe(true);
   });
 
-  it('drops what a dismiss cleared', () => {
+  it('drops what a dismiss cleared', async () => {
     const registry = new RebootRestoreRegistry();
-    registry.set([entryFor('a'), entryFor('b')]);
-    expect(registry.clear(all)).toBe(2);
+    await registry.set([entryFor('a'), entryFor('b')]);
+    expect(await registry.clear(all)).toBe(2);
     expect(registry.list(all)).toEqual([]);
   });
 
-  it('forgets a plan nobody took for a day', () => {
+  it('forgets a plan nobody took for a day', async () => {
     const registry = new RebootRestoreRegistry();
-    registry.set([entryFor('a')]);
+    await registry.set([entryFor('a')]);
     const dayLater = Date.now() + 25 * HOUR;
     const realNow = Date.now;
     Date.now = () => dayLater;

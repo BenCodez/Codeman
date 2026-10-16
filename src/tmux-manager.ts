@@ -22,17 +22,35 @@
  */
 
 import { EventEmitter } from 'node:events';
+import { supervisorManagerCommand, type SupervisorManagerLaunch } from './supervisor/manager-launch.js';
+import { createHash, randomUUID } from 'node:crypto';
+import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
+import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
+import {
+  ownedRemoteBrokerCache,
+  type OwnedRemoteBrokerScope,
+  type OwnedRemoteBrokerDescriptor,
+} from './recovery/remote-input-broker-cache.js';
+import { provisionRemoteInputBroker } from './recovery/remote-input-broker.js';
+import { observeOwnedRemoteBroker } from './recovery/remote-broker-launch.js';
+import type { PrivateFileWitness } from './recovery/private-file-witness.js';
 import { collectDescendants } from './proc-tree.js';
+import { prepareRebootWorkspaceLaunch, type RebootWorkspaceLaunch } from './recovery/reboot-workspace-launch.js';
+import { isMultiUserMode } from './config/multiuser.js';
 import { execSync, exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execAsync = promisify(exec);
-import { existsSync, readFileSync, mkdirSync } from 'node:fs';
-import { writeFile, rename } from 'node:fs/promises';
-import { dirname } from 'node:path';
+const execFileAsync = promisify(execFile);
+import { existsSync, readFileSync, constants } from 'node:fs';
+import { writeFile, rename, mkdir, open, unlink, lstat } from 'node:fs/promises';
+import { dirname, join, isAbsolute, posix } from 'node:path';
 import { homedir } from 'node:os';
+import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
+import { hasCodexComposerText, hasEmptyCodexComposer } from './recovery/codex-classifier.js';
 import {
   dataPath,
+  getDataDirPath,
   DEFAULT_TMUX_SOCKET,
   CODEMAN_INSTANCE,
   SAFE_TMUX_SOCKET_PATTERN,
@@ -61,6 +79,7 @@ import {
   type PaneExit,
 } from './types.js';
 import { getCli } from './config/cli-registry/registry.js';
+import { currentLocalCodexHome, normalizedCodexHome } from './recovery/codex-home.js';
 import { missingCliMessage, resolveCliBinDir } from './utils/cli-resolver.js';
 import {
   buildSpawnCommandFromRegistry,
@@ -108,6 +127,7 @@ import type {
   CreateSessionOptions,
   RespawnPaneOptions,
   PaneCaptureOptions,
+  RecoveryMuxDispatchGuard,
 } from './mux-interface.js';
 import {
   decideReconnect,
@@ -259,9 +279,7 @@ const PANE_LIST_FORMAT =
  * 构建 pane 启动前的 nofile 修复命令。
  *
  * macOS launchd/tmux 组合有时会让 pane 继承 256 的 soft nofile；
- * 新版 Claude Code 会在这种环境下直接退出。这里避免使用 $变量
- * 或命令替换，因为 fullCmd 目前经由双引号 bash -c 传递，外层
- * shell 会提前展开它们。
+ * 新版 Claude Code 会在这种环境下直接退出。
  */
 export function buildNofileLimitCommand(targetLimit = CLAUDE_CODE_NOFILE_LIMIT): string {
   const safeLimit = Number.isSafeInteger(targetLimit) && targetLimit > 0 ? targetLimit : CLAUDE_CODE_NOFILE_LIMIT;
@@ -312,14 +330,7 @@ interface TrackedPaneExit extends PaneExitObservation {
   reads: number;
 }
 
-/** Read one optional numeric field; a blank or non-numeric value is "not reported". */
-function paneField(fields: string[], index: number): number | undefined {
-  const raw = fields[index];
-  if (raw === undefined || raw === '') return undefined;
-  const value = parseInt(raw, 10);
-  return Number.isNaN(value) ? undefined : value;
-}
-
+const EXIT_NUMBER = /^(?:0|[1-9]\d{0,4})?$/;
 /**
  * Parse the output of `tmux list-panes -a -F` under {@link PANE_LIST_FORMAT}
  * into one row per pane, in tmux's own order. Exported for unit testing.
@@ -339,12 +350,24 @@ export function parsePaneRows(output: string): PaneRow[] {
     const pid = parseInt(fields[1] ?? '', 10);
     if (!sessionName || Number.isNaN(pid)) continue;
     const deadFlag = fields[2];
+    const rawStatus = fields[3] ?? '';
+    const rawSignal = fields[4] ?? '';
+    const signal = parseNativePaneSignal(rawSignal);
+    const validExit =
+      fields.length === 5 &&
+      /^[1-9]\d{0,9}$/.test(fields[1] ?? '') &&
+      Number.isSafeInteger(pid) &&
+      EXIT_NUMBER.test(rawStatus) &&
+      (rawStatus === '' || Number(rawStatus) <= 255) &&
+      signal !== null &&
+      !(rawStatus !== '' && (signal ?? 0) > 0) &&
+      (deadFlag !== '0' || (rawStatus === '' && rawSignal === ''));
     rows.push({
       sessionName,
       pid,
-      dead: deadFlag === '1' ? true : deadFlag === '0' ? false : undefined,
-      exitStatus: paneField(fields, 3),
-      exitSignal: paneField(fields, 4),
+      dead: validExit ? (deadFlag === '1' ? true : deadFlag === '0' ? false : undefined) : undefined,
+      exitStatus: validExit && rawStatus !== '' ? Number(rawStatus) : undefined,
+      exitSignal: validExit ? (signal ?? undefined) : undefined,
     });
   }
   return rows;
@@ -917,12 +940,8 @@ export function buildSpawnCommand(options: {
     const rendered = buildSpawnCommandFromRegistry(entry, options);
     if (rendered !== undefined) return rendered;
   }
-  // #208: NOT the literal '$SHELL'. This string is embedded in the `bash -c "…"`
-  // argument of the respawn-pane line, which execSync runs through `/bin/sh -c`,
-  // so a `$SHELL` here is expanded by the SERVER process's shell against the
-  // SERVER process's env — empty in containers and system systemd units, leaving
-  // the pane command ending in a dangling `&&` ("syntax error: unexpected end of
-  // file", pane dead on arrival). Resolve it in Node and quote the result.
+  // Resolve the local shell in Node so the pane launch is independent of the
+  // server process's environment and remains one exact bash -c payload.
   // #209: launch it as a LOGIN shell, which is what tmux itself does for a pane
   // with no `default-command`, so a Codeman shell tab matches a hand-started tmux
   // one. That is what picks up /etc/profile and /etc/profile.d/* — a systemd
@@ -962,6 +981,45 @@ export function remoteTmuxSessionName(sessionId: string): string {
   return `codeman-ssh-${sessionId.slice(0, 8)}`;
 }
 
+function buildRemoteRecoveryLoginCommand(options: {
+  entry: CliEntry;
+  mode: SessionMode;
+  sessionId: string;
+  codexConfig?: CodexConfig;
+  codexHome?: string;
+}): string {
+  if (options.entry.capabilities.recovery !== 'codex-rollout') {
+    throw new Error(`Remote recovery launch is not supported for ${options.mode}`);
+  }
+  const codexCmd = buildSpawnCommandFromRegistry(options.entry, {
+    mode: options.mode,
+    sessionId: options.sessionId,
+    codexConfig: options.codexConfig,
+  });
+  if (!codexCmd) throw new Error(`Cannot render the exact remote recovery command for ${options.mode}`);
+  const remoteEnv = [
+    `CODEX_INTERNAL_ORIGINATOR_OVERRIDE=${shellescape(`codeman_${options.sessionId}`)}`,
+    ...(options.codexHome ? [`CODEX_HOME=${shellescape(options.codexHome)}`] : []),
+  ].join(' ');
+  return remoteLoginShellCommand(`exec env ${remoteEnv} ${codexCmd}`);
+}
+
+/** Exact command placed in an owned remote Codex pane, shared with guarded recovery. */
+export function buildRemoteCodexPaneCommand(options: {
+  remotePath: string;
+  sessionId: string;
+  codexConfig?: CodexConfig;
+  codexHome?: string;
+}): string {
+  const entry = getCli('codex');
+  if (!entry) throw new Error('Cannot resolve the Codex CLI registry entry');
+  return `cd ${shellescape(options.remotePath)} && ${buildRemoteRecoveryLoginCommand({
+    ...options,
+    entry,
+    mode: 'codex',
+  })}`;
+}
+
 /**
  * COD-104 — build the SSH command that launches (or reattaches) a remote
  * session INSIDE a tmux server on the remote host, so the remote agent survives
@@ -999,9 +1057,14 @@ export function buildRemoteLaunchCommand(options: {
   allowedTools?: string;
   /** OMP only — resume/continue overrides for the remote omp relaunch (dead-pane respawn). */
   ompConfig?: OmpConfig;
+  /** Codex launch flags must cross the SSH boundary exactly as configured. */
+  codexConfig?: CodexConfig;
+  /** Only CODEX_HOME is materialized remotely; other local overrides stay local. */
+  envOverrides?: Record<string, string>;
   resumeSessionId?: string;
 }): string {
-  const { mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId } = options;
+  const { mode, remote, sessionId, claudeMode, allowedTools, ompConfig, codexConfig, envOverrides, resumeSessionId } =
+    options;
   // §6.3: honor the session's EFFECTIVE claude permission mode on remote instead of
   // hardcoding --dangerously-skip-permissions, so a non-granted multi-user user's
   // downgraded 'auto' actually reaches the remote agent (the default command otherwise
@@ -1067,6 +1130,20 @@ export function buildRemoteLaunchCommand(options: {
         }) ?? 'omp')
       : 'omp';
     modeCommand = remoteLoginShellCommand(ompCmd);
+  } else if (getCli(mode)?.capabilities.recovery === 'codex-rollout') {
+    // Recovery attribution depends on the same isolated launch configuration and
+    // originator that local Codex panes receive. These values have to be inside
+    // the remote login-shell command: setting them on the local tmux session only
+    // affects ssh, not the process started by the remote tmux server.
+    const entry = getCli(mode);
+    if (!entry) throw new Error(`Cannot resolve the CLI registry entry for ${mode}`);
+    modeCommand = buildRemoteRecoveryLoginCommand({
+      entry,
+      mode,
+      sessionId,
+      codexConfig,
+      codexHome: envOverrides?.CODEX_HOME,
+    });
   } else {
     modeCommand = defaultRemoteCommandForMode(mode);
   }
@@ -1240,7 +1317,7 @@ export interface DockerLaunchOptions {
  * Build the ONE `bash -c` launch string for a docker session: image-check ->
  * ensure (inspect-or-create) -> start -> `exec docker exec -it` into the durable
  * in-container tmux (resume-aware). PURE and unit-testable. The escaping survives
- * four layers: outer `bash -c "…"` (JSON.stringify at respawn-pane) -> the joined
+ * four layers: outer `bash -c '<…>'` (shellescape at respawn-pane) -> the joined
  * command -> `docker exec … sh -lc '<tmux>'` -> tmux `'<paneCommand>'`.
  */
 export function buildDockerLaunchCommand(opts: DockerLaunchOptions): string {
@@ -1327,11 +1404,8 @@ export function buildDockerLaunchCommand(opts: DockerLaunchOptions): string {
   const ensure = adopted
     ? `${base} inspect ${name} >/dev/null 2>&1 || { echo ${notFoundMsg}; exit 1; }`
     : `${base} inspect ${name} >/dev/null 2>&1 || ${createCommand}`;
-  // ⚠️ No double quotes and no `$(…)` in the ADOPTED arms. This whole chain is
-  // embedded in an outer `bash -c "…"`, so an unescaped `"` closes that string early,
-  // the rest is re-tokenized, and tmux fails to exec with a bare `execvp(3) failed`.
-  // A `grep -qx` pipeline reads the same answer using only the single-quoted form
-  // every other line in this builder already uses.
+  // Keep the adopted probe literal and side-effect free. A `grep -qx` pipeline
+  // reads the same answer without command substitution.
   const start = adopted
     ? `${base} inspect -f ${shellescape('{{.State.Running}}')} ${name} 2>/dev/null | grep -qx true || { echo ${notRunningMsg}; exit 1; }`
     : `${base} start ${name} >/dev/null 2>&1 || { echo ${startFailMsg}; exit 1; }`;
@@ -1523,6 +1597,14 @@ export function buildRemoteAttachCommand(remote: SessionRemote, remoteSessionNam
   return sshParts.join(' ');
 }
 
+/** Attach to an owned private-socket session without `new-session -A` recreation. */
+export function buildOwnedRemoteAttachCommand(remote: SessionRemote, sessionId: string): string {
+  const name = remoteTmuxSessionName(sessionId);
+  const tmuxInvocation = `tmux -L ${REMOTE_TMUX_SOCKET} attach -t ${shellescape(name)}`;
+  const [ssh, batchMode, ...connectionArgs] = buildSshConnectionArgs(remote);
+  return [ssh, batchMode, '-t', ...connectionArgs, remoteSshTarget(remote), shellescape(tmuxInvocation)].join(' ');
+}
+
 /**
  * COD-105 — choose the right remote ssh command for a session's ownership:
  *   - NON-owned (`remote.owned === false`): ATTACH to a discovered remote tmux
@@ -1539,13 +1621,17 @@ function buildRemoteSessionCommand(options: {
   allowedTools?: string;
   /** OMP only — resume/continue overrides for a remote omp relaunch. */
   ompConfig?: OmpConfig;
+  codexConfig?: CodexConfig;
+  envOverrides?: Record<string, string>;
   resumeSessionId?: string;
+  attachOnly?: boolean;
 }): string {
-  const { remote, sessionId } = options;
+  const { remote, sessionId, attachOnly } = options;
   if (remote.owned === false) {
     const target = remote.remoteSessionName || remoteTmuxSessionName(sessionId);
     return buildRemoteAttachCommand(remote, target);
   }
+  if (attachOnly) return buildOwnedRemoteAttachCommand(remote, sessionId);
   return buildRemoteLaunchCommand(options);
 }
 
@@ -1682,9 +1768,941 @@ function setCliConfigContent(tmuxCmd: string, muxName: string, varName: string, 
  * await manager.killSession(sessionId);
  * ```
  */
+function confirmRecoveryMuxDispatch(guard: RecoveryMuxDispatchGuard): boolean {
+  try {
+    const verdict: unknown = guard.confirm();
+    if (verdict instanceof Promise) {
+      void verdict.catch(() => {});
+      return false;
+    }
+    return verdict === true;
+  } catch {
+    return false;
+  }
+}
+
 export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
+  private readonly supervisorManagerLaunches = new Map<
+    string,
+    { profile: SupervisorManagerLaunch; record: MuxSession; pid: number; incarnation: string }
+  >();
+
+  isSupervisorManagerLaunchCurrent(sessionId: string, profile: SupervisorManagerLaunch): boolean {
+    const proof = this.supervisorManagerLaunches?.get(sessionId);
+    const record = this.sessions.get(sessionId);
+    return (
+      !!proof &&
+      proof.profile === profile &&
+      proof.record === record &&
+      record.pid === proof.pid &&
+      record.recoveryInputBroker === proof.incarnation &&
+      record.recoveryInputBrokerPending === undefined &&
+      !record.codexRestoreUncertain &&
+      profile.isCurrent()
+    );
+  }
+
   readonly backend = 'tmux' as const;
   private sessions: Map<string, MuxSession> = new Map();
+  private sessionSaves: Promise<void> = Promise.resolve();
+  private sessionPersistenceUnknown = false;
+  private remoteBrokerRollbacks?: WeakSet<MuxSession>;
+  private clearedRemoteBrokerReservations?: WeakMap<MuxSession, { oldInc: string; newInc: string }>;
+  private readonly inputBrokers = new Map<string, CodexInputBroker>();
+  private readonly inputBrokerLoads = new Map<string, Promise<CodexInputBroker | undefined>>();
+  private readonly inputQueues = new Map<string, Promise<unknown>>();
+  private ownerBrokerHydrations = new Map<string, { binding: string; deadline: number; work: Promise<boolean> }>();
+
+  private remoteBrokerScope(session: MuxSession): OwnedRemoteBrokerScope | undefined {
+    return session.remote && session.remote.owned !== false && !session.docker && session.recoveryCodexHome
+      ? {
+          sessionId: session.sessionId,
+          remote: session.remote,
+          workingDir: session.remote.remotePath,
+          codexHome: session.recoveryCodexHome,
+          owner: session.owner,
+        }
+      : undefined;
+  }
+
+  async getOwnedRemoteInputBroker(sessionId: string) {
+    const session = this.sessions.get(sessionId),
+      scope = session && this.remoteBrokerScope(session);
+    const incarnation = session?.recoveryInputBroker;
+    if (!session || !scope || !incarnation) return undefined;
+    const descriptor = await ownedRemoteBrokerCache.load(scope, incarnation);
+    return descriptor && this.sessions.get(sessionId) === session && session.recoveryInputBroker === incarnation
+      ? ownedRemoteBrokerCache.get(scope, incarnation)
+      : undefined;
+  }
+
+  observeOwnedRemoteInputBroker(
+    sessionId: string,
+    serialized: string,
+    witness: PrivateFileWitness,
+    panePid: number,
+    live = true
+  ) {
+    const session = this.sessions.get(sessionId),
+      scope = session && this.remoteBrokerScope(session);
+    return session?.recoveryInputBroker && scope
+      ? ownedRemoteBrokerCache.observe(scope, session.recoveryInputBroker, serialized, witness, panePid, live)
+      : undefined;
+  }
+
+  isOwnedRemoteInputBrokerProofCurrent(sessionId: string, proof: CodexBrokerProof): boolean {
+    const session = this.sessions.get(sessionId),
+      scope = session && this.remoteBrokerScope(session);
+    const signer =
+      scope && session?.recoveryInputBroker
+        ? ownedRemoteBrokerCache.signer(scope, session.recoveryInputBroker)
+        : undefined;
+    return signer?.incarnation === proof.incarnation && signer.authority(proof)?.proof === proof;
+  }
+
+  async reserveOwnedRemoteInputBroker(
+    sessionId: string,
+    expectedOldInc: string | undefined,
+    newInc: string
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId),
+      scope = session && this.remoteBrokerScope(session);
+    if (
+      !session ||
+      !scope ||
+      this.remoteBrokerRollbacks?.has(session) ||
+      !ownedRemoteBrokerCache.get(scope, newInc) ||
+      session.recoveryInputBroker !== expectedOldInc ||
+      session.recoveryInputBrokerPending !== undefined ||
+      newInc === expectedOldInc
+    )
+      return false;
+    session.recoveryInputBrokerPending = newInc;
+    const current = () =>
+      this.sessions.get(sessionId) === session &&
+      session.recoveryInputBroker === expectedOldInc &&
+      session.recoveryInputBrokerPending === newInc &&
+      ownedRemoteBrokerCache.get(scope, newInc) !== undefined;
+    try {
+      await this.flushSessionsDurably(current);
+      return current();
+    } catch {
+      return false;
+    } // Keep the exact uncertainty marker, including a lost durability ACK.
+  }
+
+  async commitOwnedRemoteInputBroker(
+    sessionId: string,
+    expectedOldInc: string | undefined,
+    newInc: string
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId),
+      scope = session && this.remoteBrokerScope(session);
+    if (
+      !session ||
+      !scope ||
+      this.remoteBrokerRollbacks?.has(session) ||
+      session.recoveryInputBroker !== expectedOldInc ||
+      session.recoveryInputBrokerPending !== newInc ||
+      !ownedRemoteBrokerCache.signer(scope, newInc)?.canFrame
+    )
+      return false;
+    session.recoveryInputBroker = newInc;
+    delete session.recoveryInputBrokerPending;
+    const current = () =>
+      this.sessions.get(sessionId) === session &&
+      session.recoveryInputBroker === newInc &&
+      session.recoveryInputBrokerPending === undefined &&
+      ownedRemoteBrokerCache.get(scope, newInc) !== undefined;
+    try {
+      await this.flushSessionsDurably(current);
+      return current() && ownedRemoteBrokerCache.activate(scope, newInc);
+    } catch {
+      if (this.sessions.get(sessionId) === session && session.recoveryInputBroker === newInc) {
+        session.recoveryInputBroker = expectedOldInc;
+        session.recoveryInputBrokerPending = newInc;
+      }
+      return false;
+    }
+  }
+
+  /** A certified pre-provision refusal can release only its exact acknowledged reservation. */
+  async rollbackOwnedRemoteInputBroker(sessionId: string, oldInc: string, newInc: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId),
+      scope = session && this.remoteBrokerScope(session);
+    if (
+      !session ||
+      !scope ||
+      session.recoveryInputBroker !== oldInc ||
+      session.recoveryInputBrokerPending !== newInc ||
+      this.remoteBrokerRollbacks?.has(session)
+    )
+      return false;
+    const descriptor = ownedRemoteBrokerCache.get(scope, newInc);
+    if (!descriptor || ownedRemoteBrokerCache.signer(scope, newInc)) return false;
+    const locks = (this.remoteBrokerRollbacks ??= new WeakSet<MuxSession>());
+    locks.add(session);
+    const binding = JSON.stringify(session);
+    let acknowledged = false;
+    const current = () =>
+      this.sessions.get(sessionId) === session &&
+      JSON.stringify(session) === binding &&
+      JSON.stringify(ownedRemoteBrokerCache.get(scope, newInc)) === JSON.stringify(descriptor) &&
+      !ownedRemoteBrokerCache.signer(scope, newInc);
+    try {
+      await this.flushSessionsDurably(current, undefined, { record: session, incarnation: newInc });
+      acknowledged = current();
+      if (acknowledged) {
+        delete session.recoveryInputBrokerPending;
+        (this.clearedRemoteBrokerReservations ??= new WeakMap()).set(session, { oldInc, newInc });
+      }
+      return acknowledged;
+    } catch {
+      return false;
+    } finally {
+      // Failed/lost ACK never removed the live no-replay marker.
+      locks.delete(session);
+    }
+  }
+
+  private knownInputBroker(session: MuxSession): CodexInputBroker | undefined {
+    const scope = this.remoteBrokerScope(session);
+    return session.remote
+      ? scope && session.recoveryInputBroker
+        ? ownedRemoteBrokerCache.signer(scope, session.recoveryInputBroker)
+        : undefined
+      : this.inputBrokers.get(session.sessionId);
+  }
+
+  /** Restore only retained source-host keys, then certify the surviving remote worker before owner bytes. */
+  async prepareCodexOwnerInput(
+    sessionId: string,
+    isCurrent: () => boolean,
+    expectedNative: MuxSession | null
+  ): Promise<boolean> {
+    const session = this.sessions.get(sessionId);
+    const callerCurrent = () => {
+      try {
+        const verdict: unknown = isCurrent();
+        if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+          void Promise.resolve(verdict).catch(() => {});
+        return verdict === true;
+      } catch {
+        return false;
+      }
+    };
+    if (!session || !callerCurrent() || session.recoveryInputBrokerPending !== undefined) return false;
+    if (!session.remote || session.recoveryInputBroker === undefined) return true;
+    if (session !== expectedNative) return false;
+    const scope = this.remoteBrokerScope(session),
+      incarnation = session.recoveryInputBroker;
+    if (
+      !scope ||
+      session.mode !== 'codex' ||
+      session.recoveryIsolated !== true ||
+      (session.codexRestoreUncertain !== undefined && session.codexRestoreUncertain !== false)
+    )
+      return false;
+    const binding = JSON.stringify(session);
+    const current = () =>
+      this.sessions.get(sessionId) === session && JSON.stringify(session) === binding && callerCurrent();
+    const matches = (descriptor: OwnedRemoteBrokerDescriptor | undefined) =>
+      descriptor?.incarnation === incarnation &&
+      descriptor.homeDigest === createHash('sha256').update(scope.codexHome).digest('hex') &&
+      descriptor.launchDigest ===
+        createHash('sha256')
+          .update(
+            buildRemoteCodexPaneCommand({
+              sessionId,
+              remotePath: scope.remote.remotePath,
+              codexHome: scope.codexHome,
+              codexConfig: session.codexRestoreConfig,
+            })
+          )
+          .digest('hex');
+    if (matches(ownedRemoteBrokerCache.get(scope, incarnation)) && this.canDeliverCodexOwnerInput(sessionId))
+      return current();
+    this.ownerBrokerHydrations ??= new Map();
+    let job = this.ownerBrokerHydrations.get(sessionId);
+    if (job && job.binding !== binding) return false;
+    if (!job) {
+      const deadline = performance.now() + 2000;
+      const live = () => performance.now() < deadline && current();
+      const work = Promise.resolve()
+        .then(async () => {
+          const descriptor = await this.getOwnedRemoteInputBroker(sessionId);
+          if (!matches(descriptor) || !live()) return false;
+          const observed = await observeOwnedRemoteBroker(
+            scope.remote,
+            { sessionId, descriptor: descriptor!, inspect: true },
+            { prepare: async () => live(), isCurrent: live }
+          );
+          if (observed.status !== 'observed' || !live()) return false;
+          const proof = ownedRemoteBrokerCache.observe(
+            scope,
+            incarnation,
+            observed.serialized,
+            observed.witness,
+            observed.panePid
+          );
+          return !!proof && !proof.closed && this.canDeliverCodexOwnerInput(sessionId) && live();
+        })
+        .catch(() => false);
+      job = { binding, deadline, work };
+      this.ownerBrokerHydrations.set(sessionId, job);
+      void work.finally(() => {
+        if (this.ownerBrokerHydrations.get(sessionId)?.work === work) this.ownerBrokerHydrations.delete(sessionId);
+      });
+    }
+    const remaining = job.deadline - performance.now();
+    if (remaining <= 0) return false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return (
+        (await Promise.race([
+          job.work,
+          new Promise<false>((resolve) => {
+            timer = setTimeout(() => resolve(false), remaining);
+          }),
+        ])) === true &&
+        current() &&
+        this.canDeliverCodexOwnerInput(sessionId)
+      );
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /** PID 0 with an incarnation records a possible dispatch whose native receipt was lost. */
+  private uncertainBrokerRegistration(session: MuxSession | undefined): boolean {
+    return !!session?.recoveryInputBroker && session.pid === 0;
+  }
+
+  canDeliverCodexOwnerInput(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    if (session?.recoveryInputBrokerPending !== undefined) return false;
+    if (this.uncertainBrokerRegistration(session)) return false;
+    if (!session?.recoveryInputBroker) return true;
+    const broker = this.knownInputBroker(session);
+    return broker?.incarnation === session.recoveryInputBroker && broker.canFrame;
+  }
+
+  getCodexInputAuthority(sessionId: string, proof: CodexBrokerProof) {
+    const session = this.sessions.get(sessionId);
+    const broker = session && this.knownInputBroker(session);
+    return session?.pid === proof.brokerPid &&
+      session.recoveryInputBroker === proof.incarnation &&
+      broker?.incarnation === proof.incarnation
+      ? broker.authority(proof)
+      : undefined;
+  }
+
+  async inspectCodexInputProvenance(sessionId: string, panePid: number): Promise<CodexBrokerProof | undefined> {
+    const deadline = performance.now() + 2_000;
+    const session = this.sessions.get(sessionId);
+    if (!session || session.remote || session.pid !== panePid) return undefined;
+    const broker = await this.getInputBroker(session);
+    let proof = broker && (await broker.prove(panePid, deadline));
+    if (!proof || performance.now() >= deadline) return undefined;
+    if (!proof.closed) {
+      // A zero-child-byte receipt is an ordered barrier for preceding direct
+      // terminal bytes and fragmented owner frames. Passive journal reads alone
+      // cannot certify which thread the live input stream currently belongs to.
+      if (IS_TEST_MODE) return undefined;
+      try {
+        const remaining = () => Math.max(1, Math.ceil(deadline - performance.now()));
+        const { stdout } = await execAsync(
+          `${this.tmux()} display-message -p -t ${shellescape(session.muxName)} '#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}'`,
+          { timeout: remaining(), maxBuffer: 16_384 }
+        );
+        const row = stdout.endsWith('\n') ? stdout.slice(0, -1) : '';
+        const fields = row.split('|');
+        if (
+          fields.length !== 6 ||
+          fields[0] !== session.muxName ||
+          !/^%(?:0|[1-9]\d{0,9})$/.test(fields[1]) ||
+          fields[2] !== String(panePid) ||
+          fields[3] !== '0' ||
+          fields[4] !== '' ||
+          fields[5] !== '' ||
+          performance.now() >= deadline
+        )
+          return undefined;
+        const packet = broker!.frame(
+          'probe',
+          '',
+          undefined,
+          undefined,
+          [],
+          undefined,
+          [],
+          [],
+          Number(process.hrtime.bigint() / 1_000_000n) + Math.max(0, Math.floor(deadline - performance.now()))
+        );
+        if (!packet) return undefined;
+        const predicate = [
+          `#{==:#{session_name},${session.muxName}}`,
+          `#{==:#{pane_id},${fields[1]}}`,
+          `#{==:#{pane_pid},${panePid}}`,
+          '#{==:#{pane_dead},0}',
+          '#{==:#{pane_dead_status},}',
+          '#{==:#{pane_dead_signal},}',
+        ].reduce((all, term) => `#{&&:${all},${term}}`);
+        const sent = await this.pasteBrokerInput(
+          packet.data,
+          fields[1],
+          predicate,
+          Number(process.hrtime.bigint() / 1_000_000n) + Math.max(0, Math.floor(deadline - performance.now())),
+          () =>
+            performance.now() < deadline &&
+            this.sessions.get(sessionId) === session &&
+            session.muxName === fields[0] &&
+            session.pid === panePid &&
+            session.recoveryInputBroker === broker!.incarnation
+        );
+        if (!sent || performance.now() >= deadline || (await broker!.receipt(packet.receipt, deadline)) !== 'sent')
+          return undefined;
+        proof = await broker!.prove(panePid, deadline);
+      } catch {
+        return undefined;
+      }
+    }
+    return performance.now() < deadline &&
+      this.sessions.get(sessionId) === session &&
+      session.pid === panePid &&
+      session.recoveryInputBroker === proof?.incarnation
+      ? proof
+      : undefined;
+  }
+
+  /** Load private signed input over a pipe; argv contains only an invocation-local buffer name. */
+  private loadBrokerInputBuffer(name: string, data: string, timeout: number): Promise<void> {
+    if (IS_TEST_MODE) throw new Error('Private mux input requires an explicit pipe fixture');
+    return new Promise((resolve, reject) => {
+      let pipeError: Error | undefined;
+      const child = execFile(
+        'tmux',
+        ['-L', this.tmuxSocket, 'load-buffer', '-b', name, '-'],
+        { timeout, maxBuffer: 16_384 },
+        (error, stdout) => {
+          if (pipeError || error) reject(pipeError ?? error);
+          else if (stdout !== '') reject(new Error('Private mux input load was not acknowledged'));
+          else resolve();
+        }
+      );
+      if (!child.stdin) {
+        pipeError = new Error('Private mux input pipe is unavailable');
+        child.kill();
+        return;
+      }
+      const failed = (error: Error) => {
+        pipeError = error;
+        child.kill();
+      };
+      child.stdin.once('error', failed);
+      try {
+        child.stdin.end(data);
+      } catch (error) {
+        failed(error instanceof Error ? error : new Error('Private mux input pipe failed'));
+      }
+      // Settle only when execFile's callback confirms the child has closed;
+      // cleanup must not race a late load from the same client.
+    });
+  }
+
+  private async runBrokerBufferCommand(
+    command: string,
+    timeout: number,
+    maxBuffer: number
+  ): Promise<{ stdout: string }> {
+    if (IS_TEST_MODE) {
+      const result = await this.inputCommandRunner?.(command);
+      if (!result) throw new Error('Private mux input requires an acknowledged fixture command');
+      return result;
+    }
+    return execAsync(command, { timeout, maxBuffer });
+  }
+
+  /** Paste a single signed frame without exposing its prompt or witnesses in process arguments. */
+  private async pasteBrokerInput(
+    data: string,
+    target: string,
+    predicate: string,
+    expiry: number,
+    isCurrent: () => boolean,
+    noteDispatch?: () => void,
+    noteRefusal?: () => void,
+    beforePaste?: () => boolean
+  ): Promise<boolean> {
+    const started = Number(process.hrtime.bigint() / 1_000_000n);
+    const wall = Date.now();
+    const originalRemaining = expiry - started;
+    const remaining = () =>
+      Date.now() < wall
+        ? 0
+        : Math.min(expiry - Number(process.hrtime.bigint() / 1_000_000n), originalRemaining - (Date.now() - wall));
+    const name = `codeman-private-${randomUUID()}`;
+    let attempted = false;
+    let consumed = false;
+    try {
+      if (
+        Buffer.byteLength(data) > 122_880 ||
+        data[0] !== '\x1e' ||
+        data.at(-1) !== '\x1f' ||
+        /^CODEMAN_INPUT_V1:[A-Za-z0-9+/=]+:[a-f0-9]{64}$/.exec(data.slice(1, -1))?.[0] !== data.slice(1, -1) ||
+        remaining() <= 0 ||
+        !isCurrent()
+      ) {
+        noteRefusal?.();
+        return false;
+      }
+      await this.loadBrokerInputBuffer(name, data, Math.max(1, Math.min(EXEC_TIMEOUT_MS, remaining())));
+      // Loading a server buffer is not pane input. Repeat pure authority and
+      // composer checks after that await, within the original frame deadline.
+      if (remaining() <= 0 || !isCurrent() || (beforePaste && !beforePaste()) || remaining() <= 0 || !isCurrent()) {
+        noteRefusal?.();
+        return false;
+      }
+      const remove = `delete-buffer -b ${shellescape(name)}`;
+      const paste = `paste-buffer -r -d -b ${shellescape(name)} -t ${shellescape(target)}`;
+      attempted = true;
+      noteDispatch?.();
+      const { stdout } = await this.runBrokerBufferCommand(
+        `${this.tmux()} if-shell -F -t ${shellescape(target)} ${shellescape(predicate)} ${shellescape(paste)} ${shellescape(`${remove} ; display-message -p CODEMAN_RECOVERY_PANE_REFUSED`)}`,
+        Math.max(1, Math.min(EXEC_TIMEOUT_MS, remaining())),
+        16_384
+      );
+      // Both successful native branches consume only this invocation's buffer.
+      if (stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') {
+        consumed = true;
+        noteRefusal?.();
+        return false;
+      }
+      if (stdout !== '') throw new Error('Private mux input paste was not acknowledged');
+      consumed = true;
+      return true;
+    } catch (error) {
+      if (!attempted) noteRefusal?.();
+      throw error;
+    } finally {
+      if (!consumed) {
+        // A lost load/paste reply never grants permission to replay. Cleanup
+        // can only address the unique buffer allocated by this invocation.
+        // Retirement changes no pane input and cannot renew action authority.
+        // Named buffers have no automatic TTL, even when the frame expired.
+        await this.runBrokerBufferCommand(
+          `${this.tmux()} delete-buffer -b ${shellescape(name)}`,
+          Math.max(1, Math.min(150, remaining() > 0 ? remaining() : 150)),
+          1_024
+        ).catch(() => {});
+      }
+    }
+  }
+
+  wrapCodexOwnerInput(
+    sessionId: string,
+    input: string,
+    channel: 'owner-pty' | 'owner-key' = 'owner-pty'
+  ): CodexOwnerInputFrame {
+    const session = this.sessions.get(sessionId);
+    if (session?.recoveryInputBrokerPending !== undefined) return { status: 'refused' };
+    if (this.uncertainBrokerRegistration(session)) return { status: 'refused' };
+    if (!session?.recoveryInputBroker) return { status: 'passthrough', data: input };
+    const broker = this.knownInputBroker(session);
+    if (!broker || broker.incarnation !== session.recoveryInputBroker) return { status: 'refused' };
+    const frame = broker.frame(channel, input);
+    return frame ? { status: 'framed', data: frame.data } : { status: 'refused' };
+  }
+
+  private async getInputBroker(session: MuxSession): Promise<CodexInputBroker | undefined> {
+    const incarnation = session.recoveryInputBroker;
+    if (!incarnation || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(incarnation)) return undefined;
+    if (session.remote) {
+      const scope = this.remoteBrokerScope(session);
+      const descriptor = scope && (await this.getOwnedRemoteInputBroker(session.sessionId));
+      if (!scope || !descriptor || this.sessions.get(session.sessionId) !== session) return undefined;
+      const known = ownedRemoteBrokerCache.signer(scope, incarnation);
+      if (known) return known;
+      const current = () =>
+        this.sessions.get(session.sessionId) === session &&
+        session.recoveryInputBroker === incarnation &&
+        ownedRemoteBrokerCache.get(scope, incarnation) !== undefined;
+      const observed = await observeOwnedRemoteBroker(
+        session.remote,
+        { sessionId: session.sessionId, descriptor, inspect: true },
+        { prepare: async () => current(), isCurrent: current }
+      );
+      if (observed.status !== 'observed' || !current()) return undefined;
+      ownedRemoteBrokerCache.observe(scope, incarnation, observed.serialized, observed.witness, observed.panePid);
+      return ownedRemoteBrokerCache.signer(scope, incarnation);
+    }
+    const known = this.inputBrokers.get(session.sessionId);
+    if (known?.incarnation === incarnation) return known;
+    let loading = this.inputBrokerLoads.get(session.sessionId);
+    if (!loading) {
+      loading = CodexInputBroker.load(
+        dataPath('codex-input-brokers', session.sessionId, incarnation),
+        session.sessionId
+      );
+      this.inputBrokerLoads.set(session.sessionId, loading);
+      void loading
+        .then((broker) => {
+          if (this.sessions.get(session.sessionId) === session && session.recoveryInputBroker === incarnation && broker)
+            this.inputBrokers.set(session.sessionId, broker);
+        })
+        .finally(() => {
+          if (this.inputBrokerLoads.get(session.sessionId) === loading) this.inputBrokerLoads.delete(session.sessionId);
+        });
+    }
+    return loading;
+  }
+
+  private async createInputBroker(
+    sessionId: string,
+    command: string,
+    codexHome: string,
+    required = false
+  ): Promise<CodexInputBroker | undefined> {
+    try {
+      await execFileAsync('python3', ['-c', 'import pty, termios, fcntl, select, hmac'], {
+        timeout: EXEC_TIMEOUT_MS,
+        maxBuffer: 1_024,
+      });
+      const dataDir = getDataDirPath();
+      const home = homedir();
+      // Choose the existing boundary before provisioning creates any directories.
+      // A configured missing parent refuses controlled provisioning conservatively.
+      const durableParent = dataDir.startsWith(`${home}/`) ? home : dirname(dataDir);
+      return await CodexInputBroker.create(
+        join(dataDir, 'codex-input-brokers', sessionId),
+        sessionId,
+        command,
+        codexHome,
+        durableParent
+      );
+    } catch (error) {
+      if (required) throw error;
+      return undefined;
+    }
+  }
+
+  private brokerCommand(broker: CodexInputBroker): string {
+    return `exec python3 ${shellescape(`${broker.directory}/broker.py`)} ${shellescape(broker.directory)} ${shellescape(broker.configurationDigest)}`;
+  }
+
+  private async prepareOwnedRemoteLaunch(options: CreateSessionOptions, codexHome: string) {
+    const remote = options.remote!;
+    let before = this.sessions.get(options.sessionId);
+    const retainedBinding = before && JSON.stringify(before);
+    const snapshot = JSON.stringify(options);
+    const ownerFence = options.remoteLaunchCurrent,
+      ownerPrepare = options.remoteLaunchPrepare;
+    const ownerCurrent = () => {
+      if (!ownerFence) return true;
+      const verdict: unknown = ownerFence();
+      if (verdict && typeof (verdict as { then?: unknown }).then === 'function') {
+        void Promise.resolve(verdict).catch(() => {});
+        return false;
+      }
+      return verdict === true;
+    };
+    const current = () => {
+      try {
+        return (
+          this.sessions.get(options.sessionId) === before &&
+          JSON.stringify(options) === snapshot &&
+          remote.owned !== false &&
+          options.remoteLaunchCurrent === ownerFence &&
+          options.remoteLaunchPrepare === ownerPrepare &&
+          ownerCurrent()
+        );
+      } catch {
+        return false;
+      }
+    };
+    const authority = {
+      prepare: async () =>
+        current() && (!options.remoteLaunchPrepare || (await options.remoteLaunchPrepare()) === true) && current(),
+      isCurrent: current,
+    };
+    const command = buildRemoteCodexPaneCommand({
+      remotePath: remote.remotePath,
+      sessionId: options.sessionId,
+      codexConfig: options.codexConfig,
+      codexHome,
+    });
+    const material = CodexInputBroker.provisioningMaterial(options.sessionId, command, codexHome);
+    const planned = await provisionRemoteInputBroker(
+      remote,
+      {
+        sessionId: options.sessionId,
+        incarnation: material.config.incarnation,
+        source: material.helper,
+        configJson: JSON.stringify(material.config),
+      },
+      authority,
+      { planOnly: true }
+    );
+    if (!current()) throw new Error('Owned SSH launch authority changed');
+    if (planned.status === 'existing') {
+      const command = buildOwnedRemoteAttachCommand(remote, options.sessionId);
+      if (
+        before?.recoveryInputBroker === undefined &&
+        before?.recoveryInputBrokerPending === undefined &&
+        before?.codexRestoreUncertain === undefined
+      )
+        return { command, isCurrent: current };
+      const retained = before;
+      const incarnation = retained?.recoveryInputBroker;
+      const retainedCurrent = () =>
+        current() && this.sessions.get(options.sessionId) === retained && JSON.stringify(retained) === retainedBinding;
+      if (
+        !retained ||
+        !incarnation ||
+        retained.recoveryInputBrokerPending !== undefined ||
+        (retained.codexRestoreUncertain !== undefined && retained.codexRestoreUncertain !== false) ||
+        retained.mode !== options.mode ||
+        retained.owner !== options.owner ||
+        retained.workingDir !== options.workingDir ||
+        retained.recoveryCodexHome !== codexHome ||
+        retained.recoveryIsolated !== true ||
+        JSON.stringify(retained.remote) !== JSON.stringify(remote) ||
+        JSON.stringify(retained.codexRestoreConfig) !== JSON.stringify(options.codexConfig) ||
+        !retainedCurrent()
+      )
+        throw new Error('Retained owned SSH launch authority is unavailable');
+      const scope = this.remoteBrokerScope(retained);
+      const descriptor = await this.getOwnedRemoteInputBroker(options.sessionId);
+      if (
+        !scope ||
+        !descriptor ||
+        descriptor.incarnation !== incarnation ||
+        descriptor.launchDigest !==
+          createHash('sha256')
+            .update(
+              buildRemoteCodexPaneCommand({
+                remotePath: remote.remotePath,
+                sessionId: options.sessionId,
+                codexConfig: options.codexConfig,
+                codexHome,
+              })
+            )
+            .digest('hex') ||
+        descriptor.homeDigest !== createHash('sha256').update(codexHome).digest('hex') ||
+        !retainedCurrent()
+      )
+        throw new Error('Retained owned SSH input provenance is unavailable');
+      const observed = await observeOwnedRemoteBroker(
+        remote,
+        { sessionId: options.sessionId, descriptor, codexHome, inspect: true },
+        { prepare: async () => retainedCurrent(), isCurrent: retainedCurrent }
+      );
+      if (observed.status !== 'observed' || !retainedCurrent())
+        throw new Error('Retained owned SSH worker could not be verified');
+      const proof = ownedRemoteBrokerCache.observe(
+        scope,
+        incarnation,
+        observed.serialized,
+        observed.witness,
+        observed.panePid
+      );
+      if (!proof || proof.closed || !ownedRemoteBrokerCache.signer(scope, incarnation)?.canFrame || !retainedCurrent())
+        throw new Error('Retained owned SSH worker is not ready for framed input');
+      return { command, incarnation, isCurrent: retainedCurrent };
+    }
+    if (
+      before &&
+      (before.recoveryInputBroker !== undefined ||
+        before.recoveryInputBrokerPending !== undefined ||
+        before.codexRestoreUncertain !== undefined)
+    )
+      throw new Error('Retained controlled SSH worker requires exact existing provenance');
+    // A missing Python broker leaves a manual-only owner launch available. No
+    // existing or uncertain remote pane is ever replaced by this branch.
+    if (planned.status === 'unsupported') return undefined;
+    if (planned.status !== 'planned') throw new Error('Owned SSH launch needs owner inspection');
+    const scope: OwnedRemoteBrokerScope = {
+      sessionId: options.sessionId,
+      remote: structuredClone(remote),
+      workingDir: remote.remotePath,
+      codexHome,
+      owner: options.owner,
+    };
+    if (before) throw new Error('Owned SSH launch already has a local registration');
+    const descriptor = await ownedRemoteBrokerCache.prepare(scope, material, planned.directory);
+    let reservationAttempted = false;
+    try {
+      if (!descriptor || !current()) throw new Error('Owned SSH launch material unavailable');
+      // An owner launch has no local SSH wrapper yet. Save its exact pending
+      // incarnation before the remote child can start; never rediscover a latest file.
+      const reservation: MuxSession = {
+        sessionId: options.sessionId,
+        muxName: `codeman-${options.sessionId.slice(0, 8)}`,
+        pid: 0,
+        createdAt: Date.now(),
+        workingDir: options.workingDir,
+        mode: options.mode,
+        attached: false,
+        remote,
+        owner: options.owner,
+        recoveryCodexHome: codexHome,
+        recoveryIsolated: true,
+        codexRestoreConfig: options.codexConfig && structuredClone(options.codexConfig),
+      };
+      this.sessions.set(options.sessionId, reservation);
+      before = reservation;
+      // A lost reservation ACK must retain this exact launch material.
+      reservationAttempted = true;
+      ownedRemoteBrokerCache.sealPreparation(descriptor);
+      if (
+        !(await this.reserveOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) ||
+        !current()
+      )
+        throw new Error('Owned SSH launch reservation needs owner inspection');
+      const provisioned = await provisionRemoteInputBroker(
+        remote,
+        {
+          sessionId: options.sessionId,
+          incarnation: material.config.incarnation,
+          source: material.helper,
+          configJson: JSON.stringify(material.config),
+        },
+        authority,
+        { root: posix.dirname(posix.dirname(planned.directory)), ownerInitialLaunch: true }
+      );
+      if (provisioned.status !== 'provisioned' || provisioned.directory !== descriptor.directory || !current())
+        throw new Error('Owned SSH launch provisioning needs owner inspection');
+      const observed = await observeOwnedRemoteBroker(
+        remote,
+        { sessionId: options.sessionId, descriptor, codexHome, pane: provisioned.pane },
+        authority
+      );
+      if (observed.status !== 'observed' || !current())
+        throw new Error('Owned SSH launch receipt needs owner inspection');
+      ownedRemoteBrokerCache.observe(
+        scope,
+        descriptor.incarnation,
+        observed.serialized,
+        observed.witness,
+        observed.panePid
+      );
+      if (!ownedRemoteBrokerCache.signer(scope, descriptor.incarnation)?.canFrame)
+        throw new Error('Owned SSH launch input provenance unavailable');
+      if (
+        !(await this.commitOwnedRemoteInputBroker(options.sessionId, undefined, descriptor.incarnation)) ||
+        !current()
+      )
+        throw new Error('Owned SSH launch commit needs owner inspection');
+      return {
+        command: buildOwnedRemoteAttachCommand(remote, options.sessionId),
+        incarnation: descriptor.incarnation,
+        isCurrent: current,
+      };
+    } finally {
+      if (descriptor && !reservationAttempted)
+        await ownedRemoteBrokerCache.discardUnreservedPreparation(scope, descriptor);
+    }
+  }
+  private optionalBrokerDispatchReceipt(
+    output: unknown
+  ): { sessionNativeId: string; paneId: string; brokerPid: number; serverPid: number } | undefined {
+    if (typeof output !== 'string') return undefined;
+    const row =
+      /^CODEMAN_OPTIONAL_BROKER_DISPATCHED\|(\$(?:0|[1-9]\d{0,9}))\|(%(?:0|[1-9]\d{0,9}))\|([1-9]\d{0,9})\|([1-9]\d{0,9})\n$/.exec(
+        output
+      );
+    return row && row[0] === output
+      ? { sessionNativeId: row[1], paneId: row[2], brokerPid: Number(row[3]), serverPid: Number(row[4]) }
+      : undefined;
+  }
+  /** A certified no-child refusal can fall back only in the same now-dead native pane. */
+  private async fallbackOptionalBroker(
+    muxName: string,
+    brokerPid: number,
+    originalLaunch: string,
+    isCurrent: () => boolean,
+    expectedNative?: { sessionNativeId: string; paneId: string; serverPid: number },
+    noteDispatch?: () => void
+  ): Promise<number | null> {
+    if (!expectedNative) return null;
+    const deadline = performance.now() + 2_000;
+    let fields: string[] | undefined;
+    let tuple: string | undefined;
+    for (let reads = 0; reads < 50 && performance.now() < deadline; reads++) {
+      if (!isCurrent()) return null;
+      const { stdout } = await execAsync(
+        `${this.tmux()} list-panes -s -t ${shellescape(muxName)} -F '#{session_id}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pid}'`,
+        { timeout: Math.max(1, Math.ceil(deadline - performance.now())), maxBuffer: 16_384 }
+      );
+      if (performance.now() >= deadline) return null;
+      const row = stdout.endsWith('\n') ? stdout.slice(0, -1) : undefined;
+      if (!row || /[\r\n]/.test(row)) return null;
+      fields = row.split('|');
+      if (fields.length !== 5) return null;
+      const [sessionId, paneId, rawPid, dead, serverPid] = fields;
+      const positivePid = (value: string) => /^[1-9]\d{0,9}$/.test(value) && Number.isSafeInteger(Number(value));
+      if (
+        !/^\$(?:0|[1-9]\d{0,9})$/.test(sessionId) ||
+        !/^%(?:0|[1-9]\d{0,9})$/.test(paneId) ||
+        !positivePid(rawPid) ||
+        Number(rawPid) !== brokerPid ||
+        sessionId !== expectedNative.sessionNativeId ||
+        paneId !== expectedNative.paneId ||
+        Number(serverPid) !== expectedNative.serverPid ||
+        !/^[01]$/.test(dead) ||
+        !positivePid(serverPid)
+      )
+        return null;
+      if (
+        expectedNative &&
+        (sessionId !== expectedNative.sessionNativeId ||
+          paneId !== expectedNative.paneId ||
+          Number(serverPid) !== expectedNative.serverPid)
+      )
+        return null;
+      const currentTuple = [sessionId, paneId, rawPid, serverPid].join('|');
+      if (tuple !== undefined && tuple !== currentTuple) return null;
+      tuple = currentTuple;
+      if (dead === '1') break;
+      fields = undefined;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    if (!fields || performance.now() >= deadline) return null;
+    const [sessionId, paneId, rawPid, , serverPid] = fields;
+    const predicate = [
+      `#{==:#{session_name},${muxName}}`,
+      `#{==:#{session_id},${sessionId}}`,
+      `#{==:#{pane_id},${paneId}}`,
+      `#{==:#{pane_pid},${rawPid}}`,
+      '#{==:#{pane_dead},1}',
+      `#{==:#{pid},${serverPid}}`,
+      '#{==:#{session_windows},1}',
+      '#{==:#{window_panes},1}',
+    ].reduce((all, term) => `#{&&:${all},${term}}`);
+    const spawn = `respawn-pane -c ${TMUX_LAUNCH_CWD} -t ${shellescape(paneId)} bash -c ${shellescape(originalLaunch)}`;
+    if (!isCurrent()) return null;
+    const acknowledgement = `display-message -p -t ${shellescape(paneId)} 'CODEMAN_OPTIONAL_FALLBACK_STARTED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'`;
+    noteDispatch?.();
+    const { stdout: result } = await execAsync(
+      `${this.tmux()} if-shell -F -t ${shellescape(paneId)} ${shellescape(predicate)} ${shellescape(`${spawn} ; ${acknowledgement}`)} ${shellescape('display-message -p CODEMAN_OPTIONAL_FALLBACK_REFUSED')}`,
+      { timeout: Math.max(1, Math.ceil(deadline - performance.now())), maxBuffer: 1_024 }
+    );
+    if (performance.now() >= deadline) return null;
+    if (!isCurrent()) return null;
+    const ack = result.endsWith('\n') ? result.slice(0, -1).split('|') : [];
+    if (
+      ack.length !== 5 ||
+      ack[0] !== 'CODEMAN_OPTIONAL_FALLBACK_STARTED' ||
+      ack[1] !== sessionId ||
+      ack[2] !== paneId ||
+      ack[4] !== serverPid ||
+      !/^[1-9]\d{0,9}$/.test(ack[3]) ||
+      !Number.isSafeInteger(Number(ack[3])) ||
+      Number(ack[3]) === brokerPid
+    )
+      return null;
+    return Number(ack[3]);
+  }
   private readonly tmuxSocket = resolveConfiguredTmuxSocket();
   private statsInterval: NodeJS.Timeout | null = null;
   private mouseSyncInterval: NodeJS.Timeout | null = null;
@@ -1745,11 +2763,38 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    */
   private remoteAliveInFlight: Set<string> = new Set();
 
+  private brokerCleanupProvider?: BrokerCleanupReferenceProvider;
+  private brokerCleanupInterval?: ReturnType<typeof setInterval>;
+  private brokerCleanupRunning = false;
+  setBrokerCleanupReferenceProvider(provider: BrokerCleanupReferenceProvider): void {
+    this.brokerCleanupProvider = provider;
+    if (!IS_TEST_MODE && !this.brokerCleanupInterval) {
+      this.brokerCleanupInterval = setInterval(() => void this.pruneInputBrokers(), 60_000);
+      this.brokerCleanupInterval.unref();
+      void this.pruneInputBrokers();
+    }
+  }
+  private async pruneInputBrokers(): Promise<void> {
+    if (IS_TEST_MODE || this.brokerCleanupRunning || !this.brokerCleanupProvider) return;
+    this.brokerCleanupRunning = true;
+    try {
+      await pruneCodexInputBrokers(getDataDirPath(), this.brokerCleanupProvider);
+    } catch {
+      /* Optional maintenance never blocks session lifecycle. */
+    } finally {
+      this.brokerCleanupRunning = false;
+    }
+  }
+
   private trueColorConfigured = false;
   /** tmux 3.7+ can resize pane history after creation; older releases cannot. */
   private liveHistoryResizeSupported: boolean | null = null;
 
-  constructor() {
+  constructor(
+    private readonly inputCommandRunner?: (command: string) => Promise<void | { stdout: string }>,
+    private readonly inputComposerReader?: (muxName: string) => string | null,
+    private readonly inputPaneReader?: (muxName: string) => string | null
+  ) {
     super();
     this.setMaxListeners(50);
     if (!IS_TEST_MODE) {
@@ -1820,9 +2865,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
                 continue;
               }
               this.sessions.delete(priorId);
+              this.inputBrokers.delete(priorId);
+              this.inputBrokerLoads.delete(priorId);
               dropped++;
             }
             this.sessions.set(session.sessionId, session);
+            if (session.recoveryInputBroker) void this.getInputBroker(session);
             if (muxName) keptByMuxName.set(muxName, session.sessionId);
           }
           // Persist the cleaned list so the stale duplicates don't reload.
@@ -1843,23 +2891,253 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    */
   private saveSessions(): void {
     if (IS_TEST_MODE) return;
-
     try {
-      const dir = dirname(MUX_SESSIONS_FILE);
-      if (!existsSync(dir)) {
-        mkdirSync(dir, { recursive: true });
-      }
-      const data = Array.from(this.sessions.values());
-      const json = JSON.stringify(data, null, 2);
-
+      const records = Array.from(this.sessions.values());
+      const json = JSON.stringify(records, null, 2);
       const tempPath = MUX_SESSIONS_FILE + '.tmp';
-      writeFile(tempPath, json, 'utf-8')
-        .then(() => rename(tempPath, MUX_SESSIONS_FILE))
+      this.sessionSaves = this.sessionSaves
+        .then(async () => {
+          if (this.sessionPersistenceUnknown) throw new Error('Mux metadata requires durable repair');
+          // Preserve the original ordinary-save snapshot (including tentative
+          // registration isolation), except an exact pending marker already
+          // durably cleared while this save waited in the same queue.
+          const snapshot = JSON.parse(json) as MuxSession[];
+          for (const [index, record] of records.entries()) {
+            const cleared = this.clearedRemoteBrokerReservations?.get(record);
+            if (
+              cleared &&
+              this.sessions.get(record.sessionId) === record &&
+              record.recoveryInputBroker === cleared.oldInc &&
+              record.recoveryInputBrokerPending === undefined &&
+              snapshot[index].recoveryInputBroker === cleared.oldInc &&
+              snapshot[index].recoveryInputBrokerPending === cleared.newInc
+            )
+              delete snapshot[index].recoveryInputBrokerPending;
+          }
+          await mkdir(dirname(MUX_SESSIONS_FILE), { recursive: true, mode: 0o700 });
+          await writeFile(tempPath, JSON.stringify(snapshot, null, 2), 'utf-8');
+          await rename(tempPath, MUX_SESSIONS_FILE);
+        })
         .catch((err) => {
           console.error('[TmuxManager] Failed to save sessions:', err);
         });
     } catch (err) {
       console.error('[TmuxManager] Failed to save sessions:', err);
+    }
+  }
+
+  /** Drain every queued metadata write, including work enqueued by request cleanup. */
+  async drainSessionSaves(): Promise<void> {
+    let pending: Promise<void>;
+    do {
+      pending = this.sessionSaves;
+      await pending;
+    } while (pending !== this.sessionSaves);
+  }
+
+  /** Join the write queue and acknowledge file plus directory durability before proceeding. */
+  flushSessionsDurably(
+    isCurrent: () => boolean | Promise<boolean> = () => true,
+    currentAfterAwait?: () => boolean,
+    clearedReservation?: { record: MuxSession; incarnation: string }
+  ): Promise<void> {
+    const writing = this.sessionSaves.then(() =>
+      this.persistSessionsDurably(isCurrent, currentAfterAwait, clearedReservation)
+    );
+    // Waiters remain live after this operation fails; its own caller still gets
+    // the original rejection and retains its native launch uncertainty.
+    this.sessionSaves = writing.catch(() => {});
+    return writing;
+  }
+
+  private async persistSessionsDurably(
+    isCurrent: () => boolean | Promise<boolean>,
+    currentAfterAwait?: () => boolean,
+    clearedReservation?: { record: MuxSession; incarnation: string }
+  ): Promise<void> {
+    const map = this.sessions;
+    const entries = [...map.entries()];
+    const liveJson = JSON.stringify(Array.from(map.values()), null, 2);
+    const json = clearedReservation
+      ? JSON.stringify(
+          Array.from(map.values(), (record) => {
+            if (record !== clearedReservation.record) return record;
+            if (record.recoveryInputBrokerPending !== clearedReservation.incarnation)
+              throw Error('Reservation changed');
+            const copy = { ...record };
+            delete copy.recoveryInputBrokerPending;
+            return copy;
+          }),
+          null,
+          2
+        )
+      : liveJson;
+    const assertCurrent = () => {
+      const verdict = currentAfterAwait ? currentAfterAwait() : isCurrent();
+      if (typeof verdict !== 'boolean') void Promise.resolve(verdict).catch(() => {});
+      if (
+        verdict !== true ||
+        this.sessions !== map ||
+        this.sessions.size !== entries.length ||
+        entries.some(([id, record]) => this.sessions.get(id) !== record) ||
+        JSON.stringify(Array.from(this.sessions.values()), null, 2) !== liveJson
+      )
+        throw new Error('Reboot restoration was cancelled before mux persistence');
+    };
+    const confirmCurrent = async () => {
+      const verdict = isCurrent();
+      if (typeof verdict !== 'boolean' && !currentAfterAwait) {
+        await verdict;
+        throw new Error('Asynchronous mux authority requires a final synchronous guard');
+      }
+      if ((await verdict) !== true) throw new Error('Reboot restoration was cancelled before mux persistence');
+      assertCurrent();
+    };
+    const sameMetadata = (left: Awaited<ReturnType<typeof lstat>>, right: Awaited<ReturnType<typeof lstat>>) =>
+      ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(
+        (key) => left[key as keyof typeof left] === right[key as keyof typeof right]
+      );
+    const readPrimary = async (maxBytes?: number, path = MUX_SESSIONS_FILE) => {
+      let file: Awaited<ReturnType<typeof open>> | undefined;
+      let opened = false;
+      try {
+        file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        opened = true;
+        const info = await file.stat();
+        if (!info.isFile() || (maxBytes !== undefined && info.size > maxBytes)) throw new Error('Mux metadata changed');
+        const input = Buffer.alloc(info.size + 1);
+        let size = 0;
+        while (size < input.length) {
+          const part = await file.read(input, size, input.length - size, size);
+          if (!part.bytesRead) break;
+          size += part.bytesRead;
+        }
+        const after = await file.stat();
+        const text = input.subarray(0, size).toString('utf8');
+        if (
+          size !== info.size ||
+          !sameMetadata(info, after) ||
+          !Buffer.from(text, 'utf8').equals(input.subarray(0, size))
+        )
+          throw new Error('Mux metadata changed');
+        await file.close();
+        file = undefined;
+        const current = await lstat(path);
+        if (current.isSymbolicLink() || !sameMetadata(after, current)) throw new Error('Mux metadata changed');
+        return { text, info: after };
+      } catch (error) {
+        // Only an absent initial open certifies an absent primary. Removal
+        // during a read is changed evidence, not permission to recreate it.
+        if (opened && (error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('Mux metadata changed');
+        throw error;
+      } finally {
+        if (file) await file.close().catch(() => {});
+      }
+    };
+    await confirmCurrent();
+    await mkdir(dirname(MUX_SESSIONS_FILE), { recursive: true, mode: 0o700 });
+    assertCurrent();
+    let original: Awaited<ReturnType<typeof readPrimary>> | undefined;
+    try {
+      original = await readPrimary();
+      if (!Array.isArray(JSON.parse(original.text))) throw new Error('Mux metadata is malformed');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        this.sessionPersistenceUnknown = true;
+        throw error;
+      }
+    }
+    assertCurrent();
+    const originalIsCurrent = async () => {
+      try {
+        const current = await readPrimary(original ? Buffer.byteLength(original.text) : 0);
+        return !!original && sameMetadata(original.info, current.info) && original.text === current.text;
+      } catch (error) {
+        return !original && (error as NodeJS.ErrnoException).code === 'ENOENT';
+      }
+    };
+    const temporary = `${MUX_SESSIONS_FILE}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.reboot.tmp`;
+    let temporaryInode: { dev: number; ino: number } | undefined;
+    let verifiedTemporary: Awaited<ReturnType<typeof lstat>> | undefined;
+    const ownsTemporary = async (text?: string) => {
+      if (!temporaryInode) return false;
+      try {
+        if (text === undefined) {
+          const stat = await lstat(temporary);
+          return (
+            stat.isFile() &&
+            !stat.isSymbolicLink() &&
+            stat.dev === temporaryInode.dev &&
+            stat.ino === temporaryInode.ino
+          );
+        }
+        const current = await readPrimary(Buffer.byteLength(text), temporary);
+        verifiedTemporary = current.info;
+        return (
+          current.info.dev === temporaryInode.dev && current.info.ino === temporaryInode.ino && current.text === text
+        );
+      } catch {
+        return false;
+      }
+    };
+    const cleanupTemporary = async () => {
+      if (await ownsTemporary()) await unlink(temporary).catch(() => {});
+    };
+    let commitAttempted = false;
+    try {
+      const file = await open(temporary, 'wx', 0o600);
+      try {
+        const stat = await file.stat();
+        temporaryInode = { dev: stat.dev, ino: stat.ino };
+        assertCurrent();
+        await file.writeFile(json, 'utf8');
+        assertCurrent();
+        await file.sync();
+        assertCurrent();
+      } finally {
+        await file.close();
+      }
+      await confirmCurrent();
+      if (!(await originalIsCurrent())) {
+        this.sessionPersistenceUnknown = true;
+        throw new Error('Mux metadata commit target changed');
+      }
+      if (!(await ownsTemporary(json))) throw new Error('Mux metadata staged file changed');
+      // Both proof descriptors have closed. Scan both names together so neither
+      // verification's awaited close can hide a replacement of the other file.
+      const [target, staged] = await Promise.all([
+        lstat(MUX_SESSIONS_FILE).catch((error) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          this.sessionPersistenceUnknown = true;
+          throw error;
+        }),
+        lstat(temporary),
+      ]);
+      if (original ? !target || !sameMetadata(original.info, target) : target !== undefined) {
+        this.sessionPersistenceUnknown = true;
+        throw new Error('Mux metadata commit target changed');
+      }
+      if (!verifiedTemporary || !sameMetadata(verifiedTemporary, staged))
+        throw new Error('Mux metadata staged file changed');
+      assertCurrent();
+      commitAttempted = true;
+      await rename(temporary, MUX_SESSIONS_FILE);
+      const directory = await open(dirname(MUX_SESSIONS_FILE), 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+      await confirmCurrent();
+      await cleanupTemporary();
+      assertCurrent();
+      this.sessionPersistenceUnknown = false;
+    } catch (error) {
+      if (commitAttempted) this.sessionPersistenceUnknown = true;
+      // Never roll old mux bytes back over a possibly launched worker. The
+      // caller owns pending/uncertain markers and any exact native cleanup.
+      await cleanupTemporary();
+      throw error;
     }
   }
 
@@ -1968,6 +3246,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         console.warn(`[TmuxManager] Failed to set env override ${key}:`, err);
       }
     }
+  }
+
+  /** Unlike optional env forwarding, failed home pinning must prevent the Codex launch. */
+  private pinCodexLaunchHome(muxName: string, home: string): void {
+    execSync(`${this.tmux()} setenv -t ${shellescape(muxName)} CODEX_HOME ${shellescape(home)}`, {
+      timeout: EXEC_TIMEOUT_MS,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
   }
 
   /**
@@ -2104,6 +3390,51 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       owner,
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
+    const priorRegistration = this.sessions.get(sessionId);
+    if (this.uncertainBrokerRegistration(priorRegistration))
+      throw new Error('An uncertain Codex launch cannot create another worker');
+    const launchSnapshot = JSON.stringify(options);
+    const ownerCurrent = () => {
+      try {
+        const verdict: unknown = options.ownerLaunchIsCurrent === undefined ? true : options.ownerLaunchIsCurrent();
+        if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+          void Promise.resolve(verdict).catch(() => {});
+        return verdict === true && JSON.stringify(options) === launchSnapshot;
+      } catch {
+        return false;
+      }
+    };
+    const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
+    const controlledRemoteCodex =
+      !!remote &&
+      remote.owned !== false &&
+      !docker &&
+      !remote.commands?.[mode] &&
+      getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
+      codexConfig?.noDaemon === true;
+    const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
+    const recoveryCodexHome = localCodex
+      ? normalizedCodexHome(options.recoveryCodexHome ?? launchEnvCodexHome ?? currentLocalCodexHome())
+      : controlledRemoteCodex
+        ? normalizedCodexHome(launchEnvCodexHome)
+        : undefined;
+    const retainedControlled = this.sessions.get(sessionId);
+    if (
+      retainedControlled?.remote &&
+      (retainedControlled.recoveryInputBroker !== undefined ||
+        retainedControlled.recoveryInputBrokerPending !== undefined) &&
+      (!controlledRemoteCodex || !recoveryCodexHome)
+    )
+      throw new Error('Retained controlled SSH input provenance cannot be removed');
+    // Ordinary Codex resolves a relative CODEX_HOME from its working directory.
+    // Only an isolated launch needs absolute home provenance for its input broker.
+    if (localCodex && codexConfig?.noDaemon === true && !recoveryCodexHome)
+      throw new Error('Local Codex launch home is unverified');
+    if (options.codexRestoreGuard && (!localCodex || !codexConfig?.resumeSessionId || !codexConfig.noDaemon))
+      throw new Error('Reboot restoration guard requires an exact isolated local Codex launch');
+
+    if (options.restoreGuard && (remote || docker || localCodex || options.codexRestoreGuard))
+      throw new Error('Custom profile restoration requires an exact local non-Codex launch');
 
     if (!isValidMuxName(muxName)) {
       throw new Error('Invalid session name: contains unsafe characters');
@@ -2114,10 +3445,28 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     // TEST MODE: Create in-memory session only — no real tmux session
     if (IS_TEST_MODE) {
+      if (options.restoreGuard) {
+        await options.restoreGuard.prepare();
+        if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
+          throw new Error('Reboot restoration authority changed');
+        options.restoreGuard.noteDispatch?.();
+      }
+      if (options.codexRestoreGuard) {
+        await options.codexRestoreGuard.prepare();
+        if ((await options.codexRestoreGuard.confirm()) !== true)
+          throw new Error('Reboot restoration authority changed');
+        options.codexRestoreGuard.noteDispatch?.();
+      }
       const session: MuxSession = {
         sessionId,
         muxName,
         pid: 99999,
+        recoveryCodexHome,
+        ...(options.restoreGuard ? { restoreUncertain: true } : {}),
+        recoveryIsolated: localCodex && codexConfig?.noDaemon === true,
+        ...(options.codexRestoreGuard
+          ? { codexRestoreUncertain: true, codexRestoreConfig: structuredClone(codexConfig) }
+          : {}),
         createdAt: Date.now(),
         workingDir,
         remote,
@@ -2128,6 +3477,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         name,
       };
       this.sessions.set(sessionId, session);
+      if (options.codexRestoreGuard || options.restoreGuard)
+        (this.acknowledgedRebootLaunches ??= new WeakMap()).set(session, {
+          binding: this.rebootLaunchBinding(session),
+        });
       this.emit('sessionCreated', session);
       return session;
     }
@@ -2193,14 +3546,88 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     const config = niceConfig || DEFAULT_NICE_CONFIG;
     const cmd = wrapWithNice(baseCmd, config);
 
+    let attemptedRestoreShell = false;
+    let createdRestoreShell = false;
+    let restoreCleanupPid: number | null = null;
+    let restorePane: { sessionNativeId: string; paneId: string; panePid: number; serverPid: number } | undefined;
+    let launchedRestoreWorker = false;
+    let certifiedNoChild = false;
+    let reservedRestoreRecord: MuxSession | undefined;
+    const priorCreateRecord = this.sessions.get(sessionId);
+    let inputBroker: CodexInputBroker | undefined;
+    let brokerDispatchStarted = false;
+    let workspaceLaunch: RebootWorkspaceLaunch | undefined;
+    let ownedRemoteAttach = false;
+    let ownedRemoteRecord: MuxSession | undefined;
+    let ownedRemoteBinding: string | undefined;
+    let ownedRemoteAttachPid: number | undefined;
+    let cleanedRemoteAttach = false;
+    const remoteAttachRecordCurrent = () =>
+      !ownedRemoteAttach ||
+      (this.sessions.get(sessionId) === ownedRemoteRecord && JSON.stringify(ownedRemoteRecord) === ownedRemoteBinding);
     try {
+      const workspaceGuard = options.codexRestoreGuard ?? options.restoreGuard;
+      if (workspaceGuard && owner && isMultiUserMode()) {
+        if (options.codexRestoreGuard) {
+          await options.codexRestoreGuard.prepare();
+          if ((await options.codexRestoreGuard.confirm()) !== true)
+            throw new Error('Reboot restoration authority changed');
+        }
+        if (options.restoreGuard) {
+          await options.restoreGuard.prepare();
+          if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
+            throw new Error('Reboot restoration authority changed');
+        }
+        workspaceLaunch = await prepareRebootWorkspaceLaunch(
+          owner,
+          workingDir,
+          () => workspaceGuard.isCurrent?.() === true,
+          workspaceGuard.getWorkspaceDeadline?.() ?? Infinity
+        );
+        if (!workspaceLaunch) throw new Error('Reboot workspace identity unavailable');
+      }
       // Build the full command to run inside tmux
       const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
-      const fullCmd = docker
-        ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
-        : remote
-          ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
-          : localFullCmd;
+      const ownedRemoteLaunch =
+        controlledRemoteCodex && recoveryCodexHome
+          ? await this.prepareOwnedRemoteLaunch(options, recoveryCodexHome)
+          : undefined;
+      ownedRemoteAttach = ownedRemoteLaunch?.incarnation !== undefined;
+      if (ownedRemoteAttach) {
+        ownedRemoteRecord = this.sessions.get(sessionId);
+        ownedRemoteBinding = JSON.stringify(ownedRemoteRecord);
+        if (!ownedRemoteRecord) throw new Error('Owned SSH attach registration unavailable');
+      }
+      const fullCmd =
+        ownedRemoteLaunch?.command ??
+        (docker
+          ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
+          : remote
+            ? buildRemoteSessionCommand({
+                mode,
+                remote,
+                sessionId,
+                claudeMode,
+                allowedTools,
+                ompConfig,
+                codexConfig,
+                envOverrides,
+                resumeSessionId,
+              })
+            : localFullCmd);
+      const originalLaunch =
+        remote || docker
+          ? fullCmd
+          : workspaceLaunch
+            ? workspaceLaunch.wrap(fullCmd)
+            : `cd ${shellescape(workingDir)} && ${fullCmd}`;
+      inputBroker =
+        localCodex && codexConfig?.noDaemon === true
+          ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!options.codexRestoreGuard)
+          : undefined;
+
+      if (localCodex && (this.sessions.get(sessionId) !== priorRegistration || !ownerCurrent()))
+        throw new Error('Owner launch authority changed before native creation');
 
       // Create tmux session in three steps to handle cold-start (no server running)
       // and avoid the race where the command exits before remain-on-exit is set:
@@ -2220,15 +3647,90 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // global option can resize (and when lowered, trim) unrelated live panes.
       const safeHistoryLimit =
         Number.isSafeInteger(historyLimit) && historyLimit > 0 ? Math.trunc(historyLimit) : DEFAULT_TMUX_HISTORY_LIMIT;
+      // Multi-argument argv bypasses a user's default-command and starts only this known inert process.
+      const requiresCreationReceipt =
+        !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard || ownedRemoteAttach;
+      const restorePlaceholder = requiresCreationReceipt ? ' /bin/sleep 86400' : '';
+      const restorePrint = requiresCreationReceipt
+        ? ` -P -F ${shellescape('#{session_id}|#{pane_id}|#{pane_pid}|#{pid}')}`
+        : '';
       const createSessionCommand = this.supportsLiveHistoryResize()
-        ? `${this.tmux()} new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`
-        : `${this.tmux()} set-option -g history-limit ${safeHistoryLimit} \\; new-session -ds "${muxName}" -c ${TMUX_LAUNCH_CWD} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`;
-      execSync(createSessionCommand, {
+        ? `${this.tmux()} new-session${restorePrint} -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}${restorePlaceholder} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`
+        : `${this.tmux()} set-option -g history-limit ${safeHistoryLimit} \\; new-session${restorePrint} -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}${restorePlaceholder} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`;
+      if (options.codexRestoreGuard) {
+        await options.codexRestoreGuard.prepare();
+        if ((await options.codexRestoreGuard.confirm()) !== true)
+          throw new Error('Reboot restoration authority changed');
+      }
+      if (options.restoreGuard) {
+        await options.restoreGuard.prepare();
+        if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
+          throw new Error('Reboot restoration authority changed');
+      }
+      if (ownedRemoteLaunch?.isCurrent() === false || !remoteAttachRecordCurrent())
+        throw new Error('Owned SSH attach authority changed');
+      if (workspaceLaunch && !workspaceLaunch.isCurrent()) throw new Error('Reboot workspace changed');
+      attemptedRestoreShell = requiresCreationReceipt;
+      const created = execSync(createSessionCommand, {
         cwd: TMUX_LAUNCH_CWD,
         timeout: EXEC_TIMEOUT_MS,
-        stdio: 'ignore',
+        stdio: requiresCreationReceipt ? ['ignore', 'pipe', 'ignore'] : 'ignore',
+        encoding: 'utf8',
         env: cleanEnv,
       });
+      createdRestoreShell = requiresCreationReceipt;
+      if (createdRestoreShell) {
+        const match = /^\$(0|[1-9]\d{0,9})\|(%(?:0|[1-9]\d{0,9}))\|([1-9]\d{0,9})\|([1-9]\d{0,9})\n$/.exec(
+          created.toString()
+        );
+        if (!match || ![match[3], match[4]].every((value) => Number.isSafeInteger(Number(value))))
+          throw new Error('Reboot restoration inert pane identity unavailable');
+        restorePane = {
+          sessionNativeId: `$${match[1]}`,
+          paneId: match[2],
+          panePid: Number(match[3]),
+          serverPid: Number(match[4]),
+        };
+        restoreCleanupPid = restorePane.panePid;
+      }
+      if (localCodex || options.codexRestoreGuard || options.restoreGuard) {
+        // Track the confirmed new shell before fallible env/home setup. Keep
+        // exact launch intent separate from historical state until commit.
+        // PID 0 is explicitly unknown; it never supplies live/dead action proof.
+        reservedRestoreRecord = {
+          sessionId,
+          muxName,
+          pid: 0,
+          createdAt: Date.now(),
+          workingDir,
+          remote,
+          docker,
+          owner,
+          mode,
+          attached: false,
+          name,
+          recoveryCodexHome,
+          recoveryIsolated: false,
+          recoveryInputBroker: inputBroker?.incarnation,
+          recoveryInputBrokerPending: inputBroker?.incarnation,
+          ...(options.restoreGuard
+            ? { restoreUncertain: true }
+            : { codexRestoreUncertain: true, codexRestoreConfig: structuredClone(codexConfig) }),
+        };
+        this.sessions.set(sessionId, reservedRestoreRecord);
+        const reservationIsCurrent = () =>
+          this.sessions.get(sessionId) === reservedRestoreRecord &&
+          (options.codexRestoreGuard
+            ? options.codexRestoreGuard.isCurrent?.() === true
+            : options.restoreGuard
+              ? options.restoreGuard.isCurrent() === true
+              : true);
+        await this.flushSessionsDurably(
+          () =>
+            reservationIsCurrent() && (options.codexRestoreGuard?.confirm() ?? options.restoreGuard?.confirm() ?? true),
+          reservationIsCurrent
+        );
+      }
       this.resizeWindow(muxName, 120, 40);
 
       // Set remain-on-exit now that the server is running — must be before respawn-pane
@@ -2254,17 +3756,101 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Apply user-supplied env overrides (e.g., CLAUDE_CODE_EFFORT_LEVEL) via tmux setenv
       // so secret values stay off the bash command line. Must run before respawn-pane.
       this.applyEnvOverrides(muxName, envOverrides);
+      if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
 
       // Replace the shell with the actual command (no echo in terminal). Keep
       // pane launch in /tmp, then cd inside bash against the current mount table.
-      const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
-      execSync(
-        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
-        {
-          timeout: EXEC_TIMEOUT_MS,
-          stdio: 'ignore',
-        }
+      if (
+        localCodex &&
+        (this.sessions.get(sessionId) !== (reservedRestoreRecord ?? priorRegistration) || !ownerCurrent())
+      )
+        throw new Error('Owner launch authority changed before native dispatch');
+      if (options.codexRestoreGuard) {
+        await options.codexRestoreGuard.prepare();
+        const startupDeadline = Number(process.hrtime.bigint() / 1_000_000n) + 2_000;
+        if ((await options.codexRestoreGuard.confirm()) !== true)
+          throw new Error('Reboot restoration authority changed');
+        const evidence = options.codexRestoreGuard.getStartupEvidence?.();
+        if (!inputBroker || !evidence || options.codexRestoreGuard.isCurrent?.() !== true)
+          throw new Error('Reboot restoration startup proof unavailable');
+        await inputBroker.setStartupAuthority(
+          evidence.files,
+          undefined,
+          evidence.paths,
+          evidence.missing,
+          startupDeadline
+        );
+        // Persisting startup authority can await filesystem IO. The child-side
+        // common proof rechecks the saved files; do not replace it with another
+        // asynchronous observation after it has been bound into the config.
+        if (
+          options.codexRestoreGuard.isCurrent?.() !== true ||
+          Number(process.hrtime.bigint() / 1_000_000n) >= startupDeadline
+        )
+          throw new Error('Reboot restoration authority changed');
+      }
+      if (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
+        throw new Error('Codex launch ownership changed');
+      if (options.restoreGuard) {
+        await options.restoreGuard.prepare();
+        if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
+          throw new Error('Reboot restoration authority changed');
+      }
+      if (inputBroker && !ownerCurrent()) throw new Error('Owner launch authority changed before native dispatch');
+      if (ownedRemoteLaunch?.isCurrent() === false || !remoteAttachRecordCurrent())
+        throw new Error('Owned SSH attach authority changed');
+      // Dispatch can start a worker before a timeout/exception is returned. Seal before sending bytes.
+      const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
+      const optionalDispatch = !!inputBroker && !options.codexRestoreGuard && !options.restoreGuard;
+      const requiresDispatchReceipt = optionalDispatch || ownedRemoteAttach;
+      if (workspaceLaunch && !workspaceLaunch.isCurrent()) throw new Error('Reboot workspace changed');
+      options.codexRestoreGuard?.noteDispatch?.();
+      const spawnCommand = `respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t ${restorePane ? shellescape(restorePane.paneId) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
+      const dispatchCommand = requiresDispatchReceipt
+        ? `${spawnCommand} ; display-message -p -t ${shellescape(restorePane!.paneId)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'`
+        : spawnCommand;
+      const restorePredicate = restorePane
+        ? [
+            `#{==:#{pid},${restorePane.serverPid}}`,
+            `#{==:#{session_id},${restorePane.sessionNativeId}}`,
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${restorePane.paneId}}`,
+            `#{==:#{pane_pid},${restorePane.panePid}}`,
+            '#{==:#{window_panes},1}',
+            '#{==:#{session_windows},1}',
+          ].reduce((all, term) => `#{&&:${all},${term}}`)
+        : undefined;
+      if (options.restoreGuard && options.restoreGuard.isCurrent() !== true)
+        throw new Error('Reboot restoration authority changed');
+      launchedRestoreWorker = requiresCreationReceipt;
+      options.restoreGuard?.noteDispatch?.();
+      workspaceLaunch?.noteDispatch();
+      brokerDispatchStarted = true;
+      const spawned = execSync(
+        `${this.tmux()} ${restorePane ? `if-shell -F -t ${shellescape(restorePane.paneId)} ${shellescape(restorePredicate!)} ${shellescape(dispatchCommand)} ${shellescape('display-message -p CODEMAN_REBOOT_LAUNCH_REFUSED')}` : spawnCommand}`,
+        { timeout: EXEC_TIMEOUT_MS, stdio: restorePane ? ['ignore', 'pipe', 'ignore'] : 'ignore', encoding: 'utf8' }
       );
+      if (restorePane && spawned.toString().trim() === 'CODEMAN_REBOOT_LAUNCH_REFUSED') {
+        launchedRestoreWorker = false;
+        certifiedNoChild = true;
+        throw new Error('Reboot restoration inert pane changed');
+      }
+      const dispatchReceipt = requiresDispatchReceipt ? this.optionalBrokerDispatchReceipt(spawned) : undefined;
+      if (
+        requiresDispatchReceipt &&
+        (!dispatchReceipt ||
+          dispatchReceipt.sessionNativeId !== restorePane!.sessionNativeId ||
+          dispatchReceipt.paneId !== restorePane!.paneId ||
+          dispatchReceipt.serverPid !== restorePane!.serverPid)
+      )
+        throw new Error(
+          ownedRemoteAttach
+            ? 'Owned SSH attach native dispatch receipt unavailable'
+            : 'Optional input guard native dispatch receipt unavailable'
+        );
+      if (!requiresDispatchReceipt && restorePane && spawned.toString().trim() !== '')
+        throw new Error('Reboot restoration worker launch receipt unknown');
+      if (ownedRemoteAttach) ownedRemoteAttachPid = dispatchReceipt?.brokerPid;
 
       // Wait for tmux session to be queryable
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
@@ -2306,8 +3892,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       void Promise.all(configPromises);
 
       // Get the PID of the pane process (retry for tmux server cold-start)
-      let pid = this.getPanePid(muxName);
-      for (let i = 0; !pid && i < GET_PID_MAX_RETRIES; i++) {
+      let pid = dispatchReceipt?.brokerPid ?? this.getPanePid(muxName);
+      for (let i = 0; !pid && !dispatchReceipt && i < GET_PID_MAX_RETRIES; i++) {
         await new Promise((resolve) => setTimeout(resolve, GET_PID_RETRY_MS));
         pid = this.getPanePid(muxName);
       }
@@ -2315,10 +3901,27 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         throw new Error('Failed to get tmux pane PID');
       }
 
+      if (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
+        throw new Error('Codex launch ownership changed');
+      if (ownedRemoteLaunch?.isCurrent() === false || !remoteAttachRecordCurrent())
+        throw new Error('Owned SSH attach authority changed');
       const session: MuxSession = {
         sessionId,
         muxName,
         pid,
+        recoveryCodexHome,
+        ...(options.restoreGuard ? { restoreUncertain: true } : {}),
+        ...(inputBroker || options.codexRestoreGuard
+          ? { codexRestoreUncertain: true, codexRestoreConfig: structuredClone(codexConfig) }
+          : {}),
+        recoveryInputBroker: inputBroker?.incarnation ?? ownedRemoteLaunch?.incarnation,
+        recoveryInputBrokerPending: inputBroker?.incarnation,
+        ...(ownedRemoteLaunch?.incarnation ? { codexRestoreConfig: structuredClone(codexConfig) } : {}),
+        recoveryIsolated:
+          !docker &&
+          (!remote || (remote.owned !== false && !remote.commands?.[mode])) &&
+          getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
+          /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd),
         createdAt: Date.now(),
         workingDir,
         remote,
@@ -2328,14 +3931,161 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         attached: false,
         name,
       };
+      if (inputBroker) {
+        this.inputBrokers.set(sessionId, inputBroker);
+        // Keep the durable reservation until this exact broker certifies startup.
+        this.sessions.set(sessionId, session);
+        reservedRestoreRecord = session;
+        const receipt = await inputBroker.startupReceipt(pid);
+        if (receipt === 'not-sent') {
+          restoreCleanupPid = pid;
+          certifiedNoChild = true;
+          launchedRestoreWorker = false;
+        }
+        if (receipt === 'not-sent' && !options.codexRestoreGuard && !options.restoreGuard) {
+          // This is an ordinary owner launch, not a guarded reboot. Its exact
+          // no-child receipt permits one current-owner fallback in the same dead pane.
+          const fallbackPid = await this.fallbackOptionalBroker(
+            muxName,
+            pid,
+            originalLaunch,
+            () => this.sessions.get(sessionId) === session && ownerCurrent(),
+            dispatchReceipt,
+            () => {
+              launchedRestoreWorker = true;
+            }
+          );
+          if (!fallbackPid) throw new Error('Optional input guard refusal could not safely fall back');
+          pid = fallbackPid;
+          session.pid = fallbackPid;
+          delete session.recoveryInputBroker;
+          this.inputBrokers.delete(sessionId);
+        } else if (receipt !== 'started') throw new Error('Codex startup receipt unavailable');
+        if (this.sessions.get(sessionId) !== session) throw new Error('Codex launch ownership changed');
+        if (!ownerCurrent()) throw new Error('Owner launch authority changed after native dispatch');
+        delete session.recoveryInputBrokerPending;
+        if (!options.codexRestoreGuard) delete session.codexRestoreUncertain;
+        try {
+          await this.flushSessionsDurably(() => this.sessions.get(sessionId) === session);
+        } catch (error) {
+          session.recoveryInputBrokerPending = inputBroker.incarnation;
+          session.codexRestoreUncertain = true;
+          throw error;
+        }
+      }
 
+      if (workspaceLaunch?.confirmStartup) {
+        if (!(await workspaceLaunch.confirmStartup(inputBroker ? undefined : pid)))
+          throw new Error('Reboot workspace startup acknowledgment unavailable');
+        const currentPane =
+          restorePane &&
+          execSync(
+            `${this.tmux()} display-message -p -t ${shellescape(restorePane.paneId)} '#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}'`,
+            {
+              timeout: Math.max(1, Math.min(EXEC_TIMEOUT_MS, Math.floor(workspaceLaunch.remainingStartupMs?.() ?? 1))),
+              encoding: 'utf8',
+              maxBuffer: 1024,
+            }
+          );
+        if (
+          !restorePane ||
+          currentPane !== `${restorePane.sessionNativeId}|${restorePane.paneId}|${pid}|${restorePane.serverPid}|0\n` ||
+          !workspaceLaunch.isCurrent() ||
+          !ownerCurrent() ||
+          (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
+        )
+          throw new Error('Reboot launch authority changed before startup acknowledgment');
+      }
+      if (options.restoreGuard) {
+        this.sessions.set(sessionId, session);
+        reservedRestoreRecord = session;
+        await this.flushSessionsDurably(() => this.sessions.get(sessionId) === session);
+      }
+      if (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
+        throw new Error('Codex launch ownership changed');
       this.sessions.set(sessionId, session);
       this.saveSessions();
+      if ((options.codexRestoreGuard || options.restoreGuard) && restorePane)
+        (this.acknowledgedRebootLaunches ??= new WeakMap()).set(session, {
+          binding: this.rebootLaunchBinding(session),
+          native: { ...restorePane, panePid: session.pid },
+        });
       this.emit('sessionCreated', session);
 
       return session;
     } catch (err) {
+      if (attemptedRestoreShell && !createdRestoreShell) {
+        // The native create may have landed even when its tuple/ACK was lost.
+        // Without that exact receipt, neither an ID kill nor a retry is safe.
+        options.codexRestoreGuard?.noteCleanupUncertain?.();
+        options.restoreGuard?.noteCleanupUncertain?.();
+      }
+      if (
+        createdRestoreShell &&
+        !launchedRestoreWorker &&
+        remoteAttachRecordCurrent() &&
+        (!reservedRestoreRecord || this.sessions.get(sessionId) === reservedRestoreRecord)
+      ) {
+        // Only the new-session command above established this ownership. An existing pane is never targeted.
+        let cleaned = false;
+        try {
+          if (restorePane && Number.isSafeInteger(restoreCleanupPid) && restoreCleanupPid! > 0) {
+            const predicate = [
+              `#{==:#{pid},${restorePane.serverPid}}`,
+              `#{==:#{session_id},${restorePane.sessionNativeId}}`,
+              `#{==:#{session_name},${muxName}}`,
+              `#{==:#{pane_id},${restorePane.paneId}}`,
+              `#{==:#{pane_pid},${restoreCleanupPid}}`,
+              '#{==:#{window_panes},1}',
+              '#{==:#{session_windows},1}',
+            ].reduce((all, term) => `#{&&:${all},${term}}`);
+            const output = execSync(
+              `${this.tmux()} if-shell -F -t ${shellescape(restorePane.paneId)} ${shellescape(predicate)} ${shellescape(`kill-pane -t ${shellescape(restorePane.paneId)}`)} ${shellescape('display-message -p CODEMAN_REBOOT_CLEANUP_REFUSED')}`,
+              { timeout: EXEC_TIMEOUT_MS, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }
+            );
+            cleaned = output.trim() === '';
+          }
+        } catch {
+          /* Preserve the launch refusal even when cleanup of its empty shell fails. */
+        }
+        if (ownedRemoteAttach) cleanedRemoteAttach = cleaned;
+        if (cleaned && reservedRestoreRecord && this.sessions.get(sessionId) === reservedRestoreRecord) {
+          if (priorCreateRecord) this.sessions.set(sessionId, priorCreateRecord);
+          else this.sessions.delete(sessionId);
+          try {
+            await this.flushSessionsDurably(() => this.sessions.get(sessionId) === priorCreateRecord);
+            this.inputBrokers.delete(sessionId);
+          } catch {
+            // Cleanup of the pane succeeded, but a restart may still read its
+            // reservation. Preserve that uncertainty in memory as well.
+            if (this.sessions.get(sessionId) === priorCreateRecord) this.sessions.set(sessionId, reservedRestoreRecord);
+            cleaned = false;
+          }
+        }
+        if (cleaned && (!reservedRestoreRecord || this.sessions.get(sessionId) === priorCreateRecord)) {
+          if (certifiedNoChild) {
+            options.codexRestoreGuard?.noteBrokerRefusal?.();
+            options.restoreGuard?.noteBrokerRefusal?.();
+          }
+        } else {
+          options.codexRestoreGuard?.noteCleanupUncertain?.();
+          options.restoreGuard?.noteCleanupUncertain?.();
+        }
+      } else if (createdRestoreShell) {
+        options.codexRestoreGuard?.noteCleanupUncertain?.();
+        options.restoreGuard?.noteCleanupUncertain?.();
+      }
+      if (ownedRemoteAttach && attemptedRestoreShell && !cleanedRemoteAttach && remoteAttachRecordCurrent()) {
+        // Remote startup already committed. Adopt only this unchanged local
+        // registration; never retire its remote worker or lose an uncertain wrapper.
+        ownedRemoteRecord!.pid = ownedRemoteAttachPid ?? (launchedRestoreWorker ? 0 : (restorePane?.panePid ?? 0));
+        ownedRemoteRecord!.codexRestoreUncertain = true;
+        await this.flushSessionsDurably(() => this.sessions.get(sessionId) === ownedRemoteRecord).catch(() => {});
+      }
       throw new Error(`Failed to create tmux session: ${getErrorMessage(err)}`);
+    } finally {
+      workspaceLaunch?.release();
+      if (!brokerDispatchStarted) await inputBroker?.rollbackUnlaunchedProvisioning?.();
     }
   }
 
@@ -2439,10 +4189,82 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       remote,
       docker,
       cliName,
+      remoteAttachOnly,
     } = options;
     const session = this.sessions.get(sessionId);
-    if (!session) return null;
+    if (!session || this.uncertainBrokerRegistration(session) || session.recoveryInputBrokerPending !== undefined)
+      return null;
     const muxName = session.muxName;
+    const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
+    const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
+    const recoveryCodexHome = localCodex
+      ? normalizedCodexHome(
+          options.onlyIfDead
+            ? (options.recoveryCodexHome ?? session.recoveryCodexHome)
+            : (launchEnvCodexHome ?? options.recoveryCodexHome ?? session.recoveryCodexHome ?? currentLocalCodexHome())
+        )
+      : undefined;
+    // Recovery cannot turn current server defaults into provenance for an old pane.
+    if (options.onlyIfDead && localCodex && !recoveryCodexHome) return null;
+    const guard = options.recoveryDispatchGuard;
+    const expected = options.expectedRecoveryPane;
+    const priorBroker = await this.getInputBroker(session);
+    const priorInputProof = !remote && priorBroker ? await priorBroker.prove(session.pid) : undefined;
+    if (
+      options.onlyIfDead &&
+      localCodex &&
+      (!priorInputProof?.closed ||
+        !((priorInputProof.exitStatus ?? 0) > 0 || (priorInputProof.exitSignal ?? 0) > 0) ||
+        priorInputProof.incarnation !== expected?.inputProvenance?.incarnation ||
+        priorInputProof.childPid !== expected?.inputProvenance?.childPid)
+    )
+      return null;
+    if (
+      expected &&
+      (!options.onlyIfDead ||
+        !localCodex ||
+        !/^%(?:0|[1-9]\d{0,9})$/.test(expected.paneId) ||
+        !Number.isSafeInteger(Number(expected.paneId.slice(1))) ||
+        !Number.isSafeInteger(expected.panePid) ||
+        expected.panePid <= 0 ||
+        !/^[1-9]\d{0,9}$/.test(String(expected.panePid)) ||
+        (expected.status !== undefined && (expected.status > 255 || (expected.signal ?? 0) > 0)) ||
+        !matchesNativePaneSignal(expected.signal, expected.paneSignalToken) ||
+        ![expected.status, expected.signal].every(
+          (value) => value === undefined || (Number.isSafeInteger(value) && value >= 0)
+        ) ||
+        !((expected.status ?? 0) > 0 || (expected.signal ?? 0) > 0))
+    )
+      return null;
+    const canDispatch = () => {
+      let accepted = false;
+      try {
+        if (this.sessions.get(sessionId) !== session) return false;
+        if (
+          options.supervisorManager &&
+          (options.ownerLaunchIsCurrent === undefined || options.supervisorManager.isCurrent() !== true)
+        )
+          return false;
+        const owner: unknown = options.ownerLaunchIsCurrent === undefined ? true : options.ownerLaunchIsCurrent();
+        if (owner && typeof (owner as { then?: unknown }).then === 'function')
+          void Promise.resolve(owner).catch(() => {});
+        accepted =
+          owner === true &&
+          (!guard ||
+            (options.onlyIfDead === true &&
+              localCodex &&
+              session.muxName === muxName &&
+              confirmRecoveryMuxDispatch(guard)));
+        return accepted;
+      } catch {
+        return false;
+      } finally {
+        // These checks precede native dispatch. Preserve that certified refusal
+        // even when owner admission short-circuits the recovery guard's confirm.
+        if (!accepted) guard?.noteRefusal?.();
+      }
+    };
+    if (!canDispatch()) return null;
 
     if (!isValidMuxName(muxName) || !isValidPath(workingDir)) return null;
 
@@ -2458,7 +4280,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : undefined;
     const userStatusLineCommand = statusLineCommand ? await findEffectiveUserStatusLineCommand(workingDir) : undefined;
 
-    const baseCmd = buildSpawnCommand({
+    const ordinaryCmd = buildSpawnCommand({
       mode,
       sessionId,
       model,
@@ -2478,16 +4300,128 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       statusLineCommand,
       sessionName: cliName,
     });
+    const managerProfile = options.supervisorManager;
+    if (
+      managerProfile &&
+      (remote ||
+        docker ||
+        options.onlyIfDead ||
+        guard ||
+        !localCodex ||
+        managerProfile.conversationId !== codexConfig?.resumeSessionId ||
+        normalizedCodexHome(managerProfile.home) !== recoveryCodexHome ||
+        !(await managerProfile.confirm()))
+    )
+      return null;
+    const baseCmd = managerProfile ? supervisorManagerCommand(managerProfile, codexConfig) : ordinaryCmd;
     const config = niceConfig || DEFAULT_NICE_CONFIG;
     const cmd = wrapWithNice(baseCmd, config);
     const localFullCmd = `${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${cmd}`;
     const fullCmd = docker
       ? buildDockerLaunchCommand(resolveDockerLaunchOptions(mode, docker, sessionId, resumeSessionId))
       : remote
-        ? buildRemoteSessionCommand({ mode, remote, sessionId, claudeMode, allowedTools, ompConfig, resumeSessionId })
+        ? buildRemoteSessionCommand({
+            mode,
+            remote,
+            sessionId,
+            claudeMode,
+            allowedTools,
+            ompConfig,
+            codexConfig,
+            envOverrides,
+            resumeSessionId,
+            attachOnly: remoteAttachOnly,
+          })
         : localFullCmd;
+    const originalLaunch = remote || docker ? fullCmd : `cd ${shellescape(workingDir)} && ${fullCmd}`;
+    let inputBroker =
+      localCodex && codexConfig?.noDaemon === true
+        ? await this.createInputBroker(sessionId, originalLaunch, recoveryCodexHome!, !!guard || !!managerProfile)
+        : undefined;
 
+    if (managerProfile && !inputBroker) return null;
+    const nextRestoreConfig = inputBroker ? structuredClone(codexConfig) : undefined;
+    const retiredBinding = session.codexRestoreStateBinding;
+    const retiredConfig = session.codexRestoreConfig;
+    const retiredPending = session.recoveryInputBrokerPending;
+    const retiredUncertainty = session.codexRestoreUncertain;
+    let provenanceRetired = false;
+    let workerEffectMayHaveOccurred = false;
+    const restoreRetiredProvenance = async () => {
+      if (
+        !provenanceRetired ||
+        workerEffectMayHaveOccurred ||
+        this.sessions.get(sessionId) !== session ||
+        session.recoveryInputBrokerPending !== inputBroker?.incarnation ||
+        session.codexRestoreStateBinding !== undefined ||
+        session.codexRestoreConfig !== nextRestoreConfig
+      )
+        return;
+      session.codexRestoreStateBinding = retiredBinding;
+      session.codexRestoreConfig = retiredConfig;
+      session.recoveryInputBrokerPending = retiredPending;
+      session.codexRestoreUncertain = retiredUncertainty;
+      try {
+        await this.flushSessionsDurably(() => this.sessions.get(sessionId) === session);
+      } catch {
+        // An unacknowledged rollback cannot erase the newer launch reservation.
+        if (this.sessions.get(sessionId) === session) {
+          delete session.codexRestoreStateBinding;
+          session.codexRestoreConfig = nextRestoreConfig;
+          session.recoveryInputBrokerPending = inputBroker?.incarnation;
+          session.codexRestoreUncertain = true;
+        }
+      }
+    };
+    let brokerDispatchStarted = false;
+    let managerOrdinaryRestored = false;
+    const restoreOrdinaryManager = async (
+      refusedPid: number,
+      native: ReturnType<TmuxManager['optionalBrokerDispatchReceipt']>
+    ): Promise<{ pid: number; broker: CodexInputBroker } | undefined> => {
+      if (!managerProfile || !native || !canDispatch() || !(await managerProfile.confirm()) || !canDispatch())
+        return undefined;
+      const ordinaryLaunch = `cd ${shellescape(workingDir)} && ${buildNofileLimitCommand()} && ${pathExport}${envExportsStr} && ${wrapWithNice(ordinaryCmd, config)}`;
+      const broker = await this.createInputBroker(sessionId, ordinaryLaunch, recoveryCodexHome!, true);
+      if (!broker) return undefined;
+      let dispatched = false;
+      try {
+        // Ordinary privileges require the same final owner/config/child-work
+        // witnesses. Never turn a changed preparation witness into a raw launch.
+        await broker.setStartupAuthority(
+          managerProfile.files,
+          undefined,
+          undefined,
+          managerProfile.missing,
+          Number(process.hrtime.bigint() / 1_000_000n) + 2_000
+        );
+        if (!canDispatch() || !(await managerProfile.confirm()) || !canDispatch()) return undefined;
+        session.recoveryInputBrokerPending = broker.incarnation;
+        session.recoveryInputBroker = broker.incarnation;
+        session.codexRestoreUncertain = true;
+        this.inputBrokers.set(sessionId, broker);
+        await this.flushSessionsDurably(canDispatch);
+        if (!canDispatch()) return undefined;
+        const restoredPid = await this.fallbackOptionalBroker(
+          muxName,
+          refusedPid,
+          this.brokerCommand(broker),
+          canDispatch,
+          native,
+          () => {
+            dispatched = true;
+          }
+        );
+        if (!restoredPid || !canDispatch() || this.sessions.get(sessionId) !== session) return undefined;
+        session.pid = restoredPid;
+        if ((await broker.startupReceipt(restoredPid)) !== 'started' || !canDispatch()) return undefined;
+        return { pid: restoredPid, broker };
+      } finally {
+        if (!dispatched) await broker.rollbackUnlaunchedProvisioning?.();
+      }
+    };
     try {
+      if (!canDispatch()) return null;
       // Same per-CLI env setup as createSession, re-applied so the respawned pane inherits it.
       this._configureCliEnv(
         muxName,
@@ -2500,15 +4434,138 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // Re-apply user env overrides before respawn so the new shell inherits them,
       // dropping the ones the caller retired first (see applyEnvOverrides).
       this.applyEnvOverrides(muxName, envOverrides, unsetEnvKeys);
+      if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
 
-      // -c /tmp + cd bounce — see createSession() for rationale (stale FUSE state).
-      const launchCmd = remote || docker ? fullCmd : `cd ${JSON.stringify(workingDir)} && ${fullCmd}`;
-      await execAsync(
-        `${this.tmux()} respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t "${muxName}" bash -c ${JSON.stringify(launchCmd)}`,
+      if (!canDispatch()) return null;
+      if (inputBroker || session.codexRestoreStateBinding !== undefined || session.codexRestoreConfig !== undefined) {
+        // A later owner/recovery launch must not inherit an earlier reboot's
+        // configuration binding, even if the new effect loses its receipt.
+        if (this.sessions.get(sessionId) !== session) return null;
+        provenanceRetired = true;
+        session.recoveryInputBrokerPending = inputBroker?.incarnation;
+        if (inputBroker) session.codexRestoreUncertain = true;
+        delete session.codexRestoreStateBinding;
+        session.codexRestoreConfig = nextRestoreConfig;
+        await this.flushSessionsDurably(canDispatch);
+        if (!canDispatch() || this.sessions.get(sessionId) !== session) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+      }
+      if (guard?.prepareEvidence && (await guard.prepareEvidence()) !== true) {
+        await restoreRetiredProvenance();
+        return null;
+      }
+      if (!canDispatch()) {
+        await restoreRetiredProvenance();
+        return null;
+      }
+      if (guard) {
+        if (!inputBroker || !guard.inputProof) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+        const expiry =
+          Number(process.hrtime.bigint() / 1_000_000n) +
+          Math.min(
+            2_000,
+            guard.actionDeadline === undefined ? 2_000 : Math.max(0, Math.floor(guard.actionDeadline - Date.now()))
+          );
+        await inputBroker.setStartupAuthority(
+          guard.privateFiles,
+          guard.inputIssuer,
+          guard.privatePaths,
+          guard.missingPaths,
+          expiry
+        );
+        // A second ordered probe would change the issuer journal captured in
+        // startup config. The broker performs the joint final proof after this
+        // async write; retain only the pure owner/revision fence here.
+        if (!canDispatch()) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+      }
+      if (managerProfile) {
+        if (!inputBroker || !(await managerProfile.confirm()) || !canDispatch()) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+        await inputBroker.setStartupAuthority(
+          managerProfile.files,
+          undefined,
+          undefined,
+          managerProfile.missing,
+          Number(process.hrtime.bigint() / 1_000_000n) + 2_000
+        );
+        if (!managerProfile.isCurrent() || !canDispatch()) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+      }
+      if (managerProfile) {
+        const pane = await this.inspectPaneForRecovery(muxName);
+        if (
+          !pane ||
+          pane.dead ||
+          pane.paneId !== managerProfile.expectedPane.paneId ||
+          pane.panePid !== managerProfile.expectedPane.panePid ||
+          !hasEmptyCodexComposer(pane.screen ?? '') ||
+          !canDispatch()
+        ) {
+          await restoreRetiredProvenance();
+          return null;
+        }
+      }
+      // Render only after startup authority is durably written; its exact bytes
+      // are checked by Python before any child is created.
+      const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
+      guard?.noteDispatch();
+      const managerPane = managerProfile?.expectedPane;
+      const targetPane = expected?.paneId ?? managerPane?.paneId;
+      const spawn = `respawn-pane ${options.onlyIfDead ? '' : '-k '}-c ${TMUX_LAUNCH_CWD} -t ${targetPane ? shellescape(targetPane) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
+      const predicate = expected
+        ? [
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${expected.paneId}}`,
+            `#{==:#{pane_pid},${expected.panePid}}`,
+            '#{==:#{pane_dead},1}',
+            `#{==:#{pane_dead_status},${expected.status ?? ''}}`,
+            `#{==:#{pane_dead_signal},${expected.paneSignalToken ?? ''}}`,
+          ].reduce((all, term) => `#{&&:${all},${term}}`)
+        : managerPane
+          ? [
+              `#{==:#{session_name},${muxName}}`,
+              `#{==:#{pane_id},${managerPane.paneId}}`,
+              `#{==:#{pane_pid},${managerPane.panePid}}`,
+              '#{==:#{pane_dead},0}',
+              '#{==:#{window_panes},1}',
+              '#{==:#{session_windows},1}',
+            ].reduce((all, term) => `#{&&:${all},${term}}`)
+          : undefined;
+      // The server evaluates this exact dead-process fence before queuing a no-k
+      // respawn. A refused or lost response remains uncertainty-sealed by Session.
+      const optionalDispatch = !!inputBroker && !guard && !options.onlyIfDead;
+      if (optionalDispatch && inputBroker) {
+        // A lost dispatch ACK cannot restore a numeric PID or the previous incarnation.
+        session.pid = 0;
+        session.recoveryInputBroker = inputBroker.incarnation;
+        this.inputBrokers.set(sessionId, inputBroker);
+        this.saveSessions();
+      }
+      workerEffectMayHaveOccurred = true;
+      brokerDispatchStarted = true;
+      const { stdout: spawnOutput } = await execAsync(
+        `${this.tmux()} ${predicate ? `if-shell -F -t ${shellescape(targetPane!)} ${shellescape(predicate)} ${shellescape(spawn)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}` : spawn}${inputBroker && !guard && !options.onlyIfDead ? ` ${shellescape(';')} display-message -p -t ${shellescape(muxName)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'` : ''}`,
         {
           timeout: EXEC_TIMEOUT_MS,
         }
       );
+      if ((expected || managerProfile) && spawnOutput.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED') {
+        workerEffectMayHaveOccurred = false;
+        await restoreRetiredProvenance();
+        return null;
+      }
       // Wait for the respawned process to start
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
       // The pane now runs a fresh command, so whatever the last read observed of
@@ -2516,12 +4573,78 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // poll also invalidates any read already in flight, which would otherwise
       // write the old death back over the pane that just replaced it.
       this.clearPaneExit(muxName);
-      const pid = this.getPanePid(muxName);
-      if (pid) session.pid = pid;
+      const dispatchReceipt = optionalDispatch ? this.optionalBrokerDispatchReceipt(spawnOutput) : undefined;
+      if (optionalDispatch && !dispatchReceipt) return null;
+      let pid = optionalDispatch ? dispatchReceipt!.brokerPid : this.getPanePid(muxName);
+      if (pid && this.sessions.get(sessionId) === session) {
+        session.pid = pid;
+        if (!remote || !remoteAttachOnly) session.recoveryInputBroker = inputBroker?.incarnation;
+        if (inputBroker) this.inputBrokers.set(sessionId, inputBroker);
+        else this.inputBrokers.delete(sessionId);
+        if (!remote || !remoteAttachOnly) session.recoveryCodexHome = recoveryCodexHome;
+        session.recoveryIsolated = remote
+          ? session.recoveryIsolated
+          : !docker &&
+            getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
+            /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd);
+        if (inputBroker) {
+          const receipt = await inputBroker.startupReceipt(pid);
+          if (receipt === 'not-sent') guard?.noteBrokerRefusal?.();
+          if (receipt === 'started') guard?.noteBrokerSent?.();
+          if (receipt === 'not-sent' && managerProfile) {
+            const restored = await restoreOrdinaryManager(pid, dispatchReceipt);
+            if (!restored) return null;
+            pid = restored.pid;
+            inputBroker = restored.broker;
+            managerOrdinaryRestored = true;
+          } else if (receipt === 'not-sent' && !guard && !options.onlyIfDead && !managerProfile) {
+            const fallbackPid = await this.fallbackOptionalBroker(
+              muxName,
+              pid,
+              originalLaunch,
+              () =>
+                this.sessions.get(sessionId) === session &&
+                (!options.ownerLaunchIsCurrent || options.ownerLaunchIsCurrent() === true),
+              dispatchReceipt
+            );
+            if (!fallbackPid || this.sessions.get(sessionId) !== session) return null;
+            pid = fallbackPid;
+            session.pid = fallbackPid;
+            delete session.recoveryInputBroker;
+            this.inputBrokers.delete(sessionId);
+          } else if (receipt !== 'started' || this.sessions.get(sessionId) !== session) return null;
+          delete session.recoveryInputBrokerPending;
+          delete session.codexRestoreUncertain;
+          try {
+            await this.flushSessionsDurably(() => this.sessions.get(sessionId) === session);
+          } catch (error) {
+            session.recoveryInputBrokerPending = inputBroker.incarnation;
+            session.codexRestoreUncertain = true;
+            throw error;
+          }
+        } else this.saveSessions();
+      }
+      if (
+        managerProfile &&
+        !managerOrdinaryRestored &&
+        pid &&
+        inputBroker &&
+        this.sessions.get(sessionId) === session &&
+        managerProfile.isCurrent()
+      )
+        this.supervisorManagerLaunches.set(sessionId, {
+          profile: managerProfile,
+          record: session,
+          pid,
+          incarnation: inputBroker.incarnation,
+        });
       return pid;
     } catch (err) {
+      await restoreRetiredProvenance();
       console.error('[TmuxManager] Failed to respawn pane:', err);
       return null;
+    } finally {
+      if (!brokerDispatchStarted) await inputBroker?.rollbackUnlaunchedProvisioning?.();
     }
   }
 
@@ -2659,12 +4782,137 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     return stillAlive.length === 0;
   }
 
+  /** Private receipts exist only for launches acknowledged by this manager instance. */
+  private acknowledgedRebootLaunches = new WeakMap<
+    MuxSession,
+    {
+      binding: string;
+      native?: { sessionNativeId: string; paneId: string; panePid: number; serverPid: number };
+    }
+  >();
+
+  private rebootLaunchBinding(record: MuxSession): string {
+    return JSON.stringify([
+      record.sessionId,
+      record.muxName,
+      record.pid,
+      record.createdAt,
+      record.mode,
+      record.owner,
+      record.workingDir,
+      record.recoveryCodexHome,
+      record.codexRestoreConfig,
+      record.recoveryInputBroker,
+      record.recoveryInputBrokerPending,
+      [Object.hasOwn(record, 'restoreUncertain'), record.restoreUncertain],
+    ]);
+  }
+
+  /** The private create receipt is refreshed only after this exact metadata transition is acknowledged. */
+  async completeAcknowledgedRebootLaunch(record: MuxSession, isCurrent: () => boolean): Promise<boolean> {
+    const acknowledged = this.acknowledgedRebootLaunches?.get(record);
+    const before = this.rebootLaunchBinding(record);
+    const scopeCurrent = () => this.sessions.get(record.sessionId) === record && isCurrent() === true;
+    if (!acknowledged || acknowledged.binding !== before || record.restoreUncertain !== true || !scopeCurrent())
+      return false;
+    delete record.restoreUncertain;
+    const after = this.rebootLaunchBinding(record);
+    try {
+      await this.flushSessionsDurably(() => scopeCurrent() && this.rebootLaunchBinding(record) === after);
+      if (!scopeCurrent() || this.rebootLaunchBinding(record) !== after)
+        throw new Error('Restore commit authority changed');
+      acknowledged.binding = after;
+      return true;
+    } catch {
+      if (this.sessions.get(record.sessionId) === record) {
+        record.restoreUncertain = true;
+        this.saveSessions();
+      }
+      return false;
+    }
+  }
+
+  /** Recovered metadata cannot mint authority to cancel an acknowledged local launch. */
+  async cancelAcknowledgedRebootLaunch(record: MuxSession, isCurrent: () => boolean): Promise<boolean> {
+    const acknowledged = this.acknowledgedRebootLaunches?.get(record);
+    const codexRestore = getCli(record.mode)?.capabilities.recovery === 'codex-rollout';
+    const current = () =>
+      acknowledged !== undefined &&
+      this.sessions.get(record.sessionId) === record &&
+      this.rebootLaunchBinding(record) === acknowledged.binding &&
+      !record.remote &&
+      !record.docker &&
+      isCurrent() === true;
+    try {
+      if (!current()) return false;
+      if (!codexRestore && record.restoreUncertain !== true) {
+        // A completed generic launch has no identity-fence file. Reserve its
+        // uncertainty durably before a cancellation whose native ACK may be lost.
+        record.restoreUncertain = true;
+        const pending = this.rebootLaunchBinding(record);
+        const pendingCurrent = () =>
+          this.sessions.get(record.sessionId) === record &&
+          this.rebootLaunchBinding(record) === pending &&
+          isCurrent() === true;
+        await this.flushSessionsDurably(pendingCurrent);
+        if (!pendingCurrent()) return false;
+        acknowledged!.binding = pending;
+      }
+      if (!current()) return false;
+      if (!IS_TEST_MODE) {
+        const native = acknowledged!.native;
+        if (!native || native.panePid !== record.pid || !isValidMuxName(record.muxName)) return false;
+        const terms = [
+          `#{==:#{pid},${native.serverPid}}`,
+          `#{==:#{session_id},${native.sessionNativeId}}`,
+          `#{==:#{session_name},${record.muxName}}`,
+          `#{==:#{pane_id},${native.paneId}}`,
+          `#{==:#{pane_pid},${native.panePid}}`,
+          '#{==:#{window_panes},1}',
+          '#{==:#{session_windows},1}',
+        ];
+        const predicate = terms.reduce((all, term) => `#{&&:${all},${term}}`);
+        if (!current()) return false;
+        const result = execSync(
+          `${this.tmux()} if-shell -F -t ${shellescape(native.paneId)} ${shellescape(predicate)} ${shellescape(`kill-pane -t ${shellescape(native.paneId)}`)} ${shellescape('display-message -p CODEMAN_REBOOT_CANCEL_REFUSED')}`,
+          { encoding: 'utf8', timeout: EXEC_TIMEOUT_MS, maxBuffer: 16_384 }
+        ).trim();
+        if (result !== '' || !current()) return false;
+      }
+      this.sessions.delete(record.sessionId);
+      this.inputBrokers.delete(record.sessionId);
+      this.inputBrokerLoads.delete(record.sessionId);
+      try {
+        await this.flushSessionsDurably(
+          () => this.sessions.get(record.sessionId) === undefined && isCurrent() === true
+        );
+        if (this.sessions.has(record.sessionId) || isCurrent() !== true)
+          throw new Error('Reboot cancellation authority changed');
+      } catch {
+        // A lost metadata acknowledgement cannot retire the retained uncertainty.
+        if (!this.sessions.has(record.sessionId)) {
+          if (codexRestore) record.codexRestoreUncertain = true;
+          else record.restoreUncertain = true;
+          this.sessions.set(record.sessionId, record);
+          this.saveSessions();
+        }
+        return false;
+      }
+      this.acknowledgedRebootLaunches.delete(record);
+      this.emit('sessionKilled', { sessionId: record.sessionId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Kill a tmux session and all its child processes.
    * Uses a 4-strategy approach (children → process group → tmux kill → SIGKILL).
    * In test mode: removes from memory only (no real kill).
    */
   async killSession(sessionId: string): Promise<boolean> {
+    this.supervisorManagerLaunches?.delete(sessionId);
     const session = this.sessions.get(sessionId);
     if (!session) {
       return false;
@@ -2679,6 +4927,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // TEST MODE: Remove from memory only — NEVER touch real tmux sessions
     if (IS_TEST_MODE) {
       this.sessions.delete(sessionId);
+      this.inputBrokers.delete(sessionId);
+      this.inputBrokerLoads.delete(sessionId);
       this.clearRemoteReconnectState(sessionId);
       this.emit('sessionKilled', { sessionId });
       return true;
@@ -2720,6 +4970,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       this.lastPaneCount.delete(session.muxName);
       this.clearPaneExit(session.muxName);
       this.sessions.delete(sessionId);
+      this.inputBrokers.delete(sessionId);
+      this.inputBrokerLoads.delete(sessionId);
       this.clearRemoteReconnectState(sessionId);
       this.saveSessions();
       this.emit('sessionKilled', { sessionId });
@@ -2835,6 +5087,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     this.lastPaneCount.delete(session.muxName);
     this.clearPaneExit(session.muxName);
     this.sessions.delete(sessionId);
+    this.inputBrokers.delete(sessionId);
+    this.inputBrokerLoads.delete(sessionId);
     this.clearRemoteReconnectState(sessionId);
     this.saveSessions();
     this.emit('sessionKilled', { sessionId });
@@ -2882,12 +5136,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     // socket tag to reconcile and no cross-socket ambiguity that could mark a
     // live session dead (the root cause of vanished/duplicate tabs).
     let active: Map<string, number>;
+    let completeListing = false;
     try {
-      const output = execSync(`${this.tmux()} list-panes -a -F '${PANE_LIST_FORMAT}' 2>/dev/null || true`, {
+      const output = execSync(`${this.tmux()} list-panes -a -F '${PANE_LIST_FORMAT}'`, {
         encoding: 'utf-8',
         timeout: EXEC_TIMEOUT_MS,
-      }).trim();
-      const rows = parsePaneRows(output);
+        maxBuffer: 512 * 1024,
+      });
+      const frame = output.endsWith('\n') ? output.slice(0, -1) : output;
+      const lines = frame === '' ? [] : frame.split('\n');
+      const rows = parsePaneRows(frame);
+      // Absence resolves a lost launch receipt only after a successful complete
+      // socket listing. Legacy resource parsing is intentionally more tolerant.
+      completeListing =
+        Buffer.byteLength(output, 'utf8') <= 512 * 1024 &&
+        (output === '' || output.endsWith('\n')) &&
+        !frame.includes('\r') &&
+        rows.length === lines.length &&
+        lines.every((line) => line.length > 0) &&
+        rows.every((row) => row.dead !== undefined && !/\p{Cc}/u.test(row.sessionName));
+
       active = new Map(rows.map((row) => [row.sessionName, row.pid]));
       // The same read answers both questions, so recovery starts with a pane-exit
       // reading rather than waiting for the first stats tick — which may never
@@ -2896,12 +5164,58 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         this.applyPaneExits(derivePaneExits(rows, Date.now()));
       }
     } catch (err) {
-      console.error('[TmuxManager] Failed to list tmux panes:', err);
+      // Only tmux's exact owned-socket no-server result proves absence. An
+      // unavailable/missing socket, failed command or partial output is unknown.
+      const failure = err as {
+        status?: unknown;
+        stdout?: unknown;
+        stderr?: unknown;
+        signal?: unknown;
+        killed?: unknown;
+        code?: unknown;
+        timeout?: unknown;
+      };
+      const temporaryRoot = process.env.TMUX_TMPDIR ?? '/tmp';
+      const socketPath =
+        isAbsolute(temporaryRoot) && typeof process.getuid === 'function'
+          ? join(temporaryRoot, `tmux-${process.getuid()}`, this.tmuxSocket)
+          : undefined;
+      const stdout = Buffer.isBuffer(failure?.stdout) ? failure.stdout.toString('utf8') : failure?.stdout;
+      const stderr = Buffer.isBuffer(failure?.stderr) ? failure.stderr.toString('utf8') : failure?.stderr;
+      completeListing =
+        socketPath !== undefined &&
+        failure?.status === 1 &&
+        stdout === '' &&
+        (failure.signal === undefined || failure.signal === null) &&
+        (failure.killed === undefined || failure.killed === false) &&
+        failure.code === undefined &&
+        failure.timeout === undefined &&
+        stderr === `no server running on ${socketPath}\n`;
+      if (!completeListing) console.error('[TmuxManager] Failed to list tmux panes:', err);
       active = new Map();
     }
 
+    let uncertaintyChanged = false;
     // Check tracked sessions against the live pane list.
     for (const [sessionId, session] of this.sessions) {
+      // A numeric pane listing cannot acknowledge the original command queue.
+      // Preserve unknown registrations even when the listing is unavailable.
+      if (this.uncertainBrokerRegistration(session)) continue;
+      if (
+        (session.codexRestoreUncertain === true || session.codexRestoreStateBinding !== undefined) &&
+        !completeListing
+      ) {
+        // A completed reboot binding does not prove that its worker survived
+        // this boot. Preserve its identity for inspection while the native
+        // listing is unavailable, including the server's historical-state veto.
+        if (session.codexRestoreUncertain !== true) {
+          session.codexRestoreUncertain = true;
+          uncertaintyChanged = true;
+        }
+        continue;
+      }
+      if (!completeListing && Object.hasOwn(session, 'restoreUncertain') && session.restoreUncertain !== false)
+        continue;
       const pid = active.get(session.muxName);
       if (pid !== undefined) {
         alive.push(sessionId);
@@ -2909,6 +5223,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       } else {
         dead.push(sessionId);
         this.sessions.delete(sessionId);
+        this.inputBrokers.delete(sessionId);
+        this.inputBrokerLoads.delete(sessionId);
         this.clearPaneExit(session.muxName);
         this.clearRemoteReconnectState(sessionId);
         this.emit('sessionDied', { sessionId });
@@ -2960,7 +5276,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       console.log(`[TmuxManager] Discovered unknown tmux session: ${sessionName} (PID ${pid})`);
     }
 
-    if (dead.length > 0 || discovered.length > 0) {
+    if (uncertaintyChanged || dead.length > 0 || discovered.length > 0) {
       this.saveSessions();
     }
 
@@ -3510,6 +5826,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   destroy(): void {
+    this.supervisorManagerLaunches?.clear();
+    this.brokerCleanupProvider = undefined;
+    if (this.brokerCleanupInterval) clearInterval(this.brokerCleanupInterval);
+    this.brokerCleanupInterval = undefined;
     this.stopStatsCollection();
     this.stopPaneExitWatcher();
     this.paneExits.clear();
@@ -3596,7 +5916,29 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * - `Enter` key is sent as a SEPARATE tmux invocation after a small delay
    * - Ink (Claude CLI) needs text and Enter split to avoid treating Enter as a newline
    */
-  async sendInput(sessionId: string, input: string): Promise<boolean> {
+  async sendInput(sessionId: string, input: string, recoveryGuard?: RecoveryMuxDispatchGuard): Promise<boolean> {
+    const registered = this.sessions.get(sessionId);
+    const prior = this.inputQueues.get(sessionId) ?? Promise.resolve();
+    const operation = prior
+      .catch(() => {})
+      .then(() =>
+        this.sessions.get(sessionId) === registered && registered
+          ? this.sendInputInOrder(sessionId, input, recoveryGuard)
+          : false
+      );
+    this.inputQueues.set(sessionId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.inputQueues.get(sessionId) === operation) this.inputQueues.delete(sessionId);
+    }
+  }
+
+  private async sendInputInOrder(
+    sessionId: string,
+    input: string,
+    recoveryGuard?: RecoveryMuxDispatchGuard
+  ): Promise<boolean> {
     const session = this.sessions.get(sessionId);
     if (!session) {
       console.error(
@@ -3605,8 +5947,43 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       return false;
     }
 
+    if (session.recoveryInputBrokerPending !== undefined) return false;
+    if (this.uncertainBrokerRegistration(session)) return false;
+    const muxName = session.muxName;
+    const inputBroker = await this.getInputBroker(session);
+    if (
+      (session.recoveryInputBroker && !inputBroker) ||
+      (recoveryGuard &&
+        (session.remote || !inputBroker || !(await inputBroker.prove(session.pid)) || !recoveryGuard.conversationId))
+    ) {
+      recoveryGuard?.noteRefusal?.();
+      return false;
+    }
+    const livePane = recoveryGuard?.expectedLivePane && { ...recoveryGuard.expectedLivePane };
+    if (
+      recoveryGuard &&
+      (!livePane ||
+        !/^%(?:0|[1-9]\d{0,9})$/.test(livePane.paneId) ||
+        !Number.isSafeInteger(livePane.panePid) ||
+        livePane.panePid <= 0 ||
+        !/^[1-9]\d{0,9}$/.test(String(livePane.panePid)))
+    ) {
+      recoveryGuard.noteRefusal?.();
+      return false;
+    }
+    const canDispatch = () =>
+      this.sessions.get(sessionId) === session &&
+      session.recoveryInputBrokerPending === undefined &&
+      session.muxName === muxName &&
+      (!session.remote || this.knownInputBroker(session) === inputBroker) &&
+      (!recoveryGuard || confirmRecoveryMuxDispatch(recoveryGuard));
+    if (!canDispatch()) return false;
+
     // TEST MODE: No-op — don't send input to real tmux sessions
-    if (IS_TEST_MODE) {
+    if (IS_TEST_MODE && !this.inputCommandRunner) {
+      if (recoveryGuard?.prepareEvidence && (await recoveryGuard.prepareEvidence()) !== true) return false;
+      if (!canDispatch()) return false;
+      recoveryGuard?.noteDispatch();
       return true;
     }
 
@@ -3620,31 +5997,279 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
 
     try {
+      const prepared = async (): Promise<boolean> => {
+        try {
+          return (!recoveryGuard?.prepareEvidence || (await recoveryGuard.prepareEvidence()) === true) && canDispatch();
+        } catch {
+          recoveryGuard?.noteRefusal?.();
+          return false;
+        }
+      };
       const hasCarriageReturn = input.includes('\r');
       const textPart = input.replace(/\r/g, '').replace(/\n/g, '').trimEnd();
+      let composerScreen: string | undefined;
+      const nativePredicate = livePane
+        ? [
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${livePane.paneId}}`,
+            `#{==:#{pane_pid},${livePane.panePid}}`,
+            '#{==:#{pane_dead},0}',
+            '#{==:#{pane_dead_status},}',
+            '#{==:#{pane_dead_signal},}',
+          ].reduce((all, term) => `#{&&:${all},${term}}`)
+        : undefined;
+      const inputCommand = (keys: string) => {
+        const send = `send-keys -t ${livePane ? shellescape(livePane.paneId) : `"${muxName}"`} ${keys}`;
+        return nativePredicate
+          ? `${this.tmux()} if-shell -F -t ${shellescape(livePane!.paneId)} ${shellescape(nativePredicate)} ${shellescape(send)} ${shellescape('display-message -p CODEMAN_RECOVERY_PANE_REFUSED')}`
+          : `${this.tmux()} ${send}`;
+      };
+      const dispatchInput = async (
+        keys: string,
+        data: string,
+        expiry: number,
+        finalCurrent: () => boolean
+      ): Promise<boolean> => {
+        const actionExpiry =
+          recoveryGuard?.actionDeadline === undefined
+            ? expiry
+            : Math.min(
+                expiry,
+                Number(process.hrtime.bigint() / 1_000_000n) +
+                  Math.max(0, Math.floor(recoveryGuard.actionDeadline - Date.now()))
+              );
+        if (!Number.isSafeInteger(actionExpiry) || actionExpiry <= Number(process.hrtime.bigint() / 1_000_000n)) {
+          recoveryGuard?.noteRefusal?.();
+          return false;
+        }
+        const frame = inputBroker?.frame(
+          recoveryGuard ? 'auto' : 'owner-mux',
+          data,
+          recoveryGuard?.conversationId,
+          recoveryGuard?.inputIssuer,
+          recoveryGuard?.privateFiles,
+          recoveryGuard?.inputProof?.ownerCounters,
+          recoveryGuard?.privatePaths,
+          recoveryGuard?.missingPaths,
+          actionExpiry
+        );
+        if (inputBroker && !frame) {
+          recoveryGuard?.noteRefusal?.();
+          return false;
+        }
+        if (!frame || !inputBroker) {
+          recoveryGuard?.noteDispatch();
+          const result = IS_TEST_MODE
+            ? await this.inputCommandRunner!(inputCommand(keys))
+            : await execAsync(inputCommand(keys), { timeout: EXEC_TIMEOUT_MS });
+          if (nativePredicate && (!result || result.stdout.trim() === 'CODEMAN_RECOVERY_PANE_REFUSED')) {
+            recoveryGuard?.noteRefusal?.();
+            return false;
+          }
+          return true;
+        }
+        const brokerPid = session.pid;
+        const brokerCurrent = () =>
+          this.sessions.get(sessionId) === session &&
+          session.muxName === muxName &&
+          session.pid === brokerPid &&
+          session.recoveryInputBroker === inputBroker.incarnation &&
+          canDispatch();
+        let target = livePane?.paneId;
+        let predicate = nativePredicate;
+        if (!target || !predicate) {
+          // Ordinary controlled owner input has no automatic recovery pane
+          // proof. Pin its actual native destination before the buffer await.
+          const stdout = IS_TEST_MODE
+            ? this.inputPaneReader?.(muxName)
+            : (
+                await execAsync(
+                  `${this.tmux()} display-message -p -t ${shellescape(muxName)} '#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}'`,
+                  {
+                    timeout: Math.max(
+                      1,
+                      Math.min(EXEC_TIMEOUT_MS, actionExpiry - Number(process.hrtime.bigint() / 1_000_000n))
+                    ),
+                    maxBuffer: 16_384,
+                  }
+                )
+              ).stdout;
+          const fields = typeof stdout === 'string' && stdout.endsWith('\n') ? stdout.slice(0, -1).split('|') : [];
+          if (
+            fields.length !== 6 ||
+            fields[0] !== muxName ||
+            !/^%(?:0|[1-9]\d{0,9})$/.test(fields[1]) ||
+            fields[2] !== String(brokerPid) ||
+            fields[3] !== '0' ||
+            fields[4] !== '' ||
+            fields[5] !== '' ||
+            !brokerCurrent()
+          ) {
+            recoveryGuard?.noteRefusal?.();
+            return false;
+          }
+          target = fields[1];
+          predicate = [
+            `#{==:#{session_name},${muxName}}`,
+            `#{==:#{pane_id},${target}}`,
+            `#{==:#{pane_pid},${brokerPid}}`,
+            '#{==:#{pane_dead},0}',
+            '#{==:#{pane_dead_status},}',
+            '#{==:#{pane_dead_signal},}',
+          ].reduce((all, term) => `#{&&:${all},${term}}`);
+        }
+        if (
+          !(await this.pasteBrokerInput(
+            frame.data,
+            target,
+            predicate,
+            actionExpiry,
+            brokerCurrent,
+            () => recoveryGuard?.noteDispatch(),
+            () => recoveryGuard?.noteRefusal?.(),
+            finalCurrent
+          ))
+        )
+          return false;
+        if (session.remote) {
+          const descriptor = await this.getOwnedRemoteInputBroker(sessionId);
+          const scope = this.remoteBrokerScope(session);
+          if (!descriptor || !scope) return false;
+          const current = () =>
+            this.sessions.get(sessionId) === session &&
+            this.knownInputBroker(session) === inputBroker &&
+            session.recoveryInputBroker === descriptor.incarnation;
+          const observed = await observeOwnedRemoteBroker(
+            session.remote,
+            { sessionId, descriptor, receipt: frame.receipt },
+            { prepare: async () => current(), isCurrent: current }
+          );
+          return (
+            observed.status === 'observed' &&
+            current() &&
+            ownedRemoteBrokerCache.observe(
+              scope,
+              descriptor.incarnation,
+              observed.serialized,
+              observed.witness,
+              observed.panePid
+            ) !== undefined
+          );
+        }
+        const receipt = await inputBroker.receipt(frame.receipt);
+        if (receipt === 'not-sent') recoveryGuard?.noteBrokerRefusal?.();
+        if (receipt === 'sent') recoveryGuard?.noteBrokerSent?.();
+        return receipt === 'sent';
+      };
+      const composerCurrent = (expected?: string): boolean => {
+        if (!recoveryGuard) return true;
+        // This synchronous read follows queued/async preparation. -J joins native
+        // wrapped rows without guessing whitespace or multiline draft indentation.
+        let accepted = false;
+        try {
+          // Injected commands never grant permission to inspect a real pane.
+          const row = IS_TEST_MODE
+            ? this.inputPaneReader?.(muxName)
+            : execSync(
+                `${this.tmux()} display-message -p -t ${shellescape(livePane!.paneId)} '#{session_name}|#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}'`,
+                { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS, maxBuffer: 16_384 }
+              );
+          if (typeof row !== 'string') throw new Error('Native input identity is unavailable');
+          const frame = row.endsWith('\n') ? row.slice(0, -1) : undefined;
+          if (frame !== `${muxName}|${livePane!.paneId}|${livePane!.panePid}|0||`) {
+            recoveryGuard.noteRefusal?.();
+            return false;
+          }
+          const screen = IS_TEST_MODE
+            ? this.inputComposerReader?.(muxName)
+            : execSync(`${this.tmux()} capture-pane -p -J -t ${shellescape(livePane!.paneId)}`, {
+                encoding: 'utf-8',
+                timeout: EXEC_TIMEOUT_MS,
+                maxBuffer: 64 * 1024,
+              });
+          if (typeof screen !== 'string') throw new Error('Native input composer is unavailable');
+          // Our own literal task text may mention a veto phrase. Only its exact
+          // composer row is excluded; changed drafts and surrounding UI still veto.
+          const chrome =
+            expected === undefined
+              ? screen
+              : screen
+                  .split('\n')
+                  .filter((row) => !(/^\s*›(?:\s|$)/u.test(row) && row.replace(/^\s*› ?/u, '') === expected))
+                  .join('\n');
+          accepted =
+            !/esc to interrupt|reconnecting|would you like|approve this|sign in|log in|authentication failed|usage limit|limit reached/i.test(
+              chrome
+            ) && (expected === undefined ? hasCodexComposerText(screen, '') : hasCodexComposerText(screen, expected));
+          if (accepted) composerScreen = screen;
+        } catch {
+          // No native input has been attempted by this read.
+        }
+        if (!accepted) recoveryGuard.noteRefusal?.();
+        return accepted;
+      };
+      type DispatchAdmission = { screen?: string; started: number; expiry: number };
+      const prepareDispatch = async (expected?: string): Promise<DispatchAdmission | undefined> => {
+        const started = performance.now();
+        const expiry = Number(process.hrtime.bigint() / 1_000_000n) + 2_000;
+        if (!recoveryGuard) return { started, expiry };
+        if (!(await prepared()) || !composerCurrent(expected)) return undefined;
+        const screen = composerScreen;
+        if (!(await prepared())) return undefined;
+        return { screen, started, expiry };
+      };
+      const confirmDispatch = (admission: DispatchAdmission | undefined, expected?: string): boolean => {
+        if (!admission) return false;
+        if (!recoveryGuard) return true;
+        // Keep this last capture and scope check synchronous with dispatch: an
+        // async helper returning after capture would introduce another wait gap.
+        if (
+          !composerCurrent(expected) ||
+          composerScreen !== admission.screen ||
+          performance.now() - admission.started > 2_000 ||
+          !canDispatch()
+        ) {
+          recoveryGuard.noteRefusal?.();
+          return false;
+        }
+        return true;
+      };
 
       if (textPart && hasCarriageReturn) {
         // Send text first, then Enter as a SEPARATE tmux command after a short delay.
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
         // character in the input buffer rather than as form submission.
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        const admission = await prepareDispatch();
+        if (!confirmDispatch(admission) || !canDispatch()) return false;
+        if (
+          !(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry, () =>
+            confirmDispatch(admission)
+          ))
+        )
+          return false;
         await new Promise((resolve) => setTimeout(resolve, 50));
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        const enterAdmission = await prepareDispatch(textPart);
+        if (!confirmDispatch(enterAdmission, textPart) || !canDispatch()) return false;
+        if (
+          !(await dispatchInput('Enter', '\r', enterAdmission!.expiry, () => confirmDispatch(enterAdmission, textPart)))
+        )
+          return false;
       } else if (textPart) {
         // Text only, no Enter
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" -l ${shellescape(textPart)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        const admission = await prepareDispatch();
+        if (!confirmDispatch(admission) || !canDispatch()) return false;
+        if (
+          !(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry, () =>
+            confirmDispatch(admission)
+          ))
+        )
+          return false;
       } else if (hasCarriageReturn) {
         // Enter only
-        await execAsync(`${this.tmux()} send-keys -t "${session.muxName}" Enter`, {
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        const admission = await prepareDispatch();
+        if (!confirmDispatch(admission) || !canDispatch()) return false;
+        if (!(await dispatchInput('Enter', '\r', admission!.expiry, () => confirmDispatch(admission)))) return false;
       }
 
       return true;
@@ -3835,6 +6460,63 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * terminal. Returns null in tests (no tmux) so callers fall back to their
    * stream heuristics rather than reading an empty screen as "not working".
    */
+  async inspectPaneForRecovery(muxName: string): Promise<{
+    dead: boolean;
+    paneId?: string;
+    panePid?: number;
+    status?: number;
+    signal?: number;
+    paneSignalToken?: string;
+    inputProvenance?: CodexBrokerProof;
+    screen: string | null;
+  } | null> {
+    if (IS_TEST_MODE || !isValidMuxName(muxName)) return null;
+    try {
+      const { stdout } = await execAsync(
+        `${this.tmux()} list-panes -t ${shellescape(muxName)} -F '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_id}|#{pane_pid}'`,
+        { timeout: EXEC_TIMEOUT_MS, maxBuffer: 16_384 }
+      );
+      const frame = stdout.endsWith('\n') ? stdout.slice(0, -1) : stdout;
+      const fields = frame.split('|');
+      if (fields.length !== 5 || /[\r\n]/.test(frame)) return null;
+      const [dead, status, signal, paneId, rawPid] = fields;
+      if (!/^[01]$/.test(dead) || !/^%(?:0|[1-9]\d{0,9})$/.test(paneId)) return null;
+      if (!/^[1-9]\d{0,9}$/.test(rawPid) || !Number.isSafeInteger(Number(rawPid))) return null;
+      const signalNumber = parseNativePaneSignal(signal);
+      if (
+        !EXIT_NUMBER.test(status) ||
+        (status !== '' && Number(status) > 255) ||
+        signalNumber === null ||
+        (status !== '' && (signalNumber ?? 0) > 0) ||
+        (dead === '0' && (status !== '' || signal !== ''))
+      )
+        return null;
+      const number = (s: string): number | undefined => (s === '' ? undefined : Number(s));
+      let screen: string | null = null;
+      if (dead === '0') {
+        const capture = await execAsync(`${this.tmux()} capture-pane -p -t ${shellescape(paneId)}`, {
+          timeout: EXEC_TIMEOUT_MS,
+          maxBuffer: 64 * 1024,
+        });
+        screen = capture.stdout;
+      }
+      const session = [...this.sessions.values()].find((candidate) => candidate.muxName === muxName);
+      const inputProvenance = session && (await this.inspectCodexInputProvenance(session.sessionId, Number(rawPid)));
+      return {
+        dead: dead === '1',
+        status: number(status),
+        signal: signalNumber,
+        paneSignalToken: signal,
+        screen,
+        paneId,
+        panePid: Number(rawPid),
+        inputProvenance,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   capturePaneText(muxName: string, paneTarget?: string): string | null {
     if (IS_TEST_MODE) return null;
     const target = resolveTmuxPaneTarget(muxName, paneTarget);

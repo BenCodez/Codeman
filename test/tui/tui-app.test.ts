@@ -9,11 +9,12 @@
  * full-screen loop itself is covered end-to-end under node-pty in
  * `tui-e2e.test.ts`.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   applyLiveMetrics,
   applyMuxNames,
   buildAttachBanner,
+  beginAttachHandoff,
   buildListLines,
   confirmKillStep,
   detachChord,
@@ -25,6 +26,7 @@ import {
   formatPrefixKey,
   helpKeysFor,
   isSelfSession,
+  needsDirectAttachFence,
   planAttach,
   planResume,
   previewIntervalMs,
@@ -39,7 +41,7 @@ import {
 } from '../../src/tui/tui-app.js';
 import { createTuiModel, stateSince } from '../../src/tui/tui-model.js';
 import { glyphsFor } from '../../src/tui/tui-render.js';
-import type { TuiLiveSessionMetrics, TuiTmuxSession } from '../../src/tui/tui-client.js';
+import type { TuiClient, TuiLiveSessionMetrics, TuiTmuxSession } from '../../src/tui/tui-client.js';
 import type { TuiConfirmState, TuiRow, TuiSessionRow } from '../../src/tui/tui-types.js';
 
 const GLYPHS = glyphsFor('unicode');
@@ -113,6 +115,106 @@ describe('planAttach', () => {
     const plan = planAttach('codeman-abcdef01', { socket: 'codeman' });
     if (plan.kind !== 'attach') throw new Error('expected an attach');
     expect(plan.args.some((arg) => arg.includes(' '))).toBe(false);
+  });
+});
+
+describe('direct attach recovery fence', () => {
+  it('is required for Codex rows, including future remote rows, without changing other modes', () => {
+    expect(needsDirectAttachFence({ mode: 'codex' })).toBe(true);
+    expect(needsDirectAttachFence({ mode: 'claude' })).toBe(false);
+    expect(needsDirectAttachFence({ mode: 'shell' })).toBe(false);
+    expect(needsDirectAttachFence({ mode: undefined })).toBe(true);
+    expect(needsDirectAttachFence({ mode: '' })).toBe(true);
+    expect(needsDirectAttachFence({ mode: 'unknown-cli' })).toBe(true);
+  });
+
+  it('leaves secondary workers untouched when attaching to a Claude row', async () => {
+    const fenceDirectAttach = vi.fn(async () => {});
+    const bindSwitchKey = vi.fn(async () => true);
+    const client = {
+      clearLeakedAttachSwitchKeys: vi.fn(async () => {}),
+      fenceDirectAttach,
+      readPrefixKey: vi.fn(async () => null),
+      readDetachKey: vi.fn(async () => null),
+      readPrefixBinding: vi.fn(async () => null),
+      readAttachSwitchBinding: vi.fn(async () => null),
+      bindDetachKey: vi.fn(async () => true),
+      bindSwitchKey,
+      readSessionOptions: vi.fn(async () => null),
+      applySessionOptions: vi.fn(async () => {}),
+      readWindowSizing: vi.fn(async () => null),
+      presizeWindow: vi.fn(async () => {}),
+      followAttachingClient: vi.fn(async () => true),
+      unbindSwitchKey: vi.fn(async () => {}),
+      unbindDetachKey: vi.fn(async () => {}),
+      restoreSessionOptions: vi.fn(async () => {}),
+      restoreWindowSizing: vi.fn(async () => {}),
+    } as unknown as TuiClient;
+
+    const handoff = await beginAttachHandoff(client, 'codeman-claude1', 'claude row', [
+      { index: 1, label: 'claude row', active: true, muxName: 'codeman-claude1' },
+      {
+        index: 2,
+        label: 'codex row',
+        active: false,
+        muxName: 'codeman-codex222',
+        requiresDirectAttachFence: true,
+        directAttachFenceSessionId: 'codex-session-id',
+      },
+    ]);
+
+    expect(fenceDirectAttach).not.toHaveBeenCalled();
+    expect(bindSwitchKey).not.toHaveBeenCalled();
+    await handoff.restore();
+  });
+
+  it('omits unfenced or unidentified Codex jumps without blocking an initial Claude attach', async () => {
+    const bindSwitchKey = vi.fn(async () => true);
+    const client = {
+      clearLeakedAttachSwitchKeys: vi.fn(async () => {}),
+      fenceDirectAttach: vi.fn(async () => {
+        throw new Error('server unavailable');
+      }),
+      readPrefixKey: vi.fn(async () => null),
+      readDetachKey: vi.fn(async () => null),
+      readPrefixBinding: vi.fn(async () => null),
+      readAttachSwitchBinding: vi.fn(async () => null),
+      bindDetachKey: vi.fn(async () => true),
+      bindSwitchKey,
+      readSessionOptions: vi.fn(async () => null),
+      applySessionOptions: vi.fn(async () => {}),
+      readWindowSizing: vi.fn(async () => null),
+      presizeWindow: vi.fn(async () => {}),
+      followAttachingClient: vi.fn(async () => true),
+      unbindSwitchKey: vi.fn(async () => {}),
+      unbindDetachKey: vi.fn(async () => {}),
+      restoreSessionOptions: vi.fn(async () => {}),
+      restoreWindowSizing: vi.fn(async () => {}),
+    } as unknown as TuiClient;
+
+    const handoff = await beginAttachHandoff(client, 'codeman-claude1', 'claude row', [
+      { index: 1, label: 'claude row', active: true, muxName: 'codeman-claude1' },
+      {
+        index: 2,
+        label: 'offline codex',
+        active: false,
+        muxName: 'codeman-codex222',
+        requiresDirectAttachFence: true,
+        directAttachFenceSessionId: 'offline-codex-id',
+      },
+      {
+        index: 3,
+        label: 'unknown codex',
+        active: false,
+        muxName: 'codeman-codex333',
+        requiresDirectAttachFence: true,
+      },
+    ]);
+
+    expect(bindSwitchKey).not.toHaveBeenCalled();
+    expect(bindSwitchKey).not.toHaveBeenCalledWith('M-2', expect.anything());
+    expect(bindSwitchKey).not.toHaveBeenCalledWith('M-3', expect.anything());
+    await handoff.restore();
   });
 });
 
@@ -468,20 +570,16 @@ describe('the one-key way out', () => {
     expect(ONE_KEY_DETACH).not.toContain('+');
   });
 
-  it('advertises alt+1-9 only once those keys were really claimed', () => {
-    // Same rule as the way-out key: never name a key that does nothing. That
-    // is the bug this whole series started with.
-    const withSwitch = buildAttachBanner({ oneKey: 'F1', switchKeys: true, cols: 150 })['status-format[0]'];
-    expect(withSwitch).toContain('alt+1-9 switch');
-    expect(withSwitch).toContain('back to the codeman dashboard');
-    expect(buildAttachBanner({ oneKey: 'F1', cols: 150 })['status-format[0]']).not.toContain('alt+1-9');
+  it('does not advertise global Alt switch shortcuts during an attach', () => {
+    const bar = buildAttachBanner({ oneKey: 'F1', cols: 150 })['status-format[0]'];
+    expect(bar).not.toContain('alt+1-9');
+    expect(bar).toContain('back to the codeman dashboard');
   });
 
-  it('still fits the strip once the switch hint has taken its space', () => {
+  it('fits the session strip while reserving space for the detach hint', () => {
     for (const cols of [80, 100, 120, 190]) {
       const bar = buildAttachBanner({
         oneKey: 'F1',
-        switchKeys: true,
         cols,
         tabs: Array.from({ length: 12 }, (_, i) => ({
           index: i + 1,
@@ -491,7 +589,7 @@ describe('the one-key way out', () => {
       })['status-format[0]'];
       const visible = bar.replace(/#\[[^\]]*\]/g, '');
       expect({ cols, fits: visible.length <= cols }).toEqual({ cols, fits: true });
-      expect(visible).toContain('alt+1-9 switch');
+      expect(visible).not.toContain('alt+1-9 switch');
       expect(visible).toContain('back to the codeman dashboard');
     }
   });

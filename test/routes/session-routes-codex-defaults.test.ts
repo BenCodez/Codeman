@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import { mkdir, writeFile, rm } from 'node:fs/promises';
 import { dirname, join, resolve } from 'node:path';
 import { homedir } from 'node:os';
+import vm from 'node:vm';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
 import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
 import { registerSystemRoutes } from '../../src/web/routes/system-routes.js';
@@ -37,7 +38,15 @@ describe('Codex launch defaults', () => {
     }
     await mkdir(workingDir, { recursive: true });
     await mkdir(dirname(SETTINGS_PATH), { recursive: true });
-    await writeFile(SETTINGS_PATH, JSON.stringify({ codexModel: 'gpt-6.1', codexReasoningEffort: 'high' }));
+    await writeFile(
+      SETTINGS_PATH,
+      JSON.stringify({
+        codexModel: 'gpt-6.1',
+        codexReasoningEffort: 'high',
+        codexNoDaemon: true,
+        codexNoAltScreen: true,
+      })
+    );
     harness = await createRouteTestHarness(registerSessionRoutes);
     vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
   });
@@ -62,18 +71,96 @@ describe('Codex launch defaults', () => {
     return session!.codexConfig;
   }
 
+  it.each([false, true])(
+    'uses current server isolation defaults instead of a stale browser value %s',
+    async (cached) => {
+      const current = !cached;
+      await writeFile(SETTINGS_PATH, JSON.stringify({ codexNoDaemon: current, codexNoAltScreen: current }));
+      const requests: Array<{ url: string; body?: Record<string, any> }> = [];
+      const elements = { quickStartCase: { value: 'codex-default-test' }, tabCount: { value: '1' } };
+      const CodemanApp = function () {};
+      const context = vm.createContext({
+        CodemanApp,
+        console,
+        localStorage: { getItem: () => null, setItem: () => {} },
+        document: { getElementById: (id: keyof typeof elements) => elements[id] ?? null },
+        fetch: async (url: string, init?: { body?: string }) => {
+          const body = init?.body ? JSON.parse(init.body) : undefined;
+          requests.push({ url, body });
+          if (url === '/api/codex/status') return { json: async () => ({ success: true, data: { available: true } }) };
+          const response = await harness.app.inject({
+            method: body ? 'POST' : 'GET',
+            url,
+            ...(body ? { payload: body } : {}),
+          });
+          expect(response.statusCode, response.body).toBe(200);
+          const result = response.json();
+          return { json: async () => (result.success === undefined ? { success: true, data: result } : result) };
+        },
+      });
+      vm.runInContext(
+        readFileSync(resolve(import.meta.dirname, '../../src/web/public/session-ui.js'), 'utf8'),
+        context
+      );
+      const app = new (CodemanApp as any)();
+      Object.assign(app, {
+        terminal: { clear() {}, writeln() {}, focus() {} },
+        loadAppSettingsFromStorage: () => ({ codexNoDaemon: cached, codexNoAltScreen: cached }),
+        getCaseSettings: () => ({}),
+        buildEnvOverrides: () => ({}),
+        sessions: new Map(),
+        selectSession: vi.fn(async () => {}),
+      });
+      app._onSessionCreated = (session: { id: string }) => app.sessions.set(session.id, session);
+      await app.runCodex();
+      const session = [...harness.ctx.sessions.values()].at(-1) as Session;
+      expect(session.codexConfig?.noDaemon === true).toBe(current);
+      expect(session.codexConfig?.noAltScreen === true).toBe(current);
+      const body = requests.find((request) => request.url === '/api/quick-start')!.body!;
+      expect(body.codexConfig).not.toHaveProperty('noDaemon');
+      expect(body.codexConfig).not.toHaveProperty('noAltScreen');
+      expect(buildCodexCommand(session.codexConfig).includes('--no-daemon')).toBe(current);
+      expect(buildCodexCommand(session.codexConfig).includes('--no-alt-screen')).toBe(current);
+      expect(app.selectSession).toHaveBeenCalledWith(session.id);
+    }
+  );
+
   for (const url of ['/api/sessions', '/api/quick-start']) {
     it(`applies persisted defaults at ${url} and emits the CLI options`, async () => {
       const config = await createdConfig(url);
-      expect(config).toMatchObject({ model: 'gpt-6.1', reasoningEffort: 'high' });
+      expect(config).toMatchObject({
+        model: 'gpt-6.1',
+        reasoningEffort: 'high',
+        noDaemon: true,
+        noAltScreen: true,
+      });
       expect(buildCodexCommand(config)).toContain('--model gpt-6.1');
       expect(buildCodexCommand(config)).toContain('--config model_reasoning_effort=high');
+      expect(buildCodexCommand(config)).toContain('--no-daemon');
+      expect(buildCodexCommand(config)).toContain('--no-alt-screen');
     });
 
+    it.each([false, true])(
+      `preserves explicit isolation choices against server default %s at ${url}`,
+      async (current) => {
+        await writeFile(SETTINGS_PATH, JSON.stringify({ codexNoDaemon: current, codexNoAltScreen: current }));
+        const config = await createdConfig(url, { codexConfig: { noDaemon: !current, noAltScreen: !current } });
+        expect(config).toMatchObject({ noDaemon: !current, noAltScreen: !current });
+        expect(buildCodexCommand(config).includes('--no-daemon')).toBe(!current);
+        expect(buildCodexCommand(config).includes('--no-alt-screen')).toBe(!current);
+      }
+    );
+
     it(`preserves explicit model and effort at ${url}`, async () => {
-      expect(await createdConfig(url, { codexConfig: { model: 'gpt-other', reasoningEffort: 'low' } })).toMatchObject({
+      expect(
+        await createdConfig(url, {
+          codexConfig: { model: 'gpt-other', reasoningEffort: 'low', noDaemon: false, noAltScreen: false },
+        })
+      ).toMatchObject({
         model: 'gpt-other',
         reasoningEffort: 'low',
+        noDaemon: false,
+        noAltScreen: false,
       });
     });
   }
@@ -89,9 +176,14 @@ describe('Codex launch defaults', () => {
     }
   });
 
-  it('keeps defaults out of custom endpoint launches', async () => {
+  it('keeps model defaults out of custom endpoints while applying local process isolation', async () => {
     const config = { model: 'local-model', animations: false };
-    expect(await resolveCodexDefaults(config, true)).toBe(config);
+    expect(await resolveCodexDefaults(config, true)).toEqual({
+      model: 'local-model',
+      animations: false,
+      noDaemon: true,
+      noAltScreen: true,
+    });
   });
 
   it('is driven by the registry: codex declares the defaults, and a CLI without them is untouched', async () => {
@@ -100,6 +192,8 @@ describe('Codex launch defaults', () => {
     expect(getCli('codex')!.capabilities.launchDefaults).toEqual({
       model: 'codexModel',
       reasoningEffort: 'codexReasoningEffort',
+      noDaemon: 'codexNoDaemon',
+      noAltScreen: 'codexNoAltScreen',
     });
     for (const entry of STOCK_CLIS) {
       if ((entry.id as string) === 'codex') continue;
@@ -111,17 +205,30 @@ describe('Codex launch defaults', () => {
     const bag = { codexConfig: { animations: false }, geminiConfig: { model: 'g' }, name: 'n' };
     const filled = await applyLaunchDefaults('codex', bag);
     expect(filled).toEqual({
-      codexConfig: { animations: false, model: 'gpt-6.1', reasoningEffort: 'high' },
+      codexConfig: {
+        animations: false,
+        model: 'gpt-6.1',
+        reasoningEffort: 'high',
+        noDaemon: true,
+        noAltScreen: true,
+      },
       geminiConfig: { model: 'g' },
       name: 'n',
     });
     expect(filled.geminiConfig).toBe(bag.geminiConfig);
     expect(bag.codexConfig).toEqual({ animations: false });
     // A field the caller sent is never overwritten, one at a time.
-    expect(await resolveCodexDefaults({ model: 'mine' })).toEqual({ model: 'mine', reasoningEffort: 'high' });
+    expect(await resolveCodexDefaults({ model: 'mine' })).toEqual({
+      model: 'mine',
+      reasoningEffort: 'high',
+      noDaemon: true,
+      noAltScreen: true,
+    });
     expect(await resolveCodexDefaults({ reasoningEffort: 'low' })).toEqual({
       model: 'gpt-6.1',
       reasoningEffort: 'low',
+      noDaemon: true,
+      noAltScreen: true,
     });
   });
 
@@ -183,12 +290,32 @@ describe('Codex launch defaults', () => {
     const system = await createRouteTestHarness(registerSystemRoutes);
     try {
       const put = (payload: unknown) => system.app.inject({ method: 'PUT', url: '/api/settings', payload });
-      expect((await put({ codexModel: 'gpt-6.1', codexReasoningEffort: 'xhigh' })).statusCode).toBe(200);
+      expect(
+        (
+          await put({
+            codexModel: 'gpt-6.1',
+            codexReasoningEffort: 'xhigh',
+            codexNoDaemon: true,
+            codexNoAltScreen: true,
+          })
+        ).statusCode
+      ).toBe(200);
       const read = await system.app.inject({ method: 'GET', url: '/api/settings' });
-      expect(read.json()).toMatchObject({ codexModel: 'gpt-6.1', codexReasoningEffort: 'xhigh' });
+      expect(read.json()).toMatchObject({
+        codexModel: 'gpt-6.1',
+        codexReasoningEffort: 'xhigh',
+        codexNoDaemon: true,
+        codexNoAltScreen: true,
+      });
+      const launched = await createdConfig('/api/sessions');
+      expect(launched).toMatchObject({ noDaemon: true, noAltScreen: true });
+      expect(buildCodexCommand(launched)).toContain('--no-daemon');
+      expect(buildCodexCommand(launched)).toContain('--no-alt-screen');
       expect((await put({ codexReasoningEffort: 'bogus' })).statusCode).toBe(400);
       expect((await put({ codexModel: 'bad;command' })).statusCode).toBe(400);
       expect((await put({ codexModel: '', codexReasoningEffort: '' })).statusCode).toBe(200);
+      expect(await resolveCodexDefaults(undefined)).toEqual({ noDaemon: true, noAltScreen: true });
+      expect((await put({ codexNoDaemon: false, codexNoAltScreen: false })).statusCode).toBe(200);
       expect(await resolveCodexDefaults(undefined)).toBeUndefined();
     } finally {
       await system.app.close();

@@ -31,8 +31,43 @@
  * @module session-env-clamp
  */
 
-import { canUsernameRunPrivilegedCommands } from './user-store.js';
-import { enabledClis } from './config/cli-registry/registry.js';
+import { canUsernameRunPrivilegedCommands, prepareRecoveryPrivilegeGrant } from './user-store.js';
+import { listClis } from './config/cli-registry/registry.js';
+
+/**
+ * Clamp per-CLI configs at launch or recovery using the owner's CURRENT grant.
+ * Disabled entries still govern existing sessions and persisted launch settings.
+ * Conditional clamps preserve safe explicit choices and never invent absent values.
+ */
+export async function clampExternalCliConfigsForOwner(
+  owner: string | undefined,
+  configs: Record<string, unknown>
+): Promise<Record<string, unknown>> {
+  return clampConfigsWithGrant(configs, await canUsernameRunPrivilegedCommands(owner));
+}
+
+function clampConfigsWithGrant(configs: Record<string, unknown>, privileged: boolean): Record<string, unknown> {
+  if (privileged) return configs;
+
+  const out = { ...configs };
+  for (const entry of listClis()) {
+    const field = entry.launch.legacyConfigField;
+    if (!field) continue;
+    // Clamp names use the registry-param namespace; the wire config may alias them
+    // (Codex bypassApprovals -> dangerouslyBypassApprovals).
+    const aliases = entry.launch.legacyConfigAliases ?? {};
+    const existing = out[field] as Record<string, unknown> | undefined;
+    let next = existing;
+    for (const { param, clampTo, materializeWhenAbsent, whenValues } of entry.capabilities.privilegedParams) {
+      if (next === undefined && !materializeWhenAbsent) continue;
+      const wireField = aliases[param] ?? param;
+      if (whenValues && !whenValues.some((value) => value === next?.[wireField])) continue;
+      next = { ...(next ?? {}), [wireField]: clampTo };
+    }
+    if (next !== existing) out[field] = next;
+  }
+  return out;
+}
 
 /**
  * Env-var keys a non-granted owner must not be able to set, because each one
@@ -68,7 +103,7 @@ import { enabledClis } from './config/cli-registry/registry.js';
  *   already allowlisted for pi and not addressed here — see resolveOmpHome()).
  */
 export function ownerClampedEnvKeys(): string[] {
-  return enabledClis().flatMap((entry) => entry.capabilities.privilegedEnvKeys);
+  return listClis().flatMap((entry) => entry.capabilities.privilegedEnvKeys);
 }
 
 /**
@@ -95,8 +130,33 @@ export async function clampEnvOverridesForOwner(
   if (!envOverrides) return envOverrides;
   const keys = ownerClampedEnvKeys();
   if (!keys.some((key) => key in envOverrides)) return envOverrides;
-  if (await canUsernameRunPrivilegedCommands(owner)) return envOverrides;
+  return clampEnvWithGrant(envOverrides, await canUsernameRunPrivilegedCommands(owner));
+}
+
+function clampEnvWithGrant(
+  envOverrides: Record<string, string> | undefined,
+  privileged: boolean
+): Record<string, string> | undefined {
+  if (!envOverrides || privileged) return envOverrides;
+  const keys = ownerClampedEnvKeys();
   const clamped = { ...envOverrides };
   for (const key of keys) delete clamped[key];
   return clamped;
+}
+
+/** One current owner-grant snapshot for a final configuration/environment decision. */
+export async function clampRecoveryLaunchForOwner(
+  owner: string | undefined,
+  configs: Record<string, unknown>,
+  env: Record<string, string> | undefined
+) {
+  const grant = await prepareRecoveryPrivilegeGrant(owner);
+  return {
+    configs: clampConfigsWithGrant(configs, grant.privileged),
+    env: clampEnvWithGrant(env, grant.privileged),
+    isCurrent: grant.isCurrent,
+    fileWitness: grant.fileWitness,
+    getFileWitness: grant.getFileWitness,
+    verifyCurrent: grant.verifyCurrent,
+  };
 }

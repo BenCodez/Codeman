@@ -584,6 +584,10 @@ const CODEX: CliEntry = {
     params: {
       bypassApprovals: { type: 'bool' },
       animations: { type: 'bool' },
+      noDaemon: { type: 'bool' },
+      noAltScreen: { type: 'bool' },
+      sandbox: { type: 'enum', values: ['read-only', 'workspace-write', 'danger-full-access'] },
+      approvalPolicy: { type: 'enum', values: ['on-request', 'never'] },
       model: { type: 'token', pattern: 'model' },
       reasoningEffort: { type: 'enum', values: [...CODEX_REASONING_EFFORTS] },
       resumeId: { type: 'token', pattern: 'id' },
@@ -593,7 +597,11 @@ const CODEX: CliEntry = {
         id: 'default',
         args: [
           { lit: 'codex' },
+          { flag: '--no-daemon', when: { param: 'noDaemon', is: true } },
+          { flag: '--no-alt-screen', when: { param: 'noAltScreen', is: true } },
           { flag: '--dangerously-bypass-approvals-and-sandbox', when: { param: 'bypassApprovals', is: true } },
+          { flag: '--sandbox', valueFrom: 'sandbox', when: { param: 'sandbox', state: 'set' } },
+          { flag: '--ask-for-approval', valueFrom: 'approvalPolicy', when: { param: 'approvalPolicy', state: 'set' } },
           { flag: '--config', value: 'tui.animations=true', when: { param: 'animations', is: true } },
           { flag: '--config', value: 'tui.animations=false', when: { param: 'animations', is: false } },
           { flag: '--model', valueFrom: 'model', when: { param: 'model', state: 'set' } },
@@ -692,10 +700,15 @@ const CODEX: CliEntry = {
       screenLine: String.raw`(?:^|\n) {2}([A-Za-z0-9][\w.:/@+-]{0,79}) (?:${[...CODEX_REASONING_EFFORTS, 'default'].join('|')}) · [^\n]*(?:\n {2}[^\n]*)?$`,
       screenLines: 2,
     },
-    // App Settings → Codex model / reasoning effort (synced), filled into a LOCAL launch's
+    // App Settings → Codex launch defaults (synced), filled into a LOCAL launch's
     // codexConfig wherever the caller left the field unset. Launch-only: nothing writes
     // codex's own config.toml. Read by applyLaunchDefaults() in src/web/launch-defaults.ts.
-    launchDefaults: { model: 'codexModel', reasoningEffort: 'codexReasoningEffort' },
+    launchDefaults: {
+      model: 'codexModel',
+      reasoningEffort: 'codexReasoningEffort',
+      noDaemon: 'codexNoDaemon',
+      noAltScreen: 'codexNoAltScreen',
+    },
     // Two columns, like claude's, measured on a live 0.154.0 answer: the `•`/`›`/`⚠`
     // markers sit in the gutter, prose continuations sit at 2, and a nested YAML block
     // the model wrote rendered at 2/4/6/8 for its own 0/2/4/6. Replayed at 100, 120,
@@ -703,6 +716,7 @@ const CODEX: CliEntry = {
     // never 1, so the width is not a function of the pane.
     transcriptGutter: 2,
     transcript: 'codex-rollout',
+    recovery: 'codex-rollout',
     altScreen: 'strip-full',
     echo: { policy: 'predict', anchor: { kind: 'cursor' }, predictProfile: 'codex' },
     wheelForward: { mode: 'never' }, // #227: codex ignores SGR wheel reports, never forward
@@ -715,7 +729,11 @@ const CODEX: CliEntry = {
     // does. codex is the entry where the two names differ (`bypassApprovals` here,
     // `dangerouslyBypassApprovals` on the wire), so it is the one that would have caught a
     // regression; `schema.ts` now rejects a name that is not a declared param.
-    privilegedParams: [{ param: 'bypassApprovals', clampTo: false }],
+    privilegedParams: [
+      { param: 'bypassApprovals', clampTo: false },
+      { param: 'sandbox', clampTo: 'workspace-write', whenValues: ['danger-full-access'] },
+      { param: 'approvalPolicy', clampTo: 'on-request', whenValues: ['never'] },
+    ],
     mcpConfig: {
       path: '.codex/config.toml',
       format: 'codex-toml',

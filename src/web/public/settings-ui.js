@@ -535,6 +535,10 @@ Object.assign(CodemanApp.prototype, {
       settings.codexDangerouslyBypassApprovals ?? false;
     document.getElementById('appSettingsCodexAnimations').checked =
       settings.codexAnimationsEnabled ?? false;
+    const codexNoDaemon = document.getElementById('appSettingsCodexNoDaemon');
+    const codexNoAltScreen = document.getElementById('appSettingsCodexNoAltScreen');
+    if (codexNoDaemon) codexNoDaemon.checked = settings.codexNoDaemon ?? false;
+    if (codexNoAltScreen) codexNoAltScreen.checked = settings.codexNoAltScreen ?? false;
     document.getElementById('appSettingsCodexModel').value = settings.codexModel ?? '';
     document.getElementById('appSettingsCodexReasoningEffort').value = settings.codexReasoningEffort ?? '';
     this._applyCodexSettingsVisibility();
@@ -2629,6 +2633,8 @@ Object.assign(CodemanApp.prototype, {
       codexReasoningEffort: document.getElementById('appSettingsCodexReasoningEffort').value,
       codexDangerouslyBypassApprovals: document.getElementById('appSettingsCodexDangerouslyBypassApprovals').checked,
       codexAnimationsEnabled: document.getElementById('appSettingsCodexAnimations').checked,
+      codexNoDaemon: document.getElementById('appSettingsCodexNoDaemon')?.checked ?? false,
+      codexNoAltScreen: document.getElementById('appSettingsCodexNoAltScreen')?.checked ?? false,
       // Claude Permissions settings
       agentTeamsEnabled: document.getElementById('appSettingsAgentTeams').checked,
       agentSkillEnabled: document.getElementById('appSettingsAgentSkill').checked,
@@ -3304,8 +3310,8 @@ Object.assign(CodemanApp.prototype, {
   /** Keep the launch surfaces in sync with Settings mutations without a reload. */
   _syncCliLaunchCatalog() {
     if (!Array.isArray(this._cliList) || this._cliList.length === 0) return;
-    // /api/clis rows carry no capabilities, so keep the served catalog's `external`
-    // (isExternalCliSession() reads it). A new custom CLI has none and falls back to `kind`.
+    // /api/clis rows carry no capabilities, so retain the served external and
+    // recovery capabilities. New custom entries cannot acquire them from this list.
     const previous = new Map(
       (Array.isArray(window.__codemanCliCatalog) ? window.__codemanCliCatalog : []).map((cli) => [cli.id, cli])
     );
@@ -3316,6 +3322,7 @@ Object.assign(CodemanApp.prototype, {
       order: cli.order,
       kind: cli.kind,
       external: previous.get(cli.id)?.external,
+      recovery: previous.get(cli.id)?.recovery ?? previous.get(cli.id)?.capabilities?.recovery,
       enabled: cli.enabled,
       available: cli.kind === 'shell' || (cli.enabled && cli.installed),
     }));

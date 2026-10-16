@@ -248,7 +248,7 @@ describe("applyCustomModelInjection: skipFirstRunPrompts (an isolated dir replay
     expect(written.skipDangerousModePermissionPrompt).toBe(true);
   });
 
-  it('claude: with no workingDir given (boot recovery), hasCompletedOnboarding/settings still seed, but no project entry is added', () => {
+  it('claude: without a workingDir, does not invent onboarding or project trust', () => {
     const sessionId = 'sess-firstrun-3';
     sessionsToClean.push(sessionId);
     const applied = applyCustomModelInjection(entryOrThrow('claude'), endpoint, 'qwen3', sessionId);

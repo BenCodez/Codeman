@@ -337,7 +337,12 @@
         // markers intact. Mirrors terminal-ui.js's own Ctrl+V gate; without it
         // xterm's default only ever pasted text.
         if ((ev.ctrlKey || ev.metaKey) && ev.key === 'v' && ev.type === 'keydown') {
-          global.app?._handleImagePaste?.({ terminal: this.terminal, sessionId: this.sessionId });
+          const terminal = this.terminal;
+          global.app?._handleImagePaste?.({
+            terminal,
+            sessionId: this.sessionId,
+            isCurrent: () => this.terminal === terminal,
+          });
           return false;
         }
         // Ctrl+Z (SIGTSTP/job-control suspend), as terminal-ui.js swallows it:
@@ -367,13 +372,7 @@
         // Swallow keypress/keyup too (xterm would send \r for a Shift-only keypress); only keydown sends.
         if (ev.key === 'Enter' && (ev.shiftKey || ev.ctrlKey)) {
           if (ev.type === 'keydown') {
-            fetch(`/api/sessions/${this.sessionId}/send-key`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ key: ev.ctrlKey ? 'C-Enter' : 'S-Enter' }),
-            }).catch(() => {
-              /* Best-effort, matching this pane's tolerance elsewhere. */
-            });
+            global.app?._sendNamedKey?.(this.sessionId, ev.ctrlKey ? 'C-Enter' : 'S-Enter', this);
           }
           return false;
         }
@@ -1504,6 +1503,7 @@
 
     destroy() {
       this._destroyed = true;
+      global.app?._cancelPendingKeys?.(this);
       // Anything still queued for this session stays in the app's queue and is
       // delivered over HTTP by the redelivery sweep, so closing the pane mid-
       // keystroke loses nothing.

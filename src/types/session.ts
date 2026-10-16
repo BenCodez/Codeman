@@ -74,6 +74,10 @@ export interface SessionWriteOptions {
    * name a tab; Ralph, respawn, cron and approval writes leave this unset.
    */
   fromUser?: boolean;
+  /** Internal caller authority, rechecked after asynchronous preflight and before bytes. */
+  isCurrent?: () => boolean;
+  /** Internal reliable-delivery identity, committed at the byte-dispatch boundary. */
+  inputSeq?: { clientId: string; seq: number };
 }
 
 export type RemoteCommandMode = Extract<
@@ -436,6 +440,14 @@ export interface CodexConfig {
   dangerouslyBypassApprovals?: boolean;
   /** Enable Codex's decorative TUI animations. Disable to reduce remote terminal redraws. */
   animations?: boolean;
+  /** Run in this pane's process instead of Codex's shared background daemon. Launch-time only. */
+  noDaemon?: boolean;
+  /** Keep the TUI inline so tmux retains terminal scrollback. Passed via --no-alt-screen. */
+  noAltScreen?: boolean;
+  /** Codex command sandbox, passed via --sandbox. */
+  sandbox?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  /** Codex 0.162+ approval policies, passed via --ask-for-approval. */
+  approvalPolicy?: 'on-request' | 'never';
   /** Browser rendering strategy for Codex sessions. Hybrid TUI is the only supported mode. */
   renderMode?: CodexRenderMode;
 }
@@ -725,6 +737,13 @@ export interface PaneExit {
 }
 
 export interface SessionState {
+  /** Durable, optional recovery state. Absent on existing sessions and other CLIs. */
+  recovery?: import('../recovery/types.js').RecoveryState;
+  task?: import('./task.js').SupervisionTaskState;
+  /** Computed launch-shape eligibility; never restored as authority from persisted state. */
+  taskSupported?: boolean;
+  /** Computed by the server for creating or inspecting an owner-controlled supervisor role. */
+  supervisorAvailable?: boolean;
   /** Unique session identifier */
   id: string;
   /** Process ID of the PTY process, null if not running */

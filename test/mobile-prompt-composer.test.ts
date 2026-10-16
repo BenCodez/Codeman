@@ -10,6 +10,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { JSDOM } from 'jsdom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { browserInputJournal, settleInput } from './mocks/browser-input-journal.js';
 
 const accessorySource = readFileSync(resolve('src/web/public/keyboard-accessory.js'), 'utf8');
 const appSource = readFileSync(resolve('src/web/public/app.js'), 'utf8');
@@ -102,6 +103,109 @@ function mountComposeButton(bar: any, document: Document): HTMLButtonElement {
 }
 
 describe('mobile prompt composer', () => {
+  it('opens the native multiline draft composer for agent pasting and preserves a cancelled draft', () => {
+    const { app, bar, document } = loadComposer();
+    bar.pasteFromClipboard();
+    const input = document.querySelector('.prompt-composer-textarea') as HTMLTextAreaElement;
+    expect(input).not.toBeNull();
+    input.value = '  α\n🙂\nlast line  ';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+    (document.querySelector('.paste-cancel') as HTMLButtonElement).click();
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    bar.pasteFromClipboard();
+    expect((document.querySelector('.prompt-composer-textarea') as HTMLTextAreaElement).value).toBe(input.value);
+  });
+
+  it('pins shell paste and its delayed Enter to the original session across a tab switch', () => {
+    const { app, bar, document, runTimers } = loadComposer();
+    app.sessions.set('session-1', { mode: 'shell' });
+    bar.pasteFromClipboard();
+    (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = 'fixture command';
+    app.activeSessionId = 'session-2';
+    (document.querySelector('.paste-send') as HTMLButtonElement).click();
+    runTimers();
+    expect(app._sendInputAsync.mock.calls).toEqual([
+      ['session-1', 'fixture command'],
+      ['session-1', '\r', { useMux: true }],
+    ]);
+  });
+
+  it.each(['  first line\nsecond line  \t', ' \t\n\n \t', 'λ🙂\n尾 \t'])(
+    'preserves shell paste %j through HTTP fallback, durable reload and a separate Enter',
+    async (text) => {
+      const journal = browserInputJournal();
+      const browser = journal.open(); // No WebSocket: actual POST fallback.
+      const { app, bar, document, runTimers } = loadComposer();
+      app.sessions.set('session-1', { mode: 'shell' });
+      app._sendInputAsync.mockImplementation((...args) =>
+        Reflect.apply(browser.app._sendInputAsync, browser.app, args)
+      );
+      bar.pasteFromClipboard();
+      (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = text;
+      (document.querySelector('.paste-send') as HTMLButtonElement).click();
+      await settleInput(browser.app);
+      expect(browser.fetches.map(({ body }) => body)).toEqual([
+        { clientId: browser.app._clientId, seq: 1, input: text },
+      ]);
+      expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
+        { data: text, useMux: false },
+      ]);
+      // A failed prefix remains durable; the delayed Enter cannot overtake it.
+      app.activeSessionId = 'session-2';
+      runTimers();
+      await settleInput(browser.app);
+      const records = journal.records().map(({ value }) => value);
+      expect(records.map(({ data, useMux }) => ({ data, useMux }))).toEqual([
+        { data: text, useMux: false },
+        { data: '\r', useMux: true },
+      ]);
+      expect(records[1].after).toEqual({ cid: records[0].cid, seq: records[0].seq });
+      const reloaded = journal.open();
+      reloaded.transport(vi.fn(async () => new Response('{}', { status: 200 })));
+      reloaded.app._drainSession('session-1');
+      await settleInput(reloaded.app);
+      expect(reloaded.fetches).toEqual([
+        { sid: 'session-1', body: { clientId: records[0].cid, seq: records[0].seq, input: text } },
+        { sid: 'session-1', body: { clientId: records[1].cid, seq: records[1].seq, input: '\r', useMux: true } },
+      ]);
+      expect(journal.records()).toEqual([]);
+      expect(app._sendInputAsync.mock.calls.map(([sid]) => sid)).toEqual(['session-1', 'session-1']);
+    }
+  );
+
+  it('keeps connected shell paste byte-exact while Enter remains a separate durable occurrence', () => {
+    const journal = browserInputJournal();
+    const browser = journal.open();
+    browser.socket('session-1');
+    const { app, bar, document, runTimers } = loadComposer();
+    app.sessions.set('session-1', { mode: 'shell' });
+    app._sendInputAsync.mockImplementation((...args) => Reflect.apply(browser.app._sendInputAsync, browser.app, args));
+    const text = '  first\nlast \t';
+    bar.pasteFromClipboard();
+    (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = text;
+    (document.querySelector('.paste-send') as HTMLButtonElement).click();
+    expect(browser.frames.map(({ d }) => d)).toEqual([text]);
+    runTimers();
+    expect(browser.frames.map(({ d }) => d)).toEqual([text, '\r']);
+    expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
+      { data: text, useMux: false },
+      { data: '\r', useMux: true },
+    ]);
+    expect(browser.fetches).toEqual([]);
+  });
+
+  it.each(['cancel', 'empty'] as const)('does not enqueue shell text or Enter for %s paste', (action) => {
+    const { app, bar, document, runTimers } = loadComposer();
+    app.sessions.set('session-1', { mode: 'shell' });
+    bar.pasteFromClipboard();
+    if (action === 'cancel')
+      (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = 'cancelled\ntext';
+    (document.querySelector(action === 'cancel' ? '.paste-cancel' : '.paste-send') as HTMLButtonElement).click();
+    runTimers();
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    expect(document.querySelector('.paste-overlay')).toBeNull();
+  });
+
   beforeEach(() => vi.restoreAllMocks());
 
   it('replaces Paste with Compose on agent bars while shell keeps direct Paste', () => {
@@ -222,7 +326,7 @@ describe('mobile prompt composer', () => {
   });
 
   it('wires session cleanup to composer draft cleanup', () => {
-    const cleanupStart = appSource.indexOf('  _cleanupSessionData(sessionId) {');
+    const cleanupStart = /^ {2}_cleanupSessionData\(sessionId(?:,[^)\n]*)?\) \{/m.exec(appSource)?.index ?? -1;
     expect(cleanupStart, '_cleanupSessionData not found — renamed?').toBeGreaterThan(-1);
     // The whole method, not a fixed byte window. A 1200-character slice made
     // this assertion depend on how much OTHER code sat above the line it cares
@@ -347,32 +451,35 @@ describe('mobile prompt composer', () => {
     expect(textarea(document).value).toBe('keep this; then continue');
   });
 
-  it('uploads images without writing into the PTY and inserts their paths into the draft', async () => {
-    const { app, bar, document } = loadComposer();
-    let finishUpload!: (paths: string[]) => void;
-    app._uploadAndInsertImages.mockImplementation(
-      () => new Promise<string[]>((resolveUpload) => (finishUpload = resolveUpload))
-    );
-    bar.composePrompt();
-    const input = textarea(document);
-    input.value = 'review';
-    input.selectionStart = input.selectionEnd = input.value.length;
-    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
-    const fileInput = document.querySelector('.paste-file-input') as HTMLInputElement;
-    const image = new document.defaultView!.File(['image'], 'shot.png', { type: 'image/png' });
-    Object.defineProperty(fileInput, 'files', { configurable: true, value: [image] });
+  it.each([false, true])(
+    'pins image upload and draft insertion to the composer session (tab switch=%s)',
+    async (switchTab) => {
+      const { app, bar, document } = loadComposer();
+      let finishUpload!: (paths: string[]) => void;
+      app._uploadAndInsertImages.mockImplementation(
+        () => new Promise<string[]>((resolveUpload) => (finishUpload = resolveUpload))
+      );
+      bar.composePrompt();
+      const input = textarea(document);
+      input.value = 'review';
+      input.selectionStart = input.selectionEnd = input.value.length;
+      input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+      const fileInput = document.querySelector('.paste-file-input') as HTMLInputElement;
+      const image = new document.defaultView!.File(['image'], 'shot.png', { type: 'image/png' });
+      Object.defineProperty(fileInput, 'files', { configurable: true, value: [image] });
+      if (switchTab) app.activeSessionId = 'session-2';
+      fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
+      expect((document.querySelector('.paste-image') as HTMLButtonElement).disabled).toBe(true);
+      expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(true);
+      finishUpload(['/tmp/image-one.png']);
+      await vi.waitFor(() => expect(input.value).toBe('review /tmp/image-one.png'));
 
-    fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
-    expect((document.querySelector('.paste-image') as HTMLButtonElement).disabled).toBe(true);
-    expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(true);
-    finishUpload(['/tmp/image-one.png']);
-    await vi.waitFor(() => expect(input.value).toBe('review /tmp/image-one.png'));
-
-    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([image], { insert: false });
-    expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(false);
-    expect(app.terminal.paste).not.toHaveBeenCalled();
-    expect(app._sendInputAsync).not.toHaveBeenCalled();
-  });
+      expect(app._uploadAndInsertImages).toHaveBeenCalledWith([image], { sessionId: 'session-1', insert: false });
+      expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(false);
+      expect(app.terminal.paste).not.toHaveBeenCalled();
+      expect(app._sendInputAsync).not.toHaveBeenCalled();
+    }
+  );
 
   it('finishes an upload into a reopened composer without restoring a deleted session draft', async () => {
     const { app, bar, document } = loadComposer();

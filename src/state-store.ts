@@ -24,8 +24,17 @@
  * @module state-store
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync, copyFileSync } from 'node:fs';
-import { writeFile, rename, unlink, copyFile, access } from 'node:fs/promises';
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  mkdirSync,
+  renameSync,
+  unlinkSync,
+  copyFileSync,
+  constants,
+} from 'node:fs';
+import { writeFile, rename, unlink, copyFile, access, open, mkdir, lstat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -69,6 +78,34 @@ const SAVE_DEBOUNCE_MS = 500;
  */
 /** Maximum consecutive save failures before circuit breaker opens */
 const MAX_CONSECUTIVE_FAILURES = 3;
+const MAX_REBOOT_SNAPSHOT_ATTEMPTS = 3;
+/** Only a verified concurrent snapshot change permits restaging, never an I/O error. */
+class RebootSnapshotChanged extends Error {}
+
+/**
+ * Session.toState() output accounting and CLI display reports may restage.
+ * Their launch/config counterparts, identity, owner intent and unknown fields
+ * remain authority anchors; a reported model never changes the requested model.
+ */
+function rebootRecordAuthorityJson(record: AppState['sessions'][string]): string {
+  return JSON.stringify({
+    ...record,
+    status: undefined,
+    lastActivityAt: undefined,
+    inputTokens: undefined,
+    outputTokens: undefined,
+    totalCost: undefined,
+    cliMouseTracking: undefined,
+    cliVersion: undefined,
+    cliModel: undefined,
+    cliAccountType: undefined,
+    cliLatestVersion: undefined,
+    displayModel: undefined,
+    // Startup magic links/artifact reports update public and disk-private twins.
+    attachmentHistory: undefined,
+    __attachmentHistory: undefined,
+  });
+}
 
 export class StateStore {
   private state: AppState;
@@ -194,16 +231,308 @@ export class StateStore {
    * waits for it to complete then re-checks dirty flag before starting another.
    */
   async saveNowAsync(): Promise<void> {
-    if (this._saveInFlight) {
+    while (this._saveInFlight) {
       await this._saveInFlight;
-      // After waiting, re-check if still dirty (the previous save may have handled it)
-      if (!this.dirty) return;
+      // Another waiter may already be writing the newer dirty snapshot. Drain
+      // that write too; dirty=false alone does not acknowledge its pending I/O.
     }
-    this._saveInFlight = this._doSaveAsync();
+    const writing = this._doSaveAsync();
+    const settled = writing.catch(() => {});
+    this._saveInFlight = settled;
     try {
-      await this._saveInFlight;
+      await writing;
     } finally {
-      this._saveInFlight = null;
+      if (this._saveInFlight === settled) this._saveInFlight = null;
+    }
+  }
+
+  /** Strict reboot commit: shares the ordinary save queue; publishes only after durable acknowledgement. */
+  async persistSessionDurably(
+    id: string,
+    session: AppState['sessions'][string] | (() => AppState['sessions'][string]),
+    isCurrent: () => boolean = () => true
+  ): Promise<void> {
+    while (this._saveInFlight) await this._saveInFlight;
+    const writing = this._persistSessionDurably(id, session, isCurrent);
+    // Queue waiters must still save newer owner edits if this particular restore
+    // fails. Its own caller receives the original rejection through `writing`.
+    const settled = writing.catch(() => {});
+    this._saveInFlight = settled;
+    try {
+      await writing;
+    } finally {
+      if (this._saveInFlight === settled) this._saveInFlight = null;
+    }
+  }
+
+  private async _persistSessionDurably(
+    id: string,
+    session: AppState['sessions'][string] | (() => AppState['sessions'][string]),
+    isCurrent: () => boolean
+  ): Promise<void> {
+    const originalState = this.state;
+    const originalSession = this.state.sessions[id];
+    const originalSessionJson = JSON.stringify(originalSession);
+    const currentRecord = () => (typeof session === 'function' ? session() : session);
+    const recordAuthority = rebootRecordAuthorityJson(currentRecord());
+    const current = () =>
+      isCurrent() === true &&
+      this.state === originalState &&
+      this.state.sessions[id] === originalSession &&
+      JSON.stringify(originalSession) === originalSessionJson &&
+      rebootRecordAuthorityJson(currentRecord()) === recordAuthority;
+    // Keep one save lease across a bounded number of restages. Ordinary writers
+    // cannot overtake the restore, while unrelated owner edits remain in memory.
+    for (let attempt = 0; attempt < MAX_REBOOT_SNAPSHOT_ATTEMPTS; attempt++) {
+      try {
+        await this._persistSessionSnapshotDurably(id, session, current);
+        return;
+      } catch (error) {
+        if (
+          !(error instanceof RebootSnapshotChanged) ||
+          this.circuitBreakerOpen ||
+          attempt === MAX_REBOOT_SNAPSHOT_ATTEMPTS - 1
+        )
+          throw error;
+      }
+    }
+  }
+
+  private async _persistSessionSnapshotDurably(
+    id: string,
+    session: AppState['sessions'][string] | (() => AppState['sessions'][string]),
+    isCurrent: () => boolean
+  ): Promise<void> {
+    if (this.circuitBreakerOpen) throw new Error('State persistence circuit breaker is open');
+    const originalState = this.state;
+    const originalSession = this.state.sessions[id];
+    const originalSessionJson = JSON.stringify(originalSession);
+    const currentRecord = () => (typeof session === 'function' ? session() : session);
+    const recordJson = JSON.stringify(currentRecord());
+    const record = JSON.parse(recordJson) as AppState['sessions'][string];
+    const recordAuthority = rebootRecordAuthorityJson(record);
+    const json = JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } });
+    const assertCurrent = () => {
+      if (
+        isCurrent() !== true ||
+        this.state !== originalState ||
+        this.state.sessions[id] !== originalSession ||
+        JSON.stringify(this.state.sessions[id]) !== originalSessionJson ||
+        rebootRecordAuthorityJson(currentRecord()) !== recordAuthority
+      )
+        throw new Error('Reboot restoration was cancelled before durable commit');
+    };
+    const assertSnapshotCurrent = () => {
+      assertCurrent();
+      if (
+        JSON.stringify(currentRecord()) !== recordJson ||
+        JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } }) !== json
+      )
+        throw new RebootSnapshotChanged('Concurrent state edit requires a fresh durable restore snapshot');
+    };
+    assertCurrent();
+    const temporary = `${this.filePath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.reboot.tmp`;
+    let previous: string | undefined;
+    let commitAttempted = false;
+    let candidateInode: { dev: number; ino: number } | undefined;
+    const syncDirectory = async () => {
+      const directory = await open(dirname(this.filePath), 'r');
+      try {
+        await directory.sync();
+      } finally {
+        await directory.close();
+      }
+    };
+    const sameMetadata = (left: Awaited<ReturnType<typeof lstat>>, right: Awaited<ReturnType<typeof lstat>>) =>
+      ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs'].every(
+        (key) => left[key as keyof typeof left] === right[key as keyof typeof right]
+      );
+    const readPrimary = async (maxBytes?: number, path = this.filePath) => {
+      let file: Awaited<ReturnType<typeof open>> | undefined;
+      let opened = false;
+      try {
+        file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        opened = true;
+        const info = await file.stat();
+        if (!info.isFile() || (maxBytes !== undefined && info.size > maxBytes)) throw new Error('State file changed');
+        const input = Buffer.alloc(info.size + 1);
+        let size = 0;
+        while (size < input.length) {
+          const read = await file.read(input, size, input.length - size, size);
+          if (!read.bytesRead) break;
+          size += read.bytesRead;
+        }
+        const after = await file.stat();
+        if (size !== info.size || !sameMetadata(info, after)) throw new Error('State file changed');
+        const text = input.subarray(0, size).toString('utf8');
+        if (!Buffer.from(text, 'utf8').equals(input.subarray(0, size))) throw new Error('State file is malformed');
+        await file.close();
+        file = undefined;
+        // Every participating FD closes before this common pathname scan. No
+        // awaited cleanup may follow the successful verdict.
+        const current = await lstat(path);
+        if (current.isSymbolicLink() || !sameMetadata(after, current)) throw new Error('State file changed');
+        return { text, info: after };
+      } catch (error) {
+        if (opened && (error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('State file changed');
+        throw error;
+      } finally {
+        if (file) await file.close().catch(() => {});
+      }
+    };
+    let originalPrimary: Awaited<ReturnType<typeof readPrimary>> | undefined;
+    const matchesOriginal = async () => {
+      try {
+        const current = await readPrimary(previous === undefined ? 0 : Buffer.byteLength(previous));
+        return !!originalPrimary && sameMetadata(originalPrimary.info, current.info) && current.text === previous;
+      } catch (error) {
+        return !originalPrimary && (error as NodeJS.ErrnoException).code === 'ENOENT';
+      }
+    };
+    // Rollback owns only the inode written by this invocation, with its exact
+    // candidate bytes. A replacement or in-place edit belongs to another writer.
+    let verifiedCandidate: Awaited<ReturnType<typeof lstat>> | undefined;
+    const ownsCandidate = async () => {
+      if (!candidateInode) return false;
+      try {
+        const current = await readPrimary(Buffer.byteLength(json));
+        verifiedCandidate = current.info;
+        return (
+          current.info.dev === candidateInode.dev && current.info.ino === candidateInode.ino && current.text === json
+        );
+      } catch {
+        return false;
+      }
+    };
+    let temporaryInode: { dev: number; ino: number } | undefined;
+    let verifiedTemporary: Awaited<ReturnType<typeof lstat>> | undefined;
+    const ownsTemporary = async (text?: string) => {
+      if (!temporaryInode) return false;
+      try {
+        if (text === undefined) {
+          const stat = await lstat(temporary);
+          return (
+            stat.isFile() &&
+            !stat.isSymbolicLink() &&
+            stat.dev === temporaryInode.dev &&
+            stat.ino === temporaryInode.ino
+          );
+        }
+        const current = await readPrimary(Buffer.byteLength(text), temporary);
+        verifiedTemporary = current.info;
+        return (
+          current.info.dev === temporaryInode.dev && current.info.ino === temporaryInode.ino && current.text === text
+        );
+      } catch {
+        return false;
+      }
+    };
+    const cleanupTemporary = async () => {
+      if (await ownsTemporary()) await unlink(temporary).catch(() => {});
+    };
+    const write = async (text: string, candidate: boolean) => {
+      temporaryInode = undefined;
+      const file = await open(temporary, 'wx', 0o600);
+      try {
+        const stat = await file.stat();
+        temporaryInode = { dev: stat.dev, ino: stat.ino };
+        if (candidate) assertCurrent();
+        await file.writeFile(text, 'utf8');
+        if (candidate) assertCurrent();
+        await file.sync();
+        if (candidate) {
+          assertSnapshotCurrent();
+          const info = await file.stat();
+          candidateInode = { dev: info.dev, ino: info.ino };
+        }
+      } finally {
+        await file.close();
+      }
+      if (candidate) {
+        if (!(await matchesOriginal())) {
+          this.circuitBreakerOpen = true;
+          throw new Error('State commit target changed');
+        }
+      } else if (!(await ownsCandidate())) throw new Error('State rollback target changed');
+      if (!(await ownsTemporary(text))) throw new Error('State staged file changed');
+      // All proof descriptors close before this common final pathname scan.
+      const [target, staged] = await Promise.all([
+        lstat(this.filePath).catch((error) => {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          this.circuitBreakerOpen = true;
+          throw error;
+        }),
+        lstat(temporary),
+      ]);
+      const expectedTarget = candidate ? originalPrimary?.info : verifiedCandidate;
+      if (expectedTarget ? !target || !sameMetadata(expectedTarget, target) : target !== undefined) {
+        this.circuitBreakerOpen = true;
+        throw new Error(candidate ? 'State commit target changed' : 'State rollback target changed');
+      }
+      if (!verifiedTemporary || !sameMetadata(verifiedTemporary, staged)) throw new Error('State staged file changed');
+      if (candidate) {
+        assertSnapshotCurrent();
+        commitAttempted = true;
+      }
+      await rename(temporary, this.filePath);
+      await syncDirectory();
+    };
+    this.saveDeb.cancel();
+    // Mutations during asynchronous staging re-arm dirty. Never clear them on
+    // completion or replace unrelated live records with this older snapshot.
+    this.dirty = false;
+    let published = false;
+    try {
+      await mkdir(dirname(this.filePath), { recursive: true, mode: 0o700 });
+      assertCurrent();
+      try {
+        originalPrimary = await readPrimary();
+        previous = originalPrimary.text;
+        const parsed: unknown = JSON.parse(previous);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('State file is malformed');
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+          this.circuitBreakerOpen = true;
+          throw error;
+        }
+      }
+      assertCurrent();
+      await write(json, true);
+      await cleanupTemporary();
+      assertSnapshotCurrent();
+      this.state.sessions[id] = record;
+      this.cachedSessionJsons.clear();
+      this._resetCircuitBreaker();
+      published = true;
+    } catch (error) {
+      let rollbackAcknowledged = !commitAttempted;
+      if (commitAttempted) {
+        try {
+          if (!(await ownsCandidate())) throw new Error('State rollback target changed');
+          if (previous === undefined) {
+            await unlink(this.filePath);
+            await syncDirectory();
+          } else await write(previous, false);
+          rollbackAcknowledged = true;
+        } catch {
+          // Refuse subsequent automatic writes if the tentative bytes survived
+          // or another writer replaced them; preserve that uncertainty for repair.
+          try {
+            const current = await readPrimary();
+            if (current.text !== previous) this.circuitBreakerOpen = true;
+          } catch (rollbackError) {
+            if (previous !== undefined || (rollbackError as NodeJS.ErrnoException).code !== 'ENOENT')
+              this.circuitBreakerOpen = true;
+          }
+        }
+      }
+      this.cachedSessionJsons.clear();
+      this.dirty = true;
+      if (error instanceof RebootSnapshotChanged && !rollbackAcknowledged)
+        throw new Error('Concurrent state edit encountered an uncertain durable commit', { cause: error });
+      throw error;
+    } finally {
+      if (!published) await cleanupTemporary();
     }
   }
 
@@ -379,6 +708,13 @@ export class StateStore {
    */
   saveNow(): void {
     this.saveDeb.cancel();
+    if (this._saveInFlight) {
+      this.dirty = true;
+      // A synchronous flush cannot overtake a held durable commit or rollback.
+      // Shutdown awaits flushAllAsync before leaving the process.
+      void this.saveNowAsync().catch((error) => console.error('[StateStore] Deferred flush failed:', error));
+      return;
+    }
     if (!this.dirty) {
       return;
     }
@@ -1015,6 +1351,12 @@ export class StateStore {
   /** Returns a copy of all inner states as a Map. */
   getAllRalphStates(): Map<string, RalphSessionState> {
     return new Map(this.ralphStates);
+  }
+
+  /** Await queued durable commits/rollbacks before the existing shutdown flush. */
+  async flushAllAsync(): Promise<void> {
+    while (this._saveInFlight) await this._saveInFlight.catch(() => {});
+    this.flushAll();
   }
 
   /** Flushes all pending saves (main and inner state). Call before shutdown. */

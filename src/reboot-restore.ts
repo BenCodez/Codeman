@@ -44,7 +44,19 @@
 
 import type { SessionState } from './types.js';
 import { getCli } from './config/cli-registry/registry.js';
+import { resolveCodexIdentities, resolveCodexIdentity, type CodexIdentityRequest } from './recovery/codex-identity.js';
+import { readRebootIdentityFence, rebootIdentityFencePath } from './recovery/reboot-identity-fence.js';
+import { getDataDirPath } from './config/instance.js';
+import { captureRebootBrokerBindings, type RebootFenceReceipt } from './recovery/reboot-launch-witness.js';
+import { CodexInputBroker, type BrokerPrivateEvidence } from './recovery/codex-input-broker.js';
+import { checkCodexIdentityWitnesses } from './recovery/codex-witness-check.js';
+import { join } from 'node:path';
+import { normalizedCodexHome } from './recovery/codex-home.js';
+import { isCodexRestoreConfig } from './recovery/reboot-state-binding.js';
+import { classifyCodexTail } from './recovery/codex-classifier.js';
+import type { CodexIdentityResult } from './recovery/codex-identity.js';
 import { isCleanPaneExit } from './pane-exit-sweep.js';
+import { probeRecoveryDirectory, type RecoveryDirectoryProbe } from './custom-model-recovery.js';
 
 /** Session statuses a reboot restore may rebuild. `stopped` is the kill marker. */
 const RESTORABLE_STATUSES: ReadonlySet<string> = new Set(['idle', 'busy', 'error']);
@@ -128,6 +140,9 @@ export interface RebootRestoreRejection {
     | 'respawn-blocked'
     | 'remote-or-docker'
     | 'unsupported-mode'
+    | 'identity-unverified'
+    | 'restore-cancelled'
+    | 'restore-uncertain'
     | 'no-working-dir'
     | 'workspace-missing'
     | 'workspace-forbidden'
@@ -147,7 +162,7 @@ export interface RebootRestoreEntry {
   resumeConversationId: string;
   /**
    * The persisted record, kept whole so the rebuild can replay what it held.
-   * Read at boot, before pruning deletes it, and held in memory until the click.
+   * Read at boot before pruning, retained in the private durable offer until the click.
    */
   state: SessionState;
 }
@@ -156,6 +171,8 @@ export interface RebootRestorePlan {
   restore: RebootRestoreEntry[];
   skipped: RebootRestoreRejection[];
 }
+
+export type RebootWorkspaceStatus = 'present' | 'absent' | 'unknown';
 
 /**
  * Split the sessions reconciliation just killed into the ones a reboot restore
@@ -172,7 +189,8 @@ export interface RebootRestorePlan {
 export function planRebootRestore(
   deadSessionIds: readonly string[],
   persisted: Readonly<Record<string, SessionState>>,
-  workspaceExists: (workingDir: string) => boolean
+  workspaceExists: (workingDir: string) => boolean | RebootWorkspaceStatus,
+  verifiedCodexConversationIds: ReadonlyMap<string, string> = new Map()
 ): RebootRestorePlan {
   const restore: RebootRestoreEntry[] = [];
   const skipped: RebootRestoreRejection[] = [];
@@ -224,11 +242,14 @@ export function planRebootRestore(
       skipped.push({ sessionId, reason: 'remote-or-docker' });
       continue;
     }
-    // Capability, not a CLI id: this pass resumes by handing the CLI a conversation
-    // id through the top-level `resumeSessionId`, which only a CLI whose history the
-    // claude-jsonl reader understands can consume that way. Others carry their thread
-    // id in their own `<Mode>Config`, which this pass does not thread through.
-    if (getCli(state.mode ?? 'claude')?.capabilities.transcript !== 'claude-jsonl') {
+    // Claude uses the top-level resume id; Codex requires a separately verified
+    // UUID and replays it through codexConfig, never through the Claude chain.
+    const usesCodexRecovery = getCli(state.mode ?? 'claude')?.capabilities.recovery === 'codex-rollout';
+    if (usesCodexRecovery && !verifiedCodexConversationIds.has(sessionId)) {
+      skipped.push({ sessionId, reason: 'identity-unverified' });
+      continue;
+    }
+    if (!usesCodexRecovery && getCli(state.mode ?? 'claude')?.capabilities.transcript !== 'claude-jsonl') {
       skipped.push({ sessionId, reason: 'unsupported-mode' });
       continue;
     }
@@ -236,8 +257,12 @@ export function planRebootRestore(
       skipped.push({ sessionId, reason: 'no-working-dir' });
       continue;
     }
-    if (!workspaceExists(state.workingDir)) {
-      skipped.push({ sessionId, reason: 'workspace-missing' });
+    const workspace = workspaceExists(state.workingDir);
+    if (workspace !== true && workspace !== 'present') {
+      skipped.push({
+        sessionId,
+        reason: workspace === false || workspace === 'absent' ? 'workspace-missing' : 'rebuild-failed',
+      });
       continue;
     }
     restore.push({
@@ -246,7 +271,9 @@ export function planRebootRestore(
       workingDir: state.workingDir,
       owner: state.owner,
       mode: state.mode ?? 'claude',
-      resumeConversationId: resolveResumeConversationId(state),
+      resumeConversationId: usesCodexRecovery
+        ? verifiedCodexConversationIds.get(sessionId)!
+        : resolveResumeConversationId(state),
       state,
     });
   }
@@ -288,4 +315,289 @@ export function newestPersistedActivity(persisted: Readonly<Record<string, Sessi
     if (stamp > newest) newest = stamp;
   }
   return newest;
+}
+
+interface CodexRebootIdentityCandidate {
+  request: CodexIdentityRequest;
+  expectedId?: string;
+  trackedSubmission: boolean;
+}
+
+/** Build only from an exact saved UUID or an exact durable ordinary-submission proof. */
+async function codexRebootIdentityCandidate(
+  state: SessionState,
+  fence?: RebootFenceReceipt,
+  deadline?: number
+): Promise<CodexRebootIdentityCandidate | undefined> {
+  if (getCli(state.mode ?? 'claude')?.capabilities.recovery !== 'codex-rollout' || state.remote || state.docker)
+    return undefined;
+  if (!isCodexRestoreConfig(state.codexConfig)) return undefined;
+  const durableProof = fence ? fence.value : await readRebootIdentityFence(state.id, deadline);
+  const proof =
+    durableProof ??
+    (
+      state as SessionState & {
+        __codexRebootIdentity?: {
+          switchPending?: boolean;
+          submission?: { at: number; hash: string };
+          resumeSessionId?: string;
+          untrackedInput?: boolean;
+        };
+      }
+    ).__codexRebootIdentity;
+  if (proof?.switchPending || proof?.untrackedInput) return undefined;
+  const home = normalizedCodexHome((state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome);
+  const explicitHome = (state as { __envOverrides?: Record<string, string> }).__envOverrides?.CODEX_HOME;
+  // An old record without actual launch provenance cannot establish its original ambient home.
+  // Launch treats the literal empty override as omission. Only the captured
+  // launch home supplies provenance in that case; current defaults never do.
+  if (!home || (explicitHome !== undefined && explicitHome !== '' && normalizedCodexHome(explicitHome) !== home))
+    return undefined;
+  // A completed reboot restore replaces the consumed submission with its exact
+  // launched UUID synchronously. It may be newer than the debounced state record.
+  const id = proof?.resumeSessionId ?? state.recovery?.conversationId ?? state.codexConfig?.resumeSessionId;
+  if (
+    !proof?.resumeSessionId &&
+    state.recovery?.conversationId &&
+    state.codexConfig?.resumeSessionId &&
+    state.recovery.conversationId !== state.codexConfig.resumeSessionId
+  )
+    return undefined;
+  if (!id && !proof?.submission) return undefined;
+  return {
+    expectedId: id,
+    trackedSubmission: !!(id && durableProof?.switchPending === false && durableProof.submission),
+    request: {
+      sessionId: state.id,
+      workingDir: state.workingDir,
+      codexHome: home,
+      resumeId: id,
+      submission: proof?.submission,
+      noDaemon: state.codexConfig?.noDaemon === true,
+    },
+  };
+}
+
+/** Explicit restore still retains child, owner-intent and permission vetoes from complete evidence. */
+function permitsCodexRebootRestore(identity: CodexIdentityResult): boolean {
+  if (
+    !identity.conversationId ||
+    identity.tail === undefined ||
+    identity.tailTruncated !== false ||
+    !identity.tail.endsWith('\n') ||
+    Buffer.byteLength(identity.tail, 'utf8') > 262_144
+  )
+    return false;
+  const classification = classifyCodexTail(identity.tail, {
+    conversationId: identity.conversationId,
+    now: Date.now(),
+    screen: '',
+    busy: false,
+    watching: false,
+    tailTruncated: false,
+  });
+  if (['watching', 'blocked', 'paused'].includes(classification.activity)) return false;
+  if (classification.activity !== 'unknown') return true;
+  // A newly-created exact conversation can legitimately have only metadata.
+  // That explicit owner restoration needs no failed-turn evidence, but malformed
+  // or uncertain lifecycle rows must not be mistaken for this empty history.
+  try {
+    const rows = identity.tail.split('\n').filter((row) => row.trim());
+    return rows.length === 1 && JSON.parse(rows[0])?.type === 'session_meta';
+  } catch {
+    return false;
+  }
+}
+
+export interface CodexRebootEvidence extends CodexIdentityResult {
+  historicalInput?: BrokerPrivateEvidence;
+}
+
+async function withHistoricalInput(
+  state: SessionState,
+  identity: CodexIdentityResult,
+  binding: string | null,
+  planning = false,
+  deadline = performance.now() + 2000
+): Promise<CodexRebootEvidence | undefined> {
+  // Legacy bindings require no remaining filesystem validation. Preserve an
+  // already completed identity even if a later home's scan used the budget.
+  if (binding === null) return identity;
+  if (performance.now() >= deadline) return undefined;
+  const home = normalizedCodexHome((state as SessionState & { __codexRecoveryHome?: string }).__codexRecoveryHome);
+  if (!home) return undefined;
+  const evidence = await CodexInputBroker.inspectHistoricalEvidence(
+    join(getDataDirPath(), 'codex-input-brokers', state.id, binding),
+    state.id,
+    binding,
+    home,
+    deadline
+  );
+  if (!evidence || !identity.witness) return undefined;
+  const stored = state as SessionState & {
+    __codexPriorInputBroker?: unknown;
+    __codexPriorInputEvidence?: BrokerPrivateEvidence;
+  };
+  if (!planning && Object.prototype.hasOwnProperty.call(stored, '__codexPriorInputBroker')) {
+    // A parked offer binds the actual old snapshot, not just a reusable UUID.
+    // Changed/replaced journals need a fresh offer; they cannot erase a veto.
+    if (JSON.stringify(stored.__codexPriorInputEvidence) !== JSON.stringify(evidence)) return undefined;
+  }
+  const combined = {
+    ...identity,
+    witness: { paths: [...identity.witness.paths, ...evidence.paths] },
+    historicalInput: evidence,
+  };
+  return (await checkCodexIdentityWitnesses([combined], evidence.files, deadline)) ? combined : undefined;
+}
+
+/** Revalidate saved exact evidence; cwd and timestamps alone never authorize a thread. */
+export async function verifyCodexRebootIdentity(
+  state: SessionState,
+  fence?: RebootFenceReceipt
+): Promise<string | undefined> {
+  return (await verifyCodexRebootEvidence(state, fence))?.conversationId;
+}
+
+/** Preserve the verified private inputs until the actual launch boundary. */
+export async function verifyCodexRebootEvidence(
+  state: SessionState,
+  fence?: RebootFenceReceipt
+): Promise<CodexRebootEvidence | undefined> {
+  if (
+    fence &&
+    (fence.sessionId !== state.id ||
+      fence.dataDir !== getDataDirPath() ||
+      fence.path !== rebootIdentityFencePath(state.id))
+  )
+    return undefined;
+  const bindings = await captureRebootBrokerBindings({ [state.id]: state });
+  if (!bindings?.has(state.id)) return undefined;
+  const candidate = await codexRebootIdentityCandidate(state, fence);
+  if (!candidate) return undefined;
+  // A shared home's later prompt is not this pane's thread switch. Opt in only
+  // for an actual durable clean submission and a known owned incarnation; the
+  // exact historical journal and all witnesses remain mandatory below.
+  if (candidate.trackedSubmission && typeof bindings.get(state.id) === 'string')
+    candidate.request.historyScope = 'tracked-reboot-session';
+  const identity = await resolveCodexIdentity(candidate.request);
+  if (identity.reason !== 'verified' || !permitsCodexRebootRestore(identity)) return undefined;
+  return candidate.expectedId === undefined || identity.conversationId === candidate.expectedId
+    ? withHistoricalInput(state, identity, bindings.get(state.id)!)
+    : undefined;
+}
+
+/** Disk verification is bounded and serial; the pure planner remains usable by callers/tests. */
+export async function planVerifiedRebootRestore(
+  deadSessionIds: readonly string[],
+  persisted: Readonly<Record<string, SessionState>>,
+  workspaceProbe: (
+    workingDir: string,
+    isCurrent: () => boolean,
+    deadline: number
+  ) => Promise<RecoveryDirectoryProbe> = (workingDir, isCurrent, deadline) =>
+    probeRecoveryDirectory(workingDir, isCurrent, true, deadline),
+  capturedBindings?: ReadonlyMap<string, string | null>,
+  isCurrent: () => boolean = () => true
+): Promise<RebootRestorePlan> {
+  const deadline = performance.now() + 2000;
+  const dataDir = getDataDirPath(),
+    snapshot = JSON.stringify(persisted);
+  const current = () => {
+    try {
+      const value: unknown = isCurrent();
+      if (value && typeof (value as { then?: unknown }).then === 'function')
+        void Promise.resolve(value).catch(() => {});
+      return value === true && getDataDirPath() === dataDir;
+    } catch {
+      return false;
+    }
+  };
+  const workspaces = new Map<string, RebootWorkspaceStatus>();
+  const bindings = capturedBindings ?? (await captureRebootBrokerBindings(persisted, deadline));
+  const boundPersisted = Object.fromEntries(
+    Object.entries(persisted).map(([id, state]) => [
+      id,
+      bindings?.has(id) ? { ...state, __codexPriorInputBroker: bindings.get(id) } : state,
+    ])
+  );
+  const verified = new Map<string, string>();
+  const candidates: Array<{ sessionId: string; identity: CodexRebootIdentityCandidate }> = [];
+  for (const sessionId of deadSessionIds) {
+    const state = boundPersisted[sessionId];
+    if (
+      !state ||
+      !RESTORABLE_STATUSES.has(state.status) ||
+      state.pid == null ||
+      isCleanPaneExit(state.paneExit) ||
+      state.respawnBlocked ||
+      state.remote ||
+      state.docker ||
+      !state.workingDir
+    )
+      continue;
+    const cli = getCli(state.mode ?? 'claude');
+    const codex = cli?.capabilities.recovery === 'codex-rollout';
+    if (!codex && cli?.capabilities.transcript !== 'claude-jsonl') continue;
+    if (!workspaces.has(state.workingDir)) {
+      let status: RebootWorkspaceStatus = 'unknown';
+      if (current() && performance.now() < deadline) {
+        try {
+          const evidence = await workspaceProbe(state.workingDir, current, deadline);
+          if (current() && performance.now() < deadline && ['present', 'absent', 'unknown'].includes(evidence.status))
+            status = evidence.status;
+        } catch {
+          /* Unknown IO cannot become verified absence. */
+        }
+      }
+      workspaces.set(state.workingDir, status);
+    }
+    if (!codex || !bindings?.has(sessionId) || workspaces.get(state.workingDir) !== 'present') continue;
+    if (!current() || performance.now() >= deadline) continue;
+    const identity = await codexRebootIdentityCandidate(state, undefined, deadline);
+    if (identity) {
+      if (identity.trackedSubmission && typeof bindings.get(sessionId) === 'string')
+        identity.request.historyScope = 'tracked-reboot-session';
+      candidates.push({ sessionId, identity });
+    }
+  }
+  const resolutions = await resolveCodexIdentities(
+    candidates.map((candidate) => candidate.identity.request),
+    deadline
+  );
+  for (const [index, resolution] of resolutions.entries()) {
+    if (!current()) break;
+    const candidate = candidates[index];
+    const id = resolution.conversationId;
+    if (
+      resolution.reason === 'verified' &&
+      permitsCodexRebootRestore(resolution) &&
+      id &&
+      (candidate.identity.expectedId === undefined || candidate.identity.expectedId === id)
+    ) {
+      const evidence = await withHistoricalInput(
+        boundPersisted[candidate.sessionId],
+        resolution,
+        bindings!.get(candidate.sessionId)!,
+        true,
+        deadline
+      );
+      if (evidence) {
+        if (evidence.historicalInput)
+          Object.assign(boundPersisted[candidate.sessionId], { __codexPriorInputEvidence: evidence.historicalInput });
+        verified.set(candidate.sessionId, id);
+      }
+    }
+  }
+  // This phase is pure: no callback can start another filesystem lookup after
+  // the shared scan budget. Completed evidence survives budget exhaustion, but
+  // a changed owner/state scope invalidates every earlier result.
+  const scopeValid = current() && JSON.stringify(persisted) === snapshot;
+  if (!scopeValid) verified.clear();
+  return planRebootRestore(
+    deadSessionIds,
+    boundPersisted,
+    (workingDir) => (scopeValid ? (workspaces.get(workingDir) ?? 'unknown') : 'unknown'),
+    verified
+  );
 }

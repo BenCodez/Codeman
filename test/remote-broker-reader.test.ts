@@ -1,0 +1,422 @@
+import { afterEach, expect, it } from 'vitest';
+import fs from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { remoteSourceIssuer } from './helpers/remote-source-issuer.js';
+import {
+  buildRemoteCodexInputCommand,
+  deliverRemoteCodexInput,
+  parseRemoteCodexInputResult,
+} from '../src/recovery/remote-codex.js';
+import type { BrokerReceipt } from '../src/recovery/codex-input-broker.js';
+import { remoteBrokerReaderFixture } from './mocks/remote-broker-reader-fixture.js';
+
+const fixtures: Awaited<ReturnType<typeof remoteBrokerReaderFixture>>[] = [];
+afterEach(async () => {
+  for (const f of fixtures.splice(0)) await f.close();
+});
+async function fixture() {
+  const f = await remoteBrokerReaderFixture();
+  fixtures.push(f);
+  return f;
+}
+
+/** Wait for actual fixture publication, without assuming a number of I/O turns. */
+async function waitFor(check: () => Promise<boolean>): Promise<void> {
+  const end = performance.now() + 3000;
+  while (!(await check())) {
+    if (performance.now() >= end) throw Error('Disposable broker did not publish the expected stage');
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+async function refusedEnter(f: Awaited<ReturnType<typeof fixture>>, prompt: string): Promise<void> {
+  await waitFor(() =>
+    fs.access(f.root + '/enter-expiry-forwarded').then(
+      () => true,
+      () => false
+    )
+  );
+  const records = (await fs.readFile(f.root + '/enter-expiry-forwarded', 'utf8')).trim().split('\n');
+  expect(records).toHaveLength(1);
+  const forwarded = JSON.parse(records[0]) as {
+    literal: BrokerReceipt;
+    counter: number;
+    nonce: string;
+    hash: string;
+    forwarded: number;
+    before: number;
+    expiry: number;
+    packetDeadline: number;
+  };
+  expect(forwarded.literal).toMatchObject({ channel: 'auto', counter: 1, status: 'sent' });
+  expect(forwarded.before).toBeLessThan(forwarded.expiry);
+  expect(forwarded.forwarded).toBeGreaterThanOrEqual(forwarded.expiry);
+  expect(forwarded.counter).toBe(2);
+  let receipt: BrokerReceipt | undefined;
+  await waitFor(async () => {
+    const state = await f.broker.readState();
+    receipt = state?.receipts.find((entry) => entry.nonce === forwarded.nonce);
+    return receipt !== undefined && receipt.status !== 'reserved';
+  });
+  // A missing deadline guard must fail with actual child CR, not a timing-only assertion.
+  if (receipt?.status === 'sent') await waitFor(async () => (await f.bytes()).equals(Buffer.from(prompt + '\r')));
+  expect((await f.bytes()).toString()).toBe(prompt);
+  expect(receipt).toMatchObject({ channel: 'auto', counter: 2, hash: forwarded.hash, status: 'not-sent' });
+  expect(receipt?.deliveredAt).toBeUndefined();
+  expect((await f.broker.readState())?.counters.auto).toBe(2);
+}
+
+it('probes the actual child and delivers literal text plus actual child Enter once', async () => {
+  const f = await fixture();
+  const result = await f.input('healthy 😀\nsecond line');
+  expect(result.result).toMatchObject({ status: 'sent' });
+  expect(result.failed).toBe(false);
+  expect((await f.bytes()).toString()).toBe('healthy 😀\nsecond line\r');
+  expect(result.result && 'submittedAt' in result.result ? result.result.submittedAt : 0).toBeGreaterThan(0);
+});
+
+it('retains the exact 64 KiB Unicode prompt and ordered broker phases', async () => {
+  const f = await fixture(),
+    prompt = '😀'.repeat(16384);
+  // Nine broker phases still prove exact bytes, ordering, and actual child
+  // Enter; only disposable per-query process overhead gets extra test time.
+  const result = await f.input(prompt, undefined, 5000);
+  expect(
+    result.result,
+    ('error' in result ? String(result.error).slice(-1500) : '') + ' bytes=' + (await f.bytes()).length
+  ).toMatchObject({ status: 'sent' });
+  expect(await f.bytes()).toEqual(Buffer.from(prompt + '\r'));
+  const state = await f.broker.readState();
+  const phases = state?.receipts.filter((receipt) => receipt.channel === 'auto');
+  expect(state?.counters.auto).toBe(9);
+  expect(phases?.map(({ counter, status, hash }) => ({ counter, status, hash }))).toEqual(
+    Array.from({ length: 9 }, (_, index) => ({
+      counter: index + 1,
+      status: 'sent',
+      hash: createHash('sha256')
+        .update(index < 8 ? '😀'.repeat(2048) : '\r')
+        .digest('hex'),
+    }))
+  );
+});
+
+it('waits for delayed healthy repaint without resending a literal phase', async () => {
+  const f = await fixture();
+  await f.marker('delay', '0.15');
+  const result = await f.input('slow paint');
+  expect(result.result).toMatchObject({ status: 'sent' });
+  expect((await f.bytes()).toString()).toBe('slow paint\r');
+});
+
+it.each(['draft', 'busy', 'approval'] as const)(
+  '%s before literal input refuses with zero child bytes',
+  async (veto) => {
+    const f = await fixture();
+    await f.marker(veto);
+    const result = await f.input('must not arrive');
+    expect(result.result).toEqual({ status: 'not-sent' });
+    expect(await f.bytes()).toEqual(Buffer.alloc(0));
+  }
+);
+
+it.each(['draft-after', 'no-repaint', 'tail-after'] as const)(
+  '%s after a literal phase seals partial delivery without Enter or replay',
+  async (veto) => {
+    const f = await fixture();
+    await f.marker(veto);
+    const result = await f.input('landed text');
+    expect(result.result?.status).not.toBe('sent');
+    expect((await f.bytes()).toString()).toBe('landed text');
+  }
+);
+
+it('unretained broker material cannot authorize the otherwise exact history and empty composer', async () => {
+  const f = await fixture();
+  const result = await f.input('must not arrive', (q) => {
+    delete q.inputBroker;
+  });
+  expect(result.result).toEqual({ status: 'not-sent' });
+  expect(await f.bytes()).toEqual(Buffer.alloc(0));
+});
+
+it('an intervening authenticated owner frame invalidates an earlier exact proof', async () => {
+  const f = await fixture();
+  const result = await f.input('must not arrive', (q) => {
+    q.expected.inputProof!.ownerCounters['owner-pty']++;
+  });
+  expect(result.result).toEqual({ status: 'not-sent' });
+  expect(await f.bytes()).toEqual(Buffer.alloc(0));
+});
+
+it.each(['restart', 'restore'] as const)('rotates a certified prior worker to a fresh broker on %s', async (kind) => {
+  const f = await fixture();
+  const result = await f.rotate(kind);
+  expect(result.result, JSON.stringify(result.wireCalls)).toBe('sent');
+  expect(result.pending).toBeDefined();
+  expect(result.promoted).toBe(result.pending);
+  expect(result.promoted).not.toBe(f.descriptor.incarnation);
+});
+
+it.each(['restart', 'restore'] as const)(
+  'keeps %s reserved after a lost final reply without replay or promotion',
+  async (kind) => {
+    const f = await fixture(),
+      run = f.options.transport.run;
+    f.options.transport.run = async (command, input) => {
+      await run(command, input);
+      return { stdout: '' };
+    };
+    const result = await f.rotate(kind);
+    expect(result.result).toBe('unknown');
+    expect(result.pending).toBeDefined();
+    expect(result.promoted).toBeUndefined();
+    expect(await f.bytes()).toEqual(Buffer.alloc(0));
+  }
+);
+
+it('issuer authority lost while the final remote clock is held vetoes the reserved restart', async () => {
+  const f = await fixture();
+  let current = true,
+    entered!: () => void,
+    release!: () => void;
+  const held = new Promise<void>((r) => {
+      release = r;
+    }),
+    reached = new Promise<void>((r) => {
+      entered = r;
+    });
+  const clock = f.options.transport.clock;
+  f.options.transport.clock = async () => {
+    entered();
+    await held;
+    return clock();
+  };
+  const work = f.rotate('restart', (authority) => {
+    authority.isCurrent = () => current;
+  });
+  await reached;
+  current = false;
+  release();
+  const result = await work;
+  expect(result.result).toBe('not-sent');
+  expect(result.pending).toBeDefined();
+  expect(result.promoted).toBeUndefined();
+  expect(await f.starts()).toBe(1);
+});
+
+it('old rollout progress during final clock preparation vetoes the new child', async () => {
+  const f = await fixture(),
+    clock = f.options.transport.clock;
+  f.options.transport.clock = async () => {
+    await fs.appendFile(f.rollout, ' ');
+    return clock();
+  };
+  const result = await f.rotate('restart');
+  expect(result.result).toBe('not-sent');
+  expect(result.promoted).toBeUndefined();
+  expect(await f.starts()).toBe(1);
+});
+
+it('a replacement at the atomic native restart predicate receives no new child', async () => {
+  const f = await fixture();
+  f.env.NATIVE_BEFORE_EFFECT = 'pid';
+  const result = await f.rotate('restart');
+  expect(result.result).toBe('not-sent');
+  expect(result.pending).toBeDefined();
+  expect(result.promoted).toBeUndefined();
+  expect(await f.starts()).toBe(1);
+});
+
+it('worker progress after native dispatch is rechecked by the new broker before any child fork', async () => {
+  const f = await fixture();
+  await f.marker('tail-before-child');
+  const result = await f.rotate('restart');
+  expect(result.result).toBe('unknown');
+  expect(result.pending).toBeDefined();
+  expect(result.promoted).toBeUndefined();
+  expect(await f.starts()).toBe(1);
+});
+
+it('pins the final private configuration before any child command executes', async () => {
+  const f = await fixture();
+  await f.marker('config-before-child');
+  const result = await f.rotate('restart');
+  expect(result.result).toBe('unknown');
+  let started = false;
+  const deadline = performance.now() + 500;
+  while (performance.now() < deadline) {
+    started = await fs.access(f.root + '/wrong-start').then(
+      () => true,
+      () => false
+    );
+    if (started) break;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  expect(started).toBe(false);
+  expect(result.promoted).toBeUndefined();
+});
+
+// The native command has accepted a signed frame, but Python has not consumed it.
+// Its fixed packet expiry must include the original action budget.
+it.each([
+  { label: 'within', sent: true },
+  { label: 'after', sent: false },
+])('queued Enter $label the action deadline preserves child-boundary authority', async ({ sent }) => {
+  const f = await fixture();
+  const q = await f.inputRequest('deadline text');
+  q.actionDeadline = Date.now() + 1500;
+  // Wait for this fixed ACTION boundary only after the literal sent receipt
+  // and actual child bytes. Deriving it from the packet could mask a missing clamp.
+  if (!sent) await f.marker('expire-enter', JSON.stringify({ prompt: q.prompt, actionDeadline: q.actionDeadline }));
+  const wire = await f.run(buildRemoteCodexInputCommand(f.remote, q));
+  const result = { ...wire, result: parseRemoteCodexInputResult(wire.stdout) };
+  if (sent) {
+    expect(result.result).toMatchObject({ status: 'sent' });
+    await waitFor(async () => (await f.bytes()).equals(Buffer.from('deadline text\r')));
+  } else {
+    expect(result.failed).toBe(true);
+    expect(result.result).toBeUndefined();
+    await refusedEnter(f, 'deadline text');
+  }
+  // Expiry can never turn the held control frame into an extra literal phase.
+  expect((await f.bytes()).toString()).toBe('deadline text' + (sent ? '\r' : ''));
+});
+
+it.each(['healthy', 'manager-journal', 'worker-progress', 'owner-input', 'native-replaced', 'expired-enter'] as const)(
+  'couples the real source-host issuer lease to generated child input: %s',
+  async (change) => {
+    const f = await fixture(),
+      manager = await remoteSourceIssuer(f.root);
+    try {
+      const prompt = 'leased worker input',
+        q = await f.inputRequest(prompt);
+      if (change === 'expired-enter') await f.marker('expire-enter', JSON.stringify({ prompt }));
+      if (change === 'manager-journal') await fs.appendFile(manager.broker.directory + '/state.json', ' ');
+      if (change === 'native-replaced') f.env.NATIVE_BEFORE_EFFECT = 'pid';
+      let wireCalls = 0;
+      const run = f.options.transport.run;
+      const options = {
+        ...f.options,
+        issuerLeaseTransport: manager.transport,
+        transport: {
+          ...f.options.transport,
+          run: async (command: string, input: string) => {
+            wireCalls++;
+            expect(command).not.toContain(manager.broker.directory);
+            if (change === 'worker-progress') await fs.appendFile(f.rollout, ' ');
+            if (change === 'owner-input') {
+              f.worker.stdin.write('owner raw draft');
+              await waitFor(async () => {
+                const state = await f.broker.readState();
+                return (
+                  state?.tainted === true &&
+                  state.rawGeneration > q.expected.inputProof!.rawGeneration &&
+                  (await f.bytes()).equals(Buffer.from('owner raw draft'))
+                );
+              });
+            }
+            return run(command, input);
+          },
+        },
+      };
+      const result = await deliverRemoteCodexInput(
+        f.remote,
+        q,
+        {
+          check: async () => true,
+          isCurrent: () => true,
+          getInputIssuer: () => manager.issuer,
+        },
+        options
+      );
+      if (change === 'healthy') {
+        await waitFor(async () => (await f.bytes()).equals(Buffer.from(prompt + '\r')));
+        expect(result).toMatchObject({ status: 'sent' });
+        expect((await f.bytes()).toString()).toBe(prompt + '\r');
+        expect(wireCalls).toBe(1);
+      } else if (change === 'expired-enter') {
+        expect(result).toEqual({ status: 'unknown' });
+        await refusedEnter(f, prompt);
+        expect(wireCalls).toBe(1);
+      } else {
+        expect(result.status).not.toBe('sent');
+        expect((await f.bytes()).toString()).toBe(change === 'owner-input' ? 'owner raw draft' : '');
+        expect(wireCalls).toBe(change === 'manager-journal' ? 0 : 1);
+      }
+    } finally {
+      await manager.close();
+    }
+  }
+);
+
+it.each(['restart', 'restore'] as const)(
+  'holds actual source-host authority through fresh remote %s startup',
+  async (kind) => {
+    const f = await fixture(),
+      manager = await remoteSourceIssuer(f.root);
+    try {
+      Object.assign(f.options, { issuerLeaseTransport: manager.transport });
+      const result = await f.rotate(kind, (authority) => {
+        Object.assign(authority, { getInputIssuer: () => manager.issuer });
+      });
+      expect(result.result, JSON.stringify(result.wireCalls)).toBe('sent');
+      expect(result.pending).toBeDefined();
+      expect(result.promoted).toBe(result.pending);
+      // The receipt attests the fork; wait read-only for the child fixture's
+      // first instruction before counting its launch under scheduler load.
+      const readyBy = performance.now() + 2000;
+      while ((await f.starts()) !== 2 && performance.now() < readyBy) await new Promise((r) => setTimeout(r, 5));
+      expect(await f.starts()).toBe(2);
+    } finally {
+      await manager.close();
+    }
+  }
+);
+
+it.each(['owner-pty', 'owner-key', 'owner-mux', 'auto', 'probe'] as const)(
+  'refuses a live journal missing the latest %s receipt before any input',
+  async (channel) => {
+    const f = await fixture(),
+      file = f.broker.directory + '/state.json';
+    const state = JSON.parse(await fs.readFile(file, 'utf8'));
+    state.counters[channel] = 1;
+    state.receipts = [];
+    await fs.writeFile(file, JSON.stringify(state));
+    const observed = await f.inspect();
+    expect(observed.evidence?.inputBroker).toBeUndefined();
+    expect(await f.bytes()).toEqual(Buffer.alloc(0));
+    expect(await f.starts()).toBe(1);
+  }
+);
+
+it.each(['owner-pty', 'owner-key', 'owner-mux', 'auto', 'probe'] as const)(
+  'refuses closed-worker rotation missing the latest %s receipt',
+  async (channel) => {
+    const f = await fixture();
+    await expect(
+      f.rotate('restart', undefined, (state) => {
+        state.counters[channel] = 1;
+        state.receipts = [];
+      })
+    ).rejects.toThrow('Missing broker evidence');
+    expect(await f.starts()).toBe(1);
+    expect(await f.bytes()).toEqual(Buffer.alloc(0));
+  }
+);
+
+it('accepts an exact closed journal whose older probe receipt was pruned by 128 later auto receipts', async () => {
+  const f = await fixture();
+  const result = await f.rotate('restart', undefined, (state) => {
+    state.counters.probe = 1;
+    state.counters.auto = 128;
+    state.receipts = Array.from({ length: 128 }, (_, i) => ({
+      channel: 'auto',
+      counter: i + 1,
+      nonce: randomUUID(),
+      conversationId: '11111111-2222-3333-4444-555555555555',
+      hash: createHash('sha256').update('prior input').digest('hex'),
+      status: 'sent',
+    }));
+  });
+  expect(result.result, JSON.stringify(result.wireCalls)).toBe('sent');
+  expect(await f.starts()).toBe(2);
+});

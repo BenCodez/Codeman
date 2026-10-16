@@ -33,8 +33,13 @@ export function createMockRouteContext(options?: {
   return {
     // -- SessionPort --
     sessions,
+    prepareRebootRestoreRecovery: vi.fn(async () => {}),
     addSession: vi.fn(async (s: MockSession) => {
       sessions.set(s.id, s);
+    }),
+    commitSessionRegistration: vi.fn(),
+    persistRebootRestoreDurably: vi.fn(async (_session: MockSession, current: () => boolean) => {
+      if (!current()) throw new Error('Reboot restoration cancelled');
     }),
     tabLayouts: {
       get: vi.fn(),
@@ -62,10 +67,14 @@ export function createMockRouteContext(options?: {
     persistSessionState: vi.fn(),
     persistSessionStateNow: vi.fn(),
     reapplyPersistedSessionState: vi.fn(async () => {}),
-    discardPartiallyBuiltSession: vi.fn(async (id: string) => {
-      sessions.delete(id);
-    }),
+    discardPartiallyBuiltSession: vi.fn(
+      async (id: string, expected?: MockSession, _options?: { preserveCustomModelConfigDir?: boolean }) => {
+        if (!expected || sessions.get(id) === expected) sessions.delete(id);
+      }
+    ),
     getSessionStateWithRespawn: vi.fn((s: MockSession) => s.toState()),
+    getTaskController: vi.fn(() => undefined),
+    getSupervisorController: vi.fn(() => undefined),
 
     // -- EventPort --
     broadcast: vi.fn(),
@@ -82,6 +91,9 @@ export function createMockRouteContext(options?: {
     setupTimedRespawn: vi.fn(),
     restoreRespawnController: vi.fn(),
     saveRespawnConfig: vi.fn(),
+
+    // -- RecoveryPort --
+    getRecoveryController: vi.fn(() => undefined),
 
     // -- ConfigPort --
     store: {

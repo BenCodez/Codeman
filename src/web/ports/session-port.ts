@@ -8,7 +8,13 @@ import type { SessionState } from '../../types.js';
 
 export interface SessionPort {
   readonly sessions: ReadonlyMap<string, Session>;
-  addSession(session: Session): Promise<void>;
+  /** Fence pre-reboot recovery evidence without resetting settings or retry budgets. */
+  prepareRebootRestoreRecovery?(sessionId: string): Promise<void>;
+  /** Tentative restores preserve the historical record through every state writer until committed. */
+  addSession(session: Session, options?: { tentative?: boolean }): Promise<void>;
+  commitSessionRegistration(session: Session): void;
+  /** Strict main-state and mux-metadata acknowledgement before a reboot offer is consumed. */
+  persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void>;
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
   persistSessionState(session: Session): void;
@@ -29,6 +35,8 @@ export interface SessionPort {
     saved: SessionState,
     phase: 'before-spawn' | 'after-spawn',
     options?: {
+      /** Reboot-only environment already rebuilt and bound to its final launch witness. */
+      rebootCustomModelEnv?: Record<string, string>;
       /**
        * Re-arm a PENDING auto-resume schedule from the record's `autoResumeAt`.
        * Default true, which is what a Codeman restart wants: the limit footer
@@ -47,6 +55,10 @@ export interface SessionPort {
    * Unlike {@link cleanupSession} it leaves the persisted record, the lifetime
    * token totals, the Ralph state and the workspace's own files untouched.
    */
-  discardPartiallyBuiltSession(sessionId: string): Promise<void>;
+  discardPartiallyBuiltSession(
+    sessionId: string,
+    expectedSession?: Session,
+    options?: { preserveCustomModelConfigDir?: boolean; preserveMuxPane?: boolean; retainForInspection?: boolean }
+  ): Promise<void>;
   getSessionStateWithRespawn(session: Session): unknown;
 }

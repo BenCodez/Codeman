@@ -105,6 +105,9 @@ const defaultResponder: Responder = (req, res) => {
   if (url.endsWith('/input')) {
     return sendJson(res, 200, { success: true, data: {} });
   }
+  if (url.endsWith('/direct-attach-fence')) {
+    return sendJson(res, 200, { success: true, data: {} });
+  }
   if (url.startsWith('/api/quick-start')) {
     return sendJson(res, 200, { success: true, data: { sessionId: 'new-1', casePath: '/cases/x', caseName: 'x' } });
   }
@@ -385,6 +388,13 @@ describe('TuiClient remaining API surface', () => {
     expect(recorded[0].url).toBe('/api/sessions/abc');
   });
 
+  it('commits the direct-attach fence through the authenticated API', async () => {
+    await client().fenceDirectAttach('abc/def');
+    expect(recorded[0].method).toBe('POST');
+    expect(recorded[0].url).toBe('/api/sessions/abc%2Fdef/direct-attach-fence');
+    expect(JSON.parse(recorded[0].body)).toEqual({});
+  });
+
   it('searches with an encoded query', async () => {
     await client().search('a b', 5);
     expect(recorded[0].url).toBe('/api/search?q=a+b&limit=5');
@@ -618,29 +628,14 @@ describe('attach window sizing', () => {
   });
 });
 
-describe('TuiClient.bindSwitchKey', () => {
-  it('escapes the command separator, or tmux runs the second command instead of binding it', () => {
-    // ⚠️ A bare `;` argument is a command separator to tmux's OWN parser: it
-    // ends the bind-key and executes what follows immediately. That bound only
-    // `switch-client` and ran `window-size latest` against every session at
-    // attach time, which is why sessions were left on `latest` after a detach —
-    // the sizing snapshot was taken from already-corrupted state. Verified
-    // against real tmux both ways before this test was written.
-    const calls: string[][] = [];
-    const exec: TuiExecFile = async (_file, args) => {
-      calls.push([...args]);
-      return { stdout: '', stderr: '' };
-    };
+describe('global attach switch controls', () => {
+  it('never creates, removes or sweeps another client’s root controls', async () => {
+    const exec = vi.fn<TuiExecFile>(async () => ({ stdout: '', stderr: '' }));
     const client = new TuiClient({ baseUrl, socket: 'codeman-beta', exec });
-    return client.bindSwitchKey('M-2', 'codeman-aaaa1111').then(() => {
-      const bind = calls.find((args) => args.includes('bind-key'));
-      expect(bind).toBeDefined();
-      expect(bind).toContain('\\;');
-      expect(bind).not.toContain(';');
-      // Both commands have to be in the ONE binding.
-      expect(bind?.join(' ')).toContain('switch-client -t codeman-aaaa1111');
-      expect(bind?.join(' ')).toContain('window-size latest');
-    });
+    expect(await client.bindSwitchKey('M-2', 'codeman-aaaa1111')).toBe(false);
+    await client.unbindSwitchKey('M-2');
+    await client.clearLeakedAttachSwitchKeys();
+    expect(exec).not.toHaveBeenCalled();
   });
 });
 

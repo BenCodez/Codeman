@@ -39,6 +39,7 @@ import { MAX_INPUT_LENGTH } from '../../config/terminal-limits.js';
 import { isAllowedRequestHost, isAllowedRequestOrigin, type HostPolicy } from '../network-auth-policy.js';
 import { WsConnectionRegistry } from '../ws-connection-registry.js';
 import { canAccessOwned, getAuthUser } from '../route-helpers.js';
+import { canQueueInputDispatch, queueInputDispatch } from '../input-dispatch-queue.js';
 
 /** Micro-batch interval for terminal output (ms). Short enough for low latency,
  *  long enough to group Ink's rapid cursor-up redraw sequences into single frames. */
@@ -169,18 +170,72 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
       const sizingToken = Symbol('ws-desktop-sizing');
       let holdsDesktopClaim = false;
 
-      // Attach message handler synchronously BEFORE any async work
-      // (@fastify/websocket requirement to avoid dropped messages).
-      socket.on('message', (raw) => {
+      // Legacy input has no delivery ACK or retry identity. Make rejection
+      // observable by closing its transport; never replay uncertain bytes.
+      const rejectLegacyInput = (msg: Record<string, unknown>) => {
+        if (
+          msg.t === 'i' &&
+          typeof msg.d === 'string' &&
+          !(typeof msg.cid === 'string' && msg.cid.length > 0 && Number.isSafeInteger(msg.seq)) &&
+          socket.readyState === 1
+        )
+          socket.close(4011, 'Input delivery not confirmed');
+      };
+
+      const notedOwnerIntent = new WeakSet<object>();
+      const noteLifecycleOwnerIntent = (msg: Record<string, unknown>) => {
+        if (typeof msg.cid === 'string' && Number.isSafeInteger(msg.seq) && session.paneExit) return;
+        if (
+          typeof msg.cid === 'string' &&
+          Number.isSafeInteger(msg.seq) &&
+          session.hasAppliedInputSeq(msg.cid, msg.seq as number)
+        )
+          return;
+        if (
+          !notedOwnerIntent.has(msg) &&
+          msg.t === 'i' &&
+          typeof msg.d === 'string' &&
+          Buffer.byteLength(msg.d, 'utf8') <= MAX_INPUT_LENGTH &&
+          socket.readyState === 1 &&
+          ctx.sessions.get(id) === session &&
+          canAccessOwned(getAuthUser(req), session.owner) &&
+          session.inputDispatchAllowed === false
+        ) {
+          notedOwnerIntent.add(msg);
+          session.noteRejectedOwnerInput?.(msg.d);
+        }
+      };
+
+      // EventEmitter does not await message listeners. Keep all sockets for this
+      // exact Session in arrival order through async admission. Resize/pong/close
+      // remain immediate; tagged identities enter the Session FIFO on arrival.
+      const handleMessage = async (msg: Record<string, unknown>) => {
         try {
-          const msg = JSON.parse(String(raw));
+          noteLifecycleOwnerIntent(msg);
+          if (
+            socket.readyState !== 1 ||
+            ctx.sessions.get(id) !== session ||
+            session.inputDispatchAllowed === false ||
+            !canAccessOwned(getAuthUser(req), session.owner)
+          ) {
+            rejectLegacyInput(msg);
+            return;
+          }
           if (msg.t === 'i' && typeof msg.d === 'string') {
-            if (msg.d.length > MAX_INPUT_LENGTH) {
+            // Reject supplied malformed delivery tags before retaining a FIFO identity
+            // or ACKing an oversized frame. Never reinterpret them as legacy raw input.
+            if (
+              (msg.cid !== undefined &&
+                (typeof msg.cid !== 'string' || msg.cid.length === 0 || msg.cid.length > 128)) ||
+              (msg.seq !== undefined && (typeof msg.seq !== 'number' || !Number.isSafeInteger(msg.seq) || msg.seq < 0))
+            )
+              return;
+            if (Buffer.byteLength(msg.d, 'utf8') > MAX_INPUT_LENGTH) {
               // Refused for good, so say so: a silent return left the frame
               // unACKed and the client redelivered it every few seconds forever
               // (issue #484). A client that predates `err` reads this as a plain
               // ACK and drops the frame, which is also the right outcome.
-              if (Number.isInteger(msg.seq) && socket.readyState === 1) {
+              if (Number.isSafeInteger(msg.seq) && socket.readyState === 1) {
                 socket.send(`{"t":"ia","seq":${msg.seq as number},"err":"too_large","max":${MAX_INPUT_LENGTH}}`);
               }
               return;
@@ -190,7 +245,14 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             // the client can drop it from its durable queue. Frames without seq
             // (legacy/other tools) are applied as-is — no behavior change.
             const cid = typeof msg.cid === 'string' ? msg.cid : null;
-            const seq = Number.isInteger(msg.seq) ? (msg.seq as number) : null;
+            const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
+            if (cid && seq !== null && session.paneExit) return;
+            // A rejected frame must not claim a delivery identity. Otherwise a
+            // burst during recovery can manufacture a watermark for lost bytes.
+            if (session.recoveryInputReserved) {
+              rejectLegacyInput(msg);
+              return;
+            }
             const apply = cid && seq !== null ? session.shouldApplyInput(cid, seq) : true;
             let delivered = true;
             if (apply) {
@@ -198,13 +260,42 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               // and re-asserts the desktop layout after a mobile override.
               if (holdsDesktopClaim) session.noteDesktopActivity();
               // Browser keystrokes are the user's own, so they may name the tab.
-              delivered = session.write(msg.d, { fromUser: true });
+              try {
+                const writeOptions = {
+                  fromUser: true,
+                  isCurrent: () =>
+                    socket.readyState === 1 &&
+                    ctx.sessions.get(id) === session &&
+                    !(cid && seq !== null && session.paneExit) &&
+                    canAccessOwned(getAuthUser(req), session.owner),
+                  ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
+                };
+                if (!session.writeAsync && session.requiresRemoteInputClock?.(msg.d, writeOptions)) {
+                  const admission = await session.prepareUserInputClock(msg.d, writeOptions);
+                  delivered =
+                    socket.readyState === 1 &&
+                    ctx.sessions.get(id) === session &&
+                    canAccessOwned(getAuthUser(req), session.owner) &&
+                    !!admission &&
+                    admission() === true &&
+                    session.write(msg.d, writeOptions);
+                } else
+                  delivered = await (session.writeAsync
+                    ? session.writeAsync(msg.d, writeOptions)
+                    : session.write(msg.d, writeOptions));
+              } catch (err) {
+                if (cid && seq !== null) session.forgetInputSeq(cid, seq);
+                throw err;
+              }
               // A session whose PTY is gone swallows the write. ACKing anyway told
               // the client to drop the frame from its durable queue and left the seq
               // burnt, so the retry that reliable delivery exists for was rejected as
               // a duplicate: the input was lost for good.
               if (!delivered && cid && seq !== null) session.forgetInputSeq(cid, seq);
+              if (delivered && cid && seq !== null && !session.paneExit) session.commitInputSeq(cid, seq);
+              if (!delivered) rejectLegacyInput(msg);
             }
+            if (cid && seq !== null && session.paneExit) return;
             if (seq !== null && socket.readyState === 1) {
               if (apply) {
                 if (delivered) socket.send(`{"t":"ia","seq":${seq}}`);
@@ -228,11 +319,16 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
                   typeof (session as { lastInputSeq?: (c: string) => number }).lastInputSeq === 'function'
                     ? (session as { lastInputSeq: (c: string) => number }).lastInputSeq(cid as string)
                     : seq;
+                // A matching request is still in flight (or admission is full),
+                // so neither a success nor duplicate ACK can certify delivery.
+                if (cid && !session.hasAppliedInputSeq(cid, seq)) return;
                 socket.send(`{"t":"ia","seq":${seq},"dup":true,"last":${watermark}}`);
               }
             }
           } else if (
             msg.t === 'z' &&
+            typeof msg.c === 'number' &&
+            typeof msg.r === 'number' &&
             Number.isInteger(msg.c) &&
             Number.isInteger(msg.r) &&
             msg.c >= 1 &&
@@ -267,7 +363,54 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             }
           }
         } catch {
+          rejectLegacyInput(msg);
           // Ignore malformed messages
+        }
+      };
+      // Attach synchronously before any asynchronous work (@fastify/websocket).
+      socket.on('message', (raw) => {
+        try {
+          const msg = JSON.parse(String(raw)) as Record<string, unknown>;
+          // Validate delivery tags before async admission, retention, or any ACK.
+          if (
+            msg.t === 'i' &&
+            typeof msg.d === 'string' &&
+            ((msg.cid !== undefined && (typeof msg.cid !== 'string' || msg.cid.length === 0 || msg.cid.length > 128)) ||
+              (msg.seq !== undefined && (typeof msg.seq !== 'number' || !Number.isSafeInteger(msg.seq) || msg.seq < 0)))
+          )
+            return;
+          if (msg.t !== 'i' || typeof msg.d !== 'string' || Buffer.byteLength(msg.d, 'utf8') > MAX_INPUT_LENGTH) {
+            void handleMessage(msg);
+            return;
+          }
+          const cid = typeof msg.cid === 'string' ? msg.cid : null;
+          const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
+          if (!canQueueInputDispatch(session, Buffer.byteLength(msg.d, 'utf8'))) {
+            // Capacity can recover. Leave reliable frames unacknowledged so
+            // reconnect/HTTP retry keeps their exact durable FIFO identities.
+            if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
+            return;
+          }
+          if (cid && seq !== null && !session.deferInputSeq(cid, seq)) {
+            // Capacity is temporary: an error ACK would permanently discard
+            // the browser's durable input. Reconnect retries the same identity.
+            if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
+            return;
+          }
+          // Retain reliable FIFO admission, but never queue or ACK a known
+          // exited local worker. Remote transport ambiguity stays unchanged.
+          if (cid && seq !== null && session.paneExit) return;
+          const paneStartedAt = session.paneStartedAt;
+          noteLifecycleOwnerIntent(msg);
+          void queueInputDispatch(session, Buffer.byteLength(msg.d, 'utf8'), async () => {
+            if (session.paneStartedAt !== paneStartedAt) {
+              rejectLegacyInput(msg);
+              return;
+            }
+            await handleMessage(msg);
+          }).catch(() => rejectLegacyInput(msg));
+        } catch {
+          // Ignore malformed messages without disturbing the input queue.
         }
       });
 

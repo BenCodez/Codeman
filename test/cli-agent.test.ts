@@ -19,6 +19,7 @@ import {
   agentRm,
   agentSend,
   agentSpawn,
+  agentSupervisor,
   agentWait,
   baseHeaders,
   sendPromptFromArgs,
@@ -373,6 +374,37 @@ describe('agent wait', () => {
     expect(waitExitCode({ ended: true, signal: null, timedOut: false })).toBe(EXIT.dead);
     expect(waitExitCode({ ended: true, matched: false, timedOut: false })).toBe(EXIT.dead);
     expect(waitExitCode(undefined)).toBe(EXIT.error);
+  });
+});
+
+describe('agent supervisor', () => {
+  it('uses the calling session as the scoped manager and carries a durable request id', async () => {
+    const deps = fakeDeps([ok({ phase: 'active' })], true);
+    expect(await agentSupervisor(deps, { action: 'assign', workerId: OTHER, requestId: 'request-1234' })).toBe(EXIT.ok);
+    expect(deps.calls).toHaveLength(1);
+    expect(deps.calls[0]).toMatchObject({
+      method: 'POST',
+      path: `/api/v1/sessions/${SELF}/supervisor/workers/${OTHER}/assign`,
+      headers: { 'X-Codeman-Supervisor-Session': SELF },
+      body: { requestId: 'request-1234' },
+    });
+  });
+
+  it.each([OTHER.slice(0, 8), 'invalid-worker-id', `${OTHER}-extra`])(
+    'refuses incomplete or malformed worker ids without inspecting unselected sessions (%s)',
+    async (workerId) => {
+      const deps = fakeDeps([]);
+      expect(await agentSupervisor(deps, { action: 'assign', workerId, requestId: 'request-1234' })).toBe(EXIT.refused);
+      expect(deps.calls).toEqual([]);
+    }
+  );
+
+  it('refuses self-management before calling the scoped endpoint', async () => {
+    const deps = fakeDeps([]);
+    expect(await agentSupervisor(deps, { action: 'retry', workerId: SELF, requestId: 'request-1234' })).toBe(
+      EXIT.refused
+    );
+    expect(deps.calls).toEqual([]);
   });
 });
 

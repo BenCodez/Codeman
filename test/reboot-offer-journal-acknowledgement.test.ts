@@ -1,0 +1,560 @@
+/** Real offer journals and faulted acknowledgements in CI's isolated temporary home. */
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import fs from 'node:fs';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { RebootRestoreRegistry } from '../src/web/reboot-restore-registry.js';
+import type { RebootRestoreEntry } from '../src/reboot-restore.js';
+import type { SessionState } from '../src/types.js';
+
+const faults = vi.hoisted(() => ({
+  target: '',
+  renamed: '',
+  armed: false,
+  rollback: false,
+  reads: false,
+  unreadableInode: undefined as number | undefined,
+  cleanup: false,
+  renames: 0,
+  unlinked: false,
+  cleanupSync: false,
+  cleanupRollback: false,
+  cleanupAcknowledgements: 0,
+  archiveSync: false,
+  archiveSwap: false,
+  checkSync: undefined as ((stat: fs.Stats) => void) | undefined,
+}));
+vi.mock('node:fs', async (original) => {
+  const native = await original<typeof import('node:fs')>();
+  const checkSync = (stat: fs.Stats) => {
+    if (faults.archiveSync && faults.renamed.startsWith(`${faults.target}.unacknowledged-`) && stat.isDirectory()) {
+      faults.archiveSync = false;
+      throw new Error('Fixture preserved primary directory acknowledgement failed');
+    }
+    if (faults.unlinked && stat.isDirectory()) {
+      faults.unlinked = false;
+      if (faults.cleanupSync) {
+        faults.cleanupSync = false;
+        throw new Error('Fixture shadow removal directory acknowledgement failed');
+      }
+      faults.cleanupAcknowledgements++;
+    }
+    if (faults.armed && faults.renamed === faults.target && stat.isDirectory()) {
+      faults.armed = false;
+      throw new Error('Fixture post-rename directory acknowledgement failed');
+    }
+    if (
+      stat.isFile() &&
+      ((faults.rollback && !faults.armed && faults.renamed === faults.target) ||
+        (faults.cleanupRollback && !faults.cleanupSync && faults.renamed === `${faults.target}.previous`))
+    ) {
+      throw new Error('Fixture rollback file acknowledgement failed');
+    }
+  };
+  faults.checkSync = checkSync;
+  const sync = (fd: number) => {
+    checkSync(native.fstatSync(fd));
+    return native.fsyncSync(fd);
+  };
+  const rename = (source: fs.PathLike, target: fs.PathLike) => {
+    if (faults.archiveSwap && String(target).startsWith(`${faults.target}.unacknowledged-`)) {
+      faults.archiveSwap = false;
+      native.renameSync(source, `${source}.fixture-original`);
+      native.writeFileSync(source, 'fixture replacement');
+    }
+    native.renameSync(source, target);
+    faults.renamed = String(target);
+    if (String(target) === `${faults.target}.previous`) faults.unlinked = false;
+    if (String(target) === faults.target) faults.renames++;
+  };
+  const unlink = (path: fs.PathLike) => {
+    if (faults.cleanup && String(path) === `${faults.target}.previous`)
+      throw new Error('Fixture shadow cleanup unavailable');
+    const result = native.unlinkSync(path);
+    if (String(path) === `${faults.target}.previous`) faults.unlinked = true;
+    return result;
+  };
+  const open = (...args: Parameters<typeof native.openSync>) => {
+    if (
+      faults.reads &&
+      String(args[0]) === faults.target &&
+      typeof args[1] === 'number' &&
+      fs.lstatSync(faults.target).ino === faults.unreadableInode
+    ) {
+      throw Object.assign(new Error('Fixture journal unreadable'), { code: 'EACCES' });
+    }
+    return native.openSync(...args);
+  };
+  return {
+    ...native,
+    default: { ...native, fsyncSync: sync, renameSync: rename, openSync: open, unlinkSync: unlink },
+    fsyncSync: sync,
+    renameSync: rename,
+    openSync: open,
+    unlinkSync: unlink,
+  };
+});
+
+// The production transaction is asynchronous; fault the same actual acknowledgement
+// stages through FileHandles while retaining the existing durable byte assertions.
+vi.mock('node:fs/promises', async (original) => {
+  const native = await original<typeof import('node:fs/promises')>();
+  return {
+    ...native,
+    open: async (...args: Parameters<typeof native.open>) => {
+      if (
+        faults.reads &&
+        String(args[0]) === faults.target &&
+        typeof args[1] === 'number' &&
+        fs.lstatSync(faults.target).ino === faults.unreadableInode
+      )
+        throw Object.assign(new Error('Fixture journal unreadable'), { code: 'EACCES' });
+      const file = await native.open(...args);
+      return new Proxy(file, {
+        get(target, key) {
+          if (key === 'sync')
+            return async () => {
+              faults.checkSync?.(await target.stat());
+              await target.sync();
+            };
+          const value = Reflect.get(target, key);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    },
+    rename: async (source: Parameters<typeof native.rename>[0], target: Parameters<typeof native.rename>[1]) => {
+      if (faults.archiveSwap && String(target).startsWith(`${faults.target}.unacknowledged-`)) {
+        faults.archiveSwap = false;
+        await native.rename(source, `${source}.fixture-original`);
+        await native.writeFile(source, 'fixture replacement');
+      }
+      await native.rename(source, target);
+      faults.renamed = String(target);
+      if (String(target) === `${faults.target}.previous`) faults.unlinked = false;
+      if (String(target) === faults.target) faults.renames++;
+    },
+    unlink: async (path: Parameters<typeof native.unlink>[0]) => {
+      if (faults.cleanup && String(path) === `${faults.target}.previous`)
+        throw new Error('Fixture shadow cleanup unavailable');
+      await native.unlink(path);
+      if (String(path) === `${faults.target}.previous`) faults.unlinked = true;
+    },
+  };
+});
+
+let path: string;
+let directory: string;
+function entry(id: string): RebootRestoreEntry {
+  const state = {
+    id,
+    owner: 'alice',
+    workingDir: directory,
+    mode: 'claude',
+    status: 'idle',
+    pid: 123,
+    createdAt: Date.now() - 1000,
+    claudeSessionId: '11111111-2222-3333-4444-555555555555',
+  } as SessionState;
+  return {
+    sessionId: id,
+    owner: state.owner,
+    workingDir: directory,
+    mode: 'claude',
+    state,
+    resumeConversationId: state.claudeSessionId!,
+  };
+}
+beforeEach(() => {
+  directory = fs.mkdtempSync(join(homedir(), 'offer-ack-'));
+  path = join(directory, 'offer.json');
+  Object.assign(faults, {
+    target: path,
+    renamed: '',
+    armed: false,
+    rollback: false,
+    reads: false,
+    cleanup: false,
+    renames: 0,
+    unlinked: false,
+    cleanupSync: false,
+    cleanupRollback: false,
+    cleanupAcknowledgements: 0,
+    archiveSync: false,
+    archiveSwap: false,
+  });
+});
+afterEach(() => {
+  Object.assign(faults, {
+    armed: false,
+    rollback: false,
+    reads: false,
+    cleanup: false,
+    cleanupSync: false,
+    cleanupRollback: false,
+    archiveSync: false,
+    archiveSwap: false,
+  });
+  vi.useRealTimers();
+  fs.rmSync(directory, { recursive: true, force: true });
+});
+async function fixture() {
+  const registry = new RebootRestoreRegistry();
+  await registry.configurePersistence(path);
+  const original = entry('original');
+  await registry.set([original]);
+  return { registry, original, bytes: fs.readFileSync(path, 'utf8') };
+}
+async function reload() {
+  const registry = new RebootRestoreRegistry();
+  await registry.configurePersistence(path);
+  return registry.list(() => true).map((offer) => offer.sessionId);
+}
+
+it.each(['malformed', 'oversized', 'unreadable', 'missing', 'valid'] as const)(
+  'loads the authoritative shadow before a %s primary and preserves its entry on retry',
+  async (kind) => {
+    const { original, bytes } = await fixture();
+    fs.writeFileSync(`${path}.previous`, bytes);
+    const primary =
+      kind === 'oversized'
+        ? 'x'.repeat(8 * 1024 * 1024 + 1)
+        : kind === 'valid'
+          ? JSON.stringify({ version: 1, builtAt: Date.now(), entries: [] })
+          : '{private malformed primary';
+    if (kind === 'missing') fs.unlinkSync(path);
+    else fs.writeFileSync(path, primary);
+    faults.reads = kind === 'unreadable';
+    faults.unreadableInode = faults.reads ? fs.lstatSync(path).ino : undefined;
+    const registry = new RebootRestoreRegistry();
+    await registry.configurePersistence(path);
+    expect(registry.list(() => true)).toEqual([original]);
+    expect(await registry.clear(() => true)).toBe(1);
+    faults.reads = false;
+    expect(await reload()).toEqual([]);
+    expect(fs.existsSync(`${path}.previous`)).toBe(false);
+    const preserved = fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'));
+    expect(preserved).toHaveLength(kind === 'missing' ? 0 : 1);
+    if (kind !== 'missing') {
+      expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe(primary);
+      expect(fs.statSync(join(directory, preserved[0])).mode & 0o777).toBe(0o700);
+      expect(fs.statSync(join(directory, preserved[0], 'primary')).mode & 0o777).toBe(0o600);
+    }
+  }
+);
+
+it('refuses a malformed shadow even when its primary is valid', async () => {
+  const { bytes } = await fixture();
+  fs.writeFileSync(`${path}.previous`, '{private malformed shadow');
+  const registry = new RebootRestoreRegistry();
+  await registry.configurePersistence(path);
+  expect(registry.list(() => true)).toEqual([]);
+  await expect(registry.set([entry('new')])).rejects.toThrow('refusing overwrite');
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe('{private malformed shadow');
+});
+
+it('retains shadow authority and old memory when preserving the primary cannot be acknowledged', async () => {
+  const { original, bytes } = await fixture();
+  fs.writeFileSync(`${path}.previous`, bytes);
+  const damaged = '{private damaged primary';
+  fs.writeFileSync(path, damaged);
+  const registry = new RebootRestoreRegistry();
+  await registry.configurePersistence(path);
+  const [held] = registry.take(() => true, undefined, 'alice');
+  expect(held).toEqual(original);
+  faults.archiveSync = true;
+  await expect(registry.releaseFlight('alice', [])).rejects.toThrow(
+    'preserved primary directory acknowledgement failed'
+  );
+  expect(registry.isHeld(held, 'alice')).toBe(false);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  expect(await reload()).toEqual(['original']);
+  const preserved = fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'));
+  expect(preserved).toHaveLength(1);
+  expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe(damaged);
+  await registry.releaseFlight('alice', []);
+  expect(await reload()).toEqual([]);
+  expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe(damaged);
+});
+
+it.each(['symlink', 'directory'] as const)('retains the shadow and refuses a nonregular primary: %s', async (kind) => {
+  const { original, bytes } = await fixture();
+  fs.writeFileSync(`${path}.previous`, bytes);
+  fs.unlinkSync(path);
+  if (kind === 'symlink') fs.symlinkSync(`${path}.previous`, path);
+  else fs.mkdirSync(path);
+  const registry = new RebootRestoreRegistry();
+  await registry.configurePersistence(path);
+  expect(registry.list(() => true)).toEqual([original]);
+  await expect(registry.clear(() => true)).rejects.toThrow('unreadable');
+  expect(registry.list(() => true)).toEqual([original]);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  expect(fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'))).toEqual([]);
+});
+
+it('retains shadow authority when the primary is replaced during preservation', async () => {
+  const { original, bytes } = await fixture();
+  fs.writeFileSync(`${path}.previous`, bytes);
+  const registry = new RebootRestoreRegistry();
+  await registry.configurePersistence(path);
+  faults.archiveSwap = true;
+  await expect(registry.clear(() => true)).rejects.toThrow('journal changed');
+  expect(registry.list(() => true)).toEqual([original]);
+  expect(await reload()).toEqual(['original']);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  expect(fs.readFileSync(`${path}.fixture-original`, 'utf8')).toBe(bytes);
+  const preserved = fs.readdirSync(directory).filter((name) => name.startsWith('offer.json.unacknowledged-'));
+  expect(preserved).toHaveLength(1);
+  expect(fs.readFileSync(join(directory, preserved[0], 'primary'), 'utf8')).toBe('fixture replacement');
+});
+
+it.each(['dismiss', 'replace', 'release', 'expire'] as const)(
+  'preserves memory and restart-readable old bytes after post-rename failure: %s',
+  async (action) => {
+    const { registry, original, bytes } = await fixture();
+    const parked = action === 'dismiss' || action === 'release';
+    if (parked) registry.take(() => true, undefined, 'alice');
+    if (action === 'expire') {
+      vi.useFakeTimers();
+      vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
+    }
+    faults.armed = true;
+    const execute = async () =>
+      action === 'dismiss'
+        ? await registry.clear(() => true)
+        : action === 'replace'
+          ? await registry.set([entry('new')])
+          : action === 'release'
+            ? await registry.releaseFlight('alice', [])
+            : registry.list(() => true);
+    if (action === 'expire') {
+      expect(await execute()).toEqual([]);
+      await registry.flush();
+    } else await expect(execute()).rejects.toThrow('post-rename directory acknowledgement failed');
+    expect(faults.renames).toBe(3); // Initial write, failed replacement, acknowledged old-byte rollback.
+    expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+    expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+    if (action === 'expire') vi.useRealTimers();
+    if (parked) expect(registry.isHeld(original, 'alice')).toBe(false);
+    else
+      expect(registry.list(() => true).map((offer) => offer.sessionId)).toEqual(
+        action === 'expire' ? [] : ['original']
+      );
+    expect(await reload()).toEqual(['original']);
+  }
+);
+
+it('retains the proven shadow when rollback acknowledgement fails too', async () => {
+  const { registry, original, bytes } = await fixture();
+  registry.take(() => true, undefined, 'alice');
+  faults.armed = true;
+  faults.rollback = true;
+  await expect(registry.clear(() => true)).rejects.toThrow('post-rename directory acknowledgement failed');
+  expect(registry.isHeld(original, 'alice')).toBe(false);
+  expect(JSON.parse(fs.readFileSync(path, 'utf8')).entries).toEqual([]); // Failed rollback did not pretend to commit.
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  faults.rollback = false;
+  expect(await reload()).toEqual(['original']);
+  expect(await registry.clear(() => true)).toBe(1); // A separately acknowledged retry may consume it.
+  expect(await reload()).toEqual([]);
+});
+
+it.each(['dismiss', 'replace', 'release'] as const)(
+  'publishes only an acknowledged healthy journal: %s',
+  async (action) => {
+    const { registry, original } = await fixture();
+    const acknowledgements = faults.cleanupAcknowledgements;
+    if (action !== 'replace') registry.take(() => true, undefined, 'alice');
+    if (action === 'dismiss') expect(await registry.clear(() => true)).toBe(1);
+    else if (action === 'replace') await registry.set([entry('new')]);
+    else await registry.releaseFlight('alice', []);
+    expect(registry.isHeld(original, 'alice')).toBe(false);
+    expect(await reload()).toEqual(action === 'replace' ? ['new'] : []);
+    expect(fs.existsSync(`${path}.previous`)).toBe(false);
+    expect(faults.cleanupAcknowledgements).toBe(acknowledgements + 1);
+  }
+);
+
+it('does not overwrite an unreadable old journal or alter its held offer', async () => {
+  const { registry, original, bytes } = await fixture();
+  registry.take(() => true, undefined, 'alice');
+  faults.reads = true;
+  faults.unreadableInode = fs.lstatSync(path).ino;
+  await expect(registry.clear(() => true)).rejects.toThrow('unreadable');
+  expect(registry.isHeld(original, 'alice')).toBe(false);
+  faults.reads = false;
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(faults.renames).toBe(1);
+});
+
+it.each(['malformed', 'oversized', 'unreadable'] as const)(
+  'preserves a failed configured original against later writes: %s',
+  async (kind) => {
+    const bytes = kind === 'oversized' ? 'x'.repeat(8 * 1024 * 1024 + 1) : '{private malformed journal';
+    fs.writeFileSync(path, bytes);
+    faults.reads = kind === 'unreadable';
+    faults.unreadableInode = faults.reads ? fs.lstatSync(path).ino : undefined;
+    const registry = new RebootRestoreRegistry();
+    await registry.configurePersistence(path);
+    expect(registry.list(() => true)).toEqual([]);
+    await expect(registry.set([entry('new')])).rejects.toThrow('refusing overwrite');
+    faults.reads = false;
+    expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+    expect(faults.renames).toBe(0);
+  }
+);
+
+it.each(['session-id', 'owner', 'state-id', 'workspace', 'mode', 'state-array'] as const)(
+  'preserves entry-level malformed originals on load and subsequent writes: %s',
+  async (kind) => {
+    const original = entry('original');
+    const value = JSON.parse(JSON.stringify(original));
+    if (kind === 'session-id') value.sessionId = 42;
+    else if (kind === 'owner') value.owner = 'different-owner';
+    else if (kind === 'state-id') value.state.id = 'other-id';
+    else if (kind === 'workspace') value.state.workingDir = '/different-workspace';
+    else if (kind === 'mode') value.mode = 42;
+    else value.state = [];
+    const bytes = JSON.stringify({ version: 1, builtAt: Date.now(), entries: [value] });
+    fs.writeFileSync(path, bytes);
+    const registry = new RebootRestoreRegistry();
+    await registry.configurePersistence(path);
+    expect(registry.list(() => true)).toEqual([]);
+    await expect(registry.set([entry('new')])).rejects.toThrow('refusing overwrite');
+    expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+    expect(faults.renames).toBe(0);
+  }
+);
+
+it('preserves an original that becomes malformed after it was loaded', async () => {
+  const { registry, original } = await fixture();
+  registry.take(() => true, undefined, 'alice');
+  const bad = { ...original, state: { ...original.state, owner: 'other-owner' } };
+  const bytes = JSON.stringify({ version: 1, builtAt: Date.now(), entries: [bad] });
+  fs.writeFileSync(path, bytes);
+  await expect(registry.clear(() => true)).rejects.toThrow('Invalid restore offer entries');
+  expect(registry.isHeld(original, 'alice')).toBe(false);
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(faults.renames).toBe(1);
+});
+
+it('re-offers retained parks after failed release ends, without consuming them on an empty subsequent flight', async () => {
+  const { registry, original, bytes } = await fixture();
+  expect(registry.beginSpending('alice')).toBe(true);
+  expect(registry.take(() => true, undefined, 'alice')).toEqual([original]);
+  faults.armed = true;
+  await expect(registry.releaseFlight('alice', [])).rejects.toThrow('post-rename');
+  expect(registry.isHeld(original, 'alice')).toBe(false);
+  registry.endSpending('alice');
+  expect(registry.list(() => true)).toEqual([original]);
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(await reload()).toEqual(['original']);
+  expect(registry.beginSpending('alice')).toBe(false);
+  expect(registry.take(() => true, ['not-offered'], 'alice')).toEqual([]);
+  await registry.releaseFlight('alice', []);
+  registry.endSpending('alice');
+  expect(registry.list(() => true)).toEqual([original]);
+  expect(await reload()).toEqual(['original']);
+});
+
+it('surfaces shadow cleanup failure and retains the old offer instead of acknowledging a changed restart view', async () => {
+  const { registry, original, bytes } = await fixture();
+  registry.take(() => true, undefined, 'alice');
+  faults.cleanup = true;
+  await expect(registry.clear(() => true)).rejects.toThrow('shadow cleanup unavailable');
+  expect(registry.isHeld(original, 'alice')).toBe(false);
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  expect(await reload()).toEqual(['original']);
+});
+
+it('acknowledges 1000 offers and refuses a 1001st before changing memory or journal bytes', async () => {
+  const { registry } = await fixture();
+  const supported = Array.from({ length: 1000 }, (_, index) => entry(`supported-${index}`));
+  await registry.set(supported);
+  expect(registry.list(() => true)).toEqual(supported);
+  expect(await reload()).toEqual(supported.map((offer) => offer.sessionId));
+  const bytes = fs.readFileSync(path, 'utf8');
+  const replacements = faults.renames;
+  await expect(registry.set([...supported, entry('one-too-many')])).rejects.toThrow('entry budget');
+  expect(registry.list(() => true)).toEqual(supported);
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+  expect(fs.existsSync(`${path}.previous`)).toBe(false);
+  expect(faults.renames).toBe(replacements);
+  expect(await reload()).toEqual(supported.map((offer) => offer.sessionId));
+});
+
+it.each(['dismiss', 'replace', 'release'] as const)(
+  'retains prior memory and reload view when shadow removal is not durably acknowledged: %s',
+  async (action) => {
+    const { registry, original, bytes } = await fixture();
+    if (action !== 'replace') registry.take(() => true, undefined, 'alice');
+    faults.cleanupSync = true;
+    const execute = async () =>
+      action === 'dismiss'
+        ? await registry.clear(() => true)
+        : action === 'replace'
+          ? await registry.set([entry('new')])
+          : await registry.releaseFlight('alice', []);
+    await expect(execute()).rejects.toThrow('shadow removal directory acknowledgement failed');
+    if (action !== 'replace') expect(registry.isHeld(original, 'alice')).toBe(false);
+    else expect(registry.list(() => true)).toEqual([original]);
+    expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+    expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+    expect(await reload()).toEqual(['original']);
+    await execute();
+    expect(registry.isHeld(original, 'alice')).toBe(false);
+    expect(await reload()).toEqual(action === 'replace' ? ['new'] : []);
+    expect(fs.existsSync(`${path}.previous`)).toBe(false);
+  }
+);
+
+it('retains the restored shadow when primary rollback acknowledgement also fails after unlink', async () => {
+  const { registry, original, bytes } = await fixture();
+  registry.take(() => true, undefined, 'alice');
+  faults.cleanupSync = true;
+  faults.cleanupRollback = true;
+  await expect(registry.releaseFlight('alice', [])).rejects.toThrow('shadow removal directory acknowledgement failed');
+  expect(registry.isHeld(original, 'alice')).toBe(false);
+  expect(fs.readFileSync(`${path}.previous`, 'utf8')).toBe(bytes);
+  faults.cleanupRollback = false;
+  expect(await reload()).toEqual(['original']);
+});
+
+it('captures active and parked private cleanup references without expiring or mutating offers', async () => {
+  const { registry, original, bytes } = await fixture();
+  const active = registry.getBrokerCleanupState()!;
+  expect(active.entries).toEqual([original]);
+  active.entries[0].state.workingDir = 'detached clone';
+  expect(registry.getBrokerCleanupState()!.entries[0].state.workingDir).toBe(directory);
+  expect(registry.take(() => true, undefined, 'alice')).toEqual([original]);
+  const parked = registry.getBrokerCleanupState()!;
+  expect(parked.entries).toEqual([]);
+  expect(parked.parked).toEqual([{ entry: original, spender: 'alice' }]);
+  vi.useFakeTimers();
+  vi.setSystemTime(Date.now() + 25 * 60 * 60 * 1000);
+  expect(registry.getBrokerCleanupState()).toEqual(parked);
+  expect(fs.readFileSync(path, 'utf8')).toBe(bytes);
+});
+
+it('withholds cleanup authority while restore spending or failed release ownership is unresolved', async () => {
+  const { registry, original } = await fixture();
+  expect(registry.beginSpending('alice')).toBe(true);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  registry.take(() => true, undefined, 'alice');
+  faults.cleanup = true;
+  await expect(registry.releaseFlight('alice', [])).rejects.toThrow();
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  faults.cleanup = false;
+  registry.endSpending('alice');
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+  await registry.releaseFlight('alice', []);
+  expect(registry.getBrokerCleanupState()).toEqual({ entries: [original], parked: [] });
+});
+
+it('withholds cleanup authority when an existing durable offer cannot be read', async () => {
+  fs.writeFileSync(path, '{');
+  const registry = new RebootRestoreRegistry();
+  await registry.configurePersistence(path);
+  expect(registry.getBrokerCleanupState()).toBeUndefined();
+});

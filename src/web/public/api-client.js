@@ -17,14 +17,15 @@ Object.assign(CodemanApp.prototype, {
   /**
    * Send a JSON API request. Handles Content-Type, JSON serialization, and error swallowing.
    * @param {string} path - API path (e.g., '/api/sessions/123/input')
-   * @param {object} [opts] - { method, body, signal }
+   * @param {object} [opts] - { method, body, signal, headers }
    * @returns {Promise<Response|null>} Response or null on error
    */
   async _api(path, opts = {}) {
-    const { method = 'GET', body, signal } = opts;
-    const fetchOpts = { method, signal };
+    const { method = 'GET', body, signal, headers = {} } = opts;
+    const fetchOpts = { method, signal, headers: { ...headers } };
     if (body !== undefined) {
-      fetchOpts.headers = { 'Content-Type': 'application/json' };
+      if (!Object.keys(fetchOpts.headers).some((key) => key.toLowerCase() === 'content-type'))
+        fetchOpts.headers['Content-Type'] = 'application/json';
       fetchOpts.body = JSON.stringify(body);
     }
     try {
@@ -38,7 +39,7 @@ Object.assign(CodemanApp.prototype, {
   /**
    * Send a JSON API request and parse the response as JSON.
    * @param {string} path - API path
-   * @param {object} [opts] - { method, body, signal }
+   * @param {object} [opts] - { method, body, signal, headers }
    * @returns {Promise<any|null>} Parsed JSON or null on error
    */
   async _apiJson(path, opts = {}) {

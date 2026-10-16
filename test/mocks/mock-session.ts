@@ -4,7 +4,14 @@
  */
 import { EventEmitter } from 'node:events';
 import { vi } from 'vitest';
-import type { SessionAttachmentHistoryItem, SessionStatus, SessionRemote } from '../../src/types.js';
+import type { CodexRestoreLaunchGuard } from '../../src/mux-interface.js';
+import type {
+  CodexConfig,
+  SessionAttachmentHistoryItem,
+  SessionStatus,
+  SessionRemote,
+  SessionWriteOptions,
+} from '../../src/types.js';
 
 /**
  * Enhanced mock session for testing RespawnController.
@@ -77,6 +84,19 @@ export class MockSession extends EventEmitter {
   /** Mirrors Session.trackUserInput (the send-key route feeds it around the write path). */
   trackUserInput(_data: string): void {}
 
+  /** Mirrors the owned Session named-key boundary, without executing a child. */
+  async sendNamedKey(data: string, dispatch: (signal: AbortSignal) => Promise<void>): Promise<boolean> {
+    if (this.recoveryInputReserved) return false;
+    this.recoveryInputReserved = true;
+    try {
+      this.trackUserInput(data);
+      await dispatch(new AbortController().signal);
+      return true;
+    } finally {
+      this.recoveryInputReserved = false;
+    }
+  }
+
   private _muxName: string | null = null;
 
   constructor(id: string = 'mock-session-id') {
@@ -90,18 +110,21 @@ export class MockSession extends EventEmitter {
    * which is the state in which input used to disappear silently.
    */
   failWrites = false;
+  recoveryInputReserved = false;
 
   /** Direct PTY write (used by session.write()). Mirrors the real boolean return. */
-  write(data: string): boolean {
-    if (this.failWrites) return false;
+  write(data: string, options: SessionWriteOptions = {}): boolean {
+    if (this.failWrites || this.recoveryInputReserved) return false;
     this.writeBuffer.push(data);
+    if (options.inputSeq) this.commitInputSeq(options.inputSeq.clientId, options.inputSeq.seq);
     return true;
   }
 
   /** Write via mux (used by respawn controller) */
-  async writeViaMux(data: string): Promise<boolean> {
-    if (this.failWrites) return false;
+  async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
+    if (this.failWrites || this.recoveryInputReserved) return false;
     this.writeBuffer.push(data);
+    if (options.inputSeq) this.commitInputSeq(options.inputSeq.clientId, options.inputSeq.seq);
     return true;
   }
 
@@ -115,15 +138,44 @@ export class MockSession extends EventEmitter {
 
   /** Exactly-once input dedup — mirrors Session.shouldApplyInput so route tests
    *  exercising the reliable-delivery path behave like production. */
-  private _appliedInputSeq = new Map<string, number>();
-  forgetInputSeq(clientId: string, seq: number): void {
-    if (this._appliedInputSeq.get(clientId) === seq) this._appliedInputSeq.set(clientId, seq - 1);
+  private _appliedInputSeq = new Map<string, { last?: number; pending: Set<number>; waiting: Set<number> }>();
+  lastInputSeq(clientId: string): number {
+    return this._appliedInputSeq.get(clientId)?.last ?? 0;
+  }
+  /** Distinguish the valid zero sequence from a client with no delivery. */
+  hasAppliedInputSeq(clientId: string, seq: number): boolean {
+    const state = this._appliedInputSeq.get(clientId);
+    return state?.last !== undefined && seq <= state.last && !state.waiting.has(seq);
   }
 
+  forgetInputSeq(clientId: string, seq: number): void {
+    this._appliedInputSeq.get(clientId)?.pending.delete(seq);
+  }
+  commitInputSeq(clientId: string, seq: number): void {
+    const state = this._appliedInputSeq.get(clientId);
+    if (state?.pending.delete(seq)) {
+      state.last = Math.max(state.last ?? seq, seq);
+      state.waiting.delete(seq);
+    }
+  }
+  deferInputSeq(clientId: string, seq: number): boolean {
+    const state = this._appliedInputSeq.get(clientId) ?? {
+      last: undefined,
+      pending: new Set<number>(),
+      waiting: new Set<number>(),
+    };
+    if (this.hasAppliedInputSeq(clientId, seq) || state.waiting.has(seq)) return true;
+    if (state.waiting.size >= 4096) return false;
+    state.waiting.add(seq);
+    this._appliedInputSeq.set(clientId, state);
+    return true;
+  }
   shouldApplyInput(clientId: string, seq: number): boolean {
-    const last = this._appliedInputSeq.get(clientId);
-    if (last !== undefined && seq <= last) return false;
-    this._appliedInputSeq.set(clientId, seq);
+    if (!this.deferInputSeq(clientId, seq)) return false;
+    const state = this._appliedInputSeq.get(clientId)!;
+    if (this.hasAppliedInputSeq(clientId, seq) || state.pending.size || seq !== Math.min(...state.waiting))
+      return false;
+    state.pending.add(seq);
     return true;
   }
 
@@ -275,6 +327,7 @@ export class MockSession extends EventEmitter {
 
   /** CLI mode */
   mode: string = 'claude';
+  codexConfig: CodexConfig | undefined;
 
   /** Text output buffer (stripped of ANSI) */
   textOutput: string = '';
@@ -316,6 +369,7 @@ export class MockSession extends EventEmitter {
       name: this.name,
       color: this.color,
       mode: this.mode,
+      codexConfig: this.codexConfig,
       muxName: this._muxName,
       pinned: this.pinned || undefined,
       pinnedAt: this.pinned ? (this.pinnedAt ?? undefined) : undefined,
@@ -406,8 +460,23 @@ export class MockSession extends EventEmitter {
   /** Stub for runPrompt */
   runPrompt = vi.fn(async () => {});
 
-  /** Stub for startInteractive */
-  startInteractive = vi.fn(async () => {});
+  private codexRestoreGuard?: CodexRestoreLaunchGuard;
+  codexRestoreWorkerMayExist = false;
+  commitCodexRestoreLaunch = vi.fn(() => {
+    this.codexRestoreWorkerMayExist = false;
+  });
+  setCodexRestoreLaunchGuard = vi.fn((guard: CodexRestoreLaunchGuard | undefined) => {
+    this.codexRestoreGuard = guard;
+  });
+  /** Fake launch effect retains the production reboot authority gate. */
+  startInteractive = vi.fn(async () => {
+    if (this.codexRestoreGuard) {
+      await this.codexRestoreGuard.prepare();
+      if (this.codexRestoreGuard.confirm() !== true) throw new Error('Reboot restoration authority changed');
+      this.codexRestoreWorkerMayExist = true;
+      this.codexRestoreGuard.noteDispatch?.();
+    }
+  });
 
   /** Stub for resetRespawnBreaker (COD-118) */
   resetRespawnBreaker = vi.fn();

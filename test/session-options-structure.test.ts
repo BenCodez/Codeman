@@ -34,7 +34,7 @@ function methodBody(signature: string): string {
   return sessionUi.slice(start, sessionUi.indexOf('\n  },', start));
 }
 
-const TABS = ['respawn', 'context', 'ralph', 'summary'];
+const TABS = ['respawn', 'context', 'recovery', 'task', 'supervisor', 'ralph', 'summary'];
 
 describe('Session Options modal structure', () => {
   it('keeps every element openSessionOptions and switchOptionsTab touch by id', () => {
@@ -81,6 +81,9 @@ describe('Session Options modal structure', () => {
       expect(entry, `${tab} rail entry`).toContain('data-claude-only');
     }
     expect(modal.match(/<button[^>]*data-tab="context"[^>]*>/)?.[0]).not.toContain('data-claude-only');
+    const recovery = modal.match(/<button[^>]*data-tab="recovery"[^>]*>/)?.[0] ?? '';
+    expect(recovery).not.toContain('data-claude-only');
+    expect(recovery).toContain('display: none;');
   });
 
   it('uses the shared settings surface rather than the modal-tab chrome', () => {

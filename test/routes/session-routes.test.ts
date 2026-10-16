@@ -26,6 +26,7 @@ import { createMockRouteContext, type MockRouteContext } from '../mocks/index.js
 import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { ApiErrorCode, httpStatusForErrorCode } from '../../src/types.js';
 import { Session } from '../../src/session.js';
+import type { MuxSession, TerminalMultiplexer } from '../../src/mux-interface.js';
 
 // Mock execFile so the send-key route's `tmux` invocation is observable (not run for real).
 const { execFile } = vi.hoisted(() => ({ execFile: vi.fn() }));
@@ -141,9 +142,196 @@ describe('session-routes', () => {
     await harness.app.close();
   });
 
+  it.each(['clients', 'tail'] as const)(
+    'keeps HTTP fallback retryable when the actual %s sequence backlog is full',
+    async (capacity) => {
+      const session = new Session({ id: 'test-session-1', workingDir: '/tmp', mode: 'claude' });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written } });
+      (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      let now = 0;
+      const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+      const clientId = 'fallback-client';
+      const seq = capacity === 'clients' ? 17 : 4098;
+      if (capacity === 'clients') {
+        for (let index = 0; index < 256; index++) expect(session.shouldApplyInput(`pending-${index}`, 1)).toBe(true);
+      } else {
+        expect(session.shouldApplyInput(clientId, 1)).toBe(true);
+        session.commitInputSeq(clientId, 1);
+        for (let pending = 2; pending <= 4097; pending++) expect(session.deferInputSeq(clientId, pending)).toBe(true);
+      }
+      const payload = { input: 'retained HTTP paste', clientId, seq, useMux: false };
+      const post = () => harness.app.inject({ method: 'POST', url: `/api/sessions/${session.id}/input`, payload });
+      try {
+        const refused = await post();
+        expect(refused.statusCode).toBe(429);
+        expect(refused.json()).toMatchObject({
+          success: false,
+          errorCode: 'OPERATION_FAILED',
+          retryable: true,
+          notSent: true,
+        });
+        expect(refused.headers['x-codeman-input-ack']).toBeUndefined();
+        expect(written).not.toHaveBeenCalled();
+        expect(session.hasAppliedInputSeq(clientId, seq)).toBe(false);
+        if (capacity === 'clients') session.commitInputSeq('pending-0', 1);
+        else now = 60_000;
+        const delivered = await post();
+        expect(delivered.statusCode).toBe(200);
+        expect(written).toHaveBeenCalledExactlyOnceWith(payload.input);
+        const duplicate = await post();
+        expect(duplicate.statusCode).toBe(200);
+        expect(JSON.parse(String(duplicate.headers['x-codeman-input-ack']))).toEqual({ seq, dup: true, last: seq });
+        expect(written).toHaveBeenCalledTimes(1);
+      } finally {
+        clock.mockRestore();
+        await session.stop(false);
+      }
+    }
+  );
+
   // ========== POST /api/sessions/:id/send-key ==========
 
   describe('POST /api/sessions/:id/send-key', () => {
+    it('reserves the actual Session before a held child callback, excluding concurrent key/input/recovery', async () => {
+      const thread = '11111111-2222-3333-4444-555555555555';
+      const mux = {
+        isAvailable: () => true,
+        inspectPaneForRecovery: vi.fn(async () => ({ dead: false, screen: '›\n  example-model high · /tmp\n' })),
+        sendInput: vi.fn(async () => true),
+      };
+      const session = new Session({
+        id: 'test-session-1',
+        workingDir: '/tmp',
+        mode: 'codex',
+        useMux: true,
+        mux: mux as unknown as TerminalMultiplexer,
+        muxSession: {
+          muxName: 'codeman-test-key',
+          recoveryIsolated: true,
+          recoveryCodexHome: '/fixture/codex-home',
+        } as MuxSession,
+        codexConfig: { noDaemon: true, resumeSessionId: thread },
+      });
+      const written = vi.fn();
+      Object.assign(session, { ptyProcess: { write: written, kill: vi.fn() } });
+      expect(await session.ensureRecoveryIdentityFence()).toBe(true);
+      (harness.ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      let queuedInput: Promise<{ statusCode: number }> | undefined;
+      let complete: (err: Error | null) => void = () => {};
+      execFile.mockReset();
+      execFile.mockImplementation((_bin: string, _argv: string[], _opts: unknown, cb: typeof complete) => {
+        complete = cb;
+      });
+      const sending = harness.app
+        .inject({
+          method: 'POST',
+          url: `/api/sessions/${session.id}/send-key`,
+          payload: { key: 'S-Enter' },
+        })
+        .then((response) => response);
+      try {
+        await vi.waitFor(() => expect(execFile).toHaveBeenCalledTimes(1));
+        expect(session.recoveryInputReserved).toBe(true);
+        expect(session.paneLifecycleInFlight).toBe(true);
+        expect(session.getRecoveryContext().generation).toBe(2);
+        expect(
+          await session.deliverRecovery(
+            { action: 'continue', key: 'fixture', conversationId: thread, startedAt: Date.now() },
+            2
+          )
+        ).toBe('not-sent');
+        expect(mux.sendInput).not.toHaveBeenCalled();
+        const blockedKey = await harness.app.inject({
+          method: 'POST',
+          url: `/api/sessions/${session.id}/send-key`,
+          payload: { key: 'C-Enter' },
+        });
+        expect(blockedKey.statusCode).toBe(422);
+        expect(blockedKey.json()).toMatchObject({ retryable: true, notSent: true });
+        expect(await session.writeAsync('refused concurrent owner input', { fromUser: true })).toBe(false);
+        const admitted = vi.spyOn(session, 'deferInputSeq');
+        let inputCompleted = false;
+        queuedInput = harness.app
+          .inject({
+            method: 'POST',
+            url: `/api/sessions/${session.id}/input`,
+            payload: { input: 'later', useMux: false, clientId: 'fixture', seq: 1 },
+          })
+          .then((response) => {
+            inputCompleted = true;
+            return response;
+          });
+        await vi.waitFor(() => expect(admitted).toHaveBeenCalledWith('fixture', 1));
+        expect(inputCompleted).toBe(false);
+        expect(session.hasAppliedInputSeq('fixture', 1)).toBe(false);
+        expect(written).not.toHaveBeenCalled();
+        expect(session.getRecoveryContext().generation).toBe(2);
+        expect(execFile).toHaveBeenCalledTimes(1);
+        complete(null);
+        expect((await sending).statusCode).toBe(200);
+        expect((await queuedInput).statusCode).toBe(200);
+        expect(written).toHaveBeenCalledExactlyOnceWith('later');
+        expect(session.hasAppliedInputSeq('fixture', 1)).toBe(true);
+        expect(session.recoveryInputReserved).toBe(false);
+        expect(session.paneLifecycleInFlight).toBe(false);
+        // One preparation + one tracking step for each of the key and queued frame.
+        expect(session.getRecoveryContext().generation).toBe(4);
+      } finally {
+        complete(null);
+        await sending;
+        await queuedInput;
+        await session.stop(false);
+      }
+    });
+
+    it('certifies recovery-reserved keys as not sent, then sends the exact chord once after recovery', async () => {
+      execFile.mockReset();
+      execFile.mockImplementation((_bin: string, _argv: string[], _opts: unknown, cb: (e: Error | null) => void) =>
+        cb(null)
+      );
+      const session = harness.ctx._session;
+      session.recoveryInputReserved = true;
+      const blocked = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/send-key',
+        payload: { key: 'S-Enter' },
+      });
+      expect(blocked.statusCode).toBe(422);
+      expect(blocked.json()).toMatchObject({
+        success: false,
+        errorCode: 'OPERATION_FAILED',
+        retryable: true,
+        notSent: true,
+      });
+      expect(execFile).not.toHaveBeenCalled();
+
+      session.recoveryInputReserved = false;
+      const retried = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/send-key',
+        payload: { key: 'S-Enter' },
+      });
+      expect(retried.statusCode).toBe(200);
+      expect(execFile).toHaveBeenCalledTimes(1);
+      expect(execFile.mock.calls[0][1].slice(-1)).toEqual(['0a']);
+    });
+
+    it('does not label an uncertain tmux failure as safe to retry', async () => {
+      execFile.mockReset();
+      execFile.mockImplementation((_bin: string, _argv: string[], _opts: unknown, cb: (e: Error | null) => void) =>
+        cb(new Error('tmux timeout'))
+      );
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/sessions/test-session-1/send-key',
+        payload: { key: 'C-Enter' },
+      });
+      expect(res.statusCode).toBe(500);
+      expect(res.json()).not.toHaveProperty('retryable');
+      expect(res.json()).not.toHaveProperty('notSent');
+    });
+
     it('routes tmux send-keys through the dedicated Codeman socket (-L)', async () => {
       // Regression guard: bare `tmux` would hit the user's default server and never
       // find a session that lives only on the Codeman socket (#80 regression class).
@@ -516,7 +704,7 @@ describe('session-routes', () => {
     });
 
     it('removes a persisted-only session (not live) via the state store, without touching cleanupSession', async () => {
-      vi.mocked(harness.ctx.store.getSession).mockReturnValueOnce({
+      vi.mocked(harness.ctx.store.getSession).mockReturnValue({
         id: 'ghost-session',
         owner: undefined,
       } as never);
@@ -2185,7 +2373,7 @@ describe('session-routes', () => {
           {
             id: 'gpu-box',
             label: 'GPU Box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             commands: { codex: 'exec codx personal' },
           },
@@ -2207,7 +2395,7 @@ describe('session-routes', () => {
           workingDir: '/home/ubuntu/work',
           remote: expect.objectContaining({
             hostId: 'gpu-box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             remotePath: '/home/ubuntu/work',
             commands: { codex: 'exec codx personal' },
@@ -2225,7 +2413,7 @@ describe('session-routes', () => {
           {
             id: 'gpu-box',
             label: 'GPU Box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             commands: { codex: 'exec codx personal' },
           },
@@ -2247,7 +2435,7 @@ describe('session-routes', () => {
           workingDir: '/home/ubuntu/work',
           remote: expect.objectContaining({
             hostId: 'gpu-box',
-            host: '10.0.0.42',
+            host: '192.0.2.42',
             username: 'ubuntu',
             remotePath: '/home/ubuntu/work',
           }),
@@ -2258,7 +2446,7 @@ describe('session-routes', () => {
     });
 
     it('rejects a remote quick-start that carries envOverrides (inert over ssh)', async () => {
-      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu' }];
       remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
 
       const res = await harness.app.inject({
@@ -2271,12 +2459,103 @@ describe('session-routes', () => {
       expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: ApiErrorCode.INVALID_INPUT });
     });
 
+    it('preserves exact owned remote Codex config and an absolute CODEX_HOME', async () => {
+      const startInteractive = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
+      try {
+        remoteStore.hosts = [
+          {
+            id: 'gpu-box',
+            label: 'GPU Box',
+            host: '192.0.2.42',
+            username: 'ubuntu',
+            port: 2222,
+            identityFile: '/keys/gpu',
+            jumpHost: 'bastion.example',
+            extraSshOptions: ['ConnectTimeout=4'],
+          },
+        ];
+        remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+        const codexConfig = {
+          model: 'gpt-6.1-codex',
+          reasoningEffort: 'high',
+          noDaemon: true,
+          noAltScreen: true,
+          sandbox: 'workspace-write',
+          approvalPolicy: 'on-request',
+        };
+        const res = await harness.app.inject({
+          method: 'POST',
+          url: '/api/quick-start',
+          payload: {
+            caseName: 'gpu-work',
+            mode: 'codex',
+            codexConfig,
+            envOverrides: { CODEX_HOME: '/home/ubuntu/.codex-team' },
+          },
+        });
+
+        expect(res.statusCode).toBe(200);
+        const body = JSON.parse(res.body);
+        const session = [...harness.ctx.sessions.values()].find((item) => item.id === body.data.sessionId);
+        expect(session?.codexConfig).toMatchObject(codexConfig);
+        expect(session?.getEnvOverridesForPersist()).toEqual({ CODEX_HOME: '/home/ubuntu/.codex-team' });
+        expect(session?.toState().remote).toMatchObject({
+          port: 2222,
+          identityFile: '/keys/gpu',
+          jumpHost: 'bastion.example',
+          extraSshOptions: ['ConnectTimeout=4'],
+        });
+      } finally {
+        startInteractive.mockRestore();
+      }
+    });
+
+    it.each([
+      { envOverrides: { CODEX_HOME: 'relative/home' } },
+      { envOverrides: { CODEX_HOME: '/home/ubuntu/.codex', OPENAI_API_KEY: 'secret' } },
+    ])('rejects unsafe remote Codex environment overrides: %j', async (extra) => {
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu' }];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/quick-start',
+        payload: { caseName: 'gpu-work', mode: 'codex', codexConfig: { noDaemon: true }, ...extra },
+      });
+
+      expect(res.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.INVALID_INPUT));
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: ApiErrorCode.INVALID_INPUT });
+    });
+
+    it('rejects exact remote Codex config when a host command override is authoritative', async () => {
+      remoteStore.hosts = [
+        {
+          id: 'gpu-box',
+          label: 'GPU Box',
+          host: '192.0.2.42',
+          username: 'ubuntu',
+          commands: { codex: 'codex --profile remote' },
+        },
+      ];
+      remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
+
+      const res = await harness.app.inject({
+        method: 'POST',
+        url: '/api/quick-start',
+        payload: { caseName: 'gpu-work', mode: 'codex', codexConfig: { noDaemon: true } },
+      });
+
+      expect(res.statusCode).toBe(httpStatusForErrorCode(ApiErrorCode.INVALID_INPUT));
+      expect(JSON.parse(res.body)).toMatchObject({ success: false, errorCode: ApiErrorCode.INVALID_INPUT });
+    });
+
     it('rejects a remote quick-start when the remote host lacks tmux', async () => {
-      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu' }];
+      remoteStore.hosts = [{ id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu' }];
       remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
       remoteStore.tmuxCheck = {
         ok: false,
-        error: 'remote host 10.0.0.42 needs tmux installed for durable remote sessions',
+        error: 'remote host 192.0.2.42 needs tmux installed for durable remote sessions',
       };
 
       const res = await harness.app.inject({
@@ -2428,7 +2707,7 @@ describe('session-routes', () => {
       const startInteractive = vi.spyOn(Session.prototype, 'startInteractive').mockResolvedValue(undefined);
       try {
         remoteStore.hosts = [
-          { id: 'gpu-box', label: 'GPU Box', host: '10.0.0.42', username: 'ubuntu', commands: { codex: 'exec codx' } },
+          { id: 'gpu-box', label: 'GPU Box', host: '192.0.2.42', username: 'ubuntu', commands: { codex: 'exec codx' } },
         ];
         remoteStore.cases = [{ name: 'gpu-work', type: 'remote', hostId: 'gpu-box', remotePath: '/home/ubuntu/work' }];
 

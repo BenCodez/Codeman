@@ -563,6 +563,7 @@ Object.assign(CodemanApp.prototype, {
     const stored = parseInt(localStorage.getItem('codeman-scrollback'));
     const scrollback = Number.isFinite(stored) && stored > 0 ? Math.max(stored, DEFAULT_SCROLLBACK) : DEFAULT_SCROLLBACK;
 
+    this._cancelPendingKeys?.(this.terminal);
     this._destroyKeyCode229Recovery();
     const fontSettings = this.loadAppSettingsFromStorage?.() || {};
     this.terminal = new Terminal({
@@ -768,30 +769,21 @@ Object.assign(CodemanApp.prototype, {
       // Shift+Enter's keypress sends a bare \r (submit) after the newline. Only keydown sends.
       if (ev.key === 'Enter' && (ev.shiftKey || ev.ctrlKey)) {
         if (ev.type === 'keydown' && this.activeSessionId) {
+          const sessionId = this.activeSessionId;
+          let text = '';
           if (this._localEchoEnabled) {
-            const text = this._localEchoOverlay?.pendingText || '';
+            text = this._localEchoOverlay?.pendingText || '';
             this._localEchoOverlay?.clear();
             this._localEchoOverlay?.suppressBufferDetection();
             this._flushedOffsets?.delete(this.activeSessionId);
             this._flushedTexts?.delete(this.activeSessionId);
-            if (text) {
-              this._pendingInput += text;
-              flushInput();
-            }
-            setTimeout(() => {
-              fetch(`/api/sessions/${this.activeSessionId}/send-key`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ key: ev.ctrlKey ? 'C-Enter' : 'S-Enter' }),
-              });
-            }, text ? 80 : 0);
-          } else {
-            fetch(`/api/sessions/${this.activeSessionId}/send-key`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ key: ev.ctrlKey ? 'C-Enter' : 'S-Enter' }),
-            });
+            this._pendingInput += text;
           }
+          // Include normal-mode text still waiting for its batching timer, too.
+          // Reserve the key's queue position synchronously before later typing.
+          clearTimeout(this._inputFlushTimeout);
+          flushInput();
+          this._sendNamedKey(sessionId, ev.ctrlKey ? 'C-Enter' : 'S-Enter', this.terminal, text ? 80 : 0);
         }
         return false;
       }

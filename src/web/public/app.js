@@ -193,6 +193,8 @@ const _SSE_HANDLER_MAP = [
   [SSE_EVENTS.SESSION_RESPAWN_BREAKER_TRIPPED, '_onSessionRespawnBreakerTripped'],
   [SSE_EVENTS.SESSION_CLI_INFO, '_onSessionCliInfo'],
   [SSE_EVENTS.SESSION_STATUS_TELEMETRY, '_onSessionStatusTelemetry'],
+  [SSE_EVENTS.SESSION_RECOVERY, '_onSessionRecovery'],
+  [SSE_EVENTS.SESSION_TASK, '_onSessionTask'],
 
   // Scheduled runs
   [SSE_EVENTS.SCHEDULED_CREATED, '_onScheduledCreated'],
@@ -729,13 +731,11 @@ class CodemanApp {
     this._clientId = (typeof crypto !== 'undefined' && crypto.randomUUID)
       ? crypto.randomUUID()
       : 'c-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-    // Per-TAB nonce for the WS registry key (COD-137). _loadReliableState()
-    // later replaces _clientId with the browser-wide localStorage identity
-    // (shared by every tab/window of this profile), so the WS upgrade sends
-    // `clientId:nonce` instead — a same-tab reconnect still supersedes its own
-    // socket, but two tabs on one session coexist instead of evicting each
-    // other in a 4010 ping-pong. Input frames keep the bare clientId for seq
-    // dedup.
+    // Per-document WS registry nonce (COD-137). Reliable input also receives
+    // a fresh document CID below. Recovered frames retain their original CID
+    // and use serialized HTTP; the socket carries only this document's frames.
+    // The `clientId:nonce` upgrade key still lets reconnect supersede its own
+    // socket without evicting another window on the same session.
     this._wsTabNonce = this._clientId;
     this.terminal = null;
     this.fitAddon = null;
@@ -974,8 +974,8 @@ class CodemanApp {
     this._lastOfflineUiKey = '';
 
     // Reliable, durable input delivery (replaces the old best-effort queue).
-    // Every input byte is recorded with a stable clientId + a monotonic
-    // per-session seq, persisted to localStorage, and only dropped once the
+    // Every input byte is recorded with its document clientId + a monotonic
+    // per-session seq in an immutable localStorage record, and only dropped once the
     // server ACKs that exact seq — so a half-open socket silently dropping a
     // frame, a reconnect, or a page reload can never lose a typed prompt.
     // Exactly-once: the server applies each (clientId, seq) at most once.
@@ -2291,6 +2291,10 @@ class CodemanApp {
   _onInit(data) {
     _crashDiag.log(`INIT: ${data.sessions?.length || 0} sessions`);
     this.handleInit(data);
+    // Recovery events missed during a disconnect are reconciled by an authoritative read.
+    if (this._recoveryView) void this.loadRecoveryStatus?.();
+    if (this._taskView) void this.loadTaskStatus?.();
+    if (this._supervisorView) void this.loadSupervisorStatus?.();
     // Start the remote-host reachability poller even if no session switch follows
     // (a page loaded with the remote tab already active) — see host-wake-ui.js.
     this._ensureHostWakePoller?.();
@@ -2349,7 +2353,8 @@ class CodemanApp {
     }
   }
 
-  _onSessionDeleted(data) {
+  _onSessionDeleted(data, confirmed = true) {
+    if (this.editingSessionId === data.id) this.closeSessionOptions?.();
     if (this._wsSessionId === data.id) this._disconnectWs();
     // Solo window whose session just ended → show the "unavailable" state.
     if (this.isSoloWindow && data.id === this.soloSessionId) {
@@ -2357,7 +2362,7 @@ class CodemanApp {
     }
     // Dashboard: a detached session ended → clear its detached state/timers.
     if (this.detachedSessions.has(data.id)) this._redock(data.id);
-    this._cleanupSessionData(data.id);
+    this._cleanupSessionData(data.id, confirmed);
     // ⚠️ Skip the whole active-session handoff while THIS tab is closing that
     // session: closeSession() owns the follow-up selection and moves you to the
     // next tab, so acting here would race it and flash the welcome screen (or
@@ -3850,11 +3855,12 @@ class CodemanApp {
     // as one contiguous stream. A mux write is line-oriented (it strips newlines
     // and sends Enter on its own), so it is never split: refuse it instead.
     const limit = window.CodemanInputLimit;
-    if (limit && input.length > limit.FRAME_MAX_CHARS) {
-      if (useMux || input.length > limit.PASTE_MAX_CHARS) {
+    const inputBytes = limit?.bytes ? limit.bytes(input) : input.length;
+    if (limit && inputBytes > limit.FRAME_MAX_CHARS) {
+      if (useMux || inputBytes > limit.PASTE_MAX_CHARS) {
         const max = useMux ? limit.FRAME_MAX_CHARS : limit.PASTE_MAX_CHARS;
         this.showToast?.(
-          `Input too large (${Math.ceil(input.length / 1024)} KB, limit ${Math.floor(max / 1024)} KB); not sent`,
+          `Input too large (${Math.ceil(inputBytes / 1024)} KB, limit ${Math.floor(max / 1024)} KB); not sent`,
           'error'
         );
         return;
@@ -3863,6 +3869,58 @@ class CodemanApp {
       return;
     }
     this._reliableSend(sessionId, input, useMux);
+  }
+
+  /**
+   * Named newline keys share the input queue's ordering, but only travel over
+   * HTTP: the server chooses the CLI's exact hex sequence. They have no server
+   * dedup contract, so only a certified not-sent response may be retried, and
+   * their ordering barriers are persisted but never replayed across a reload.
+   * `owner` is the terminal/tile lifetime, also used to cancel pending keys.
+   */
+  _sendNamedKey(sessionId, key, owner, delayMs = 0) {
+    if (!sessionId || (key !== 'S-Enter' && key !== 'C-Enter')) return;
+    let list = this._pendingDeliveries.get(sessionId);
+    if (!list) {
+      list = [];
+      this._pendingDeliveries.set(sessionId, list);
+    }
+    if (list.filter((r) => r.key).length >= 32) {
+      this.showToast?.('Too many newline keys queued; key not sent', 'error');
+      return;
+    }
+    const seq = this._nextSeq(sessionId);
+    if (seq === null) {
+      if (!list.length) this._pendingDeliveries.delete(sessionId);
+      this.showToast?.('Input delivery limit reached; newline key not sent. Check the prompt before retrying', 'warning');
+      return;
+    }
+    list.push({
+      cid: this._clientId, seq,
+      after: list.length ? { cid: list.at(-1).cid ?? this._clientId, seq: list.at(-1).seq } : undefined,
+      data: '', key, owner, delayMs,
+      ts: Date.now(), tries: 0, sentAt: 0, retryAt: 0,
+    });
+    this._persistReliableNow();
+    this._updateConnectionIndicator();
+    this._drainSession(sessionId);
+  }
+
+  /** Terminal teardown cancels newline retries and the unsent input that depended on them. */
+  _cancelPendingKeys(owner) {
+    for (const [sessionId, list] of this._pendingDeliveries) {
+      for (const rec of [...list]) {
+        if (!rec.key || rec.owner !== owner) continue;
+        rec.cancelled = true;
+        rec.abort?.abort();
+        if (rec.tries > 0 && !rec.retryAt) {
+          this._discardKeySuffix(sessionId, rec, 'Terminal closed during newline delivery; following input not sent', 'warning');
+        } else {
+          this._discardKeySuffix(sessionId, rec, 'Terminal closed; pending newline key cancelled; following input not sent', 'warning');
+        }
+      }
+      this._drainSession(sessionId);
+    }
   }
 
   /**
@@ -3945,12 +4003,17 @@ class CodemanApp {
   /** Record one input frame and kick delivery. The record lives until ACKed. */
   _reliableSend(sessionId, data, useMux) {
     const seq = this._nextSeq(sessionId);
-    const rec = { seq, data, useMux: !!useMux, ts: Date.now(), tries: 0, sentAt: 0 };
+    if (seq === null) {
+      this.showToast?.('Input delivery limit reached; input not sent. Check the prompt before retrying', 'warning');
+      return;
+    }
+    const rec = { cid: this._clientId, seq, data, useMux: !!useMux, ts: Date.now(), tries: 0, sentAt: 0 };
     let list = this._pendingDeliveries.get(sessionId);
     if (!list) {
       list = [];
       this._pendingDeliveries.set(sessionId, list);
     }
+    rec.after = list.length ? { cid: list.at(-1).cid ?? this._clientId, seq: list.at(-1).seq } : undefined;
     list.push(rec);
     // ⚠️ SYNCHRONOUS, not the debounced writer: the seq counter is precisely the
     // thing that must survive a crash, and a debounce puts it on the path most
@@ -3962,28 +4025,36 @@ class CodemanApp {
   }
 
   _nextSeq(sessionId) {
-    const next = (this._seqCounters.get(sessionId) || 0) + 1;
-    this._seqCounters.set(sessionId, next);
-    return next;
+    const previous = this._seqCounters.get(sessionId) ?? 0;
+    if (!Number.isSafeInteger(previous) || previous < 0 || previous >= Number.MAX_SAFE_INTEGER) return null;
+    this._seqCounters.set(sessionId, previous + 1);
+    return previous + 1;
   }
 
   /** Deliver all unacked records for a session, in seq order. */
   _drainSession(sessionId) {
+    if (this._closingSessions?.has(sessionId)) return;
     const list = this._pendingDeliveries.get(sessionId);
-    if (!list || list.length === 0) return;
+    if (!list || list.length === 0 || list[0].persistenceBlocked) return;
+    // An HTTP key (or input POST already in flight) owns the ordering barrier.
+    // A newly opened socket must not let later text overtake it.
+    if (this._postDraining.has(sessionId)) return;
 
     // Fast path: WebSocket open for this session — fire each not-yet-sent record
     // over the single ordered stream. They stay pending until the server ACKs
     // them ({t:'ia'}); a frame swallowed by a half-open socket is re-sent after
     // the sweep force-reconnects (which resets sentAt=0 in _onWsReady).
     const sock = this._inputSocketFor(sessionId);
-    if (sock) {
+    if (sock && !list[0].key && (list[0].cid ?? this._clientId) === this._clientId) {
       for (const rec of list) {
+        if (rec.key || (rec.cid ?? this._clientId) !== this._clientId || rec.persistenceBlocked) break;
         if (rec.sentAt !== 0) continue;
         try {
-          sock.ws.send(JSON.stringify({ t: 'i', d: rec.data, seq: rec.seq, cid: this._clientId }));
+          // Seal the attempt before bytes can land, including a send that throws.
           rec.sentAt = Date.now();
           rec.tries++;
+          this._persistReliableNow();
+          sock.ws.send(JSON.stringify({ t: 'i', d: rec.data, seq: rec.seq, cid: rec.cid ?? this._clientId }));
         } catch {
           break; // socket died mid-send — reconnect/POST drainer retries
         }
@@ -3991,42 +4062,100 @@ class CodemanApp {
       return;
     }
 
-    // Slow path: no WS — POST records in order, awaiting each (the HTTP 2xx is
-    // the ACK). Serialized per session so seq order survives async fetches.
-    if (this._postDraining.has(sessionId)) return;
+    // HTTP path: no WS, or a named key at the head. Await each POST (the HTTP
+    // 2xx is the ACK), serialized per session so async fetches keep seq order.
+    if (list[0].key && list[0].retryAt > Date.now()) return;
     this._postDraining.add(sessionId);
     (async () => {
       try {
         for (;;) {
           const cur = this._pendingDeliveries.get(sessionId);
+          if (this._closingSessions?.has(sessionId)) break;
           if (!cur || cur.length === 0) break;
           // If the WebSocket came back mid-drain, yield to it (the acked stream)
           // so we don't redundantly re-POST what onopen is already re-sending.
-          if (this._inputSocketFor(sessionId)) {
+          if (this._inputSocketFor(sessionId) && !cur[0].key && (cur[0].cid ?? this._clientId) === this._clientId) {
             break;
           }
           const rec = cur[0];
+          if (rec.persistenceBlocked) break;
+          if (rec.key) {
+            if (rec.retryAt > Date.now()) break;
+            if (Date.now() - rec.ts >= 30000 || rec.tries >= 16) {
+              this._dropNamedKey(sessionId, rec, 'Recovery did not finish; newline key not sent');
+              continue;
+            }
+            // Local echo flushes text first, then gives the CLI a short gap so
+            // it does not classify the newline chord as part of a paste burst.
+            if (!rec.tries && rec.delayMs) await new Promise((resolve) => setTimeout(resolve, rec.delayMs));
+            if (rec.cancelled) continue;
+          }
           rec.tries++;
           rec.sentAt = Date.now();
+          if (rec.key) rec.retryAt = 0;
+          this._persistReliableNow();
+          // ACK the occurrence sent by THIS request, even if a late socket ACK
+          // repairs the record's sequence while the POST is still in flight.
+          const sentSeq = rec.seq;
+          const sentCid = rec.cid ?? this._clientId;
           let resp = null;
           try {
-            const body = { input: rec.data, seq: rec.seq, clientId: this._clientId };
+            const body = rec.key ? { key: rec.key } : { input: rec.data, seq: rec.seq, clientId: sentCid };
             if (rec.useMux) body.useMux = true;
-            resp = await fetch(`/api/sessions/${sessionId}/input`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(body),
-              keepalive: rec.data.length < 65536,
-            });
+            const serializedBody = JSON.stringify(body);
+            // Fetch's keepalive quota counts the entire UTF-8 body, including
+            // delivery tags and JSON escaping, rather than plaintext characters.
+            const bodyBytes = window.CodemanInputLimit?.bytes?.(serializedBody) ?? Infinity;
+            // The server bounds tmux at 5s; bound the browser request too so a
+            // stalled proxy cannot hold all later keystrokes indefinitely.
+            const controller = new AbortController();
+            rec.abort = controller;
+            const deadline = setTimeout(() => controller.abort(), 10000);
+            try {
+              resp = await fetch(`/api/sessions/${sessionId}/${rec.key ? 'send-key' : 'input'}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: serializedBody,
+                keepalive: !rec.key && bodyBytes < 65536,
+                signal: controller.signal,
+              });
+              if (rec.key && resp.status === 422) {
+                const failure = await resp.json();
+                if (failure.success === false && failure.retryable === true && failure.notSent === true) {
+                  rec.retryAt = Date.now() + 1000;
+                }
+              }
+            } finally {
+              clearTimeout(deadline);
+              rec.abort = null;
+            }
           } catch {
             resp = null;
           }
+          if (rec.key && !resp?.ok) {
+            if (rec.cancelled) continue;
+            if (rec.retryAt > Date.now()) break;
+            const refused = resp && [400, 404, 410, 413].includes(resp.status);
+            if (refused) this._dropNamedKey(sessionId, rec, 'Newline key refused by the server; not sent');
+            else this._discardKeySuffix(sessionId, rec,
+              'Newline key delivery could not be confirmed; following input not sent. Check the prompt before retrying');
+            continue;
+          }
           if (resp && resp.ok) {
-            this._ackDelivery(sessionId, rec.seq);
+            let ack = {};
+            if (!rec.key) {
+              // Duplicate metadata travels in a header so ordinary successful
+              // POSTs retain their body-independent ACK/backpressure behavior.
+              try {
+                const taggedAck = JSON.parse(resp.headers?.get?.('x-codeman-input-ack') || 'null');
+                if (taggedAck?.seq === sentSeq && taggedAck.dup === true) ack = taggedAck;
+              } catch { /* A legacy/malformed ACK remains an ordinary 2xx ACK. */ }
+            }
+            this._onWsInputAck(sentSeq, ack, sessionId, sentCid);
           } else if (resp && (resp.status === 404 || resp.status === 410)) {
             // Session no longer exists — the input can never land. Drop it
             // rather than retry forever (not a "lost" prompt: the target is gone).
-            this._ackDelivery(sessionId, rec.seq);
+            this._ackDelivery(sessionId, rec.seq, rec.cid ?? this._clientId);
           } else if (resp && (resp.status === 400 || resp.status === 413)) {
             // The frame itself was refused, so a retry gets the same answer. Kept
             // queued, it was re-POSTed every 2 s forever and blocked every later
@@ -4039,23 +4168,46 @@ class CodemanApp {
         }
       } finally {
         this._postDraining.delete(sessionId);
+        // A socket may have opened while the HTTP barrier was in flight.
+        if (this._inputSocketFor(sessionId) &&
+            (this._pendingDeliveries.get(sessionId)?.[0]?.cid ?? this._clientId) === this._clientId) this._drainSession(sessionId);
       }
     })();
   }
 
+  _dropNamedKey(sessionId, rec, message) {
+    this._discardKeySuffix(sessionId, rec, `${message}; following input not sent`);
+  }
+
+  /** A failed non-deduplicated key cannot release text that depended on it. */
+  _discardKeySuffix(sessionId, rec, message, level = 'error') {
+    const list = this._pendingDeliveries.get(sessionId);
+    const index = list?.indexOf(rec) ?? -1;
+    if (index === -1) return;
+    const removed = list.splice(index);
+    // Delete a cancelled suffix from its tail. If storage refuses a deletion,
+    // retain its earlier key barrier so reload cannot release surviving text.
+    for (const pending of removed.reverse()) if (!this._forgetReliableRecord(sessionId, pending)) break;
+    if (!list.length) this._pendingDeliveries.delete(sessionId);
+    this._persistReliableNow();
+    this._updateConnectionIndicator();
+    this.showToast?.(message, level);
+  }
+
   /** Drop a frame the server refused for good, and say so once. */
   _dropRejectedInput(sessionId, rec) {
-    this._ackDelivery(sessionId, rec.seq);
+    this._ackDelivery(sessionId, rec.seq, rec.cid ?? this._clientId);
     this.showToast?.(`Input refused by the server (${Math.ceil(rec.data.length / 1024)} KB); not sent`, 'error');
   }
 
   /** Drop an ACKed record (by exact seq) and persist. */
-  _ackDelivery(sessionId, seq) {
+  _ackDelivery(sessionId, seq, cid = this._clientId) {
     const list = this._pendingDeliveries.get(sessionId);
     if (list) {
-      const idx = list.findIndex((r) => r.seq === seq);
+      const idx = list.findIndex((r) => r.seq === seq && (r.cid ?? this._clientId) === cid);
       if (idx !== -1) {
-        list.splice(idx, 1);
+        const [rec] = list.splice(idx, 1);
+        this._forgetReliableRecord(sessionId, rec);
         if (list.length === 0) this._pendingDeliveries.delete(sessionId);
         // When nothing is left pending anywhere, flush durable state immediately
         // (not debounced) so a reload in the next 250ms can't redeliver an
@@ -4076,48 +4228,88 @@ class CodemanApp {
   }
 
   /**
-   * Server input-ACK frame ({t:'ia',seq}) over the WebSocket.
+   * Server input ACK: a WS {t:'ia',seq} or an HTTP duplicate ACK header.
    *
    * `dup:true` means the server REJECTED the frame as already-seen rather than
    * applying it, and `last` is its watermark for this clientId. That combination
-   * is the escape hatch from a rolled-back counter: our seqs persist on a
-   * debounced write, so a tab killed between a send and that write comes back
+   * is the escape hatch from a rolled-back counter: a failed durable write
+   * can leave a tab killed after a send counting from an older snapshot, coming back
    * counting from BELOW the server's watermark, and from then on every keystroke
    * is dropped-but-ACKed — a silently dead terminal that a reload cannot fix,
    * because the stale counter is restored from localStorage too.
    *
-   * ⚠️ Only a FIRST-attempt record is re-queued. A retry (`tries > 1`) being
+   * ⚠️ Only a FIRST-attempt record is repaired. A retry (`tries > 1`) being
    * called a duplicate is the mechanism working as designed — the original did
-   * land — and re-sending it would type the same thing twice.
+   * land — and re-sending it would type the same thing twice. Restored records
+   * remain uncertain even when their saved attempt count was zero.
    */
-  _onWsInputAck(seq, msg, sessionId = this._wsSessionId) {
+  _onWsInputAck(seq, msg, sessionId = this._wsSessionId, cid = this._clientId) {
     // `sessionId` is the session of the socket the ACK arrived on: `{t:'ia'}`
     // frames carry none, and with a second terminal's socket in play
     // `this._wsSessionId` is no longer the only candidate.
     if (!sessionId || !Number.isInteger(seq)) return;
     if (msg && msg.err) {
       // Refused for good (e.g. over the size limit): retrying cannot help.
-      const rec = (this._pendingDeliveries.get(sessionId) || []).find((r) => r.seq === seq);
+      const rec = (this._pendingDeliveries.get(sessionId) || []).find((r) => r.seq === seq && (r.cid ?? this._clientId) === cid);
       if (rec) this._dropRejectedInput(sessionId, rec);
-      else this._ackDelivery(sessionId, seq);
+      else this._ackDelivery(sessionId, seq, cid);
+      this._drainSession(sessionId);
       return;
     }
     if (msg && msg.dup) {
       const list = this._pendingDeliveries.get(sessionId);
-      const rec = list && list.find((r) => r.seq === seq);
+      const rec = list && list.find((r) => r.seq === seq && (r.cid ?? this._clientId) === cid);
       const watermark = Number.isInteger(msg.last) ? msg.last : seq;
-      // Lift the counter clear of the server's watermark before anything else, so
-      // the re-queue below (and every later keystroke) gets an acceptable seq.
-      if ((this._seqCounters.get(sessionId) || 0) <= watermark) {
+      // Lift the counter before repairing any sequence. Do not move the record:
+      // appending it to the tail lets a named key and subsequent text overtake it.
+      if (cid === this._clientId && (this._seqCounters.get(sessionId) || 0) <= watermark) {
         this._seqCounters.set(sessionId, watermark);
         this._persistReliableNow();
       }
-      const lost = rec && rec.tries <= 1 ? rec.data : null;
-      this._ackDelivery(sessionId, seq);
-      if (lost !== null) this._reliableSend(sessionId, lost, rec.useMux);
+      if (rec && !rec.key && !rec.replayUncertain && rec.tries <= 1) {
+        const following = list.slice(list.indexOf(rec) + 1).filter((pending) => pending.tries === 0 && (pending.cid ?? this._clientId) === cid);
+        // Check room for the whole synchronous repair before changing identities or crossing a key.
+        const counter = this._seqCounters.get(sessionId) ?? 0;
+        if (!Number.isSafeInteger(counter) || counter < 0 ||
+            counter > Number.MAX_SAFE_INTEGER - following.length - 1) {
+          this._discardKeySuffix(sessionId, rec,
+            'Input delivery limit reached; pending input not replayed. Check the prompt before retrying', 'warning');
+          this._drainSession(sessionId);
+          return;
+        }
+        const renamed = new Map();
+        const oldRecSeq = rec.seq;
+        rec._previousDurable = [...(rec._previousDurable ?? []), { ...rec }];
+        rec._durableAttempted = false; rec._durableStored = false; rec._durableKey = undefined;
+        rec.seq = this._nextSeq(sessionId);
+        renamed.set(oldRecSeq, rec.seq);
+        rec.sentAt = 0;
+        rec.tries = 0;
+        // Never-attempted frames behind it need increasing sequences too. Keep
+        // every record (including chunk boundaries/key owners) in its FIFO slot.
+        // Attempted frames retain their identities until their own ACK certifies
+        // rejection; renumbering an ambiguous send would risk applying it twice.
+        for (const pending of following) {
+          pending._previousDurable = [...(pending._previousDurable ?? []), { ...pending }];
+          pending._durableAttempted = false; pending._durableStored = false; pending._durableKey = undefined;
+          const oldSeq = pending.seq;
+          pending.seq = this._nextSeq(sessionId);
+          renamed.set(oldSeq, pending.seq);
+        }
+        for (const pending of [rec, ...following])
+          if (pending.after?.cid === cid && renamed.has(pending.after.seq))
+            pending.after = { cid, seq: renamed.get(pending.after.seq) };
+        this._persistReliableNow();
+        this._drainSession(sessionId);
+        return;
+      }
+      this._ackDelivery(sessionId, seq, cid);
+      this._drainSession(sessionId);
       return;
     }
-    this._ackDelivery(sessionId, seq);
+    this._ackDelivery(sessionId, seq, cid);
+    // The ACK of the text ahead of a named key releases its HTTP barrier.
+    if (this._pendingDeliveries.get(sessionId)?.length) this._drainSession(sessionId);
   }
 
   /** Called from ws.onopen — flush everything pending over the fresh socket. */
@@ -4147,7 +4339,7 @@ class CodemanApp {
         // cause needless WS↔HTTP flapping. A truly half-open socket goes quiet.
         // Silence is measured on THIS socket: the primary's last frame says
         // nothing about a second terminal's connection, and the reverse.
-        const stale = oldest && oldest.sentAt && Date.now() - oldest.sentAt > this._reliableAckTimeoutMs;
+        const stale = oldest && !oldest.key && oldest.sentAt && Date.now() - oldest.sentAt > this._reliableAckTimeoutMs;
         const silent = Date.now() - (sock.lastRecvAt || 0) > this._reliableAckTimeoutMs;
         if (stale && silent) {
           try {
@@ -4189,59 +4381,322 @@ class CodemanApp {
 
   // ---- durable persistence (localStorage; quota- and disabled-storage-safe) --
 
+  /** A new document owns new sequences; recovered frames always keep their original identity. */
   _loadReliableState() {
-    // Stable client identity for server-side dedup across reconnects/reloads.
-    try {
-      this._clientId = localStorage.getItem('codeman:clientId') || '';
-    } catch {
-      this._clientId = '';
-    }
-    if (!this._clientId) {
-      this._clientId = 'c-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
-      try {
-        localStorage.setItem('codeman:clientId', this._clientId);
-      } catch {
-        /* storage disabled — dedup degrades to per-load, still no loss */
+    const random = typeof crypto !== 'undefined' && crypto.randomUUID
+      ? crypto.randomUUID()
+      : typeof crypto !== 'undefined' && crypto.getRandomValues
+        ? Array.from(crypto.getRandomValues(new Uint32Array(4)), (part) => part.toString(16).padStart(8, '0')).join('')
+        : Array.from({ length: 4 }, () => Math.random().toString(36).slice(2)).join('-');
+    this._clientId = 'c-' + random;
+    const prefix = 'codeman:pendingInput:v3:';
+    const groups = new Map();
+    const warn = (message) => this.showToast?.(message, 'warning');
+    let bytes = 0, records = 0, storageBytes = 0, unknownBoundary = false;
+    const group = (cid, sid) => {
+      const id = JSON.stringify([cid, sid]);
+      if (!groups.has(id)) groups.set(id, { cid, sid, frames: [], barrier: Infinity });
+      return groups.get(id);
+    };
+    const add = (cid, sid, rec, storedKey, legacy = false) => {
+      const partition = group(cid, sid);
+      const dataBytes = typeof rec?.data === 'string' ? window.CodemanInputLimit?.bytes?.(rec.data) : 0;
+      if (++records > 4096 || (bytes += Number.isSafeInteger(dataBytes) && dataBytes >= 0 ? dataBytes : 0) > this._reliableMaxBytes)
+        throw new Error('Pending input exceeds its bounded recovery limit');
+      if (!rec || !Number.isSafeInteger(rec.seq) || rec.seq <= 0) {
+        partition.barrier = 0;
+        return;
       }
-    }
+      if (legacy && localStorage.getItem(this._legacyReliableAckKey(cid, sid, rec.seq)) === '1') return;
+      if (Object.prototype.hasOwnProperty.call(rec, 'key') || (rec.useMux !== undefined && typeof rec.useMux !== 'boolean') || typeof rec.data !== 'string' || !rec.data.length) {
+        partition.barrier = Math.min(partition.barrier, rec.seq);
+        return;
+      }
+      const frameLimit = window.CodemanInputLimit?.FRAME_MAX_CHARS;
+      if (!Number.isSafeInteger(dataBytes) || dataBytes <= 0 ||
+          !Number.isSafeInteger(frameLimit) || frameLimit <= 0 || dataBytes > frameLimit) {
+        partition.barrier = Math.min(partition.barrier, rec.seq);
+        return;
+      }
+      if (!legacy && Object.prototype.hasOwnProperty.call(rec, 'after') &&
+          (!rec.after || typeof rec.after !== 'object' || Array.isArray(rec.after) ||
+           Object.keys(rec.after).sort().join(',') !== 'cid,seq' ||
+           typeof rec.after.cid !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(rec.after.cid) ||
+           !Number.isSafeInteger(rec.after.seq) || rec.after.seq <= 0 ||
+           (rec.after.cid === cid && rec.after.seq >= rec.seq))) {
+        partition.barrier = Math.min(partition.barrier, rec.seq);
+        return;
+      }
+      partition.frames.push({
+        ...(!legacy && rec.after ? { after: { ...rec.after } } : {}),
+        cid, seq: rec.seq, data: rec.data, useMux: !!rec.useMux,
+        ts: Number.isFinite(rec.ts) && rec.ts > 0 ? rec.ts : Date.now(),
+        tries: Number.isSafeInteger(rec.tries) && rec.tries > 0 ? rec.tries : 1,
+        replayUncertain: true, sentAt: 0,
+        _durableAttempted: true, _durableStored: true, _durableKey: storedKey, _legacy: legacy,
+      });
+    };
     try {
-      const raw = localStorage.getItem('codeman:pendingInput');
-      if (!raw) return;
-      const saved = JSON.parse(raw);
-      if (saved && saved.seqs) {
-        for (const [s, n] of Object.entries(saved.seqs)) {
-          if (Number.isFinite(n)) this._seqCounters.set(s, n);
+      const indexSnapshot = () => {
+        const length = localStorage.length;
+        if (!Number.isSafeInteger(length) || length < 0 || length > 8192)
+          throw new Error('Pending input storage cannot be scanned safely');
+        const names = [];
+        for (let index = 0; index < length; index++) {
+          const name = localStorage.key(index);
+          if (typeof name !== 'string' || name.length > 2048) throw new Error('Invalid input storage index');
+          names.push(name);
         }
+        if (localStorage.length !== length || new Set(names).size !== length)
+          throw new Error('Input storage changed during enumeration');
+        return names.sort();
+      };
+      const initialIndex = JSON.stringify(indexSnapshot());
+      if (JSON.stringify(indexSnapshot()) !== initialIndex) throw new Error('Input storage index changed');
+      const keys = JSON.parse(initialIndex).filter((key) => key.startsWith(prefix));
+      if (keys.length > 4096) throw new Error('Oversized input index');
+      const captured = new Map();
+      for (const key of keys) {
+        let identity;
+        try { identity = JSON.parse(decodeURIComponent(key.slice(prefix.length))); } catch { unknownBoundary = true; continue; }
+        if (!Array.isArray(identity) || identity.length !== 3 ||
+            typeof identity[0] !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(identity[0]) ||
+            typeof identity[1] !== 'string' || !identity[1].length || identity[1].length > 256 ||
+            !Number.isSafeInteger(identity[2]) || identity[2] <= 0) { unknownBoundary = true; continue; }
+        const [cid, sid, seq] = identity;
+        if (key !== prefix + encodeURIComponent(JSON.stringify(identity))) {
+          group(cid, sid).barrier = Math.min(group(cid, sid).barrier, seq);
+          continue;
+        }
+        let rec;
+        try {
+          const raw = localStorage.getItem(key);
+          captured.set(key, raw);
+          if (raw === null) continue; // Another document acknowledged this exact frame during the scan.
+          storageBytes += raw.length;
+          if (storageBytes > this._reliableMaxBytes * 6 + 65536) throw new Error('Oversized input storage');
+          if (raw.length > this._reliableMaxBytes * 6 + 4096) throw new Error('Oversized frame record');
+          rec = JSON.parse(raw);
+        } catch {
+          if (storageBytes > this._reliableMaxBytes * 6 + 65536) throw new Error('Oversized input storage');
+          group(cid, sid).barrier = Math.min(group(cid, sid).barrier, seq); continue;
+        }
+        if (rec?.version !== 3 || rec.cid !== cid || rec.sessionId !== sid || rec.seq !== seq) {
+          group(cid, sid).barrier = Math.min(group(cid, sid).barrier, seq);
+          continue;
+        }
+        add(cid, sid, rec, key);
       }
-      if (saved && saved.pending) {
-        for (const [s, recs] of Object.entries(saved.pending)) {
-          if (Array.isArray(recs) && recs.length) {
-            const frameMax = window.CodemanInputLimit?.FRAME_MAX_CHARS ?? Infinity;
-            const kept = recs
-              .filter((r) => r && typeof r.data === 'string' && Number.isInteger(r.seq))
-              // A frame over the server's limit can never be ACKed; one persisted
-              // by an older build would otherwise come back on every load (#484).
-              .filter((r) => r.data.length <= frameMax)
-              // Reset sentAt so they re-deliver promptly on this fresh load.
-              .map((r) => ({
-                seq: r.seq,
-                data: r.data,
-                useMux: !!r.useMux,
-                ts: r.ts || Date.now(),
-                tries: 0,
-                sentAt: 0,
-              }));
-            if (kept.length) this._pendingDeliveries.set(s, kept);
+      // Old whole-map snapshots are read-only. Only bounded legacy ACK markers
+      // retire their exact occurrences; another window's legacy bytes are never overwritten.
+      const raw = localStorage.getItem('codeman:pendingInput');
+      captured.set('codeman:pendingInput', raw);
+      if (raw) {
+        if (raw.length + storageBytes > this._reliableMaxBytes * 6 + 65536) throw new Error('Oversized legacy pending input');
+        let saved;
+        try { saved = JSON.parse(raw); } catch { unknownBoundary = true; }
+        if (saved?.pending) {
+          if (typeof saved.pending !== 'object' || Array.isArray(saved.pending)) throw new Error('Invalid legacy input map');
+          const cid = localStorage.getItem('codeman:clientId');
+          if (saved.version !== undefined && saved.version !== 2) {
+            warn('Pending input format could not be verified; input not replayed. Check the prompt before retrying');
+            unknownBoundary = true;
+          } else if (typeof cid !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(cid) ||
+              (saved.version === 2 ? saved.clientId !== cid : saved.clientId && saved.clientId !== cid)) {
+            warn('Pending input identity could not be verified; input not replayed. Check the prompt before retrying');
+            unknownBoundary = true;
+          } else {
+            for (const [sid, recs] of Object.entries(saved.pending)) {
+              if (!Array.isArray(recs) || !sid || sid.length > 256) { unknownBoundary = true; continue; }
+              let previous;
+              for (const rec of recs) {
+                if (!Number.isSafeInteger(rec?.seq) || rec.seq <= 0 ||
+                    (previous !== undefined && rec.seq <= previous) ||
+                    (saved.version !== 2 && rec.seq !== (previous === undefined ? 1 : previous + 1))) {
+                  group(cid, sid).barrier = Math.min(group(cid, sid).barrier, previous === undefined ? 0 : previous + 1);
+                  break;
+                }
+                previous = rec?.seq;
+                add(cid, sid, rec, undefined, true);
+              }
+            }
           }
         }
       }
+      // All documents can ACK concurrently. Refuse a partial enumeration or
+      // changed record rather than skip a key/prefix and replay its suffix.
+      for (const [key, text] of captured)
+        if (localStorage.getItem(key) !== text) throw new Error('Input storage bytes changed');
+      if (JSON.stringify(indexSnapshot()) !== initialIndex) throw new Error('Input storage index changed');
+      if (unknownBoundary) throw new Error('Unknown pending input boundary');
+      const blocked = new Map();
+      for (const partition of groups.values()) if (partition.barrier !== Infinity) {
+        if (blocked.has(partition.sid)) blocked.set(partition.sid, null);
+        else blocked.set(partition.sid, partition);
+      }
+      const partitions = [...groups.values()].sort((a, b) =>
+        (a.frames[0]?.ts ?? 0) - (b.frames[0]?.ts ?? 0) || a.cid.localeCompare(b.cid));
+      for (const partition of partitions) {
+        // An unknown newline/corrupt boundary cannot release a same-session
+        // suffix from another window. Keep its durable records for inspection.
+        if (blocked.has(partition.sid) && blocked.get(partition.sid) !== partition) continue;
+        const kept = partition.frames.sort((a, b) => a.seq - b.seq).filter((rec) => rec.seq < partition.barrier);
+        if (kept.length) {
+          const prior = this._pendingDeliveries.get(partition.sid) ?? [];
+          this._pendingDeliveries.set(partition.sid, prior.concat(kept));
+        }
+      }
+      for (const [sid, list] of this._pendingDeliveries) {
+        const identity = (rec) => JSON.stringify([rec.cid, rec.seq]);
+        const byIdentity = new Map(list.map((rec) => [identity(rec), rec]));
+        const preceding = new Map(), last = new Map();
+        for (const rec of list) {
+          if (last.has(rec.cid)) preceding.set(identity(rec), last.get(rec.cid));
+          last.set(rec.cid, rec);
+        }
+        const ordered = [], visiting = new Set(), visited = new Set();
+        const visit = (rec) => {
+          const key = identity(rec);
+          if (visited.has(key)) return;
+          if (visiting.has(key)) throw new Error('Cyclic input dependencies');
+          visiting.add(key);
+          const prior = preceding.get(key);
+          if (prior) visit(prior);
+          if (rec.after) {
+            const dependency = byIdentity.get(identity(rec.after));
+            if (dependency) visit(dependency);
+            else {
+              // A persisted unknown key/corrupt boundary is not an ACK.
+              const partition = groups.get(JSON.stringify([rec.after.cid, sid]));
+              if (partition && (rec.after.seq >= partition.barrier || partition.frames.some((known) => known.seq === rec.after.seq)))
+                throw new Error('Unverified input dependency');
+            }
+          }
+          visiting.delete(key); visited.add(key); ordered.push(rec);
+        };
+        try { for (const rec of list) visit(rec); this._pendingDeliveries.set(sid, ordered); }
+        catch { this._pendingDeliveries.delete(sid); blocked.set(sid, null); }
+      }
+      if (blocked.size) warn('Pending newline or incomplete input queue was not replayed; following input not sent. Check the prompt before retrying');
     } catch {
-      /* corrupt/parse error — start clean rather than throw */
+      // Never replay a partially scanned snapshot with an unknown ordering boundary.
+      this._pendingDeliveries.clear();
+      warn('Pending input could not be verified; input not replayed. Check the prompt before retrying');
     }
   }
 
+  _reliableRecordKey(sessionId, rec) {
+    return 'codeman:pendingInput:v3:' + encodeURIComponent(JSON.stringify([rec.cid ?? this._clientId, sessionId, rec.seq]));
+  }
+
+  _legacyReliableAckKey(cid, sessionId, seq) {
+    return 'codeman:pendingInput:legacyAck:' + encodeURIComponent(JSON.stringify([cid, sessionId, seq]));
+  }
+
+  /** Remove only this occurrence. A stale window never rewrites an imported record. */
+  _forgetReliableRecord(sessionId, rec) {
+    try {
+      if (rec._legacy) {
+        const key = this._legacyReliableAckKey(rec.cid, sessionId, rec.seq);
+        if (localStorage.getItem(key) !== '1') {
+          const length = localStorage.length;
+          if (!Number.isSafeInteger(length) || length < 0 || length > 8192) return false;
+          let count = 0;
+          const names = new Set();
+          for (let index = 0; index < length; index++) {
+            const name = localStorage.key(index);
+            if (typeof name !== 'string' || name.length > 2048 || names.has(name)) return false;
+            names.add(name);
+            if (name.startsWith('codeman:pendingInput:legacyAck:')) count++;
+          }
+          if (localStorage.length !== length || count >= 4096) return false;
+          localStorage.setItem(key, '1');
+        }
+      }
+      if (rec._durableKey) localStorage.removeItem(rec._durableKey);
+      return true;
+    } catch { return false; }
+  }
+
+  /** Retire only a positively deleted target, without turning partial deletion into an ACK. */
+  _retireDeletedSessionInput(sessionId) {
+    const prefix = 'codeman:pendingInput:v3:';
+    let retired = false;
+    try {
+      const index = () => {
+        const length = localStorage.length;
+        if (!Number.isSafeInteger(length) || length < 0 || length > 8192) throw new Error('Unverified input index');
+        const names = [];
+        for (let i = 0; i < length; i++) {
+          const key = localStorage.key(i);
+          if (typeof key !== 'string' || key.length > 2048) throw new Error('Unverified input key');
+          names.push(key);
+        }
+        if (localStorage.length !== length || new Set(names).size !== length) throw new Error('Input index changed');
+        return names.sort();
+      };
+      const names = index(), expected = new Set(names), records = new Map();
+      if (JSON.stringify(index()) !== JSON.stringify(names)) throw new Error('Input index changed');
+      let bytes = 0;
+      for (const key of names) {
+        if (!key.startsWith(prefix)) continue;
+        let identity;
+        try { identity = JSON.parse(decodeURIComponent(key.slice(prefix.length))); } catch { continue; }
+        if (!Array.isArray(identity) || identity.length !== 3 || identity[1] !== sessionId) continue;
+        const [cid, sid, seq] = identity;
+        if (typeof cid !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(cid) ||
+            !Number.isSafeInteger(seq) || seq <= 0 || key !== prefix + encodeURIComponent(JSON.stringify(identity)))
+          throw new Error('Unverified deleted input identity');
+        const raw = localStorage.getItem(key);
+        if (typeof raw !== 'string' || (bytes += raw.length) > this._reliableMaxBytes * 6 + 65536 || records.size >= 4096)
+          throw new Error('Unverified deleted input storage');
+        const rec = JSON.parse(raw);
+        if (rec?.version !== 3 || rec.cid !== cid || rec.sessionId !== sid || rec.seq !== seq ||
+            typeof rec.data !== 'string' || (rec.key !== undefined && rec.key !== 'S-Enter' && rec.key !== 'C-Enter') ||
+            (rec.after !== undefined && (!rec.after || typeof rec.after !== 'object' || Array.isArray(rec.after) ||
+              Object.keys(rec.after).sort().join(',') !== 'cid,seq' || typeof rec.after.cid !== 'string' ||
+              !/^[A-Za-z0-9_-]{1,128}$/.test(rec.after.cid) || !Number.isSafeInteger(rec.after.seq) || rec.after.seq <= 0)))
+          throw new Error('Unverified deleted input record');
+        records.set(JSON.stringify([cid, seq]), { cid, seq, key, raw, after: rec.after });
+      }
+      if (JSON.stringify(index()) !== JSON.stringify(names)) throw new Error('Input index changed');
+      const prior = new Map(), tails = new Map();
+      for (const rec of [...records.values()].sort((a, b) => a.seq - b.seq)) {
+        if (tails.has(rec.cid)) prior.set(rec, tails.get(rec.cid));
+        tails.set(rec.cid, rec);
+      }
+      const ordered = [], visiting = new Set(), visited = new Set();
+      const visit = (rec) => {
+        if (visited.has(rec)) return;
+        if (visiting.has(rec)) throw new Error('Unverified deleted input dependency');
+        visiting.add(rec);
+        if (prior.has(rec)) visit(prior.get(rec));
+        const dependency = rec.after && records.get(JSON.stringify([rec.after.cid, rec.after.seq]));
+        if (dependency) visit(dependency);
+        visiting.delete(rec); visited.add(rec); ordered.push(rec);
+      };
+      for (const rec of records.values()) visit(rec);
+      for (const rec of ordered.reverse()) {
+        if (JSON.stringify(index()) !== JSON.stringify([...expected].sort())) throw new Error('Input index changed');
+        for (const remaining of records.values())
+          if (localStorage.getItem(remaining.key) !== remaining.raw) throw new Error('Input record changed');
+        localStorage.removeItem(rec.key);
+        if (localStorage.getItem(rec.key) !== null) throw new Error('Input removal was not confirmed');
+        records.delete(JSON.stringify([rec.cid, rec.seq]));
+        expected.delete(rec.key);
+      }
+      retired = true;
+    } catch {
+      this.showToast?.('Deleted session input could not be fully retired; retained input requires attention', 'warning');
+    }
+    this._pendingDeliveries?.delete(sessionId);
+    // Preserve this document's monotonic counter and an unresolved HTTP lease.
+    // A reused session id cannot reuse an old receipt or overlap an old request.
+    this._persistReliableState();
+    return retired;
+  }
+
   _persistReliableState() {
-    // Debounced — typing without local echo calls this per keystroke.
     if (this._persistReliableTimer) return;
     this._persistReliableTimer = setTimeout(() => {
       this._persistReliableTimer = null;
@@ -4254,30 +4709,39 @@ class CodemanApp {
       clearTimeout(this._persistReliableTimer);
       this._persistReliableTimer = null;
     }
-    try {
-      const seqs = {};
-      for (const [s, n] of this._seqCounters) seqs[s] = n;
-      const pending = {};
-      let bytes = 0;
-      for (const [s, list] of this._pendingDeliveries) {
-        if (!list.length) continue;
-        pending[s] = list.map((r) => ({
-          seq: r.seq,
-          data: r.data,
-          useMux: r.useMux,
-          ts: r.ts,
-          tries: r.tries,
-        }));
-        for (const r of list) bytes += r.data.length;
+    let bytes = 0, count = 0;
+    for (const [sid, list] of this._pendingDeliveries) {
+      let prefixStored = true;
+      for (const rec of list) {
+        const dataBytes = window.CodemanInputLimit?.bytes?.(rec.data);
+        bytes += Number.isSafeInteger(dataBytes) && dataBytes >= 0 ? dataBytes : Infinity;
+        count++;
+        if (!rec._durableAttempted && prefixStored && bytes <= this._reliableMaxBytes && count <= 4096) {
+          // One immutable write per occurrence, including a failed storage call.
+          // Retrying a stale snapshot must never resurrect an ACKed frame.
+          rec._durableAttempted = true;
+          const key = this._reliableRecordKey(sid, rec);
+          const payload = JSON.stringify({ version: 3, cid: rec.cid ?? this._clientId, sessionId: sid,
+            seq: rec.seq, data: rec.data, ...(rec.after ? { after: rec.after } : {}), ...(rec.key ? { key: rec.key } : {}), useMux: rec.useMux, ts: rec.ts, tries: rec.tries });
+          try {
+            const existing = localStorage.getItem(key);
+            if (existing !== null) {
+              rec.persistenceBlocked = true;
+              throw new Error('Input occurrence identity already exists');
+            }
+            localStorage.setItem(key, payload);
+            rec._durableStored = true;
+            rec._durableKey = key;
+            for (const old of rec._previousDurable ?? []) this._forgetReliableRecord(sid, old);
+            rec._previousDurable = [];
+          } catch { /* Keep in-memory delivery and every other document's immutable bytes. */ }
+        }
+        if (!rec._durableStored) prefixStored = false;
       }
-      // Bound the persisted backlog. On extreme overflow keep the seq counters
-      // (so future input stays monotonic and dedup-safe) but skip the payloads —
-      // the in-memory queue still delivers; only cross-reload durability is lost.
-      const payload =
-        bytes > this._reliableMaxBytes ? { seqs } : { seqs, pending };
-      localStorage.setItem('codeman:pendingInput', JSON.stringify(payload));
-    } catch {
-      /* QuotaExceeded or disabled storage — in-memory delivery is unaffected */
+    }
+    if ([...this._pendingDeliveries.values()].some((list) => list.some((rec) => !rec._durableStored)) && !this._reliableStorageWarning) {
+      this._reliableStorageWarning = true;
+      this.showToast?.('Input storage is unavailable or full; keep this window open until pending input is acknowledged', 'warning');
     }
   }
 
@@ -9779,7 +10243,7 @@ class CodemanApp {
   }
 
   // Shared cleanup for all session data — called from both closeSession() and session:deleted handler
-  _cleanupSessionData(sessionId) {
+  _cleanupSessionData(sessionId, confirmed = true) {
     this.closeTabRailActionMenu?.();
     // A dead session has no buffer to reconcile; leaving the marker set would
     // make a later socket for a REUSED id reconcile against nothing.
@@ -9805,13 +10269,9 @@ class CodemanApp {
     this._flushedOffsets?.delete(sessionId);
     this._flushedTexts?.delete(sessionId);
     if (typeof KeyboardAccessoryBar !== 'undefined') KeyboardAccessoryBar.discardComposerDraft?.(sessionId);
-    // Drop any durably-queued input for a session that's actually gone (deleted/
-    // exited). Not a lost prompt — the target no longer exists. Only reached on
-    // real session removal, never on a tab switch.
-    this._pendingDeliveries?.delete(sessionId);
-    this._seqCounters?.delete(sessionId);
-    this._postDraining?.delete(sessionId);
-    this._persistReliableState();
+    // Optimistic tab removal is not evidence that its server target disappeared.
+    // A confirmed deletion retires all captured occurrences, including key barriers.
+    if (confirmed) this._retireDeletedSessionInput(sessionId);
     this.ralphStates.delete(sessionId);
     this.ralphClosedSessions.delete(sessionId);
     this.projectInsights.delete(sessionId);
@@ -9867,7 +10327,7 @@ class CodemanApp {
       // The same teardown the SSE event runs (split pane, tile, detached window,
       // WebSocket, per-session state), only now instead of when the server is
       // done. It is idempotent, so the real event finds nothing left to do.
-      this._onSessionDeleted({ id: sessionId });
+      this._onSessionDeleted({ id: sessionId }, false);
 
       if (wasActive && grid?.open) {
         // `auto`: the app chose this tile because the previous one went away.
@@ -9916,6 +10376,7 @@ class CodemanApp {
       // An SSE resync (handleInit) that landed mid-request rebuilds the list from
       // the server, which still had the session then.
       if (this.sessions.has(sessionId)) this._onSessionDeleted({ id: sessionId });
+      else this._retireDeletedSessionInput(sessionId);
       if (killMux) {
         this.showToast('Session closed and tmux killed', 'success');
       } else {

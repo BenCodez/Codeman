@@ -7,6 +7,9 @@
  */
 
 import type { EventEmitter } from 'node:events';
+import type { BrokerAuthority, CodexBrokerProof, CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
+import type { PrivateFileWitness } from './recovery/private-file-witness.js';
+import type { OwnedRemoteBrokerDescriptor } from './recovery/remote-input-broker-cache.js';
 import type {
   ProcessStats,
   PersistedRespawnConfig,
@@ -31,6 +34,22 @@ import type {
  * Multiplexer session metadata.
  */
 export interface MuxSession {
+  /** An uncommitted local custom-profile launch is inspection-only across server restarts. */
+  restoreUncertain?: boolean;
+  /** A guarded reboot launch may have started; preserve this exact pane until owner inspection. */
+  codexRestoreUncertain?: boolean;
+  /** Non-secret exact argv settings recorded before an uncertain reboot worker effect. */
+  codexRestoreConfig?: CodexConfig;
+  /** Non-secret identity digest of the main-state snapshot expected after a reboot launch. */
+  codexRestoreStateBinding?: string;
+  /** Persisted launch fact: the owned pane's actual registry command disabled the shared daemon. */
+  recoveryIsolated?: boolean;
+  /** Exact non-secret local Codex home pinned at an owned launch, never inferred on attach. */
+  recoveryCodexHome?: string;
+  /** Opaque launch-owned input incarnation; authentication keys remain private. */
+  recoveryInputBroker?: string;
+  /** Exact replacement reserved durably before a possible worker effect. Uncertainty vetoes reuse. */
+  recoveryInputBrokerPending?: string;
   /** Codeman session ID */
   sessionId: string;
   /** Multiplexer session name (e.g., "codeman-abc12345") */
@@ -85,7 +104,37 @@ export interface MuxSessionWithStats extends MuxSession {
 }
 
 /** Options for creating a new multiplexer session. */
+export interface RestoreLaunchGuard {
+  /** Original shared monotonic workspace budget, never renewed by native preparation. */
+  getWorkspaceDeadline?(): number;
+  prepare(): Promise<void>;
+  confirm(): boolean | Promise<boolean>;
+  isCurrent(): boolean;
+  noteDispatch?(): void;
+  noteCleanupUncertain?(): void;
+  noteBrokerRefusal?(): void;
+}
+
+export interface CodexRestoreLaunchGuard {
+  /** Original shared monotonic workspace budget, never renewed by native preparation. */
+  getWorkspaceDeadline?(): number;
+  prepare(): Promise<void>;
+  confirm(): boolean | Promise<boolean>;
+  /** Pure current-owner/configuration fence after the startup proof has been saved. */
+  isCurrent?(): boolean;
+  /** Mark uncertainty before a worker launch can have effects. */
+  noteDispatch?(): void;
+  /** The last successful bounded proof, rechecked by the launch-owned broker before fork. */
+  getStartupEvidence?(): import('./recovery/reboot-launch-witness.js').RebootLaunchEvidence | undefined;
+  /** Release only a certified no-child startup whose exact native cleanup was acknowledged. */
+  noteBrokerRefusal?(): void;
+  /** A created native pane could not be safely cleaned; retain it for inspection. */
+  noteCleanupUncertain?(): void;
+}
+
 export interface CreateSessionOptions {
+  /** Current owner intent for a certified optional guard fallback; never automatic authority. */
+  ownerLaunchIsCurrent?(): boolean;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;
@@ -113,6 +162,15 @@ export interface CreateSessionOptions {
   resumeSessionId?: string;
   /** Extra env vars exported before launching the CLI (e.g., CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS). Ephemeral — not written to disk. */
   envOverrides?: Record<string, string>;
+  /** Trusted previously verified local home for exact recovery/reboot launch. */
+  recoveryCodexHome?: string;
+  /** Ephemeral local reboot authority; never serialized or exposed to a client. */
+  codexRestoreGuard?: CodexRestoreLaunchGuard;
+  /** Private owner/generation veto for a controlled SSH launch; never persisted. */
+  remoteLaunchCurrent?: () => boolean;
+  remoteLaunchPrepare?: () => Promise<boolean>;
+  /** Ephemeral exact custom-profile authority for a local non-Codex reboot launch. */
+  restoreGuard?: RestoreLaunchGuard;
   /** Claude CLI effort level, injected as a `--settings` soft default (overridable via /effort in-session) */
   effort?: EffortLevel;
   /** Claude advisor model, merged into the same `--settings` JSON (overridable via /advisor in-session) */
@@ -127,8 +185,55 @@ export interface CreateSessionOptions {
   owner?: string;
 }
 
+/** Final synchronous authority for an automatic recovery effect, including partial delivery. */
+export interface RecoveryMuxDispatchGuard {
+  /** Exact verified conversation for an authenticated automatic input packet. */
+  conversationId?: string;
+  /** Captured private grant/issuer files for broker-side final verification. */
+  privateFiles?: readonly PrivateFileWitness[];
+  privatePaths?: import('./recovery/codex-identity.js').CodexIdentityWitness['paths'];
+  missingPaths?: readonly string[];
+  inputIssuer?: BrokerAuthority;
+  inputProof?: CodexBrokerProof;
+  actionDeadline?: number;
+  /** Exact observed live process for continuation; final native effects cannot target a replacement. */
+  expectedLivePane?: Pick<RecoveryPaneIdentity, 'paneId' | 'panePid'>;
+  /** Fresh bounded filesystem evidence before each effect; never a cached grant. */
+  prepareEvidence?(): Promise<boolean>;
+  confirm(): boolean;
+  noteDispatch(): void;
+  /** Certifies a native pre-effect refusal; it cannot release an already partial delivery. */
+  noteRefusal?(): void;
+  /** Exact scoped broker receipt: at least one child input phase was written. */
+  noteBrokerSent?(): void;
+  /** Exact scoped broker refusal; cannot release an earlier accepted child phase. */
+  noteBrokerRefusal?(): void;
+}
+
 /** Options for respawning a dead pane. */
+export interface RecoveryPaneIdentity {
+  paneId: string;
+  panePid: number;
+  status?: number;
+  signal?: number;
+  paneSignalToken?: string;
+  /** Private input provenance; broker death alone never proves the child exited. */
+  inputProvenance?: CodexBrokerProof;
+}
+
 export interface RespawnPaneOptions {
+  /** Private fresh restricted manager launch; never restored or accepted from request JSON. */
+  supervisorManager?: import('./supervisor/manager-launch.js').SupervisorManagerLaunch;
+  /** Current owner intent for a certified optional guard fallback; never automatic authority. */
+  ownerLaunchIsCurrent?(): boolean;
+  /** Automatic local recovery checks authority again immediately before its worker effect. */
+  recoveryDispatchGuard?: RecoveryMuxDispatchGuard;
+  /** Recovery refuses a pane that became live by omitting tmux's kill-live-pane flag. Local only. */
+  onlyIfDead?: boolean;
+  /** Ephemeral exact-process fence for an automatic owned local restart; never restored from disk. */
+  expectedRecoveryPane?: RecoveryPaneIdentity;
+  /** Owned SSH recovery may attach to an existing private remote tmux, never create it. */
+  remoteAttachOnly?: boolean;
   sessionId: string;
   workingDir: string;
   mode: SessionMode;
@@ -157,6 +262,8 @@ export interface RespawnPaneOptions {
   resumeSessionId?: string;
   /** Extra env vars exported before launching the CLI (preserved across respawns). */
   envOverrides?: Record<string, string>;
+  /** Trusted previously verified local home for exact recovery/reboot launch. */
+  recoveryCodexHome?: string;
   /**
    * Env vars to REMOVE from the tmux session (`setenv -u`) before `envOverrides` is
    * applied. `setenv` persists at the tmux-session level and is inherited by
@@ -219,6 +326,49 @@ export interface PaneCaptureOptions {
  * - `paneExitsUpdated` () - A pane read finished; ask `getPaneExit()` per session
  */
 export interface TerminalMultiplexer extends EventEmitter {
+  isSupervisorManagerLaunchCurrent?(
+    sessionId: string,
+    profile: import('./supervisor/manager-launch.js').SupervisorManagerLaunch
+  ): boolean;
+  /** Optional private reference provider: unknown snapshots disable broker retirement. */
+  setBrokerCleanupReferenceProvider?(
+    provider: import('./recovery/codex-broker-cleanup.js').BrokerCleanupReferenceProvider
+  ): void;
+  /** Bounded read-only hydration before an owner input consumes its private fence receipt. */
+  prepareCodexOwnerInput?(
+    sessionId: string,
+    isCurrent: () => boolean,
+    expectedNative: MuxSession | null
+  ): Promise<boolean>;
+  /** Pure preflight; refusal must not append a phantom owner submission. */
+  canDeliverCodexOwnerInput?(sessionId: string): boolean;
+  /** Bounded private broker journal read, scoped to the exact native pane process. */
+  getCodexInputAuthority?(sessionId: string, proof: CodexBrokerProof): BrokerAuthority | undefined;
+  inspectCodexInputProvenance?(sessionId: string, panePid: number): Promise<CodexBrokerProof | undefined>;
+  getOwnedRemoteInputBroker?(sessionId: string): Promise<OwnedRemoteBrokerDescriptor | undefined>;
+  observeOwnedRemoteInputBroker?(
+    sessionId: string,
+    serialized: string,
+    witness: PrivateFileWitness,
+    panePid: number,
+    /** Historical host-reboot journals retain identity but cannot authorize owner input. */
+    live?: boolean
+  ): CodexBrokerProof | undefined;
+  isOwnedRemoteInputBrokerProofCurrent?(sessionId: string, proof: CodexBrokerProof): boolean;
+  reserveOwnedRemoteInputBroker?(
+    sessionId: string,
+    expectedOldInc: string | undefined,
+    newInc: string
+  ): Promise<boolean>;
+  commitOwnedRemoteInputBroker?(
+    sessionId: string,
+    expectedOldInc: string | undefined,
+    newInc: string
+  ): Promise<boolean>;
+  /** Only after certified no remote provisioning effects; ACK exact pending clear before deleting keys. */
+  rollbackOwnedRemoteInputBroker?(sessionId: string, expectedOldInc: string, newInc: string): Promise<boolean>;
+  /** Cached authentication inside the caller's existing synchronous input FIFO. */
+  wrapCodexOwnerInput?(sessionId: string, input: string, channel?: 'owner-pty' | 'owner-key'): CodexOwnerInputFrame;
   /** Which backend this instance uses */
   readonly backend: 'tmux';
 
@@ -232,12 +382,20 @@ export interface TerminalMultiplexer extends EventEmitter {
    * The session runs the appropriate command (claude, opencode, or shell) in detached mode.
    */
   createSession(options: CreateSessionOptions): Promise<MuxSession>;
+  /** Strict metadata acknowledgement for owner-controlled reboot restoration. */
+  flushSessionsDurably(isCurrent?: () => boolean | Promise<boolean>, currentAfterAwait?: () => boolean): Promise<void>;
+  /** Await queued metadata writes before process shutdown. */
+  drainSessionSaves?(): Promise<void>;
 
   /**
    * Kill a session and all its child processes.
    * Uses a multi-strategy approach (children → process group → mux kill → SIGKILL).
    */
   killSession(sessionId: string): Promise<boolean>;
+  /** Cancel only a locally acknowledged reboot worker, with exact native ownership. */
+  cancelAcknowledgedRebootLaunch?(record: MuxSession, isCurrent: () => boolean): Promise<boolean>;
+  /** Clear only our acknowledged generic launch marker after the caller has committed main state. */
+  completeAcknowledgedRebootLaunch?(record: MuxSession, isCurrent: () => boolean): Promise<boolean>;
 
   /** Clean up resources (stop stats collection, etc.) */
   destroy(): void;
@@ -261,7 +419,7 @@ export interface TerminalMultiplexer extends EventEmitter {
   /**
    * Send input to a session via tmux send-keys.
    */
-  sendInput(sessionId: string, input: string): Promise<boolean>;
+  sendInput(sessionId: string, input: string, recoveryGuard?: RecoveryMuxDispatchGuard): Promise<boolean>;
 
   // ========== Metadata ==========
 
@@ -381,4 +539,16 @@ export interface TerminalMultiplexer extends EventEmitter {
    * pane cannot be read.
    */
   capturePaneText?(muxName: string, paneTarget?: string): string | null;
+  /** Fresh, bounded local-pane evidence for recovery. A missing/ambiguous probe is UNKNOWN. */
+  inspectPaneForRecovery?(muxName: string): Promise<{
+    dead: boolean;
+    paneId?: string;
+    panePid?: number;
+    status?: number;
+    signal?: number;
+    /** Validated exact native signal token, retained only for a final pane-identity fence. */
+    paneSignalToken?: string;
+    inputProvenance?: CodexBrokerProof;
+    screen: string | null;
+  } | null>;
 }

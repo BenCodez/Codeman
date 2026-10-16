@@ -34,6 +34,9 @@ interface FakeTrap {
 }
 
 interface Harness {
+  app: Record<string, any>;
+  focusElsewhere: () => void;
+  terminalFocus: ReturnType<typeof vi.fn>;
   /** Fire a paste event on the trap the last _handleImagePaste() call created. */
   firePaste: (payload: { text?: string; images?: string[] }) => void;
   /** Text handed to xterm's terminal.paste(), one entry per call. */
@@ -45,19 +48,22 @@ interface Harness {
   runTimers: () => void;
 }
 
-function loadPasteHarness(): Harness {
+function loadPasteHarness(options: { mode?: string; refused?: boolean } = {}): Harness {
   const traps: FakeTrap[] = [];
   const listeners: TrapListener[] = [];
   const attached = new Set<FakeTrap>();
   const timers: Array<() => void> = [];
 
   const documentObj = {
+    activeElement: null as unknown,
     createElement: (): FakeTrap => {
       const trap: FakeTrap = {
         contentEditable: '',
         style: { cssText: '' },
         parentNode: null,
-        focus: () => {},
+        focus: () => {
+          documentObj.activeElement = trap;
+        },
         addEventListener: (ev: string, fn: TrapListener) => {
           if (ev === 'paste') listeners.push(fn);
         },
@@ -77,7 +83,10 @@ function loadPasteHarness(): Harness {
     },
     // A browser that honours the command fires the trap's paste listener from
     // here as well; the tests model that by firing the listener twice.
-    execCommand: () => true,
+    execCommand: () => {
+      if (options.refused) throw new Error('Clipboard permission refused');
+      return true;
+    },
     getElementById: () => null,
   };
 
@@ -100,9 +109,13 @@ function loadPasteHarness(): Harness {
   const uploadedBatches: Array<Array<{ type: string }>> = [];
   const app = new CodemanApp();
   app.activeSessionId = 'session-1';
+  app.sessions = new Map([['session-1', { mode: options.mode || 'claude' }]]);
+  const terminalFocus = vi.fn();
   app.terminal = {
     paste: (text: string) => pastedText.push(text),
-    focus: () => {},
+    input: (text: string) => pastedText.push(text),
+    focus: terminalFocus,
+    modes: { bracketedPasteMode: false },
   };
   app._uploadAndInsertImages = (files: Array<{ type: string }>) => {
     uploadedBatches.push(Array.from(files));
@@ -112,6 +125,11 @@ function loadPasteHarness(): Harness {
   (app._handleImagePaste as () => void).call(app);
 
   return {
+    app,
+    terminalFocus,
+    focusElsewhere: () => {
+      documentObj.activeElement = {};
+    },
     firePaste({ text = '', images = [] }) {
       const items = images.map((type) => ({ type, getAsFile: () => ({ type }) }));
       const event = {
@@ -150,6 +168,50 @@ function loadImageInputApp() {
 }
 
 describe('Ctrl+V paste trap', () => {
+  it('preserves multiline Unicode Codex text inside one paste after terminal replay', () => {
+    const h = loadPasteHarness({ mode: 'codex' });
+    h.firePaste({ text: '  α\r\n🙂\n終  ' });
+    h.firePaste({ text: '  α\r\n🙂\n終  ' });
+    expect(h.pastedText).toEqual(['\x1b[200~  α\r🙂\r終  \x1b[201~']);
+  });
+
+  it('cleans a clipboard-refused trap and restores the terminal without sending input', () => {
+    const h = loadPasteHarness({ refused: true });
+    expect(h.attachedTraps()).toBe(1);
+    h.runTimers();
+    expect(h.attachedTraps()).toBe(0);
+    expect(h.terminalFocus).toHaveBeenCalledOnce();
+    expect(h.pastedText).toEqual([]);
+  });
+
+  it('does not steal focus back from a text field after a paste', () => {
+    const h = loadPasteHarness();
+    h.firePaste({ text: 'hello' });
+    h.focusElsewhere();
+    h.runTimers();
+    expect(h.terminalFocus).not.toHaveBeenCalled();
+    expect(h.attachedTraps()).toBe(0);
+  });
+
+  it('refuses text and image paste after the primary target changes', () => {
+    const h = loadPasteHarness();
+    h.app.activeSessionId = 'session-2';
+    h.firePaste({ text: 'old target', images: ['image/png'] });
+    expect(h.pastedText).toEqual([]);
+    expect(h.uploadedBatches).toEqual([]);
+    expect(h.attachedTraps()).toBe(0);
+  });
+
+  it('keeps one active trap and one delivery when another paste gesture replaces it', () => {
+    const h = loadPasteHarness();
+    h.app._handleImagePaste();
+    expect(h.attachedTraps()).toBe(1);
+    h.firePaste({ text: 'latest paste' });
+    expect(h.pastedText).toEqual(['latest paste']);
+    h.runTimers();
+    expect(h.attachedTraps()).toBe(0);
+  });
+
   it('sends clipboard text to the terminal once for a single paste event', () => {
     const h = loadPasteHarness();
 

@@ -12,7 +12,8 @@
  * because the tab most likely to want this is one that was open across the reboot
  * and reconnects to a server that came back up with an empty board. Restore posts to
  * `POST /api/reboot-restore/restore` and Dismiss posts to
- * `POST /api/reboot-restore/dismiss`. Dismiss always clears the banner; Restore
+ * `POST /api/reboot-restore/dismiss`. Dismiss clears the banner only after the
+ * durable server-side removal succeeds; Restore
  * re-reads the plan afterwards, because the server puts back anything it could
  * not build for a reason that may pass, such as a session limit or an agent that
  * would not start. The restored sessions arrive as ordinary `session:created`
@@ -40,6 +41,12 @@ function rebootSkipReason(reason) {
       return 'already open';
     case 'capacity-reached':
       return 'session limit reached';
+    case 'identity-unverified':
+      return 'conversation identity could not be verified';
+    case 'restore-cancelled':
+      return 'restore offer was dismissed';
+    case 'restore-uncertain':
+      return 'the worker may be running; inspect its pane before retrying';
     case 'rebuild-failed':
       return 'the agent would not start';
     default:
@@ -61,6 +68,8 @@ Object.assign(CodemanApp.prototype, {
     const banner = this.$('rebootRestoreBanner');
     if (!banner) return;
     const sessions = this._rebootRestoreSessions ?? [];
+    const dismiss = this.$('rebootRestoreBannerDismiss');
+    if (dismiss) dismiss.disabled = this._rebootRestoreDismissPending === true;
     if (sessions.length === 0) {
       banner.hidden = true;
       return;
@@ -135,8 +144,21 @@ Object.assign(CodemanApp.prototype, {
 
   /** Drop the offer. The Resume list still reaches every one of these conversations. */
   async dismissRebootRestore() {
-    this._rebootRestoreSessions = [];
-    this.renderRebootRestoreBanner();
-    await this._apiPost('/api/reboot-restore/dismiss', {});
+    if (this._rebootRestoreDismissPending) return;
+    this._rebootRestoreDismissPending = true;
+    const button = this.$('rebootRestoreBannerDismiss');
+    if (button) button.disabled = true;
+    try {
+      const response = await this._apiPost('/api/reboot-restore/dismiss', {});
+      if (!response?.ok) {
+        this.showToast?.('Could not dismiss the restore offer', 'error');
+        return;
+      }
+      this._rebootRestoreSessions = [];
+      this.renderRebootRestoreBanner();
+    } finally {
+      this._rebootRestoreDismissPending = false;
+      this.renderRebootRestoreBanner();
+    }
   },
 });

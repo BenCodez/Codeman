@@ -20,7 +20,9 @@ import {
   type PaneRow,
   resolveActivePaneTarget,
 } from '../src/tmux-manager.js';
-import { execSync, exec } from 'node:child_process';
+import { execSync, exec, execFileSync } from 'node:child_process';
+import { shellescape } from '../src/remote-hosts.js';
+import type { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 import type { MuxSession } from '../src/mux-interface.js';
 
 // ============================================================================
@@ -728,6 +730,22 @@ describe('TmuxManager (unit)', () => {
       return module.TmuxManager;
     }
 
+    async function expectLiteralWorkspace(command: unknown, workspace: string): Promise<void> {
+      expect(typeof command).toBe('string');
+      const argument = (command as string).split(' bash -c ')[1];
+      expect(argument).toBeTypeOf('string');
+      const native = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+      // Decode only the already-quoted single argument. Never execute the tmux
+      // command or the decoded pane payload; both remain fixture observations.
+      const decoded = native.execFileSync('/bin/sh', ['-c', `set -- ${argument}; printf '%s' "$1"`], {
+        encoding: 'utf8',
+        timeout: 1000,
+        env: { PATH: '/usr/bin:/bin' },
+      });
+      expect(decoded.startsWith(`cd ${shellescape(workspace)} && `)).toBe(true);
+      expect(decoded).toContain(workspace);
+    }
+
     beforeEach(() => {
       mockedExecSync.mockImplementation((cmd: string) => {
         if (typeof cmd === 'string' && cmd.includes('which tmux')) {
@@ -738,6 +756,241 @@ describe('TmuxManager (unit)', () => {
         }
         return '';
       });
+    });
+
+    it('passes exact manual remote launch bytes as one bash argv for create and respawn', async () => {
+      vi.doMock('../src/utils/cli-resolver.js', async () => {
+        const actual =
+          await vi.importActual<typeof import('../src/utils/cli-resolver.js')>('../src/utils/cli-resolver.js');
+        return { ...actual, resolveCliBinDir: vi.fn(() => '/fixture/bin') };
+      });
+      const realFs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+      const { join } = await import('node:path');
+      const { tmpdir } = await import('node:os');
+      const root = await realFs.mkdtemp(join(tmpdir(), 'codeman-tmux-argv-'));
+      const fakeTmux = join(root, 'tmux');
+      const argvFile = join(root, 'argv');
+      const originalPath = process.env.PATH;
+      const specialHome = '/tmp/codex home $(printf changed) `printf tick` \'single\' "double" $HOME';
+      const remote = {
+        hostId: 'fixture-host',
+        label: 'Fixture',
+        host: 'fixture.invalid',
+        username: 'runner',
+        remotePath: '/srv/work $(printf path) `printf path-tick` \'quoted\' "double" $HOME',
+        owned: true,
+      };
+      const sessionId = 'abc12345-1234-5678-90ab-cdef12345678';
+      // This exercises generic SSH argv preservation; controlled broker launch
+      // has its own actual fake-native/Python suite.
+      const codexConfig = { noDaemon: false };
+      const envOverrides = { CODEX_HOME: specialHome };
+      const expectedLaunch = buildRemoteLaunchCommand({
+        mode: 'codex',
+        remote,
+        sessionId,
+        codexConfig,
+        envOverrides,
+      });
+      const recordBashPayload = async (command: string): Promise<string> => {
+        await realFs.writeFile(
+          fakeTmux,
+          '#!/bin/sh\nnode -e \'require("fs").writeFileSync(process.env.ARGV_FILE,process.argv.slice(1).join("\\0")+"\\0")\' -- "$@"\n'
+        );
+        await realFs.chmod(fakeTmux, 0o755);
+        execFileSync('/bin/sh', ['-c', command], {
+          env: {
+            ...process.env,
+            PATH: `${root}:${originalPath}`,
+            ARGV_FILE: argvFile,
+            HOME: '/local/home-must-not-expand',
+            SHELL: '/local/shell-must-not-expand',
+          },
+        });
+        const argv = (await realFs.readFile(argvFile, 'utf8')).split('\0').filter(Boolean);
+        const bash = argv.lastIndexOf('bash');
+        expect(argv.slice(bash, bash + 2)).toEqual(['bash', '-c']);
+        return argv[bash + 2];
+      };
+
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+      try {
+        await nonTestManager.createSession({
+          sessionId,
+          workingDir: '/tmp',
+          mode: 'codex',
+          remote,
+          codexConfig,
+          envOverrides,
+        });
+        const createCall = mockedExecSync.mock.calls.find(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane ')
+        );
+        expect(createCall).toBeDefined();
+        expect(await recordBashPayload(String(createCall![0]))).toBe(expectedLaunch);
+
+        mockedExec.mockClear();
+        expect(
+          await nonTestManager.respawnPane({
+            sessionId,
+            workingDir: '/tmp',
+            mode: 'codex',
+            remote,
+            codexConfig,
+            envOverrides,
+          })
+        ).toBe(4242);
+        const respawnCall = mockedExec.mock.calls.find(
+          ([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane ')
+        );
+        expect(respawnCall).toBeDefined();
+        const respawnPayload = await recordBashPayload(String(respawnCall![0]));
+        expect(respawnPayload).toBe(expectedLaunch);
+        expect(respawnPayload).toContain('${SHELL:-/bin/sh}');
+        expect(respawnPayload).not.toContain('/local/home-must-not-expand');
+        expect(respawnPayload).not.toContain('/local/shell-must-not-expand');
+      } finally {
+        nonTestManager.destroy();
+        vi.doUnmock('../src/utils/cli-resolver.js');
+        await realFs.rm(root, { recursive: true, force: true });
+      }
+    });
+
+    it.each([
+      'unchanged',
+      'before-create',
+      'before-worker',
+      'grant-revoked-during-shell-prep',
+      'dispatch-uncertain',
+      'async-confirm',
+      'async-refused',
+      'async-rejected',
+    ])('scopes guarded reboot launch effects and cleanup for %s', async (outcome) => {
+      // Guarded acknowledgement uses real async durability; ordinary unit cases
+      // retain their no-I/O mocks. Give this matrix its own complete journal.
+      const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+      const actualAsyncFs = await vi.importActual<typeof import('node:fs/promises')>('node:fs/promises');
+      const asyncFs = await import('node:fs/promises');
+      const { join } = await import('node:path');
+      const { homedir } = await import('node:os');
+      const fixtureData = actualFs.mkdtempSync(join(homedir(), 'tmux-guarded-journal-'));
+      const previousData = process.env.CODEMAN_DATA_DIR;
+      const previousWrite = vi.mocked(asyncFs.writeFile).getMockImplementation()!;
+      const previousRename = vi.mocked(asyncFs.rename).getMockImplementation()!;
+      process.env.CODEMAN_DATA_DIR = fixtureData;
+      vi.mocked(asyncFs.writeFile).mockImplementation(actualAsyncFs.writeFile);
+      vi.mocked(asyncFs.rename).mockImplementation(actualAsyncFs.rename);
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+      const { dataPath } = await import('../src/config/instance.js');
+      const metadataPath = dataPath('mux-sessions.json');
+      vi.spyOn(
+        nonTestManager as unknown as { buildPathExport(mode: string): { dir: string; pathExport: string } },
+        'buildPathExport'
+      ).mockReturnValue({ dir: '/fixture/bin', pathExport: 'export PATH=/fixture/bin:$PATH && ' });
+      // This fixture owns only fake native effects; startup mechanics/receipts
+      // are exercised against real disposable brokers in the dedicated suite.
+      const broker = {
+        directory: '/fixture/private-input-broker',
+        incarnation: 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',
+        configurationDigest: 'a'.repeat(64),
+        setStartupAuthority: vi.fn(async () => {
+          broker.configurationDigest = 'b'.repeat(64);
+        }),
+        startupReceipt: vi.fn(async () => 'started'),
+      } as unknown as CodexInputBroker;
+      vi.spyOn(
+        nonTestManager as unknown as { createInputBroker(): Promise<CodexInputBroker> },
+        'createInputBroker'
+      ).mockResolvedValue(broker);
+      let workerMayBeRunning = false;
+      let grant = true;
+      mockedExecSync.mockImplementation((cmd: string) => {
+        if (cmd.includes('respawn-pane')) {
+          expect(cmd).toContain('b'.repeat(64));
+          expect(cmd).not.toContain('a'.repeat(64));
+          const persisted = JSON.parse(actualFs.readFileSync(metadataPath, 'utf8'));
+          expect(persisted).toMatchObject([
+            {
+              sessionId: 'aabbccdd-1234-5678-90ab-cdef12345678',
+              pid: 0,
+              recoveryCodexHome: '/fixture/codex-home',
+              codexRestoreUncertain: true,
+              codexRestoreConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
+            },
+          ]);
+        }
+        if (cmd.includes('respawn-pane') && outcome === 'dispatch-uncertain') {
+          workerMayBeRunning = true;
+          throw new Error('Fixture response lost after worker dispatch');
+        }
+        if (cmd.includes('respawn-pane') || cmd.includes('kill-pane')) return '';
+        if (cmd.includes('new-session')) return '$1|%7|4242|88\n';
+        if (cmd.includes('which tmux')) return '/usr/bin/tmux\n';
+        if (cmd.includes('setenv') && outcome === 'grant-revoked-during-shell-prep') grant = false;
+        if (cmd.includes('display-message') && cmd.includes('#{pane_pid}')) return '4242\n';
+        return '';
+      });
+      let confirmations = 0;
+      let authorized = false;
+      const launch = nonTestManager.createSession({
+        sessionId: 'aabbccdd-1234-5678-90ab-cdef12345678',
+        workingDir: '/fixture/workspace',
+        mode: 'codex',
+        codexConfig: { noDaemon: true, resumeSessionId: '11111111-2222-3333-4444-555555555555' },
+        recoveryCodexHome: '/fixture/codex-home',
+        codexRestoreGuard: {
+          getStartupEvidence: () => ({ files: [], paths: [], missing: [] }),
+          isCurrent: () => authorized && grant,
+          prepare: async () => {
+            await Promise.resolve();
+            authorized = grant && outcome !== 'before-create';
+          },
+          confirm: () => {
+            confirmations++;
+            if (outcome === 'async-confirm') return Promise.resolve(authorized);
+            if (outcome === 'async-refused') return Promise.resolve(false);
+            if (outcome === 'async-rejected') return Promise.reject(new Error('Fixture private proof rejected'));
+            return authorized && (outcome !== 'before-worker' || confirmations === 1);
+          },
+        },
+      });
+      try {
+        if (['unchanged', 'async-confirm'].includes(outcome)) expect((await launch).pid).toBe(4242);
+        else await expect(launch).rejects.toThrow();
+        const commands = mockedExecSync.mock.calls.map(([cmd]) => String(cmd));
+        expect(commands.some((cmd) => cmd.includes('new-session'))).toBe(
+          !['before-create', 'async-refused', 'async-rejected'].includes(outcome)
+        );
+        expect(commands.some((cmd) => cmd.includes('respawn-pane'))).toBe(
+          ['unchanged', 'async-confirm', 'dispatch-uncertain'].includes(outcome)
+        );
+        expect(commands.filter((cmd) => cmd.includes('kill-pane'))).toHaveLength(
+          ['before-worker', 'grant-revoked-during-shell-prep'].includes(outcome) ? 1 : 0
+        );
+        expect(workerMayBeRunning).toBe(outcome === 'dispatch-uncertain');
+        if (outcome === 'dispatch-uncertain')
+          expect(nonTestManager.getSessions()).toMatchObject([
+            {
+              sessionId: 'aabbccdd-1234-5678-90ab-cdef12345678',
+              pid: 0,
+              codexRestoreUncertain: true,
+              recoveryCodexHome: '/fixture/codex-home',
+            },
+          ]);
+      } finally {
+        try {
+          await nonTestManager.drainSessionSaves();
+        } finally {
+          nonTestManager.destroy();
+          vi.mocked(asyncFs.writeFile).mockImplementation(previousWrite);
+          vi.mocked(asyncFs.rename).mockImplementation(previousRename);
+          if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+          else process.env.CODEMAN_DATA_DIR = previousData;
+          actualFs.rmSync(fixtureData, { recursive: true, force: true });
+        }
+      }
     });
 
     it('starts new tmux sessions from /tmp and cd-bounces into the requested workspace', async () => {
@@ -767,7 +1020,10 @@ describe('TmuxManager (unit)', () => {
           ([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane ')
         );
         expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abc12345"`);
-        expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project with spaces\\" &&');
+        expect(respawnCall?.[0]).toContain(
+          shellescape(`cd ${shellescape('/mnt/gdrive/project with spaces')} &&`).slice(0, -1)
+        );
+        await expectLiteralWorkspace(respawnCall?.[0], '/mnt/gdrive/project with spaces');
       } finally {
         nonTestManager.destroy();
       }
@@ -852,7 +1108,64 @@ describe('TmuxManager (unit)', () => {
           .mocked(currentExec)
           .mock.calls.find(([cmd]) => typeof cmd === 'string' && cmd.includes(' respawn-pane '));
         expect(respawnCall?.[0]).toContain(`tmux -L 'codeman' respawn-pane -k -c /tmp -t "codeman-abcd1234"`);
-        expect(respawnCall?.[0]).toContain('cd \\"/mnt/gdrive/project\\" &&');
+        expect(respawnCall?.[0]).toContain(shellescape(`cd ${shellescape('/mnt/gdrive/project')} &&`).slice(0, -1));
+        await expectLiteralWorkspace(respawnCall?.[0], '/mnt/gdrive/project');
+      } finally {
+        nonTestManager.destroy();
+      }
+    });
+
+    it('preserves persisted remote recovery isolation when reattaching an existing worker', async () => {
+      const NonTestTmuxManager = await importWithTmuxCommandsEnabled();
+      const nonTestManager = new NonTestTmuxManager();
+      const remote = {
+        hostId: 'fixture-host',
+        label: 'Fixture',
+        host: 'fixture.invalid',
+        username: 'runner',
+        remotePath: '/srv/work',
+        owned: true,
+      };
+      for (const [suffix, muxName, recoveryIsolated] of [
+        ['unverified', 'codeman-abc1234a', undefined],
+        ['isolated', 'codeman-def5678b', true],
+      ] as const) {
+        nonTestManager.registerSession({
+          sessionId: `remote-${suffix}`,
+          muxName,
+          pid: 1000,
+          createdAt: Date.now(),
+          workingDir: remote.remotePath,
+          mode: 'codex',
+          attached: false,
+          remote,
+          recoveryIsolated,
+        });
+      }
+
+      try {
+        for (const [suffix, recoveryIsolated] of [
+          ['unverified', undefined],
+          ['isolated', true],
+        ] as const) {
+          expect(
+            await nonTestManager.respawnPane({
+              sessionId: `remote-${suffix}`,
+              workingDir: remote.remotePath,
+              mode: 'codex',
+              remote,
+              codexConfig: { noDaemon: true },
+              remoteAttachOnly: true,
+            })
+          ).toBe(4242);
+          expect(nonTestManager.getSession(`remote-${suffix}`)?.recoveryIsolated).toBe(recoveryIsolated);
+        }
+        const attachCalls = mockedExec.mock.calls.filter(
+          ([cmd]) =>
+            typeof cmd === 'string' && cmd.includes(' respawn-pane ') && cmd.includes('tmux -L codeman-remote attach')
+        );
+        expect(attachCalls).toHaveLength(2);
+        expect(attachCalls.every(([cmd]) => !(cmd as string).includes('new-session'))).toBe(true);
       } finally {
         nonTestManager.destroy();
       }
@@ -977,7 +1290,7 @@ describe('parsePaneRows', () => {
 
   it('reads a live pane as not dead, with no status or signal', () => {
     // Measured against tmux 3.2a: a live pane leaves both numeric fields blank.
-    const [row] = parsePaneRows('codeman-aaaa|1234|0|||1');
+    const [row] = parsePaneRows('codeman-aaaa|1234|0||');
     expect(row.dead).toBe(false);
     expect(row.exitStatus).toBeUndefined();
     expect(row.exitSignal).toBeUndefined();
@@ -1017,6 +1330,57 @@ describe('parsePaneRows', () => {
     const rows = parsePaneRows('codeman-aaaa|100|0|||\ncodeman-aaaa|200|1|0|');
     expect(rows.map((row) => row.pid)).toEqual([100, 200]);
     expect(rows.map((row) => row.sessionName)).toEqual(['codeman-aaaa', 'codeman-aaaa']);
+  });
+});
+
+describe('native exit signal evidence', () => {
+  it.each([
+    ['KILL', 9],
+    ['TERM', 15],
+    ['9', 9],
+  ] as const)('maps known native signal %s to a classified recorded exit', (raw, signal) => {
+    const rows = parsePaneRows(`codeman-aaaa|700|1||${raw}`);
+    expect(rows[0]).toMatchObject({ pid: 700, dead: true, exitSignal: signal });
+    expect(derivePaneExits(rows, 12345).get('codeman-aaaa')).toEqual({ panePid: 700, exit: { signal, at: 12345 } });
+  });
+  it.each([
+    '1|9',
+    '1|0',
+    '1',
+    '1|9|garbage',
+    '1|9|KILL',
+    '1|0|TERM',
+    '0|0|',
+    '0||KILL',
+    '1|0|UNKNOWN',
+    '1|9|TERM;touch',
+    '1|9|SIGKILL',
+    '1|9|kill',
+    '1|9|99999',
+    '1|256|',
+    '1|9|TERM|extra',
+    '1|0x|',
+    '1|-1|',
+  ])('keeps resource PID compatibility while refusing malformed death evidence: %s', (frame) => {
+    const rows = parsePaneRows(`codeman-aaaa|700|${frame}`);
+    expect(rows[0].pid).toBe(700);
+    expect(rows[0].dead).toBeUndefined();
+    expect(rows[0].exitStatus).toBeUndefined();
+    expect(rows[0].exitSignal).toBeUndefined();
+    expect(derivePaneExits(rows, 12345).size).toBe(0);
+  });
+  it.each(['700x', '0', '-1', '700 ', '9999999999999999999'])(
+    'refuses death evidence from a malformed native PID while preserving legacy resource parsing: %s',
+    (rawPid) => {
+      const rows = parsePaneRows(`codeman-aaaa|${rawPid}|1|9|`);
+      expect(rows).toHaveLength(1);
+      expect(rows[0].dead).toBeUndefined();
+      expect(derivePaneExits(rows, 12345).size).toBe(0);
+    }
+  );
+  it('keeps legacy blank signal/status death unknown instead of inventing a clean exit', () => {
+    const rows = parsePaneRows('codeman-aaaa|700|1||');
+    expect(derivePaneExits(rows, 12345).get('codeman-aaaa')).toEqual({ panePid: 700, exit: { at: 12345 } });
   });
 });
 

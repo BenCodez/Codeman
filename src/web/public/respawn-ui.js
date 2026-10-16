@@ -860,6 +860,9 @@ Object.assign(CodemanApp.prototype, {
       focused.blur();
     }
 
+    this.closeRecoveryOptions?.();
+    this.closeTaskOptions?.();
+    this.closeSupervisorOptions?.();
     this.editingSessionId = null;
     // Stop run summary auto-refresh if it was running
     this.stopRunSummaryAutoRefresh();

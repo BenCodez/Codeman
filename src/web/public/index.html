@@ -245,7 +245,13 @@
       >
         Restore
       </button>
-      <button class="reboot-restore-banner-dismiss" onclick="app.dismissRebootRestore()">Dismiss</button>
+      <button
+        class="reboot-restore-banner-dismiss"
+        id="rebootRestoreBannerDismiss"
+        onclick="app.dismissRebootRestore()"
+      >
+        Dismiss
+      </button>
     </div>
 
     <!-- Timer Banner (shown when timed run is active) -->
@@ -1247,6 +1253,12 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v6c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12v6c0 1.7 3.6 3 8 3s8-1.3 8-3v-6"/></svg>
                 <span>Session</span>
               </button>
+              <button type="button" class="set-rail-item" data-tab="recovery" style="display: none;" onclick="app.switchOptionsTab('recovery')">
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 3 3 9 9 9"/><polyline points="9 12 11 14 15 10"/></svg>
+                <span>Recovery</span>
+              </button>
+              <button type="button" class="set-rail-item" data-tab="task" style="display: none;" onclick="app.switchOptionsTab('task')"><span>Task supervision</span></button>
+              <button type="button" class="set-rail-item" data-tab="supervisor" style="display: none;" onclick="app.switchOptionsTab('supervisor')"><span>Codex supervisor</span></button>
               <button type="button" class="set-rail-item" data-tab="ralph" data-claude-only onclick="app.switchOptionsTab('ralph')">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 6h11"/><path d="M9 12h11"/><path d="M9 18h11"/><polyline points="3 6 4 7 6 5"/><polyline points="3 12 4 13 6 11"/><polyline points="3 18 4 19 6 17"/></svg>
                 <span>Ralph / Todo</span>
@@ -1386,6 +1398,7 @@
               </div><!-- End sessionRespawnSection -->
             </section>
 
+
             <!-- ══ Context ══════════════════════════════════════════════════ -->
             <section class="set-section hidden" id="context-tab" data-label="Session">
               <div class="set-section-head">
@@ -1503,6 +1516,159 @@
                   </div>
                 </div>
               </div>
+            </section>
+
+            <!-- Recovery uses structured Codex events. Quiet output alone never starts a retry. -->
+            <section class="set-section hidden" id="recovery-tab" data-label="Recovery">
+              <div class="set-section-head">
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7"/><polyline points="3 3 3 9 9 9"/><polyline points="9 12 11 14 15 10"/></svg>
+                <h2>Recovery</h2>
+              </div>
+              <p class="set-section-blurb">Resume verified unfinished work after an interruption or crash, with bounded retries.</p>
+              <p class="set-group-hint">Automatic recovery requires a Codeman-owned Codex session launched with --no-daemon. Owned SSH sessions use bounded remote evidence; Docker and discovered sessions remain paused.</p>
+              <p class="recovery-notice" id="recoveryError" role="alert" hidden>Recovery status is unavailable. Refresh to try again.</p>
+
+              <div class="set-group">
+                <div class="set-group-head"><h4>Recovery status</h4></div>
+                <dl class="recovery-state-grid" aria-live="polite">
+                  <div><dt>Observed activity</dt><dd id="recoveryActivity">Loading</dd></div>
+                  <div><dt>Automation state</dt><dd id="recoveryPhase">Loading</dd></div>
+                  <div><dt>Conversation ID</dt><dd id="recoveryConversationId" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Recovery attempts</dt><dd id="recoveryAttempts" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Failed attempts</dt><dd id="recoveryFailures" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Last successful recovery</dt><dd id="recoveryLastSuccess" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Next retry</dt><dd id="recoveryNextRetry" data-i18n-skip>&mdash;</dd></div>
+                  <div><dt>Attention</dt><dd id="recoveryAttention">Loading</dd></div>
+                  <div class="recovery-state-reason"><dt>Reason</dt><dd id="recoveryReason">Loading</dd></div>
+                </dl>
+                <div class="recovery-actions">
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryRefreshBtn" onclick="app.loadRecoveryStatus()">Refresh status</button>
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryRetryBtn" onclick="app.retryRecovery()" disabled>Retry recovery</button>
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryRestoreRemoteBtn" onclick="app.restoreRemoteRecovery()" hidden disabled>Restore remote worker</button>
+                  <button type="button" class="btn-toolbar btn-sm" id="recoveryResetBtn" onclick="app.resetRecovery()" disabled>Reset recovery</button>
+                </div>
+                <p class="set-group-hint recovery-actions-hint">Retry rechecks safety before acting. Reset clears retry limits without restarting the session.</p>
+              </div>
+
+              <fieldset class="recovery-settings" id="recoverySettings" disabled>
+                <legend class="sr-only">Recovery settings</legend>
+                <div class="set-group">
+                  <div class="set-group-head"><h4>Automatic recovery</h4></div>
+                  <div class="set-group-body">
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryEnabled">Enable automatic recovery</label><span class="set-row-desc">Off by default. Pauses for user input, approvals, authentication, and usage limits.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryEnabled" aria-label="Enable automatic recovery" onchange="app.saveRecoverySetting('enabled', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryInterrupted">Recover interrupted turns</label><span class="set-row-desc">Continue only when structured events confirm an unfinished turn.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryInterrupted" checked aria-label="Recover interrupted turns" onchange="app.saveRecoverySetting('recoverInterrupted', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryCrashes">Recover crashes</label><span class="set-row-desc">Resume the same verified conversation after an unexpected process exit.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryCrashes" checked aria-label="Recover crashes" onchange="app.saveRecoverySetting('recoverCrashes', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalls">Detect stalls (alert only)</label><span class="set-row-desc">Raise an alert for stalled work. Silence alone never triggers recovery.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryStalls" aria-label="Detect stalls (alert only)" onchange="app.saveRecoverySetting('detectStalls', this)"><span class="slider"></span></label>
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryRestartStalls">Restart confirmed dead stalls</label><span class="set-row-desc">Requires stall detection and separate owner consent. Restart only after repeated fresh observations confirm an abnormal dead local or owned SSH pane. Live silence and transport failures only ask for attention.</span></div>
+                      <label class="switch switch-sm"><input type="checkbox" id="recoveryRestartStalls" aria-label="Restart confirmed dead stalls" onchange="app.saveRecoverySetting('restartStalls', this)"><span class="slider"></span></label>
+                    </div>
+                  </div>
+                </div>
+                <div class="set-group">
+                  <div class="set-group-head"><h4>Retry limits</h4></div>
+                  <div class="set-group-body">
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryMaxRetries">Maximum retries</label><span class="set-row-desc">Stop automatic attempts when this limit is reached.</span></div>
+                      <input class="set-input recovery-number" id="recoveryMaxRetries" type="number" min="1" max="10" step="1" value="3" onchange="app.saveRecoverySetting('maxRetries', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryRetryDelay">Retry delay (seconds)</label><span class="set-row-desc">Initial wait before retrying. Later attempts use bounded backoff.</span></div>
+                      <input class="set-input recovery-number" id="recoveryRetryDelay" type="number" min="1" max="300" step="1" value="15" onchange="app.saveRecoverySetting('retryDelayMs', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryMaxDelay">Maximum retry delay (seconds)</label><span class="set-row-desc">Must be at least the initial retry delay.</span></div>
+                      <input class="set-input recovery-number" id="recoveryMaxDelay" type="number" min="1" max="3600" step="1" value="120" onchange="app.saveRecoverySetting('maxRetryDelayMs', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryMaxDuration">Maximum recovery duration (seconds)</label><span class="set-row-desc">Stop trying after this total recovery window.</span></div>
+                      <input class="set-input recovery-number" id="recoveryMaxDuration" type="number" min="10" max="3600" step="1" value="900" onchange="app.saveRecoverySetting('maxRecoveryDurationMs', this)">
+                    </div>
+                    <div class="set-row">
+                      <div class="set-row-text"><label class="set-row-label" for="recoveryStalledAfter">Stall threshold (seconds)</label><span class="set-row-desc">How long the current structured turn can lack progress before confirmation begins.</span></div>
+                      <input class="set-input recovery-number" id="recoveryStalledAfter" type="number" min="10" max="3600" step="1" value="300" onchange="app.saveRecoverySetting('stalledAfterMs', this)">
+                    </div>
+                  </div>
+                </div>
+              </fieldset>
+
+              <div class="set-group">
+                <div class="set-group-head"><h4>Recent recovery events</h4></div>
+                <p class="set-group-hint" id="recoveryHistoryEmpty">No recovery events yet</p>
+                <div class="recovery-history-wrap" id="recoveryHistoryWrap" hidden>
+                  <table class="recovery-history"><thead><tr><th scope="col">Time</th><th scope="col">Action</th><th scope="col">Reason</th><th scope="col">Attempt</th></tr></thead><tbody id="recoveryHistory"></tbody></table>
+                </div>
+              </div>
+            </section>
+
+            <section class="set-section hidden" id="task-tab" data-label="Task supervision">
+              <div class="set-section-head"><h2>Task supervision</h2></div>
+              <p class="set-section-blurb">Opt in separately from recovery. Completion requires verified acceptance criteria; a model completion marker alone is insufficient. Approval, authentication, and usage blockers pause supervision.</p>
+              <p id="taskError" role="alert" hidden>Task status is unavailable. Refresh to try again.</p>
+              <div class="set-group"><h4>Task status</h4><dl class="task-status-grid">
+                <dt>Supervision</dt><dd id="taskPhase">Loading</dd><dt>Outcome</dt><dd id="taskOutcome">Unknown</dd>
+                <dt>Reason</dt><dd id="taskReason" data-i18n-skip>—</dd><dt>Continuations used / limit</dt><dd id="taskAttempts" data-i18n-skip>—</dd>
+                <dt>Runtime / limit (seconds)</dt><dd id="taskRuntime" data-i18n-skip>—</dd><dt>Current attempt started</dt><dd id="taskCurrentAttempt" data-i18n-skip>—</dd>
+                <dt>Last verified step</dt><dd id="taskLastVerified" data-i18n-skip>—</dd><dt>Input evidence</dt><dd id="taskInputEvidence">No input awaiting acceptance</dd>
+              </dl><div class="task-actions">
+                <button class="btn-toolbar" type="button" id="taskRefreshBtn" onclick="app.loadTaskStatus()">Refresh</button>
+                <button class="btn-toolbar" type="button" id="taskResumeBtn" onclick="app.taskAction('resume')">Start / resume</button>
+                <button class="btn-toolbar" type="button" id="taskPauseBtn" onclick="app.taskAction('pause')">Pause</button>
+                <button class="btn-toolbar" type="button" id="taskResetBtn" onclick="app.taskAction('reset')">Reset and disable</button>
+              </div></div>
+              <fieldset class="set-group task-form" id="taskSettings" disabled><legend>Task configuration</legend>
+                <label for="taskObjective">Objective</label><textarea class="set-textarea" id="taskObjective" rows="3" maxlength="4000" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <div id="taskCriteriaRows"></div>
+                <div class="task-actions">
+                  <button class="btn-toolbar" type="button" id="taskAddManualCriterion" onclick="app.addTaskCriterion('manual')">Add owner criterion</button>
+                  <button class="btn-toolbar" type="button" id="taskAddCommandCriterion" onclick="app.addTaskCriterion('command')">Add command check</button>
+                </div>
+                <p class="set-group-hint">Commands are matched against structured successful execution in this conversation. Saving checks does not run shell commands.</p>
+                <label><input type="checkbox" id="taskEnabled" onchange="app.markTaskDraft()"> Enable task supervision</label>
+                <label for="taskMaxContinuations">Maximum continuations</label><input class="set-input" type="number" id="taskMaxContinuations" min="0" max="10" step="1" oninput="app.markTaskDraft()">
+                <label for="taskMaxRuntime">Maximum runtime (seconds)</label><input class="set-input" type="number" id="taskMaxRuntime" min="1" max="86400" step="1" oninput="app.markTaskDraft()">
+                <button class="btn-toolbar" type="button" onclick="app.saveTaskConfiguration()">Save task configuration</button>
+              </fieldset>
+              <fieldset class="set-group task-form" id="taskProgress" disabled><legend>Checkpoints and completion evidence</legend>
+                <div id="taskCriteriaEvidence"></div>
+                <p class="set-group-hint" id="taskOwnerAuthNotice">Sign in with Codeman authentication to verify manual criteria. Anonymous or agent requests cannot certify them.</p>
+                <p class="set-group-hint">Select owner criteria you have independently verified, or request verification of command checks. Command checks require correlated successful execution evidence. Completed is accepted only when every criterion is verified.</p>
+                <label for="taskCheckpoint">Checkpoint</label><textarea class="set-textarea" id="taskCheckpoint" maxlength="4000" rows="2" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <label for="taskNextAction">Next action</label><textarea class="set-textarea" id="taskNextAction" maxlength="4000" rows="2" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
+                <label for="taskProgressOutcome">Reported outcome</label><select class="set-input" id="taskProgressOutcome" onchange="app.markTaskDraft()"><option value="unknown">Unknown</option><option value="unfinished">Unfinished</option><option value="blocked">Blocked</option><option value="completed">Completed</option></select>
+                <button class="btn-toolbar" type="button" onclick="app.saveTaskProgress()">Save checkpoint / verification</button>
+              </fieldset>
+              <div class="set-group"><h4>Recent task events</h4><p id="taskHistoryEmpty">No task events yet</p><ol id="taskHistory" class="task-history"></ol></div>
+            </section>
+
+            <section class="set-section hidden" id="supervisor-tab" data-label="Codex supervisor">
+              <div class="set-section-head"><h2>Codex supervisor</h2></div>
+              <p class="set-section-blurb">Assign this local isolated Codex session to manage selected owned Codex workers through guarded task and recovery controllers. The role is off by default and requires server authentication. The manager and local workers need distinct authorized <code>CODEX_HOME</code> directories. Submit an ordinary prompt through Codeman in each current isolated <code>--no-daemon</code> conversation to establish its verified Codex identity, then wait for the manager to become idle. A launch or resume seed alone cannot authorize automatic input.</p>
+              <p id="supervisorError" role="alert" hidden>Supervisor is unavailable for this session. Local managed Codex, isolation, owner access, and verified identity are required.</p>
+              <div class="set-group"><h4>Codex process isolation</h4><p class="set-group-hint">To create an isolated conversation, set the <code>--no-daemon</code> and <code>--no-alt-screen</code> launch defaults under App Settings → Codex, then create a new local session and submit its first prompt. Select Prepare restricted manager to explicitly resume the verified manager conversation with restricted supervisor tools and a scoped credential. Preparation refuses active work, pending child work, unknown identity and uncertain delivery. Start requires a verified restricted launch; an ordinary Codex process cannot adopt the role.</p></div>
+              <div class="set-group"><h4>Supervisor status</h4><dl class="task-status-grid"><dt>Phase</dt><dd id="supervisorPhase">Loading</dd><dt>Reason</dt><dd id="supervisorReason">—</dd></dl>
+                <div class="task-actions"><button class="btn-toolbar" id="supervisorPrepareBtn" onclick="app.prepareSupervisorManager()">Prepare restricted manager</button><button class="btn-toolbar" id="supervisorStartBtn" onclick="app.supervisorAction('start')">Start manager</button><button class="btn-toolbar" id="supervisorPauseBtn" onclick="app.supervisorAction('pause')">Pause</button><button class="btn-toolbar" id="supervisorResetBtn" onclick="app.supervisorAction('reset')">Reset</button><button class="btn-toolbar" onclick="app.loadSupervisorStatus()">Refresh</button></div>
+              </div>
+              <fieldset class="set-group task-form" id="supervisorSettings" disabled><legend>Owner configuration</legend>
+                <label for="supervisorObjective">Manager objective</label><textarea class="set-textarea" id="supervisorObjective" maxlength="3000" rows="3"></textarea>
+                <label><input type="checkbox" id="supervisorEnabled"> Enable supervisor role</label>
+                <label for="supervisorWorkers">Worker plans (JSON)</label><textarea class="set-textarea" id="supervisorWorkers" rows="12" spellcheck="false" placeholder='[{"sessionId":"...","task":"...","criteria":[{"id":"tests","description":"Tests pass","kind":"command","command":"npm test"}],"maxAssignments":3,"maxRuntimeMs":900000}]'></textarea>
+                <p class="set-group-hint">Each worker needs an explicit task, acceptance criteria, assignment budget, and runtime. Manual criteria remain owner-only. Unsupported or discovered remote transports, Docker, foreign-owner, self, cyclic, and already-leased workers are refused.</p>
+                <button class="btn-toolbar" onclick="app.saveSupervisorConfiguration()">Save supervisor configuration</button>
+              </fieldset>
+              <div class="set-group"><h4>Selected workers</h4><p class="set-group-hint">Health and task state come from bounded controller inspection. Stale or unknown evidence never enables crash retry.</p><div class="task-actions"><button class="btn-toolbar" onclick="app.loadSupervisorWorkers()">Refresh worker evidence</button></div><ol id="supervisorWorkerStatus" class="task-history"></ol></div>
             </section>
 
             <!-- ══ Ralph / Todo ═════════════════════════════════════════════ -->
@@ -2711,6 +2877,20 @@
                       <span class="set-row-desc">Decorative Codex TUI motion. Leave off to reduce remote and mobile redraws.</span>
                     </div>
                     <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexAnimations"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="codex no daemon isolated supervision recovery">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Isolated process for recovery</span>
+                      <span class="set-row-desc">Start new local Codex sessions with <code>--no-daemon</code>. Required for task recovery and the optional supervisor role.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexNoDaemon"><span class="slider"></span></label>
+                  </div>
+                  <div class="set-row" data-search="codex no alternate screen terminal">
+                    <div class="set-row-text">
+                      <span class="set-row-label">Disable alternate screen</span>
+                      <span class="set-row-desc">Start new local Codex sessions with <code>--no-alt-screen</code> so transcript output remains in terminal scrollback.</span>
+                    </div>
+                    <label class="switch switch-sm"><input type="checkbox" id="appSettingsCodexNoAltScreen"><span class="slider"></span></label>
                   </div>
                 </div>
               </div>
@@ -4111,6 +4291,9 @@
   <script defer src="terminal-split.js"></script>
   <script defer src="tile-grid.js"></script>
   <script defer src="respawn-ui.js"></script>
+  <script defer src="recovery-ui.js"></script>
+  <script defer src="supervision-ui.js"></script>
+  <script defer src="supervisor-ui.js"></script>
   <script defer src="ralph-panel.js"></script>
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>

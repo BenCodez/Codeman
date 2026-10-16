@@ -31,6 +31,7 @@ function loadCodemanAppClass() {
     clearTimeout,
     requestAnimationFrame: vi.fn(),
     HTMLCanvasElement: class HTMLCanvasElement {},
+    AbortController,
     WebSocket: { OPEN: 1 },
     fetch: (...args: Parameters<typeof fetch>) => global.fetch(...args),
     document: { addEventListener: vi.fn() },
@@ -62,7 +63,15 @@ type PostBody = { input: string; seq: number; clientId: string };
 
 type App = {
   _sendInputAsync: (sessionId: string, input: string, opts?: { useMux?: boolean }) => void;
-  _pendingDeliveries: Map<string, Array<{ seq: number; data: string; sentAt: number }>>;
+  _sendNamedKey: (sessionId: string, key: string, owner: object, delayMs?: number) => void;
+  _cancelPendingKeys: (owner: object) => void;
+  _drainSession: (sessionId: string) => void;
+  _onWsInputAck: (seq: number, msg: object, sessionId: string) => void;
+  _pendingDeliveries: Map<
+    string,
+    Array<{ seq: number; data: string; sentAt: number; key?: string; retryAt: number; ts: number; tries: number }>
+  >;
+  showToast: ReturnType<typeof vi.fn>;
   _ws: { readyState: number; send: (data: string) => void } | null;
   _wsSessionId: string | null;
   activeSessionId: string | null;
@@ -77,6 +86,7 @@ function makeApp(): App {
   app._persistReliableState = vi.fn();
   app._persistReliableNow = vi.fn();
   app._updateConnectionIndicator = vi.fn();
+  app.showToast = vi.fn();
   app.clearPendingHooks = vi.fn();
   // _ackDelivery spends a pending IDLE alert through markIdleAlertSeen, which
   // reads this map; without it the real prototype method throws on every ACK.
@@ -149,6 +159,22 @@ describe('durable input delivery — send ordering', () => {
     expect(app._pendingDeliveries.get('session-1')?.[0].data).toBe('a');
   });
 
+  it('keeps recovery-blocked input queued when the server returns 422', async () => {
+    const app = makeApp();
+    const calls: PostBody[] = [];
+    global.fetch = vi.fn(async (_url, init) => {
+      calls.push(JSON.parse(String(init?.body)) as PostBody);
+      return new Response(JSON.stringify({ success: false, errorCode: 'OPERATION_FAILED' }), { status: 422 });
+    });
+
+    app._sendInputAsync('session-1', 'retry after recovery');
+    await waitForCalls(calls, 1);
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(app._pendingDeliveries.get('session-1')).toHaveLength(1);
+    expect(app._pendingDeliveries.get('session-1')?.[0].data).toBe('retry after recovery');
+  });
+
   it('drops a frame addressed to a vanished session (404) instead of retrying forever', async () => {
     const app = makeApp();
     global.fetch = vi.fn(async () => new Response('gone', { status: 404 }));
@@ -158,6 +184,381 @@ describe('durable input delivery — send ordering', () => {
     await new Promise((r) => setTimeout(r, 0));
 
     expect(app._pendingDeliveries.get('session-1')).toBeUndefined();
+  });
+});
+
+describe('named newline keys in the input queue', () => {
+  const busy = () => new Response(JSON.stringify({ success: false, retryable: true, notSent: true }), { status: 422 });
+
+  it('repairs a stale first-attempt duplicate ACK ahead of the named key and never-attempted text', async () => {
+    const app = makeApp();
+    const frames: Frame[] = [];
+    const delivered: string[] = [];
+    app._ws = {
+      readyState: 1,
+      send: (d) => {
+        const frame = JSON.parse(d);
+        frames.push(frame);
+        if (frame.seq > 10) delivered.push(frame.d); // another tab already used sequences through 10
+      },
+    };
+    app._wsSessionId = 'session-1';
+    global.fetch = vi.fn(async (_url, init) => {
+      delivered.push(JSON.parse(String(init?.body)).key);
+      return new Response('{}', { status: 200 });
+    });
+    app._sendInputAsync('session-1', 'before', { useMux: true });
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    const original = app._pendingDeliveries.get('session-1')![0];
+    const originalTs = original.ts;
+    app._onWsInputAck(1, { dup: true, last: 10 }, 'session-1');
+    const repaired = app._pendingDeliveries.get('session-1')!;
+    expect(repaired.map((r) => [r.key || r.data, r.seq])).toEqual([
+      ['before', 11],
+      ['S-Enter', 12],
+      ['after', 13],
+    ]);
+    expect(repaired[0]).toBe(original);
+    expect(repaired[0].ts).toBe(originalTs);
+    expect(repaired[0]).toHaveProperty('useMux', true);
+    expect(delivered).toEqual(['before']);
+    app._onWsInputAck(11, {}, 'session-1');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(delivered).toEqual(['before', 'S-Enter', 'after']);
+    expect(frames.map((f) => [f.d, f.seq])).toEqual([
+      ['before', 1],
+      ['before', 11],
+      ['after', 13],
+    ]);
+  });
+
+  it('keeps ordinary attempted text in its original slot until its own duplicate ACK certifies rejection', () => {
+    const app = makeApp();
+    const frames: Frame[] = [];
+    app._ws = { readyState: 1, send: (d) => frames.push(JSON.parse(d)) };
+    app._wsSessionId = 'session-1';
+    app._sendInputAsync('session-1', 'before');
+    app._sendInputAsync('session-1', 'after');
+    app._onWsInputAck(1, { dup: true, last: 10 }, 'session-1');
+    // 'after' was already attempted, so its identity cannot be changed speculatively.
+    expect(app._pendingDeliveries.get('session-1')?.map((r) => [r.data, r.seq])).toEqual([
+      ['before', 11],
+      ['after', 2],
+    ]);
+    app._onWsInputAck(2, { dup: true, last: 10 }, 'session-1');
+    expect(app._pendingDeliveries.get('session-1')?.map((r) => [r.data, r.seq])).toEqual([
+      ['before', 11],
+      ['after', 12],
+    ]);
+    expect(frames.map((f) => [f.d, f.seq])).toEqual([
+      ['before', 1],
+      ['after', 2],
+      ['before', 11],
+      ['after', 12],
+    ]);
+  });
+
+  it('does not repair an ambiguous retried WS frame when its duplicate ACK confirms prior delivery', async () => {
+    const app = makeApp();
+    const frames: Frame[] = [];
+    app._ws = { readyState: 1, send: (d) => frames.push(JSON.parse(d)) };
+    app._wsSessionId = 'session-1';
+    global.fetch = vi.fn(async () => new Response('{}', { status: 200 }));
+    app._sendInputAsync('session-1', 'before');
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    const before = app._pendingDeliveries.get('session-1')![0];
+    before.sentAt = 0;
+    app._drainSession('session-1'); // same occurrence retried after an unknown send
+    expect(before.tries).toBe(2);
+    app._onWsInputAck(1, { dup: true, last: 1 }, 'session-1');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(frames.filter((f) => f.d === 'before').map((f) => f.seq)).toEqual([1, 1]);
+    expect(frames.at(-1)?.d).toBe('after');
+  });
+
+  it('uses the HTTP duplicate ACK watermark to retain before/key/after FIFO order', async () => {
+    const app = makeApp();
+    const delivered: string[] = [];
+    const bodies: Record<string, unknown>[] = [];
+    global.fetch = vi.fn(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      bodies.push(body);
+      if (!body.key && body.seq <= 10) {
+        return new Response('{}', {
+          status: 200,
+          headers: {
+            'x-codeman-input-ack': JSON.stringify({ seq: body.seq, dup: true, last: 10 }),
+          },
+        });
+      }
+      delivered.push(body.key || body.input);
+      return new Response('{}', { status: 200 });
+    });
+    app._sendInputAsync('session-1', 'before');
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    await waitForCalls(delivered, 3);
+    expect(delivered).toEqual(['before', 'S-Enter', 'after']);
+    expect(bodies.map((b) => [b.key || b.input, b.seq])).toEqual([
+      ['before', 1],
+      ['before', 11],
+      ['S-Enter', undefined],
+      ['after', 13],
+    ]);
+  });
+
+  it('keeps every split-paste chunk and the following key in place during HTTP sequence repair', async () => {
+    const app = makeApp();
+    const before = 'x'.repeat(64 * 1024) + 'tail';
+    const delivered: string[] = [];
+    global.fetch = vi.fn(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.seq === 1)
+        return new Response('{}', {
+          status: 200,
+          headers: {
+            'x-codeman-input-ack': JSON.stringify({ seq: 1, dup: true, last: 10 }),
+          },
+        });
+      delivered.push(body.key || body.input);
+      return new Response('{}', { status: 200 });
+    });
+    app._sendInputAsync('session-1', before);
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    const records = [...app._pendingDeliveries.get('session-1')!];
+    await waitForCalls(delivered, 4);
+    expect(delivered).toEqual(['x'.repeat(64 * 1024), 'tail', 'S-Enter', 'after']);
+    expect(records.map((r) => r.seq)).toEqual([11, 12, 13, 14]);
+    expect(records[1].data).toBe('tail');
+  });
+
+  it('does not replay HTTP input after an unknown send followed by a duplicate ACK', async () => {
+    const app = makeApp();
+    const delivered: string[] = [];
+    let attempts = 0;
+    global.fetch = vi.fn(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      if (body.input === 'before') {
+        if (++attempts === 1) {
+          delivered.push(body.input);
+          throw new Error('response lost after delivery');
+        }
+        return new Response('{}', {
+          status: 200,
+          headers: {
+            'x-codeman-input-ack': JSON.stringify({ seq: body.seq, dup: true, last: 1 }),
+          },
+        });
+      }
+      delivered.push(body.key || body.input);
+      return new Response('{}', { status: 200 });
+    });
+    app._sendInputAsync('session-1', 'before');
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    await new Promise((r) => setTimeout(r, 0));
+    app._drainSession('session-1');
+    await waitForCalls(delivered, 3);
+    expect(delivered).toEqual(['before', 'S-Enter', 'after']);
+    expect(attempts).toBe(2);
+  });
+
+  it('a late HTTP ACK names the sent sequence and cannot delete a record repaired by a socket ACK', async () => {
+    const app = makeApp();
+    const delivered: string[] = [];
+    const requests: number[] = [];
+    let release: () => void = () => {};
+    global.fetch = vi.fn(async (_url, init) => {
+      const body = JSON.parse(String(init?.body));
+      requests.push(body.seq);
+      if (body.seq === 1)
+        await new Promise<void>((resolve) => {
+          release = resolve;
+        });
+      else delivered.push(body.key || body.input);
+      return new Response('{}', { status: 200 });
+    });
+    app._sendInputAsync('session-1', 'before');
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    app._onWsInputAck(1, { dup: true, last: 10 }, 'session-1');
+    expect(requests).toEqual([1]); // the existing POST retains backpressure ownership
+    release();
+    await waitForCalls(delivered, 3);
+    expect(delivered).toEqual(['before', 'S-Enter', 'after']);
+    expect(requests).toEqual([1, 11, undefined, 13]);
+  });
+
+  it('retries a certified not-sent key, holding subsequent text in order even with an open socket', async () => {
+    const app = makeApp();
+    const sent: string[] = [];
+    app._ws = { readyState: 1, send: (d) => sent.push(JSON.parse(d).d) };
+    app._wsSessionId = 'session-1';
+    let reserved = true;
+    const keys: string[] = [];
+    global.fetch = vi.fn(async (_url, init) => {
+      const key = JSON.parse(String(init?.body)).key;
+      keys.push(key);
+      if (reserved) return busy();
+      sent.push(key === 'S-Enter' ? '\x1b\r' : '\n');
+      return new Response('{}', { status: 200 });
+    });
+    app._sendInputAsync('session-1', 'before');
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    expect(sent).toEqual(['before']);
+    expect(keys).toEqual([]); // waits for the prior text's ACK
+    app._onWsInputAck(1, {}, 'session-1');
+    await waitForCalls(keys, 1);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(sent).toEqual(['before']);
+    expect(app._pendingDeliveries.get('session-1')?.map((r) => r.key || r.data)).toEqual(['S-Enter', 'after']);
+    // Typing again during the retry delay cannot bypass the key or spam retries.
+    app._drainSession('session-1');
+    expect(keys).toEqual(['S-Enter']);
+    reserved = false;
+    app._pendingDeliveries.get('session-1')![0].retryAt = 0;
+    app._drainSession('session-1');
+    await waitForCalls(keys, 2);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(keys).toEqual(['S-Enter', 'S-Enter']);
+    expect(sent).toEqual(['before', '\x1b\r', 'after']);
+  });
+
+  it.each(['network', '500', 'untagged-422'])('never replays a key after an unknown %s outcome', async (failure) => {
+    const app = makeApp();
+    const requests: string[] = [];
+    global.fetch = vi.fn(async (url) => {
+      requests.push(String(url));
+      if (String(url).endsWith('/send-key')) {
+        if (failure === 'network') throw new Error('response lost');
+        return new Response('{}', { status: failure === '500' ? 500 : 422 });
+      }
+      return new Response('{}', { status: 200 });
+    });
+    app._sendNamedKey('session-1', 'C-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    await new Promise((r) => setTimeout(r, 0));
+    app._drainSession('session-1');
+    expect(requests).toEqual(['/api/sessions/session-1/send-key']);
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'error');
+  });
+
+  it.each(['S-Enter', 'C-Enter'])(
+    'cancels a certified-unsent %s and its dependent text on owner destruction',
+    async (key) => {
+      const app = makeApp();
+      const owner = {};
+      const requests: string[] = [];
+      global.fetch = vi.fn(async (url) => {
+        requests.push(String(url));
+        return String(url).endsWith('/send-key') ? busy() : new Response('{}', { status: 200 });
+      });
+      app._sendNamedKey('session-1', key, owner);
+      app._sendInputAsync('session-1', 'after');
+      await waitForCalls(requests, 1);
+      await new Promise((r) => setTimeout(r, 0));
+      expect(app._pendingDeliveries.get('session-1')![0].retryAt).toBeGreaterThan(0);
+      app._cancelPendingKeys(owner);
+      app._drainSession('session-1');
+      await new Promise((r) => setTimeout(r, 0));
+      expect(requests).toEqual(['/api/sessions/session-1/send-key']);
+      expect(app._pendingDeliveries.has('session-1')).toBe(false);
+      expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('cancelled'), 'warning');
+      expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'warning');
+    }
+  );
+
+  it('keeps preceding text and another session when a tab change cancels an unattempted newline', () => {
+    const app = makeApp();
+    const owner = {};
+    const frames: Frame[] = [];
+    app._ws = { readyState: 1, send: (data) => frames.push(JSON.parse(data)) };
+    app._wsSessionId = 'session-1';
+    app._sendInputAsync('session-1', 'before');
+    app._sendNamedKey('session-1', 'S-Enter', owner);
+    app._sendInputAsync('session-1', 'dependent');
+    // The old terminal's queue is independent of the newly selected session.
+    app.activeSessionId = 'session-2';
+    Reflect.set(app, '_extraInputSockets', new Map([['session-2', { ws: app._ws, lastRecvAt: Date.now() }]]));
+    app._sendInputAsync('session-2', 'unrelated');
+    const unrelated = app._pendingDeliveries.get('session-2')![0];
+    expect(app._pendingDeliveries.get('session-1')![1].tries).toBe(0);
+    app._cancelPendingKeys(owner);
+    expect(app._pendingDeliveries.get('session-1')?.map((rec) => rec.data)).toEqual(['before']);
+    expect(app._pendingDeliveries.get('session-2')).toEqual([unrelated]);
+    expect(frames.map((frame) => frame.d)).toEqual(['before', 'unrelated']);
+    app._onWsInputAck(1, {}, 'session-1');
+    app._drainSession('session-1');
+    expect(frames.map((frame) => frame.d)).toEqual(['before', 'unrelated']);
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+  });
+
+  it('keeps text after an acknowledged newline when its former owner is destroyed', async () => {
+    const app = makeApp();
+    const owner = {};
+    const keys: string[] = [];
+    global.fetch = vi.fn(async (_url, init) => {
+      keys.push(JSON.parse(String(init?.body)).key);
+      return new Response('{}', { status: 200 });
+    });
+    app._sendNamedKey('session-1', 'C-Enter', owner);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+    const frames: Frame[] = [];
+    app._ws = { readyState: 1, send: (data) => frames.push(JSON.parse(data)) };
+    app._wsSessionId = 'session-1';
+    app._sendInputAsync('session-1', 'after');
+    const after = app._pendingDeliveries.get('session-1')![0];
+    app._cancelPendingKeys(owner);
+    app._drainSession('session-1');
+    expect(keys).toEqual(['C-Enter']);
+    expect(frames.map((frame) => frame.d)).toEqual(['after']);
+    expect(app._pendingDeliveries.get('session-1')).toEqual([after]);
+    expect(app.showToast).not.toHaveBeenCalled();
+  });
+
+  it.each([400, 404, 410, 413])('refuses dependent text when the key receives HTTP %s', async (status) => {
+    const app = makeApp();
+    const requests: string[] = [];
+    global.fetch = vi.fn(async (url) => {
+      requests.push(String(url));
+      return new Response('{}', { status: String(url).endsWith('/send-key') ? status : 200 });
+    });
+    app._sendNamedKey('session-1', 'S-Enter', {});
+    app._sendInputAsync('session-1', 'after');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(requests).toEqual(['/api/sessions/session-1/send-key']);
+    expect(app._pendingDeliveries.has('session-1')).toBe(false);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('following input not sent'), 'error');
+  });
+
+  it.each(['expired', 'attempts'])('bounds certified retries by %s and reports the unsent key', async (bound) => {
+    const app = makeApp();
+    const requests: string[] = [];
+    global.fetch = vi.fn(async (url) => {
+      requests.push(String(url));
+      return busy();
+    });
+    app._sendNamedKey('session-1', 'C-Enter', {});
+    await waitForCalls(requests, 1);
+    await new Promise((r) => setTimeout(r, 0));
+    app._sendInputAsync('session-1', 'after');
+    const key = app._pendingDeliveries.get('session-1')![0];
+    key.retryAt = 0;
+    if (bound === 'expired') key.ts = Date.now() - 30000;
+    else key.tries = 16;
+    app._drainSession('session-1');
+    expect(requests).toHaveLength(1);
+    expect(app._pendingDeliveries.get('session-1')).toBeUndefined();
+    expect(app.showToast).toHaveBeenCalledWith(
+      expect.stringContaining('key not sent; following input not sent'),
+      'error'
+    );
   });
 });
 

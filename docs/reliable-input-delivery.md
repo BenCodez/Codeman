@@ -4,7 +4,7 @@
 
 With local echo on, pressing Enter cleared the overlay and then sent the prompt
 over the WebSocket **fire-and-forget** (`ws.send({t:'i',d})`). On a flaky link
-(e.g. a moving train) the socket is frequently *half-open*: `readyState === OPEN`
+(e.g. a moving train) the socket is frequently _half-open_: `readyState === OPEN`
 so `ws.send()` does **not** throw, but the underlying TCP is dead, so the frame is
 silently discarded. Nothing was enqueued (the send "succeeded"), the on-screen
 prompt was already wiped, and `navigator.onLine` stays `true` — so a long typed
@@ -12,29 +12,60 @@ prompt vanished with no trace and no resend.
 
 ## The guarantee
 
-Every byte of user input is **recorded durably before delivery** and **only
-dropped once the server ACKs it** — so a half-open socket, a reconnect, or a page
-reload can never lose input. Redelivery is **exactly-once**: the server applies
-each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
+Ordinary input is queued and persisted before delivery, and remains pending
+until the server ACKs or permanently refuses it. A half-open socket or reconnect
+replays its exact `(clientId, seq)` identity. The server applies that identity at
+most once while its dedup state remains available. Storage failures, backlog
+limits, and uncertain newline boundaries limit cross-reload durability as
+explained below.
 
 ## How it works
 
 ### Client (`app.js`)
 
-- A stable **`clientId`** (`localStorage['codeman:clientId']`) identifies this
-  browser to the server's dedup across reconnects and reloads.
-- Each input frame gets a **monotonic per-session `seq`**. Frame records
-  (`{seq,data,useMux,ts,tries,sentAt}`) live in `_pendingDeliveries`
-  (`Map<sessionId, record[]>`), persisted (debounced, + flushed on `pagehide`/
-  `visibilitychange`) to `localStorage['codeman:pendingInput']`. The seq counters
-  persist too, so seqs stay monotonic across reloads (never reset — a reset would
-  let the server treat fresh input as an already-applied duplicate).
+- Every document creates a fresh **`clientId`**, even after reload or duplicating
+  a window whose `sessionStorage` was copied. Its per-session sequences start at
+  one. New input never borrows another window's sequence counter.
+- Each frame keeps its original `(clientId, sessionId, seq)` in an **immutable
+  localStorage record**. A window appends only its own new records and removes
+  only an exact acknowledged occurrence or a deliberately cancelled suffix.
+  Pagehide never replaces a browser-wide snapshot, so one window cannot erase
+  another window's pending input or resurrect its acknowledged records.
+- On reload, recovery reads pending records from **all windows**, retaining each
+  original identity and sequence order. Another live window may still retry the
+  same occurrence; server deduplication prevents another application. Recovered
+  identities use serialized HTTP, whose response identifies the exact request.
+  WebSocket ACKs contain only a sequence, so that socket carries only the current
+  document's identity. Recovered frames always remain uncertain and cannot be
+  assigned fresh replay identities.
+- New records name their pending predecessor, separately from wall-clock timestamps.
+  Recovery preserves those causal edges and each original CID sequence; a missing
+  legacy timestamp or backwards clock cannot move a suffix before its prefix.
+  A quarantined predecessor never counts as an acknowledged occurrence.
+- Named newline keys are never replayed after reload. Their saved barriers, or
+  malformed records, refuse dependent suffixes and other imported partitions
+  for that same session. Other sessions remain recoverable. Recovery bounds
+  storage enumeration to 8192 keys, 4096 frames and the 256 KiB backlog, checks
+  the index repeatedly, and verifies captured bytes before publishing a queue.
+  A changing or unverifiable snapshot refuses replay and leaves its bytes intact.
+- Verified session removal forgets only exact loaded occurrences. Quarantined
+  key/suffix or unreadable evidence remains intact rather than allowing partial
+  deletion to release a dependent suffix. These records can consume the bounded
+  browser recovery capacity; they are never automatically replayed as new input.
+- Legacy whole-map snapshots are read-only. Verified legacy identities retain
+  their original bytes and use bounded, exact-occurrence ACK markers (at most 4096) so another window cannot recreate acknowledged legacy input. Uncertain
+  key barriers are retained. Missing/mismatched identities or unsupported
+  snapshot versions refuse replay with feedback.
+- Disabled/full storage keeps in-memory delivery available and reports that the
+  window must remain open. No durable suffix is written behind a failed prefix.
+  Existing records belonging to other windows are retained. Sequence exhaustion
+  still refuses new frames and sequence repair without resetting an identity.
 - **Delivery** (`_drainSession`):
-  - **WS path** — when the socket is `OPEN` for the session, send each not-yet-sent
+  - **WS path** — when the socket is `OPEN` for the session and its current-document CID owns the head, send each not-yet-sent
     record (`sentAt === 0`) in seq order over the single ordered stream. Records
     stay pending until the server's `{t:'ia',seq}` ACK removes them.
-  - **POST path** — when no WS, POST records in order, awaiting each (the HTTP 2xx
-    *is* the ACK). A 404/410 (session gone) drops the record rather than retry
+  - **POST path** — when no WS or a recovered CID owns the head, POST records in order, awaiting each (the HTTP 2xx
+    _is_ the ACK). A 404/410 (session gone) drops the record rather than retry
     forever.
 - **Half-open recovery** (`_redeliverSweep`, every 2s): if the active WS session's
   oldest record is unacked past `_reliableAckTimeoutMs` (4s), the socket is assumed
@@ -45,26 +76,41 @@ each `(clientId, seq)` at most once, so a resend can't type the prompt twice.
 
 ### Server
 
-- **`Session.shouldApplyInput(clientId, seq)`** — returns `true` exactly once per
-  `(clientId, seq)`: the first time a seq strictly greater than that client's
-  last-applied is seen. A replayed/lower seq returns `false`. Bounded MRU map
-  (`MAX_INPUT_DEDUP_CLIENTS = 256`).
+- **Session admission and commit** — `deferInputSeq` remembers received identities,
+  including frames rejected during recovery or named-key delivery, without moving
+  the applied watermark. `shouldApplyInput` admits only the earliest received
+  uncommitted identity for that client. A lock that clears halfway through a burst
+  therefore cannot let later frames overtake earlier retries. `commitInputSeq`
+  seals completed byte dispatch before submission listeners run; known unsent
+  failure releases admission while retaining its FIFO slot. Unknown partial sends
+  remain sealed so a retry cannot duplicate their effects. The owner bounds state
+  to 256 clients and 4096 received identities per client, refuses overflow with
+  feedback, and never evicts an undelivered identity.
 - **WS route** (`ws-routes.ts`) — parses optional `cid`/`seq` on `{t:'i'}`; applies
-  via `shouldApplyInput`. An applied frame is ACKed with `{t:'ia',seq}`; a duplicate is
+  via `shouldApplyInput`. Pending/blocked frames are not ACKed. An applied frame is ACKed with `{t:'ia',seq}`; a duplicate is
   ACKed as `{t:'ia',seq,dup:true,last:<watermark>}`, where `last` is the server's
   highest applied seq for that `clientId` (`Session.lastInputSeq`). The client drops
-  the record either way, and on `dup` it lifts its own counter to `last` first and
-  re-sends a FIRST-attempt record (a retry being called a duplicate is the mechanism
-  working: the original landed). Without `last`, a tab killed between a send and the
+  an applied record; on `dup` it lifts its own counter to `last` first and
+  repairs a fresh FIRST-attempt record's sequence **in its existing FIFO position**,
+  also renumbering later never-attempted records in place. Attempted records keep
+  their identities until their own ACK certifies rejection. A newline barrier
+  therefore cannot overtake the rejected text. A retry being called a duplicate
+  confirms that the original landed. Without `last`, a tab killed between a send and the
   persisted counter write came back counting BELOW the server's watermark, and every
   later keystroke was dropped-but-ACKed: a silently dead terminal a reload could not
   fix, since the stale counter was restored from localStorage too. The client now
-  persists the counter synchronously on every send for the same reason. Untagged
+  retains each original replay identity and starts a fresh document CID for new input. Untagged
   frames apply unconditionally (no behavior change).
 - **POST route** (`/api/sessions/:id/input`) — optional `seq`/`clientId` in
   `SessionInputWithLimitSchema`; a deduped duplicate returns 200 without writing
-  (the 200 is the client's ACK). `curl`/legacy callers omit the fields and always
-  apply.
+  (the 200 is the client's ACK), with an `x-codeman-input-ack` header carrying
+  `{seq,dup:true,last}` through the same client ACK handler. Headers avoid adding
+  a body-read dependency to ordinary input delivery. `curl`/legacy callers omit
+  the fields and always apply. Tagged known-unsent or still-pending deliveries
+  return 422; a 2xx never acknowledges those reservations. Both transports pass
+  the optional internal `SessionWriteOptions.inputSeq` identity to the write
+  boundary, so an exception after bytes land cannot reopen the identity or trigger
+  a fallback write.
 
 ## Oversized input (issue #484)
 
@@ -93,9 +139,33 @@ input for the session, and came back from localStorage on each reload.
 
 ## Known limitation
 
+Shift/Ctrl+Enter use `/send-key`, whose CLI-specific hex chord has no server
+deduplication contract. Both terminal implementations put these keys in the same
+input queue as an HTTP ordering barrier: earlier text must be acknowledged and
+later text waits. Only a recovery reservation's `422` response with
+`retryable:true` and `notSent:true` permits a retry (at most 16 attempts within
+30 seconds, with a 1-second minimum retry delay). Key requests have a 10-second
+deadline. A permanent refusal, expired retry budget, or unknown key outcome
+refuses the dependent suffix with feedback; it cannot join text from opposite
+sides of the missing newline. Explicit terminal teardown also refuses the dependent suffix when cancelling a
+never-attempted or certified-not-sent key; an in-flight key with an uncertain
+outcome remains sealed with its suffix. Snapshots preserve named-key
+ordering markers. Reload never replays a key: it refuses that barrier and its
+dependent suffix with a warning while preserving preceding ordinary text and
+sequence counters. Legacy snapshots omitted keys, so only their contiguous
+prefix beginning at sequence 1 proves the absence of a missing key. Disabled or
+full browser storage and backlogs over 256 KiB can lose cross-reload durability;
+the live queue remains available.
+
+Each live Session retains at most 256 client ledgers. Evicted committed identities
+remain in a fixed 16 KiB rejection-only filter: a possible collision refuses input
+rather than reopening an old receipt. Existing live clients continue normally, and
+abandoned identities that never dispatched input can be reclaimed. This rejection
+history has the same live-Session lifetime as the original counters.
+
 Dedup state is in-memory on the server. A **server restart** between a write and
 the client's redelivery of that same seq could re-apply it (a rare duplicate).
-This is a deliberate trade-off: favor *never losing input* over a rare duplicate
+This is a deliberate trade-off: favor _never losing input_ over a rare duplicate
 across the narrow restart window.
 
 ## Tests
@@ -104,5 +174,7 @@ across the narrow restart window.
   semantics (monotonic, per-client, gap-tolerant, eviction-safe).
 - `test/routes/session-routes.test.ts` — POST `/input` applies a tagged
   `(clientId, seq)` once on redelivery; untagged input always applies.
+- `test/reliable-input-reload.test.ts` — response-loss replay identity, failed
+  attempt persistence, legacy snapshots, and unreplayable newline barriers.
 - `test/input-size-limit.test.ts`: one input limit on both sides, frame
   splitting, and dropping (never retrying) a frame refused for good (#484).

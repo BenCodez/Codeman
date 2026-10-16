@@ -263,12 +263,20 @@ describe('Session promptSubmitted', () => {
     (session as unknown as { _mux: unknown; _muxSession: unknown })._mux = { sendInput };
     (session as unknown as { _mux: unknown; _muxSession: unknown })._muxSession = { sessionId: session.id };
 
-    expect(await session.writeViaMux('dropped\r', { fromUser: true })).toBe(false);
+    await expect(session.writeViaMux('dropped\r', { fromUser: true })).rejects.toThrow(
+      'Mux input delivery could not be confirmed'
+    );
+    expect(sendInput.mock.calls).toEqual([[session.id, 'dropped\r']]);
     expect(prompts).toEqual([]);
     sendInput.mockResolvedValue(true);
     expect(await session.writeViaMux('delivered\r', { fromUser: true })).toBe(true);
     expect(prompts).toEqual(['delivered']);
     expect(await session.writeViaMux('/clear\r')).toBe(true);
     expect(prompts).toEqual(['delivered']);
+    expect(sendInput.mock.calls).toEqual([
+      [session.id, 'dropped\r'],
+      [session.id, 'delivered\r'],
+      [session.id, '/clear\r'],
+    ]);
   });
 });

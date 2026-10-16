@@ -722,7 +722,7 @@ describe('Codex quick start settings', () => {
     });
   });
 
-  it('passes global Codex settings into quick-start config for new sessions', async () => {
+  it('leaves synced Codex isolation defaults to the server when creating sessions', async () => {
     const elements: Record<string, any> = {
       quickStartCase: { value: 'codex-case' },
       tabCount: { value: '1' },
@@ -760,6 +760,8 @@ describe('Codex quick start settings', () => {
     app.loadAppSettingsFromStorage = () => ({
       codexDangerouslyBypassApprovals: true,
       codexAnimationsEnabled: false,
+      codexNoDaemon: true,
+      codexNoAltScreen: true,
     });
     app.getCaseSettings = () => ({});
     app.buildEnvOverrides = () => ({});
@@ -778,8 +780,15 @@ describe('Codex quick start settings', () => {
       mode: 'codex',
       // tabs follow the w<n>-<case> naming convention (quick-start would otherwise auto-name codeman-<id>)
       sessionName: 'w1-codex-case',
-      codexConfig: { dangerouslyBypassApprovals: true, animations: false, renderMode: 'hybrid' },
+      codexConfig: {
+        dangerouslyBypassApprovals: true,
+        animations: false,
+        renderMode: 'hybrid',
+      },
     });
+    const config = requests.find((req) => req.url === '/api/quick-start')?.body.codexConfig;
+    expect(config).not.toHaveProperty('noDaemon');
+    expect(config).not.toHaveProperty('noAltScreen');
     expect(selected).toEqual(['sess-1']);
   });
 });

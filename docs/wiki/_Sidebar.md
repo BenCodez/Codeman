@@ -26,6 +26,7 @@
 - [Notifications & Approvals](Notifications-And-Approvals)
 - [Cron Jobs](Cron-Jobs)
 - [Autonomous Loops](Autonomous-Loops)
+- [Codex Supervisor](Codex-Supervisor)
 - [Watching Agents Work](Watching-Agents-Work)
 
 **Where it runs**

@@ -1175,7 +1175,8 @@ function resolveTerminalFontWeights(settings) {
 // ---------------------------------------------------------------------------
 
 /**
- * Largest single input frame the server accepts, in UTF-16 code units.
+ * Largest single input frame the server accepts, in UTF-8 bytes.
+ * The exported *_CHARS name is retained for existing frontend callers.
  * ⚠️ Must equal MAX_INPUT_LENGTH in src/config/terminal-limits.ts (pinned by
  * test/input-size-limit.test.ts). Both transports reject a longer frame, and
  * before issue #484 the durable input queue retried such a frame forever.
@@ -1184,36 +1185,48 @@ const INPUT_FRAME_MAX_CHARS = 64 * 1024;
 
 /**
  * Largest paste the client will deliver at all. Anything up to this is split
- * into INPUT_FRAME_MAX_CHARS frames that go out in seq order, so the PTY sees
+ * into INPUT_FRAME_MAX_CHARS byte-bounded frames that go out in seq order, so the PTY sees
  * one contiguous byte stream (bracketed-paste markers included). Past it the
  * input is refused with a toast rather than queued: every frame is persisted
  * and retried until ACKed, so a multi-megabyte paste would pin the queue.
  */
 const INPUT_PASTE_MAX_CHARS = 1024 * 1024;
 
+/** UTF-8 replacement semantics match the server's Buffer.byteLength. */
+function inputUtf8Length(data) {
+  let bytes = 0;
+  for (const char of data) {
+    const point = char.codePointAt(0);
+    bytes += point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+  }
+  return bytes;
+}
+
 /**
- * Split input into frames no longer than `max` code units, never cutting a
- * surrogate pair in half (a lone surrogate reaches the PTY as U+FFFD).
+ * Split input into UTF-8 byte-bounded frames, preserving exact text and whole
+ * surrogate pairs (a lone surrogate reaches the PTY as U+FFFD).
  *
  * @param {string} data
- * @param {number} [max]
+ * @param {number} [max] UTF-8 byte budget; at least one Unicode scalar fits.
  * @returns {string[]}
  */
 function splitInputFrames(data, max = INPUT_FRAME_MAX_CHARS) {
   if (typeof data !== 'string' || data.length === 0) return [];
-  if (!(max >= 2)) max = 2;
-  if (data.length <= max) return [data];
+  if (!(max >= 4)) max = 4;
   const frames = [];
-  let start = 0;
-  while (start < data.length) {
-    let end = Math.min(start + max, data.length);
-    if (end < data.length) {
-      const code = data.charCodeAt(end - 1);
-      if (code >= 0xd800 && code <= 0xdbff) end--; // keep the pair together
+  let start = 0, offset = 0, bytes = 0;
+  for (const char of data) {
+    const point = char.codePointAt(0);
+    const width = point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+    if (bytes + width > max) {
+      frames.push(data.slice(start, offset));
+      start = offset;
+      bytes = 0;
     }
-    frames.push(data.slice(start, end));
-    start = end;
+    bytes += width;
+    offset += char.length;
   }
+  if (offset > start) frames.push(data.slice(start));
   return frames;
 }
 
@@ -1473,6 +1486,7 @@ if (typeof window !== 'undefined') {
     FRAME_MAX_CHARS: INPUT_FRAME_MAX_CHARS,
     PASTE_MAX_CHARS: INPUT_PASTE_MAX_CHARS,
     split: splitInputFrames,
+    bytes: inputUtf8Length,
   };
   window.CodemanAutoCopy = {
     decide: decideAutoCopy,
@@ -1632,6 +1646,8 @@ const SSE_EVENTS = {
   SESSION_INTERACTIVE: 'session:interactive',
   SESSION_RUNNING: 'session:running',
   SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
+  SESSION_RECOVERY: 'session:recovery',
+  SESSION_TASK: 'session:task',
 
   // Scheduled runs
   SCHEDULED_CREATED: 'scheduled:created',
