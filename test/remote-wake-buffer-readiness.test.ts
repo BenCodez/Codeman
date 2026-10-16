@@ -245,6 +245,25 @@ it('preserves an accepted FIFO when wake configuration disappears while TCP read
   expect(f.session.writeViaMux).not.toHaveBeenCalled();
 });
 
+it('keeps a failed empty attachment gated after settings removal and later flushes the accepted FIFO', async () => {
+  const f = fixture();
+  f.session.confirmRemoteWakeReady.mockResolvedValue(false);
+  f.release();
+  expect(await f.registry.wake(f.session)).toBe(false);
+  f.session.remote.wakeCommand = '';
+  expect(await f.registry.hasWakeTarget(f.session)).toBe(false);
+  expect(await f.registry.requiresInputReadiness(f.session)).toBe(true);
+  expect(await f.registry.handleInput(f.session, 'first')).toBe('buffered');
+  expect(await f.registry.handleInput(f.session, 'second')).toBe('buffered');
+  expect(await f.registry.ensureAwake(f.session)).toBe(false);
+  expect(f.session.writeViaMux).not.toHaveBeenCalled();
+  f.session.remote.wakeCommand = 'fake-wake';
+  f.session.confirmRemoteWakeReady.mockResolvedValue(true);
+  expect(await f.registry.ensureAwake(f.session)).toBe(true);
+  expect(f.session.writeViaMux.mock.calls.map(([data]) => data)).toEqual(['first', 'second']);
+  expect(f.registry.pendingBytes(f.session.id)).toBe(0);
+});
+
 it('send-and-wait joins a held attachment proof even when its target configuration is removed', async () => {
   const f = fixture();
   let releaseProof!: (ready: boolean) => void;

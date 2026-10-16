@@ -2393,6 +2393,7 @@ export class Session extends EventEmitter {
   private _remoteWakeReady?: () => boolean;
   private _remoteWakeReadinessWork?: Promise<boolean>;
   private _remoteWakeReadinessRevision = 0;
+  private _remoteWakeAttachmentReady?: boolean;
   private readonly _remoteBrokerRecords = new WeakSet<MuxSession>();
 
   /** Stable private scope across acknowledged owner input, without exposing environment values. */
@@ -2615,6 +2616,12 @@ export class Session extends EventEmitter {
       !this._remote || this._remote.owned === false || getCli(this.mode)?.capabilities.recovery !== 'codex-rollout'
     );
   }
+
+  /** Only a completed wake/reattach proof may release this sticky input veto. */
+  setRemoteWakeAttachmentReady(ready: boolean): void {
+    this._remoteWakeAttachmentReady = ready;
+    if (!ready) this._submitVerifier?.cancel();
+  }
   private _ownedInputTail: Promise<unknown> = Promise.resolve();
   private _ownedInputQueued = 0;
   private _ownedInputBytes = 0;
@@ -2628,7 +2635,9 @@ export class Session extends EventEmitter {
 
   /** Queued owner input must not cross closing, stopped or pane-lifecycle boundaries. */
   get inputDispatchAllowed(): boolean {
-    return !this._closing && !this._isStopped && this._paneLifecycleOps === 0;
+    return (
+      !this._closing && !this._isStopped && this._paneLifecycleOps === 0 && this._remoteWakeAttachmentReady !== false
+    );
   }
 
   get recoveryInputReserved(): boolean {
@@ -2701,6 +2710,7 @@ export class Session extends EventEmitter {
       this._noteRejectedOwnedInput(options);
       return false;
     }
+    if (!taintOnly && this._remoteWakeAttachmentReady === false) return false;
     if (this._ownedInputQueued >= 256 || this._ownedInputBytes + bytes > 2_097_152) return false;
     this._ownedInputQueued++;
     this._ownedInputBytes += bytes;
@@ -2712,6 +2722,7 @@ export class Session extends EventEmitter {
           this._isStopped ||
           this._paneLifecycleOps !== lifecycle ||
           (!taintOnly && lifecycle > 0) ||
+          (!taintOnly && this._remoteWakeAttachmentReady === false) ||
           epoch !== this._paneStartedAt ||
           scope !== this._identityInputScope()
         )
@@ -2765,6 +2776,7 @@ export class Session extends EventEmitter {
       !this._isStopped &&
       this._paneLifecycleOps === lifecycle &&
       (taintOnly || lifecycle === 0) &&
+      (taintOnly || this._remoteWakeAttachmentReady !== false) &&
       epoch === this._paneStartedAt &&
       generation === this._recoveryGeneration &&
       scope === this._identityInputScope() &&
@@ -2895,7 +2907,7 @@ export class Session extends EventEmitter {
           return false;
         }
       }
-      if (this.paneExit) return false;
+      if (this.paneExit || !this.inputDispatchAllowed) return false;
       this._consumePreparedRecoveryInput(data, { fromUser: true });
       const submitted = this._trackSubmit(data, { fromUser: true });
       if (abort.signal.aborted) return false;
@@ -6353,6 +6365,7 @@ export class Session extends EventEmitter {
         return false;
       }
       if (this._rejectUnavailableTaggedInput(options)) return false;
+      if (!this.inputDispatchAllowed) return false;
       const submittedPrompt = this._trackSubmit(data, options);
       try {
         this.ptyProcess.write(input);
@@ -6888,6 +6901,7 @@ export class Session extends EventEmitter {
       return false;
     }
     if (this._rejectUnavailableTaggedInput(options)) return false;
+    if (!this.inputDispatchAllowed) return false;
     const submittedPrompt = this._trackSubmit(data, options, viaMux);
     if (this._mux && this._muxSession) {
       let sent: boolean;
