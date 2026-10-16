@@ -35,6 +35,8 @@ export interface SessionPort {
     saved: SessionState,
     phase: 'before-spawn' | 'after-spawn',
     options?: {
+      /** Reboot-only environment already rebuilt and bound to its final launch witness. */
+      rebootCustomModelEnv?: Record<string, string>;
       /**
        * Re-arm a PENDING auto-resume schedule from the record's `autoResumeAt`.
        * Default true, which is what a Codeman restart wants: the limit footer
