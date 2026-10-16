@@ -201,10 +201,15 @@ def refs_unknown(value):
         if refs_unknown(v): return True
     return False
 
+# Main state includes bounded session attachment histories in both public/private
+# forms. Its larger finite read budget never applies to journals or receipts.
+def metadata_limit(name):
+    return 33554432 if name in ('state.json','state.json.bak') else 2097152
+
 def metadata(datafd, inc):
     captured=[]
     for name, optional in [('state.json',False),('state.json.bak',True),('mux-sessions.json',False),('recovery.json',True),('reboot-restore-offer.json',True)]:
-        try: data,sig,digest=readat(datafd,name,2097152,False)
+        try: data,sig,digest=readat(datafd,name,metadata_limit(name),False)
         except FileNotFoundError:
             if not optional: raise
             captured.append((name,None,None)); continue
@@ -220,7 +225,7 @@ def same_metadata(datafd, captures):
             except FileNotFoundError: continue
             return False
         else:
-            _,current,hashed=readat(datafd,name,2097152,False)
+            _,current,hashed=readat(datafd,name,metadata_limit(name),False)
             if current!=sig or hashed!=digest: return False
     return True
 
