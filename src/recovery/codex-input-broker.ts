@@ -683,8 +683,12 @@ export class CodexInputBroker {
   /** Caller must certify that no native broker dispatch was attempted. */
   async rollbackUnlaunchedProvisioning(): Promise<void> {
     const receipt = this.unlaunchedRollback;
-    this.unlaunchedRollback = undefined;
-    if (receipt) await rollbackCodexBrokerProvisioning(receipt).catch(() => {});
+    if (!receipt) return;
+    const captured = JSON.stringify(receipt);
+    if (await rollbackCodexBrokerProvisioning(receipt).catch(() => false)) {
+      if (this.unlaunchedRollback === receipt && JSON.stringify(receipt) === captured)
+        this.unlaunchedRollback = undefined;
+    }
   }
   static async load(
     directory: string,
