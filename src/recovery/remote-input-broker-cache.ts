@@ -46,6 +46,12 @@ type Preparation = {
   unlinked?: boolean;
   removed?: boolean;
 };
+type EmptyPreparation = {
+  entry: Entry;
+  epoch: CacheEpoch;
+  parents: Stats[];
+  created: Array<{ index: number; stat?: Stats; removing?: boolean; removed?: boolean }>;
+};
 type CleanupIntent = {
   version: 1 | 2;
   sessionId: string;
@@ -245,6 +251,7 @@ export class OwnedRemoteBrokerCache {
   private readonly epochs = new Map<string, CacheEpoch>();
   private readonly deletions = new Map<string, object>();
   private readonly preparations = new WeakMap<OwnedRemoteBrokerDescriptor, Preparation>();
+  private readonly emptyPreparations = new WeakMap<OwnedRemoteBrokerDescriptor, EmptyPreparation>();
   private readonly canceledPreparations = new Map<string, OwnedRemoteBrokerDescriptor>();
   private readonly preparingReceipts = new WeakSet<OwnedRemoteBrokerDescriptor>();
   constructor(
@@ -275,6 +282,7 @@ export class OwnedRemoteBrokerCache {
       if (
         key.startsWith(sessionId + ':') &&
         !this.preparations.get(receipt)?.unpublished &&
+        !this.emptyPreparations.has(receipt) &&
         !this.preparingReceipts.has(receipt)
       )
         this.canceledPreparations.delete(key);
@@ -853,11 +861,186 @@ export class OwnedRemoteBrokerCache {
   private directories(sessionId: string, incarnation: string): string[] {
     return [this.root, join(this.root, sessionId), join(this.root, sessionId, incarnation)];
   }
+  /** Empty/incomplete directories retain capacity across cache recreation too. */
+  private async checkIncompleteCapacity(sessionId: string): Promise<void> {
+    const sessionPath = join(this.root, sessionId);
+    let before: Stats;
+    try {
+      before = await fs.lstat(sessionPath);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (!privateStat(before, true)) throw Error('Unknown private cache parent');
+    const incomplete = new Set<string>();
+    const directory = await fs.opendir(sessionPath);
+    try {
+      let count = 0;
+      for await (const child of directory) {
+        if (++count > 1024) throw Error('Private cache inventory too large');
+        if (!UUID.test(child.name)) continue;
+        const path = join(sessionPath, child.name);
+        const info = await fs.lstat(path);
+        if (!privateStat(info, true)) throw Error('Unknown private cache incarnation');
+        let file: Stats | undefined;
+        try {
+          file = await fs.lstat(join(path, 'private.json'));
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        if (file && !privateStat(file)) throw Error('Unknown private cache material');
+        if (!file || file.size === 0) incomplete.add(sessionId + ':' + child.name);
+      }
+    } finally {
+      await directory.close().catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ERR_DIR_CLOSED') throw error;
+      });
+    }
+    const after = await fs.lstat(sessionPath);
+    if (!privateStat(after, true) || after.dev !== before.dev || after.ino !== before.ino)
+      throw Error('Private cache inventory replaced');
+    for (const key of [...this.entries.keys(), ...this.canceledPreparations.keys()])
+      if (key.startsWith(sessionId + ':')) incomplete.add(key);
+    if (incomplete.size > 2) throw Error('Private cache incarnation capacity exhausted');
+  }
+  private async discardEmptyPreparation(
+    scope: OwnedRemoteBrokerScope,
+    receipt: OwnedRemoteBrokerDescriptor,
+    prepared: EmptyPreparation
+  ): Promise<boolean> {
+    const key = scope.sessionId + ':' + receipt.incarnation;
+    const dirs = this.directories(scope.sessionId, receipt.incarnation);
+    const deadline = performance.now() + 2000;
+    const current = () =>
+      performance.now() < deadline &&
+      !this.deletions.has(scope.sessionId) &&
+      this.emptyPreparations.get(receipt) === prepared &&
+      this.canceledPreparations.get(key) === receipt &&
+      !this.preparingReceipts.has(receipt) &&
+      !this.entries.has(key) &&
+      !prepared.entry.signer &&
+      prepared.entry.epoch === prepared.epoch &&
+      prepared.entry.scope === scopeKey(scope) &&
+      Object.keys(receipt).length === Object.keys(prepared.entry.descriptor).length &&
+      Object.entries(prepared.entry.descriptor).every(
+        ([field, value]) => receipt[field as keyof OwnedRemoteBrokerDescriptor] === value
+      );
+    return (
+      (await bounded('discard-empty:' + dirs[2], async () => {
+        if (!current()) return false;
+        // The cache root is shared. Only positively-created session/incarnation
+        // directories are eligible; rmdir itself refuses every nonempty directory.
+        for (const created of prepared.created.filter((value) => value.index > 0).reverse()) {
+          const index = created.index,
+            expected = created.stat;
+          if (!expected) return false;
+          const parentRemoval = prepared.created.find((value) => value.index === index - 1);
+          if (parentRemoval?.removing) {
+            try {
+              await fs.lstat(dirs[index - 1]);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code === 'ENOENT') parentRemoval.removed = true;
+              else return false;
+            }
+          }
+          // Acknowledging the removed parent below subsumes its removed child's
+          // directory ACK; never reopen a nonexistent parent on a lost-ACK retry.
+          if (parentRemoval?.removed) {
+            if (!created.removed) return false;
+            continue;
+          }
+          if (!created.removed) {
+            let info: Stats | undefined;
+            try {
+              info = await fs.lstat(dirs[index]);
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || !created.removing) return false;
+            }
+            if (info) {
+              if (!privateStat(info, true) || info.dev !== expected.dev || info.ino !== expected.ino) return false;
+              const handle = await fs.open(
+                dirs[index],
+                constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+              );
+              let opened: Stats;
+              try {
+                opened = await handle.stat();
+                await handle.sync();
+              } finally {
+                await handle.close();
+              }
+              const proof = await Promise.all(dirs.slice(0, index + 1).map((path) => fs.lstat(path)));
+              if (
+                !current() ||
+                !privateStat(opened, true) ||
+                opened.dev !== expected.dev ||
+                opened.ino !== expected.ino ||
+                proof.some(
+                  (value, i) =>
+                    !privateStat(value, true) ||
+                    !prepared.parents[i] ||
+                    value.dev !== prepared.parents[i].dev ||
+                    value.ino !== prepared.parents[i].ino
+                )
+              )
+                return false;
+              created.removing = true;
+              await fs.rmdir(dirs[index]);
+            }
+            created.removed = true;
+          }
+          const parent = await fs.open(
+            dirs[index - 1],
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
+          );
+          try {
+            const info = await parent.stat(),
+              expectedParent = prepared.parents[index - 1];
+            if (
+              !current() ||
+              !expectedParent ||
+              !privateStat(info, true) ||
+              info.dev !== expectedParent.dev ||
+              info.ino !== expectedParent.ino
+            )
+              return false;
+            await parent.sync();
+          } finally {
+            await parent.close();
+          }
+          const parents = await Promise.all(dirs.slice(0, index).map((path) => fs.lstat(path)));
+          if (
+            !current() ||
+            parents.some(
+              (value, i) =>
+                !privateStat(value, true) ||
+                !prepared.parents[i] ||
+                value.dev !== prepared.parents[i].dev ||
+                value.ino !== prepared.parents[i].ino
+            )
+          )
+            return false;
+          try {
+            await fs.lstat(dirs[index]);
+            return false;
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+          }
+        }
+        if (!current()) return false;
+        this.emptyPreparations.delete(receipt);
+        this.canceledPreparations.delete(key);
+        return true;
+      })) === true
+    );
+  }
   /** Caller certifies no reservation/remote dispatch was attempted for this exact prepare receipt. */
   async discardUnreservedPreparation(
     scope: OwnedRemoteBrokerScope,
     receipt: OwnedRemoteBrokerDescriptor
   ): Promise<boolean> {
+    const empty = this.emptyPreparations.get(receipt);
+    if (empty) return this.discardEmptyPreparation(scope, receipt, empty);
     const prepared = this.preparations.get(receipt),
       key = scope.sessionId + ':' + receipt.incarnation;
     const current = () =>
@@ -989,6 +1172,7 @@ export class OwnedRemoteBrokerCache {
   /** Reservation/dispatch permanently ends local known-unsent rollback authority. */
   sealPreparation(receipt: OwnedRemoteBrokerDescriptor): void {
     this.preparations.delete(receipt);
+    this.emptyPreparations.delete(receipt);
   }
   /** O_EXCL only, after missing/inert remote provisioning and before any broker child launch. */
   async prepare(
@@ -1035,6 +1219,7 @@ export class OwnedRemoteBrokerCache {
     let ownedFile: Stats | undefined;
     let rollbackBytes = bytes;
     const ownedParents: Stats[] = [];
+    const createdDirectories: EmptyPreparation['created'] = [];
     this.preparingReceipts.add(receipt);
     this.canceledPreparations.set(entryKey, receipt);
     try {
@@ -1042,11 +1227,18 @@ export class OwnedRemoteBrokerCache {
         'write:' + file + ':' + createHash('sha256').update(bytes).digest('hex') + ':' + epoch.id,
         async () => {
           try {
-            for (const path of dirs) {
-              await fs.mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-                if (error.code !== 'EEXIST') throw error;
-              });
+            await this.checkIncompleteCapacity(sessionId);
+            for (const [index, path] of dirs.entries()) {
+              let created: EmptyPreparation['created'][number] | undefined;
+              try {
+                await fs.mkdir(path, { mode: 0o700 });
+                created = { index };
+                createdDirectories.push(created);
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+              }
               const parent = await fs.lstat(path);
+              if (created) created.stat = parent;
               if (!privateStat(parent, true)) throw new Error('Private remote cache unavailable');
               ownedParents.push(parent);
             }
@@ -1102,6 +1294,9 @@ export class OwnedRemoteBrokerCache {
                 bytes: rollbackBytes,
                 unpublished: true,
               });
+              this.canceledPreparations.set(entryKey, receipt);
+            } else if (createdDirectories.some((value) => value.index > 0)) {
+              this.emptyPreparations.set(receipt, { entry, epoch, parents: ownedParents, created: createdDirectories });
               this.canceledPreparations.set(entryKey, receipt);
             } else if (this.canceledPreparations.get(entryKey) === receipt) {
               this.canceledPreparations.delete(entryKey);

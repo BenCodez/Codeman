@@ -1174,3 +1174,25 @@ describe('task server events refresh clean sibling sections', () => {
     expect(h.get('taskPhase').textContent).toBe('Blocked');
   });
 });
+
+it('disables Pause for a completed enabled task while preserving Pause for unfinished work', async () => {
+  const initial = {
+    ...state(),
+    outcome: 'completed',
+    phase: 'completed',
+    config: { ...state().config, enabled: true },
+  };
+  const h = harness(initial);
+  await h.open();
+  expect(h.get('taskPauseBtn').disabled).toBe(true);
+  expect(h.get('taskResumeBtn').disabled).toBe(true);
+  await h.app.taskAction('pause');
+  expect(h.app._apiJson).toHaveBeenCalledOnce();
+  expect(h.get('taskPhase').textContent).toBe('Completed');
+  h.app._onSessionTask({ sessionId: 'a', state: { ...initial, outcome: 'unfinished', phase: 'watching' } });
+  expect(h.get('taskPauseBtn').disabled).toBe(false);
+  h.app._apiJson.mockResolvedValueOnce({ ...initial, outcome: 'unfinished', phase: 'paused' });
+  await h.app.taskAction('pause');
+  expect(h.app._apiJson).toHaveBeenLastCalledWith('/api/sessions/a/task/pause', { method: 'POST' });
+  expect(h.get('taskPhase').textContent).toBe('Paused');
+});
