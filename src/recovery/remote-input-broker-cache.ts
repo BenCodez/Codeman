@@ -41,6 +41,8 @@ type Preparation = {
   file: Stats;
   parents: Stats[];
   bytes: Buffer;
+  /** Completed private write that was never handed to a launch caller. */
+  unpublished?: boolean;
   unlinked?: boolean;
   removed?: boolean;
 };
@@ -244,6 +246,7 @@ export class OwnedRemoteBrokerCache {
   private readonly deletions = new Map<string, object>();
   private readonly preparations = new WeakMap<OwnedRemoteBrokerDescriptor, Preparation>();
   private readonly canceledPreparations = new Map<string, OwnedRemoteBrokerDescriptor>();
+  private readonly preparingReceipts = new WeakSet<OwnedRemoteBrokerDescriptor>();
   constructor(
     private readonly root = join(getDataDirPath(), 'remote-input-brokers'),
     private readonly remoteCleanup?: typeof cleanupRemoteBroker
@@ -266,8 +269,15 @@ export class OwnedRemoteBrokerCache {
   retire(sessionId: string): void {
     this.epochs.delete(sessionId);
     this.scopes.delete(sessionId);
-    for (const key of this.canceledPreparations.keys())
-      if (key.startsWith(sessionId + ':')) this.canceledPreparations.delete(key);
+    // Failed unpublished writes retain their exact rollback receipt even if
+    // retirement occurs while the filesystem job is still running.
+    for (const [key, receipt] of this.canceledPreparations)
+      if (
+        key.startsWith(sessionId + ':') &&
+        !this.preparations.get(receipt)?.unpublished &&
+        !this.preparingReceipts.has(receipt)
+      )
+        this.canceledPreparations.delete(key);
     for (const [key, entry] of this.entries) {
       if (!key.startsWith(sessionId + ':')) continue;
       entry.signer?.retire();
@@ -853,8 +863,9 @@ export class OwnedRemoteBrokerCache {
     const current = () =>
       !!prepared &&
       !this.deletions.has(scope.sessionId) &&
-      this.epochs.get(scope.sessionId) === prepared.epoch &&
-      this.entries.get(key) === prepared.entry &&
+      (prepared.unpublished
+        ? this.canceledPreparations.get(key) === receipt && !this.entries.has(key)
+        : this.epochs.get(scope.sessionId) === prepared.epoch && this.entries.get(key) === prepared.entry) &&
       prepared.entry.epoch === prepared.epoch &&
       prepared.entry.scope === scopeKey(scope) &&
       !prepared.entry.signer &&
@@ -893,10 +904,13 @@ export class OwnedRemoteBrokerCache {
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
       }
-      this.entries.delete(key);
+      if (this.entries.get(key) === prepared.entry) this.entries.delete(key);
       this.canceledPreparations.delete(key);
       this.preparations.delete(receipt);
-      if (![...this.entries.keys()].some((entry) => entry.startsWith(scope.sessionId + ':'))) {
+      if (
+        this.epochs.get(scope.sessionId) === prepared.epoch &&
+        ![...this.entries.keys()].some((entry) => entry.startsWith(scope.sessionId + ':'))
+      ) {
         this.scopes.delete(scope.sessionId);
         if (prepared.epoch.pending === 0) this.epochs.delete(scope.sessionId);
       }
@@ -1002,48 +1016,85 @@ export class OwnedRemoteBrokerCache {
     if (
       bytes.length > MAX_BYTES ||
       prior ||
+      this.canceledPreparations.has(entryKey) ||
       (this.scopes.has(scope.sessionId) && this.scopes.get(scope.sessionId) !== key) ||
-      [...this.entries.keys()].filter((entry) => entry.startsWith(scope.sessionId + ':')).length >= 2
+      [...new Set([...this.entries.keys(), ...this.canceledPreparations.keys()])].filter((entry) =>
+        entry.startsWith(scope.sessionId + ':')
+      ).length >= 2
     )
       return undefined;
     const dirs = this.directories(scope.sessionId, copied.config.incarnation);
     const file = join(dirs[2], 'private.json');
     const sessionId = scope.sessionId;
     const epoch = this.begin(sessionId);
+    const receipt = { ...proof },
+      entry: Entry = { epoch, scope: key, material: copied, descriptor: proof },
+      originalScope = structuredClone(scope);
+    let retained: Promise<unknown> | undefined,
+      published = false;
     let ownedFile: Stats | undefined;
     const ownedParents: Stats[] = [];
+    this.preparingReceipts.add(receipt);
+    this.canceledPreparations.set(entryKey, receipt);
     try {
       const prepared = await bounded(
         'write:' + file + ':' + createHash('sha256').update(bytes).digest('hex') + ':' + epoch.id,
         async () => {
-          for (const path of dirs) {
-            await fs.mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-              if (error.code !== 'EEXIST') throw error;
-            });
-            if (!privateStat(await fs.lstat(path), true)) throw new Error('Private remote cache unavailable');
-          }
-          const handle = await fs.open(
-            file,
-            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-            0o600
-          );
           try {
-            await handle.writeFile(bytes);
-            await handle.sync();
-            ownedFile = await handle.stat();
-          } finally {
-            await handle.close();
-          }
-          for (const path of dirs.slice().reverse()) {
-            const handle = await fs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-            try {
-              await handle.sync();
-              ownedParents.unshift(await handle.stat());
-            } finally {
-              await handle.close();
+            for (const path of dirs) {
+              await fs.mkdir(path, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+                if (error.code !== 'EEXIST') throw error;
+              });
+              const parent = await fs.lstat(path);
+              if (!privateStat(parent, true)) throw new Error('Private remote cache unavailable');
+              ownedParents.push(parent);
             }
+            const handle = await fs.open(
+              file,
+              constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+              0o600
+            );
+            try {
+              ownedFile = await handle.stat();
+              await handle.writeFile(bytes);
+              await handle.sync();
+            } finally {
+              try {
+                ownedFile = await handle.stat();
+              } finally {
+                await handle.close();
+              }
+            }
+            for (const path of dirs.slice().reverse()) {
+              const handle = await fs.open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+              try {
+                await handle.sync();
+              } finally {
+                await handle.close();
+              }
+            }
+            return true;
+          } finally {
+            // The actual job owns this receipt, including when bounded() has
+            // already returned. It can only remove its exact, unused artifact.
+            if (ownedFile && ownedParents.length === 3) {
+              this.preparations.set(receipt, {
+                entry,
+                epoch,
+                file: ownedFile!,
+                parents: ownedParents,
+                bytes,
+                unpublished: true,
+              });
+              this.canceledPreparations.set(entryKey, receipt);
+            } else if (this.canceledPreparations.get(entryKey) === receipt) {
+              this.canceledPreparations.delete(entryKey);
+            }
+            this.preparingReceipts.delete(receipt);
           }
-          return true;
+        },
+        (work) => {
+          retained = work;
         }
       );
       if (
@@ -1055,14 +1106,27 @@ export class OwnedRemoteBrokerCache {
       )
         return undefined;
       this.scopes.set(scope.sessionId, key);
-      const entry = { epoch, scope: key, material: copied, descriptor: proof },
-        receipt = { ...proof };
       this.entries.set(entryKey, entry);
-      if (ownedFile && ownedParents.length === 3)
-        this.preparations.set(receipt, { entry, epoch, file: ownedFile, parents: ownedParents, bytes });
+      this.preparations.get(receipt)!.unpublished = false;
+      this.canceledPreparations.delete(entryKey);
+      published = true;
       return receipt;
     } finally {
-      this.finish(sessionId, epoch);
+      if (retained)
+        void retained
+          .finally(async () => {
+            try {
+              if (!published) await this.discardUnreservedPreparation(originalScope, receipt);
+            } finally {
+              this.finish(sessionId, epoch);
+            }
+          })
+          .catch(() => {});
+      else {
+        this.preparingReceipts.delete(receipt);
+        if (this.canceledPreparations.get(entryKey) === receipt) this.canceledPreparations.delete(entryKey);
+        this.finish(sessionId, epoch);
+      }
     }
   }
   /** Reads only locally retained launch material; an existing remote pane cannot create this record. */

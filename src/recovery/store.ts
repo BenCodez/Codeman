@@ -168,6 +168,7 @@ const StateSchema = z
 export class RecoveryStore {
   private records: Record<string, RecoveryState> = {};
   private writes: Promise<unknown> = Promise.resolve();
+  private writeUncertain = false;
   readonly loadFailed: boolean;
   private pendingCleanupWrites = 0;
   private cleanupWriteFailed = false;
@@ -195,14 +196,14 @@ export class RecoveryStore {
 
   /** Pure complete private reference domain; pending/failed durability is unknown. */
   getCleanupSnapshot(): Record<string, RecoveryState> | undefined {
-    return this.loadFailed || this.pendingCleanupWrites > 0 || this.cleanupWriteFailed
+    return this.loadFailed || this.writeUncertain || this.pendingCleanupWrites > 0 || this.cleanupWriteFailed
       ? undefined
       : structuredClone(this.records);
   }
 
   get(id: string): RecoveryState {
     const state = structuredClone(this.records[id] ?? initialRecoveryState());
-    if (this.loadFailed) {
+    if (this.loadFailed || this.writeUncertain) {
       state.config.enabled = false;
       state.circuitOpen = true;
       state.needsAttention = true;
@@ -214,11 +215,13 @@ export class RecoveryStore {
 
   save(id: string, state: RecoveryState): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
+    if (this.writeUncertain) return Promise.reject(new Error('Recovery journal durability is uncertain'));
     if (!/^[\w-]{1,100}$/.test(id)) return Promise.reject(new Error('Invalid session identity'));
     StateSchema.parse(state);
     const copy = structuredClone(state);
     this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
+      if (this.writeUncertain) throw new Error('Recovery journal durability is uncertain');
       const next = { ...this.records, [id]: copy };
       if (Object.keys(next).length > 200) throw new Error('Recovery journal is over capacity');
       await this.write(next);
@@ -239,8 +242,10 @@ export class RecoveryStore {
 
   drop(id: string): Promise<void> {
     if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
+    if (this.writeUncertain) return Promise.reject(new Error('Recovery journal durability is uncertain'));
     this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
+      if (this.writeUncertain) throw new Error('Recovery journal durability is uncertain');
       if (!this.records[id]) return;
       const next = { ...this.records };
       delete next[id];
@@ -263,8 +268,10 @@ export class RecoveryStore {
   /** Remove unreachable settings/intentions; a durable delivery reservation remains evidence. */
   pruneOrphans(keep: (id: string) => boolean): Promise<number> {
     if (this.loadFailed) return Promise.reject(new Error('Recovery journal could not be loaded; refusing overwrite'));
+    if (this.writeUncertain) return Promise.reject(new Error('Recovery journal durability is uncertain'));
     this.pendingCleanupWrites++;
     const result = this.writes.then(async () => {
+      if (this.writeUncertain) throw new Error('Recovery journal durability is uncertain');
       const next = { ...this.records };
       let removed = 0;
       for (const [id, state] of Object.entries(next)) {
@@ -297,6 +304,7 @@ export class RecoveryStore {
       throw new Error('Recovery journal is over byte capacity');
     await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
     const temp = `${this.path}.${randomUUID()}.tmp`;
+    let commitAttempted = false;
     try {
       const handle = await open(temp, 'wx', 0o600);
       try {
@@ -305,6 +313,9 @@ export class RecoveryStore {
       } finally {
         await handle.close();
       }
+      // Replacement or its durability acknowledgement may fail after publication.
+      // Require a fresh journal load before another snapshot can overwrite it.
+      commitAttempted = true;
       await rename(temp, this.path);
       const directory = await open(dirname(this.path), 'r');
       try {
@@ -312,6 +323,9 @@ export class RecoveryStore {
       } finally {
         await directory.close();
       }
+    } catch (error) {
+      if (commitAttempted) this.writeUncertain = true;
+      throw error;
     } finally {
       await unlink(temp).catch(() => {});
     }

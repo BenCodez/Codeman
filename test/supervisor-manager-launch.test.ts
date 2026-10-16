@@ -363,6 +363,51 @@ it('revokes immediately and retires exactly the issued profile and credential di
   expect(await fs.readFile(ownerFile, 'utf8')).toBe('owner configuration');
 });
 
+it('gives queued homes a fresh cleanup budget after an earlier retirement expires', async () => {
+  const first = await profile(),
+    second = await profile(),
+    third = await profile(),
+    entered = createDeferred(),
+    release = createDeferred();
+  for (const item of [second, third]) await fs.writeFile(join(item.home, 'owner.txt'), 'keep');
+  const original = fs.lstat.bind(fs),
+    now = performance.now();
+  vi.spyOn(performance, 'now').mockReturnValue(now);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  let held = false;
+  vi.spyOn(fs, 'lstat').mockImplementation(async (...args) => {
+    if (String(args[0]) === first.home && !held) {
+      held = true;
+      entered.resolve();
+      await release.promise;
+    }
+    return original(...args);
+  });
+  const retiringFirst = first.profile.revoke();
+  await entered.promise;
+  const retiringSecond = second.profile.revoke(),
+    retiringThird = third.profile.revoke();
+  expect([first, second, third].every((item) => !item.profile.isCurrent())).toBe(true);
+  try {
+    // Queueing exceeds the public response budget. Actual cleanup must still run
+    // later, with its own bounded lifetime and all existing artifact witnesses.
+    vi.mocked(performance.now).mockReturnValue(now + 2001);
+    await vi.advanceTimersByTimeAsync(2001);
+    expect(await Promise.all([retiringFirst, retiringSecond, retiringThird])).toEqual([false, false, false]);
+    for (const item of [second, third])
+      expect(await fs.readFile(item.profile.file, 'utf8')).toContain('codeman_supervisor');
+  } finally {
+    release.resolve();
+    vi.useRealTimers();
+  }
+  await vi.waitFor(async () => {
+    for (const item of [second, third]) expect(await fs.readdir(item.home)).toEqual(['owner.txt']);
+  });
+  // Its own expired observation still prevents the first job from deleting.
+  expect(await fs.readFile(first.profile.file, 'utf8')).toContain('codeman_supervisor');
+  for (const item of [second, third]) expect(await fs.readFile(join(item.home, 'owner.txt'), 'utf8')).toBe('keep');
+});
+
 it.each(['profile-replacement', 'credential-symlink', 'directory-replacement'] as const)(
   'preserves unknown artifacts on %s instead of unlinking foreign material',
   async (kind) => {

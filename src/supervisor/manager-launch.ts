@@ -342,10 +342,12 @@ export async function prepareSupervisorManagerLaunch(options: {
         revoke: () => {
           revoked = true;
           if (retirement) return retirement;
-          const limit = performance.now() + 2_000;
+          const responseDeadline = performance.now() + 2_000;
           const before = Promise.allSettled([retirements.get(home) ?? pendingWork.get(home), retirementWork]);
           const cleanup = before
             .then(async () => {
+              // Waiting for other homes must not consume this artifact's cleanup budget.
+              const limit = performance.now() + 2_000;
               const current = () => performance.now() < limit;
               const directories = [
                 [home, preparedHome],
@@ -395,7 +397,7 @@ export async function prepareSupervisorManagerLaunch(options: {
               return await Promise.race([
                 cleanup,
                 new Promise<false>((resolve) => {
-                  timer = setTimeout(() => resolve(false), Math.max(0, limit - performance.now()));
+                  timer = setTimeout(() => resolve(false), Math.max(0, responseDeadline - performance.now()));
                 }),
               ]);
             } finally {

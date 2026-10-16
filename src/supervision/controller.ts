@@ -230,9 +230,11 @@ export class TaskController {
               const evidence = fresh.commands.get(proof.hash);
               return (
                 this.commandEvidenceIsCurrent(evidence) &&
-                evidence.startedAt === proof.startedAt &&
-                evidence.completedAt === proof.completedAt &&
-                commandEvidenceIdentity(evidence) === proof.identity
+                (proof.identity !== undefined
+                  ? commandEvidenceIdentity(evidence) === proof.identity
+                  : commandEvidenceIdentity(evidence) === undefined &&
+                    evidence.startedAt === proof.startedAt &&
+                    evidence.completedAt === proof.completedAt)
               );
             });
           // TaskStore's callback performs its final guard and atomic replacement
@@ -681,6 +683,9 @@ export class TaskController {
         this.state.phase = 'blocked';
         return this.save('budget-exhausted');
       }
+      // Explicit Resume withdraws the old blocker, but does not certify a
+      // continuation from its old checkpoint. New evidence must establish it.
+      if (this.state.outcome === 'blocked') this.state.outcome = 'unknown';
       if (this.state.kickoffAt !== undefined) {
         this.state.phase = 'watching';
         const result = await this.save('owner-resumed');

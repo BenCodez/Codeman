@@ -1,4 +1,4 @@
-/** Production reboot route, Session, and WebServer persistence against isolated test-mode panes. */
+/** @fileoverview Production reboot route, Session, and WebServer persistence against isolated test-mode panes. */
 import Fastify, { type FastifyInstance } from 'fastify';
 import fastifyCookie from '@fastify/cookie';
 import { createHash } from 'node:crypto';
@@ -6,7 +6,7 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import fs from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { dataPath, getDataDir } from '../../src/config/instance.js';
 import { userCasesDir } from '../../src/config/multiuser.js';
 import { writeCustomModelHosts } from '../../src/custom-model-hosts.js';
@@ -25,6 +25,7 @@ import { installRouteErrorHandler } from '../../src/web/route-error-handler.js';
 import { registerRebootRestoreRoutes } from '../../src/web/routes/reboot-restore-routes.js';
 import { WebServer } from '../../src/web/server.js';
 import * as launchGrants from '../../src/session-env-clamp.js';
+import { getCli, reloadCliRegistry } from '../../src/config/cli-registry/registry.js';
 
 const UUID = '12345678-1234-1234-1234-123456789abc';
 const servers: WebServer[] = [];
@@ -1201,4 +1202,124 @@ describe('deleted custom endpoint on reboot', () => {
     expect(readFileSync(history, 'utf8')).toBe('original history\n');
     expect(readFileSync(config, 'utf8')).toBe('model_provider = "deleted-endpoint"\n');
   });
+});
+
+describe('custom CLI exact reboot state bindings', () => {
+  beforeEach(async () => {
+    const codex = getCli('codex')!;
+    await fs.mkdir(getDataDir(), { recursive: true });
+    await fs.writeFile(
+      dataPath('clis.json'),
+      JSON.stringify({
+        schemaVersion: 1,
+        clis: {
+          'binding-codex-a': { ...codex, id: 'binding-codex-a', label: 'Binding A', order: 990 },
+          'binding-codex-b': { ...codex, id: 'binding-codex-b', label: 'Binding B', order: 991 },
+          'binding-no-recovery': {
+            ...codex,
+            id: 'binding-no-recovery',
+            label: 'Unsupported',
+            order: 992,
+            capabilities: { ...codex.capabilities, recovery: undefined },
+          },
+        },
+      }),
+      { mode: 0o600 }
+    );
+    reloadCliRegistry();
+  });
+  afterEach(async () => {
+    await fs.rm(dataPath('clis.json'), { force: true });
+    reloadCliRegistry();
+  });
+  it.each(['codex', 'binding-codex-a'])(
+    'durably commits an exact %s restore through the actual route',
+    async (mode) => {
+      const id = `${mode === 'codex' ? '60606060' : '60606061'}-1111-2222-3333-444444444444`;
+      const { state, home } = fixture(id, join(homedir(), `binding-route-${mode}`));
+      state.mode = mode;
+      state.codexConfig!.resumeSessionId = UUID;
+      await offer(state);
+      const { app, ctx, store } = await harness();
+      store.setSession(id, state);
+      store.flush();
+      const result = await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+      expect(result.json().skipped).toEqual([]);
+      expect(result.json().restored.map((item: { id: string }) => item.id)).toEqual([id]);
+      const saved = JSON.parse(readFileSync(dataPath('state.json'), 'utf8')).sessions[id];
+      const binding = rebootStateBinding(saved);
+      expect(binding).toMatch(/^[a-f0-9]{64}$/);
+      expect(saved).toMatchObject({ mode, codexConfig: state.codexConfig, __codexRecoveryHome: home });
+      expect(ctx.mux.getSession(id)).toMatchObject({
+        mode,
+        codexRestoreUncertain: false,
+        codexRestoreStateBinding: binding,
+      });
+    }
+  );
+  it('exact capable CLI identities cannot share a digest even with identical owner/home/config', () => {
+    const { state } = fixture('61616161-1111-2222-3333-444444444444');
+    state.codexConfig!.resumeSessionId = UUID;
+    const bindings = ['codex', 'binding-codex-a', 'binding-codex-b'].map((mode) =>
+      rebootStateBinding({ ...state, mode })
+    );
+    expect(bindings.every((binding) => /^[a-f0-9]{64}$/.test(binding!))).toBe(true);
+    expect(new Set(bindings).size).toBe(3);
+    const reordered = Object.fromEntries(Object.entries(state.codexConfig!).reverse()) as NonNullable<
+      SessionState['codexConfig']
+    >;
+    expect(rebootStateBinding({ ...state, codexConfig: reordered })).toBe(bindings[0]);
+  });
+  it.each(['binding-no-recovery', 'unregistered-binding-cli', 'claude'])(
+    'does not create a Codex receipt for unsupported CLI %s',
+    (mode) => {
+      const { state } = fixture('62626262-1111-2222-3333-444444444444');
+      state.codexConfig!.resumeSessionId = UUID;
+      expect(rebootStateBinding({ ...state, mode })).toBeUndefined();
+    }
+  );
+  it.each(['binding-codex-a', 'binding-codex-b'])(
+    'normal restart validates custom CLI receipt originally issued for %s',
+    async (receiptMode) => {
+      const id = '63636363-1111-2222-3333-444444444444';
+      const { state, home } = fixture(id, join(homedir(), `binding-restart-${receiptMode}`));
+      state.mode = 'binding-codex-a';
+      state.codexConfig!.resumeSessionId = UUID;
+      const { server, ctx, store } = await harness();
+      store.setSession(id, state);
+      store.flush();
+      const before = structuredClone(store.getSession(id));
+      ctx.mux.registerSession({
+        sessionId: id,
+        muxName: `codeman-${id.slice(0, 8)}`,
+        pid: 0,
+        createdAt: state.createdAt,
+        workingDir: state.workingDir,
+        mode: state.mode,
+        owner: state.owner,
+        attached: false,
+        recoveryCodexHome: home,
+        codexRestoreUncertain: false,
+        codexRestoreConfig: state.codexConfig,
+        codexRestoreStateBinding: rebootStateBinding({ ...state, mode: receiptMode }),
+      });
+      vi.spyOn(ctx.mux, 'reconcileSessions').mockResolvedValue({ alive: [id], dead: [], discovered: [] });
+      vi.spyOn(ctx.mux, 'muxSessionExists').mockReturnValue(true);
+      vi.spyOn(ctx.mux, 'isPaneDead').mockReturnValue(false);
+      const create = vi.spyOn(ctx.mux, 'createSession');
+      const respawn = vi.spyOn(ctx.mux, 'respawnPane');
+      const kill = vi.spyOn(ctx.mux, 'killSession');
+      await Reflect.get(server, 'restoreMuxSessions').call(server);
+      const session = sessionMap(server).get(id)!;
+      expect(session).toBeDefined();
+      expect(session.codexRestoreWorkerMayExist).toBe(receiptMode !== state.mode);
+      Reflect.get(server, '_persistSessionStateNow').call(server, session);
+      store.flush();
+      if (receiptMode !== state.mode) expect(store.getSession(id)).toEqual(before);
+      else expect(rebootStateBinding(store.getSession(id)!)).toBe(rebootStateBinding(state));
+      expect(create).not.toHaveBeenCalled();
+      expect(respawn).not.toHaveBeenCalled();
+      expect(kill).not.toHaveBeenCalled();
+    }
+  );
 });
