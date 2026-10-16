@@ -79,6 +79,7 @@ it.each(['EIO', 'ETIMEDOUT'] as const)(
     const f = await fixture();
     const interrupted = interruptWrite(code);
     await f.broker.rollbackUnlaunchedProvisioning();
+    expect(f.transport).not.toHaveBeenCalled();
     await expect(fs.lstat(f.marker)).rejects.toMatchObject({ code: 'ENOENT' });
     await expect(fs.lstat(interrupted.staging())).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await fs.readdir(f.broker.directory)).toEqual(['broker.py', 'config.json', 'lock']);
@@ -92,23 +93,37 @@ it.each(['EIO', 'ETIMEDOUT'] as const)(
   }
 );
 
-it('retries interrupted publication on the existing bounded background schedule before cold discovery', async () => {
-  const f = await fixture();
-  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
-  interruptWrite('EIO');
-  expect(await f.cleanup.rollbackCodexBrokerProvisioning(f.receipt, f.transport, true)).toBe(false);
-  await expect(fs.lstat(f.marker)).rejects.toMatchObject({ code: 'ENOENT' });
-  vi.restoreAllMocks();
-  await vi.advanceTimersByTimeAsync(2_100);
-  await vi.waitFor(async () => {
-    expect(JSON.parse(await fs.readFile(f.marker, 'utf8'))).toEqual(f.receipt);
-    expect(f.transport).toHaveBeenCalledTimes(2);
-  });
-  vi.clearAllTimers();
-  vi.useRealTimers();
-  await f.coldCleanup();
-  await expect(fs.lstat(f.broker.directory)).rejects.toMatchObject({ code: 'ENOENT' });
-});
+it.each(['write', 'link', 'fsync'] as const)(
+  'defers helper dispatch until %s publication failure is repaired by the bounded retry',
+  async (fault) => {
+    const f = await fixture();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+    if (fault === 'write') interruptWrite('EIO');
+    if (fault === 'link') vi.spyOn(fs, 'link').mockRejectedValueOnce(Error('fixture publication link refused'));
+    if (fault === 'fsync') {
+      const open = fs.open.bind(fs);
+      vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+        const handle = await open(...args);
+        if (args[1] === 'wx' && String(args[0]).endsWith('.next'))
+          vi.spyOn(handle, 'sync').mockRejectedValueOnce(Error('fixture publication fsync refused'));
+        return handle;
+      });
+    }
+    expect(await f.cleanup.rollbackCodexBrokerProvisioning(f.receipt, f.transport, true)).toBe(false);
+    await expect(fs.lstat(f.marker)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(f.transport).not.toHaveBeenCalled();
+    vi.restoreAllMocks();
+    await vi.advanceTimersByTimeAsync(2_100);
+    await vi.waitFor(async () => {
+      expect(JSON.parse(await fs.readFile(f.marker, 'utf8'))).toEqual(f.receipt);
+      expect(f.transport).toHaveBeenCalledOnce();
+    });
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    await f.coldCleanup();
+    await expect(fs.lstat(f.broker.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+  }
+);
 
 it.each(['same-bytes', 'different'] as const)(
   'preserves %s replacement staging instead of unlinking a foreign inode',
