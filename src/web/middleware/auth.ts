@@ -44,6 +44,13 @@ declare module 'fastify' {
 // Auth session cookie name
 export const AUTH_COOKIE_NAME = 'codeman_session';
 
+// Only validated owner credentials can add a request; client headers and the
+// synthetic single-user identity cannot manufacture this request-scoped proof.
+const ownerCredentialRequests = new WeakSet<FastifyRequest>();
+export function hasValidatedOwnerCredential(req: FastifyRequest): boolean {
+  return ownerCredentialRequests.has(req);
+}
+
 /** State returned from registerAuthMiddleware for cleanup in server stop() */
 interface AuthState {
   authSessions: StaleExpirationMap<string, AuthSessionRecord> | null;
@@ -377,6 +384,7 @@ export function registerAuthMiddleware(app: FastifyInstance, https: boolean, bas
     // Use get() instead of has() so refreshOnGet extends the TTL on active sessions
     const sessionToken = req.cookies[AUTH_COOKIE_NAME];
     if (sessionToken && authSessions.get(sessionToken) !== undefined) {
+      ownerCredentialRequests.add(req);
       // Sliding cookie: re-issue on every authenticated request so the browser
       // cookie lifetime tracks the server-side sliding TTL (refreshOnGet above).
       reply.setCookie(AUTH_COOKIE_NAME, sessionToken, {
@@ -395,6 +403,7 @@ export function registerAuthMiddleware(app: FastifyInstance, https: boolean, bas
     const authBuf = Buffer.from(auth ?? '');
     const expectedBuf = Buffer.from(expectedHeader);
     if (authBuf.length === expectedBuf.length && timingSafeEqual(authBuf, expectedBuf)) {
+      ownerCredentialRequests.add(req);
       // Issue session token cookie so browser doesn't need to re-send credentials
       const token = randomBytes(32).toString('hex');
 
@@ -529,6 +538,7 @@ function registerMultiUserAuthHook(
         // 500-ing an already-authenticated client (pre-#24 behaviour); a persistently
         // corrupt store still fails all WRITES loudly at the mutator/bootstrap layer.
         req.authUser = { username: record.username, role: record.role ?? 'user' };
+        ownerCredentialRequests.add(req);
         setSessionCookie(reply, sessionToken!);
         enforcePasswordChange(req, reply, !!record.mustChangePassword);
         return;
@@ -542,6 +552,7 @@ function registerMultiUserAuthHook(
       // Trust the LIVE role/mustChangePassword, not the (possibly stale) cookie snapshot
       // (also defends #9/#13: a CLI demotion is reflected without a revoke).
       req.authUser = { username: live.username, role: live.role };
+      ownerCredentialRequests.add(req);
       setSessionCookie(reply, sessionToken!); // sliding re-issue
       enforcePasswordChange(req, reply, !!live.mustChangePassword);
       return;
@@ -582,6 +593,7 @@ function registerMultiUserAuthHook(
           mustChangePassword: !!user.mustChangePassword,
         });
         req.authUser = { username: user.username, role: user.role };
+        ownerCredentialRequests.add(req);
         setSessionCookie(reply, token);
         enforcePasswordChange(req, reply, !!user.mustChangePassword);
         return;

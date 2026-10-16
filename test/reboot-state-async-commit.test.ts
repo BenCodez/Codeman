@@ -212,6 +212,98 @@ function editUnrelatedState(kind: 'session' | 'config' | 'task') {
 }
 
 it.each(
+  (['codex', 'claude'] as const).flatMap((mode) =>
+    (['file-sync', 'directory-sync'] as const).map((stage) => ({ mode, stage }))
+  )
+)(
+  'restages live $mode status/activity/accounting during $stage without cancelling its restore',
+  async ({ mode, stage }) => {
+    const record: SessionState = {
+      ...tentative(),
+      mode,
+      status: 'idle',
+      lastActivityAt: 10,
+      inputTokens: 20,
+      outputTokens: 30,
+      totalCost: 1,
+    };
+    const entered = hold(stage),
+      before = fs.readFileSync(path, 'utf8');
+    const committing = store.persistSessionDurably(ID, () => record);
+    await reached(entered, committing);
+    expect(store.getSession(ID)).toEqual(historical);
+    Object.assign(record, { status: 'busy', lastActivityAt: 100, inputTokens: 200, outputTokens: 300, totalCost: 2 });
+    release!();
+    await committing;
+    expect(store.getSession(ID)).toEqual(record);
+    expect(reload().getSession(ID)).toEqual(record);
+    expect(fs.readFileSync(path, 'utf8')).not.toBe(before);
+    expect(io.writes).toBeGreaterThan(1);
+    expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(false);
+  }
+);
+
+it.each(['owner', 'config', 'conversation', 'home', 'broker', 'dismiss'] as const)(
+  'live accounting drift cannot mask a changed %s restore authority',
+  async (change) => {
+    const record: SessionState = {
+      ...tentative(),
+      mode: 'codex',
+      status: 'idle',
+      lastActivityAt: 10,
+      codexConfig: { noDaemon: true, resumeSessionId: ID, sandbox: 'read-only' },
+    };
+    Object.assign(record, { __codexRecoveryHome: '/fixture/home', __codexInputBroker: ID });
+    let current = true;
+    const entered = hold('file-sync'),
+      before = fs.readFileSync(path, 'utf8');
+    const committing = store.persistSessionDurably(
+      ID,
+      () => record,
+      () => current
+    );
+    const rejected = expect(committing).rejects.toThrow('cancelled');
+    await reached(entered, committing);
+    record.lastActivityAt = 100;
+    if (change === 'owner') record.owner = 'replacement-owner';
+    if (change === 'config') record.codexConfig = { ...record.codexConfig, sandbox: 'workspace-write' };
+    if (change === 'conversation') record.codexConfig = { ...record.codexConfig, resumeSessionId: OTHER };
+    if (change === 'home') Reflect.set(record, '__codexRecoveryHome', '/fixture/replacement-home');
+    if (change === 'broker') Reflect.set(record, '__codexInputBroker', OTHER);
+    if (change === 'dismiss') current = false; // Owner/role/grant cancellation stays a separate pure authority verdict.
+    release!();
+    await rejected;
+    expect(io.writes).toBe(1);
+    expect(store.getSession(ID)).toEqual(historical);
+    expect(fs.readFileSync(path, 'utf8')).toBe(before);
+    expect(reload().getSession(ID)).toEqual(historical);
+  }
+);
+
+it.each(['file-sync', 'directory-sync'] as const)(
+  'bounds continuous live activity churn during %s as restaging rather than cancellation',
+  async (stage) => {
+    const record: SessionState = { ...tentative(), lastActivityAt: 1 };
+    const before = fs.readFileSync(path, 'utf8');
+    let changes = 0;
+    io.onStage = (current) => {
+      if (current === stage) record.lastActivityAt = ++changes + 1;
+    };
+    await expect(store.persistSessionDurably(ID, () => record)).rejects.toThrow('Concurrent state edit');
+    io.onStage = undefined;
+    expect(changes).toBeGreaterThanOrEqual(3);
+    expect(io.writes).toBeLessThanOrEqual(stage === 'file-sync' ? 3 : 6);
+    expect(store.getSession(ID)).toEqual(historical);
+    expect(fs.readFileSync(path, 'utf8')).toBe(before);
+    expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(false);
+    // The bounded save lease releases, so stable output can commit without
+    // inventing a new worker or treating the previous churn as owner Dismiss.
+    await store.persistSessionDurably(ID, () => record);
+    expect(reload().getSession(ID)).toEqual(record);
+  }
+);
+
+it.each(
   ['file-sync', 'rename', 'directory-sync', 'directory-close'].flatMap((stage) =>
     (['session', 'config', 'task'] as const).map((kind) => ({ stage, kind }))
   )

@@ -1637,6 +1637,7 @@
               </fieldset>
               <fieldset class="set-group task-form" id="taskProgress" disabled><legend>Checkpoints and completion evidence</legend>
                 <div id="taskCriteriaEvidence"></div>
+                <p class="set-group-hint" id="taskOwnerAuthNotice">Sign in with Codeman authentication to verify manual criteria. Anonymous or agent requests cannot certify them.</p>
                 <p class="set-group-hint">Select owner criteria you have independently verified, or request verification of command checks. Command checks require correlated successful execution evidence. Completed is accepted only when every criterion is verified.</p>
                 <label for="taskCheckpoint">Checkpoint</label><textarea class="set-textarea" id="taskCheckpoint" maxlength="4000" rows="2" data-i18n-skip oninput="app.markTaskDraft()"></textarea>
                 <label for="taskNextAction">Next action</label><textarea class="set-textarea" id="taskNextAction" maxlength="4000" rows="2" data-i18n-skip oninput="app.markTaskDraft()"></textarea>

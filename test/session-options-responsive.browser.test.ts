@@ -250,6 +250,8 @@ describe('Session Options responsive layout in Chromium', () => {
         app.openTaskOptions('a');
         await app.loadTaskStatus();
       }, original);
+      expect(await page.locator('#taskOwnerAuthNotice').isVisible()).toBe(true);
+      expect(await page.locator('#taskOwnerAuthNotice').textContent()).toContain('Sign in with Codeman authentication');
       const rows = page.locator('#taskCriteriaRows > [data-task-criterion-row]');
       await expect.poll(() => rows.count()).toBe(3);
       expect(await rows.first().locator('[data-task-field="command"]').inputValue()).toBe(exact.replace(/\r\n/g, '\n'));
