@@ -142,10 +142,18 @@ def eligible(config, state, sid, inc):
     if not isinstance(receipts,list) or len(receipts)>128: return False
     seen=set(); heads={}
     for receipt in receipts:
-        if not isinstance(receipt,dict) or set(receipt)!={'channel','counter','nonce','conversationId','hash','status'}: return False
+        fields={'channel','counter','nonce','conversationId','hash','status'}
+        if not isinstance(receipt,dict) or set(receipt) not in (fields,fields|{'deliveredAt'}): return False
         channel=receipt['channel']; count=receipt['counter']
         if channel not in CHANNELS or type(count) is not int or not 0<count<=counters[channel] or (channel,count) in seen or receipt['status'] not in ('sent','not-sent'): return False
         if not isinstance(receipt['nonce'],str) or not UUID.fullmatch(receipt['nonce']) or not isinstance(receipt['conversationId'],str) or (channel=='auto' and not UUID.fullmatch(receipt['conversationId'])) or not isinstance(receipt['hash'],str) or not re.fullmatch(r'[a-f0-9]{64}',receipt['hash']): return False
+        if 'deliveredAt' in receipt:
+            at=receipt['deliveredAt']
+            if (channel!='auto' or receipt['status']!='sent' or not isinstance(at,dict) or
+                set(at)!={'wallBefore','wallAfter','monoBefore','monoAfter'} or
+                any(type(value) is not int or not 0<value<=9007199254740991 for value in at.values()) or
+                not 0<=at['wallAfter']-at['wallBefore']<=500 or at['monoAfter']<at['monoBefore'] or
+                abs(at['wallAfter']-at['wallBefore']-at['monoAfter']+at['monoBefore'])>100): return False
         seen.add((channel,count)); heads[channel]=max(heads.get(channel,0),count)
     return all(heads[c]==counters[c] if c in heads else counters[c]==0 or len(receipts)==128 for c in CHANNELS)
 
