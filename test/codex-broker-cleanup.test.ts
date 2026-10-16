@@ -947,6 +947,8 @@ it.each([
   'enabled',
   'legacy',
   'attention',
+  'local-attention',
+  'malformed-local-progress',
   'malformed-consent',
   'malformed-alert',
   'unknown-config',
@@ -959,12 +961,15 @@ it.each([
   if (kind === 'legacy') delete config.restartStalls;
   if (kind === 'malformed-consent') config.restartStalls = 'true';
   if (kind === 'unknown-config') config.futurePolicy = true;
-  if (kind === 'attention' || kind === 'malformed-alert' || kind === 'unknown-alert') {
+  if (['attention', 'local-attention', 'malformed-local-progress', 'malformed-alert', 'unknown-alert'].includes(kind)) {
     state.stallAlert = {
       key: 'attention-deadline',
       conversationId: SID,
       progressAt: kind === 'malformed-alert' ? -1 : 1,
-      progressEvidenceKey: 'remote:' + 'a'.repeat(64),
+      progressEvidenceKey:
+        kind === 'malformed-local-progress'
+          ? 'local:invalid'
+          : (kind === 'local-attention' ? 'local:' : 'remote:') + 'a'.repeat(64),
       ...(kind === 'unknown-alert' ? { futureSchema: true } : {}),
     };
   }

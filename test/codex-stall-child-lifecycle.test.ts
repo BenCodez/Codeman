@@ -1,4 +1,4 @@
-/** Shared child statuses must veto local stall and remote recovery authority. No process launches. */
+/** @fileoverview Shared child statuses must veto local stall and remote recovery authority. No process launches. */
 import fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -1252,6 +1252,54 @@ describe('actual remote adapter uses the same child lifecycle veto', () => {
       await f.cleanup();
     }
   });
+
+  it.each(['same-ms-progress', 'delayed-progress', 'pane', 'actual-failure', 'unknown'] as const)(
+    'refunds only certified pre-effect remote withdrawal, never %s delivery uncertainty',
+    async (change) => {
+      const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);
+      const observe = f.adapter.observe.bind(f.adapter);
+      let changed = false;
+      const spy = vi.spyOn(f.adapter, 'observe').mockImplementation(async () => {
+        if (f.controller.getStatus().inFlight && !changed) {
+          changed = true;
+          if (change === 'same-ms-progress' || change === 'delayed-progress')
+            f.evidence.identity.tail +=
+              childEvent(
+                { type: 'agent_message', message: 'New native progress after reservation' },
+                change === 'same-ms-progress' ? 25_000 : 40_000
+              ) + '\n';
+          if (change === 'pane') f.evidence.pane = { ...f.evidence.pane!, paneId: '%8' };
+        }
+        return observe();
+      });
+      try {
+        await f.controller.updateConfig({ maxRetries: 1 });
+        if (change === 'actual-failure') vi.mocked(f.deps.restartRemote).mockResolvedValue('not-sent');
+        if (change === 'unknown') vi.mocked(f.deps.restartRemote).mockResolvedValue('unknown');
+        vi.setSystemTime(CHILD_NOW + 15_000);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 17_000);
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 18_000);
+        await f.controller.refresh();
+        expect(changed).toBe(true);
+        const realDispatch = change === 'actual-failure' || change === 'unknown';
+        expect(f.deps.restartRemote).toHaveBeenCalledTimes(realDispatch ? 1 : 0);
+        expect(f.controller.getStatus()).toMatchObject({
+          attempts: realDispatch ? 1 : 0,
+          failedAttempts: realDispatch ? 1 : 0,
+          circuitOpen: change === 'actual-failure',
+        });
+        expect(f.store.get(f.session.id).attempts).toBe(realDispatch ? 1 : 0);
+        expect(!!f.store.get(f.session.id).inFlight).toBe(change === 'unknown');
+        if (!realDispatch)
+          expect(f.controller.getStatus().history.some((event) => event.reason === 'delivery-failed')).toBe(false);
+      } finally {
+        spy.mockRestore();
+        await f.cleanup();
+      }
+    }
+  );
 
   it('seals an uncertain remote stall dispatch against further recovery and journal reload', async () => {
     const f = await remoteFixture('collab_resume_end', { completed: null }, true, true, true);

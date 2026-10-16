@@ -265,7 +265,7 @@ def rows_valid(name,value):
             if cfg['maxRetryDelayMs']<cfg['retryDelayMs']: return False
             if 'stallAlert' in row:
                 alert=row['stallAlert']
-                if not isinstance(alert,dict) or not {'key','conversationId','progressAt'}<=set(alert)<={'key','conversationId','progressAt','progressEvidenceKey'} or not isinstance(alert['key'],str) or len(alert['key'])>250 or not re.fullmatch(r'[\w:.-]+',alert['key'],re.ASCII) or not isinstance(alert['conversationId'],str) or not UUID.fullmatch(alert['conversationId'].lower()) or not nonnegative(alert['progressAt']) or ('progressEvidenceKey' in alert and (not isinstance(alert['progressEvidenceKey'],str) or not re.fullmatch(r'remote:[a-f0-9]{64}',alert['progressEvidenceKey']))): return False
+                if not isinstance(alert,dict) or not {'key','conversationId','progressAt'}<=set(alert)<={'key','conversationId','progressAt','progressEvidenceKey'} or not isinstance(alert['key'],str) or len(alert['key'])>250 or not re.fullmatch(r'[\w:.-]+',alert['key'],re.ASCII) or not isinstance(alert['conversationId'],str) or not UUID.fullmatch(alert['conversationId'].lower()) or not nonnegative(alert['progressAt']) or ('progressEvidenceKey' in alert and (not isinstance(alert['progressEvidenceKey'],str) or not re.fullmatch(r'(?:local|remote):[a-f0-9]{64}',alert['progressEvidenceKey']))): return False
             if not isinstance(row['handledEvidence'],list) or len(row['handledEvidence'])>32 or any(not isinstance(v,str) or len(v)>250 or not re.fullmatch(r'[\w:.-]+',v,re.ASCII) for v in row['handledEvidence']): return False
             if not isinstance(row['history'],list) or len(row['history'])>100: return False
             for event in row['history']:

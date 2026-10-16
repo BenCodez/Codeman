@@ -68,6 +68,8 @@ export type RecoveryEvidenceGuard = (() => boolean | Promise<boolean>) & {
   getEvidenceSource?: () => RecoveryEvidenceSource | undefined;
 };
 export type RecoveryActionAuthority = (() => boolean) & {
+  /** Adapter-only certificate: evidence changed before any dispatch effect began. */
+  withdrawEvidence?: () => void;
   getActionDeadline?: () => number;
   getInputIssuer?: () => import('./codex-input-broker.js').BrokerAuthority | undefined;
   prepareEvidence?: (source?: RecoveryEvidenceSource) => Promise<boolean>;
@@ -133,7 +135,7 @@ export interface RecoveryObservation {
   submissionKey?: string;
   turnId?: string;
   progressAt?: number;
-  /** Stable complete native remote event identity; local clock bounds cannot identify progress. */
+  /** Stable complete validated native event identity; timestamps alone cannot identify progress. */
   progressEvidenceKey?: string;
   /** Earliest plausible local progress time, for conservative owner/recovery ordering. */
   progressLowerBound?: number;

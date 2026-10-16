@@ -1242,6 +1242,8 @@ describe('authoritative agent exits and process readiness', () => {
       conversationId: THREAD,
       startedAt: NOW,
       stallProgressAt: observation.progressAt,
+      stallProgressEvidenceKey: observation.progressEvidenceKey,
+      stallQuietPeriodMs: 10_000,
     };
     configClamp.mockResolvedValueOnce({ codexConfig: { ...f.session.codexConfig, noDaemon: false } });
     expect(await f.adapter.act(reserved)).toBe('not-sent');
@@ -1272,6 +1274,9 @@ describe('authoritative agent exits and process readiness', () => {
       reason: 'stalled',
       conversationId: THREAD,
       startedAt: NOW,
+      stallProgressAt: observation.progressAt,
+      stallProgressEvidenceKey: observation.progressEvidenceKey,
+      stallQuietPeriodMs: 10_000,
     };
     expect(await f.adapter.act(reservation)).toBe('sent');
   });
@@ -1338,6 +1343,9 @@ describe('authoritative agent exits and process readiness', () => {
       reason: 'stalled',
       conversationId: THREAD,
       startedAt: NOW,
+      stallProgressAt: observation.progressAt,
+      stallProgressEvidenceKey: observation.progressEvidenceKey,
+      stallQuietPeriodMs: 10_000,
     };
     f.pane = { dead: false, screen: READY };
     expect(await f.adapter.act(reservation)).toBe('not-sent');
@@ -1347,9 +1355,18 @@ describe('authoritative agent exits and process readiness', () => {
   it.each([
     { label: 'fresh progress', progressAge: 1951 },
     { label: 'progress that is already silent again', progressAge: 15_000 },
-    { label: 'unchanged progress', progressAge: undefined },
-  ])('revalidates $label after a stall restart is durably reserved', async ({ progressAge }) => {
+    { label: 'same-millisecond progress', progressAge: 33_000 },
+    { label: 'delayed older progress', progressAge: 45_000 },
+    { label: 'identical same-millisecond progress', change: 'identical' },
+    { label: 'changed pane', change: 'pane' },
+    { label: 'malformed progress', change: 'malformed' },
+    { label: 'unchanged progress' },
+    { label: 'metadata only', change: 'metadata' },
+    { label: 'actual delivery failure', result: 'not-sent' as const },
+    { label: 'uncertain dispatch', result: 'unknown' as const },
+  ])('revalidates $label after a stall restart is durably reserved', async ({ progressAge, change, result }) => {
     const f = fixture();
+    if (result) vi.mocked(f.session.deliverRecovery).mockResolvedValueOnce(result);
     f.context.submission!.at = NOW - 60_000;
     const root = await fs.mkdtemp(join(homedir(), 'codex-stall-delivery-'));
     const directory = join(root, 'sessions', '2026', '10', '13');
@@ -1370,7 +1387,10 @@ describe('authoritative agent exits and process readiness', () => {
         '\n' +
         event({ type: 'user_message', message: 'Sanitized fixture request.' }, f.context.submission!.at) +
         '\n' +
-        activeTail()
+        activeTail() +
+        (change === 'identical'
+          ? event({ type: 'agent_message', message: 'Same native progress' }, NOW - 20_000) + '\n'
+          : '')
     );
     await fs.writeFile(
       join(root, 'history.jsonl'),
@@ -1397,6 +1417,19 @@ describe('authoritative agent exits and process readiness', () => {
           reserved = true;
           expect(new RecoveryStore(join(root, 'recovery.json')).get(SESSION).inFlight).toEqual(state.inFlight);
           expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+          if (change === 'pane') f.pane = { ...f.pane!, paneId: '%8' };
+          if (change === 'malformed') await fs.appendFile(rollout, '{truncated');
+          if (change === 'identical')
+            await fs.appendFile(
+              rollout,
+              event({ type: 'agent_message', message: 'Same native progress' }, NOW - 20_000) + '\n'
+            );
+          if (change === 'metadata')
+            await fs.appendFile(
+              rollout,
+              JSON.stringify({ type: 'response_item', payload: { type: 'message', role: 'assistant', content: [] } }) +
+                '\n'
+            );
           if (progressAge !== undefined) {
             await fs.appendFile(
               rollout,
@@ -1418,6 +1451,7 @@ describe('authoritative agent exits and process readiness', () => {
         restartStalls: true,
         stalledAfterMs: 10_000,
         retryDelayMs: 1000,
+        maxRetries: 1,
       });
       await controller.refresh();
       expect(controller.getStatus().pending).toBeUndefined();
@@ -1436,18 +1470,62 @@ describe('authoritative agent exits and process readiness', () => {
       expect(reserved).toBe(true);
       expect(observations.at(-1)).toMatchObject({ stallRestartable: true, progressAt: NOW - 20_000 });
       const finalObservation = await f.adapter.observe();
-      expect(finalObservation.stallEvidenceKey).toBe(observations.at(-1)?.stallEvidenceKey);
-      expect(finalObservation.stallRestartable).toBe(true);
-      if (progressAge !== undefined) {
-        expect(finalObservation.progressAt).toBe(Date.now() - progressAge);
+      if (change !== 'malformed') {
+        expect(finalObservation.stallEvidenceKey).toBe(observations.at(-1)?.stallEvidenceKey);
+        expect(finalObservation.stallRestartable).toBe(true);
+      }
+      if (progressAge !== undefined || change === 'pane' || change === 'malformed' || change === 'identical') {
+        if (change === 'identical') {
+          expect(finalObservation.progressAt).toBe(observations.at(-1)?.progressAt);
+          expect(finalObservation.progressEvidenceKey).not.toBe(observations.at(-1)?.progressEvidenceKey);
+        }
+        if (progressAge !== undefined) {
+          expect(finalObservation.progressAt).toBe(Math.max(NOW - 20_000, Date.now() - progressAge));
+          expect(finalObservation.progressEvidenceKey).not.toBe(observations.at(-1)?.progressEvidenceKey);
+        }
         expect(f.session.deliverRecovery).not.toHaveBeenCalled();
-        expect(controller.getStatus()).toMatchObject({ lastReason: 'delivery-failed', attempts: 1, failedAttempts: 1 });
+        expect(controller.getStatus()).toMatchObject({ attempts: 0, failedAttempts: 0, circuitOpen: false });
+        expect(store.get(SESSION)).toMatchObject({ attempts: 0, failedAttempts: 0, circuitOpen: false });
         expect(controller.getStatus().inFlight).toBeUndefined();
+        expect(controller.getStatus().history.some((entry) => entry.reason === 'delivery-failed')).toBe(false);
         expect(controller.getStatus().history.some((entry) => entry.reason === 'process-resumed')).toBe(false);
+        if (progressAge !== undefined) {
+          // The maxRetries=1 budget remains available, but the changed proof
+          // must earn two fresh confirmations and a full new retry delay.
+          const freshAt = Math.max(NOW + 13_000, finalObservation.progressAt! + 10_000);
+          vi.setSystemTime(freshAt);
+          await controller.refresh();
+          expect(controller.getStatus().pending).toBeUndefined();
+          vi.setSystemTime(freshAt + 2000);
+          await controller.refresh();
+          expect(controller.getStatus().nextRetryAt).toBe(freshAt + 3000);
+          vi.setSystemTime(freshAt + 2999);
+          await controller.refresh();
+          expect(f.session.deliverRecovery).not.toHaveBeenCalled();
+          vi.setSystemTime(freshAt + 3000);
+          await controller.refresh();
+          expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+          expect(controller.getStatus()).toMatchObject({
+            attempts: 1,
+            failedAttempts: 0,
+            lastReason: 'process-resumed',
+          });
+        }
+      } else if (result) {
+        expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
+        expect(controller.getStatus()).toMatchObject({
+          attempts: 1,
+          failedAttempts: 1,
+          circuitOpen: result === 'not-sent',
+          lastReason: result === 'not-sent' ? 'delivery-failed' : 'acceptance-unverified',
+        });
+        expect(!!controller.getStatus().inFlight).toBe(result === 'unknown');
       } else {
         expect(f.session.deliverRecovery).toHaveBeenCalledOnce();
         expect(controller.getStatus()).toMatchObject({ lastReason: 'process-resumed', attempts: 1, failedAttempts: 0 });
         expect(controller.getStatus().inFlight).toMatchObject({ action: 'restart', conversationId: THREAD });
+        if (change === 'metadata')
+          expect(finalObservation.progressEvidenceKey).toBe(observations.at(-1)?.progressEvidenceKey);
       }
     } finally {
       controller.stop();

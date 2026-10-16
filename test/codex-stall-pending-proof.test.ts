@@ -1,4 +1,4 @@
-/** A scheduled stall delay belongs to the confirmed native worker/progress, never just its turn. */
+/** @fileoverview A scheduled stall delay belongs to the confirmed native worker/progress, never just its turn. */
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { RecoveryController } from '../src/recovery/controller.js';
 import {
@@ -195,5 +195,44 @@ it.each([false, true])(
     expect(f.controller.getStatus().failedAttempts).toBe(before.failedAttempts);
     expect(f.controller.getStatus().pending).toBeUndefined();
     expect(f.act).toHaveBeenCalledOnce();
+  }
+);
+
+it.each(['certified', 'uncertain', 'owner-input', 'newer-warning'] as const)(
+  'a pre-effect evidence certificate preserves the %s final boundary',
+  async (kind) => {
+    const f = await schedule(false);
+    await f.controller.updateConfig({ maxRetries: 1 });
+    f.act.mockImplementation(async (_flight, authority) => {
+      authority.withdrawEvidence?.();
+      if (kind === 'owner-input') f.controller.noteUserInput();
+      if (kind === 'newer-warning') {
+        // An independently established newer authority warning must survive
+        // receipt cleanup; the certificate only retires this unsent operation.
+        const state = Reflect.get(f.controller, 'state') as RecoveryState;
+        state.phase = 'paused';
+        state.needsAttention = true;
+        state.lastReason = 'approval-required';
+      }
+      return kind === 'uncertain' ? 'unknown' : 'not-sent';
+    });
+    vi.setSystemTime(NOW + 12_000);
+    await f.controller.refresh();
+    const state = f.controller.getStatus();
+    expect(state).toMatchObject({
+      attempts: kind === 'uncertain' ? 1 : 0,
+      failedAttempts: kind === 'uncertain' ? 1 : 0,
+      circuitOpen: false,
+    });
+    expect(!!state.inFlight).toBe(kind === 'uncertain');
+    if (kind === 'uncertain') expect(state.lastReason).toBe('acceptance-unverified');
+    else {
+      expect(state.pending).toBeUndefined();
+      expect(state.nextRetryAt).toBeUndefined();
+      expect(state.history.some((event) => event.reason === 'delivery-failed')).toBe(false);
+    }
+    if (kind === 'owner-input') expect(state.armedAt).toBe(NOW + 12_000);
+    if (kind === 'newer-warning')
+      expect(state).toMatchObject({ phase: 'paused', needsAttention: true, lastReason: 'approval-required' });
   }
 );

@@ -896,6 +896,18 @@ export class CodexRecoveryAdapter {
       observation.liveProofAt = this.livePaneProof.at;
       this.latestLiveProofAt = this.livePaneProof.at;
     } else this.livePaneProof = undefined;
+    if (
+      (observation.activity === 'working' || observation.activity === 'crashed') &&
+      observation.progressAt !== undefined &&
+      Number.isFinite(observation.progressAt) &&
+      observation.progressAt > 0
+    ) {
+      // Classification accepted every complete record and its lifecycle schema.
+      // Only native events define progress: metadata and read latency do not.
+      const events = identity.tail.split('\n').filter((line) => line.trim() && JSON.parse(line)?.type === 'event_msg');
+      observation.progressEvidenceKey = `local:${createHash('sha256').update(events.join('\n')).digest('hex')}`;
+      observation.progressLowerBound = observation.progressAt;
+    }
     // A bounded suffix can hide an earlier still-live child, including after the parent process exits.
     observation.safeToAct = observation.safeToAct && identity.tailTruncated === false;
     if (identity.tailTruncated !== false) delete observation.stallRestartable;
@@ -914,6 +926,7 @@ export class CodexRecoveryAdapter {
           ? {
               stallEvidenceKey: observation.stallEvidenceKey,
               stallProgressAt: observation.progressAt ?? observation.at,
+              stallProgressEvidenceKey: observation.progressEvidenceKey,
             }
           : {}),
       };
@@ -956,6 +969,8 @@ export class CodexRecoveryAdapter {
       reserveInputBroker: (oldInc: string, newInc: string) =>
         this.session.reserveOwnedRemoteInputBroker(oldInc, newInc),
       commitInputBroker: (oldInc: string, newInc: string) => this.session.commitOwnedRemoteInputBroker(oldInc, newInc),
+      rollbackInputBroker: (oldInc: string, newInc: string) =>
+        this.session.rollbackOwnedRemoteInputBroker(oldInc, newInc),
     };
   }
 
@@ -1081,6 +1096,11 @@ export class CodexRecoveryAdapter {
       (flight.reason === 'stalled' ? previous.stallEvidenceKey !== flight.key : previous.key !== flight.key)
     )
       return 'not-sent';
+    const refuseChangedEvidence = (): 'not-sent' => {
+      // No Session/SSH delivery method has been called on these paths.
+      isCurrent.withdrawEvidence?.();
+      return 'not-sent';
+    };
     // Reads are repeated immediately before execution; a completed turn or new user input vetoes an old reservation.
     const current = await this.observe();
     // The turn key survives appended progress. A stall needs the same silence
@@ -1111,15 +1131,16 @@ export class CodexRecoveryAdapter {
       (JSON.stringify(this.proof?.remotePane) !== JSON.stringify(previous.remotePane) ||
         previous.processProofKey !== this.proof?.processProofKey)
     )
-      return 'not-sent';
+      return refuseChangedEvidence();
     if (
       flight.action === 'restart' &&
       !this.session.remote &&
       (!previous.nativePane || previous.processProofKey !== this.proof?.processProofKey)
     )
-      return 'not-sent';
-    if (!isCurrent() || !currentProvesAction || !this.proof || this.proof.generation !== previous.generation)
-      return 'not-sent';
+      return refuseChangedEvidence();
+    if (!isCurrent()) return 'not-sent';
+    if (!currentProvesAction || !this.proof || this.proof.generation !== previous.generation)
+      return refuseChangedEvidence();
     let result: 'sent' | 'not-sent' | 'unknown';
     if (this.session.remote) {
       if (flight.action === 'restart') {
@@ -1164,8 +1185,11 @@ export class CodexRecoveryAdapter {
       }
     } else {
       const generation = this.proof.generation;
-      const confirmEvidence: import('./types.js').RecoveryEvidenceGuard = () =>
-        this.confirmLocalEvidence(flight.conversationId, generation);
+      const confirmEvidence: import('./types.js').RecoveryEvidenceGuard = async () => {
+        const confirmed = await this.confirmLocalEvidence(flight.conversationId, generation);
+        if (!confirmed) isCurrent.withdrawEvidence?.();
+        return confirmed;
+      };
       confirmEvidence.getEvidenceSource = () => this.getLocalEvidenceSource(flight.conversationId, generation);
       result =
         flight.action === 'restart'

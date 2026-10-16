@@ -56,7 +56,7 @@ const Evidence = z
   .string()
   .max(250)
   .regex(/^[\w:.-]+$/);
-const ProgressEvidence = z.string().regex(/^remote:[a-f0-9]{64}$/);
+const ProgressEvidence = z.string().regex(/^(?:local|remote):[a-f0-9]{64}$/);
 const Pending = z
   .object({
     key: Evidence,

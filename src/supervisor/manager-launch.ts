@@ -34,6 +34,7 @@ const UTILITY_FEATURES = [
   'current_time_reminder',
   'sleep_tool',
   'goals',
+  'image_generation',
 ];
 const quote = (text: string) => (/^[A-Za-z0-9_./:=@%+,-]+$/.test(text) ? text : `'${text.replace(/'/g, `'\\''`)}'`);
 

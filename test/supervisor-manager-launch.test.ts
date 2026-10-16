@@ -282,7 +282,7 @@ it('retains failed-preparation files when their contents cannot be verified for 
 it('loads the exact adjacent named profile and keeps the only credential in its private JSON file', async () => {
   const p = await paths();
   const base =
-    'model = "gpt-5.6-sol"\nupdate_plan_enabled = true\nexperimental_request_user_input_enabled = true\n[agents]\nenabled = true\n[features]\ngoals = true\ndeferred_executor = true\nrequest_permissions_tool = true\ntoken_budget = true\ncurrent_time_reminder = true\nsleep_tool = true\n[features.multi_agent_v2]\nenabled = true\n';
+    'model = "gpt-5.6-sol"\nupdate_plan_enabled = true\nexperimental_request_user_input_enabled = true\n[agents]\nenabled = true\n[features]\ngoals = true\ndeferred_executor = true\nrequest_permissions_tool = true\ntoken_budget = true\ncurrent_time_reminder = true\nsleep_tool = true\nimage_generation = true\n[features.multi_agent_v2]\nenabled = true\n';
   await fs.writeFile(join(p.home, 'config.toml'), base);
   const prepared = await prepareSupervisorManagerLaunch({
     home: p.home,
@@ -354,6 +354,7 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
     'current_time_reminder',
     'sleep_tool',
     'goals',
+    'image_generation',
   ]) {
     expect((parsed.features as Record<string, unknown>)[feature]).toBe(false);
     expect(command).toContain(`--config features.${feature}=false`);

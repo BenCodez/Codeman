@@ -139,6 +139,7 @@ export type RemoteCodexActionAuthority =
       getActionDeadline?: () => number;
       reserveInputBroker?: (expectedOldInc: string, newInc: string) => Promise<boolean>;
       commitInputBroker?: (expectedOldInc: string, newInc: string) => Promise<boolean>;
+      rollbackInputBroker?: (expectedOldInc: string, newInc: string) => Promise<boolean>;
     };
 
 /** Explicit disposable transports are mandatory under VITEST; never a live fallback. */
@@ -1008,7 +1009,6 @@ async function rotateRemoteCodexBroker(
     provisional = descriptor;
     if (!descriptor || !currentRemoteAuthority(authority)) return 'not-sent';
     reservationAttempted = true;
-    cache.sealPreparation(descriptor);
     if (!(await authority.reserveInputBroker(oldInc, descriptor.incarnation)) || !currentRemoteAuthority(authority))
       return 'unknown';
     const prepared = await provisionRemoteInputBroker(
@@ -1026,7 +1026,15 @@ async function rotateRemoteCodexBroker(
         transport: options.provisionTransport,
       }
     );
-    if (prepared.status !== 'provisioned') return prepared.status === 'unknown' ? 'unknown' : 'not-sent';
+    if (prepared.status !== 'provisioned') {
+      if (prepared.status === 'unknown' || !authority.rollbackInputBroker) return 'unknown';
+      // Provision certifies no remote effects. Keep keys until the exact durable
+      // pending reservation is acknowledged clear; unknown writes never release it.
+      if ((await authority.rollbackInputBroker(oldInc, descriptor.incarnation)) !== true) return 'unknown';
+      reservationAttempted = false;
+      return 'not-sent';
+    }
+    cache.sealPreparation(descriptor);
     if (
       prepared.directory !== descriptor.directory ||
       prepared.incarnation !== descriptor.incarnation ||
@@ -1063,6 +1071,7 @@ async function rotateRemoteCodexBroker(
     return reservationAttempted ? 'unknown' : 'not-sent';
   } finally {
     if (provisional && !reservationAttempted) await cache.discardUnreservedPreparation(sourceScope, provisional);
+    else if (provisional) cache.sealPreparation(provisional);
   }
 }
 

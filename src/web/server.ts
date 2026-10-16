@@ -5289,6 +5289,10 @@ export class WebServer extends EventEmitter {
     let ok = false;
     try {
       ok = await session.reattachRemote();
+      if (ok) {
+        const current = () => this.sessions.get(sessionId) === session;
+        ok = current() && (this.remoteWake ? await this.remoteWake.acceptVerifiedReattachment(session, current) : true);
+      }
     } catch (err) {
       console.error(`[Server] Remote reattach failed for ${sessionId}:`, err);
       ok = false;

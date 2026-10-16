@@ -365,6 +365,8 @@ export interface TerminalMultiplexer extends EventEmitter {
     expectedOldInc: string | undefined,
     newInc: string
   ): Promise<boolean>;
+  /** Only after certified no remote provisioning effects; ACK exact pending clear before deleting keys. */
+  rollbackOwnedRemoteInputBroker?(sessionId: string, expectedOldInc: string, newInc: string): Promise<boolean>;
   /** Cached authentication inside the caller's existing synchronous input FIFO. */
   wrapCodexOwnerInput?(sessionId: string, input: string, channel?: 'owner-pty' | 'owner-key'): CodexOwnerInputFrame;
   /** Which backend this instance uses */
