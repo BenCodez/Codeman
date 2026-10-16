@@ -2568,7 +2568,15 @@ export class WebServer extends EventEmitter {
   }
 
   /** Explicit, authenticated conversion; a persisted role never grants a running CLI new API authority. */
-  private async prepareSupervisorManager(session: Session, callerCurrent: () => boolean): Promise<boolean> {
+  private supervisorManagerPreparationChecks = new WeakMap<
+    Session,
+    ((isCurrent: () => boolean) => Promise<boolean | { inspectionOnly: true }>) & { canOperate?: () => boolean }
+  >();
+
+  private async prepareSupervisorManager(
+    session: Session,
+    callerCurrent: () => boolean
+  ): Promise<boolean | { inspectionOnly: true }> {
     if (
       !this.supervisorManagerEndpointAvailable() ||
       !this.supervisorManagerAuthenticationAvailable() ||
@@ -2577,187 +2585,240 @@ export class WebServer extends EventEmitter {
       this.sessions.get(session.id) !== session
     )
       return false;
-    if (!(await session.ensureRecoveryIdentityFence())) return false;
-    const owner = session.owner;
-    const configuration = () =>
-      JSON.stringify([
-        session.owner,
-        session.mode,
-        session.workingDir,
-        session.codexConfig,
-        session.getEnvOverridesForPersist(),
-        session.remote,
-        session.docker,
+    const retained = this.supervisorManagerPreparationChecks.get(session);
+    if (retained) return retained(callerCurrent);
+    // Serialize owner preparation/rechecks before their first asynchronous proof.
+    const pending = Object.assign(async () => false, { canOperate: () => false });
+    this.supervisorManagerPreparationChecks.set(session, pending);
+    try {
+      if (!(await session.ensureRecoveryIdentityFence())) return false;
+      const owner = session.owner;
+      const configuration = () =>
+        JSON.stringify([
+          session.owner,
+          session.mode,
+          session.workingDir,
+          session.codexConfig,
+          session.getEnvOverridesForPersist(),
+          session.remote,
+          session.docker,
+        ]);
+      const captured = configuration();
+      const authentication = JSON.stringify([
+        isMultiUserMode(),
+        process.env.CODEMAN_USERNAME,
+        process.env.CODEMAN_PASSWORD,
       ]);
-    const captured = configuration();
-    const authentication = JSON.stringify([
-      isMultiUserMode(),
-      process.env.CODEMAN_USERNAME,
-      process.env.CODEMAN_PASSWORD,
-    ]);
-    const clear = () =>
-      !this.taskStore.loadFailed &&
-      !this.recoveryStore.loadFailed &&
-      !this.supervisorStore.loadFailed &&
-      !this.controllerHasTaskFlight(session.id) &&
-      !this.controllerHasRecoveryFlight(session.id) &&
-      !this.supervisorControllers.get(session.id)?.getStatus().inFlight &&
-      !this.supervisorStore.get(session.id).inFlight &&
-      this.supervisorControllers.get(session.id)?.getStatus().phase !== 'active' &&
-      this.taskControllers.get(session.id)?.getStatus().phase !== 'watching';
-    const scopeCurrent = () => {
-      try {
-        return (
-          callerCurrent() === true &&
-          this.supervisorManagerEndpointAvailable() &&
-          !this.recoveryStopping &&
-          !this.cleaningUp.has(session.id) &&
-          this.sessions.get(session.id) === session &&
-          configuration() === captured &&
-          authentication ===
-            JSON.stringify([isMultiUserMode(), process.env.CODEMAN_USERNAME, process.env.CODEMAN_PASSWORD])
-        );
-      } catch {
+      const clear = () =>
+        !this.taskStore.loadFailed &&
+        !this.recoveryStore.loadFailed &&
+        !this.supervisorStore.loadFailed &&
+        !this.controllerHasTaskFlight(session.id) &&
+        !this.controllerHasRecoveryFlight(session.id) &&
+        !this.supervisorControllers.get(session.id)?.getStatus().inFlight &&
+        !this.supervisorStore.get(session.id).inFlight &&
+        this.supervisorControllers.get(session.id)?.getStatus().phase !== 'active' &&
+        this.taskControllers.get(session.id)?.getStatus().phase !== 'watching';
+      const scopeCurrent = () => {
+        try {
+          return (
+            callerCurrent() === true &&
+            this.supervisorManagerEndpointAvailable() &&
+            !this.recoveryStopping &&
+            !this.cleaningUp.has(session.id) &&
+            this.sessions.get(session.id) === session &&
+            configuration() === captured &&
+            authentication ===
+              JSON.stringify([isMultiUserMode(), process.env.CODEMAN_USERNAME, process.env.CODEMAN_PASSWORD])
+          );
+        } catch {
+          return false;
+        }
+      };
+      const current = () => scopeCurrent() && clear();
+      const context = session.getRecoveryContext();
+      if (
+        !current() ||
+        session.mode !== 'codex' ||
+        session.remote ||
+        session.docker ||
+        session.paneLifecycleInFlight ||
+        !context.managed ||
+        !context.noDaemon ||
+        context.switchPending ||
+        context.untrackedInput ||
+        context.inputBrokerPending ||
+        !session.codexConfig?.resumeSessionId ||
+        !context.codexHome
+      )
         return false;
-      }
-    };
-    const current = () => scopeCurrent() && clear();
-    const context = session.getRecoveryContext();
-    if (
-      !current() ||
-      session.mode !== 'codex' ||
-      session.remote ||
-      session.docker ||
-      session.paneLifecycleInFlight ||
-      !context.managed ||
-      !context.noDaemon ||
-      context.switchPending ||
-      context.untrackedInput ||
-      context.inputBrokerPending ||
-      !session.codexConfig?.resumeSessionId ||
-      !context.codexHome
-    )
-      return false;
-    const grant = await clampRecoveryLaunchForOwner(
-      owner,
-      { codexConfig: session.codexConfig },
-      session.getEnvOverridesForPersist()
-    );
-    if (
-      !current() ||
-      !grant.isCurrent() ||
-      JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(session.codexConfig) ||
-      JSON.stringify(grant.env) !== JSON.stringify(session.getEnvOverridesForPersist())
-    )
-      return false;
-    const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
-    const observation = await adapter.observe();
-    const idle =
-      observation.processReady === true &&
-      ['idle', 'completed'].includes(observation.activity) &&
-      observation.conversationId === session.codexConfig.resumeSessionId &&
-      !session.isBusy() &&
-      !session.watching;
-    const source = adapter.getLocalEvidenceSource(
-      session.codexConfig.resumeSessionId,
-      session.getRecoveryContext().generation
-    );
-    if (
-      !idle ||
-      !source ||
-      !current() ||
-      !grant.isCurrent() ||
-      !(await adapter.confirmLocalEvidence(
+      const grant = await clampRecoveryLaunchForOwner(
+        owner,
+        { codexConfig: session.codexConfig },
+        session.getEnvOverridesForPersist()
+      );
+      if (
+        !current() ||
+        !grant.isCurrent() ||
+        JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(session.codexConfig) ||
+        JSON.stringify(grant.env) !== JSON.stringify(session.getEnvOverridesForPersist())
+      )
+        return false;
+      const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+      const observation = await adapter.observe();
+      const idle =
+        observation.processReady === true &&
+        ['idle', 'completed'].includes(observation.activity) &&
+        observation.conversationId === session.codexConfig.resumeSessionId &&
+        !session.isBusy() &&
+        !session.watching;
+      const source = adapter.getLocalEvidenceSource(
         session.codexConfig.resumeSessionId,
         session.getRecoveryContext().generation
-      )) ||
-      !current()
-    )
-      return false;
-    const leaf = source.identity.witness?.paths.find(
-      (value) => value.path === source.identity.path && value.kind === 'file'
-    );
-    if (
-      !leaf ||
-      leaf.size === undefined ||
-      leaf.mtimeMs === undefined ||
-      leaf.ctimeMs === undefined ||
-      source.identity.tail === undefined ||
-      !source.identity.path
-    )
-      return false;
-    const files = [
-      {
-        path: source.identity.path,
-        dev: leaf.dev,
-        ino: leaf.ino,
-        size: leaf.size,
-        mtimeMs: leaf.mtimeMs,
-        ctimeMs: leaf.ctimeMs,
-        hash: createHash('sha256').update(source.identity.tail).digest('hex'),
-        maxBytes: 262_144,
-      },
-    ];
-    const grantFile = grant.getFileWitness?.() ?? grant.fileWitness;
-    if (grantFile) files.push(grantFile);
-    let converting = true;
-    const credential = this.supervisorManagerCredentials.issue({
-      sessionId: session.id,
-      owner,
-      isCurrent: () =>
-        converting
-          ? current() && grant.isCurrent()
-          : scopeCurrent() &&
-            session.owner === owner &&
-            session.isSupervisorManagerLaunchCurrent() &&
-            grant.isCurrent(),
-    });
-    try {
-      const scheme = this.https ? 'https' : 'http';
-      const launchStartedAt = Date.now();
-      const prepared = await session.prepareSupervisorManager({
-        token: credential.token,
-        endpoint: `${scheme}://127.0.0.1:${this.port}${this.basePath}/api/supervisor-mcp`,
-        files,
-        isCurrent: () => (converting ? current() : scopeCurrent()) && grant.isCurrent(),
-      });
-      let ready = false;
-      const readyDeadline = performance.now() + 5_000;
-      while (
-        prepared &&
-        current() &&
-        grant.isCurrent() &&
-        session.isSupervisorManagerLaunchCurrent() &&
-        performance.now() < readyDeadline
-      ) {
-        const observed = await adapter.observe();
-        if (
-          current() &&
-          grant.isCurrent() &&
-          observed.conversationId === session.codexConfig?.resumeSessionId &&
-          ['idle', 'completed'].includes(observed.activity) &&
-          hasFreshProcessReady(observed, launchStartedAt, Date.now())
-        ) {
-          ready = true;
-          break;
-        }
-        if (!['unknown', 'idle', 'completed'].includes(observed.activity)) break;
-        const remaining = readyDeadline - performance.now();
-        if (remaining <= 0) break;
-        await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
-      }
-      converting = false;
-      if (!ready || !session.isSupervisorManagerLaunchCurrent() || !current() || !grant.isCurrent()) {
-        credential.revoke();
-        await session.revokeSupervisorManagerLaunch();
+      );
+      if (
+        !idle ||
+        !source ||
+        !current() ||
+        !grant.isCurrent() ||
+        !(await adapter.confirmLocalEvidence(
+          session.codexConfig.resumeSessionId,
+          session.getRecoveryContext().generation
+        )) ||
+        !current()
+      )
         return false;
+      const leaf = source.identity.witness?.paths.find(
+        (value) => value.path === source.identity.path && value.kind === 'file'
+      );
+      if (
+        !leaf ||
+        leaf.size === undefined ||
+        leaf.mtimeMs === undefined ||
+        leaf.ctimeMs === undefined ||
+        source.identity.tail === undefined ||
+        !source.identity.path
+      )
+        return false;
+      const files = [
+        {
+          path: source.identity.path,
+          dev: leaf.dev,
+          ino: leaf.ino,
+          size: leaf.size,
+          mtimeMs: leaf.mtimeMs,
+          ctimeMs: leaf.ctimeMs,
+          hash: createHash('sha256').update(source.identity.tail).digest('hex'),
+          maxBytes: 262_144,
+        },
+      ];
+      const grantFile = grant.getFileWitness?.() ?? grant.fileWitness;
+      if (grantFile) files.push(grantFile);
+      let converting = true,
+        acknowledged = false,
+        operationReady = false;
+      let launchAuthority: ReturnType<Session['captureSupervisorManagerLaunchAuthority']>;
+      const credential = this.supervisorManagerCredentials.issue({
+        canOperate: () => operationReady,
+        sessionId: session.id,
+        owner,
+        isCurrent: () =>
+          converting
+            ? current() && grant.isCurrent()
+            : scopeCurrent() && session.owner === owner && launchAuthority?.() === true && grant.isCurrent(),
+      });
+      const launchIsCurrent = () =>
+        acknowledged &&
+        scopeCurrent() &&
+        grant.isCurrent() &&
+        launchAuthority?.() === true &&
+        this.supervisorManagerCredentials.resolve(credential.token) !== undefined;
+      const refuse = async (): Promise<boolean | { inspectionOnly: true }> => {
+        converting = false;
+        if (launchIsCurrent()) {
+          // Readiness uncertainty cannot justify replacing a possibly working pane.
+          // Keep its exact restricted profile usable for inspection, with no actions.
+          this.supervisorManagerPreparationChecks.set(session, checkReadiness);
+          return { inspectionOnly: true };
+        }
+        this.supervisorManagerPreparationChecks.delete(session);
+        credential.revoke();
+        if (launchAuthority) await launchAuthority.revoke();
+        else if (!acknowledged) await session.revokeSupervisorManagerLaunch();
+        return false;
+      };
+      let launchStartedAt = 0,
+        checking = false;
+      const checkReadiness = async (requestCurrent: () => boolean): Promise<boolean | { inspectionOnly: true }> => {
+        if (requestCurrent() !== true) return scopeCurrent() ? false : refuse();
+        if (operationReady) return launchIsCurrent() ? true : refuse();
+        if (checking) return launchIsCurrent() ? { inspectionOnly: true } : false;
+        checking = true;
+        try {
+          let ready = false;
+          const readyDeadline = performance.now() + 5_000;
+          try {
+            while (
+              acknowledged &&
+              requestCurrent() === true &&
+              current() &&
+              grant.isCurrent() &&
+              session.isSupervisorManagerLaunchCurrent() &&
+              performance.now() < readyDeadline
+            ) {
+              const observed = await adapter.observe();
+              if (
+                requestCurrent() === true &&
+                current() &&
+                grant.isCurrent() &&
+                observed.conversationId === session.codexConfig?.resumeSessionId &&
+                ['idle', 'completed'].includes(observed.activity) &&
+                hasFreshProcessReady(observed, launchStartedAt, Date.now())
+              ) {
+                ready = true;
+                break;
+              }
+              if (!['unknown', 'idle', 'completed'].includes(observed.activity)) break;
+              const remaining = readyDeadline - performance.now();
+              if (remaining <= 0) break;
+              await new Promise((resolve) => setTimeout(resolve, Math.min(100, remaining)));
+            }
+            converting = false;
+            if (ready && requestCurrent() === true && launchIsCurrent() && current()) {
+              operationReady = true;
+              this.supervisorManagerPreparationChecks.set(session, checkReadiness);
+              return true;
+            }
+          } catch {
+            /* A failed observation never certifies readiness. */
+          }
+          // A cancelled recheck grants nothing and leaves the previous read-only proof intact.
+          if (requestCurrent() !== true && scopeCurrent()) return false;
+          return refuse();
+        } finally {
+          checking = false;
+        }
+      };
+      Object.assign(checkReadiness, { canOperate: () => operationReady && launchIsCurrent() });
+      try {
+        const scheme = this.https ? 'https' : 'http';
+        launchStartedAt = Date.now();
+        acknowledged =
+          (await session.prepareSupervisorManager({
+            token: credential.token,
+            endpoint: `${scheme}://127.0.0.1:${this.port}${this.basePath}/api/supervisor-mcp`,
+            files,
+            isCurrent: () => (converting ? current() : scopeCurrent()) && grant.isCurrent(),
+          })) === true;
+        if (acknowledged) launchAuthority = session.captureSupervisorManagerLaunchAuthority();
+        converting = false;
+        return await checkReadiness(callerCurrent);
+      } catch {
+        return refuse();
       }
-      return true;
-    } catch {
-      converting = false;
-      credential.revoke();
-      await session.revokeSupervisorManagerLaunch();
-      return false;
+    } finally {
+      if (this.supervisorManagerPreparationChecks.get(session) === pending)
+        this.supervisorManagerPreparationChecks.delete(session);
     }
   }
 
@@ -3107,7 +3168,11 @@ export class WebServer extends EventEmitter {
         startManager: async (objective, _workers, isCurrent, runtimeStartedAt) => {
           managerGrant = undefined;
           managerEvidence = undefined;
-          if (!managerIsEligible() || !session.isSupervisorManagerLaunchCurrent())
+          if (
+            !managerIsEligible() ||
+            !session.isSupervisorManagerLaunchCurrent() ||
+            this.supervisorManagerPreparationChecks.get(session)?.canOperate?.() === false
+          )
             throw new SupervisorValidationError('Prepare a restricted manager launch before Start');
           const task = this.getTaskController(session);
           if (!task) throw new Error('Supervisor task controller is unavailable');
@@ -3120,6 +3185,7 @@ export class WebServer extends EventEmitter {
             this.taskControllers.get(session.id) === task &&
             managerIsEligible() &&
             session.isSupervisorManagerLaunchCurrent() &&
+            this.supervisorManagerPreparationChecks.get(session)?.canOperate?.() !== false &&
             managerScope() === scope;
           try {
             await task.update(buildSupervisorManagerTask(objective), current);

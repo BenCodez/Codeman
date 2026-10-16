@@ -71,9 +71,12 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
     });
     const current = () => !cancelled && ctx.sessions.get(id) === session;
     try {
-      if (!ctx.prepareSupervisorManager || !(await ctx.prepareSupervisorManager(session, current)) || !current())
-        throw new SupervisorValidationError('Restricted manager preparation was refused');
-      return { success: true, data: { managerReady: true } };
+      const prepared = await ctx.prepareSupervisorManager?.(session, current);
+      if (!current()) throw new SupervisorValidationError('Restricted manager preparation was refused');
+      if (prepared === true) return { success: true, data: { managerReady: true } };
+      if (prepared && prepared.inspectionOnly === true)
+        return { success: true, data: { managerReady: false, managerInspectionOnly: true } };
+      throw new SupervisorValidationError('Restricted manager preparation was refused');
     } catch (error) {
       return operationFailure(
         reply,

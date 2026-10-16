@@ -416,6 +416,42 @@ describe('Codex supervisor UI in Chromium', () => {
   }
 
   for (const width of [1440, 390]) {
+    it(`shows inspection-only preparation without starting or restarting at ${width}px`, async () => {
+      const page = await render(width);
+      try {
+        await page.evaluate(() => {
+          const app = (window as any).app;
+          const request = app._apiJson;
+          app._apiJson = async (url: string, options: unknown) => {
+            if (url.endsWith('/prepare-manager')) {
+              (window as any).supervisorCalls.push({ url, options });
+              return { managerReady: false, managerInspectionOnly: true };
+            }
+            return request(url, options);
+          };
+          app.showToast = (message: string) => {
+            const toast = document.createElement('div');
+            toast.id = 'inspectionOnlyNotice';
+            toast.textContent = message;
+            document.body.appendChild(toast);
+          };
+        });
+        await page.locator('[data-tab="supervisor"]').click();
+        page.once('dialog', (dialog) => void dialog.accept());
+        await page.getByRole('button', { name: 'Prepare restricted manager' }).click();
+        await page.waitForSelector('#inspectionOnlyNotice');
+        expect(await page.locator('#inspectionOnlyNotice').textContent()).toContain(
+          'status and worker inspection only'
+        );
+        expect(await page.locator('#inspectionOnlyNotice').textContent()).toContain('without restarting');
+        const calls = await page.evaluate(() => (window as any).supervisorCalls);
+        expect(calls.some((call: any) => /\/(start|restart)$/.test(call.url))).toBe(false);
+        expect(calls.filter((call: any) => call.url.endsWith('/prepare-manager'))).toHaveLength(1);
+      } finally {
+        await page.close();
+      }
+    });
+
     it(`configures explicit workers and starts the manager at ${width}px`, async () => {
       const page = await render(width);
       try {

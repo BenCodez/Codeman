@@ -75,6 +75,42 @@ describe('supervisor routes', () => {
     vi.unstubAllEnvs();
   });
 
+  it.each([
+    { prepared: true, ready: true, inspect: false },
+    { prepared: { inspectionOnly: true }, ready: false, inspect: true },
+    { prepared: false, ready: false, inspect: false },
+    { prepared: { inspectionOnly: 'true' }, ready: false, inspect: false },
+  ])('reports exact preparation readiness or retained inspection: $prepared', async ({ prepared, ready, inspect }) => {
+    const preparation = vi.fn(async () => prepared as never);
+    const local = await createRouteTestHarness(
+      (app, ctx) =>
+        registerSupervisorRoutes(app, {
+          ...ctx,
+          getSupervisorController: () => controller,
+          prepareSupervisorManager: preparation,
+        }),
+      { authUser: { username: 'alice', role: 'user' } }
+    );
+    Object.assign(local.ctx._session, { mode: 'codex', owner: 'alice' });
+    try {
+      const response = await local.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${local.ctx._sessionId}/supervisor/prepare-manager`,
+        payload: { confirmRestrictedManager: true },
+      });
+      expect(response.statusCode).toBe(ready || inspect ? 200 : 400);
+      if (ready || inspect)
+        expect(response.json().data).toEqual(
+          ready ? { managerReady: true } : { managerReady: false, managerInspectionOnly: true }
+        );
+      else expect(response.json().success).toBe(false);
+      expect(preparation).toHaveBeenCalledOnce();
+      expect(controller.start).not.toHaveBeenCalled();
+    } finally {
+      await local.app.close();
+    }
+  });
+
   it('requires authenticated owner access before resolving a controller', async () => {
     Object.assign(h.ctx._session, { owner: 'bob' });
     const res = await h.app.inject({ method: 'GET', url: `/api/sessions/${h.ctx._sessionId}/supervisor` });

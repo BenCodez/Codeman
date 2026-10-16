@@ -9,6 +9,7 @@ interface Entry {
   readonly scope: SupervisorManagerScope;
   readonly key: string;
   readonly isCurrent: () => boolean;
+  readonly canOperate: () => boolean;
 }
 const TOKEN = /^codeman-manager-v1\.[a-f0-9]{64}$/;
 const SESSION = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
@@ -18,12 +19,16 @@ export class ManagerCredentialRegistry {
   private readonly entries = new Map<string, Entry>();
   private readonly scopes = new WeakMap<SupervisorManagerScope, Entry>();
 
-  issue(options: SupervisorManagerScope & { isCurrent: () => boolean }): { token: string; revoke(): void } {
+  issue(options: SupervisorManagerScope & { isCurrent: () => boolean; canOperate?: () => boolean }): {
+    token: string;
+    revoke(): void;
+  } {
     if (
       !SESSION.test(options.sessionId) ||
       (options.owner !== undefined &&
         (typeof options.owner !== 'string' || !options.owner || options.owner.length > 128)) ||
-      typeof options.isCurrent !== 'function'
+      typeof options.isCurrent !== 'function' ||
+      (options.canOperate !== undefined && typeof options.canOperate !== 'function')
     )
       throw new Error('Invalid supervisor credential scope');
     this.revokeSession(options.sessionId);
@@ -34,7 +39,7 @@ export class ManagerCredentialRegistry {
       sessionId: options.sessionId,
       ...(options.owner !== undefined ? { owner: options.owner } : {}),
     });
-    const entry: Entry = { scope, key, isCurrent: options.isCurrent };
+    const entry: Entry = { scope, key, isCurrent: options.isCurrent, canOperate: options.canOperate ?? (() => true) };
     this.entries.set(key, entry);
     this.scopes.set(scope, entry);
     return {
@@ -61,6 +66,19 @@ export class ManagerCredentialRegistry {
         return false;
       }
       return verdict === true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Readiness never follows from credential possession or an uncertain launch. */
+  canOperate(scope: SupervisorManagerScope): boolean {
+    if (!this.isCurrent(scope)) return false;
+    try {
+      const verdict: unknown = this.scopes.get(scope)!.canOperate();
+      if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+        void Promise.resolve(verdict).catch(() => {});
+      return verdict === true && this.isCurrent(scope);
     } catch {
       return false;
     }

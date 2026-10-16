@@ -2414,6 +2414,17 @@ export class Session extends EventEmitter {
     return current;
   }
 
+  /** Process-local proof for this exact acknowledged profile, never a replacement launch. */
+  captureSupervisorManagerLaunchAuthority(): ((() => boolean) & { revoke(): Promise<void> }) | undefined {
+    const profile = this._supervisorManagerProfile;
+    return profile && this.isSupervisorManagerLaunchCurrent()
+      ? Object.assign(() => this._supervisorManagerProfile === profile && this.isSupervisorManagerLaunchCurrent(), {
+          revoke: () =>
+            this._supervisorManagerProfile === profile ? this.revokeSupervisorManagerLaunch() : Promise.resolve(),
+        })
+      : undefined;
+  }
+
   /** Explicit owner conversion of a separately verified idle pane; no create or fallback path. */
   async prepareSupervisorManager(options: {
     token: string;

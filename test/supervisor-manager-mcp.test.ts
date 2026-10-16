@@ -16,7 +16,12 @@ const SID = '11111111-2222-4333-8444-555555555555';
 const WORKER = '22222222-3333-4444-8555-666666666666';
 const REQUEST = '33333333-4444-4555-8666-777777777777';
 const apps: FastifyInstance[] = [];
-async function fixture(password = 'owner-password', multiuser = false, initiallyAborted = false) {
+async function fixture(
+  password = 'owner-password',
+  multiuser = false,
+  initiallyAborted = false,
+  initiallyReady = true
+) {
   vi.stubEnv('CODEMAN_MULTIUSER', multiuser ? '1' : '0');
   vi.stubEnv('CODEMAN_PASSWORD', password);
   vi.stubEnv('CODEMAN_USERNAME', 'admin');
@@ -34,8 +39,14 @@ async function fixture(password = 'owner-password', multiuser = false, initially
     }
   });
   const registry = new ManagerCredentialRegistry();
-  let current = true;
-  const issued = registry.issue({ sessionId: SID, owner: multiuser ? 'alice' : undefined, isCurrent: () => current });
+  let current = true,
+    ready = initiallyReady;
+  const issued = registry.issue({
+    sessionId: SID,
+    owner: multiuser ? 'alice' : undefined,
+    isCurrent: () => current,
+    canOperate: () => ready,
+  });
   const auth = registerAuthMiddleware(app, false, '', registry);
   app.addHook('onClose', async () => {
     for (const map of Object.values(auth)) map?.dispose();
@@ -78,6 +89,9 @@ async function fixture(password = 'owner-password', multiuser = false, initially
     });
   return {
     app,
+    setReady: (value: boolean) => {
+      ready = value;
+    },
     registry,
     issued,
     controller,
@@ -327,4 +341,34 @@ it('refuses an already-aborted request before invoking any manager operation', a
   expect(f.resolve).not.toHaveBeenCalled();
   expect(f.controller.assign).not.toHaveBeenCalled();
   expect(f.controller.retry).not.toHaveBeenCalled();
+});
+
+it('keeps an uncertain launch usable for inspection while refusing every worker mutation', async () => {
+  const f = await fixture('owner-password', false, false, false);
+  const scope = f.registry.resolve(f.issued.token)!;
+  expect(scope).toBeDefined();
+  expect(f.registry.canOperate(scope)).toBe(false);
+  for (const name of ['supervisor_status', 'supervisor_workers']) {
+    const response = await f.rpc('tools/call', { name, arguments: {} });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().result.content[0].type).toBe('text');
+  }
+  for (const name of ['supervisor_assign', 'supervisor_retry']) {
+    const response = await f.rpc('tools/call', { name, arguments: { workerId: WORKER, requestId: REQUEST } });
+    expect(response.json().error).toMatchObject({ code: -32001 });
+  }
+  expect(f.controller.inspectWorkers).toHaveBeenCalledWith(true);
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.retry).not.toHaveBeenCalled();
+  expect((await f.rpc('tools/list')).json().result.tools).toHaveLength(4);
+  f.setReady(true);
+  expect(f.registry.resolve(f.issued.token)).toBe(scope);
+  expect(
+    (
+      await f.rpc('tools/call', { name: 'supervisor_assign', arguments: { workerId: WORKER, requestId: REQUEST } })
+    ).json().error
+  ).toBeUndefined();
+  expect(f.controller.assign).toHaveBeenCalledOnce();
+  f.revoke();
+  expect((await f.rpc('tools/call', { name: 'supervisor_status' })).statusCode).toBe(401);
 });

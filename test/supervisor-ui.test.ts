@@ -349,6 +349,28 @@ describe('Codex supervisor UI', () => {
     expect(h.app._supervisorView.state.phase).toBe('disabled');
   });
 
+  it.each(['en', 'zh-CN'] as const)(
+    'explains retained inspection-only preparation in %s without starting or restarting',
+    async (language) => {
+      const h = harness();
+      vm.runInContext(read('i18n.js'), h.ctx);
+      h.dom.window.CodemanI18n.configure({ language });
+      h.app.openSupervisorOptions(SID);
+      await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+      vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
+      h.app._apiJson.mockImplementation(async (url: string) =>
+        url.endsWith('/prepare-manager') ? { managerReady: false, managerInspectionOnly: true } : state()
+      );
+      await h.app.prepareSupervisorManager();
+      expect(h.app.showToast).toHaveBeenCalledWith(
+        expect.stringContaining(language === 'en' ? 'inspection only' : '不能执行操作'),
+        'error'
+      );
+      expect(h.app._apiJson.mock.calls.some(([url]: [string]) => /\/(start|restart)$/.test(url))).toBe(false);
+      expect(h.app._supervisorView.state.phase).toBe('disabled');
+    }
+  );
+
   it.each([null, {}, { managerReady: false }])('never treats uncertain preparation %j as ready', async (result) => {
     const h = harness();
     h.app.openSupervisorOptions(SID);

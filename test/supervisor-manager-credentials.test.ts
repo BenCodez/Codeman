@@ -84,3 +84,20 @@ it('a new launch for the same session retires the old token without reviving it'
   registry.revokeSession(SID);
   expect(registry.resolve(fresh.token)).toBeUndefined();
 });
+
+it('requires a literal current readiness grant independently of inspection authentication', async () => {
+  const registry = new ManagerCredentialRegistry();
+  let verdict: unknown = false;
+  const issued = registry.issue({ sessionId: SID, isCurrent: () => true, canOperate: () => verdict as boolean });
+  const scope = registry.resolve(issued.token)!;
+  for (const value of [false, undefined, null, 'true', Promise.reject(Error('unknown readiness'))]) {
+    verdict = value;
+    expect(registry.resolve(issued.token)).toBe(scope);
+    expect(registry.canOperate(scope)).toBe(false);
+  }
+  await Promise.resolve();
+  verdict = true;
+  expect(registry.canOperate(scope)).toBe(true);
+  issued.revoke();
+  expect(registry.canOperate(scope)).toBe(false);
+});

@@ -291,17 +291,18 @@ export class SupervisorController {
     });
   }
 
-  async inspectWorkers(): Promise<SupervisorWorkerInspection[]> {
-    if (this.state.phase !== 'active') throw new SupervisorValidationError('Supervisor is not active');
+  async inspectWorkers(inspectionOnly = false): Promise<SupervisorWorkerInspection[]> {
+    if (this.state.phase !== 'active' && inspectionOnly !== true)
+      throw new SupervisorValidationError('Supervisor is not active');
     if (!this.inspection) {
-      this.inspection = this.runInspection().finally(() => {
+      this.inspection = this.runInspection(inspectionOnly).finally(() => {
         this.inspection = undefined;
       });
     }
     return structuredClone(await this.inspection);
   }
 
-  private async runInspection(): Promise<SupervisorWorkerInspection[]> {
+  private async runInspection(inspectionOnly: boolean): Promise<SupervisorWorkerInspection[]> {
     const revision = this.revision;
     const configured = [...this.state.workers];
     const result = new Array<SupervisorWorkerInspection>(configured.length);
@@ -380,7 +381,7 @@ export class SupervisorController {
       const currentWorker = this.deps.worker(workerId);
       if (
         this.stopped ||
-        this.state.phase !== 'active' ||
+        (this.state.phase !== 'active' && inspectionOnly !== true) ||
         this.revision !== revision ||
         currentWorker?.task !== worker.task ||
         currentWorker?.recovery !== worker.recovery

@@ -445,6 +445,13 @@ Object.assign(CodemanApp.prototype, {
     if (this._supervisorView !== view) return;
     if (prepared?.managerReady === true)
       this.showToast(supervisorUiTranslate('Restricted manager prepared. Select Start manager to begin.'), 'success');
+    else if (prepared?.managerReady === false && prepared?.managerInspectionOnly === true)
+      this.showToast(
+        supervisorUiTranslate(
+          'Manager readiness is uncertain. The restricted conversation remains available for status and worker inspection only. Check the conversation, then select Prepare to recheck without restarting it; owner controls remain available.'
+        ),
+        'error'
+      );
     else
       this.showToast(
         supervisorUiTranslate(

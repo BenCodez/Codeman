@@ -55,7 +55,7 @@ interface Internals {
   taskStore: TaskStore;
   supervisorStore: SupervisorStore;
   getSupervisorController(session: Session): SupervisorController | undefined;
-  prepareSupervisorManager(session: Session, isCurrent: () => boolean): Promise<boolean>;
+  prepareSupervisorManager(session: Session, isCurrent: () => boolean): Promise<boolean | { inspectionOnly: true }>;
   getTaskController(session: Session): TaskController | undefined;
   getRecoveryController(session: Session): RecoveryController | undefined;
   stopRecoveryController(id: string, drop: boolean): Promise<void>;
@@ -120,6 +120,11 @@ async function fakeSession(id: string, conversationId: string): Promise<Session>
   });
   // This suite isolates Task/native issuer authority after the separate restricted launch boundary.
   vi.spyOn(session, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
+  vi.spyOn(session, 'captureSupervisorManagerLaunchAuthority').mockImplementation(() =>
+    Object.assign(() => session.isSupervisorManagerLaunchCurrent(), {
+      revoke: () => session.revokeSupervisorManagerLaunch(),
+    })
+  );
   constructedSessions.push(session);
   expect(await session.ensureRecoveryIdentityFence()).toBe(true);
   inputProofs.set(session, inputProof);
@@ -439,6 +444,112 @@ describe('manager authority at the real server boundary', () => {
     expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
     expect(prepare).toHaveBeenCalledOnce();
   });
+
+  it('binds inspection authority and retirement to one exact profile, preserving a replacement', async () => {
+    const original = {},
+      replacement = {};
+    Reflect.set(managerSession, '_supervisorManagerProfile', original);
+    const authority = Session.prototype.captureSupervisorManagerLaunchAuthority.call(managerSession)!;
+    const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
+    try {
+      expect(authority()).toBe(true);
+      Reflect.set(managerSession, '_supervisorManagerProfile', replacement);
+      expect(authority()).toBe(false);
+      await authority.revoke();
+      expect(revoke).not.toHaveBeenCalled();
+      expect(Reflect.get(managerSession, '_supervisorManagerProfile')).toBe(replacement);
+    } finally {
+      Reflect.set(managerSession, '_supervisorManagerProfile', undefined);
+    }
+  });
+
+  it.each(['timeout', 'observe-failure', 'working'] as const)(
+    'retains an acknowledged exact launch for inspection after %s and rechecks without respawning',
+    async (kind) => {
+      await manager.pause();
+      Reflect.set(server, 'supervisorManagerAuthReady', true);
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      const registry = Reflect.get(
+        server,
+        'supervisorManagerCredentials'
+      ) as import('../src/supervisor/manager-credentials.js').ManagerCredentialRegistry;
+      let launched = false,
+        inspect = true,
+        token = '',
+        offset = 0;
+      const monotonic = performance.now.bind(performance);
+      const now = monotonic();
+      vi.spyOn(performance, 'now').mockImplementation(() => now + offset);
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const original = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        if (launched && inspect) {
+          if (kind === 'observe-failure') throw Error('fixture failed readiness observation');
+          if (kind === 'timeout') offset += 5_001;
+          return { ...observation, activity: kind === 'working' ? 'working' : 'unknown', processReady: false };
+        }
+        return original.call(this);
+      });
+      const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
+      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        token = options.token;
+        launched = true;
+        return true;
+      });
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toEqual({ inspectionOnly: true });
+      const scope = registry.resolve(token)!;
+      expect(scope).toBeDefined();
+      expect(registry.canOperate(scope)).toBe(false);
+      expect(revoke).not.toHaveBeenCalled();
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toEqual({ inspectionOnly: true });
+      expect(prepare).toHaveBeenCalledOnce();
+      expect(registry.canOperate(scope)).toBe(false);
+      await expect(manager.inspectWorkers()).rejects.toThrow(/not active/);
+      expect((await manager.inspectWorkers(true)).map((worker) => worker.sessionId)).toEqual([WORKER]);
+      const taskBeforeStart = managerTask.getStatus();
+      await expect(manager.start()).rejects.toThrow(/restricted manager/);
+      expectManagerEvidenceUnchanged(managerTask.getStatus(), taskBeforeStart, true);
+      expect(registry.resolve(token)).toBe(scope);
+      expect(prepare).toHaveBeenCalledOnce();
+      inspect = false;
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+      expect(prepare).toHaveBeenCalledOnce();
+      expect(registry.resolve(token)).toBe(scope);
+      expect(registry.canOperate(scope)).toBe(true);
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+      expect(prepare).toHaveBeenCalledOnce();
+      expect(effects).not.toHaveBeenCalled();
+    }
+  );
+  it.each(['owner', 'config', 'authentication', 'incarnation', 'cancelled'] as const)(
+    'revokes instead of retaining a launch with changed %s proof',
+    async (kind) => {
+      await manager.pause();
+      Reflect.set(server, 'supervisorManagerAuthReady', true);
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      let current = true,
+        token = '';
+      const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
+      vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        token = options.token;
+        if (kind === 'owner') managerSession.owner = 'changed-owner';
+        if (kind === 'config')
+          Reflect.set(managerSession, '_codexConfig', { ...managerSession.codexConfig, model: 'changed-model' });
+        if (kind === 'authentication') process.env.CODEMAN_PASSWORD = 'changed-fixture-password';
+        if (kind === 'incarnation') vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockReturnValue(false);
+        if (kind === 'cancelled') current = false;
+        return true;
+      });
+      expect(await internals.prepareSupervisorManager(managerSession, () => current)).toBe(false);
+      const registry = Reflect.get(
+        server,
+        'supervisorManagerCredentials'
+      ) as import('../src/supervisor/manager-credentials.js').ManagerCredentialRegistry;
+      expect(registry.resolve(token)).toBeUndefined();
+      expect(revoke).toHaveBeenCalled();
+      expect(effects).not.toHaveBeenCalled();
+    }
+  );
 
   it.each(['active', 'working', 'unknown'] as const)(
     'does not interrupt a %s manager to convert its role',

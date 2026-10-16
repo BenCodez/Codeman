@@ -260,6 +260,8 @@
     'Disable alternate screen': '禁用备用屏幕',
     'Start new local Codex sessions with --no-alt-screen so transcript output remains in terminal scrollback.':
       '使用 --no-alt-screen 启动新的本地 Codex 会话，使对话输出保留在终端回滚记录中。',
+    'Manager readiness is uncertain. The restricted conversation remains available for status and worker inspection only. Check the conversation, then select Prepare to recheck without restarting it; owner controls remain available.':
+      '主管就绪状态不确定。受限会话仍可查询状态和查看工作会话，但不能执行操作。请检查会话，然后选择“准备”重新验证（不会重启会话）；所有者控制仍然可用。',
     'Supervisor is off': '主管已关闭',
     'Supervisor configuration saved': '主管配置已保存',
     'Manager start reserved': '已保留管理器启动操作',

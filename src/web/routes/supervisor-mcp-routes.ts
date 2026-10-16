@@ -74,7 +74,9 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
     };
     req.raw.once('aborted', cancel);
     reply.raw.once('close', closed);
-    const current = () => !disconnected && ctx.credentials.isCurrent(scope);
+    let operation = false;
+    const current = () =>
+      !disconnected && ctx.credentials.isCurrent(scope) && (!operation || ctx.credentials.canOperate(scope));
     const send = (value: unknown) => reply.type('application/json').send(JSON.stringify(value));
     const fail = (id: string | number | null, code: number, message: string) =>
       send({ jsonrpc: '2.0', id, error: { code, message } });
@@ -146,7 +148,9 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
         .strict()
         .safeParse(params);
       if (!call.success) return fail(id, -32602, 'Unknown or invalid manager tool');
-      const operation = call.data.name === 'supervisor_assign' || call.data.name === 'supervisor_retry';
+      operation = call.data.name === 'supervisor_assign' || call.data.name === 'supervisor_retry';
+      if (operation && !ctx.credentials.canOperate(scope))
+        return fail(id, -32001, 'Manager preparation is uncertain; only status and worker inspection are available');
       const args = (operation ? Operation : Empty).safeParse(
         call.data.arguments === undefined ? {} : call.data.arguments
       );
@@ -155,7 +159,8 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
       if (!controller || !current()) return fail(id, -32001, 'Manager role is no longer current');
       let result: unknown;
       if (call.data.name === 'supervisor_status') result = controller.getStatus();
-      else if (call.data.name === 'supervisor_workers') result = await controller.inspectWorkers();
+      else if (call.data.name === 'supervisor_workers')
+        result = await controller.inspectWorkers(!ctx.credentials.canOperate(scope));
       else {
         const selected = Operation.parse(args.data);
         if (selected.workerId === scope.sessionId) return fail(id, -32602, 'A manager cannot operate on itself');
