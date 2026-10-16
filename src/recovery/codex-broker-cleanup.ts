@@ -1,7 +1,7 @@
 /** Bounded optional retirement. Unknown references or evidence always retain private files. */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { constants, type Stats } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
 import { join, normalize, isAbsolute } from 'node:path';
 import { CODEX_BROKER_CLEANUP_SOURCE } from './codex-broker-cleanup-source.js';
@@ -24,40 +24,74 @@ export function captureBrokerCleanupReferences(read: () => unknown): BrokerClean
       typeof (item as { then?: unknown }).then !== 'function'
     );
   }
-  function uncertain(item: unknown): boolean {
-    if (typeof item === 'function' || typeof item === 'symbol' || typeof item === 'bigint') return true;
-    if (!item || typeof item !== 'object') return typeof item === 'number' && !Number.isFinite(item);
-    if (!Array.isArray(item) && !plain(item)) {
-      drain(item);
-      return true;
-    }
-    return Object.entries(item).some(
-      ([key, child]) =>
-        (['inFlight', 'deliveryUncertain', 'codexRestoreUncertain', 'recoveryInputBrokerPending'].includes(key) &&
-          !!child) ||
-        (/inputbroker|inputevidence/i.test(key) && child === 'unknown') ||
-        uncertain(child)
-    );
-  }
-  function serialize(): string | undefined {
+  function capture(): { digest: string; references: string[] } | undefined {
     try {
       const value = read();
       if (!plain(value) || Object.values(value as object).some((item) => item === undefined)) {
         drain(value);
         return undefined;
       }
-      if (uncertain(value)) return undefined;
-      const text = JSON.stringify(value);
-      return text && Buffer.byteLength(text) <= 2_097_152 ? text : undefined;
+      const hash = createHash('sha256'),
+        references = new Set<string>(),
+        ancestors = new Set<object>();
+      let relevantBytes = 0,
+        nodes = 0;
+      const token = (kind: string, text: string) => {
+        hash.update(`${kind}${Buffer.byteLength(text)}:`).update(text);
+      };
+      const text = (kind: string, value: string, provenance: boolean) => {
+        token(kind, value);
+        const matches = provenance ? value.match(UUID) : null;
+        if (matches) {
+          relevantBytes += Buffer.byteLength(value);
+          if (relevantBytes > 2_097_152) throw new Error('Oversized broker provenance');
+          for (const match of matches) references.add(match);
+          if (references.size > 32_768) throw new Error('Too many broker references');
+        }
+      };
+      const visit = (item: unknown, depth: number, provenance = true): void => {
+        if (++nodes > 262_144 || depth > 128) throw new Error('Unbounded reference domain');
+        if (typeof item === 'string') return text('string', item, provenance);
+        if (item === undefined) return token('undefined', '');
+        if (item === null) return token('null', '');
+        if (typeof item === 'boolean') return token('boolean', String(item));
+        if (typeof item === 'number' && Number.isFinite(item)) return token('number', String(item));
+        if (typeof item !== 'object' || (!Array.isArray(item) && !plain(item))) {
+          drain(item);
+          throw new Error('Unknown broker references');
+        }
+        if (ancestors.has(item)) throw new Error('Cyclic broker references');
+        ancestors.add(item);
+        token(Array.isArray(item) ? 'array' : 'object', Array.isArray(item) ? String(item.length) : '');
+        for (const [key, child] of Object.entries(item)) {
+          text('key', key, provenance);
+          if (
+            (['inFlight', 'deliveryUncertain', 'codexRestoreUncertain', 'recoveryInputBrokerPending'].includes(key) &&
+              !!child) ||
+            (/inputbroker|inputevidence/i.test(key) && child === 'unknown') ||
+            (/inputbroker/i.test(key) &&
+              child !== undefined &&
+              child !== null &&
+              child !== false &&
+              (typeof child !== 'string' || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(child)))
+          )
+            throw new Error('Uncertain broker references');
+          visit(child, depth + 1, provenance && key !== 'attachmentHistory' && key !== '__attachmentHistory');
+        }
+        token('end', '');
+        ancestors.delete(item);
+      };
+      // Known attachment histories contribute only to freshness, not
+      // the provenance budget. Never truncate a UUID-bearing reference value.
+      visit(value, 0);
+      return { digest: hash.digest('hex'), references: [...references] };
     } catch {
       return undefined;
     }
   }
-  const text = serialize();
-  if (text === undefined) return undefined;
-  const references = [...new Set(text.match(UUID) ?? [])];
-  if (references.length > 32_768) return undefined;
-  return { references, isCurrent: () => serialize() === text };
+  const snapshot = capture();
+  if (!snapshot) return undefined;
+  return { references: snapshot.references, isCurrent: () => capture()?.digest === snapshot.digest };
 }
 
 const active = new Set<ChildProcessWithoutNullStreams>();

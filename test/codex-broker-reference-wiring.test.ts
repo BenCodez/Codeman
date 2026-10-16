@@ -188,3 +188,43 @@ it('keeps exact private references in healthy task records and invalidates a cha
     expect(prior.isCurrent()).toBe(false);
     expect(internal.captureInputBrokerCleanupReferences()).toBeDefined();
   }));
+
+it('captures actual private references despite full public/private attachment histories above two MiB', async () =>
+  fixture(async ({ internal }) => {
+    const attachmentId = '11111111-2222-4333-8444-555555555555';
+    const history = Array.from({ length: 100 }, (_, index) => ({
+      id: `${attachmentId}-${index}`,
+      name: 'image.png',
+      externalPath: '/disposable/' + attachmentId + '/' + 'x'.repeat(400),
+    }));
+    const sessions = internal.store.getState().sessions;
+    for (let index = 0; index < 50; index++) {
+      sessions[`worker-${index}`] = {
+        id: `worker-${index}`,
+        owner: 'alice',
+        recovery: initialRecoveryState(),
+        attachmentHistory: history,
+        __attachmentHistory: history,
+      } as never;
+    }
+    expect(Buffer.byteLength(JSON.stringify(internal.store.getState()))).toBeGreaterThan(2_097_152);
+    vi.mocked(internal.mux.getSessions).mockReturnValue([
+      {
+        sessionId: SID,
+        muxName: 'codeman-' + SID,
+        pid: 17,
+        createdAt: 1,
+        workingDir: '/disposable',
+        mode: 'codex',
+        attached: false,
+        recoveryInputBroker: INC,
+      },
+    ]);
+    const snapshot = internal.captureInputBrokerCleanupReferences();
+    expect(snapshot?.references).toContain(INC);
+    expect(snapshot?.references).not.toContain(attachmentId);
+    expect(snapshot?.isCurrent()).toBe(true);
+    sessions['worker-49'].owner = 'bob';
+    expect(snapshot?.isCurrent()).toBe(false);
+    expect(internal.captureInputBrokerCleanupReferences()?.isCurrent()).toBe(true);
+  }));
