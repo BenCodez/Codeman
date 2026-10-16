@@ -278,7 +278,10 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('taskPauseBtn').disabled = !available || !state?.config.enabled;
     document.getElementById('taskResetBtn').disabled = !available;
     if (force || !view.dirty) {
-      document.getElementById('taskObjective').value = state?.objective ?? '';
+      const objectiveInput = document.getElementById('taskObjective');
+      const originalObjective = state?.objective ?? '';
+      objectiveInput.value = originalObjective;
+      view.objectiveTextBaseline = { original: originalObjective, baseline: objectiveInput.value };
       const criteria = (state?.criteria ?? []).map(taskUiCriterionInput);
       const criteriaSignature = JSON.stringify(criteria);
       // Status-only updates must not interrupt a focused field before its first input.
@@ -291,7 +294,7 @@ Object.assign(CodemanApp.prototype, {
         this._updateTaskCriterionButtons();
       }
       view.configurationBaseline = {
-        objective: (state?.objective ?? '').trim(),
+        objective: originalObjective,
         criteria: criteriaSignature,
       };
       document.getElementById('taskEnabled').checked = state?.config.enabled ?? false;
@@ -355,7 +358,10 @@ Object.assign(CodemanApp.prototype, {
   async saveTaskConfiguration() {
     const view = this._taskView;
     if (!view?.state || view.busy || view.loading) return;
-    const objective = document.getElementById('taskObjective').value.trim();
+    const objectiveInput = document.getElementById('taskObjective').value;
+    const objectiveField = view.objectiveTextBaseline;
+    const objective =
+      objectiveField && objectiveInput === objectiveField.baseline ? objectiveField.original : objectiveInput;
     const baseline = view.configurationBaseline;
     const read = (field) => (field.input.value === field.baseline ? field.original : field.input.value);
     const criteria = view.criterionRows.map((row) => {
@@ -371,7 +377,7 @@ Object.assign(CodemanApp.prototype, {
     const max = document.getElementById('taskMaxContinuations');
     const runtime = document.getElementById('taskMaxRuntime');
     if (
-      !objective ||
+      !objective.trim() ||
       !criteria.length ||
       criteria.length > 30 ||
       criteria.some(

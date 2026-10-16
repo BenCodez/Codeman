@@ -939,3 +939,54 @@ describe('owner progress text preserves exact whitespace', () => {
     });
   });
 });
+
+describe('owner objective preserves exact whitespace', () => {
+  it.each(['untouched', 'remove-boundaries', 'add-boundaries', 'edited-multiline', 'blank'] as const)(
+    'saves the exact %s objective without normalizing owner intent',
+    async (edit) => {
+      const initial = { ...state(), objective: '  Owner objective\r\n界  ' };
+      const h = harness(initial);
+      await h.open();
+      const objective =
+        edit === 'remove-boundaries'
+          ? 'Owner objective\n界'
+          : edit === 'add-boundaries'
+            ? ' \t  Owner objective\n界  \n '
+            : edit === 'edited-multiline'
+              ? '  Edited objective\n 界\n  '
+              : edit === 'blank'
+                ? ' \t\n '
+                : initial.objective;
+      if (edit !== 'untouched') {
+        h.get('taskObjective').value = objective;
+        h.get('taskObjective').dispatchEvent(new h.dom.window.Event('input', { bubbles: true }));
+        h.app.markTaskDraft(); // JSDOM's outside-only fixture does not execute inline handlers.
+      }
+      h.get('taskMaxContinuations').value = '5';
+      await h.app.saveTaskConfiguration();
+      if (edit === 'blank') {
+        expect(h.app._apiJson).toHaveBeenCalledOnce();
+        expect(h.get('taskObjective').value).toBe(objective);
+        expect(h.app._taskView.dirty).toBe(true);
+      } else {
+        const body = h.app._apiJson.mock.calls[1][1].body;
+        expect(body.config.maxContinuations).toBe(5);
+        if (edit === 'untouched') expect(Object.hasOwn(body, 'objective')).toBe(false);
+        else expect(body.objective).toBe(objective);
+      }
+    }
+  );
+  it('retries a rejected boundary-only objective edit with its exact bytes', async () => {
+    const h = harness({ ...state(), objective: '  Owner objective  ' });
+    await h.open();
+    h.get('taskObjective').value = 'Owner objective';
+    h.app.markTaskDraft();
+    h.app._apiJson.mockResolvedValueOnce(null);
+    await h.app.saveTaskConfiguration();
+    expect(h.app._taskView.dirty).toBe(true);
+    expect(h.get('taskObjective').value).toBe('Owner objective');
+    await h.app.saveTaskConfiguration();
+    expect(h.app._apiJson.mock.calls[1][1].body.objective).toBe('Owner objective');
+    expect(h.app._apiJson.mock.calls[2][1].body).toEqual(h.app._apiJson.mock.calls[1][1].body);
+  });
+});
