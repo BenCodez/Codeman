@@ -330,6 +330,109 @@ export class BrainStore {
       }
     });
   }
+  /** Remove only this positively retired manager's validated file and empty private directory. */
+  drop(id: string, authority: BrainAuthority): Promise<void> {
+    return this.run(id, authority, async (path) => {
+      const dirs = await this.directories(id, false, authority);
+      if (!dirs) {
+        try {
+          const info = fsSync.lstatSync(this.root);
+          if (!privateStat(info, true)) throw new BrainStoreError('unavailable');
+          await this.syncDirectories([{ path: this.root, info }], authority);
+        } catch (error) {
+          if (!missing(error)) throw error;
+        }
+        return;
+      }
+      const before = this.readLeaf(path, dirs, authority);
+      const directory = await fs.opendir(dirname(path));
+      try {
+        for (let count = 0; count < 2; count++) {
+          const entry = await directory.read();
+          this.current(dirs, authority);
+          if (!entry) break;
+          if (count || entry.name !== 'brain.md' || !entry.isFile() || entry.isSymbolicLink())
+            throw new BrainStoreError('unavailable');
+        }
+      } finally {
+        await directory.close();
+      }
+      const latest = this.readLeaf(path, dirs, authority);
+      if (
+        latest.text !== before.text ||
+        !!latest.info !== !!before.info ||
+        (latest.info && before.info && !same(latest.info, before.info))
+      )
+        throw new BrainStoreError('conflict');
+      this.current(dirs, authority);
+      let removed = false;
+      try {
+        // Neither exact-file unlink nor nonrecursive rmdir has an awaited gap
+        // after the final owner/scope check. Foreign entries are never removed.
+        if (latest.info) {
+          fsSync.unlinkSync(path);
+          removed = true;
+        }
+        fsSync.rmdirSync(dirname(path));
+        removed = true;
+        await this.syncDirectories(dirs.slice(0, -1), authority);
+      } catch (error) {
+        if (removed) throw new BrainStoreError('uncertain');
+        throw error;
+      }
+    });
+  }
+  /** Bounded startup cleanup uses live, historical and uncertain-domain ownership vetoes. */
+  async pruneOrphans(keep: (id: string) => boolean): Promise<number> {
+    if (!this.ancestorsCurrent()) throw new BrainStoreError('unavailable');
+    let directory: Awaited<ReturnType<typeof fs.opendir>>;
+    let root: Stats;
+    try {
+      root = fsSync.lstatSync(this.root);
+      if (!privateStat(root, true)) throw new BrainStoreError('unavailable');
+      directory = await fs.opendir(this.root);
+    } catch (error) {
+      if (missing(error)) return 0;
+      throw new BrainStoreError('unavailable');
+    }
+    let removed = 0;
+    try {
+      // There are at most 100 owner-visible managers. Removing known orphans
+      // lets subsequent passes advance without an unbounded directory read.
+      for (let count = 0; count < 128; count++) {
+        const entry = await directory.read();
+        if (!entry) break;
+        if (!ID.test(entry.name) || !entry.isDirectory() || entry.isSymbolicLink() || keep(entry.name) !== false)
+          continue;
+        const original = fsSync.lstatSync(join(this.root, entry.name));
+        const current = () => {
+          const now = fsSync.lstatSync(this.root);
+          let manager: Stats | undefined;
+          try {
+            manager = fsSync.lstatSync(join(this.root, entry.name));
+          } catch (error) {
+            if (!missing(error)) throw error;
+          }
+          return (
+            keep(entry.name) === false &&
+            privateStat(now, true) &&
+            now.dev === root.dev &&
+            now.ino === root.ino &&
+            (!manager || (privateStat(manager, true) && manager.dev === original.dev && manager.ino === original.ino))
+          );
+        };
+        try {
+          await this.drop(entry.name, current);
+          removed++;
+        } catch {
+          /* Unreadable, replaced, uncertain or newly owned memory remains private for retry. */
+        }
+      }
+    } finally {
+      await directory.close();
+    }
+    return removed;
+  }
   read(id: string, authority: BrainAuthority): Promise<BrainSnapshot> {
     return this.run(id, authority, async (path) => {
       const dirs = await this.directories(id, false, authority);

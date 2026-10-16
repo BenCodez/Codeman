@@ -1579,6 +1579,11 @@ export class WebServer extends EventEmitter {
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
+    const ownsManagement =
+      this.supervisorAutomations?.has(sessionId) ||
+      this.supervisorStore.has(sessionId) ||
+      this.supervisorAutomationStore?.ids().includes(sessionId) ||
+      getCli(session?.mode ?? this.store.getSession(sessionId)?.mode ?? '')?.capabilities.recovery === 'codex-rollout';
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], () =>
         this._doCleanupSession(sessionId, killMux, reason, false)
@@ -1788,6 +1793,15 @@ export class WebServer extends EventEmitter {
         const retiredState = this.store.getSessions()[sessionId];
         const retiredStateText = JSON.stringify(retiredState);
         const retiredOwner = session.owner;
+        if (ownsManagement)
+          await this.dropSupervisorManagementState(
+            sessionId,
+            () =>
+              !this.sessions.has(sessionId) &&
+              session.owner === retiredOwner &&
+              this.store.getSessions()[sessionId] === retiredState &&
+              JSON.stringify(retiredState) === retiredStateText
+          );
         await ownedRemoteBrokerCache.finishFinalCleanup(
           sessionId,
           () =>
@@ -3740,6 +3754,20 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  /** Optional manager data is retired only after the native session/state deletion succeeded. */
+  private async dropSupervisorManagementState(id: string, current: () => boolean): Promise<void> {
+    for (const [name, journal] of [
+      ['Management schedule', this.supervisorAutomationStore],
+      ['Manager memory', this.supervisorBrainStore],
+    ] as const) {
+      try {
+        await journal.drop(id, current);
+      } catch (err) {
+        console.warn(`[Server] ${name} deletion failed: ${getErrorMessage(err)}`);
+      }
+    }
+  }
+
   /**
    * Get lightweight session state for SSE init - excludes full terminal buffers
    * to prevent browser freezes on SSE reconnect. Full buffers are fetched
@@ -3807,11 +3835,35 @@ export class WebServer extends EventEmitter {
         console.warn(`[Server] ${name} journal cleanup failed: ${getErrorMessage(err)}`);
       }
     }
+    // Reuse the authoritative startup cleanup rather than inferring absence
+    // from a missing live controller. Detach, restore and uncertain work veto it.
+    for (const [name, journal] of [
+      ['Management schedule', this.supervisorAutomationStore],
+      ['Manager memory', this.supervisorBrainStore],
+    ] as const) {
+      try {
+        await journal.pruneOrphans((id) => this.supervisorManagementHasOwner(id));
+      } catch (err) {
+        console.warn(`[Server] ${name} cleanup failed: ${getErrorMessage(err)}`);
+      }
+    }
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
     }
     return result.count;
+  }
+
+  private supervisorManagementHasOwner(id: string): boolean {
+    try {
+      return (
+        this.codexJournalHasOwner(id) ||
+        this.supervisorAutomations.has(id) ||
+        !!this.supervisorAutomationStore.get(id).inFlight
+      );
+    } catch {
+      return true;
+    }
   }
 
   private codexJournalHasOwner(id: string): boolean {

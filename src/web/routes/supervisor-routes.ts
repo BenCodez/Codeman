@@ -135,7 +135,11 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
       if (!scoped) throw new SupervisorValidationError('Management automation is unavailable');
       return { success: true, data: await scoped.configure(config, current) };
     } catch (error) {
-      return operationFailure(reply, error, 'Management schedule is invalid or unavailable');
+      return operationFailure(
+        reply,
+        error,
+        'Management schedule is invalid or unavailable; configured runs and retained receipts must fit the shared 128-run capacity'
+      );
     }
   });
   app.post('/api/sessions/:id/supervisor/automation/tasks/:taskId/run', async (req, reply) => {

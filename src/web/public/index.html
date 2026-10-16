@@ -1673,6 +1673,7 @@
               <details class="set-group" id="supervisorAutomationPanel" ontoggle="if(this.open) app.loadSupervisorAutomation()">
                 <summary>Scheduled check-ins and custom tasks</summary>
                 <p class="set-group-hint">Reuse this prepared manager. Runs wait for idle state and respect pauses, approvals and existing runtime limits. A missed interval does not launch a burst of catch-up work.</p>
+                <p class="set-group-hint">Schedules share a lifetime limit of 128 runs. Periodic check-ins reserve up to 100; configured custom tasks must fit the remaining capacity. Editing or removing tasks does not erase used capacity.</p>
                 <p id="supervisorAutomationStatus" role="status">Open to load schedules.</p>
                 <button class="btn-toolbar" onclick="app.loadSupervisorAutomation(true)">Refresh schedules</button>
                 <fieldset class="task-form" id="supervisorAutomationSettings" disabled>

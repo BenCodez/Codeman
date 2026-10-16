@@ -7,6 +7,11 @@ import { SupervisorAutomationController, CHECK_IN_INSTRUCTIONS } from '../src/su
 import { SupervisorAutomationStore } from '../src/supervisor/automation-store.js';
 import type { SupervisorAutomationConfig, SupervisorAutomationRecord } from '../src/types/supervisor-automation.js';
 import type { RecoveryActionAuthority } from '../src/recovery/types.js';
+import {
+  SupervisorAutomationConfigSchema,
+  SupervisorAutomationRecordSchema,
+  initialSupervisorAutomationRecord,
+} from '../src/supervisor/automation-schema.js';
 import { createDeferred } from './mocks/index.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
@@ -333,4 +338,172 @@ it('does not run a recurring task early after a backward clock adjustment', asyn
   f.setTime(NOW + HOUR);
   await f.controller.tick();
   expect(f.dispatch).toHaveBeenCalledOnce();
+});
+
+it('rejects overallocated recurring schedules before ACK instead of starving the later task at receipt 129', async () => {
+  const f = await fixture(),
+    cfg = config('recurring');
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task' });
+  await expect(async () => f.controller.configure(cfg)).rejects.toThrow(/128 lifetime/);
+  expect(f.persist).not.toHaveBeenCalled();
+  expect(f.controller.getStatus().tasks).toEqual([]);
+  await f.controller.tick();
+  expect(f.dispatch).not.toHaveBeenCalled();
+});
+
+it('allocates enabled check-ins 100 slots and counts once tasks once and disabled custom tasks for manual runs', () => {
+  const cfg = config('recurring');
+  cfg.checkIns.enabled = true;
+  cfg.tasks[0].maxRuns = 28;
+  expect(SupervisorAutomationConfigSchema.safeParse(cfg).success).toBe(true);
+  cfg.tasks[0].maxRuns = 29;
+  expect(SupervisorAutomationConfigSchema.safeParse(cfg).success).toBe(false);
+  cfg.tasks[0].kind = 'once';
+  cfg.tasks[0].maxRuns = 100;
+  expect(SupervisorAutomationConfigSchema.safeParse(cfg).success).toBe(true);
+  cfg.checkIns.enabled = false;
+  cfg.tasks[0].kind = 'recurring';
+  cfg.tasks[0].enabled = false;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'disabled-manual-task' });
+  expect(SupervisorAutomationConfigSchema.safeParse(cfg).success).toBe(false);
+});
+
+it('executes both tasks to their complete allocated 128-run bound, including the later due task, then preserves receipts on reload', async () => {
+  const f = await fixture(),
+    cfg = config('recurring');
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', instructions: 'Later task remains runnable', maxRuns: 28 });
+  await f.controller.configure(cfg);
+  for (let hour = 1; hour <= 100; hour++) {
+    f.setTime(NOW + hour * HOUR);
+    await f.controller.tick();
+    await f.controller.tick();
+  }
+  expect(f.dispatch).toHaveBeenCalledTimes(128);
+  expect(f.store.get(ID).runs).toEqual(
+    expect.arrayContaining([
+      { taskId: 'owner-task', attempts: 100, nextRunAt: NOW + 101 * HOUR },
+      { taskId: 'later-task', attempts: 28, nextRunAt: NOW + 29 * HOUR },
+    ])
+  );
+  const saved = f.store.get(ID);
+  expect(saved.handled).toHaveLength(128);
+  const reloaded = f.reload();
+  await reloaded.tick();
+  expect(f.dispatch).toHaveBeenCalledTimes(128);
+  const last = saved.handled.at(-1)!;
+  await reloaded.runTask(last.taskId, last.requestId);
+  expect(f.dispatch).toHaveBeenCalledTimes(128);
+  await expect(reloaded.runTask('later-task', 'new-exhausted-request')).rejects.toThrow(/full/);
+  expect(f.store.get(ID).handled).toEqual(saved.handled);
+});
+
+it('includes receipts from removed tasks in edits while allowing the exact remaining allocation', async () => {
+  const f = await fixture();
+  await f.controller.configure(config());
+  await f.controller.runTask('owner-task', 'old-task-request');
+  const cfg = config('recurring');
+  cfg.tasks[0].id = 'new-task';
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', maxRuns: 28 });
+  await expect(f.controller.configure(cfg)).rejects.toThrow(/retained history/);
+  cfg.tasks[1].maxRuns = 27;
+  await f.controller.configure(cfg);
+  expect(f.store.get(ID).handled[0].requestId).toBe('old-task-request');
+  expect(f.store.get(ID).runs.find((run) => run.taskId === 'owner-task')?.attempts).toBe(1);
+  await f.controller.configure({ checkIns: cfg.checkIns, tasks: [] });
+  await f.controller.runTask('owner-task', 'old-task-request');
+  expect(f.dispatch).toHaveBeenCalledOnce();
+});
+
+it('does not let refused manual request IDs consume the remaining slots of admitted schedules', async () => {
+  const f = await fixture(),
+    cfg = config('recurring');
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', maxRuns: 28 });
+  await f.controller.configure(cfg);
+  f.setAvailable(false);
+  await expect(f.controller.runTask('owner-task', 'refused-before-run')).rejects.toThrow(/unallocated receipt/);
+  expect(f.store.get(ID).handled).toEqual([]);
+  expect(f.store.get(ID).runs.every((run) => run.attempts === 0)).toBe(true);
+  f.setAvailable(true);
+  await f.controller.runTask('owner-task', 'refused-before-run');
+  expect(f.dispatch).toHaveBeenCalledOnce();
+  expect(f.store.get(ID).handled[0]).toMatchObject({ requestId: 'refused-before-run', phase: 'accepted' });
+});
+
+it('retains a certified refusal when spare headroom exists and accounts for it on later edits', async () => {
+  const f = await fixture(),
+    cfg = config('recurring');
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', maxRuns: 27 });
+  await f.controller.configure(cfg);
+  f.setAvailable(false);
+  await f.controller.runTask('owner-task', 'spare-refusal-request');
+  expect(f.store.get(ID).handled[0].phase).toBe('refused');
+  await expect(f.controller.runTask('owner-task', 'second-spare-refusal')).rejects.toThrow(/unallocated receipt/);
+  cfg.tasks[1].maxRuns = 28;
+  await expect(f.controller.configure(cfg)).rejects.toThrow(/retained history/);
+  f.setAvailable(true);
+  await f.controller.runTask('owner-task', 'spare-refusal-request');
+  expect(f.dispatch).not.toHaveBeenCalled();
+});
+
+it('keeps an old overallocated journal inspectable and blocks every new run until an owner reduces its allocation', async () => {
+  const legacy = initialSupervisorAutomationRecord(ID),
+    cfg = config('recurring');
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task' });
+  Object.assign(legacy, cfg);
+  legacy.runs = cfg.tasks.map((task) => ({ taskId: task.id, attempts: 0, nextRunAt: NOW }));
+  expect(SupervisorAutomationRecordSchema.safeParse(legacy).success).toBe(true);
+  const f = await fixture(legacy);
+  expect(f.controller.getStatus().status).toMatchObject({ phase: 'blocked', reason: 'run-allocation-exhausted' });
+  await f.controller.tick();
+  await expect(f.controller.runTask('owner-task', 'legacy-new-request')).rejects.toThrow(/allocation/);
+  expect(f.dispatch).not.toHaveBeenCalled();
+  cfg.tasks[1].maxRuns = 28;
+  await f.controller.configure(cfg);
+  await f.controller.runTask('later-task', 'repaired-later-request');
+  expect(f.dispatch).toHaveBeenCalledOnce();
+});
+
+it.each(['reserved', 'unknown'] as const)(
+  'keeps an unresolved %s flight and old IDs sealed while reducing the remaining allocation',
+  async (phase) => {
+    const f = await fixture();
+    await f.controller.configure(config('recurring'));
+    f.dispatch.mockResolvedValue('unknown');
+    await f.controller.runTask('owner-task', 'sealed-allocation-request');
+    const saved = f.store.get(ID);
+    saved.inFlight!.phase = phase;
+    await f.store.save(ID, saved);
+    const reloaded = f.reload(),
+      cfg = config('recurring');
+    await reloaded.runTask('owner-task', 'sealed-allocation-request');
+    cfg.tasks[0].maxRuns = 1;
+    await reloaded.configure(cfg);
+    await expect(reloaded.runTask('owner-task', 'sealed-allocation-request')).rejects.toThrow(/different instructions/);
+    await expect(reloaded.runTask('owner-task', 'new-allocation-request')).rejects.toThrow(/unresolved/);
+    expect(f.dispatch).toHaveBeenCalledOnce();
+    expect(f.store.get(ID).inFlight?.requestId).toBe('sealed-allocation-request');
+  }
+);
+
+it('rejects malformed journals that put the same request in handled and unresolved receipts or exceed combined capacity', () => {
+  const record = initialSupervisorAutomationRecord(ID),
+    receipt = {
+      requestId: 'same-receipt-id',
+      taskId: 'owner-task',
+      payloadHash: 'a'.repeat(64),
+      startedAt: NOW,
+      phase: 'accepted' as const,
+    };
+  record.handled = [receipt];
+  record.inFlight = { ...receipt, phase: 'unknown' };
+  expect(SupervisorAutomationRecordSchema.safeParse(record).success).toBe(false);
+  record.handled = Array.from({ length: 128 }, (_, index) => ({ ...receipt, requestId: 'handled-request-' + index }));
+  record.inFlight.requestId = 'different-flight-id';
+  expect(SupervisorAutomationRecordSchema.safeParse(record).success).toBe(false);
 });

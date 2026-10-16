@@ -9,6 +9,9 @@ import type {
 } from '../types/supervisor-automation.js';
 import {
   initialSupervisorAutomationRecord,
+  MAX_SUPERVISOR_AUTOMATION_RECEIPTS,
+  SUPERVISOR_CHECK_IN_MAX_RUNS,
+  remainingAutomationRuns,
   SupervisorAutomationConfigSchema,
   SupervisorAutomationRecordSchema,
   SupervisorAutomationRequestSchema,
@@ -73,18 +76,36 @@ export class SupervisorAutomationController {
     }
     this.deps.changed?.();
   }
+  private receiptCapacity(config: SupervisorAutomationConfig = this.state): {
+    limit: number;
+    used: number;
+    reserved: number;
+    remaining: number;
+  } {
+    const used = this.state.handled.length + (this.state.inFlight ? 1 : 0);
+    const reserved = remainingAutomationRuns(config, this.state.runs);
+    return {
+      limit: MAX_SUPERVISOR_AUTOMATION_RECEIPTS,
+      used,
+      reserved,
+      remaining: MAX_SUPERVISOR_AUTOMATION_RECEIPTS - used - reserved,
+    };
+  }
   getStatus(): SupervisorAutomationStatus {
     return structuredClone({
       checkIns: this.state.checkIns,
       tasks: this.state.tasks,
       status: {
         phase:
-          this.failed || this.state.inFlight?.phase === 'unknown'
+          this.failed || this.state.inFlight?.phase === 'unknown' || this.receiptCapacity().remaining < 0
             ? 'blocked'
             : this.state.inFlight
               ? 'running'
               : 'idle',
-        reason: this.state.reason,
+        reason:
+          !this.failed && !this.state.inFlight && this.receiptCapacity().remaining < 0
+            ? 'run-allocation-exhausted'
+            : this.state.reason,
         ...(this.state.handled.at(-1) ? { lastRun: this.state.handled.at(-1) } : {}),
         ...(this.state.inFlight ? { inFlight: this.state.inFlight } : {}),
         runs: this.state.runs,
@@ -101,6 +122,10 @@ export class SupervisorAutomationController {
     return this.enqueue(async () => {
       if (this.stopped || this.failed || revision !== this.revision || !this.current(callerCurrent))
         throw new SupervisorAutomationError('Management configuration is no longer current');
+      if (this.receiptCapacity(config).remaining < 0)
+        throw new SupervisorAutomationError(
+          'Management schedules share 128 lifetime receipt slots, including retained history; reduce the remaining run allocation'
+        );
       const previous = this.state;
       const runs = previous.runs.map((run) => ({ ...run }));
       const schedule = (taskId: string, due: number) => {
@@ -153,7 +178,7 @@ export class SupervisorAutomationController {
     return {
       instructions,
       interval,
-      maxRuns: task ? (task.kind === 'once' ? 1 : task.maxRuns) : 100,
+      maxRuns: task ? (task.kind === 'once' ? 1 : task.maxRuns) : SUPERVISOR_CHECK_IN_MAX_RUNS,
       enabled: task?.enabled ?? this.state.checkIns.enabled,
       hash: createHash('sha256')
         .update(JSON.stringify({ taskId, task: task ?? this.state.checkIns, instructions }))
@@ -185,7 +210,11 @@ export class SupervisorAutomationController {
       if (!plan || revision !== this.revision)
         throw new SupervisorAutomationError('Management task is no longer configured');
       if (this.state.inFlight) throw new SupervisorAutomationError('A management instruction remains unresolved');
-      if (this.state.handled.length >= 128) throw new SupervisorAutomationError('Management request journal is full');
+      if (taskId === 'check-in' && !plan.enabled) throw new SupervisorAutomationError('Check-ins are disabled');
+      if (this.receiptCapacity().remaining < 0)
+        throw new SupervisorAutomationError('Management run allocation exceeds the shared 128 lifetime receipt slots');
+      if (this.state.handled.length >= MAX_SUPERVISOR_AUTOMATION_RECEIPTS)
+        throw new SupervisorAutomationError('Management request journal is full');
       const run = this.state.runs.find((item) => item.taskId === taskId) ?? { taskId, attempts: 0 };
       const flight: SupervisorAutomationRun = {
         requestId,
@@ -195,6 +224,11 @@ export class SupervisorAutomationController {
         phase: 'reserved',
       };
       if (run.attempts >= plan.maxRuns || !this.available()) {
+        // A refused manual request must not consume the slots already allocated to future work.
+        if (this.receiptCapacity().remaining === 0)
+          throw new SupervisorAutomationError(
+            'No unallocated receipt slots remain for a refused request; scheduled runs retain their budget'
+          );
         flight.phase = 'refused';
         this.state.handled.push(flight);
         this.state.reason = 'manager-not-ready';
@@ -240,7 +274,15 @@ export class SupervisorAutomationController {
     });
   }
   async tick(): Promise<void> {
-    if (this.ticking || this.configuring > 0 || this.stopped || this.failed || this.state.inFlight || !this.available())
+    if (
+      this.ticking ||
+      this.configuring > 0 ||
+      this.stopped ||
+      this.failed ||
+      this.state.inFlight ||
+      this.receiptCapacity().remaining < 0 ||
+      !this.available()
+    )
       return;
     this.ticking = true;
     try {

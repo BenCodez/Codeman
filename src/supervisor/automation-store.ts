@@ -1,5 +1,5 @@
-/** Private bounded schedule journal; unknown replacement ACKs prohibit further writes. */
-import { existsSync, lstatSync, readFileSync, constants } from 'node:fs';
+/** @fileoverview Private bounded schedule journal; unknown replacement ACKs prohibit further writes. */
+import { existsSync, lstatSync, readFileSync, renameSync, constants } from 'node:fs';
 import fs from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -71,6 +71,41 @@ export class SupervisorAutomationStore {
     this.writes = writing.catch(() => {});
     return writing;
   }
+  /** Final owner deletion, serialized after all admitted schedule writes. */
+  drop(id: string, current: () => boolean): Promise<void> {
+    const writing = this.writes.then(async () => {
+      if (this.loadFailed || this.uncertain) throw Error('Management schedule journal is unavailable');
+      if (current() !== true) throw Error('Management deletion is no longer current');
+      if (!Object.hasOwn(this.records, id)) return;
+      const before = this.records[id],
+        next = { ...this.records };
+      delete next[id];
+      await this.write(next, () => current() === true && this.records[id] === before);
+      this.records = next;
+    });
+    this.writes = writing.catch(() => {});
+    return writing;
+  }
+  /** Startup may reclaim settled, unreachable schedules; unknown operations retain their receipt seal. */
+  pruneOrphans(keep: (id: string) => boolean): Promise<number> {
+    const writing = this.writes.then(async () => {
+      if (this.loadFailed || this.uncertain) throw Error('Management schedule journal is unavailable');
+      const next = { ...this.records },
+        removed: string[] = [];
+      for (const [id, row] of Object.entries(next)) {
+        if (keep(id) !== false || row.inFlight) continue;
+        delete next[id];
+        removed.push(id);
+      }
+      if (removed.length) {
+        await this.write(next, () => removed.every((id) => keep(id) === false && !this.records[id]?.inFlight));
+        this.records = next;
+      }
+      return removed.length;
+    });
+    this.writes = writing.catch(() => {});
+    return writing;
+  }
   private async snapshot(path: string): Promise<{ stat: Stat; bytes: Buffer } | undefined> {
     let file: Awaited<ReturnType<typeof fs.open>>;
     try {
@@ -93,7 +128,7 @@ export class SupervisorAutomationStore {
     if (!same(stat, await fs.lstat(path))) throw Error('Management journal changed');
     return { stat, bytes };
   }
-  private async write(next: Record<string, SupervisorAutomationRecord>): Promise<void> {
+  private async write(next: Record<string, SupervisorAutomationRecord>, current?: () => boolean): Promise<void> {
     const bytes = Buffer.from(JSON.stringify({ version: 1, managers: next }));
     if (bytes.length > MAX_BYTES) throw Error('Management schedule journal is full');
     await fs.mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
@@ -113,7 +148,7 @@ export class SupervisorAutomationStore {
         await file.close();
       }
       const staged = await this.snapshot(temp),
-        current = await this.snapshot(this.path);
+        present = await this.snapshot(this.path);
       const parentNow = await fs.lstat(dirname(this.path));
       if (
         !staged ||
@@ -121,18 +156,43 @@ export class SupervisorAutomationStore {
         staged.stat.dev !== owned.dev ||
         staged.stat.ino !== owned.ino ||
         !staged.bytes.equals(bytes) ||
-        !!prior !== !!current ||
-        (prior && current && (!same(prior.stat, current.stat) || !prior.bytes.equals(current.bytes))) ||
+        !!prior !== !!present ||
+        (prior && present && (!same(prior.stat, present.stat) || !prior.bytes.equals(present.bytes))) ||
         !parentNow.isDirectory() ||
         parentNow.isSymbolicLink() ||
         parentNow.dev !== parent.dev ||
         parentNow.ino !== parent.ino ||
         !same(staged.stat, await fs.lstat(temp)) ||
-        (current && !same(current.stat, await fs.lstat(this.path)))
+        (present && !same(present.stat, await fs.lstat(this.path)))
       )
         throw Error('Management journal changed');
-      attempted = true;
-      await fs.rename(temp, this.path);
+      if (current) {
+        // Cleanup authority and exact directory/file ownership share the final
+        // synchronous boundary; a newly restored session cannot inherit deletion.
+        const finalParent = lstatSync(dirname(this.path));
+        let finalFile: Stat | undefined;
+        try {
+          finalFile = lstatSync(this.path);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        }
+        if (
+          !!prior !== !!finalFile ||
+          current() !== true ||
+          !finalParent.isDirectory() ||
+          finalParent.isSymbolicLink() ||
+          finalParent.dev !== parent.dev ||
+          finalParent.ino !== parent.ino ||
+          !same(staged.stat, lstatSync(temp)) ||
+          (prior && finalFile && !same(prior.stat, finalFile))
+        )
+          throw Error('Management deletion is no longer current');
+        attempted = true;
+        renameSync(temp, this.path);
+      } else {
+        attempted = true;
+        await fs.rename(temp, this.path);
+      }
       const directory = await fs.open(
         dirname(this.path),
         constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW
