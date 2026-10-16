@@ -1,4 +1,4 @@
-/** @fileoverview Actual HTTP/WS routes retain tagged input when the cached local worker has exited. */
+/** @fileoverview Actual HTTP/WS tagged input retains FIFO across known exits and pane lifecycle ownership. */
 import fastifyCookie from '@fastify/cookie';
 import fastifyWebsocket from '@fastify/websocket';
 import Fastify, { type FastifyInstance } from 'fastify';
@@ -21,6 +21,7 @@ let session: Session;
 let socket: WebSocket | undefined;
 let written: ReturnType<typeof vi.fn>;
 let sent: ReturnType<typeof vi.fn>;
+let respawn: ReturnType<typeof vi.fn>;
 let probe: ReturnType<typeof vi.fn>;
 let intent: ReturnType<typeof vi.fn>;
 let acknowledgements: unknown[];
@@ -31,6 +32,7 @@ beforeEach(async () => {
   await app.register(fastifyWebsocket);
   written = vi.fn();
   sent = vi.fn(async () => true);
+  respawn = vi.fn(async () => 654);
   probe = vi.fn(() => {
     throw new Error('Browser input must not synchronously probe tmux');
   });
@@ -39,7 +41,14 @@ beforeEach(async () => {
     workingDir: '/tmp',
     mode: 'codex',
     useMux: true,
-    mux: { isAvailable: () => true, sendInput: sent, isPaneDead: probe } as unknown as TerminalMultiplexer,
+    mux: {
+      isAvailable: () => true,
+      sendInput: sent,
+      isPaneDead: probe,
+      muxSessionExists: () => true,
+      respawnPane: respawn,
+      clearPaneExit: vi.fn(),
+    } as unknown as TerminalMultiplexer,
     muxSession: { muxName: 'codeman-cached-exit', pid: 321 } as MuxSession,
     codexConfig: { noDaemon: true },
   });
@@ -93,6 +102,97 @@ async function send(transport: 'http' | 'ws', seq: number, data = `${seq}`, useM
     socket!.ping();
   });
 }
+
+it.each([
+  ['http', false],
+  ['http', true],
+  ['ws', false],
+] as const)('retains tagged %s input while a real restart owns the old pane (useMux=%s)', async (transport, useMux) => {
+  const release = createDeferred<number>();
+  respawn.mockImplementation(() => release.promise);
+  if (transport === 'ws') await connect();
+  const restarting = session.restartCli();
+  try {
+    await vi.waitFor(() => expect(respawn).toHaveBeenCalledTimes(1));
+    expect(session.paneLifecycleInFlight).toBe(true);
+    for (const seq of [7, 100]) {
+      const response = await send(transport, seq, `${seq}`, useMux);
+      if (response) {
+        expect(response.statusCode).toBeGreaterThanOrEqual(400);
+        expect(response.headers['x-codeman-input-ack']).toBeUndefined();
+      }
+    }
+    expect(acknowledgements).toEqual([]);
+    expect(session.lastInputSeq(CID)).toBe(0);
+    expect(session.lastSubmitAt).toBe(0);
+    expect(written).not.toHaveBeenCalled();
+    expect(sent).not.toHaveBeenCalled();
+    // Layer 4 preserves the owner's cancellation veto during lifecycle work.
+    // Its notification does not acknowledge delivery or consume the FIFO slot.
+    expect(intent).toHaveBeenCalled();
+    intent.mockClear();
+    release.resolve(654);
+    expect(await restarting).toBe(true);
+    expect(session.paneLifecycleInFlight).toBe(false);
+    // The later refused frame cannot overtake its earlier FIFO identity.
+    const suffix = await send(transport, 100, '100', useMux);
+    if (suffix) expect(suffix.statusCode).toBeGreaterThanOrEqual(400);
+    expect(written).not.toHaveBeenCalled();
+    expect(sent).not.toHaveBeenCalled();
+    for (const seq of [7, 100]) {
+      const response = await send(transport, seq, `${seq}`, useMux);
+      if (response) expect(response.statusCode).toBe(200);
+    }
+    if (transport === 'ws')
+      await vi.waitFor(() =>
+        expect(acknowledgements).toEqual([
+          { t: 'ia', seq: 7 },
+          { t: 'ia', seq: 100 },
+        ])
+      );
+    expect((useMux ? sent : written).mock.calls.map((args) => args[useMux ? 1 : 0])).toEqual(['7', '100']);
+    expect(intent).toHaveBeenCalledTimes(2);
+    expect(session.lastInputSeq(CID)).toBe(100);
+    await send(transport, 100, '100', useMux);
+    expect(useMux ? sent : written).toHaveBeenCalledTimes(2);
+  } finally {
+    release.resolve(654);
+    await restarting;
+  }
+});
+
+it('keeps the reverse-order veto when an actual mux send already owns input delivery', async () => {
+  const release = createDeferred<boolean>();
+  sent.mockImplementation(() => release.promise);
+  const request = send('http', 1, 'owned send', true);
+  try {
+    await vi.waitFor(() => expect(sent).toHaveBeenCalledTimes(1));
+    expect(await session.restartCli()).toBe(false);
+    expect(respawn).not.toHaveBeenCalled();
+    release.resolve(true);
+    expect((await request)!.statusCode).toBe(200);
+    expect(session.lastInputSeq(CID)).toBe(1);
+  } finally {
+    release.resolve(true);
+    await request;
+  }
+});
+
+it('retains the dispatch seal when PTY bytes land before an exception, including a concurrent restart attempt', async () => {
+  let restart: Promise<boolean> | undefined;
+  written.mockImplementation(() => {
+    restart = session.restartCli();
+    throw Error('fixture bytes may already have landed');
+  });
+  const response = await send('http', 1, 'possibly landed');
+  expect(response!.statusCode).toBe(500);
+  expect(await restart).toBe(false);
+  expect(respawn).not.toHaveBeenCalled();
+  expect(session.lastInputSeq(CID)).toBe(1);
+  written.mockImplementation(() => {});
+  expect((await send('http', 1, 'possibly landed'))!.statusCode).toBe(200);
+  expect(written).toHaveBeenCalledTimes(1);
+});
 
 it.each(['http', 'ws'] as const)(
   'keeps dead %s input unacknowledged, without owner intent, and retries the same FIFO identities',

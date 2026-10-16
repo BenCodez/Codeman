@@ -555,6 +555,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               performance.now() < workspaceDeadline &&
               launchScopeIsCurrent();
             session.setCodexRestoreLaunchGuard({
+              getWorkspaceDeadline: () => workspaceDeadline,
               prepare: async () => {
                 workspaceDeadline = Math.min(workspaceDeadline, performance.now() + 2000);
                 granted = false;
@@ -634,6 +635,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               performance.now() < workspaceDeadline &&
               launchScopeIsCurrent();
             session.setRestoreLaunchGuard({
+              getWorkspaceDeadline: () => workspaceDeadline,
               prepare: async () => {
                 workspaceDeadline = Math.min(workspaceDeadline, performance.now() + 2000);
                 grantPreparationAttempted = true;

@@ -1,4 +1,4 @@
-/** Final owner deletion only: trusted remote retirement, never broker code or worker input. */
+/** @fileoverview Final owner deletion only: trusted remote retirement, never broker code or worker input. */
 import { performance } from 'node:perf_hooks';
 import type { SessionRemote } from '../types.js';
 import { buildSshConnectionArgs, remoteLoginShellCommand, remoteSshTarget, shellescape } from '../remote-hosts.js';
@@ -25,8 +25,14 @@ def mux_absent(sid):
     name='codeman-ssh-'+sid[:8]
     result=subprocess.run(['tmux','-L','codeman-remote','has-session','-t','='+name],stdout=subprocess.PIPE,stderr=subprocess.PIPE,timeout=max(0.001,DEADLINE-time.monotonic()),env={**os.environ,'LC_ALL':'C'})
     if result.stdout or len(result.stderr)>16384 or result.returncode!=1: return False
-    error=result.stderr.decode('utf-8','strict').strip()
-    return error=='can\'t find session: '+name or error.startswith('no server running on ')
+    diagnostic=result.stderr.decode('utf-8','strict')
+    error=diagnostic.strip()
+    if error=='can\'t find session: '+name or error.startswith('no server running on '): return True
+    # The explicit -L socket lives under tmux's canonical per-user directory.
+    missing=re.fullmatch(r'error connecting to (/[^\x00-\x1f\x7f]+) \(No such file or directory\)\n?',diagnostic)
+    if missing is None: return False
+    path=missing.group(1)
+    return canonical(path) and os.path.basename(path)=='codeman-remote' and os.path.basename(os.path.dirname(path))=='tmux-'+str(os.getuid())
 
 def retired(config,state,expected):
     if not isinstance(config,dict) or set(config)!=set(expected) or type(config.get('version')) is not int: return False

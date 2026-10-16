@@ -1,4 +1,4 @@
-/** Real generated retirement over fixture-only SSH/tmux; no live host or pane. */
+/** @fileoverview Real generated retirement over fixture-only SSH/tmux; no live host or pane. */
 import fs from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
@@ -12,8 +12,17 @@ import type { RemoteBrokerTransport } from '../src/recovery/remote-input-broker.
 
 let root: string, bin: string;
 const SHIM = '#!/bin/sh\nfor arg; do last="$arg"; done\nexec /bin/sh -c "$last"\n';
-const TMUX =
-  '#!/bin/sh\nif [ -f "$FIXTURE_MUX_LIVE" ]; then exit 0; fi\nprintf "no server running on fixture-only\\n" >&2\nexit 1\n';
+const TMUX = `#!/bin/sh
+if [ "$#" -ne 5 ] || [ "$1" != '-L' ] || [ "$2" != 'codeman-remote' ] || [ "$3" != 'has-session' ] || [ "$4" != '-t' ] || [ "$5" != "$FIXTURE_MUX_TARGET" ]; then exit 99; fi
+if [ -f "$FIXTURE_MUX_LIVE" ]; then exit 0; fi
+if [ -n "$FIXTURE_MUX_APPEARS" ]; then
+ if [ -f "$FIXTURE_MUX_CHECKED" ]; then exit 0; fi
+ : > "$FIXTURE_MUX_CHECKED"
+fi
+printf '%s\\n' "$FIXTURE_MUX_DIAGNOSTIC" >&2
+printf '%s' "$FIXTURE_MUX_STDOUT"
+exit "$FIXTURE_MUX_STATUS"
+`;
 const PYTHON = `#!/usr/bin/python3 -S
 import os,sys
 assert sys.argv[1:4]==['-I','-S','-c'] and len(sys.argv)==5
@@ -53,7 +62,16 @@ afterEach(async () => {
   await fs.rm(root, { recursive: true, force: true });
 });
 function transport(
-  options: { offline?: boolean; partial?: boolean; parentFailure?: 'before' | 'after'; after?: () => void } = {}
+  options: {
+    offline?: boolean;
+    partial?: boolean;
+    parentFailure?: 'before' | 'after';
+    after?: () => void;
+    muxError?: string;
+    muxStdout?: string;
+    muxStatus?: number;
+    muxAppears?: boolean;
+  } = {}
 ): RemoteBrokerTransport {
   return {
     run: async (command, input) => {
@@ -75,6 +93,14 @@ function transport(
             SHELL: join(bin, 'login-shell'),
             PATH: `${bin}:/usr/bin:/bin`,
             FIXTURE_MUX_LIVE: join(root, 'live-pane'),
+            FIXTURE_MUX_TARGET: '=codeman-ssh-' + JSON.parse(input).material.config.sessionId.slice(0, 8),
+            FIXTURE_MUX_DIAGNOSTIC:
+              options.muxError ??
+              `error connecting to ${join(root, 'tmux-' + process.getuid!(), 'codeman-remote')} (No such file or directory)`,
+            FIXTURE_MUX_STATUS: String(options.muxStatus ?? 1),
+            FIXTURE_MUX_STDOUT: options.muxStdout ?? '',
+            FIXTURE_MUX_APPEARS: options.muxAppears ? 'yes' : '',
+            FIXTURE_MUX_CHECKED: join(root, 'checked-pane'),
             FIXTURE_UNLINK_FAILURE: options.partial ? 'yes' : '',
             FIXTURE_PARENT_FAILURE: options.parentFailure ?? '',
             FIXTURE_PARENT_PATH: dirname(JSON.parse(input).directory),
@@ -580,4 +606,100 @@ it('removes both exact session UUID parents before acknowledging final cleanup',
   await expect(fs.lstat(dirname(f.directory))).rejects.toMatchObject({ code: 'ENOENT' });
   expect(await fs.readdir(f.cacheRoot)).toEqual([]);
   expect(await fs.readdir(join(root, 'remote'))).toEqual([]);
+});
+
+it.each(['enoent', 'enoent-space-directory', 'no-server', 'missing-session'] as const)(
+  'retires an exact closed incarnation after the recognized native absence response: %s',
+  async (kind) => {
+    const f = await fixture();
+    await f.writeState();
+    const socket = join(
+      root,
+      kind === 'enoent-space-directory' ? 'socket fixtures' : 'sockets',
+      'tmux-' + process.getuid!(),
+      'codeman-remote'
+    );
+    const muxError =
+      kind === 'no-server'
+        ? 'no server running on ' + socket
+        : kind === 'missing-session'
+          ? "can't find session: codeman-ssh-" + f.scope.sessionId.slice(0, 8)
+          : `error connecting to ${socket} (No such file or directory)`;
+    expect(await f.clean(transport({ muxError }))).toBe(true);
+    await expect(fs.lstat(f.directory)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.lstat(dirname(f.directory))).rejects.toMatchObject({ code: 'ENOENT' });
+  }
+);
+it.each([
+  'permission',
+  'refused',
+  'not-directory',
+  'unknown',
+  'wrong-socket',
+  'wrong-user',
+  'relative',
+  'dot-segment',
+  'control-path',
+  'extra-line',
+  'suffix',
+  'stdout',
+  'wrong-status',
+  'leading-whitespace',
+  'trailing-whitespace',
+  'extra-newline',
+] as const)('retains private cleanup material after an unverified native diagnostic: %s', async (kind) => {
+  const f = await fixture();
+  await f.writeState();
+  const socket = join(root, 'tmux-' + process.getuid!(), 'codeman-remote');
+  const missing = (path: string) => `error connecting to ${path} (No such file or directory)`;
+  const muxError =
+    kind === 'permission'
+      ? `error connecting to ${socket} (Permission denied)`
+      : kind === 'refused'
+        ? `error connecting to ${socket} (Connection refused)`
+        : kind === 'not-directory'
+          ? `error connecting to ${socket} (Not a directory)`
+          : kind === 'unknown'
+            ? 'unrecognized native error'
+            : kind === 'wrong-socket'
+              ? missing(socket + '-other')
+              : kind === 'wrong-user'
+                ? missing(join(root, 'tmux-' + (process.getuid!() + 1), 'codeman-remote'))
+                : kind === 'relative'
+                  ? missing('tmux-' + process.getuid!() + '/codeman-remote')
+                  : kind === 'dot-segment'
+                    ? missing(root + '/other/../tmux-' + process.getuid!() + '/codeman-remote')
+                    : kind === 'control-path'
+                      ? missing(root + '/bad\npath/tmux-' + process.getuid!() + '/codeman-remote')
+                      : kind === 'extra-line'
+                        ? missing(socket) + '\nunknown native error'
+                        : kind === 'suffix'
+                          ? missing(socket) + ' unexpected'
+                          : kind === 'leading-whitespace'
+                            ? ' ' + missing(socket)
+                            : kind === 'trailing-whitespace'
+                              ? missing(socket) + ' '
+                              : kind === 'extra-newline'
+                                ? missing(socket) + '\n'
+                                : missing(socket);
+  const original = await fs.readFile(join(f.directory, 'config.json'));
+  expect(
+    await f.clean(
+      transport({
+        muxError,
+        muxStdout: kind === 'stdout' ? 'unexpected stdout' : '',
+        muxStatus: kind === 'wrong-status' ? 2 : 1,
+      })
+    )
+  ).toBe(false);
+  expect(await fs.readFile(join(f.directory, 'config.json'))).toEqual(original);
+  expect((await fs.lstat(dirname(f.directory))).isDirectory()).toBe(true);
+});
+it('rechecks native absence before unlinking when a pane appears after the initial ENOENT', async () => {
+  const f = await fixture();
+  await f.writeState();
+  const original = await fs.readFile(join(f.directory, 'config.json'));
+  expect(await f.clean(transport({ muxAppears: true }))).toBe(false);
+  expect(await fs.readFile(join(f.directory, 'config.json'))).toEqual(original);
+  expect((await fs.lstat(dirname(f.directory))).isDirectory()).toBe(true);
 });

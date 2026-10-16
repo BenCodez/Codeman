@@ -351,6 +351,18 @@ describe('Session Options responsive layout in Chromium', () => {
           if (options?.method !== 'GET') {
             w.taskRequests.push(JSON.parse(options!.body!));
             if (w.taskFailure) return new Response(JSON.stringify({ success: false }), { status: 500 });
+            const patch = JSON.parse(options!.body!);
+            if (options?.method === 'PUT') w.taskState = { ...w.taskState, ...patch };
+            else
+              w.taskState = {
+                ...w.taskState,
+                checkpoint: patch.checkpoint,
+                nextAction: patch.nextAction,
+                outcome: patch.outcome,
+                criteria: w.taskState.criteria.map((criterion: any) =>
+                  patch.verifiedCriteria.includes(criterion.id) ? { ...criterion, verified: true } : criterion
+                ),
+              };
           }
           return new Response(JSON.stringify({ success: true, data: w.taskState }), { status: 200 });
         };
@@ -397,8 +409,12 @@ describe('Session Options responsive layout in Chromium', () => {
       });
       const requests = await page.evaluate(() => (window as any).taskRequests);
       expect(requests[2]).toEqual(requests[1]);
-      expect(await page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
-      expect(await page.locator('#taskObjective').inputValue()).toBe('Stored objective');
+      expect(await page.evaluate(() => (window as any).app._taskView.dirty)).toBe(true);
+      expect(await page.locator('#taskObjective').inputValue()).toBe('Draft objective');
+      expect(await command.inputValue()).toBe('  printf "界"\nnext line  ');
+      await page.getByRole('button', { name: 'Save task configuration', exact: true }).click();
+      await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
+      expect(await page.locator('#taskObjective').inputValue()).toBe('Draft objective');
       await page.evaluate(() => (window as any).app.closeTaskOptions());
     }
   );
@@ -452,6 +468,18 @@ describe('Session Options responsive layout in Chromium', () => {
           if (w.failTaskControl) return new Response(JSON.stringify({ success: false }), { status: 500 });
           if (url.endsWith('/pause')) w.taskState = { ...w.taskState, phase: 'paused', reason: 'owner-paused' };
           if (url.endsWith('/resume')) w.taskState = { ...w.taskState, phase: 'watching', reason: 'owner-resumed' };
+          if (url.endsWith('/progress')) {
+            const patch = JSON.parse(options.body!);
+            w.taskState = {
+              ...w.taskState,
+              checkpoint: patch.checkpoint,
+              nextAction: patch.nextAction,
+              outcome: patch.outcome,
+              criteria: w.taskState.criteria.map((criterion: any) =>
+                patch.verifiedCriteria.includes(criterion.id) ? { ...criterion, verified: true } : criterion
+              ),
+            };
+          }
           if (options?.method === 'PUT') {
             const patch = JSON.parse(options.body!);
             w.taskState = {
@@ -536,7 +564,18 @@ describe('Session Options responsive layout in Chromium', () => {
     });
     expect(requests[3].body.criteria.map((criterion: any) => criterion.id)).toEqual(draft.rows.map((row) => row.id));
     expect(requests[3].body.criteria[1].command).toBe(draft.rows[1].fields[1]);
+    await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(true);
+    expect(await page.locator('#taskCheckpoint').inputValue()).toBe(draft.checkpoint);
+    expect(await page.locator('#taskNextAction').inputValue()).toBe(draft.nextAction);
+    expect(await page.locator('#taskCriteriaEvidence input').first().isChecked()).toBe(true);
+    await page.getByRole('button', { name: 'Save checkpoint / verification', exact: true }).click();
     await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
+    const progress = await page.evaluate(() => (window as any).taskRequests[4]);
+    expect(progress.body).toMatchObject({
+      checkpoint: draft.checkpoint,
+      nextAction: draft.nextAction,
+      verifiedCriteria: ['manual'],
+    });
     await page.evaluate(() => (window as any).app.closeTaskOptions());
   });
   it.each([390, 1280])('preserves original and edited checkpoint whitespace at %spx', async (width) => {
