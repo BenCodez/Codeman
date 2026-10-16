@@ -342,6 +342,93 @@ describe('accepted common reservations', () => {
   );
 
   it.each(
+    ['recovery', 'recovery-restart'].flatMap((domain) =>
+      ['accepted', 'user-input', 'approval-required', 'persistence-failed'].map((reason) => ({
+        domain: domain as Domain,
+        reason,
+      }))
+    )
+  )('preserves disabled $domain accepted receipt state on reload: $reason', async ({ domain, reason }) => {
+    const f = await fixture(domain);
+    const accept = f.accepted.getMockImplementation()!;
+    // Acceptance is really saved to RecoveryStore, while the exact shared
+    // reservation remains durable for a later receipt-only cleanup pass.
+    f.accepted.mockResolvedValue(false);
+    try {
+      f.observeAccepted();
+      await f.reconcile();
+      const accepted = f.reloadState() as RecoveryState;
+      expect(accepted.config.enabled).toBe(false);
+      expect(accepted.inFlight).toMatchObject({ key: f.flight.key, accepted: true });
+      expect(accepted).toMatchObject({ phase: 'watching', needsAttention: false, lastReason: 'recovery-accepted' });
+      if (reason !== 'accepted') {
+        accepted.phase = 'paused';
+        accepted.needsAttention = true;
+        accepted.lastReason = reason as RecoveryState['lastReason'];
+        accepted.circuitOpen = reason === 'persistence-failed';
+        await f.domainPersist(accepted);
+      }
+      const expected = {
+        phase: accepted.phase,
+        needsAttention: accepted.needsAttention,
+        lastReason: accepted.lastReason,
+        circuitOpen: accepted.circuitOpen,
+        lastSuccessfulRecovery: accepted.lastSuccessfulRecovery,
+      };
+      f.accepted.mockImplementation(accept);
+      f.replaceArbiter(f.common().inFlight?.key);
+      f.restart();
+      expect(f.get()).toMatchObject(expected);
+      // No new worker evidence is needed to retire an already accepted receipt,
+      // and an unrelated unknown observation cannot fabricate a restart warning.
+      f.observeAccepted({
+        activity: 'unknown',
+        reason: 'identity-unverified',
+        processReady: false,
+        processReadyAt: undefined,
+        submissionKey: undefined,
+        submissionHash: undefined,
+      });
+      await f.reconcile();
+      expect(f.get()).toMatchObject(expected);
+      expect(f.reloadState()).toMatchObject(expected);
+      expect(f.get().inFlight).toBeUndefined();
+      expect(f.common().inFlight).toBeUndefined();
+      expect(f.effect).toHaveBeenCalledOnce();
+    } finally {
+      await f.clean();
+    }
+  });
+
+  it.each(['recovery', 'recovery-restart'] as const)(
+    'keeps unaccepted disabled %s uncertain after reload',
+    async (domain) => {
+      const f = await fixture(domain);
+      try {
+        f.replaceArbiter(f.common().inFlight?.key);
+        f.restart();
+        expect(f.get()).toMatchObject({ phase: 'paused', needsAttention: true, lastReason: 'restart-in-flight' });
+        f.observeAccepted({
+          activity: 'unknown',
+          reason: 'identity-unverified',
+          processReady: false,
+          processReadyAt: undefined,
+          submissionKey: undefined,
+          submissionHash: undefined,
+        });
+        await f.reconcile();
+        expect(f.get()).toMatchObject({ phase: 'paused', needsAttention: true, lastReason: 'acceptance-unverified' });
+        expect(f.get().inFlight?.accepted).toBeUndefined();
+        expect(f.common().inFlight).toBeDefined();
+        expect(f.accepted).not.toHaveBeenCalled();
+        expect(f.effect).toHaveBeenCalledOnce();
+      } finally {
+        await f.clean();
+      }
+    }
+  );
+
+  it.each(
     ['task', 'task-restart', 'recovery'].flatMap((domain) =>
       ['other-owner', 'newer-operation', 'legacy'].map((mismatch) => ({ domain: domain as Domain, mismatch }))
     )
