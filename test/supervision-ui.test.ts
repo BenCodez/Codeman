@@ -36,8 +36,8 @@ function harness(initial = state()) {
   const app = vm.runInContext('new CodemanApp()', ctx) as any;
   (dom.window as any).__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
   app.sessions = new Map([
-    ['a', { mode: 'codex' }],
-    ['b', { mode: 'codex' }],
+    ['a', { mode: 'codex', taskSupported: true }],
+    ['b', { mode: 'codex', taskSupported: true }],
   ]);
   app.editingSessionId = 'a';
   app.showToast = vi.fn();
@@ -170,6 +170,9 @@ describe('Task supervision UI', () => {
 
   it.each([
     ['local', {}, true],
+    ['daemon', { taskSupported: false, codexConfig: { noDaemon: false } }, false],
+    ['discovered', { taskSupported: false, codexConfig: { noDaemon: true } }, false],
+    ['missing eligibility', { taskSupported: undefined }, false],
     ['docker', { docker: { containerId: 'fixture' } }, false],
     ['owned SSH', { remote: { owned: true } }, false],
     ['unowned SSH', { remote: { owned: false } }, false],
@@ -177,7 +180,7 @@ describe('Task supervision UI', () => {
     'offers layer3 task controls only for the supported %s location',
     async (_location, location, supported) => {
       const h = harness();
-      h.app.sessions.set('a', { mode: 'codex', ...location });
+      h.app.sessions.set('a', { mode: 'codex', taskSupported: true, ...location });
       expect(h.app.openTaskOptions('a')).toBe(supported);
       if (supported) await vi.waitFor(() => expect(h.app._taskView.loading).toBe(false));
       expect(h.app._apiJson).toHaveBeenCalledTimes(supported ? 1 : 0);

@@ -1,5 +1,6 @@
 /** @fileoverview Integration coverage for WebServer's shared task/recovery action boundary. */
 import { createHash } from 'node:crypto';
+import type { FastifyInstance } from 'fastify';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -76,7 +77,13 @@ function controllers(id: string): {
   recoveryDeps: RecoveryDependencies;
 } {
   ids.add(id);
-  const session = new Session({ id, workingDir: process.cwd(), mode: 'codex', useMux: false });
+  const session = new Session({
+    id,
+    workingDir: process.cwd(),
+    mode: 'codex',
+    useMux: true,
+    codexConfig: { noDaemon: true },
+  });
   internals.sessions.set(id, session);
   const task = internals.getTaskController(session)!;
   const recovery = internals.getRecoveryController(session)!;
@@ -88,12 +95,13 @@ function controllers(id: string): {
   };
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
   // This suite isolates arbitration; real envelope admission has dedicated broker/adapter coverage.
   vi.spyOn(CodexTaskAdapter.prototype, 'admitPrompt').mockResolvedValue(true);
   server = new WebServer(0, false, true);
   internals = server as unknown as ServerInternals;
+  await Reflect.get(server, 'setupRoutes').call(server);
 });
 
 afterAll(async () => {
@@ -108,17 +116,41 @@ afterAll(async () => {
 describe('task and recovery server action wiring', () => {
   it.each([
     ['local', {}, true],
+    ['daemon', { codexConfig: { noDaemon: false } }, false],
+    ['default daemon', { codexConfig: undefined }, false],
+    ['discovered', { discoveredMuxSession: true }, false],
+    ['direct PTY', { useMux: false }, false],
     ['docker', { docker: { containerId: 'fixture' } }, false],
     ['owned SSH', { remote: { owned: true, host: 'fixture.invalid', remotePath: '/fixture' } }, false],
     ['unowned SSH', { remote: { owned: false, host: 'fixture.invalid', remotePath: '/fixture' } }, false],
-  ] as const)('does not create unsupported layer3 task workflows for %s', (_kind, location, supported) => {
+  ] as const)('does not create unsupported layer3 task workflows for %s', async (_kind, location, supported) => {
     const id = `task-location-${_kind.replaceAll(' ', '-')}`;
     ids.add(id);
-    const session = new Session({ id, mode: 'codex', workingDir: process.cwd(), useMux: false, ...location });
+    const session = new Session({
+      id,
+      mode: 'codex',
+      workingDir: process.cwd(),
+      useMux: true,
+      codexConfig: { noDaemon: true },
+      ...location,
+    });
     internals.sessions.set(id, session);
     const controller = internals.getTaskController(session);
     expect(controller !== undefined).toBe(supported);
-    if (!supported) expect(internals.taskStore.get(id)).toEqual(initialTaskState());
+    expect(session.toLightDetailedState().taskSupported).toBe(supported);
+    const app = Reflect.get(server, 'app') as FastifyInstance;
+    const status = await app.inject({ method: 'GET', url: `/api/sessions/${id}/task` });
+    expect(status.statusCode).toBe(supported ? 200 : 400);
+    if (!supported) {
+      const enable = await app.inject({
+        method: 'PUT',
+        url: `/api/sessions/${id}/task`,
+        payload: { config: { enabled: true } },
+      });
+      expect(enable.statusCode).toBe(400);
+      expect(enable.json().error).toContain('unsupported');
+      expect(internals.taskStore.get(id)).toEqual(initialTaskState());
+    }
   });
 
   it.each([false, true])(

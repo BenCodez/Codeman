@@ -62,7 +62,12 @@ function taskUiCriterionInput(criterion) {
 }
 Object.assign(CodemanApp.prototype, {
   supportsSessionTask(session) {
-    return this.supportsSessionRecovery?.(session) === true && !session.remote && !session.docker;
+    return (
+      this.supportsSessionRecovery?.(session) === true &&
+      session.taskSupported === true &&
+      !session.remote &&
+      !session.docker
+    );
   },
   openTaskOptions(sessionId) {
     this.closeTaskOptions();
