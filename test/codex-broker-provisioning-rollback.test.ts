@@ -1,6 +1,7 @@
 /** Disposable private FS plus the trusted janitor only. No broker, worker, tmux or SSH is launched. */
 import fs from 'node:fs/promises';
 import { renameSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -142,6 +143,210 @@ it.each([false, true])(
     await broker.rollbackUnlaunchedProvisioning();
     expect(await fs.readdir(f.session)).toEqual([]);
     expect(hooks.receipt?.files.map((file) => file.name)).toEqual(['broker.py', 'config.json', 'lock']);
+  }
+);
+
+it.each([
+  'partial-write',
+  'write-receipt',
+  'file-sync',
+  'file-close',
+  'rename',
+  'rename-receipt',
+  'directory-open',
+  'directory-sync',
+  'directory-close',
+] as const)('rolls back the exact unlaunched startup after a %s failure', async (fault) => {
+  const f = await fixture();
+  f.fail('none');
+  const broker = await f.create();
+  const path = join(broker.directory, 'config.json'),
+    next = `${path}.next`;
+  const original = await fs.readFile(path);
+  const writeFile = fs.writeFile.bind(fs),
+    rename = fs.rename.bind(fs);
+  const injected = new Error(`fixture startup ${fault} failed`);
+  let stagingCloseInjected = false;
+  // Both the previous path writer and the owned-handle writer perform actual
+  // partial/full writes before their simulated acknowledgement is lost.
+  vi.spyOn(fs, 'writeFile').mockImplementation(async (...args) => {
+    if (String(args[0]) === next && (fault === 'partial-write' || fault === 'write-receipt')) {
+      const bytes = Buffer.from(args[1] as string);
+      await writeFile(args[0], fault === 'partial-write' ? bytes.subarray(0, 31) : bytes, args[2]);
+      throw injected;
+    }
+    return writeFile(...args);
+  });
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    const target = String(args[0]);
+    if (target === broker.directory && fault === 'directory-open') throw injected;
+    const handle = await f.open(...args);
+    if (target === next) {
+      if (args[1] === 'wx' && (fault === 'partial-write' || fault === 'write-receipt')) {
+        const write = handle.writeFile.bind(handle);
+        vi.spyOn(handle, 'writeFile').mockImplementation(async (...input) => {
+          const bytes = Buffer.from(input[0] as string);
+          await write(fault === 'partial-write' ? bytes.subarray(0, 31) : bytes);
+          throw injected;
+        });
+      }
+      if (fault === 'file-sync') vi.spyOn(handle, 'sync').mockRejectedValueOnce(injected);
+      if (fault === 'file-close' && !stagingCloseInjected) {
+        stagingCloseInjected = true;
+        const close = handle.close.bind(handle);
+        vi.spyOn(handle, 'close').mockImplementationOnce(async () => {
+          await close();
+          throw injected;
+        });
+      }
+    }
+    if (target === broker.directory) {
+      if (fault === 'directory-sync') vi.spyOn(handle, 'sync').mockRejectedValueOnce(injected);
+      if (fault === 'directory-close') {
+        const close = handle.close.bind(handle);
+        vi.spyOn(handle, 'close').mockImplementationOnce(async () => {
+          await close();
+          throw injected;
+        });
+      }
+    }
+    return handle;
+  });
+  vi.spyOn(fs, 'rename').mockImplementation(async (...args) => {
+    if (String(args[0]) === next && fault === 'rename') throw injected;
+    await rename(...args);
+    if (String(args[0]) === next && fault === 'rename-receipt') throw injected;
+  });
+  await expect(broker.setStartupAuthority()).rejects.toBe(injected);
+  expect(await fs.readdir(broker.directory)).toEqual(['broker.py', 'config.json', 'lock']);
+  const current = await fs.readFile(path);
+  const replaced = ['rename-receipt', 'directory-open', 'directory-sync', 'directory-close'].includes(fault);
+  expect(current.equals(original)).toBe(!replaced);
+  expect(broker.configurationDigest).toBe(createHash('sha256').update(current).digest('hex'));
+  await broker.rollbackUnlaunchedProvisioning();
+  expect(await fs.readdir(f.session)).toEqual([]);
+  const file = hooks.receipt!.files.find((file) => file.name === 'config.json')!;
+  expect(file.hash).toBe(createHash('sha256').update(current).digest('hex'));
+});
+
+it.each(['inode', 'bytes', 'symlink', 'permissions', 'directory'] as const)(
+  'preserves startup staging when %s evidence no longer proves invocation ownership',
+  async (change) => {
+    const f = await fixture();
+    f.fail('none');
+    const broker = await f.create();
+    const next = join(broker.directory, 'config.json.next'),
+      outside = join(f.root, 'owner-private-file');
+    await fs.writeFile(outside, 'keep owner bytes', { mode: 0o600 });
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await f.open(...args);
+      if (String(args[0]) === next && args[1] === 'wx') {
+        vi.spyOn(handle, 'sync').mockImplementationOnce(async () => {
+          if (change === 'inode') {
+            await fs.writeFile(next + '.owner', 'keep owner bytes', { mode: 0o600 });
+            await fs.rename(next + '.owner', next);
+          } else if (change === 'bytes') await fs.writeFile(next, 'keep owner bytes');
+          else if (change === 'symlink') {
+            await fs.unlink(next);
+            await fs.symlink(outside, next);
+          } else if (change === 'permissions') await fs.chmod(next, 0o644);
+          else {
+            await fs.rename(broker.directory, broker.directory + '.held');
+            await fs.mkdir(broker.directory, { mode: 0o700 });
+            await fs.writeFile(next, 'keep owner bytes', { mode: 0o600 });
+          }
+          throw Error('fixture staging ownership changed');
+        });
+      }
+      return handle;
+    });
+    await expect(broker.setStartupAuthority()).rejects.toThrow('fixture staging ownership changed');
+    await broker.rollbackUnlaunchedProvisioning();
+    expect(await fs.readFile(outside, 'utf8')).toBe('keep owner bytes');
+    if (change !== 'permissions') expect(await fs.readFile(next, 'utf8')).toBe('keep owner bytes');
+    else expect((await fs.stat(next)).mode & 0o077).toBe(0o044);
+    if (change === 'directory') expect(await fs.readdir(broker.directory + '.held')).toContain('config.json.next');
+    else expect(await fs.readdir(broker.directory)).toEqual(['broker.py', 'config.json', 'config.json.next', 'lock']);
+  }
+);
+
+it.each(['inode', 'bytes', 'symlink'] as const)(
+  'refuses to replace a changed %s configuration and removes only its own startup stage',
+  async (change) => {
+    const f = await fixture();
+    f.fail('none');
+    const broker = await f.create();
+    const path = join(broker.directory, 'config.json'),
+      next = `${path}.next`;
+    const original = await fs.readFile(path),
+      outside = join(f.root, 'owner-config');
+    await fs.writeFile(outside, original, { mode: 0o600 });
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await f.open(...args);
+      if (String(args[0]) === next && args[1] === 'wx') {
+        const sync = handle.sync.bind(handle);
+        vi.spyOn(handle, 'sync').mockImplementationOnce(async () => {
+          await sync();
+          if (change === 'inode') await fs.rename(outside, path);
+          else if (change === 'bytes') await fs.writeFile(path, original.toString() + '\n');
+          else {
+            await fs.unlink(path);
+            await fs.symlink(outside, path);
+          }
+        });
+      }
+      return handle;
+    });
+    await expect(broker.setStartupAuthority()).rejects.toThrow();
+    expect(await fs.readdir(broker.directory)).toEqual(['broker.py', 'config.json', 'lock']);
+    const changed = await fs.lstat(path);
+    await broker.rollbackUnlaunchedProvisioning();
+    expect((await fs.lstat(path)).ino).toBe(changed.ino);
+    expect(await fs.readFile(path, 'utf8')).toBe(original.toString() + (change === 'bytes' ? '\n' : ''));
+    if (change === 'symlink') expect(changed.isSymbolicLink()).toBe(true);
+  }
+);
+
+it.each(['unknown-file', 'started-child', 'reserved-receipt', 'replaced-config'] as const)(
+  'retains an updated post-rename broker when %s vetoes unlaunched rollback',
+  async (change) => {
+    const f = await fixture();
+    f.fail('none');
+    const broker = await f.create();
+    const path = join(broker.directory, 'config.json');
+    let current!: Buffer;
+    vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      const handle = await f.open(...args);
+      if (String(args[0]) === broker.directory)
+        vi.spyOn(handle, 'sync').mockImplementationOnce(async () => {
+          current = await fs.readFile(path);
+          if (change === 'unknown-file')
+            await fs.writeFile(join(broker.directory, 'owner-file'), 'keep', { mode: 0o600 });
+          else if (change === 'started-child' || change === 'reserved-receipt')
+            await fs.writeFile(
+              join(broker.directory, 'state.json'),
+              JSON.stringify(
+                change === 'started-child'
+                  ? { startup: { status: 'started' }, childPid: 123 }
+                  : { receipts: [{ status: 'reserved' }] }
+              ),
+              { mode: 0o600 }
+            );
+          else {
+            await fs.writeFile(path + '.owner', current, { mode: 0o600 });
+            await fs.rename(path + '.owner', path);
+          }
+          throw Error('fixture post-rename sync failed');
+        });
+      return handle;
+    });
+    await expect(broker.setStartupAuthority()).rejects.toThrow('fixture post-rename sync failed');
+    await broker.rollbackUnlaunchedProvisioning();
+    expect(await fs.readFile(path)).toEqual(current);
+    expect(await fs.readdir(broker.directory)).toContain('broker.py');
+    expect(hooks.receipt!.files.find((file) => file.name === 'config.json')?.hash).toBe(
+      createHash('sha256').update(current).digest('hex')
+    );
   }
 );
 it.each([

@@ -315,6 +315,9 @@ Object.assign(CodemanApp.prototype, {
       input.checked = criterion.verified || selected.has(criterion.id);
       input.disabled = !available || criterion.verified;
       input.dataset.taskCriterion = '';
+      input.addEventListener('change', () => {
+        if (this._taskView === view) this.markTaskDraft();
+      });
       const text = document.createElement('span');
       text.dataset.i18nSkip = '';
       text.textContent = `${criterion.description} — ${criterion.verified && criterion.evidence ? `${taskUiTranslate(criterion.evidence.source === 'owner' ? 'Owner verified' : 'Command exit verified')} (${taskUiDate(criterion.evidence.at)})` : taskUiTranslate('Unverified')}`;
@@ -431,8 +434,11 @@ Object.assign(CodemanApp.prototype, {
     if (this._taskView !== view || this.editingSessionId !== view.sessionId) return;
     view.busy = false;
     if (state?.version === 1 && state.config && Array.isArray(state.criteria)) {
-      if (view.revision === revision) view.state = state;
-      view.dirty = false;
+      const current = view.revision === revision;
+      if (current) view.state = state;
+      // Controls persist no draft. A save may acknowledge its matching SSE
+      // publication, but an older response cannot clear a newer server view.
+      if (body !== undefined && (current || JSON.stringify(state) === JSON.stringify(view.state))) view.dirty = false;
     } else {
       this.showToast('Task action failed. Refresh status before trying again.', 'error');
       this._renderTaskStatus();
@@ -442,6 +448,6 @@ Object.assign(CodemanApp.prototype, {
       }
       return;
     }
-    this._renderTaskStatus(true);
+    this._renderTaskStatus(!view.dirty);
   },
 });
