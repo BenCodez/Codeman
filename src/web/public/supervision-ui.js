@@ -302,8 +302,13 @@ Object.assign(CodemanApp.prototype, {
       !state?.criteria.length;
     document.getElementById('taskPauseBtn').disabled = !available || !state?.config.enabled;
     document.getElementById('taskResetBtn').disabled = !available;
-    const renderConfiguration = force || !view.dirty || savedSection === 'configuration';
-    const renderProgress = force || !view.dirty || savedSection === 'progress';
+    const configurationDirty =
+      view.configurationDraftBaseline !== undefined &&
+      this._taskDraftSnapshot('configuration') !== view.configurationDraftBaseline;
+    const progressDirty =
+      view.progressDraftBaseline !== undefined && this._taskDraftSnapshot('progress') !== view.progressDraftBaseline;
+    const renderConfiguration = force || !configurationDirty || savedSection === 'configuration';
+    const renderProgress = force || !progressDirty || savedSection === 'progress';
     if (renderConfiguration) {
       const objectiveInput = document.getElementById('taskObjective');
       const originalObjective = state?.objective ?? '';

@@ -99,6 +99,16 @@ it.each([
   await expect(readManagerBridgeCredential(f.file)).rejects.toThrow();
 });
 
+it.each(['/codeman.v2', '/~team', '/tenant_alpha-beta/agent.v2/~'])(
+  'accepts server-supported base path %s',
+  async (base) => {
+    const url = `https://127.0.0.1:3000${base}/api/supervisor-mcp`;
+    const f = await credential(url);
+    expect((await readManagerBridgeCredential(f.file)).url).toBe(url);
+    expect(managerBridgeUrl(url).pathname).toBe(`${base}/api/supervisor-mcp`);
+  }
+);
+
 it.each([
   'https://foreign.invalid:3000/api/supervisor-mcp',
   'http://localhost:3000/api/supervisor-mcp',
@@ -106,56 +116,66 @@ it.each([
   'http://user:pass@127.0.0.1:3000/api/supervisor-mcp',
   'http://127.0.0.1:3000/api/sessions',
   'http://127.0.0.1:3000/api/supervisor-mcp?path=/api/settings',
+  'http://127.0.0.1:3000/codeman.v2/api/sessions',
+  'http://127.0.0.1:3000/codeman.v2/api/supervisor-mcp/child',
+  'http://127.0.0.1:3000/codeman%20v2/api/supervisor-mcp',
+  'http://127.0.0.1:3000/codeman%2fv2/api/supervisor-mcp',
+  'http://127.0.0.1:3000/codeman.v2/api/supervisor-mcp#fragment',
 ])('refuses arbitrary bridge endpoint %s', (text) => {
   expect(() => managerBridgeUrl(text)).toThrow();
 });
 
-it('serializes newline RPC requests through only the pinned endpoint, with no Basic or ambient fallback', async () => {
-  const calls: Array<{ path?: string; auth?: string; body: unknown }> = [];
-  const server = http.createServer(async (req, res) => {
-    const chunks: Buffer[] = [];
-    for await (const chunk of req) chunks.push(chunk);
-    const body = JSON.parse(Buffer.concat(chunks).toString());
-    calls.push({ path: req.url, auth: req.headers.authorization, body });
-    if (body.method === 'notifications/initialized') {
-      res.writeHead(202);
-      res.end();
-      return;
-    }
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { fixture: body.method } }));
-  });
-  servers.push(server);
-  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
-  const port = (server.address() as { port: number }).port;
-  const f = await credential(`http://127.0.0.1:${port}/api/supervisor-mcp`);
-  let output = '';
-  const sink = new Writable({
-    write(chunk, _encoding, done) {
-      output += chunk.toString();
-      done();
-    },
-  });
-  const requests = [
-    { jsonrpc: '2.0', id: 1, method: 'tools/list' },
-    { jsonrpc: '2.0', method: 'notifications/initialized' },
-    { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} } },
-  ];
-  await runSupervisorManagerMcp(
-    f.file,
-    Readable.from([requests.map((request) => JSON.stringify(request) + '\n').join('')]),
-    sink
-  );
-  expect(calls).toHaveLength(3);
-  expect(calls.every((call) => call.path === '/api/supervisor-mcp' && call.auth === 'Bearer ' + TOKEN)).toBe(true);
-  expect(
-    output
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line).id)
-  ).toEqual([1, 2]);
-  expect(output).not.toContain(TOKEN);
-});
+it.each(['', '/codeman.v2/~team_alpha-beta'])(
+  'serializes newline RPC requests through the pinned endpoint with base %s',
+  async (base) => {
+    const calls: Array<{ path?: string; auth?: string; body: unknown }> = [];
+    const server = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      calls.push({ path: req.url, auth: req.headers.authorization, body });
+      if (body.method === 'notifications/initialized') {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.setHeader('Content-Type', 'application/json');
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { fixture: body.method } }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    const f = await credential(`http://127.0.0.1:${port}${base}/api/supervisor-mcp`);
+    let output = '';
+    const sink = new Writable({
+      write(chunk, _encoding, done) {
+        output += chunk.toString();
+        done();
+      },
+    });
+    const requests = [
+      { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+      { jsonrpc: '2.0', method: 'notifications/initialized' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} } },
+    ];
+    await runSupervisorManagerMcp(
+      f.file,
+      Readable.from([requests.map((request) => JSON.stringify(request) + '\n').join('')]),
+      sink
+    );
+    expect(calls).toHaveLength(3);
+    expect(calls.every((call) => call.path === `${base}/api/supervisor-mcp` && call.auth === 'Bearer ' + TOKEN)).toBe(
+      true
+    );
+    expect(
+      output
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line).id)
+    ).toEqual([1, 2]);
+    expect(output).not.toContain(TOKEN);
+  }
+);
 
 it('permits the existing selfsigned TLS convention only on a numeric loopback MCP request', async () => {
   const response = new EventEmitter() as EventEmitter & { statusCode: number };

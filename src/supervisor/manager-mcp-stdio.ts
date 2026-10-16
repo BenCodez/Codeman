@@ -6,6 +6,7 @@ import http from 'node:http';
 import https from 'node:https';
 import type { Readable, Writable } from 'node:stream';
 import { TextDecoder } from 'node:util';
+import { isValidBasePath } from '../config/base-path.js';
 
 const MAX_REQUEST = 65_536;
 const MAX_RESPONSE = 2_097_152;
@@ -30,6 +31,7 @@ const privateStat = (s: Stats) =>
 /** TLS exception is limited to the configured numeric loopback endpoint, never redirects. */
 export function managerBridgeUrl(text: string): URL {
   const url = new URL(text);
+  const endpoint = '/api/supervisor-mcp';
   if (
     !['http:', 'https:'].includes(url.protocol) ||
     !['127.0.0.1', '[::1]'].includes(url.hostname) ||
@@ -37,7 +39,8 @@ export function managerBridgeUrl(text: string): URL {
     url.password ||
     url.search ||
     url.hash ||
-    !/^\/(?:[A-Za-z0-9_-]+\/)*api\/supervisor-mcp$/.test(url.pathname)
+    !url.pathname.endsWith(endpoint) ||
+    !isValidBasePath(url.pathname.slice(0, -endpoint.length))
   )
     throw new Error('Manager bridge requires a fixed numeric loopback MCP endpoint');
   return url;

@@ -3,8 +3,9 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import type { Stats } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, isAbsolute, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { resolveCliBinDir } from '../utils/cli-resolver.js';
 
 export const MAX_SUPERVISOR_CATALOG_BYTES = 1_048_576;
 let active = 0;
@@ -106,15 +107,21 @@ export async function readSupervisorManagerCatalog(options: {
     if (!current()) fail();
   }, 25);
   const work = (async () => {
+    // Use the same discovered installation as normal session launches, including
+    // supported directories outside the server's PATH. Never run a PATH fallback
+    // when that discovery is absent or no longer within the preparation budget.
+    const binDir = resolveCliBinDir('codex');
+    if (!binDir || !isAbsolute(binDir) || binDir.includes('\0') || !current()) return;
     directory = await fs.mkdtemp(join(tmpdir(), 'codeman-manager-catalog-'));
     owned = await fs.lstat(directory);
     if (!owned.isDirectory() || owned.isSymbolicLink() || (owned.mode & 0o077) !== 0 || !current()) return;
     const before = await fs.lstat(directory);
     if (before.dev !== owned.dev || before.ino !== owned.ino || before.isSymbolicLink() || !current()) return;
-    child = spawn('codex', ['debug', 'models', '--bundled'], {
+    child = spawn(join(binDir, 'codex'), ['debug', 'models', '--bundled'], {
       cwd: directory,
       env: {
-        PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+        // npm/nvm shims may resolve their Node interpreter from this directory.
+        PATH: binDir + delimiter + (process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'),
         HOME: directory,
         CODEX_HOME: directory,
         XDG_CONFIG_HOME: directory,

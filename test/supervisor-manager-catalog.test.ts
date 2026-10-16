@@ -1,12 +1,20 @@
-/** Offline catalog subprocesses are strict fakes; only disposable temp directories are real. */
+/** Strict subprocess fakes plus one explicitly owned inert Node shim; no real Codex or model calls. */
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import fs from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { delimiter, join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-const effects = vi.hoisted(() => ({ spawn: vi.fn() }));
+const effects = vi.hoisted(() => ({
+  spawn: vi.fn(),
+  resolveDir: vi.fn(),
+  nativeSpawn: undefined as unknown as typeof import('node:child_process').spawn,
+}));
+vi.mock('../src/utils/cli-resolver.js', () => ({ resolveCliBinDir: effects.resolveDir }));
 vi.mock('node:child_process', async (original) => {
   const actual = await original<typeof import('node:child_process')>();
+  effects.nativeSpawn = actual.spawn;
   const refuse = () => {
     throw Error('All uninjected processes forbidden');
   };
@@ -89,6 +97,7 @@ async function drained() {
 }
 beforeEach(() => {
   effects.spawn.mockReset();
+  effects.resolveDir.mockReset().mockReturnValue('/fixture/codex-bin');
   now = 1000;
   vi.spyOn(performance, 'now').mockImplementation(() => now);
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
@@ -183,7 +192,7 @@ it('reads only the bundled offline command in a new credential-free HOME/cwd', a
   const reading = readSupervisorManagerCatalog({ deadline: now + 2000, isCurrent: () => true });
   await reached;
   const [command, args, options] = effects.spawn.mock.calls[0];
-  expect(command).toBe('codex');
+  expect(command).toBe('/fixture/codex-bin/codex');
   expect(args).toEqual(['debug', 'models', '--bundled']);
   expect(options.stdio).toEqual(['ignore', 'pipe', 'pipe']);
   expect(options.shell).toBeUndefined();
@@ -209,6 +218,68 @@ it('reads only the bundled offline command in a new credential-free HOME/cwd', a
     )
   ).toBe(true);
   expect(result.models[0].instructions).toBe(catalog().models[0].instructions);
+});
+it('probes the discovered Codex installation even when its directory is absent from PATH', async () => {
+  vi.stubEnv('PATH', '/fixture/system-only');
+  effects.resolveDir.mockReturnValue('/fixture/home with spaces/.local/codex-bin');
+  const { child, reached } = nextChild();
+  const reading = readSupervisorManagerCatalog({ deadline: now + 2000, isCurrent: () => true });
+  await reached;
+  expect(effects.resolveDir).toHaveBeenCalledWith('codex');
+  expect(effects.spawn.mock.calls[0][0]).toBe('/fixture/home with spaces/.local/codex-bin/codex');
+  expect(effects.spawn.mock.calls[0][2].env.PATH).toBe(
+    '/fixture/home with spaces/.local/codex-bin' + delimiter + '/fixture/system-only'
+  );
+  child.stdout.write(raw());
+  child.emit('close', 0, null);
+  expect(await reading).toBeDefined();
+});
+it.runIf(process.platform === 'linux')(
+  'runs an owned inert npm-style shim when both Codex and Node are outside server PATH',
+  async () => {
+    const root = await fs.mkdtemp(join(tmpdir(), 'manager-catalog-shim-'));
+    const bin = join(root, 'bin with spaces');
+    let child: ReturnType<typeof effects.nativeSpawn> | undefined;
+    try {
+      await fs.mkdir(bin, { mode: 0o700 });
+      await fs.symlink(process.execPath, join(bin, 'node'));
+      const executable = join(bin, 'codex');
+      await fs.writeFile(executable, '#!/usr/bin/env node\nprocess.stdout.write(' + JSON.stringify(raw()) + ');\n', {
+        mode: 0o700,
+      });
+      vi.stubEnv('PATH', '/fixture/no-executables');
+      effects.resolveDir.mockReturnValue(bin);
+      effects.spawn.mockImplementationOnce((command, args, options) => {
+        // The sole native process in this file executes only the fixture just written.
+        expect(command).toBe(executable);
+        expect(args).toEqual(['debug', 'models', '--bundled']);
+        child = effects.nativeSpawn(command, args, options);
+        return child;
+      });
+      const result = await readSupervisorManagerCatalog({ deadline: now + 2000, isCurrent: () => true });
+      expect(result).toBeDefined();
+      expect(JSON.parse(result!).models[0].apply_patch_tool_type).toBeNull();
+    } finally {
+      if (child?.pid && child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  }
+);
+it.each([null, '', 'relative/bin', '/fixture/invalid\0bin'])(
+  'never falls back to PATH when executable discovery is absent or invalid: %j',
+  async (directory) => {
+    effects.resolveDir.mockReturnValue(directory);
+    expect(await readSupervisorManagerCatalog({ deadline: now + 2000, isCurrent: () => true })).toBeUndefined();
+    expect(effects.spawn).not.toHaveBeenCalled();
+  }
+);
+it('refuses a discovery result that consumed the original preparation budget', async () => {
+  effects.resolveDir.mockImplementation(() => {
+    now += 2001;
+    return '/fixture/codex-bin';
+  });
+  expect(await readSupervisorManagerCatalog({ deadline: now + 2000, isCurrent: () => true })).toBeUndefined();
+  expect(effects.spawn).not.toHaveBeenCalled();
 });
 it.each([NaN, Infinity, -1, 1000])('refuses an invalid/expired deadline %s without spawning', async (deadline) => {
   expect(await readSupervisorManagerCatalog({ deadline, isCurrent: () => true })).toBeUndefined();

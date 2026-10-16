@@ -1,5 +1,5 @@
 /** Recovery-only asynchronous profile IO; ordinary custom-model application stays synchronous. */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
 import fs from 'node:fs/promises';
 import { homedir, platform } from 'node:os';
@@ -268,39 +268,151 @@ export async function rebuildPersistedCustomModelEnv(
       };
       const write = async (rel: string, text: string) => {
         const target = filePath(rel);
+        if (Buffer.byteLength(text) > 2 * 1024 * 1024) throw Error('Recovery profile oversized');
         if (dirname(target) !== path) await ensure(dirname(target));
         await directoryCurrent();
-        const file = await fs.open(
-          target,
-          constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-          0o600
-        );
-        let stat: Stats;
+        const parent = dirname(target),
+          parentInfo = await fs.lstat(parent);
+        check();
+        const prior = await read(target).catch((error) => {
+          if (absent(error)) return undefined;
+          throw error;
+        });
+        check();
+        const temporary = target + '.recovery-' + randomUUID();
+        let ownedStage: Stats | undefined;
+        let stagedText: string | undefined;
+        let file: Awaited<ReturnType<typeof fs.open>> | undefined;
+        const parentCurrent = async () => {
+          const [directory, profile] = await Promise.all([fs.lstat(parent), fs.lstat(path)]);
+          const expected = created ?? (probe.status === 'present' ? probe : undefined);
+          return (
+            expected &&
+            directory.isDirectory() &&
+            !directory.isSymbolicLink() &&
+            directory.dev === parentInfo.dev &&
+            directory.ino === parentInfo.ino &&
+            profile.isDirectory() &&
+            !profile.isSymbolicLink() &&
+            profile.dev === expected.dev &&
+            profile.ino === expected.ino
+          );
+        };
         try {
+          try {
+            file = await fs.open(
+              temporary,
+              constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+              0o600
+            );
+            ownedStage = await file.stat();
+            check();
+            if (!ownedStage.isFile() || !owned(ownedStage)) throw Error('Recovery profile staging unavailable');
+            await file.writeFile(text, 'utf8');
+            check();
+            await file.sync();
+            check();
+          } finally {
+            // Even a partial failed write belongs only to this exclusive FD. Capture
+            // its actual prefix before close; unknown/foreign bytes are never deleted.
+            if (file) {
+              try {
+                const before = await file.stat();
+                if (
+                  ownedStage &&
+                  before.dev === ownedStage.dev &&
+                  before.ino === ownedStage.ino &&
+                  before.size <= Buffer.byteLength(text)
+                ) {
+                  const bytes = Buffer.alloc(before.size + 1);
+                  let size = 0;
+                  while (size < bytes.length) {
+                    const result = await file.read(bytes, size, bytes.length - size, size);
+                    if (!result.bytesRead) break;
+                    size += result.bytesRead;
+                  }
+                  const after = await file.stat();
+                  if (
+                    size === before.size &&
+                    same(before, after) &&
+                    bytes.subarray(0, size).equals(Buffer.from(text).subarray(0, size))
+                  ) {
+                    ownedStage = after;
+                    stagedText = bytes.subarray(0, size).toString('utf8');
+                  }
+                }
+              } catch {
+                /* Retain unverifiable staging bytes. */
+              }
+              await file.close();
+            }
+          }
           check();
-          stat = await file.stat();
-          check();
-          if (!stat.isFile() || !owned(stat)) throw Error('Recovery profile file');
-          await file.chmod(0o600);
-          check();
+          if (!ownedStage || stagedText !== text) throw Error('Recovery profile staging incomplete');
           await directoryCurrent();
-          await file.writeFile(text, 'utf8');
+          const currentTarget = await read(target).catch((error) => {
+            if (absent(error)) return undefined;
+            throw error;
+          });
           check();
-          await file.truncate(Buffer.byteLength(text));
+          if (
+            prior
+              ? !currentTarget || !same(prior.stat, currentTarget.stat) || prior.text !== currentTarget.text
+              : currentTarget !== undefined
+          )
+            throw Error('Recovery profile changed');
+          // All proof FDs have closed. Recheck every pathname jointly before the
+          // atomic effect; a replaced temp/parent/primary is never overwritten.
+          const [stageInfo, targetInfo, parentOkay, endpointInfo] = await Promise.all([
+            fs.lstat(temporary),
+            fs.lstat(target).catch((error) => {
+              if (absent(error)) return undefined;
+              throw error;
+            }),
+            parentCurrent(),
+            fs.lstat(hostsPath),
+          ]);
+          if (
+            !same(hosts.stat, endpointInfo) ||
+            !parentOkay ||
+            !same(stageInfo, ownedStage) ||
+            stageInfo.isSymbolicLink() ||
+            (prior ? !targetInfo || !same(prior.stat, targetInfo) : targetInfo !== undefined)
+          )
+            throw Error('Recovery profile replaced');
           check();
-          await file.sync();
+          created?.files.push({ path: target, dev: ownedStage.dev, ino: ownedStage.ino, hash: hash(text) });
+          await fs.rename(temporary, target);
           check();
-          const after = await file.stat();
-          if (after.dev !== stat.dev || after.ino !== stat.ino) throw Error('Recovery profile changed');
-          stat = after;
+          const directory = await fs.open(
+            parent,
+            constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW | constants.O_NONBLOCK
+          );
+          try {
+            const info = await directory.stat();
+            check();
+            if (info.dev !== parentInfo.dev || info.ino !== parentInfo.ino)
+              throw Error('Recovery profile parent replaced');
+            await directory.sync();
+            check();
+          } finally {
+            await directory.close();
+          }
+          check();
+          const published = await read(target);
+          if (published.stat.dev !== ownedStage.dev || published.stat.ino !== ownedStage.ino || published.text !== text)
+            throw Error('Recovery profile replaced');
+          check();
         } finally {
-          await file.close();
+          try {
+            if (ownedStage && stagedText !== undefined) {
+              const [final, parentOkay] = await Promise.all([fs.lstat(temporary), parentCurrent()]);
+              if (parentOkay && same(ownedStage, final) && !final.isSymbolicLink()) await fs.unlink(temporary);
+            }
+          } catch {
+            /* Unknown or replaced artifacts remain inspection-only. */
+          }
         }
-        check();
-        const after = await fs.lstat(target);
-        check();
-        if (!same(stat, after) || after.isSymbolicLink()) throw Error('Recovery profile replaced');
-        created?.files.push({ path: target, dev: after.dev, ino: after.ino, hash: hash(text) });
       };
       const json = async (rel: string) => {
         try {
