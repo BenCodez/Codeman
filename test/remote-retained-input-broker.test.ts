@@ -1,6 +1,9 @@
 /** Existing remote workers keep exact broker provenance when their local wrapper is recreated. */
 import { createHash } from 'node:crypto';
-import { afterEach, beforeAll, expect, it, vi } from 'vitest';
+import fs from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, afterEach, beforeAll, expect, it, vi } from 'vitest';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 import { ownedRemoteBrokerCache } from '../src/recovery/remote-input-broker-cache.js';
 import { provisionRemoteInputBroker } from '../src/recovery/remote-input-broker.js';
@@ -33,7 +36,13 @@ vi.mock('../src/recovery/remote-input-broker.js', () => ({ provisionRemoteInputB
 vi.mock('../src/recovery/remote-broker-launch.js', () => ({ observeOwnedRemoteBroker: vi.fn() }));
 let TmuxManager: typeof import('../src/tmux-manager.js').TmuxManager;
 let paneCommand: typeof import('../src/tmux-manager.js').buildRemoteCodexPaneCommand;
+let root: string;
+let previousData: string | undefined;
+const managers: Manager[] = [];
 beforeAll(async () => {
+  root = await fs.mkdtemp(join(homedir(), 'retained-remote-wrapper-'));
+  previousData = process.env.CODEMAN_DATA_DIR;
+  process.env.CODEMAN_DATA_DIR = root;
   const vitest = process.env.VITEST;
   delete process.env.VITEST;
   try {
@@ -44,17 +53,30 @@ beforeAll(async () => {
     if (vitest !== undefined) process.env.VITEST = vitest;
   }
 });
-afterEach(() => {
+afterEach(async () => {
+  for (const manager of managers.splice(0)) await manager.drainSessionSaves();
   expect(effects.forbidden).not.toHaveBeenCalled();
   vi.restoreAllMocks();
   effects.forbidden.mockClear();
+});
+afterAll(async () => {
+  if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
+  else process.env.CODEMAN_DATA_DIR = previousData;
+  await fs.rm(root, { recursive: true, force: true });
 });
 const ID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const home = '/fixture/remote-home';
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 function fixture() {
   effects.exec.mockReset().mockResolvedValue({ stdout: '', stderr: '' });
-  effects.sync.mockReset().mockReturnValue('700\n');
+  effects.sync.mockReset().mockImplementation((command: string) => {
+    // A retained remote worker only needs a new, exactly acknowledged local
+    // wrapper. Model the inert creation and its guarded replacement separately.
+    if (command.includes(' new-session ') && command.includes(' -P ')) return '$1|%7|600|88\n';
+    if (command.includes('CODEMAN_OPTIONAL_BROKER_DISPATCHED'))
+      return 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|$1|%7|700|88\n';
+    return '700\n';
+  });
   vi.mocked(provisionRemoteInputBroker).mockReset().mockResolvedValue({ status: 'existing' });
   vi.mocked(observeOwnedRemoteBroker).mockReset();
   const options: CreateSessionOptions = {
@@ -143,9 +165,13 @@ function fixture() {
     inputBrokers: new Map(),
     inputBrokerLoads: new Map(),
     inputQueues: new Map(),
+    ownerBrokerHydrations: new Map(),
+    sessionSaves: Promise.resolve(),
+    sessionPersistenceUnknown: false,
     tmuxSocket: 'fixture',
     trueColorConfigured: true,
   });
+  managers.push(manager);
   for (const method of [
     'saveSessions',
     '_configureCliEnv',
@@ -201,12 +227,25 @@ it('recreates only the local attach wrapper while retaining the verified origina
   expect(observeOwnedRemoteBroker).toHaveBeenCalledOnce();
   expect(next.recoveryInputBrokerPending).toBeUndefined();
   expect(next.recoveryCodexHome).toBe(home);
+  expect(next.pid).toBe(700);
   expect(f.manager.wrapCodexOwnerInput(ID, 'owner text')).toMatchObject({ status: 'framed' });
+  const create = effects.sync.mock.calls.find(([command]) => command.includes(' new-session '))?.[0];
+  expect(create).toContain(' -P -F ');
+  expect(create).toContain('/bin/sleep 86400');
   const launch = effects.sync.mock.calls.find(([command]) => command.includes('respawn-pane'))?.[0];
+  expect(launch).toContain('if-shell -F -t');
+  expect(launch).toContain('#{==:#{session_id},$1}');
+  expect(launch).toContain('#{==:#{pane_id},%7}');
+  expect(launch).toContain('#{==:#{pane_pid},600}');
+  expect(launch).toContain('#{==:#{pid},88}');
+  expect(launch).toContain('CODEMAN_OPTIONAL_BROKER_DISPATCHED');
   expect(launch).toContain(' attach -t ');
   expect(launch).not.toContain('exec codex');
   expect(provisionRemoteInputBroker).toHaveBeenCalledOnce();
   expect(vi.mocked(provisionRemoteInputBroker).mock.calls[0][3]).toEqual({ planOnly: true });
+  await f.manager.flushSessionsDurably();
+  const persisted = JSON.parse(await fs.readFile(join(root, 'mux-sessions.json'), 'utf8')) as MuxSession[];
+  expect(persisted).toEqual([next]);
 });
 
 it.each([

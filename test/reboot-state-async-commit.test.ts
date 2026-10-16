@@ -5,6 +5,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { StateStore } from '../src/state-store.js';
+import { Session } from '../src/session.js';
 import type { SessionState } from '../src/types.js';
 
 const io = vi.hoisted(() => ({
@@ -243,8 +244,57 @@ it.each(
   }
 );
 
-it.each(['owner', 'config', 'conversation', 'home', 'broker', 'dismiss'] as const)(
-  'live accounting drift cannot mask a changed %s restore authority',
+it.each(
+  (['codex', 'claude'] as const).flatMap((mode) =>
+    (['file-sync', 'directory-sync'] as const).map((stage) => ({ mode, stage }))
+  )
+)('restages actual serialized $mode output display metadata during $stage before ACK', async ({ mode, stage }) => {
+  // Only construct a Session and run its output parsers; never start a CLI,
+  // create a PTY, or touch a real account/config directory.
+  const live = new Session({
+    id: ID,
+    mode,
+    workingDir: root,
+    useMux: false,
+    model: 'requested-model',
+    codexConfig: { model: 'requested-codex-model', noDaemon: true, resumeSessionId: ID },
+  });
+  const entered = hold(stage);
+  const committing = store.persistSessionDurably(ID, () => live.toState());
+  try {
+    await reached(entered, committing);
+    Reflect.get(live, '_recordStrippedMouseMode').call(live, '\u001b[?1002h');
+    live.noteReportedModel(mode === 'claude' ? 'statusline' : 'screen', 'Reported model');
+    if (mode === 'claude')
+      Reflect.get(live, 'parseClaudeCodeInfo').call(
+        live,
+        'Claude Code v2.1.27\ncurrent: 2.1.27 latest: 2.1.28\nOpus 4.5 · Claude Max'
+      );
+    const latest = live.toState();
+    expect(latest).toMatchObject({ cliMouseTracking: true, displayModel: { model: 'Reported model' } });
+    if (mode === 'claude')
+      expect(latest).toMatchObject({
+        cliVersion: '2.1.27',
+        cliModel: 'Opus 4.5',
+        cliAccountType: 'Claude Max',
+        cliLatestVersion: '2.1.28',
+        model: 'requested-model',
+      });
+    release!();
+    await committing;
+    expect(store.getSession(ID)).toEqual(latest);
+    expect(reload().getSession(ID)).toEqual(latest);
+    expect(io.writes).toBeGreaterThan(1);
+    expect(Reflect.get(store, 'circuitBreakerOpen')).toBe(false);
+  } finally {
+    release!();
+    await committing.catch(() => {});
+    await live.stop(false);
+  }
+});
+
+it.each(['owner', 'config', 'conversation', 'home', 'broker', 'dismiss', 'model', 'custom-model', 'unknown'] as const)(
+  'live output display/accounting drift cannot mask a changed %s restore authority',
   async (change) => {
     const record: SessionState = {
       ...tentative(),
@@ -265,12 +315,21 @@ it.each(['owner', 'config', 'conversation', 'home', 'broker', 'dismiss'] as cons
     const rejected = expect(committing).rejects.toThrow('cancelled');
     await reached(entered, committing);
     record.lastActivityAt = 100;
+    Object.assign(record, {
+      cliModel: 'Reported replacement',
+      cliAccountType: 'API',
+      cliMouseTracking: true,
+      displayModel: { model: 'Reported replacement', source: 'screen' },
+    });
     if (change === 'owner') record.owner = 'replacement-owner';
     if (change === 'config') record.codexConfig = { ...record.codexConfig, sandbox: 'workspace-write' };
     if (change === 'conversation') record.codexConfig = { ...record.codexConfig, resumeSessionId: OTHER };
     if (change === 'home') Reflect.set(record, '__codexRecoveryHome', '/fixture/replacement-home');
     if (change === 'broker') Reflect.set(record, '__codexInputBroker', OTHER);
     if (change === 'dismiss') current = false; // Owner/role/grant cancellation stays a separate pure authority verdict.
+    if (change === 'model') record.model = 'different-owner-launch-model';
+    if (change === 'custom-model') Reflect.set(record, 'customModel', { endpointName: 'different-owner-endpoint' });
+    if (change === 'unknown') Reflect.set(record, '__futureAuthority', 'unknown-changed-field');
     release!();
     await rejected;
     expect(io.writes).toBe(1);
