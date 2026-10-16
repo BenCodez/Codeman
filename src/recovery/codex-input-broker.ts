@@ -510,7 +510,12 @@ export class CodexInputBroker {
   }
 
   /** Fresh owned-SSH bytes only; caller also attests the remote native/stream/clock boundary. */
-  observeRemote(serialized: string, witness: PrivateFileWitness, panePid: number): CodexBrokerProof | undefined {
+  observeRemote(
+    serialized: string,
+    witness: PrivateFileWitness,
+    panePid: number,
+    live = true
+  ): CodexBrokerProof | undefined {
     this.ready = false;
     try {
       if (
@@ -548,7 +553,9 @@ export class CodexInputBroker {
         !birth(state.childStart)
       )
         return undefined;
-      this.ready = !state.closed;
+      // A surviving journal after host reboot proves historical identity only.
+      // Keep that proof/cursor, but only an observed native worker admits input.
+      this.ready = live === true && !state.closed;
       // Locally reserved owner frames retain FIFO admission, while automation
       // still requires the remote journal to acknowledge every owner counter.
       if (OWNER_CHANNELS.some((key) => this.counters[key] !== state.counters[key])) return undefined;

@@ -1,4 +1,4 @@
-/** Every process is a disposable Python helper/child in the test-owned HOME. No native pane or SSH runs. */
+/** @fileoverview Every process is a disposable Python helper/child in the test-owned HOME. No native pane or SSH runs. */
 import fs from 'node:fs/promises';
 import { mkdirSync, renameSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -716,6 +716,44 @@ it.each(['primary', 'shadow', 'malformed-shadow', 'future-primary', 'future-shad
 );
 
 it.each(
+  ['tasks.json', 'action-reservations.json', 'state.json'].flatMap((name) =>
+    (['healthy', 'zero', 'negative', 'string', 'boolean', 'null', 'nonfinite'] as const).map((kind) => ({ name, kind }))
+  )
+)('native janitor validates durable resumed task time: $name $kind', async ({ name, kind }) => {
+  const f = await fixture();
+  const resumedAt =
+    kind === 'healthy'
+      ? Date.now()
+      : kind === 'zero'
+        ? 0
+        : kind === 'negative'
+          ? -1
+          : kind === 'string'
+            ? '1234'
+            : kind === 'boolean'
+              ? true
+              : kind === 'null'
+                ? null
+                : Infinity;
+  const task = { ...initialTaskState(), objective: 'Other dormant owner task', resumedAt };
+  const value =
+    name === 'state.json'
+      ? {
+          sessions: {
+            [SID]: { id: SID, workingDir: f.root, status: 'idle', pid: null, createdAt: 1, lastActivityAt: 1, task },
+          },
+        }
+      : { version: 1, sessions: { [SID]: task } };
+  const bytes =
+    kind === 'nonfinite'
+      ? JSON.stringify(value).replace('"resumedAt":null', '"resumedAt":1e999')
+      : JSON.stringify(value);
+  await fs.writeFile(join(f.root, name), bytes, { mode: 0o600 });
+  await f.prune();
+  expect(await f.exists()).toBe(kind !== 'healthy' && kind !== 'zero');
+});
+
+it.each(
   ['tasks.json', 'action-reservations.json'].flatMap((name) =>
     (['healthy', 'referenced', 'flight', 'malformed', 'unknown'] as const).map((kind) => ({ name, kind }))
   )
@@ -901,4 +939,67 @@ it.each([
   });
   await f.prune();
   expect(await f.exists()).toBe(reason === 'unknown-future-reason');
+});
+
+it.each(
+  ['reboot-restore-offer.json', 'reboot-restore-offer.json.previous'].flatMap((name) =>
+    (
+      [
+        'healthy',
+        'referenced',
+        'negative',
+        'future',
+        'missing',
+        'foreign',
+        'string',
+        'boolean',
+        'null',
+        'nonfinite',
+        'wrong-minimum',
+        'unknown-field',
+      ] as const
+    ).map((kind) => ({ name, kind }))
+  )
+)('native janitor validates per-entry reboot offer age: $name $kind', async ({ name, kind }) => {
+  const f = await fixture();
+  const at = Date.now() - 1000;
+  const entry = (id: string) => ({
+    sessionId: id,
+    mode: 'codex',
+    workingDir: f.root,
+    resumeConversationId: SID,
+    state: {
+      id,
+      mode: 'codex',
+      workingDir: f.root,
+      status: 'error',
+      pid: 123,
+      createdAt: 1,
+      lastActivityAt: 1,
+      __codexPriorInputBroker: kind === 'referenced' ? f.broker.incarnation : randomUUID(),
+    },
+  });
+  const other = randomUUID();
+  const ages: Record<string, unknown> = { [SID]: at, [other]: at + 500 };
+  if (kind === 'negative') ages[SID] = -1;
+  if (kind === 'future') ages[other] = Date.now() + 60_000;
+  if (kind === 'missing') delete ages[SID];
+  if (kind === 'foreign') ages[randomUUID()] = at;
+  if (kind === 'string') ages[SID] = String(at);
+  if (kind === 'boolean') ages[SID] = true;
+  if (kind === 'null') ages[SID] = null;
+  if (kind === 'nonfinite') ages[SID] = Infinity;
+  if (kind === 'wrong-minimum') ages[SID] = at + 1;
+  const value = {
+    version: 1,
+    builtAt: at,
+    entries: [entry(SID), entry(other)],
+    entryBuiltAt: ages,
+    ...(kind === 'unknown-field' ? { futureSchema: true } : {}),
+  };
+  const text = JSON.stringify(value);
+  const bytes = kind === 'nonfinite' ? text.replace('"' + SID + '":null', '"' + SID + '":1e999') : text;
+  await fs.writeFile(join(f.root, name), bytes, { mode: 0o600 });
+  await f.prune();
+  expect(await f.exists()).toBe(kind !== 'healthy');
 });

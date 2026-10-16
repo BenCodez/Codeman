@@ -50,6 +50,40 @@ afterEach(async () => {
 });
 
 describe('named-key input reservation', () => {
+  it.each(['recovery', 'key'] as const)(
+    'retains %s reservation ahead of rejected tagged lifecycle owner intent',
+    async (reservation) => {
+      const f = fixture();
+      const before = f.session.getRecoveryContext().generation;
+      const intent = vi.fn();
+      f.session.on('recoveryUserInput', intent);
+      const keyAbort = reservation === 'key' ? new AbortController() : null;
+      Object.assign(f.session, {
+        _paneLifecycleOps: 1,
+        _recoveryDelivering: reservation === 'recovery',
+        _namedKeyAbort: keyAbort,
+      });
+      const options = { fromUser: true, inputSeq: { clientId: 'fixture-client', seq: 1 } };
+      try {
+        expect(f.session.shouldApplyInput('fixture-client', 1)).toBe(true);
+        expect(await f.session.writeAsync('rejected owner input\r', options)).toBe(false);
+        expect(await f.session.writeViaMux('rejected owner input\r', options)).toBe(false);
+        expect(f.session.write('rejected owner input\r', options)).toBe(false);
+        expect(intent).not.toHaveBeenCalled();
+        expect(f.session.getRecoveryContext().generation).toBe(before);
+        expect(f.session.lastSubmitAt).toBe(0);
+        expect(f.session.hasAppliedInputSeq('fixture-client', 1)).toBe(false);
+        expect(f.mux.sendInput).not.toHaveBeenCalled();
+        expect(f.session.recoveryInputReserved).toBe(true);
+        expect(keyAbort?.signal.aborted).not.toBe(true);
+        f.session.forgetInputSeq('fixture-client', 1);
+        expect(f.session.shouldApplyInput('fixture-client', 1)).toBe(true);
+      } finally {
+        Object.assign(f.session, { _paneLifecycleOps: 0, _recoveryDelivering: false, _namedKeyAbort: null });
+      }
+    }
+  );
+
   it.each(['pty', 'mux', 'key'] as const)(
     'cancels a tentative launch for rejected owner %s input without committing bytes or submission evidence',
     async (transport) => {
@@ -94,6 +128,49 @@ describe('named-key input reservation', () => {
     expect(f.session.getRecoveryContext().generation).toBe(before);
     expect(f.mux.sendInput).not.toHaveBeenCalled();
     Object.assign(f.session, { _paneLifecycleOps: 0 });
+  });
+
+  it.each(['pty', 'mux'] as const)(
+    'rejects programmatic or stale-caller tagged %s input without manufacturing owner intent',
+    async (transport) => {
+      const f = fixture();
+      const before = f.session.getRecoveryContext().generation;
+      const intent = vi.fn();
+      f.session.on('recoveryUserInput', intent);
+      Object.assign(f.session, { _paneLifecycleOps: 1 });
+      for (const options of [
+        { inputSeq: { clientId: 'fixture-client', seq: 1 } },
+        { fromUser: true, inputSeq: { clientId: 'fixture-client', seq: 1 }, isCurrent: () => false },
+      ]) {
+        const delivered =
+          transport === 'pty'
+            ? await f.session.writeAsync('not owner intent', options)
+            : await f.session.writeViaMux('not owner intent', options);
+        expect(delivered).toBe(false);
+      }
+      expect(intent).not.toHaveBeenCalled();
+      expect(f.session.getRecoveryContext().generation).toBe(before);
+      expect(f.mux.sendInput).not.toHaveBeenCalled();
+      Object.assign(f.session, { _paneLifecycleOps: 0 });
+    }
+  );
+  it('rejects direct named keys on a cached dead worker before preparation or owner intent', async () => {
+    const f = fixture();
+    f.session.setPaneExit({ at: Date.now(), status: 42 });
+    const before = f.session.getRecoveryContext().generation;
+    const intent = vi.fn();
+    f.session.on('recoveryUserInput', intent);
+    const prepare = vi.fn(() => true);
+    const dispatch = vi.fn(async () => {});
+    expect(await f.session.sendNamedKey('\n', dispatch, prepare)).toBe(false);
+    expect(prepare).not.toHaveBeenCalled();
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(intent).not.toHaveBeenCalled();
+    expect(f.session.getRecoveryContext().generation).toBe(before);
+    expect(f.session.lastSubmitAt).toBe(0);
+    f.session.setPaneExit(undefined);
+    expect(await f.session.sendNamedKey('\n', dispatch, prepare)).toBe(true);
+    expect(dispatch).toHaveBeenCalledOnce();
   });
 
   it('cancels old authority before dispatch and excludes recovery, another key, and text until completion', async () => {

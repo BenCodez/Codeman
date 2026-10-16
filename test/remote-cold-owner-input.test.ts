@@ -298,3 +298,65 @@ it('rejects an equal-looking replacement mux record before hydration for the old
   expect(f.observed).not.toHaveBeenCalled();
   expect(f.write).not.toHaveBeenCalled();
 });
+
+it.each(['pty', 'mux', 'named-key'] as const)(
+  'historical host-reboot evidence cannot ACK %s input; a fresh live worker can',
+  async (path) => {
+    const f = await fixture();
+    await f.session.getOwnedRemoteInputBroker();
+    const serialized = JSON.stringify(f.state);
+    const witness = {
+      path: f.descriptor.directory + '/state.json',
+      dev: 1,
+      ino: 2,
+      size: Buffer.byteLength(serialized),
+      mtimeMs: 1,
+      ctimeMs: 1,
+      hash: hash(serialized),
+      maxBytes: 98304,
+    };
+    // First certify a live worker, then receive the same journal after its host
+    // rebooted: the file survives with closed:false, both native processes do not.
+    expect(f.session.observeOwnedRemoteInputBroker(serialized, witness, 900)).toBeDefined();
+    expect(f.manager.canDeliverCodexOwnerInput(ID)).toBe(true);
+    const signer = f.cache.signer(f.scope, f.material.config.incarnation)!;
+    const proof = f.session.observeOwnedRemoteInputBroker(serialized, witness, 900, false)!;
+    expect(proof).toMatchObject({ closed: false });
+    expect(f.session.isOwnedRemoteInputBrokerProofCurrent(proof)).toBe(true);
+    expect(f.manager.canDeliverCodexOwnerInput(ID)).toBe(false);
+    f.observed.mockResolvedValueOnce({ status: 'unknown' });
+    const send = vi.fn(async () => {
+      const framed = f.manager.wrapCodexOwnerInput(
+        ID,
+        'retained owner input',
+        path === 'named-key' ? 'owner-key' : 'owner-pty'
+      );
+      expect(framed.status).toBe('framed');
+      f.write(framed.data);
+      return true;
+    });
+    if (path === 'mux') vi.spyOn(f.manager, 'sendInput').mockImplementation(send);
+    const deliver = () =>
+      path === 'mux'
+        ? f.session.writeViaMux('retained owner input', { fromUser: true })
+        : path === 'named-key'
+          ? f.session.sendNamedKey('Enter', async () => {
+              await send();
+            })
+          : f.session.writeAsync('retained owner input', { fromUser: true });
+    await expect(deliver()).rejects.toThrow();
+    expect(f.observed).toHaveBeenCalledOnce();
+    expect(f.write).not.toHaveBeenCalled();
+    expect(send).not.toHaveBeenCalled();
+    expect(f.cache.signer(f.scope, f.material.config.incarnation)).toBe(signer);
+    expect(signer.canFrame).toBe(false);
+    // The next actual live observation may restore readiness. No historical
+    // frame was minted, so the original delivery still starts at owner counter1.
+    expect(await deliver()).toBe(true);
+    expect(f.observed).toHaveBeenCalledTimes(2);
+    expect(f.write).toHaveBeenCalledOnce();
+    const wire = f.write.mock.calls[0][0] as string;
+    const packet = JSON.parse(Buffer.from(wire.slice(1, -1).split(':')[1], 'base64').toString());
+    expect(packet.counter).toBe(1);
+  }
+);

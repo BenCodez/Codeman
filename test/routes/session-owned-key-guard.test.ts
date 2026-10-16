@@ -152,3 +152,79 @@ it('keeps a refused newline out of the draft and drains malformed async formatte
   expect(await f.session.writeAsync('second\r', { fromUser: true })).toBe(true);
   expect(f.session.getRecoveryContext().submission?.hash).toBe(hashCodexPrompt('first\nsecond'));
 });
+
+it.each(['S-Enter', 'C-Enter'])(
+  'retains %s for retry while a local worker is known dead, without owner intent',
+  async (key) => {
+    const f = await fixture();
+    Object.assign(f.session, { _useMux: true });
+    const intent = vi.fn();
+    f.session.on('recoveryUserInput', intent);
+    f.session.setPaneExit({ at: Date.now(), status: 42 });
+    const before = f.session.getRecoveryContext().generation;
+    const refused = await f.post(key);
+    expect(refused.statusCode).toBe(422);
+    expect(refused.json()).toMatchObject({ retryable: true, notSent: true });
+    expect(f.wrap).not.toHaveBeenCalled();
+    expect(f.effects).toEqual([]);
+    expect(intent).not.toHaveBeenCalled();
+    expect(f.session.lastSubmitAt).toBe(0);
+    expect(f.session.getRecoveryContext().generation).toBe(before);
+    expect(f.session.recoveryInputReserved).toBe(false);
+    f.session.setPaneExit(undefined);
+    expect((await f.post(key)).statusCode).toBe(200);
+    expect(f.wrap).toHaveBeenCalledOnce();
+    expect(f.effects).toHaveLength(1);
+    expect(intent).toHaveBeenCalledOnce();
+  }
+);
+
+it('refuses an exit observed by key preparation before dispatch or draft tracking', async () => {
+  const f = await fixture();
+  Object.assign(f.session, { _useMux: true });
+  const intent = vi.fn();
+  f.session.on('recoveryUserInput', intent);
+  f.wrap.mockImplementationOnce(() => {
+    f.session.setPaneExit({ at: Date.now(), status: 42 });
+    return { status: 'framed', data: 'never-sent' };
+  });
+  const refused = await f.post();
+  expect(refused.statusCode).toBe(422);
+  expect(refused.json()).toMatchObject({ retryable: true, notSent: true });
+  expect(f.effects).toEqual([]);
+  expect(intent).not.toHaveBeenCalled();
+  expect(f.session.lastSubmitAt).toBe(0);
+  expect(f.session.recoveryInputReserved).toBe(false);
+});
+
+it('never certifies a key as unsent when worker death is observed after native dispatch', async () => {
+  const f = await fixture();
+  Object.assign(f.session, { _useMux: true });
+  f.hold();
+  const key = f.post();
+  await vi.waitFor(() => expect(f.effects).toHaveLength(1));
+  f.session.setPaneExit({ at: Date.now(), status: 42 });
+  f.release();
+  const uncertain = await key;
+  expect(uncertain.statusCode).toBe(500);
+  expect(uncertain.json()).not.toMatchObject({ retryable: true, notSent: true });
+  expect(f.effects).toHaveLength(1);
+  expect(f.session.recoveryInputReserved).toBe(false);
+});
+
+it.each(['remote', 'docker', 'discovered'] as const)(
+  'does not treat an unproven %s local transport exit as worker death',
+  async (scope) => {
+    const f = await fixture();
+    Object.assign(f.session, {
+      _useMux: true,
+      ...(scope === 'remote' ? { _remote: { host: 'fixture', owned: true } } : {}),
+      ...(scope === 'docker' ? { _docker: { container: 'fixture' } } : {}),
+      ...(scope === 'discovered' ? { _discoveredMuxSession: true } : {}),
+    });
+    f.session.setPaneExit({ at: Date.now(), status: 42 });
+    expect(f.session.paneExit).toBeUndefined();
+    expect((await f.post()).statusCode).toBe(200);
+    expect(f.effects).toHaveLength(1);
+  }
+);
