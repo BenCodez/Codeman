@@ -4847,7 +4847,9 @@ export class Session extends EventEmitter {
    * input could disappear while the caller believed it had been delivered.
    */
   write(data: string, options: SessionWriteOptions = {}): boolean {
-    if (options.inputSeq && this.paneExit) return false;
+    // Tagged browser frames must not land in a pane already being replaced.
+    // Refusal leaves FIFO/delivery bookkeeping with the transport, before intent.
+    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
     if (this.recoveryInputReserved) return false;
     this._ordinaryInputWrites++;
     try {
@@ -4860,7 +4862,7 @@ export class Session extends EventEmitter {
         this._noteRejectedOwnedInput();
         return false;
       }
-      if (options.inputSeq && this.paneExit) return false;
+      if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
       const submittedPrompt = this._trackSubmit(data, options);
       try {
         this.ptyProcess.write(input);
@@ -5170,7 +5172,7 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    if (options.inputSeq && this.paneExit) return false;
+    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
     if (this.recoveryInputReserved) return false;
     this._ordinaryInputWrites++;
     try {
@@ -5181,7 +5183,7 @@ export class Session extends EventEmitter {
   }
 
   private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
-    if (options.inputSeq && this.paneExit) return false;
+    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
     const viaMux = !!(this._mux && this._muxSession);
     if (!viaMux && !this.ptyProcess) {
       this._noteRejectedOwnedInput();
@@ -5207,7 +5209,7 @@ export class Session extends EventEmitter {
       this._noteRejectedOwnedInput();
       return false;
     }
-    if (options.inputSeq && this.paneExit) return false;
+    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
     const submittedPrompt = this._trackSubmit(data, options, viaMux);
     if (this._mux && this._muxSession) {
       let sent: boolean;
