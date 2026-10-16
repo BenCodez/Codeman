@@ -443,7 +443,8 @@ if op == 'if-shell':`
   const rotate = async (
     kind: 'restart' | 'restore',
     veto?: (authority: { check: () => Promise<boolean>; isCurrent: () => boolean }) => void,
-    priorJournal?: (state: import('../../src/recovery/codex-input-broker.js').CodexBrokerState) => void
+    priorJournal?: (state: import('../../src/recovery/codex-input-broker.js').CodexBrokerState) => void,
+    codexHome = home
   ) => {
     await fs.writeFile(join(root, 'exit-status'), '1');
     await fs.writeFile(join(root, 'stop'), '');
@@ -482,7 +483,7 @@ if op == 'if-shell':`
       submission: request.submission,
       expectedIdentity: { conversationId: CID, tailHash: hash(tail) },
       codexConfig: { noDaemon: true, resumeSessionId: CID },
-      codexHome: home,
+      codexHome,
       inputBroker: descriptor,
       expectedInputProof: proof,
       ...(kind === 'restart' ? { expectedPane: { paneId: '%7', panePid: worker.pid!, status: 1 } } : {}),

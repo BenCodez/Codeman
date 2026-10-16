@@ -499,7 +499,15 @@ export class TaskController {
         throw new TaskValidationError('Unresolved delivery requires reset');
       // Even an unreadable-for-delivery legacy task can be explicitly disabled.
       if (changed || patch.config?.enabled !== false) this.requirePromptSize(candidate);
-      if (!candidate.agentProgressVeto && acceptanceCriteriaComplete(candidate)) candidate.outcome = 'completed';
+      // Settings do not revalidate command or post-resume turn evidence. Only
+      // retained, independent owner certification can infer completion here.
+      if (
+        !candidate.agentProgressVeto &&
+        candidate.resumedAt === undefined &&
+        acceptanceCriteriaComplete(candidate) &&
+        candidate.criteria.every((criterion) => criterion.kind === 'manual' && criterion.evidence?.source === 'owner')
+      )
+        candidate.outcome = 'completed';
       // Configuration saves do not reacquire authority cancelled by owner input or restart.
       const enabledChanged = candidate.config.enabled !== this.state.config.enabled;
       candidate.phase = candidate.agentProgressVeto
