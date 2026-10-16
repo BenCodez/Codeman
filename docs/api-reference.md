@@ -714,6 +714,13 @@ skipped: { sessionId, reason }[] }`. `reason` is one of `workspace-missing`
 - `POST /api/v1/reboot-restore/dismiss` → `{ dismissed: n }`. Drops the offer
   for everything the caller can see.
 
+For a regular owner in multi-user mode, a local reboot launch binds its actual
+child working directory to an opened directory identity under that owner's case
+space. A renamed or symlink-replaced pathname cannot redirect the worker. This
+requires Linux `/proc` and a Node runtime providing `process.execve`; unavailable
+or timed-out directory proof refuses restoration without a fresh launch fallback.
+The saved working directory remains the original historical pathname.
+
 Each rebuilt session also emits the ordinary `session:created` SSE event, so
 clients other than the one that clicked pick it up without refetching.
 

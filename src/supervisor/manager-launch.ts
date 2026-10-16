@@ -19,6 +19,14 @@ type FileIdentity = Pick<Stats, 'dev' | 'ino' | 'size' | 'mtimeMs' | 'ctimeMs'>;
 const same = (a: FileIdentity, b: FileIdentity) =>
   a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;
 const UUID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+const UTILITY_FEATURES = [
+  'deferred_executor',
+  'request_permissions_tool',
+  'token_budget',
+  'current_time_reminder',
+  'sleep_tool',
+  'goals',
+];
 const quote = (text: string) => (/^[A-Za-z0-9_./:=@%+,-]+$/.test(text) ? text : `'${text.replace(/'/g, `'\\''`)}'`);
 
 export interface SupervisorManagerLaunch {
@@ -56,6 +64,13 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
   ])
     args.push('--disable', feature);
   args.push(
+    ...[
+      'update_plan_enabled=false',
+      'experimental_request_user_input_enabled=false',
+      'tools.update_plan.enabled=false',
+      'tools.experimental_request_user_input.enabled=false',
+      ...UTILITY_FEATURES.map((feature) => `features.${feature}=false`),
+    ].flatMap((value) => ['--config', value]),
     '--config',
     'tools.view_image=false',
     '--config',
@@ -317,7 +332,10 @@ export async function prepareSupervisorManagerLaunch(options: {
       // The bridge gets a path, never the credential in its process arguments.
       const profile = (profileText = stringify({
         model_catalog_json: catalogFile,
+        update_plan_enabled: false,
+        experimental_request_user_input_enabled: false,
         features: {
+          ...Object.fromEntries(UTILITY_FEATURES.map((feature) => [feature, false])),
           // The pinned server CLI uses this flag; newer CLIs use tools.view_image.
           view_image: false,
           shell_tool: false,
@@ -330,7 +348,11 @@ export async function prepareSupervisorManagerLaunch(options: {
           remote_plugin: false,
         },
         web_search: 'disabled',
-        tools: { view_image: false },
+        tools: {
+          view_image: false,
+          update_plan: { enabled: false },
+          experimental_request_user_input: { enabled: false },
+        },
         agents: { enabled: false },
         cli_auth_credentials_store: 'file',
         mcp_servers: {

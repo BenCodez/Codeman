@@ -278,7 +278,8 @@ it('retains failed-preparation files when their contents cannot be verified for 
 
 it('loads the exact adjacent named profile and keeps the only credential in its private JSON file', async () => {
   const p = await paths();
-  const base = 'model = "gpt-5.6-sol"\n[agents]\nenabled = true\n[features.multi_agent_v2]\nenabled = true\n';
+  const base =
+    'model = "gpt-5.6-sol"\nupdate_plan_enabled = true\nexperimental_request_user_input_enabled = true\n[agents]\nenabled = true\n[features]\ngoals = true\ndeferred_executor = true\nrequest_permissions_tool = true\ntoken_budget = true\ncurrent_time_reminder = true\nsleep_tool = true\n[features.multi_agent_v2]\nenabled = true\n';
   await fs.writeFile(join(p.home, 'config.toml'), base);
   const prepared = await prepareSupervisorManagerLaunch({
     home: p.home,
@@ -328,11 +329,32 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
   expect(command).toContain('--config tools.view_image=false');
   expect(command).toContain('--config features.view_image=false');
   expect((parsed.features as Record<string, unknown>).view_image).toBe(false);
-  expect(parsed.tools).toEqual({ view_image: false });
+  expect(parsed.tools).toEqual({
+    view_image: false,
+    update_plan: { enabled: false },
+    experimental_request_user_input: { enabled: false },
+  });
+  expect(command).toContain('--config tools.update_plan.enabled=false');
+  expect(command).toContain('--config tools.experimental_request_user_input.enabled=false');
   expect(parsed.agents).toEqual({ enabled: false });
   expect((parsed.features as Record<string, unknown>).multi_agent_v2).toEqual({ enabled: false });
   expect(command).toContain('--config agents.enabled=false');
   expect(command).toContain('--config features.multi_agent_v2.enabled=false');
+  for (const key of ['update_plan_enabled', 'experimental_request_user_input_enabled']) {
+    expect(parsed[key]).toBe(false);
+    expect(command).toContain(`--config ${key}=false`);
+  }
+  for (const feature of [
+    'deferred_executor',
+    'request_permissions_tool',
+    'token_budget',
+    'current_time_reminder',
+    'sleep_tool',
+    'goals',
+  ]) {
+    expect((parsed.features as Record<string, unknown>)[feature]).toBe(false);
+    expect(command).toContain(`--config features.${feature}=false`);
+  }
   expect(command).toContain('-u CODEMAN_PASSWORD');
   expect(command).toContain('-u CODEMAN_HOOK_SECRET_FILE');
   expect(command).toContain('CODEMAN_SUPERVISOR_SCOPED=1');

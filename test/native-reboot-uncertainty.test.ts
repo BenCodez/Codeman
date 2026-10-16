@@ -2725,3 +2725,96 @@ describe('registered Codex-compatible uncertain launch adoption', () => {
     expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-pane '))).toBe(false);
   });
 });
+
+// The final native command must consume the opened-directory proof, including
+// the broker's inner child command. Native tmux/worker effects remain injected.
+it.each(['codex', 'claude'] as const)('binds %s guarded cwd across a post-proof symlink replacement', async (mode) => {
+  const workspaceModule = await import('../src/recovery/reboot-workspace-launch.js');
+  const { renameSync, symlinkSync } = await import('node:fs');
+  const { manager, home, getBroker } = fixture();
+  const priorMultiuser = process.env.CODEMAN_MULTIUSER;
+  const priorSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+  const spaces = join(root, randomUUID());
+  const workspace = join(spaces, 'alice', 'cases', 'workspace');
+  const outside = join(root, randomUUID());
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  writeFileSync(join(root, 'users.json'), JSON.stringify({ version: 1, users: [{ username: 'alice', role: 'user' }] }));
+  process.env.CODEMAN_MULTIUSER = '1';
+  process.env.CODEMAN_USER_SPACES_DIR = spaces;
+  invalidateUsersCache();
+  const prepare = workspaceModule.prepareRebootWorkspaceLaunch;
+  let wrapped = '',
+    original = '';
+  vi.spyOn(workspaceModule, 'prepareRebootWorkspaceLaunch').mockImplementation(async (...args) => {
+    const lease = await prepare(...args);
+    if (!lease) return undefined;
+    const wrap = lease.wrap;
+    lease.wrap = (command) => {
+      original = command;
+      wrapped = wrap(command);
+      return wrapped;
+    };
+    return lease;
+  });
+  let brokerCommand = '';
+  vi.spyOn(
+    manager as unknown as { createInputBroker(id: string, command: string): Promise<CodexInputBroker> },
+    'createInputBroker'
+  ).mockImplementation(async (_id, command) => {
+    brokerCommand = command;
+    return getBroker();
+  });
+  let swapped = false;
+  effects.sync.mockImplementation((command) => {
+    if (command.includes(' new-session ')) {
+      renameSync(workspace, workspace + '-original');
+      symlinkSync(outside, workspace, 'dir');
+      swapped = true;
+    }
+    return nativeOutput(command);
+  });
+  const deadline = performance.now() + 2000;
+  const guard = {
+    prepare: async () => {},
+    confirm: () => true,
+    isCurrent: () => true,
+    getWorkspaceDeadline: () => deadline,
+  };
+  try {
+    const created = await manager.createSession({
+      sessionId: ID,
+      workingDir: workspace,
+      mode,
+      owner: 'alice',
+      ...(mode === 'codex'
+        ? {
+            codexConfig: config,
+            recoveryCodexHome: home,
+            codexRestoreGuard: { ...guard, getStartupEvidence: () => ({ files: [], paths: [], missing: [] }) },
+          }
+        : { restoreGuard: guard }),
+    });
+    expect(swapped).toBe(true);
+    expect(created.workingDir).toBe(workspace);
+    expect(original).not.toContain(`cd '${workspace}'`);
+    expect(wrapped).toContain(process.execPath);
+    expect(wrapped).toContain('fs.fstatSync');
+    expect(wrapped).toContain('process.execve');
+    expect(wrapped).toContain('process.chdir');
+    if (mode === 'codex') expect(brokerCommand).toBe(wrapped);
+    else
+      expect(
+        effects.sync.mock.calls.some(
+          ([command]) => command.includes('respawn-pane') && command.includes('process.execve')
+        )
+      ).toBe(true);
+    expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane'))).toHaveLength(1);
+  } finally {
+    if (priorMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+    else process.env.CODEMAN_MULTIUSER = priorMultiuser;
+    if (priorSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+    else process.env.CODEMAN_USER_SPACES_DIR = priorSpaces;
+    invalidateUsersCache();
+  }
+});

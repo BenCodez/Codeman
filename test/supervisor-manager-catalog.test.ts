@@ -33,6 +33,7 @@ const catalog = () => ({
       slug: 'fixture-sol',
       apply_patch_tool_type: 'freeform',
       tool_mode: 'code_mode_only',
+      experimental_supported_tools: ['clock', 'send_user_message_async', 'test_sync_tool'],
       context_window: 200000,
       instructions: 'Private fixture café 🧭',
       reasoning: { supported: ['low', 'high'] },
@@ -105,6 +106,7 @@ it('clears patch selectors, pins direct mode and preserves other bundled setting
   for (const model of expected.models) {
     model.apply_patch_tool_type = null;
     model.tool_mode = 'direct';
+    model.experimental_supported_tools = [];
   }
   expect(JSON.parse(sanitizeSupervisorManagerCatalog(raw())!)).toEqual(expected);
 });
@@ -116,7 +118,27 @@ it.each(['direct', 'code_mode', 'code_mode_only', null, undefined])(
       slug: 'fixture',
       apply_patch_tool_type: null,
       tool_mode: 'direct',
+      experimental_supported_tools: [],
     });
+  }
+);
+it.each([[], ['clock'], ['send_user_message_async', 'test_sync_tool'], ['future_utility']].map((value) => [value]))(
+  'removes every model-selected experimental utility %#',
+  (experimental_supported_tools) => {
+    const sanitized = sanitizeSupervisorManagerCatalog(
+      JSON.stringify({ models: [{ slug: 'fixture', apply_patch_tool_type: null, experimental_supported_tools }] })
+    );
+    expect(JSON.parse(sanitized!).models[0].experimental_supported_tools).toEqual([]);
+  }
+);
+it.each([null, false, 'clock', {}, [1], [null]].map((value) => [value]))(
+  'refuses malformed model utility selectors %#',
+  (experimental_supported_tools) => {
+    expect(
+      sanitizeSupervisorManagerCatalog(
+        JSON.stringify({ models: [{ slug: 'fixture', apply_patch_tool_type: null, experimental_supported_tools }] })
+      )
+    ).toBeUndefined();
   }
 );
 it.each(['future-mode', '', false, 0, {}, []])('refuses an unknown model tool selector %#', (tool_mode) => {
@@ -181,6 +203,11 @@ it('reads only the bundled offline command in a new credential-free HOME/cwd', a
     true
   );
   expect(result.models.every((model: { tool_mode: unknown }) => model.tool_mode === 'direct')).toBe(true);
+  expect(
+    result.models.every(
+      (model: { experimental_supported_tools: unknown[] }) => model.experimental_supported_tools.length === 0
+    )
+  ).toBe(true);
   expect(result.models[0].instructions).toBe(catalog().models[0].instructions);
 });
 it.each([NaN, Infinity, -1, 1000])('refuses an invalid/expired deadline %s without spawning', async (deadline) => {

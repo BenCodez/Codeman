@@ -40,12 +40,16 @@ export function sanitizeSupervisorManagerCatalog(raw: string): string | undefine
         (model.apply_patch_tool_type !== null && model.apply_patch_tool_type !== 'freeform') ||
         (model.tool_mode !== undefined &&
           model.tool_mode !== null &&
-          !['direct', 'code_mode', 'code_mode_only'].includes(model.tool_mode))
+          !['direct', 'code_mode', 'code_mode_only'].includes(model.tool_mode)) ||
+        (model.experimental_supported_tools !== undefined &&
+          (!Array.isArray(model.experimental_supported_tools) ||
+            !model.experimental_supported_tools.every((tool: unknown) => typeof tool === 'string')))
       )
         return undefined;
       slugs.add(model.slug);
       model.apply_patch_tool_type = null;
       model.tool_mode = 'direct';
+      model.experimental_supported_tools = [];
     }
     const result = JSON.stringify(value);
     return Buffer.byteLength(result) <= MAX_SUPERVISOR_CATALOG_BYTES ? result : undefined;

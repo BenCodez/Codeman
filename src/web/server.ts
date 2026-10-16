@@ -2568,6 +2568,7 @@ export class WebServer extends EventEmitter {
   /** Explicit, authenticated conversion; a persisted role never grants a running CLI new API authority. */
   private async prepareSupervisorManager(session: Session, callerCurrent: () => boolean): Promise<boolean> {
     if (
+      !this.supervisorManagerEndpointAvailable() ||
       !this.supervisorManagerAuthReady ||
       (!isMultiUserMode() && !process.env.CODEMAN_PASSWORD) ||
       this.recoveryStopping ||
@@ -2607,6 +2608,7 @@ export class WebServer extends EventEmitter {
       try {
         return (
           callerCurrent() === true &&
+          this.supervisorManagerEndpointAvailable() &&
           !this.recoveryStopping &&
           !this.cleaningUp.has(session.id) &&
           this.sessions.get(session.id) === session &&
@@ -2758,9 +2760,15 @@ export class WebServer extends EventEmitter {
     }
   }
 
+  /** Only these numeric binds guarantee the bridge's IPv4 loopback endpoint. */
+  private supervisorManagerEndpointAvailable(): boolean {
+    return this.host === '127.0.0.1' || this.host === '0.0.0.0';
+  }
+
   private supervisorManagerIsEligible(session: Session): boolean {
     const context = session.getRecoveryContext();
     return (
+      this.supervisorManagerEndpointAvailable() &&
       getCli(session.mode)?.capabilities.recovery === 'codex-rollout' &&
       !session.remote &&
       !session.docker &&

@@ -16,17 +16,24 @@ import { initialSupervisorState } from '../src/supervisor/schema.js';
 
 const publicDir = resolve(import.meta.dirname, '../src/web/public');
 it.each([
-  ['isolated local', true, true, true, false, false, true],
-  ['daemon local', false, true, true, false, false, false],
-  ['manual-only fallback', true, false, true, false, false, false],
-  ['missing pinned home', true, true, false, false, false, false],
-  ['discovered pane', true, true, true, true, false, false],
-  ['durable ineligible role', false, false, false, false, true, true],
+  ['isolated local', true, true, true, false, false, true, '127.0.0.1'],
+  ['daemon local', false, true, true, false, false, false, '127.0.0.1'],
+  ['manual-only fallback', true, false, true, false, false, false, '127.0.0.1'],
+  ['missing pinned home', true, true, false, false, false, false, '127.0.0.1'],
+  ['discovered pane', true, true, true, true, false, false, '127.0.0.1'],
+  ['durable ineligible role', false, false, false, false, true, true, '127.0.0.1'],
+  ['IPv4 wildcard listener', true, true, true, false, false, true, '0.0.0.0'],
+  ['IPv6 loopback only', true, true, true, false, false, false, '::1'],
+  ['uncertain IPv6 wildcard', true, true, true, false, false, false, '::'],
+  ['ambiguous hostname', true, true, true, false, false, false, 'localhost'],
+  ['specific network address', true, true, true, false, false, false, '192.0.2.10'],
+  ['different IPv4 loopback', true, true, true, false, false, false, '127.0.0.2'],
+  ['durable role on unsupported listener', true, true, true, false, true, true, '::1'],
 ] as const)(
   'aligns public state, actual API and UI for %s',
-  async (_name, noDaemon, isolated, pinnedHome, discovered, durableRole, supported) => {
+  async (_name, noDaemon, isolated, pinnedHome, discovered, durableRole, supported, host) => {
     const directory = await mkdtemp(join(homedir(), 'supervisor-ui-eligibility-'));
-    const server = new WebServer(0, false, true);
+    const server = new WebServer(0, false, true, host);
     const id = randomUUID();
     const sessions = Reflect.get(server, 'sessions') as Map<string, Session>;
     const store = new SupervisorStore(join(directory, 'supervisors.json'));
@@ -63,7 +70,12 @@ it.each([
       expect(state.supervisorAvailable).toBe(supported);
       await Reflect.get(server, 'setupRoutes').call(server);
       const api = Reflect.get(server, 'app') as FastifyInstance;
-      const response = await api.inject({ method: 'GET', url: `/api/sessions/${id}/supervisor` });
+      const authority = host.includes(':') ? `[${host}]` : host === '0.0.0.0' ? '127.0.0.1' : host;
+      const response = await api.inject({
+        method: 'GET',
+        url: `/api/sessions/${id}/supervisor`,
+        headers: { host: authority },
+      });
       expect(response.statusCode).toBe(supported ? 200 : 400);
       const context = dom.getInternalVMContext();
       vm.runInContext('class CodemanApp {}', context);
@@ -79,8 +91,19 @@ it.each([
       expect(dom.window.document.querySelector<HTMLElement>('[data-tab="supervisor"]')!.style.display).toBe(
         supported ? '' : 'none'
       );
+      // An unsupported bind must refuse before identity IO or credential issuance,
+      // even with authentication available; the positive bind reaches that gate.
+      vi.stubEnv('CODEMAN_PASSWORD', 'fixture-manager-listener');
+      Reflect.set(server, 'supervisorManagerAuthReady', true);
+      const fence = vi.spyOn(session, 'ensureRecoveryIdentityFence').mockResolvedValue(false);
+      const preparation = vi.spyOn(session, 'prepareSupervisorManager');
+      expect(await Reflect.get(server, 'prepareSupervisorManager').call(server, session, () => true)).toBe(false);
+      expect(fence).toHaveBeenCalledTimes(['127.0.0.1', '0.0.0.0'].includes(host) ? 1 : 0);
+      expect(preparation).not.toHaveBeenCalled();
     } finally {
       dom.window.close();
+      vi.restoreAllMocks();
+      vi.unstubAllEnvs();
       sessions.clear();
       await server.stop();
       await rm(directory, { recursive: true, force: true });

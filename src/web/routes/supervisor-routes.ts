@@ -78,7 +78,7 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
       return operationFailure(
         reply,
         error,
-        'Restricted manager requires authentication, a verified idle conversation, and verifiable unmanaged Linux configuration with file-only API-key authentication'
+        'Restricted manager requires an IPv4-loopback listener, authentication, a verified idle conversation, and verifiable unmanaged Linux configuration with file-only API-key authentication'
       );
     }
   });
