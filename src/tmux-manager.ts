@@ -1813,11 +1813,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       : undefined;
   }
 
-  observeOwnedRemoteInputBroker(sessionId: string, serialized: string, witness: PrivateFileWitness, panePid: number) {
+  observeOwnedRemoteInputBroker(
+    sessionId: string,
+    serialized: string,
+    witness: PrivateFileWitness,
+    panePid: number,
+    live = true
+  ) {
     const session = this.sessions.get(sessionId),
       scope = session && this.remoteBrokerScope(session);
     return session?.recoveryInputBroker && scope
-      ? ownedRemoteBrokerCache.observe(scope, session.recoveryInputBroker, serialized, witness, panePid)
+      ? ownedRemoteBrokerCache.observe(scope, session.recoveryInputBroker, serialized, witness, panePid, live)
       : undefined;
   }
 

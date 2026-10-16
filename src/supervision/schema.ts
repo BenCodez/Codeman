@@ -112,6 +112,7 @@ export const TaskStateSchema = z
     reason: z.string().regex(/^[\w-]{1,80}$/),
     startedAt: z.number().optional(),
     configuredAt: z.number().optional(),
+    resumedAt: z.number().finite().nonnegative().optional(),
     kickoffAt: z.number().optional(),
     lastProgressAt: z.number().optional(),
     conversationId: z.string().max(100).optional(),

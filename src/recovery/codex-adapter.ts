@@ -456,7 +456,8 @@ export class CodexRecoveryAdapter {
       const inputProof = session.observeOwnedRemoteInputBroker(
         evidence.inputBroker.serialized,
         evidence.inputBroker.witness,
-        brokerPanePid
+        brokerPanePid,
+        evidence.session === 'present' && evidence.inputBroker.historical !== true
       );
       if (
         !inputProof ||

@@ -49,8 +49,17 @@ type SnapshotWriter = (
 
 const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 
-function validateSnapshot(value: unknown): { builtAt: number; entries: RebootRestoreEntry[] } {
-  const saved = value as { version?: unknown; builtAt: number; entries: RebootRestoreEntry[] };
+function validateSnapshot(value: unknown): {
+  builtAt: number;
+  entries: RebootRestoreEntry[];
+  entryBuiltAt?: Record<string, number>;
+} {
+  const saved = value as {
+    version?: unknown;
+    builtAt: number;
+    entries: RebootRestoreEntry[];
+    entryBuiltAt?: Record<string, number>;
+  };
   if (
     !saved ||
     typeof saved !== 'object' ||
@@ -88,6 +97,22 @@ function validateSnapshot(value: unknown): { builtAt: number; entries: RebootRes
     )
   )
     throw new Error('Invalid restore offer entries');
+  if (saved.entryBuiltAt !== undefined) {
+    const ages = saved.entryBuiltAt;
+    const ids = new Set(saved.entries.map((entry) => entry.sessionId));
+    if (
+      !ages ||
+      typeof ages !== 'object' ||
+      Array.isArray(ages) ||
+      ids.size !== saved.entries.length ||
+      Object.keys(ages).length !== ids.size ||
+      Object.entries(ages).some(
+        ([id, at]) => !ids.has(id) || !Number.isFinite(at) || at <= 0 || at < saved.builtAt || at > Date.now()
+      ) ||
+      (ids.size > 0 && Math.min(...Object.values(ages)) !== saved.builtAt)
+    )
+      throw new Error('Invalid restore offer ages');
+  }
   return saved;
 }
 
@@ -402,6 +427,8 @@ export class RebootRestoreRegistry {
     for (const held of this.parked.values()) this.revoked.add(held.entry);
     this.entries.clear();
     this.parked.clear();
+    this.entryBuiltAt = new WeakMap();
+    this.expiredEntries = new WeakSet();
     this.failedReleases.clear();
     this.builtAt = 0;
     this.expired = false;
@@ -428,7 +455,9 @@ export class RebootRestoreRegistry {
           this.entries = new Map(
             entries.filter((entry) => ids.has(entry.sessionId)).map((entry) => [entry.sessionId, entry])
           );
-          this.builtAt = saved.builtAt;
+          for (const entry of this.entries.values())
+            this.entryBuiltAt.set(entry, saved.entryBuiltAt?.[entry.sessionId] ?? saved.builtAt);
+          this.builtAt = this.oldestOfferAt();
           this.stateRevision++;
         } else {
           this.acknowledgedSnapshot = JSON.stringify({ version: 1, builtAt: 0, entries: [] });
@@ -475,14 +504,23 @@ export class RebootRestoreRegistry {
     const path = this.persistencePath;
     const outstanding = [...entries.values(), ...[...parked.values()].map((held) => held.entry)];
     if (outstanding.length > 1000) throw new Error('Restore offer exceeds entry budget');
-    const text = JSON.stringify({ version: 1, builtAt, entries: outstanding });
+    const snapshot = () => {
+      const ages = Object.fromEntries(
+        outstanding.map((entry) => [entry.sessionId, this.entryBuiltAt.get(entry) ?? builtAt])
+      );
+      const oldest = outstanding.length ? Math.min(...Object.values(ages)) : 0;
+      return {
+        version: 1,
+        builtAt: oldest,
+        entries: outstanding,
+        ...(Object.values(ages).some((at) => at !== oldest) ? { entryBuiltAt: ages } : {}),
+      };
+    };
+    const text = JSON.stringify(snapshot());
     if (Buffer.byteLength(text) > 8 * 1024 * 1024) throw new Error('Restore offer exceeds storage budget');
     const epoch = this.epoch;
     const current = () =>
-      this.epoch === epoch &&
-      this.persistencePath === path &&
-      scopeCurrent() &&
-      JSON.stringify({ version: 1, builtAt, entries: outstanding }) === text;
+      this.epoch === epoch && this.persistencePath === path && scopeCurrent() && JSON.stringify(snapshot()) === text;
     if (!current()) throw new Error('Restore offer transaction was superseded');
     await this.snapshotWriter(path, text, current, expectedPreviousText);
     if (!current()) throw new Error('Restore offer transaction was superseded');
@@ -494,6 +532,16 @@ export class RebootRestoreRegistry {
   private entries = new Map<string, RebootRestoreEntry>();
   /** When the boot pass built the plan, in ms since the epoch. */
   private builtAt = 0;
+  /** Private offer age follows its exact entry through take/release and durable reload. */
+  private entryBuiltAt = new WeakMap<RebootRestoreEntry, number>();
+  private expiredEntries = new WeakSet<RebootRestoreEntry>();
+  private offerIsExpired(entry: RebootRestoreEntry, now = Date.now()): boolean {
+    return this.expiredEntries.has(entry) || now - (this.entryBuiltAt.get(entry) ?? this.builtAt) > PLAN_TTL_MS;
+  }
+  private oldestOfferAt(entries = this.entries, parked = this.parked): number {
+    const all = [...entries.values(), ...[...parked.values()].map((held) => held.entry)];
+    return all.length ? Math.min(...all.map((entry) => this.entryBuiltAt.get(entry) ?? this.builtAt)) : 0;
+  }
   /**
    * Entries handed to a restore that has not finished, by session id, each
    * remembering which caller is spending it.
@@ -578,9 +626,15 @@ export class RebootRestoreRegistry {
       // Unrelated loaded offers retain their original identity and expiry.
       const scanned = new Set(scannedIds);
       const next = new Map([...this.entries].filter(([id]) => !scanned.has(id)));
-      for (const entry of entries) next.set(entry.sessionId, entry);
+      for (const entry of entries) {
+        const previous = this.entries.get(entry.sessionId);
+        this.entryBuiltAt.set(entry, previous ? (this.entryBuiltAt.get(previous) ?? builtAt) : Date.now());
+        next.set(entry.sessionId, entry);
+      }
       if (JSON.stringify([...next]) === snapshot) return true;
-      const nextBuiltAt = next.size ? builtAt || Date.now() : 0;
+      const nextBuiltAt = next.size
+        ? Math.min(...[...next.values()].map((entry) => this.entryBuiltAt.get(entry) ?? builtAt))
+        : 0;
       if (next.size > 1000 || Buffer.byteLength(JSON.stringify([...next.values()])) > MAX_SNAPSHOT_BYTES)
         throw new Error('Restore offer exceeds storage budget');
       const publish = () => {
@@ -607,6 +661,10 @@ export class RebootRestoreRegistry {
   set(entries: readonly RebootRestoreEntry[]): Promise<void> {
     const nextEntries = new Map(entries.map((entry) => [entry.sessionId, entry]));
     const nextBuiltAt = entries.length > 0 ? Date.now() : 0;
+    for (const entry of entries) {
+      this.entryBuiltAt.set(entry, nextBuiltAt);
+      this.expiredEntries.delete(entry);
+    }
     try {
       if (nextEntries.size > 1000) throw new Error('Restore offer exceeds entry budget');
       if (
@@ -645,7 +703,9 @@ export class RebootRestoreRegistry {
    */
   list(canAccess: (owner: string | undefined) => boolean): RebootRestoreEntry[] {
     this.dropIfExpired();
-    return this.expired || this.loading ? [] : [...this.entries.values()].filter((entry) => canAccess(entry.owner));
+    return this.loading
+      ? []
+      : [...this.entries.values()].filter((entry) => !this.offerIsExpired(entry) && canAccess(entry.owner));
   }
 
   /** Include a restore already in flight when retaining an absent session's role. */
@@ -681,6 +741,7 @@ export class RebootRestoreRegistry {
       // A fresh explicit click gets a fresh identity after an earlier cancelled
       // flight. Its old held callback can never regain authority.
       const heldEntry = this.revoked.has(entry) ? structuredClone(entry) : entry;
+      if (heldEntry !== entry) this.entryBuiltAt.set(heldEntry, this.entryBuiltAt.get(entry) ?? this.builtAt);
       this.parked.set(entry.sessionId, { entry: heldEntry, spender });
       taken.push(heldEntry);
     }
@@ -706,14 +767,14 @@ export class RebootRestoreRegistry {
       for (const [id, held] of captured) {
         if (nextParked.get(id) !== held) continue;
         nextParked.delete(id);
-        if (!this.expired && wanted.has(id)) nextEntries.set(id, held.entry);
+        if (!this.offerIsExpired(held.entry) && wanted.has(id)) nextEntries.set(id, held.entry);
       }
       return { nextEntries, nextParked };
     };
     const publish = (next: ReturnType<typeof transition>) => {
       this.entries = next.nextEntries;
       this.parked = next.nextParked;
-      if (!this.entries.size && !this.parked.size) this.builtAt = 0;
+      this.builtAt = this.oldestOfferAt();
       this.failedReleases.delete(spender);
       this.stateRevision++;
     };
@@ -763,7 +824,7 @@ export class RebootRestoreRegistry {
         nextParked,
         removed,
         removedSpenders,
-        builtAt: nextEntries.size || nextParked.size ? this.builtAt : 0,
+        builtAt: this.oldestOfferAt(nextEntries, nextParked),
       };
     };
     const publish = (next: ReturnType<typeof transition>) => {
@@ -859,7 +920,7 @@ export class RebootRestoreRegistry {
     for (const [id, held] of this.parked) {
       if (held.spender !== owner) continue;
       this.revoked.add(held.entry);
-      if (!this.expired) this.entries.set(id, held.entry);
+      if (!this.offerIsExpired(held.entry)) this.entries.set(id, held.entry);
       this.parked.delete(id);
     }
   }
@@ -868,6 +929,8 @@ export class RebootRestoreRegistry {
   reset(): void {
     this.epoch++;
     this.revoked = new WeakSet();
+    this.entryBuiltAt = new WeakMap();
+    this.expiredEntries = new WeakSet();
     this.persistenceWriteFailed = false;
     this.loading = false;
     this.expired = false;
@@ -884,15 +947,28 @@ export class RebootRestoreRegistry {
   }
 
   private dropIfExpired(): void {
-    if (!(this.builtAt > 0 && Date.now() - this.builtAt > PLAN_TTL_MS)) return;
+    const now = Date.now();
+    const aged = (entry: RebootRestoreEntry) => this.offerIsExpired(entry, now);
+    const all = [...this.entries.values(), ...[...this.parked.values()].map((held) => held.entry)];
+    if (!all.some(aged)) return;
     this.expired = true;
-    for (const held of this.parked.values()) this.revoked.add(held.entry);
+    for (const entry of all)
+      if (aged(entry)) {
+        this.revoked.add(entry);
+        this.expiredEntries.add(entry);
+      }
     if (this.expiryScheduled) return;
     const revision = this.stateRevision;
+    const nextEntries = new Map([...this.entries].filter(([, entry]) => !aged(entry)));
+    const nextParked = new Map([...this.parked].filter(([, held]) => !aged(held.entry)));
+    const retained = [...nextEntries.values(), ...[...nextParked.values()].map((held) => held.entry)];
+    const builtAt = retained.length
+      ? Math.min(...retained.map((entry) => this.entryBuiltAt.get(entry) ?? this.builtAt))
+      : 0;
     const publish = () => {
-      this.entries.clear();
-      this.parked.clear();
-      this.builtAt = 0;
+      this.entries = nextEntries;
+      this.parked = nextParked;
+      this.builtAt = builtAt;
       this.expired = false;
       this.stateRevision++;
     };
@@ -903,7 +979,7 @@ export class RebootRestoreRegistry {
     this.expiryScheduled = true;
     void this.enqueue(async () => {
       if (revision !== this.stateRevision) return;
-      await this.persistState(new Map(), new Map(), 0);
+      await this.persistState(nextEntries, nextParked, builtAt);
       if (revision === this.stateRevision) publish();
     })
       .catch(() => {

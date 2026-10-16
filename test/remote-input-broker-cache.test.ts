@@ -921,3 +921,22 @@ it.each(['foreign-artifact', 'lost-parent-sync'] as const)(
     }
   }
 );
+
+it('historical refresh preserves pending owner counters until an exact fresh live acknowledgement', async () => {
+  const f = fixture();
+  await f.cache.prepare(f.scope, f.material, f.remoteDirectory);
+  expect(f.observe()).toBeDefined();
+  const signer = f.cache.signer(f.scope, f.material.config.incarnation)!;
+  const reserved = signer.frame('owner-pty', 'retained exact owner bytes')!;
+  const sample = f.snapshot();
+  expect(
+    f.cache.observe(f.scope, f.material.config.incarnation, sample.serialized, sample.witness, 700, false)
+  ).toBeUndefined();
+  expect(f.cache.signer(f.scope, f.material.config.incarnation)).toBe(signer);
+  expect(signer.canFrame).toBe(false);
+  expect(signer.frame('owner-pty', 'must not replay')).toBeUndefined();
+  f.state.counters['owner-pty'] = reserved.receipt.counter;
+  f.state.receipts.push({ ...reserved.receipt, status: 'sent' });
+  expect(f.observe()).toBeDefined();
+  expect(signer.frame('owner-pty', 'next owner bytes')!.receipt.counter).toBe(2);
+});
