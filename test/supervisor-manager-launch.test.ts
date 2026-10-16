@@ -268,7 +268,7 @@ it('retains failed-preparation files when their contents cannot be verified for 
 
 it('loads the exact adjacent named profile and keeps the only credential in its private JSON file', async () => {
   const p = await paths();
-  const base = 'model = "owner-model"\n';
+  const base = 'model = "gpt-5.6-sol"\n[agents]\nenabled = true\n[features.multi_agent_v2]\nenabled = true\n';
   await fs.writeFile(join(p.home, 'config.toml'), base);
   const prepared = await prepareSupervisorManagerLaunch({
     home: p.home,
@@ -317,6 +317,10 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
   expect(command).not.toContain('--disable view_image');
   expect(command).toContain('--config tools.view_image=false');
   expect(parsed.tools).toEqual({ view_image: false });
+  expect(parsed.agents).toEqual({ enabled: false });
+  expect((parsed.features as Record<string, unknown>).multi_agent_v2).toEqual({ enabled: false });
+  expect(command).toContain('--config agents.enabled=false');
+  expect(command).toContain('--config features.multi_agent_v2.enabled=false');
   expect(command).toContain('-u CODEMAN_PASSWORD');
   expect(command).toContain('-u CODEMAN_HOOK_SECRET_FILE');
   expect(command).toContain('CODEMAN_SUPERVISOR_SCOPED=1');
@@ -330,7 +334,7 @@ it('the emitted command passes a fake CLI with the registered feature inventory 
   await fs.mkdir(bin);
   await fs.writeFile(
     join(bin, 'codex'),
-    `#!${process.execPath}\nconst a=process.argv.slice(2);\nconst known=new Set(['shell_tool','apply_patch_freeform','apps','multi_agent','plugins','hooks','remote_plugin','skill_mcp_dependency_install','code_mode']);\nfor(let i=0;i<a.length;i++) if(a[i]==='--disable'&&!known.has(a[++i])) { console.error('Unknown feature flag: '+a[i]); process.exit(2); }\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='tools.view_image=false'))process.exit(3);\nif(!a.includes('${CID}'))process.exit(4);\n`,
+    `#!${process.execPath}\nconst a=process.argv.slice(2);\nconst known=new Set(['shell_tool','apply_patch_freeform','apps','multi_agent','plugins','hooks','remote_plugin','skill_mcp_dependency_install','code_mode']);\nfor(let i=0;i<a.length;i++) if(a[i]==='--disable'&&!known.has(a[++i])) { console.error('Unknown feature flag: '+a[i]); process.exit(2); }\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='tools.view_image=false'))process.exit(3);\nif(!a.includes('${CID}'))process.exit(4);\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='agents.enabled=false'))process.exit(5);\nif(!a.some((v,i)=>v==='--config'&&a[i+1]==='features.multi_agent_v2.enabled=false'))process.exit(6);\n`,
     { mode: 0o700 }
   );
   const command = supervisorManagerCommand(p.profile, { noDaemon: true, resumeSessionId: CID });
