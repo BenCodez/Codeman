@@ -489,7 +489,7 @@ function removeSession(app: object, sid: string) {
 }
 
 it.each([false, true])(
-  'verified removal preserves key/suffix evidence and another session (reloaded=%s)',
+  'verified removal stops before a failed dependent deletion and preserves another session (reloaded=%s)',
   async (reload) => {
     const h = browserInputJournal(),
       original = h.open();
@@ -508,14 +508,15 @@ it.each([false, true])(
     });
     removeSession(recovery.app, SID);
     h.failRemove();
-    expect(removed).not.toContain(recordKey(original.app._clientId, SID, 3));
+    expect(removed).toContain(recordKey(original.app._clientId, SID, 3));
     expect(h.records().map(({ value }) => [value.sessionId, value.seq])).toEqual([
+      [SID, 1],
       [SID, 2],
       [SID, 3],
       ['other-session', 1],
     ]);
     const next = h.open();
-    expect(next.app._pendingDeliveries.has(SID)).toBe(false);
+    expect(next.app._pendingDeliveries.get(SID)?.map((rec) => rec.data)).toEqual(['prefix']);
     expect(next.app._pendingDeliveries.get('other-session')?.map((rec) => rec.data)).toEqual(['keep']);
   }
 );
@@ -551,7 +552,7 @@ it('stops prefix cleanup on a failed exact removal without erasing its earlier c
   h.failRemove((key) => key === recordKey(original.app._clientId, SID, 2));
   removeSession(original.app, SID);
   h.failRemove();
-  expect(h.records().map(({ value }) => value.seq)).toEqual([1, 2, 3, 4]);
+  expect(h.records().map(({ value }) => value.seq)).toEqual([1, 2]);
   expect(
     h
       .open()
@@ -559,3 +560,152 @@ it('stops prefix cleanup on a failed exact removal without erasing its earlier c
       ?.map((rec) => rec.data)
   ).toEqual(['prefix one', 'prefix two']);
 });
+
+it.each([false, true])(
+  'retires all positively deleted target records, including hidden keys/suffixes after reload=%s',
+  async (reload) => {
+    const h = browserInputJournal(),
+      first = h.open();
+    first.socket(SID);
+    first.app._sendInputAsync(SID, 'owned prefix');
+    first.app._sendNamedKey(SID, 'C-Enter', {});
+    first.app._sendInputAsync(SID, 'dependent suffix');
+    first.app._sendInputAsync('other', 'unrelated owner input');
+    await settleInput(first.app);
+    const cleanup = reload ? h.open() : first;
+    removeSession(cleanup.app, SID);
+    expect(h.records().map(({ value }) => [value.sessionId, value.data])).toEqual([['other', 'unrelated owner input']]);
+    first.app._persistReliableNow(); // Another old document cannot resurrect immutable occurrences.
+    const next = h.open();
+    expect(next.app._pendingDeliveries.has(SID)).toBe(false);
+    expect(next.app.showToast).not.toHaveBeenCalled();
+    expect(next.app._pendingDeliveries.get('other')?.[0].data).toBe('unrelated owner input');
+  }
+);
+it('deletes captured cross-document dependencies in reverse order and frees a full storage budget', async () => {
+  const h = browserInputJournal(),
+    first = h.open();
+  first.socket(SID);
+  first.app._sendInputAsync(SID, 'original prefix');
+  const second = h.open();
+  second.transport(vi.fn(async () => new Response('{}', { status: 503 })));
+  second.app._sendNamedKey(SID, 'S-Enter', {});
+  second.app._sendInputAsync(SID, 'cross-document suffix');
+  await settleInput(second.app);
+  const order: number[] = [];
+  h.failSet(() => h.records().length >= 3);
+  h.failRemove((key) => {
+    if (key.startsWith('codeman:pendingInput:v3:')) order.push(JSON.parse(decodeURIComponent(key.split('v3:')[1]))[2]);
+    return false;
+  });
+  removeSession(h.open().app, SID);
+  h.failRemove();
+  expect(h.records()).toEqual([]);
+  expect(order).toEqual([2, 1, 1]); // second document's suffix, its key, then the first document prefix.
+  const restored = h.open();
+  restored.socket(SID);
+  restored.app._sendInputAsync(SID, 'fresh owner input');
+  expect(h.records()).toHaveLength(1);
+  expect(restored.frames[0].d).toBe('fresh owner input');
+});
+it('keeps monotonically increasing same-document identities after confirmed target deletion and restore', () => {
+  const h = browserInputJournal(),
+    first = h.open();
+  first.socket(SID);
+  first.app._sendInputAsync(SID, 'old input');
+  removeSession(first.app, SID);
+  first.socket(SID);
+  first.app._sendInputAsync(SID, 'new input');
+  expect(first.frames.map((frame) => frame.seq)).toEqual([1, 2]);
+  expect(h.records().map(({ value }) => value.seq)).toEqual([2]);
+});
+it.each(['replacement', 'insertion', 'malformed'] as const)(
+  'preserves uncertain/concurrent durable input during confirmed cleanup: %s',
+  (kind) => {
+    const h = browserInputJournal(),
+      first = h.open();
+    first.socket(SID);
+    first.app._sendInputAsync(SID, 'prefix');
+    first.app._sendNamedKey(SID, 'S-Enter', {});
+    first.app._sendInputAsync(SID, 'suffix');
+    const key = recordKey(first.app._clientId, SID, 2);
+    let changed = false,
+      scans = 0;
+    if (kind === 'malformed') h.storage.set(key, '{unknown key');
+    else
+      h.onKey((index) => {
+        if (index === 0) scans++;
+        if (changed || scans !== 3) return;
+        changed = true;
+        if (kind === 'replacement')
+          h.storage.set(key, JSON.stringify({ ...JSON.parse(h.storage.get(key)!), data: 'concurrent replacement' }));
+        else
+          h.storage.set(
+            recordKey('concurrent-document', SID, 1),
+            JSON.stringify({
+              version: 3,
+              cid: 'concurrent-document',
+              sessionId: SID,
+              seq: 1,
+              data: 'new concurrent input',
+            })
+          );
+      });
+    removeSession(first.app, SID);
+    h.onKey();
+    expect(h.storage.has(key)).toBe(true);
+    expect(h.storage.has(recordKey(first.app._clientId, SID, 3))).toBe(true);
+    if (kind === 'insertion') expect(h.storage.has(recordKey('concurrent-document', SID, 1))).toBe(true);
+  }
+);
+it('optimistic removal retains its live target queue and durable barriers until server confirmation', async () => {
+  const h = browserInputJournal(),
+    first = h.open();
+  first.socket(SID);
+  first.app._sendInputAsync(SID, 'prefix');
+  first.app._sendNamedKey(SID, 'S-Enter', {});
+  first.app._sendInputAsync(SID, 'suffix');
+  await settleInput(first.app);
+  removeSession(first.app, 'unrelated'); // Initialize inert UI bookkeeping without deleting this target.
+  Reflect.get(first.app, '_cleanupSessionData').call(first.app, SID, false);
+  expect(first.app._pendingDeliveries.get(SID)).toHaveLength(3);
+  expect(h.records()).toHaveLength(3);
+  removeSession(first.app, SID);
+  expect(h.records()).toEqual([]);
+});
+
+it.each(['success', 'refused', 'uncertain'] as const)(
+  'retires durable target input only after the actual close result is known: %s',
+  async (result) => {
+    const h = browserInputJournal(),
+      first = h.open();
+    first.socket(SID);
+    first.app._sendInputAsync(SID, 'prefix');
+    first.app._sendNamedKey(SID, 'S-Enter', {});
+    first.app._sendInputAsync(SID, 'suffix');
+    await settleInput(first.app);
+    removeSession(first.app, 'unrelated');
+    Object.assign(first.app, {
+      _closingSessions: new Set(),
+      sessions: new Map([[SID, { id: SID }]]),
+      sessionOrder: [SID],
+      detachedSessions: new Set(),
+      activeSessionId: null,
+      renderSessionTabs: vi.fn(),
+      renderRalphStatePanel: vi.fn(),
+      renderProjectInsightsPanel: vi.fn(),
+      updateCost: vi.fn(),
+      stopSystemStatsPolling: vi.fn(),
+      saveSessionOrder: vi.fn(),
+      _disconnectWs: vi.fn(),
+      _apiDelete: vi.fn(async () => ({ ok: result === 'success', status: result === 'success' ? 200 : 503 })),
+      _api: vi.fn(async () => (result === 'uncertain' ? null : { status: 200 })),
+    });
+    await Reflect.get(first.app, 'closeSession').call(first.app, SID);
+    expect(h.records()).toHaveLength(result === 'success' ? 0 : 3);
+    if (result !== 'success') {
+      expect(first.app._pendingDeliveries.get(SID)).toHaveLength(3);
+      expect(Reflect.get(first.app, 'sessions').has(SID)).toBe(true);
+    }
+  }
+);

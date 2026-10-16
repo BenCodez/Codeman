@@ -28,7 +28,10 @@ async function initialize(page: Page) {
       _updateConnectionIndicator() {},
       pendingHooks: new Map(),
       _wsSessionId: 'fixture-session',
-      showToast() {},
+      showToast(message: string) {
+        this._warnings.push(message);
+      },
+      _warnings: [],
       _frames: [],
     });
     app._persistReliableState = () => app._persistReliableNow();
@@ -154,3 +157,103 @@ it.each([
     await context.close();
   }
 });
+
+it.each([
+  { width: 1440, height: 900 },
+  { width: 390, height: 844 },
+])(
+  'retires deleted-session keys and dependent input across actual reload without consuming other input at $width px',
+  async (viewport) => {
+    const context = await browser.newContext({ viewport, serviceWorkers: 'block' });
+    const unexpected: string[] = [];
+    await context.route('**/*', async (route) => {
+      const request = route.request(),
+        url = new URL(request.url());
+      if (request.isNavigationRequest() && url.origin === 'http://input-fixture.invalid')
+        await route.fulfill({ contentType: 'text/html', body: '<!doctype html><title>Deleted input fixture</title>' });
+      else if (url.pathname.startsWith('/api/sessions/')) await route.fulfill({ status: 503, body: '{}' });
+      else if (url.pathname === '/api/crash-diag' || url.pathname === '/favicon.ico')
+        await route.fulfill({ status: 204, body: '' });
+      else {
+        unexpected.push(request.url());
+        await route.abort();
+      }
+    });
+    try {
+      const page = await context.newPage();
+      await page.goto('http://input-fixture.invalid', { waitUntil: 'domcontentloaded' });
+      await initialize(page);
+      await page.evaluate(() => {
+        const app = (window as any).queue;
+        app._sendInputAsync('fixture-session', 'owned prefix');
+        app._sendNamedKey('fixture-session', 'S-Enter', {});
+        app._sendInputAsync('fixture-session', 'dependent suffix');
+        app._sendInputAsync('other-session', 'keep other owner input');
+      });
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await initialize(page);
+      expect(await page.evaluate(() => (window as any).queue._warnings.length)).toBeGreaterThan(0);
+      await page.evaluate(() => {
+        const app = (window as any).queue;
+        const setItem = Storage.prototype.setItem;
+        Storage.prototype.setItem = function (key, value) {
+          if (
+            key.startsWith('codeman:pendingInput:v3:') &&
+            Object.keys(localStorage).filter((name) => name.startsWith('codeman:pendingInput:v3:')).length >= 4
+          )
+            throw new DOMException('Fixture quota', 'QuotaExceededError');
+          setItem.call(this, key, value);
+        };
+        for (const key of [
+          'sessions',
+          'terminalBuffers',
+          'terminalBufferCache',
+          'ralphStates',
+          'ralphClosedSessions',
+          'projectInsights',
+          'pendingHooks',
+          'tabAlerts',
+          'attachmentHistoryCounts',
+          'terminalLoadStates',
+          'idleTimers',
+        ])
+          app[key] = new Map();
+        for (const key of ['respawnStatus', 'respawnTimers', 'respawnCountdownTimers', 'respawnActionLogs'])
+          app[key] = {};
+        app.sessionOrder = [];
+        for (const key of [
+          '_markTerminalBufferReconciled',
+          '_clearHistoryTruncation',
+          'clearCountdownTimers',
+          'closeSessionLogViewerWindows',
+          'closeSessionImagePopups',
+          'closeSessionAttachmentCards',
+          'closeSessionSubagentWindows',
+        ])
+          app[key] = () => {};
+        app._cleanupSessionData('fixture-session');
+      });
+      expect(
+        await page.evaluate(() =>
+          Object.keys(localStorage)
+            .filter((key) => key.startsWith('codeman:pendingInput:v3:'))
+            .map((key) => JSON.parse(localStorage.getItem(key)!).sessionId)
+        )
+      ).toEqual(['other-session']);
+      await page.reload({ waitUntil: 'domcontentloaded' });
+      await initialize(page);
+      expect(await page.evaluate(() => (window as any).queue._warnings)).toEqual([]);
+      expect(await page.evaluate(() => (window as any).queue._pendingDeliveries.has('fixture-session'))).toBe(false);
+      expect(await page.evaluate(() => (window as any).queue._pendingDeliveries.get('other-session')[0].data)).toBe(
+        'keep other owner input'
+      );
+      await page.evaluate(() => (window as any).queue._sendInputAsync('fixture-session', 'new explicit owner input'));
+      expect(await page.evaluate(() => (window as any).queue._frames.map((frame: any) => frame.d))).toEqual([
+        'new explicit owner input',
+      ]);
+      expect(unexpected).toEqual([]);
+    } finally {
+      await context.close();
+    }
+  }
+);
