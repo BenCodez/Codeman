@@ -1,6 +1,8 @@
 /** @fileoverview Native launch branches with injected child/PTY effects and temporary metadata. */
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
+import * as nativeFs from 'node:fs';
+import { runInNewContext } from 'node:vm';
 import { createHash, randomUUID } from 'node:crypto';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 import type { CodexRestoreLaunchGuard } from '../src/mux-interface.js';
@@ -2967,103 +2969,186 @@ describe('registered Codex-compatible uncertain launch adoption', () => {
 
 // The final native command must consume the opened-directory proof, including
 // the broker's inner child command. Native tmux/worker effects remain injected.
-it.each(['codex', 'claude'] as const)('binds %s guarded cwd across a post-proof symlink replacement', async (mode) => {
-  const workspaceModule = await import('../src/recovery/reboot-workspace-launch.js');
-  const { renameSync, symlinkSync } = await import('node:fs');
-  const { manager, home, getBroker } = fixture();
-  const priorMultiuser = process.env.CODEMAN_MULTIUSER;
-  const priorSpaces = process.env.CODEMAN_USER_SPACES_DIR;
-  const spaces = join(root, randomUUID());
-  const workspace = join(spaces, 'alice', 'cases', 'workspace');
-  const outside = join(root, randomUUID());
-  mkdirSync(workspace, { recursive: true });
-  mkdirSync(outside, { recursive: true });
-  writeFileSync(join(root, 'users.json'), JSON.stringify({ version: 1, users: [{ username: 'alice', role: 'user' }] }));
-  process.env.CODEMAN_MULTIUSER = '1';
-  process.env.CODEMAN_USER_SPACES_DIR = spaces;
-  invalidateUsersCache();
-  const prepare = workspaceModule.prepareRebootWorkspaceLaunch;
-  let wrapped = '',
-    original = '';
-  vi.spyOn(workspaceModule, 'prepareRebootWorkspaceLaunch').mockImplementation(async (...args) => {
-    const lease = await prepare(...args);
-    if (!lease) return undefined;
-    const wrap = lease.wrap;
-    lease.wrap = (command) => {
-      original = command;
-      wrapped = wrap(command);
-      return wrapped;
-    };
-    return lease;
-  });
-  let brokerCommand = '';
-  vi.spyOn(
-    manager as unknown as { createInputBroker(id: string, command: string): Promise<CodexInputBroker> },
-    'createInputBroker'
-  ).mockImplementation(async (_id, command) => {
-    brokerCommand = command;
-    return getBroker();
-  });
-  let swapped = false;
-  effects.sync.mockImplementation((command) => {
-    if (command.includes(' new-session ')) {
-      renameSync(workspace, workspace + '-original');
-      symlinkSync(outside, workspace, 'dir');
-      swapped = true;
-    }
-    return nativeOutput(command);
-  });
-  const deadline = performance.now() + 2000;
-  const guard = {
-    prepare: async () => {},
-    confirm: () => true,
-    isCurrent: () => true,
-    getWorkspaceDeadline: () => deadline,
-  };
-  try {
-    const created = await manager.createSession({
-      sessionId: ID,
-      workingDir: workspace,
-      mode,
-      owner: 'alice',
-      ...(mode === 'codex'
-        ? {
-            codexConfig: config,
-            recoveryCodexHome: home,
-            codexRestoreGuard: { ...guard, getStartupEvidence: () => ({ files: [], paths: [], missing: [] }) },
-          }
-        : { restoreGuard: guard }),
-    });
-    expect(swapped).toBe(true);
-    expect(created.workingDir).toBe(workspace);
-    expect(original).not.toContain(`cd '${workspace}'`);
-    expect(wrapped).toContain(process.execPath);
-    expect(wrapped).toContain('fs.fstatSync');
-    expect(wrapped).toContain('process.execve');
-    expect(wrapped).toContain('process.chdir');
-    if (mode === 'codex') expect(brokerCommand).toBe(wrapped);
-    else
-      expect(
-        effects.sync.mock.calls.some(
-          ([command]) => command.includes('respawn-pane') && command.includes('process.execve')
-        )
-      ).toBe(true);
-    expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane'))).toHaveLength(1);
-  } finally {
-    if (priorMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
-    else process.env.CODEMAN_MULTIUSER = priorMultiuser;
-    if (priorSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
-    else process.env.CODEMAN_USER_SPACES_DIR = priorSpaces;
+it.each(['codex', 'claude'] as const)(
+  'refuses %s child startup across a post-proof symlink replacement',
+  async (mode) => {
+    const workspaceModule = await import('../src/recovery/reboot-workspace-launch.js');
+    const { renameSync, symlinkSync } = await import('node:fs');
+    const { manager, home, getBroker } = fixture();
+    const priorMultiuser = process.env.CODEMAN_MULTIUSER;
+    const priorSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+    const spaces = join(root, randomUUID());
+    const workspace = join(spaces, 'alice', 'cases', 'workspace');
+    const outside = join(root, randomUUID());
+    mkdirSync(workspace, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    writeFileSync(
+      join(root, 'users.json'),
+      JSON.stringify({ version: 1, users: [{ username: 'alice', role: 'user' }] })
+    );
+    process.env.CODEMAN_MULTIUSER = '1';
+    process.env.CODEMAN_USER_SPACES_DIR = spaces;
     invalidateUsersCache();
+    const prepare = workspaceModule.prepareRebootWorkspaceLaunch;
+    let wrapped = '',
+      original = '';
+    vi.spyOn(workspaceModule, 'prepareRebootWorkspaceLaunch').mockImplementation(async (...args) => {
+      const lease = await prepare(...args);
+      if (!lease) return undefined;
+      const wrap = lease.wrap;
+      lease.wrap = (command) => {
+        original = command;
+        wrapped = wrap(command);
+        return wrapped;
+      };
+      return lease;
+    });
+    let brokerCommand = '';
+    vi.spyOn(
+      manager as unknown as { createInputBroker(id: string, command: string): Promise<CodexInputBroker> },
+      'createInputBroker'
+    ).mockImplementation(async (_id, command) => {
+      brokerCommand = command;
+      return getBroker();
+    });
+    let swapped = false;
+    const executed = vi.fn();
+    effects.sync.mockImplementation((command) => {
+      if (command.includes(' new-session ')) {
+        renameSync(workspace, workspace + '-original');
+        symlinkSync(outside, workspace, 'dir');
+        swapped = true;
+      }
+      if (command.includes('respawn-pane ')) {
+        const at = wrapped.lastIndexOf(" '{");
+        const value = JSON.parse(
+          wrapped
+            .slice(at + 2, -1)
+            .split("'\\''")
+            .join("'")
+        );
+        try {
+          runInNewContext(workspaceModule.REBOOT_WORKSPACE_CHILD, {
+            require: () => nativeFs,
+            process: {
+              argv: ['node', JSON.stringify(value)],
+              pid: 99999,
+              env: {},
+              hrtime: process.hrtime,
+              chdir: () => {},
+              execve: executed,
+              exit: () => {
+                throw Error('fixture child exited125');
+              },
+            },
+          });
+        } catch (error) {
+          expect(String(error)).toContain('exited125');
+        }
+      }
+      return nativeOutput(command);
+    });
+    const deadline = performance.now() + 400;
+    const guard = {
+      prepare: async () => {},
+      confirm: () => true,
+      isCurrent: () => true,
+      getWorkspaceDeadline: () => deadline,
+    };
+    try {
+      await expect(
+        manager.createSession({
+          sessionId: ID,
+          workingDir: workspace,
+          mode,
+          owner: 'alice',
+          ...(mode === 'codex'
+            ? {
+                codexConfig: config,
+                recoveryCodexHome: home,
+                codexRestoreGuard: { ...guard, getStartupEvidence: () => ({ files: [], paths: [], missing: [] }) },
+              }
+            : { restoreGuard: guard }),
+        })
+      ).rejects.toThrow('startup acknowledgment unavailable');
+      const created = manager.getSession(ID)!;
+      expect(executed).not.toHaveBeenCalled();
+      expect(created).toBeDefined();
+      expect(swapped).toBe(true);
+      expect(created.workingDir).toBe(workspace);
+      expect(original).not.toContain(`cd '${workspace}'`);
+      expect(wrapped).toContain(process.execPath);
+      expect(wrapped).toContain('fs.fstatSync');
+      expect(wrapped).toContain('process.execve');
+      expect(wrapped).toContain('process.chdir');
+      if (mode === 'codex') expect(brokerCommand).toBe(wrapped);
+      else
+        expect(
+          effects.sync.mock.calls.some(
+            ([command]) => command.includes('respawn-pane') && command.includes('process.execve')
+          )
+        ).toBe(true);
+      expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane'))).toHaveLength(1);
+    } finally {
+      if (priorMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+      else process.env.CODEMAN_MULTIUSER = priorMultiuser;
+      if (priorSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+      else process.env.CODEMAN_USER_SPACES_DIR = priorSpaces;
+      invalidateUsersCache();
+      await new Promise<void>((resolve) => setTimeout(resolve, 450));
+    }
   }
-});
+);
 
 describe('reboot profile reuse through actual persisted-state reapplication', () => {
   it.each(
     (['codex', 'claude'] as const).flatMap((mode) =>
-      (['healthy', 'changed-profile', 'cancelled'] as const).map((kind) => ({ mode, kind }))
+      (['healthy', 'changed-profile', 'cancelled', 'owner-startup', 'expired-startup', 'dead-startup'] as const).map(
+        (kind) => ({ mode, kind })
+      )
     )
   )('restores the verified $mode profile once and retains final $kind vetoes', async ({ mode, kind }) => {
+    const priorMultiuser = process.env.CODEMAN_MULTIUSER;
+    const priorSpaces = process.env.CODEMAN_USER_SPACES_DIR;
+    const ownedStartup = kind.endsWith('startup');
+    if (ownedStartup) {
+      process.env.CODEMAN_MULTIUSER = '1';
+      process.env.CODEMAN_USER_SPACES_DIR = join(root, 'startup-spaces');
+      writeFileSync(
+        join(root, 'users.json'),
+        JSON.stringify({ version: 1, users: [{ username: 'alice', role: 'user' }] })
+      );
+      invalidateUsersCache();
+    }
+    const workingDir = ownedStartup ? join(root, 'startup-spaces', 'alice', 'cases', 'project') : root;
+    mkdirSync(workingDir, { recursive: true });
+    const workspaceModule = await import('../src/recovery/reboot-workspace-launch.js');
+    const prepareWorkspace = workspaceModule.prepareRebootWorkspaceLaunch;
+    let startupPayload: { deadline: number } | undefined;
+    if (ownedStartup)
+      vi.spyOn(workspaceModule, 'prepareRebootWorkspaceLaunch').mockImplementation(async (...args) => {
+        const lease = await prepareWorkspace(
+          args[0],
+          args[1],
+          args[2],
+          Math.min(args[3] ?? Infinity, performance.now() + 400)
+        );
+        if (lease) {
+          const wrap = lease.wrap;
+          lease.wrap = (command) => {
+            const wrapped = wrap(command);
+            const at = wrapped.lastIndexOf(" '{");
+            startupPayload = JSON.parse(
+              wrapped
+                .slice(at + 2, -1)
+                .split("'\\''")
+                .join("'")
+            );
+            return wrapped;
+          };
+        }
+        return lease;
+      });
     const { writeCustomModelHosts } = await import('../src/custom-model-hosts.js');
     const { customModelConfigDir } = await import('../src/custom-model-injection-apply.js');
     const { rebuildPersistedCustomModelEnv } = await import('../src/custom-model-recovery.js');
@@ -3087,7 +3172,7 @@ describe('reboot profile reuse through actual persisted-state reapplication', ()
         mode === 'codex' ? ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'] : ['CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY'],
       configDir: profile,
     };
-    const env = await rebuildPersistedCustomModelEnv(mode, ID, bookkeeping, root);
+    const env = await rebuildPersistedCustomModelEnv(mode, ID, bookkeeping, workingDir);
     expect(env).toBeDefined();
     if (mode === 'codex') {
       mkdirSync(join(profile, 'sessions'), { recursive: true });
@@ -3096,7 +3181,7 @@ describe('reboot profile reuse through actual persisted-state reapplication', ()
         JSON.stringify({
           type: 'session_meta',
           timestamp: '2026-10-13T15:00:00Z',
-          payload: { id: THREAD, cwd: root, originator: `codeman_${ID}` },
+          payload: { id: THREAD, cwd: workingDir, originator: `codeman_${ID}` },
         }) + '\n'
       );
     }
@@ -3120,6 +3205,42 @@ describe('reboot profile reuse through actual persisted-state reapplication', ()
       'destroy',
     ] as const)
       vi.spyOn(manager, method).mockImplementation(() => {});
+    if (ownedStartup) {
+      const native = effects.sync.getMockImplementation()!;
+      effects.sync.mockImplementation((command: string) => {
+        if (command.includes('respawn-pane ')) {
+          expect(startupPayload).toBeDefined();
+          try {
+            runInNewContext(workspaceModule.REBOOT_WORKSPACE_CHILD, {
+              require: () => nativeFs,
+              process: {
+                argv: ['node', JSON.stringify(startupPayload)],
+                pid: 99999,
+                env: {},
+                hrtime: {
+                  bigint:
+                    kind === 'expired-startup'
+                      ? () => BigInt(startupPayload!.deadline) * 1000000n
+                      : process.hrtime.bigint,
+                },
+                chdir: () => {},
+                exit: () => {
+                  throw Error('disposable wrapper exited125');
+                },
+                execve: () => {
+                  if (kind === 'dead-startup') throw Error('disposable execve failed');
+                },
+              },
+            });
+          } catch (error) {
+            expect(String(error)).toContain('exited125');
+          }
+        }
+        if (command.includes('#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{pane_dead}'))
+          return `$1|%7|99999|88|${kind === 'dead-startup' ? 1 : 0}\n`;
+        return native(command);
+      });
+    }
     const secondRebuild = vi.spyOn(
       server as unknown as { _rebuildCustomModelEnv(): Promise<Record<string, string> | undefined> },
       '_rebuildCustomModelEnv'
@@ -3127,7 +3248,8 @@ describe('reboot profile reuse through actual persisted-state reapplication', ()
     const saved = {
       id: ID,
       mode,
-      workingDir: root,
+      workingDir,
+      owner: ownedStartup ? 'alice' : undefined,
       pid: 1234,
       status: 'idle',
       currentTaskId: null,
@@ -3173,22 +3295,34 @@ describe('reboot profile reuse through actual persisted-state reapplication', ()
     try {
       const response = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
       expect(beforeApplied).toBe(true);
-      expect(response.restored).toHaveLength(kind === 'healthy' ? 1 : 0);
+      expect(response.restored).toHaveLength(kind === 'healthy' || kind === 'owner-startup' ? 1 : 0);
       expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(
-        kind === 'healthy' ? 1 : 0
+        kind === 'healthy' || ownedStartup ? 1 : 0
       );
       expect(secondRebuild).not.toHaveBeenCalled();
       const session = ctx.sessions.get(ID);
-      if (kind === 'healthy') {
+      if (kind === 'healthy' || kind === 'owner-startup') {
         expect(session).toBeDefined();
         sessions.push(session!);
         expect(session!.getCustomModelForPersist()).toEqual(bookkeeping);
+      } else if (ownedStartup) {
+        expect(effects.attach).not.toHaveBeenCalled();
+        expect(response.skipped[0].reason).toBe('restore-uncertain');
+        expect(manager.getSession(ID)).toBeDefined();
+        expect(store.getSession(ID)).toEqual(historical);
+        if (session) sessions.push(session);
       } else {
         expect(session).toBeUndefined();
         expect(store.getSession(ID)).toEqual(historical);
       }
     } finally {
       await app.close();
+      if (priorMultiuser === undefined) delete process.env.CODEMAN_MULTIUSER;
+      else process.env.CODEMAN_MULTIUSER = priorMultiuser;
+      if (priorSpaces === undefined) delete process.env.CODEMAN_USER_SPACES_DIR;
+      else process.env.CODEMAN_USER_SPACES_DIR = priorSpaces;
+      invalidateUsersCache();
+      if (ownedStartup) await new Promise<void>((resolve) => setTimeout(resolve, 450));
     }
   });
 });
