@@ -2519,10 +2519,10 @@ export class Session extends EventEmitter {
 
   /** The synchronous effect consumes one exact, current durable-fence receipt. */
   async writeAsync(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+    if (this._rejectUnavailableTaggedInput(options)) return false;
     if (getCli(this.mode)?.capabilities.recovery !== 'codex-rollout') return this.write(data, options);
     return this._queueOwnedInput(data, options, async () => {
-      if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+      if (this._rejectUnavailableTaggedInput(options)) return false;
       if (this.recoveryInputReserved) return false;
       this._ordinaryInputWrites++;
       try {
@@ -2548,6 +2548,9 @@ export class Session extends EventEmitter {
     dispatch: (signal: AbortSignal) => Promise<void>,
     prepare?: () => boolean
   ): Promise<boolean> {
+    // A retained local pane can accept tmux keys after its worker has exited.
+    // Cached death refuses before durable preparation or owner intent.
+    if (this.paneExit) return false;
     if (this._ordinaryInputWrites > 0) return false;
     return this._queueOwnedInput(data, { fromUser: true }, () => this._doSendNamedKey(data, dispatch, prepare));
   }
@@ -2557,6 +2560,7 @@ export class Session extends EventEmitter {
     prepare?: () => boolean
   ): Promise<boolean> {
     if (
+      this.paneExit ||
       this.recoveryInputReserved ||
       this._ordinaryInputWrites > 0 ||
       this._paneLifecycleOps > 0 ||
@@ -2570,6 +2574,7 @@ export class Session extends EventEmitter {
       this._submitVerifier?.cancel();
       this._submitVerifier = null;
       await this._prepareRecoveryInput(data, { fromUser: true });
+      if (this.paneExit) return false;
       if (prepare) {
         let admitted = false;
         try {
@@ -2585,11 +2590,13 @@ export class Session extends EventEmitter {
           return false;
         }
       }
+      if (this.paneExit) return false;
       this._consumePreparedRecoveryInput(data, { fromUser: true });
       const submitted = this._trackSubmit(data, { fromUser: true });
       if (abort.signal.aborted) return false;
       await dispatch(abort.signal);
       if (abort.signal.aborted) throw new Error('Named key dispatch cancelled');
+      if (this.paneExit) throw new Error('Named key worker exited during dispatch');
       this._emitSubmittedPrompt(submitted);
       await this._recoveryFencePublication;
       return true;
@@ -5461,14 +5468,14 @@ export class Session extends EventEmitter {
   write(data: string, options: SessionWriteOptions = {}): boolean {
     // Tagged browser frames must not land in a pane already being replaced.
     // Refusal retains FIFO delivery ownership before preparing or tracking input.
-    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+    if (this._rejectUnavailableTaggedInput(options)) return false;
     // Public synchronous callers cannot borrow a receipt between the private
     // preparer's resolution and its owner's awaited continuation.
     if (getCli(this.mode)?.capabilities.recovery === 'codex-rollout') throw new RebootIdentityFenceError();
     return this._doWritePreparedInput(data, options);
   }
   private _doWritePreparedInput(data: string, options: SessionWriteOptions): boolean {
-    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+    if (this._rejectUnavailableTaggedInput(options)) return false;
     if (!this._inputCallerCurrent(options)) return false;
     if (this.recoveryInputReserved) return false;
     this._ordinaryInputWrites++;
@@ -5483,7 +5490,7 @@ export class Session extends EventEmitter {
         this._noteRejectedOwnedInput(options);
         return false;
       }
-      if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+      if (this._rejectUnavailableTaggedInput(options)) return false;
       const submittedPrompt = this._trackSubmit(data, options);
       try {
         this.ptyProcess.write(input);
@@ -5516,6 +5523,17 @@ export class Session extends EventEmitter {
     // Missing keys, malformed receipts, and incomplete broker setup are known
     // pre-delivery refusals. The caller retains the input's original FIFO slot.
     return undefined;
+  }
+
+  /** Keep unsent FIFO ownership while preserving the owner's launch-cancellation veto. */
+  private _rejectUnavailableTaggedInput(options: SessionWriteOptions): boolean {
+    if (!options.inputSeq) return false;
+    // Cached death is attention-only; it cannot invent a new owner action.
+    if (this.paneExit) return true;
+    if (this._paneLifecycleOps <= 0) return false;
+    // A reserved recovery/key delivery retains its stronger no-input boundary.
+    if (!this.recoveryInputReserved) this._noteRejectedOwnedInput(options);
+    return true;
   }
 
   /** Rejected owner input still cancels automation, without inventing delivered text. */
@@ -5869,9 +5887,9 @@ export class Session extends EventEmitter {
    * ```
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
-    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+    if (this._rejectUnavailableTaggedInput(options)) return false;
     return this._queueOwnedInput(data, options, async () => {
-      if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+      if (this._rejectUnavailableTaggedInput(options)) return false;
       if (this.recoveryInputReserved) return false;
       this._ordinaryInputWrites++;
       try {
@@ -5885,7 +5903,7 @@ export class Session extends EventEmitter {
 
   private async _doWriteViaMux(data: string, options: SessionWriteOptions): Promise<boolean> {
     await this._prepareRecoveryInput(data, options);
-    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+    if (this._rejectUnavailableTaggedInput(options)) return false;
     const viaMux = !!(this._mux && this._muxSession);
     if (!viaMux && !this.ptyProcess) {
       this._noteRejectedOwnedInput(options);
@@ -5912,7 +5930,7 @@ export class Session extends EventEmitter {
       this._noteRejectedOwnedInput(options);
       return false;
     }
-    if (options.inputSeq && (this.paneExit || this._paneLifecycleOps > 0)) return false;
+    if (this._rejectUnavailableTaggedInput(options)) return false;
     const submittedPrompt = this._trackSubmit(data, options, viaMux);
     if (this._mux && this._muxSession) {
       let sent: boolean;

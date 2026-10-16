@@ -99,6 +99,8 @@ export interface SupervisionTaskState {
   reason: string;
   startedAt?: number;
   configuredAt?: number;
+  /** Latest explicit owner resume; earlier automatic completion evidence is not reusable. */
+  resumedAt?: number;
   kickoffAt?: number;
   lastProgressAt?: number;
   conversationId?: string;
