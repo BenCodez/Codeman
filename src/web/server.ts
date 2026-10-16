@@ -172,6 +172,7 @@ import { CodexTaskAdapter } from '../supervision/adapter.js';
 import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
 import { ManagerCredentialRegistry } from '../supervisor/manager-credentials.js';
+import { drainSupervisorManagerRetirements } from '../supervisor/manager-launch.js';
 import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
 import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
 import { SupervisorStore } from '../supervisor/store.js';
@@ -5259,6 +5260,7 @@ export class WebServer extends EventEmitter {
     ]);
     await Promise.all([...automationIds].map((id) => this.stopRecoveryController(id, false)));
     await Promise.all(managerRetirements);
+    await drainSupervisorManagerRetirements();
     await this.recoveryStore.flush();
     await this.taskStore.flush();
     await this.actionReservationStore.flush();
@@ -5451,6 +5453,8 @@ export class WebServer extends EventEmitter {
     await rebootRestoreRegistry.flush();
     // Closing in-flight requests can enqueue late reservation/uncertainty writes.
     await this.mux.drainSessionSaves?.();
+    // Closing requests may retire a profile after the first shutdown drain.
+    await drainSupervisorManagerRetirements();
   }
 }
 

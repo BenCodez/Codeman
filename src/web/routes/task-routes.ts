@@ -7,6 +7,7 @@ import { findSessionOrFail, parseBody } from '../route-helpers.js';
 import { TaskUpdateSchema, TaskProgressSchema, TaskActionSchema } from '../../supervision/schema.js';
 import { TaskValidationError, type TaskController } from '../../supervision/controller.js';
 import { createErrorResponse, ApiErrorCode } from '../../types.js';
+import { hasValidatedOwnerCredential } from '../middleware/auth.js';
 export function registerTaskRoutes(app: FastifyInstance, ctx: SessionPort & TaskPort): void {
   app.get('/api/sessions/:id/task', async (req, reply) => {
     const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req);
@@ -32,11 +33,21 @@ export function registerTaskRoutes(app: FastifyInstance, ctx: SessionPort & Task
           execute = () => c.update(patch);
         } else if (action === 'progress') {
           const patch = parseBody(TaskProgressSchema, req.body, 'Invalid task progress');
-          // Agent attribution only narrows authority. It cannot certify owner
-          // criteria or replace a task checkpoint through the ordinary owner API.
+          // Attribution can withdraw authority, never establish it. Owner
+          // progress requires the credential proof minted by auth middleware.
           const owner =
+            hasValidatedOwnerCredential(req) &&
             req.headers['x-codeman-parent-session'] === undefined &&
             req.headers['x-codeman-supervisor-session'] === undefined;
+          if (!owner)
+            return reply
+              .code(403)
+              .send(
+                createErrorResponse(
+                  ApiErrorCode.FORBIDDEN,
+                  'Task progress requires an authenticated Codeman owner; anonymous or agent requests cannot certify criteria'
+                )
+              );
           execute = () => c.progress(patch, owner);
         } else {
           if (req.body !== undefined) parseBody(TaskActionSchema, req.body, 'Task action does not accept options');

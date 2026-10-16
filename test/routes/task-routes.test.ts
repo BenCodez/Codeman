@@ -1,7 +1,7 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from 'vitest';
 import { registerTaskRoutes } from '../../src/web/routes/task-routes.js';
 import { initialTaskState } from '../../src/supervision/schema.js';
-import { TaskController, TaskValidationError } from '../../src/supervision/controller.js';
+import { TaskController } from '../../src/supervision/controller.js';
 import { createRouteTestHarness, type RouteTestHarness } from './_route-test-utils.js';
 describe('task routes ownership and bounded inputs', () => {
   let h: RouteTestHarness;
@@ -49,7 +49,7 @@ describe('task routes ownership and bounded inputs', () => {
     expect(res.json().data.config.enabled).toBe(false);
   });
   it.each(['x-codeman-parent-session', 'x-codeman-supervisor-session'] as const)(
-    'refuses agent-attributed progress via %s while preserving direct owner verification',
+    'refuses agent-attributed progress via %s and synthetic owner identities',
     async (header) => {
       const observe = vi.fn(async () => ({
         observation: {
@@ -85,8 +85,8 @@ describe('task routes ownership and bounded inputs', () => {
           headers: { [header]: attribution },
           payload: progress,
         });
-        expect(res.statusCode).toBe(400);
-        expect(res.json()).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
+        expect(res.statusCode).toBe(403);
+        expect(res.json()).toMatchObject({ success: false, errorCode: 'FORBIDDEN' });
         expect(actual.getStatus()).toEqual(before);
       }
       expect(observe).not.toHaveBeenCalled();
@@ -96,9 +96,11 @@ describe('task routes ownership and bounded inputs', () => {
         url: `/api/sessions/${h.ctx._sessionId}/task/progress`,
         payload: progress,
       });
-      expect(owner.statusCode).toBe(200);
-      expect(owner.json().data).toMatchObject({ phase: 'completed', outcome: 'completed' });
-      expect(owner.json().data.criteria[0].evidence.source).toBe('owner');
+      expect(owner.statusCode).toBe(403);
+      expect(actual.getStatus()).toEqual(before);
+      expect(actual.getStatus().criteria[0].verified).toBe(false);
+      expect(observe).not.toHaveBeenCalled();
+      expect(persist).not.toHaveBeenCalled();
       actual.stop();
     }
   );
@@ -175,14 +177,14 @@ describe('task routes ownership and bounded inputs', () => {
     expect(act).not.toHaveBeenCalled();
     actual.stop();
   });
-  it('does not expose internal verification errors', async () => {
-    controller.progress.mockRejectedValueOnce(new TaskValidationError('/private/transcript'));
+  it('rejects unproven progress before internal verification', async () => {
     const res = await h.app.inject({
       method: 'POST',
       url: `/api/sessions/${h.ctx._sessionId}/task/progress`,
       payload: { outcome: 'completed' },
     });
-    expect(res.statusCode).toBe(400);
+    expect(res.statusCode).toBe(403);
+    expect(controller.progress).not.toHaveBeenCalled();
     expect(res.body).not.toContain('/private');
   });
   it('never grants owner-only manual verification to an agent-attributed request', async () => {
@@ -193,8 +195,9 @@ describe('task routes ownership and bounded inputs', () => {
       headers: { 'x-codeman-parent-session': '12345678-worker' },
       payload,
     });
-    expect(res.statusCode).toBe(200);
-    expect(controller.progress).toHaveBeenCalledWith(payload, false);
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toMatchObject({ success: false, errorCode: 'FORBIDDEN' });
+    expect(controller.progress).not.toHaveBeenCalled();
   });
   it('returns a sanitized operational failure when valid task persistence fails', async () => {
     const actual = new TaskController({

@@ -15,6 +15,14 @@ const pending = new Set<string>();
 const pendingWork = new Map<string, Promise<unknown>>();
 const retirements = new Map<string, Promise<boolean>>();
 let retirementWork: Promise<unknown> = Promise.resolve();
+/** Shutdown must retain actual cleanup work after bounded revoke responses expire. */
+export async function drainSupervisorManagerRetirements(): Promise<void> {
+  let tail: Promise<unknown>;
+  do {
+    tail = retirementWork;
+    await tail;
+  } while (retirementWork !== tail);
+}
 type FileIdentity = Pick<Stats, 'dev' | 'ino' | 'size' | 'mtimeMs' | 'ctimeMs'>;
 const same = (a: FileIdentity, b: FileIdentity) =>
   a.dev === b.dev && a.ino === b.ino && a.size === b.size && a.mtimeMs === b.mtimeMs && a.ctimeMs === b.ctimeMs;

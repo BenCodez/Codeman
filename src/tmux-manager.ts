@@ -3479,6 +3479,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     let inputBroker: CodexInputBroker | undefined;
     let brokerDispatchStarted = false;
     let workspaceLaunch: RebootWorkspaceLaunch | undefined;
+    let ownedRemoteAttach = false;
+    let ownedRemoteRecord: MuxSession | undefined;
+    let ownedRemoteBinding: string | undefined;
+    let ownedRemoteAttachPid: number | undefined;
+    let cleanedRemoteAttach = false;
+    const remoteAttachRecordCurrent = () =>
+      !ownedRemoteAttach ||
+      (this.sessions.get(sessionId) === ownedRemoteRecord && JSON.stringify(ownedRemoteRecord) === ownedRemoteBinding);
     try {
       const workspaceGuard = options.codexRestoreGuard ?? options.restoreGuard;
       if (workspaceGuard && owner && isMultiUserMode()) {
@@ -3506,6 +3514,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         controlledRemoteCodex && recoveryCodexHome
           ? await this.prepareOwnedRemoteLaunch(options, recoveryCodexHome)
           : undefined;
+      ownedRemoteAttach = ownedRemoteLaunch?.incarnation !== undefined;
+      if (ownedRemoteAttach) {
+        ownedRemoteRecord = this.sessions.get(sessionId);
+        ownedRemoteBinding = JSON.stringify(ownedRemoteRecord);
+        if (!ownedRemoteRecord) throw new Error('Owned SSH attach registration unavailable');
+      }
       const fullCmd =
         ownedRemoteLaunch?.command ??
         (docker
@@ -3556,12 +3570,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const safeHistoryLimit =
         Number.isSafeInteger(historyLimit) && historyLimit > 0 ? Math.trunc(historyLimit) : DEFAULT_TMUX_HISTORY_LIMIT;
       // Multi-argument argv bypasses a user's default-command and starts only this known inert process.
-      const restorePlaceholder =
-        inputBroker || options.codexRestoreGuard || options.restoreGuard ? ' /bin/sleep 86400' : '';
-      const restorePrint =
-        inputBroker || options.codexRestoreGuard || options.restoreGuard
-          ? ` -P -F ${shellescape('#{session_id}|#{pane_id}|#{pane_pid}|#{pid}')}`
-          : '';
+      const requiresCreationReceipt =
+        !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard || ownedRemoteAttach;
+      const restorePlaceholder = requiresCreationReceipt ? ' /bin/sleep 86400' : '';
+      const restorePrint = requiresCreationReceipt
+        ? ` -P -F ${shellescape('#{session_id}|#{pane_id}|#{pane_pid}|#{pid}')}`
+        : '';
       const createSessionCommand = this.supportsLiveHistoryResize()
         ? `${this.tmux()} new-session${restorePrint} -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}${restorePlaceholder} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`
         : `${this.tmux()} set-option -g history-limit ${safeHistoryLimit} \\; new-session${restorePrint} -ds "${muxName}" -c ${TMUX_LAUNCH_CWD}${restorePlaceholder} \\; set-option -t "${muxName}" history-limit ${safeHistoryLimit}`;
@@ -3575,18 +3589,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         if ((await options.restoreGuard.confirm()) !== true || options.restoreGuard.isCurrent() !== true)
           throw new Error('Reboot restoration authority changed');
       }
-      if (ownedRemoteLaunch?.isCurrent() === false) throw new Error('Owned SSH attach authority changed');
+      if (ownedRemoteLaunch?.isCurrent() === false || !remoteAttachRecordCurrent())
+        throw new Error('Owned SSH attach authority changed');
       if (workspaceLaunch && !workspaceLaunch.isCurrent()) throw new Error('Reboot workspace changed');
-      attemptedRestoreShell = !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard;
+      attemptedRestoreShell = requiresCreationReceipt;
       const created = execSync(createSessionCommand, {
         cwd: TMUX_LAUNCH_CWD,
         timeout: EXEC_TIMEOUT_MS,
-        stdio:
-          inputBroker || options.codexRestoreGuard || options.restoreGuard ? ['ignore', 'pipe', 'ignore'] : 'ignore',
+        stdio: requiresCreationReceipt ? ['ignore', 'pipe', 'ignore'] : 'ignore',
         encoding: 'utf8',
         env: cleanEnv,
       });
-      createdRestoreShell = !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard;
+      createdRestoreShell = requiresCreationReceipt;
       if (createdRestoreShell) {
         const match = /^\$(0|[1-9]\d{0,9})\|(%(?:0|[1-9]\d{0,9}))\|([1-9]\d{0,9})\|([1-9]\d{0,9})\n$/.exec(
           created.toString()
@@ -3705,13 +3719,16 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           throw new Error('Reboot restoration authority changed');
       }
       if (inputBroker && !ownerCurrent()) throw new Error('Owner launch authority changed before native dispatch');
+      if (ownedRemoteLaunch?.isCurrent() === false || !remoteAttachRecordCurrent())
+        throw new Error('Owned SSH attach authority changed');
       // Dispatch can start a worker before a timeout/exception is returned. Seal before sending bytes.
       const launchCmd = inputBroker ? this.brokerCommand(inputBroker) : originalLaunch;
       const optionalDispatch = !!inputBroker && !options.codexRestoreGuard && !options.restoreGuard;
+      const requiresDispatchReceipt = optionalDispatch || ownedRemoteAttach;
       if (workspaceLaunch && !workspaceLaunch.isCurrent()) throw new Error('Reboot workspace changed');
       options.codexRestoreGuard?.noteDispatch?.();
       const spawnCommand = `respawn-pane -k -c ${TMUX_LAUNCH_CWD} -t ${restorePane ? shellescape(restorePane.paneId) : `"${muxName}"`} bash -c ${shellescape(launchCmd)}`;
-      const dispatchCommand = optionalDispatch
+      const dispatchCommand = requiresDispatchReceipt
         ? `${spawnCommand} ; display-message -p -t ${shellescape(restorePane!.paneId)} 'CODEMAN_OPTIONAL_BROKER_DISPATCHED|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}'`
         : spawnCommand;
       const restorePredicate = restorePane
@@ -3727,7 +3744,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         : undefined;
       if (options.restoreGuard && options.restoreGuard.isCurrent() !== true)
         throw new Error('Reboot restoration authority changed');
-      launchedRestoreWorker = !!inputBroker || !!options.codexRestoreGuard || !!options.restoreGuard;
+      launchedRestoreWorker = requiresCreationReceipt;
       options.restoreGuard?.noteDispatch?.();
       workspaceLaunch?.noteDispatch();
       brokerDispatchStarted = true;
@@ -3740,17 +3757,22 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         certifiedNoChild = true;
         throw new Error('Reboot restoration inert pane changed');
       }
-      const dispatchReceipt = optionalDispatch ? this.optionalBrokerDispatchReceipt(spawned) : undefined;
+      const dispatchReceipt = requiresDispatchReceipt ? this.optionalBrokerDispatchReceipt(spawned) : undefined;
       if (
-        optionalDispatch &&
+        requiresDispatchReceipt &&
         (!dispatchReceipt ||
           dispatchReceipt.sessionNativeId !== restorePane!.sessionNativeId ||
           dispatchReceipt.paneId !== restorePane!.paneId ||
           dispatchReceipt.serverPid !== restorePane!.serverPid)
       )
-        throw new Error('Optional input guard native dispatch receipt unavailable');
-      if (!optionalDispatch && restorePane && spawned.toString().trim() !== '')
+        throw new Error(
+          ownedRemoteAttach
+            ? 'Owned SSH attach native dispatch receipt unavailable'
+            : 'Optional input guard native dispatch receipt unavailable'
+        );
+      if (!requiresDispatchReceipt && restorePane && spawned.toString().trim() !== '')
         throw new Error('Reboot restoration worker launch receipt unknown');
+      if (ownedRemoteAttach) ownedRemoteAttachPid = dispatchReceipt?.brokerPid;
 
       // Wait for tmux session to be queryable
       await new Promise((resolve) => setTimeout(resolve, TMUX_CREATION_WAIT_MS));
@@ -3803,7 +3825,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
       if (reservedRestoreRecord && this.sessions.get(sessionId) !== reservedRestoreRecord)
         throw new Error('Codex launch ownership changed');
-      if (ownedRemoteLaunch?.isCurrent() === false) throw new Error('Owned SSH attach authority changed');
+      if (ownedRemoteLaunch?.isCurrent() === false || !remoteAttachRecordCurrent())
+        throw new Error('Owned SSH attach authority changed');
       const session: MuxSession = {
         sessionId,
         muxName,
@@ -3900,6 +3923,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       if (
         createdRestoreShell &&
         !launchedRestoreWorker &&
+        remoteAttachRecordCurrent() &&
         (!reservedRestoreRecord || this.sessions.get(sessionId) === reservedRestoreRecord)
       ) {
         // Only the new-session command above established this ownership. An existing pane is never targeted.
@@ -3924,6 +3948,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         } catch {
           /* Preserve the launch refusal even when cleanup of its empty shell fails. */
         }
+        if (ownedRemoteAttach) cleanedRemoteAttach = cleaned;
         if (cleaned && reservedRestoreRecord && this.sessions.get(sessionId) === reservedRestoreRecord) {
           if (priorCreateRecord) this.sessions.set(sessionId, priorCreateRecord);
           else this.sessions.delete(sessionId);
@@ -3949,6 +3974,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       } else if (createdRestoreShell) {
         options.codexRestoreGuard?.noteCleanupUncertain?.();
         options.restoreGuard?.noteCleanupUncertain?.();
+      }
+      if (ownedRemoteAttach && attemptedRestoreShell && !cleanedRemoteAttach && remoteAttachRecordCurrent()) {
+        // Remote startup already committed. Adopt only this unchanged local
+        // registration; never retire its remote worker or lose an uncertain wrapper.
+        ownedRemoteRecord!.pid = ownedRemoteAttachPid ?? (launchedRestoreWorker ? 0 : (restorePane?.panePid ?? 0));
+        ownedRemoteRecord!.codexRestoreUncertain = true;
+        await this.flushSessionsDurably(() => this.sessions.get(sessionId) === ownedRemoteRecord).catch(() => {});
       }
       throw new Error(`Failed to create tmux session: ${getErrorMessage(err)}`);
     } finally {

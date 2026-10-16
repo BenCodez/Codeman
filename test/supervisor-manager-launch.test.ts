@@ -8,9 +8,11 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { parse } from 'smol-toml';
 import { Session } from '../src/session.js';
+import { WebServer } from '../src/web/server.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import {
   prepareSupervisorManagerLaunch,
+  drainSupervisorManagerRetirements,
   supervisorManagerCommand,
   type SupervisorManagerLaunch,
 } from '../src/supervisor/manager-launch.js';
@@ -499,6 +501,119 @@ it('gives queued homes a fresh cleanup budget after an earlier retirement expire
   expect(await fs.readFile(first.profile.file, 'utf8')).toContain('codeman_supervisor');
   for (const item of [second, third]) expect(await fs.readFile(join(item.home, 'owner.txt'), 'utf8')).toBe('keep');
 });
+
+function shutdownSession(server: WebServer, p: Awaited<ReturnType<typeof profile>>, id: string, restricted = true) {
+  const session = new Session({ id, mode: 'codex', workingDir: p.work, useMux: false });
+  sessions.push(session);
+  // This fixture assigns only an actually issued artifact owner. It never
+  // grants native launch authority or starts/converts a manager process.
+  if (restricted) Reflect.set(session, '_supervisorManagerProfile', p.profile);
+  (Reflect.get(server, 'sessions') as Map<string, Session>).set(id, session);
+  return session;
+}
+
+it('shutdown drains actual queued manager retirements after their public responses expire', async () => {
+  const first = await profile(),
+    second = await profile(),
+    third = await profile();
+  vi.stubEnv('CODEMAN_DATA_DIR', join(first.root, 'shutdown-data'));
+  const server = new WebServer(0, false, true);
+  const owners = [first, second, third].map((p, index) =>
+    shutdownSession(server, p, `33333333-3333-4333-8333-${String(index).padStart(12, '0')}`)
+  );
+  const ordinary = shutdownSession(server, third, 'ordinary-session', false);
+  const ownerFile = join(third.home, 'owner.txt');
+  await fs.writeFile(ownerFile, 'keep ordinary owner material');
+  const credentials = Reflect.get(
+    server,
+    'supervisorManagerCredentials'
+  ) as import('../src/supervisor/manager-credentials.js').ManagerCredentialRegistry;
+  const credential = credentials.issue({ sessionId: owners[0].id, isCurrent: () => true });
+  const flush = vi
+    .spyOn(Reflect.get(server, 'recoveryStore') as { flush(): Promise<void> }, 'flush')
+    .mockResolvedValue();
+  const entered = [createDeferred(), createDeferred()],
+    release = [createDeferred(), createDeferred()];
+  const original = fs.lstat.bind(fs),
+    started = new Set<string>(),
+    now = performance.now();
+  vi.spyOn(performance, 'now').mockReturnValue(now);
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  vi.spyOn(fs, 'lstat').mockImplementation(async (...args) => {
+    const index = [first.home, second.home].indexOf(String(args[0]));
+    if (index >= 0 && !started.has(String(args[0]))) {
+      started.add(String(args[0]));
+      entered[index].resolve();
+      await release[index].promise;
+    }
+    return original(...args);
+  });
+  let settled = false;
+  const stopping = server.stop().then(() => {
+    settled = true;
+  });
+  const responses = Promise.all(owners.map((session) => session.revokeSupervisorManagerLaunch()));
+  try {
+    await entered[0].promise;
+    expect(credentials.resolve(credential.token)).toBeUndefined();
+    expect([first, second, third].every((p) => !p.profile.isCurrent())).toBe(true);
+    vi.mocked(performance.now).mockReturnValue(now + 1500);
+    await vi.advanceTimersByTimeAsync(1500);
+    release[0].resolve();
+    await entered[1].promise;
+    await expect(fs.lstat(first.profile.file)).rejects.toMatchObject({ code: 'ENOENT' });
+    // The aggregate queue outlives every public 2s response, while each actual
+    // cleanup remains inside its own original 2s authority budget.
+    vi.mocked(performance.now).mockReturnValue(now + 2501);
+    await vi.advanceTimersByTimeAsync(1001);
+    await responses;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(settled).toBe(false);
+    expect(flush).not.toHaveBeenCalled();
+    expect(await fs.readFile(second.profile.file, 'utf8')).toContain('codeman_supervisor');
+    expect(await fs.readFile(third.profile.file, 'utf8')).toContain('codeman_supervisor');
+    release[1].resolve();
+    await stopping;
+    expect(flush).toHaveBeenCalledOnce();
+    for (const p of [first, second, third])
+      await expect(fs.lstat(p.profile.file)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(await fs.readdir(third.home)).toEqual(['owner.txt']);
+    expect(await fs.readFile(ownerFile, 'utf8')).toBe('keep ordinary owner material');
+    expect(Reflect.get(ordinary, '_supervisorManagerProfile')).toBeUndefined();
+  } finally {
+    for (const item of release) item.resolve();
+    vi.useRealTimers();
+    await stopping;
+    await drainSupervisorManagerRetirements();
+  }
+});
+
+it.each(['replacement', 'io-error'] as const)(
+  'shutdown retains uncertain manager files after %s retirement',
+  async (kind) => {
+    const p = await profile();
+    vi.stubEnv('CODEMAN_DATA_DIR', join(p.root, 'shutdown-data'));
+    const server = new WebServer(0, false, true);
+    shutdownSession(server, p, 'shutdown-uncertain-manager');
+    const bytes = await fs.readFile(p.profile.file);
+    if (kind === 'replacement') {
+      await fs.rename(p.profile.file, p.profile.file + '.original');
+      await fs.writeFile(p.profile.file, bytes, { mode: 0o600 });
+    } else {
+      const original = fs.lstat.bind(fs);
+      vi.spyOn(fs, 'lstat').mockImplementation((...args) =>
+        String(args[0]) === p.home
+          ? Promise.reject(Object.assign(Error('Fixture cleanup directory unknown'), { code: 'EIO' }))
+          : original(...args)
+      );
+    }
+    await server.stop();
+    expect(p.profile.isCurrent()).toBe(false);
+    expect(await p.profile.revoke()).toBe(false);
+    expect(await fs.readFile(p.profile.file)).toEqual(bytes);
+    expect(await fs.readFile(join(p.home, `.${p.profile.name}`, 'credential.json'), 'utf8')).toContain(TOKEN);
+  }
+);
 
 it.each(['profile-replacement', 'credential-symlink', 'directory-replacement'] as const)(
   'preserves unknown artifacts on %s instead of unlinking foreign material',

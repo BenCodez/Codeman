@@ -24,7 +24,7 @@ No check commands are executed by the service. Supervision only submits a bounde
 
 ## HTTP API
 
-All responses use the standard `{success:true,data:...}` envelope. Routes use the existing owner and Origin protection. Bodies are strict and bounded.
+All responses use the standard `{success:true,data:...}` envelope. Routes use the existing owner and Origin protection. Bodies are strict and bounded. The progress endpoint additionally requires a validated Codeman owner Basic credential or session cookie; anonymous requests, synthetic identities and agent-attributed requests return `FORBIDDEN` before changing task evidence. This owner-only endpoint is unavailable without configured authentication. Structured rollout progress remains available for agents, including verified command evidence; it cannot certify manual criteria.
 
 | Method | Route                             | Purpose                                              |
 | ------ | --------------------------------- | ---------------------------------------------------- |
