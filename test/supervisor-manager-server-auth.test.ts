@@ -1,4 +1,4 @@
-/** Real server authentication and routing, with disposable credentials and no native workers. */
+/** @fileoverview Real server authentication and routing, with disposable credentials and no native workers. */
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,11 +20,11 @@ afterEach(async () => {
   for (const directory of directories.splice(0)) await rm(directory, { recursive: true, force: true });
 });
 
-async function fixture(authenticated = true) {
+async function fixture(authenticated = true, multiUser = false) {
   const directory = await mkdtemp(join(tmpdir(), 'codeman-manager-auth-'));
   directories.push(directory);
   vi.stubEnv('CODEMAN_DATA_DIR', directory);
-  vi.stubEnv('CODEMAN_MULTIUSER', '0');
+  vi.stubEnv('CODEMAN_MULTIUSER', multiUser ? '1' : '0');
   vi.stubEnv('CODEMAN_USERNAME', 'fixture-owner');
   vi.stubEnv('CODEMAN_PASSWORD', authenticated ? 'fixture-password' : '');
   vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
@@ -49,7 +49,7 @@ async function fixture(authenticated = true) {
       headers,
       payload: { jsonrpc: '2.0', id: 1, method, ...(params === undefined ? {} : { params }) },
     });
-  return { app, effect, headers, rpc, revoke: credential.revoke, expire: () => (current = false) };
+  return { server, app, effect, headers, rpc, revoke: credential.revoke, expire: () => (current = false) };
 }
 
 describe('actual server restricted manager credential', () => {
@@ -175,3 +175,22 @@ describe('actual server restricted manager credential', () => {
     expect(h.effect).toHaveBeenCalledOnce();
   });
 });
+
+it.each([
+  { authenticated: false, multiUser: false, available: false },
+  { authenticated: true, multiUser: false, available: true },
+  { authenticated: false, multiUser: true, available: true },
+])(
+  'shares actual middleware readiness for new supervisor admission: $authenticated/$multiUser',
+  async ({ authenticated, multiUser, available }) => {
+    const h = await fixture(authenticated, multiUser);
+    const readiness = () => Reflect.get(h.server, 'supervisorManagerAuthenticationAvailable').call(h.server);
+    expect(readiness()).toBe(available);
+    const session = { mode: 'codex', getRecoveryContext: () => ({ managed: true, noDaemon: true }) };
+    const eligible = () => Reflect.get(h.server, 'supervisorManagerIsEligible').call(h.server, session);
+    expect(eligible()).toBe(available);
+    Reflect.set(h.server, 'supervisorManagerAuthReady', false);
+    expect(readiness()).toBe(false); // An environment credential cannot replace uninstalled middleware.
+    expect(eligible()).toBe(false);
+  }
+);

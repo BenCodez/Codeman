@@ -2569,8 +2569,7 @@ export class WebServer extends EventEmitter {
   private async prepareSupervisorManager(session: Session, callerCurrent: () => boolean): Promise<boolean> {
     if (
       !this.supervisorManagerEndpointAvailable() ||
-      !this.supervisorManagerAuthReady ||
-      (!isMultiUserMode() && !process.env.CODEMAN_PASSWORD) ||
+      !this.supervisorManagerAuthenticationAvailable() ||
       this.recoveryStopping ||
       this.cleaningUp.has(session.id) ||
       this.sessions.get(session.id) !== session
@@ -2765,10 +2764,15 @@ export class WebServer extends EventEmitter {
     return this.host === '127.0.0.1' || this.host === '0.0.0.0';
   }
 
+  private supervisorManagerAuthenticationAvailable(): boolean {
+    return this.supervisorManagerAuthReady && (isMultiUserMode() || !!process.env.CODEMAN_PASSWORD);
+  }
+
   private supervisorManagerIsEligible(session: Session): boolean {
     const context = session.getRecoveryContext();
     return (
       this.supervisorManagerEndpointAvailable() &&
+      this.supervisorManagerAuthenticationAvailable() &&
       getCli(session.mode)?.capabilities.recovery === 'codex-rollout' &&
       !session.remote &&
       !session.docker &&

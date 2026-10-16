@@ -132,6 +132,9 @@ describe('server supervisor lease reconciliation', () => {
     vi.spyOn(CodexTaskAdapter.prototype, 'admitPrompt').mockResolvedValue(true);
     rebootRestoreRegistry.reset();
     server = new WebServer(0, false, true);
+    // This fixture models installed auth; actual middleware readiness is covered separately.
+    vi.stubEnv('CODEMAN_PASSWORD', 'fixture-lease-owner');
+    Reflect.set(server, 'supervisorManagerAuthReady', true);
     internals = server as unknown as Internals;
     routes = [];
     old = await session(OLD);

@@ -1193,3 +1193,92 @@ it.each(
   await f.prune();
   expect(await f.exists()).toBe(kind !== 'healthy');
 });
+
+it.each(['unrelated', 'referenced', 'late-owner'] as const)(
+  'rechecks large private snapshots through the actual retirement handshake (%s)',
+  async (kind) => {
+    const f = await fixture();
+    const references = {
+      owner: 'alice',
+      attachmentHistory: 'unrelated attachment metadata '.repeat(100_000),
+      ...(kind === 'referenced' ? { recoveryInputBroker: f.broker.incarnation } : {}),
+    };
+    f.refs(references);
+    expect(Buffer.byteLength(JSON.stringify(references))).toBeGreaterThan(2_097_152);
+    expect(f.provider()).toBeDefined();
+    let reached = false;
+    const transport = ((...args: Parameters<typeof spawn>) => {
+      const child = spawn(...args);
+      let output = '';
+      child.stdout!.on('data', (chunk: Buffer) => {
+        output += chunk.toString('utf8');
+        let at: number;
+        while ((at = output.indexOf('\n')) !== -1) {
+          const frame = JSON.parse(output.slice(0, at));
+          output = output.slice(at + 1);
+          if (!frame.ready) continue;
+          reached = true;
+          if (kind === 'late-owner') references.owner = 'bob';
+        }
+      });
+      return child;
+    }) as typeof spawn;
+    await f.prune(transport);
+    expect(reached).toBe(kind !== 'referenced');
+    expect(await f.exists()).toBe(kind !== 'unrelated');
+  }
+);
+it.each(['oversized', 'malformed-broker', 'unknown-broker', 'in-flight', 'thenable'] as const)(
+  'retains unknown or oversized relevant provenance in a large private snapshot (%s)',
+  async (kind) => {
+    const f = await fixture();
+    f.refs({
+      attachmentHistory: 'unrelated'.repeat(300_000),
+      ...(kind === 'oversized' ? { prior: f.broker.incarnation + 'x'.repeat(2_097_152) } : {}),
+      ...(kind === 'malformed-broker' ? { recoveryInputBroker: { incarnation: f.broker.incarnation } } : {}),
+      ...(kind === 'unknown-broker' ? { recoveryInputBroker: 'unknown' } : {}),
+      ...(kind === 'in-flight' ? { inFlight: { conversationId: SID } } : {}),
+      ...(kind === 'thenable' ? { prior: Promise.resolve(f.broker.incarnation) } : {}),
+    });
+    expect(f.provider()).toBeUndefined();
+    await f.prune();
+    expect(await f.exists()).toBe(true);
+  }
+);
+
+it.each([
+  ['state.json', false],
+  ['state.json.bak', false],
+  ['state.json', true],
+  ['state.json.bak', true],
+] as const)('reads the whole large %s and protects references at its tail (%s)', async (name, referenced) => {
+  const f = await fixture();
+  const row = {
+    id: SID,
+    status: 'idle',
+    workingDir: f.root,
+    pid: null,
+    createdAt: 1,
+    lastActivityAt: 1,
+    attachmentHistory: Array.from({ length: 100 }, () => ({ name: 'image.png', path: 'x'.repeat(24_000) })),
+  };
+  const state = {
+    sessions: { [SID]: row },
+    ...(referenced ? { privatePrior: { incarnation: f.broker.incarnation } } : {}),
+  };
+  const text = JSON.stringify(state);
+  expect(Buffer.byteLength(text)).toBeGreaterThan(2_097_152);
+  if (referenced) expect(text.lastIndexOf(f.broker.incarnation)).toBeGreaterThan(2_097_152);
+  await fs.writeFile(join(f.root, name), text, { mode: 0o600 });
+  f.refs({ persisted: state });
+  await f.prune();
+  expect(await f.exists()).toBe(referenced);
+});
+it('retains main state above its finite read budget', async () => {
+  const f = await fixture();
+  await fs.writeFile(join(f.root, 'state.json'), JSON.stringify({ sessions: {}, unrelated: 'x'.repeat(33_554_432) }), {
+    mode: 0o600,
+  });
+  await f.prune();
+  expect(await f.exists()).toBe(true);
+});

@@ -194,12 +194,15 @@ describe('manager authority at the real server boundary', () => {
     previousData = process.env.CODEMAN_DATA_DIR;
     previousMode = process.env.CODEMAN_MULTIUSER;
     previousPassword = process.env.CODEMAN_PASSWORD;
+    process.env.CODEMAN_MULTIUSER = '0';
+    process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';
     grantDirectory = undefined;
     fixtureData = await mkdtemp(join(homedir(), 'manager-authority-state-'));
     process.env.CODEMAN_DATA_DIR = fixtureData;
     workerPaths = [];
     vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
     server = new WebServer(0, false, true);
+    Reflect.set(server, 'supervisorManagerAuthReady', true);
     internals = server as unknown as Internals;
     originalTaskStore = internals.taskStore;
     managerSession = await fakeSession(MANAGER, MANAGER_THREAD);

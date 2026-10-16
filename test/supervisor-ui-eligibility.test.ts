@@ -1,4 +1,4 @@
-/** Real session/route eligibility with temporary journals and no native effects. */
+/** @fileoverview Real session/route eligibility with temporary journals and no native effects. */
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { mkdtemp, rm } from 'node:fs/promises';
@@ -29,9 +29,14 @@ it.each([
   ['specific network address', true, true, true, false, false, false, '192.0.2.10'],
   ['different IPv4 loopback', true, true, true, false, false, false, '127.0.0.2'],
   ['durable role on unsupported listener', true, true, true, false, true, true, '::1'],
+  ['anonymous isolated local', true, true, true, false, false, false, '127.0.0.1', false],
+  ['anonymous durable role', true, true, true, false, true, true, '127.0.0.1', false],
 ] as const)(
   'aligns public state, actual API and UI for %s',
-  async (_name, noDaemon, isolated, pinnedHome, discovered, durableRole, supported, host) => {
+  async (_name, noDaemon, isolated, pinnedHome, discovered, durableRole, supported, host, authenticated = true) => {
+    vi.stubEnv('CODEMAN_MULTIUSER', '0');
+    vi.stubEnv('CODEMAN_USERNAME', 'fixture-owner');
+    vi.stubEnv('CODEMAN_PASSWORD', authenticated ? 'fixture-password' : '');
     const directory = await mkdtemp(join(homedir(), 'supervisor-ui-eligibility-'));
     const server = new WebServer(0, false, true, host);
     const id = randomUUID();
@@ -66,15 +71,20 @@ it.each([
       url: 'http://localhost/',
     });
     try {
+      await Reflect.get(server, 'setupRoutes').call(server);
       const state = Reflect.get(server, 'getSessionStateWithRespawn').call(server, session);
       expect(state.supervisorAvailable).toBe(supported);
-      await Reflect.get(server, 'setupRoutes').call(server);
       const api = Reflect.get(server, 'app') as FastifyInstance;
       const authority = host.includes(':') ? `[${host}]` : host === '0.0.0.0' ? '127.0.0.1' : host;
       const response = await api.inject({
         method: 'GET',
         url: `/api/sessions/${id}/supervisor`,
-        headers: { host: authority },
+        headers: {
+          host: authority,
+          ...(authenticated
+            ? { authorization: 'Basic ' + Buffer.from('fixture-owner:fixture-password').toString('base64') }
+            : {}),
+        },
       });
       expect(response.statusCode).toBe(supported ? 200 : 400);
       const context = dom.getInternalVMContext();
@@ -91,6 +101,41 @@ it.each([
       expect(dom.window.document.querySelector<HTMLElement>('[data-tab="supervisor"]')!.style.display).toBe(
         supported ? '' : 'none'
       );
+      if (!authenticated && !durableRole) {
+        const refused = await api.inject({
+          method: 'PUT',
+          url: `/api/sessions/${id}/supervisor`,
+          headers: { host: authority },
+          payload: {
+            objective: 'Owner-selected plan',
+            enabled: true,
+            workers: [
+              {
+                sessionId: randomUUID(),
+                task: 'Owner worker task',
+                criteria: [{ id: 'review', kind: 'manual', description: 'Owner reviews result' }],
+                maxAssignments: 1,
+                maxRuntimeMs: 1000,
+              },
+            ],
+          },
+        });
+        expect(refused.statusCode).toBe(400);
+        expect(store.has(id)).toBe(false);
+        expect(Reflect.get(server, 'supervisorControllers').has(id)).toBe(false);
+      }
+      if (!authenticated && durableRole) {
+        const live = Reflect.get(server, 'getSupervisorController').call(server, session);
+        expect(live).toBeDefined();
+        expect(Reflect.get(server, 'getSupervisorController').call(server, session)).toBe(live);
+        const reset = await api.inject({
+          method: 'POST',
+          url: `/api/sessions/${id}/supervisor/reset`,
+          headers: { host: authority },
+        });
+        expect(reset.statusCode).toBe(200);
+        expect(store.get(id)).toMatchObject({ enabled: false, phase: 'disabled' });
+      }
       // An unsupported bind must refuse before identity IO or credential issuance,
       // even with authentication available; the positive bind reaches that gate.
       vi.stubEnv('CODEMAN_PASSWORD', 'fixture-manager-listener');
