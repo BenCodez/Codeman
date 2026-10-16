@@ -72,9 +72,8 @@ export const REMOTE_WAKE_COMMAND_TIMEOUT_MS = 10_000;
 export const REMOTE_WAKE_ATTACH_SETTLE_MS = 1_500;
 /**
  * Cap on buffered input per session while a host is being woken. 4 KB is a lot
- * of typing for a ~10 s wake; beyond it the OLDEST bytes are dropped (keeping the
- * tail preserves what the user just typed, and a silently unbounded buffer would
- * be a memory leak keyed on user input).
+ * of typing for a ~10 s wake; additional chunks are refused without evicting
+ * previously accepted input. A silently unbounded buffer would be a memory leak.
  */
 export const REMOTE_WAKE_PENDING_MAX_BYTES = 4096;
 /** Default SSH port used when the host config has no explicit `port`. */
@@ -118,30 +117,21 @@ export function decideRemoteInputAction(args: {
 }
 
 /**
- * Append `data` to the pending buffer, dropping the OLDEST whole chunks when the cap
- * is exceeded. Returns the resulting buffer — the SAME array reference when the chunk
- * was rejected, so the caller can tell the two apart. Pure.
+ * Append `data` only when the entire chunk fits beside all accepted chunks.
+ * Returns the SAME array reference on refusal, so callers retain their bytes.
  *
  * A chunk LARGER than the cap is dropped outright rather than trimmed: one paste is
  * one `input` value, and it was never typed character by character, so delivering its
  * tail would execute a fragment of it (with the trailing carriage return, if the paste
- * had one) — a partial command the user never sent. Keeping the tail is right for
- * typing, where the newest bytes are the ones the user just produced, and wrong for a
- * chunk that arrived whole.
+ * had one) — a partial command the user never sent.
  */
 export function appendBoundedPending(
   pending: string[],
   data: string,
   maxBytes = REMOTE_WAKE_PENDING_MAX_BYTES
 ): string[] {
-  if (Buffer.byteLength(data) > maxBytes) return pending;
-  const next = [...pending, data];
-  let total = next.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0);
-  while (next.length > 1 && total > maxBytes) {
-    total -= Buffer.byteLength(next[0]);
-    next.shift();
-  }
-  return next;
+  const total = pending.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), Buffer.byteLength(data));
+  return total > maxBytes ? pending : [...pending, data];
 }
 
 /** The remote fields the wake flow needs. Structurally satisfied by `SessionRemote`. */
@@ -479,6 +469,9 @@ export class RemoteWakeRegistry {
     // asleep), so it delivers; the manual button still wakes, blind (see `wake`).
     if (!isProbeable(remote)) return opts.force ? this.wake(session, opts) : true;
     const state = this._state(session.id);
+    // Reachability becomes true before reattach/settle/flush completes. A sibling
+    // request must join that whole operation rather than write into its old pane.
+    if (state.waking) return state.waking;
     // `force` is the manual path (a user pressed "wake"): a cached "reachable" from
     // seconds ago must not talk the button out of waking a host that just slept.
     if (opts.force || (state.reachable !== false && Date.now() - state.probedAt >= REMOTE_WAKE_PROBE_MIN_INTERVAL_MS)) {
@@ -591,10 +584,10 @@ export class RemoteWakeRegistry {
       const id = session.id;
       try {
         const ready = await this._wakeAndWait(remote, state, { sessionId: id, timeoutMs: opts.timeoutMs });
-        if (!ready) return false;
+        if (!ready || this.stopped || this.states.get(id) !== state) return false;
 
         const reattached = await session.reattachRemote();
-        if (!reattached) {
+        if (!reattached || this.stopped || this.states.get(id) !== state) {
           this.deps.log?.(`[RemoteWake] ${remote.label} is up but the pane could not be reattached`);
           return false;
         }
@@ -605,6 +598,7 @@ export class RemoteWakeRegistry {
         this.deps.log?.(`[RemoteWake] ${remote.label} reattached for session ${id}`);
 
         await this.deps.delay(REMOTE_WAKE_ATTACH_SETTLE_MS);
+        if (this.stopped || this.states.get(id) !== state) return false;
         await this._flush(state, session);
         return true;
       } catch (err) {
@@ -773,19 +767,12 @@ export class RemoteWakeRegistry {
     const state = this._state(sessionId);
     const next = appendBoundedPending(state.pending, data);
     if (next === state.pending) {
-      // Oversized chunk: dropped whole (see `appendBoundedPending`), so the buffer is
-      // untouched and nothing is delivered as a fragment. Logged, and reported to the
-      // route, which answers `dropped:true` — the user's paste is gone and a bare 200
-      // could not say so.
+      // Capacity refusal leaves every accepted chunk untouched. The input route
+      // reports retryable not-sent, so a caller must retain this whole occurrence.
       this.deps.log?.(
-        `[RemoteWake] dropped a ${Buffer.byteLength(data)}-byte input chunk for session ${sessionId} — over the ${REMOTE_WAKE_PENDING_MAX_BYTES}-byte wake buffer, and a truncated paste must not be delivered as a fragment`
+        `[RemoteWake] refused a ${Buffer.byteLength(data)}-byte input chunk for session ${sessionId} — the ${REMOTE_WAKE_PENDING_MAX_BYTES}-byte wake buffer is full`
       );
       return 'dropped';
-    }
-    const before = state.pending.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0);
-    const after = next.reduce((sum, chunk) => sum + Buffer.byteLength(chunk), 0);
-    if (before + Buffer.byteLength(data) > after) {
-      this.deps.log?.(`[RemoteWake] pending buffer cap reached for session ${sessionId} — oldest input dropped`);
     }
     state.pending = next;
     return 'buffered';
@@ -794,12 +781,9 @@ export class RemoteWakeRegistry {
   private async _flush(state: WakeState, session: WakeableSession): Promise<void> {
     while (state.pending.length > 0) {
       const chunk = state.pending[0];
-      // Take the chunk OUT before awaiting the write. Input arriving during the await is
-      // enqueued by `handleInput` (a wake is still in flight, so it takes the buffer
-      // path), and `appendBoundedPending` may then drop the OLDEST chunk to stay under
-      // the cap — which would be this one, already on its way to the pane. Shifting
-      // afterwards removed the NEXT chunk instead, so the drop-oldest bookkeeping lost a
-      // chunk that was never written while the log line blamed the one that was.
+      // Take the chunk OUT before awaiting the write. New input can use the freed
+      // capacity while this chunk is dispatched; shifting after the await could
+      // otherwise remove a different pending occurrence.
       state.pending = state.pending.slice(1);
       // `fromUser`: these bytes came through the input route as a person's prompt, so
       // they may name the tab — without it a session whose FIRST prompt was buffered
