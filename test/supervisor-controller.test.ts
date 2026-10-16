@@ -118,6 +118,28 @@ describe('SupervisorController', () => {
     }
   );
 
+  it.each(['initial', 'late', 'healthy'] as const)(
+    'requires fresh manager eligibility before enabled leases (%s)',
+    async (kind) => {
+      let eligible = kind !== 'initial';
+      const h = harness({
+        managerIsEligible: () => eligible,
+        validateWorkers: vi.fn(async () => {
+          if (kind === 'late') eligible = false;
+        }),
+      });
+      if (kind === 'healthy') await expect(h.controller.configure(config)).resolves.toMatchObject({ enabled: true });
+      else {
+        await expect(h.controller.configure(config)).rejects.toThrow(/manager is no longer eligible/);
+        expect(h.controller.getStatus().enabled).toBe(false);
+        expect(h.deps.leaseHolder).not.toHaveBeenCalled();
+      }
+      eligible = false;
+      await expect(h.controller.configure({ ...config, enabled: false })).resolves.toMatchObject({ enabled: false });
+      await expect(h.controller.reset()).resolves.toMatchObject({ enabled: false, workers: [] });
+    }
+  );
+
   describe('existing worker task admission', () => {
     function matching(h: ReturnType<typeof harness>, kickoffAt: number | undefined) {
       h.taskState.objective = config.workers[0].task;

@@ -1,8 +1,11 @@
 /** @fileoverview Codex manager authority, expressed only through guarded worker controllers. */
 import type { RecoveryActionAuthority, RecoveryEvidenceSource, RecoveryState } from '../recovery/types.js';
+import { createHash } from 'node:crypto';
+import { PromptTextSchema } from '../supervision/schema.js';
+import { delegatedInstructionPrompt } from '../supervision/delegated-instruction.js';
 import type { TaskState, TaskUpdate } from '../supervision/schema.js';
 import { TaskConfigurationCancelledError } from '../supervision/controller.js';
-import type { SupervisorWorkerInspection } from '../types/supervisor.js';
+import type { SupervisorWorkerInspection, SupervisorUsage } from '../types/supervisor.js';
 import { SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from './manager-task.js';
 import { formatTaskPrompt } from '../supervision/prompt.js';
 import {
@@ -38,12 +41,18 @@ export function classifyRecoveryRetry(state: RecoveryState): GuardedDispatchOutc
 export interface SupervisorWorkerHandle {
   /** Exact selected Session/controller incarnation throughout one operation. */
   isCurrent?(): boolean;
+  usage?(): SupervisorUsage;
   /** Read-only current worker/issuer envelope check before an assignment reservation. */
   admitPrompt?(prompt: string, authority: RecoveryActionAuthority): Promise<boolean>;
   task: {
     getStatus(): TaskState;
     update(patch: TaskUpdate, isCurrent?: () => boolean): Promise<TaskState>;
     resume(isCurrent?: RecoveryActionAuthority, runtimeStartedAt?: number): Promise<TaskState>;
+    deliverInstruction?(
+      instructions: string,
+      source: string,
+      authority: RecoveryActionAuthority
+    ): Promise<'sent' | 'not-sent' | 'unknown'>;
   };
   recovery: {
     getStatus(): RecoveryState;
@@ -53,6 +62,8 @@ export interface SupervisorWorkerHandle {
   };
 }
 export interface SupervisorDependencies {
+  /** Fresh server launch eligibility; absent only in isolated controller adapters. */
+  managerIsEligible?(): boolean;
   /** Eligibility refusals are validation errors; operational failures must retain their type. */
   validateWorkers(ids: readonly string[]): void | Promise<void>;
   worker(id: string): SupervisorWorkerHandle | undefined;
@@ -78,6 +89,13 @@ export interface SupervisorDependencies {
   pauseManager(): Promise<void>;
   resetManager(): Promise<void>;
   revokeManager?(): void;
+  managerUsage?(): SupervisorUsage;
+  managerInstructionAvailable?(): boolean;
+  dispatchManagerInstruction?(
+    instructions: string,
+    authority: RecoveryActionAuthority
+  ): Promise<'sent' | 'not-sent' | 'unknown'>;
+  captureBrainAuthority?(caller: () => boolean): Promise<(() => boolean) | undefined>;
   changed(state: SupervisorState): void;
   now?: () => number;
   inspectionTimeoutMs?: number;
@@ -115,6 +133,44 @@ export class SupervisorController {
 
   getStatus(): SupervisorState {
     return structuredClone(this.state);
+  }
+
+  getManagerUsage(): SupervisorUsage | undefined {
+    return this.deps.managerUsage?.();
+  }
+  captureBrainAuthority(caller: () => boolean): Promise<(() => boolean) | undefined> {
+    return this.stopped || caller() !== true
+      ? Promise.resolve(undefined)
+      : (this.deps.captureBrainAuthority?.(caller) ?? Promise.resolve(undefined));
+  }
+
+  canRunManagementInstruction(): boolean {
+    return (
+      !this.stopped &&
+      this.state.phase === 'active' &&
+      !this.state.inFlight &&
+      this.hasRuntimeBudget(this.state.startedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS) &&
+      this.deps.managerInstructionAvailable?.() === true
+    );
+  }
+
+  runManagementInstruction(
+    instructions: string,
+    external: RecoveryActionAuthority
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
+    const revision = this.revision;
+    return this.enqueue(async () => {
+      const current: RecoveryActionAuthority = () =>
+        external() === true && revision === this.revision && this.canRunManagementInstruction();
+      if (!current() || !this.deps.dispatchManagerInstruction) return 'not-sent';
+      if (!(await this.deps.validateManagerAuthority()) || !current()) return 'not-sent';
+      current.getActionDeadline = () =>
+        Math.min(
+          (this.state.startedAt ?? NaN) + SUPERVISOR_MANAGER_MAX_RUNTIME_MS,
+          external.getActionDeadline?.() ?? Infinity
+        );
+      return this.deps.dispatchManagerInstruction(instructions, current);
+    });
   }
 
   stop(): void {
@@ -183,6 +239,18 @@ export class SupervisorController {
     return this.getStatus();
   }
 
+  private managerIsEligible(): boolean {
+    if (!this.deps.managerIsEligible) return true;
+    try {
+      const verdict: unknown = this.deps.managerIsEligible();
+      if (verdict && typeof (verdict as { then?: unknown }).then === 'function')
+        void Promise.resolve(verdict).catch(() => {});
+      return verdict === true;
+    } catch {
+      return false;
+    }
+  }
+
   configure(config: SupervisorConfig): Promise<SupervisorState> {
     SupervisorConfigSchema.parse(config);
     const revision = ++this.revision;
@@ -196,9 +264,13 @@ export class SupervisorController {
           if (this.state.inFlight)
             throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
           if (config.enabled) {
+            if (!this.managerIsEligible())
+              throw new SupervisorValidationError('Supervisor manager is no longer eligible');
             await this.deps.validateWorkers(config.workers.map((w) => w.sessionId));
             if (this.stopped || this.revision !== revision)
               throw new SupervisorValidationError('Supervisor action was superseded');
+            if (!this.managerIsEligible())
+              throw new SupervisorValidationError('Supervisor manager is no longer eligible');
             if (this.deps.leaseHolder(this.state.supervisorSessionId, this.state.supervisorSessionId))
               throw new SupervisorValidationError('A worker cannot become a supervisor');
             for (const worker of config.workers) {
@@ -419,6 +491,7 @@ export class SupervisorController {
             taskStale: true,
             recoveryStale: true,
           };
+      if (currentWorker.usage) result[index].usage = currentWorker.usage();
     };
     const runners = Array.from({ length: Math.min(concurrency, configured.length) }, async () => {
       while (cursor < configured.length) {
@@ -590,11 +663,56 @@ export class SupervisorController {
     );
   }
 
+  message(
+    workerId: string,
+    requestId: string,
+    message: string,
+    callerIsCurrent?: () => boolean
+  ): Promise<SupervisorState> {
+    SupervisorRequestSchema.parse({ requestId });
+    PromptTextSchema.min(1)
+      .max(4000)
+      .refine((text) => !!text.trim())
+      .parse(message);
+    const payloadHash = createHash('sha256').update(message).digest('hex');
+    return this.operation(
+      workerId,
+      requestId,
+      'message',
+      async (worker, configured, authority) => {
+        if (configured.allowMessages !== true || !worker.task.deliverInstruction)
+          throw new SupervisorValidationError('Owner messaging grant is required');
+        const task = worker.task.getStatus(),
+          snapshot = JSON.stringify(task);
+        if (task.inFlight || task.phase !== 'watching' || task.outcome !== 'unfinished')
+          throw new SupervisorValidationError('Worker requires owner attention or is not ready');
+        const prompt = delegatedInstructionPrompt(task, message, `supervisor:${this.state.supervisorSessionId}`);
+        if (worker.admitPrompt && (await worker.admitPrompt(prompt, authority)) !== true)
+          throw new SupervisorValidationError('Delegated message does not fit the verified worker envelope');
+        return () => JSON.stringify(worker.task.getStatus()) === snapshot;
+      },
+      async (worker, configured, authority) => {
+        if (configured.allowMessages !== true || !worker.task.deliverInstruction)
+          throw new SupervisorOperationRefused('Messaging grant changed');
+        const result = await worker.task.deliverInstruction(
+          message,
+          `supervisor:${this.state.supervisorSessionId}`,
+          authority
+        );
+        if (result === 'not-sent')
+          throw new SupervisorOperationRefused('Worker was not ready for the delegated message');
+        if (result === 'unknown' || !authority()) throw Error('Delegated message delivery may have started');
+      },
+      callerIsCurrent,
+      payloadHash
+    );
+  }
+
   /** A manager's plan never clears a later worker pause, block, or competing task. */
   private workerAllowsAction(
     worker: SupervisorWorkerHandle,
     configured: SupervisorState['workers'][number],
-    action: 'assign' | 'retry',
+    action: 'assign' | 'retry' | 'message',
     includeFlights: boolean
   ): boolean {
     const task = worker.task.getStatus();
@@ -647,7 +765,7 @@ export class SupervisorController {
   private operation(
     workerId: string,
     requestId: string,
-    action: 'assign' | 'retry',
+    action: 'assign' | 'retry' | 'message',
     preflight: (
       worker: SupervisorWorkerHandle,
       configured: SupervisorState['workers'][number],
@@ -659,7 +777,8 @@ export class SupervisorController {
       isCurrent: RecoveryActionAuthority,
       runtimeStartedAt: number
     ) => Promise<void>,
-    callerIsCurrent?: () => boolean
+    callerIsCurrent?: () => boolean,
+    payloadHash?: string
   ): Promise<SupervisorState> {
     const callerCurrent = () => {
       try {
@@ -673,7 +792,12 @@ export class SupervisorController {
       if (!callerCurrent()) throw new SupervisorOperationRefused('Supervisor credential is no longer current');
       if (this.state.handledRequestIds.includes(requestId)) {
         const binding = this.state.handledRequestBindings.find((entry) => entry.requestId === requestId);
-        if (!binding || binding.workerId !== workerId || binding.action !== action)
+        if (
+          !binding ||
+          binding.workerId !== workerId ||
+          binding.action !== action ||
+          binding.payloadHash !== payloadHash
+        )
           throw new SupervisorValidationError('Supervisor request id is bound to a different operation');
         return this.getStatus();
       }
@@ -692,7 +816,9 @@ export class SupervisorController {
       // only once dispatch is accepted; a certified unsent refusal starts no budget.
       const runtimeStartedAt = configured.startedAt ?? this.now();
       const hasBudget = () =>
-        configured.assignments < configured.maxAssignments &&
+        (action === 'message'
+          ? configured.allowMessages === true && (configured.messages ?? 0) < (configured.maxMessages ?? 20)
+          : configured.assignments < configured.maxAssignments) &&
         this.hasRuntimeBudget(runtimeStartedAt, configured.maxRuntimeMs) &&
         this.hasRuntimeBudget(this.state.startedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS);
       const isCurrent: RecoveryActionAuthority = () =>
@@ -739,7 +865,13 @@ export class SupervisorController {
       preparedPromptIsCurrent = (await preflight(worker, configured, isCurrent)) ?? (() => true);
       await requireManagerAuthority();
       requireCurrent();
-      this.state.inFlight = { requestId, workerId, action, reservedAt: this.now() };
+      this.state.inFlight = {
+        requestId,
+        workerId,
+        action,
+        reservedAt: this.now(),
+        ...(payloadHash ? { payloadHash } : {}),
+      };
       await this.save(`${action}-reserved`, workerId);
       try {
         await requireManagerAuthority();
@@ -772,11 +904,15 @@ export class SupervisorController {
         await this.save(`${action}-uncertain`, workerId).catch(() => {});
         throw error;
       }
-      configured.assignments++;
+      if (action === 'message') configured.messages = (configured.messages ?? 0) + 1;
+      else configured.assignments++;
       configured.startedAt ??= runtimeStartedAt;
       configured.lastRequestId = requestId;
       this.state.handledRequestIds = [...this.state.handledRequestIds, requestId];
-      this.state.handledRequestBindings = [...this.state.handledRequestBindings, { requestId, workerId, action }];
+      this.state.handledRequestBindings = [
+        ...this.state.handledRequestBindings,
+        { requestId, workerId, action, ...(payloadHash ? { payloadHash } : {}) },
+      ];
       delete this.state.inFlight;
       return this.save(`${action}-accepted`, workerId);
     });

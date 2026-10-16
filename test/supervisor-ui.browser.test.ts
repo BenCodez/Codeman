@@ -9,6 +9,8 @@ const html = readFileSync(resolve(publicDir, 'index.html'), 'utf8');
 const styles = readFileSync(resolve(publicDir, 'styles.css'), 'utf8');
 const mobileStyles = readFileSync(resolve(publicDir, 'mobile.css'), 'utf8');
 const controller = readFileSync(resolve(publicDir, 'supervisor-ui.js'), 'utf8');
+const automationController = readFileSync(resolve(publicDir, 'supervisor-automation-ui.js'), 'utf8');
+const brainController = readFileSync(resolve(publicDir, 'supervisor-brain-ui.js'), 'utf8');
 const apiHelpers = readFileSync(resolve(publicDir, 'api-client.js'), 'utf8');
 const fixtureOrigin = 'http://codeman-supervisor.test';
 const SID = '11111111-1111-4111-8111-111111111111';
@@ -53,6 +55,8 @@ describe('Codex supervisor UI in Chromium', () => {
   async function mount(page: Page): Promise<void> {
     await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp = CodemanApp;' });
     await page.addScriptTag({ content: controller });
+    await page.addScriptTag({ content: automationController });
+    await page.addScriptTag({ content: brainController });
     await page.evaluate(
       ({ sid }) => {
         let current = {
@@ -132,6 +136,85 @@ describe('Codex supervisor UI in Chromium', () => {
   }
 
   for (const width of [1440, 390]) {
+    it(`saves hourly check-ins, pasted custom tasks and persistent brain memory at ${width}px`, async () => {
+      const page = await render(width);
+      try {
+        await page.evaluate(() => {
+          const w = window as any;
+          const original = w.app._apiJson;
+          let automation: any = {
+            checkIns: { enabled: false, intervalMinutes: 60 },
+            tasks: [],
+            status: { phase: 'idle', reason: 'configured', runs: [] },
+          };
+          let brain = { markdown: '', revision: 'a'.repeat(64), exists: false, noteCount: 0 };
+          w.app._apiJson = async (url: string, options?: any) => {
+            if (url.endsWith('/automation')) {
+              w.supervisorCalls.push({ url, options });
+              if (options?.method === 'PUT') automation = { ...options.body, status: automation.status };
+              return structuredClone(automation);
+            }
+            if (url.endsWith('/brain')) {
+              w.supervisorCalls.push({ url, options });
+              if (options?.method === 'PUT')
+                brain = { ...brain, markdown: options.body.markdown, revision: 'b'.repeat(64), exists: true };
+              return structuredClone(brain);
+            }
+            return original(url, options);
+          };
+          w.app.switchOptionsTab('supervisor');
+        });
+        await page.locator('#supervisorAutomationPanel summary').click();
+        await page.waitForFunction(() => !(window as any).app._supervisorView.automationBusy);
+        expect(await page.locator('#supervisorCheckInMinutes').inputValue()).toBe('60');
+        await page.locator('#supervisorCheckInsEnabled').check();
+        await page.getByRole('button', { name: 'Add custom task', exact: true }).click();
+        const tasks = page.locator('#supervisorCustomTasks');
+        await tasks.locator('[data-field="name"]').fill('Review backend progress');
+        const instructions = 'Read brain.md first. 🌍\n\nCheck worker evidence; send one concise next step.  ';
+        await tasks.locator('[data-field="instructions"]').fill(instructions);
+        await tasks.locator('[data-field="kind"]').selectOption('recurring');
+        await tasks.locator('[data-field="intervalMinutes"]').fill('60');
+        await tasks.locator('[data-field="maxRuns"]').fill('2');
+        await tasks.locator('[data-field="enabled"]').check();
+        await page.getByRole('button', { name: 'Save schedules', exact: true }).click();
+        await page.waitForFunction(() => !(window as any).app._supervisorView.automationBusy);
+        const saved = await page.evaluate(
+          () =>
+            (window as any).supervisorCalls.findLast(
+              (call: any) => call.url.endsWith('/automation') && call.options?.method === 'PUT'
+            ).options.body
+        );
+        expect(saved.checkIns).toEqual({ enabled: true, intervalMinutes: 60 });
+        expect(saved.tasks[0]).toMatchObject({
+          name: 'Review backend progress',
+          instructions,
+          kind: 'recurring',
+          intervalMinutes: 60,
+          maxRuns: 2,
+        });
+        await page.locator('#supervisorBrainPanel summary').click();
+        await page.waitForFunction(() => !(window as any).app._supervisorView.brainBusy);
+        const memory =
+          '# Goals\n\nShip small verified changes.\n\n## Worker roles\nAPI agent owns the backend; UI agent owns the frontend.\n\n## Usage\nReport unknown quota honestly.';
+        await page.locator('#supervisorBrainMarkdown').fill(memory);
+        await page.getByRole('button', { name: 'Save memory', exact: true }).click();
+        await page.waitForFunction(() => !(window as any).app._supervisorView.brainBusy);
+        const memoryRequest = await page.evaluate(
+          () =>
+            (window as any).supervisorCalls.findLast(
+              (call: any) => call.url.endsWith('/brain') && call.options?.method === 'PUT'
+            ).options.body
+        );
+        expect(memoryRequest).toEqual({ markdown: memory, ifMatch: 'a'.repeat(64) });
+        expect(await page.locator('#supervisorBrainMarkdown').inputValue()).toBe(memory);
+        expect(await page.locator('#supervisor-tab').evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(
+          true
+        );
+      } finally {
+        await page.close();
+      }
+    });
     it(`hides manager controls for SSH and Docker workers at ${width}px`, async () => {
       const page = await render(width);
       try {

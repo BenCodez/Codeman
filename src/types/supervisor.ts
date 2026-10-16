@@ -11,12 +11,16 @@ export interface SupervisorWorkerPlan {
   criteria: SupervisorCriterion[];
   maxAssignments: number;
   maxRuntimeMs: number;
+  /** Explicit owner delegation; absent means no messaging authority. */
+  allowMessages?: boolean;
+  maxMessages?: number;
 }
 
 export interface SupervisorWorkerState extends SupervisorWorkerPlan {
   assignments: number;
   startedAt?: number;
   lastRequestId?: string;
+  messages?: number;
 }
 
 export interface SupervisorConfig {
@@ -37,12 +41,20 @@ export interface SupervisorState {
   inFlight?: {
     requestId: string;
     workerId: string;
-    action: 'assign' | 'retry';
+    action: 'assign' | 'retry' | 'message';
+    payloadHash?: string;
     reservedAt: number;
   };
   handledRequestIds: string[];
-  handledRequestBindings: Array<{ requestId: string; workerId: string; action: 'assign' | 'retry' }>;
+  handledRequestBindings: Array<{
+    requestId: string;
+    workerId: string;
+    action: 'assign' | 'retry' | 'message';
+    payloadHash?: string;
+  }>;
   history: Array<{ at: number; reason: string; workerId?: string }>;
+  /** Read-only API decoration; never part of the durable authority journal. */
+  usage?: SupervisorUsage;
 }
 
 export interface SupervisorOperationRequest {
@@ -62,4 +74,17 @@ export interface SupervisorWorkerInspection {
   taskStale: boolean;
   /** True when recovery inspection timed out or the worker was unavailable; health is then unknown. */
   recoveryStale: boolean;
+  usage?: SupervisorUsage;
+}
+
+/** Session-parsed counters are estimates, never an inferred provider/account quota. */
+export interface SupervisorUsage {
+  source: 'codeman-session-counter-estimate';
+  available: boolean;
+  observedAt: number;
+  stale: boolean;
+  inputTokens?: number;
+  outputTokens?: number;
+  costEstimate?: number;
+  providerQuota: 'unknown';
 }

@@ -997,7 +997,24 @@ The session routes below are owner-scoped and available through `/api/v1` aliase
 | `GET`  | `/api/sessions/:id/supervisor/workers`                  | none                                 | Manager view of selected workers' task checkpoints, verified criteria, recovery state, normalized health, observation time, and freshness.                                                                             |
 | `POST` | `/api/sessions/:id/supervisor/workers/:workerId/assign` | `{ requestId }`                      | Start the exact owner-configured task through the worker task controller.                                                                                                                                              |
 | `POST` | `/api/sessions/:id/supervisor/workers/:workerId/retry`  | `{ requestId }`                      | Ask the recovery controller to retry a currently validated crash.                                                                                                                                                      |
-| `POST` | `/api/supervisor-mcp`                                   | Bounded JSON-RPC 2.0 request         | Authenticate a current manager bearer credential and expose only `supervisor_status`, `supervisor_workers`, `supervisor_assign`, and `supervisor_retry`.                                                               |
+| `POST` | `/api/supervisor-mcp`                                   | Bounded JSON-RPC 2.0 request         | Authenticate a current manager bearer credential and expose only `supervisor_status`, `supervisor_workers`, `supervisor_assign`, `supervisor_retry`, `supervisor_message`, and `supervisor_brain`.                                                               |
+
+The owner can also use:
+
+| Method | Path | Body | Purpose |
+| --- | --- | --- | --- |
+| `GET` | `/api/sessions/:id/supervisor/automation` | none | Read check-ins, custom tasks and durable run status. |
+| `PUT` | `/api/sessions/:id/supervisor/automation` | `{ checkIns, tasks }` | Save owner-defined bounded schedules. |
+| `POST` | `/api/sessions/:id/supervisor/automation/tasks/:taskId/run` | `{ requestId }` | Run the saved task now through the same manager. |
+| `GET` | `/api/sessions/:id/supervisor/brain` | none | Read scoped memory and its content revision. |
+| `PUT` | `/api/sessions/:id/supervisor/brain` | `{ markdown, ifMatch }` | Replace owner memory only if its revision still matches; conflict returns 409. |
+| `POST` | `/api/sessions/:id/supervisor/workers/:workerId/message` | `{ requestId, message }` | Deliver a bounded owner-delegated instruction to an explicitly permitted worker. |
+
+`checkIns` is `{ enabled, intervalMinutes }`, initially disabled with a 60-minute interval. Each custom task has `{ id, name, instructions, enabled, kind, maxRuns }`, plus `intervalMinutes` for `kind: "recurring"`; `kind: "once"` is also supported. There are at most 12 tasks, names are at most 100 characters, instructions at most 4,000 characters, intervals 1–1,440 minutes, and run limits 1–100. Run status includes the request ID, task ID, content hash and acceptance/uncertainty state. Retain the same request ID after a lost response. Existing manager and worker budgets are not renewed by a timer.
+
+Worker plans can add `allowMessages: true` and `maxMessages` (default 20, at most 100). MCP messages use `{ workerId, requestId, message }`, with at most 4,000 characters. Request IDs also bind the message hash, so different content cannot reuse an accepted ID. `supervisor_brain` takes `{ mode: "read" }` or `{ mode: "append", requestId, note, ifMatch }`; notes are at most 2,000 characters. Brain snapshots contain `{ markdown, revision, exists, noteCount }`. Memory is capped at 32 KiB UTF-8 with 64 retained note receipts. Fresh metadata authority can permit owner teaching while worker automation is paused; it cannot authorize worker actions.
+
+Usage snapshots use `source: "codeman-session-counter-estimate"`, `available`, `observedAt`, `stale: true`, optional positive `inputTokens`, `outputTokens`, and `costEstimate`, and `providerQuota: "unknown"`. Snapshot time does not establish the age of the underlying counters. Missing measurements do not establish zero consumption or remaining provider quota.
 
 MCP assignment and retry arguments are exactly `{ workerId, requestId }`; inspection tools take no arguments. Manager identity comes from the credential, not a caller-supplied session ID. Unknown, stale or revoked credentials return `401` without falling back to an owner cookie or anonymous access. A current manager credential presented on any other route returns `403`. Host and Origin checks remain active. Credentials expire with the application process and are never returned in public session settings.
 

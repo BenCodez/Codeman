@@ -2415,7 +2415,9 @@ export class Session extends EventEmitter {
       !context.untrackedInput &&
       !context.inputBrokerPending &&
       this._mux?.isSupervisorManagerLaunchCurrent?.(this.id, profile) === true;
-    if (profile && !profileCurrent) void this.revokeSupervisorManagerLaunch();
+    // A tracked owner frame temporarily withholds input authority until its
+    // durable publication. It does not replace the exact restricted launch.
+    if (profile && !profileCurrent && !context.switchPending) void this.revokeSupervisorManagerLaunch();
     return current;
   }
 
@@ -3803,8 +3805,12 @@ export class Session extends EventEmitter {
             pane.status !== expectedRecoveryPane.status ||
             pane.signal !== expectedRecoveryPane.signal ||
             (pane.paneSignalToken ?? '') !== (expectedRecoveryPane.paneSignalToken ?? ''))
-        )
+        ) {
+          // This lifecycle-guarded read still precedes every native effect.
+          // Retire the stale reservation without charging a delivery failure.
+          isCurrent.withdrawEvidence?.();
           return 'not-sent';
+        }
         const currentContext = this.getRecoveryContext();
         if (
           granted.isCurrent() !== true ||

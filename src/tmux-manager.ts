@@ -4906,6 +4906,101 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     }
   }
 
+  /** Owner deletion of a retained SSH row must not mistake a local kill for a remote ACK. */
+  async killPersistedOwnedRemoteSession(
+    sessionId: string,
+    expected: MuxSession,
+    isCurrent: () => boolean
+  ): Promise<boolean> {
+    if (IS_TEST_MODE) return false; // Native-effect fixtures explicitly replace every process boundary.
+    const binding = JSON.stringify(expected);
+    const current = () => {
+      try {
+        return (
+          isCurrent() === true &&
+          this.sessions.get(sessionId) === expected &&
+          JSON.stringify(expected) === binding &&
+          !expected.discovered &&
+          expected.sessionId === sessionId &&
+          /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(sessionId) &&
+          !!expected.remote &&
+          expected.remote.owned !== false &&
+          isValidMuxName(expected.muxName) &&
+          expected.muxName !== process.env.CODEMAN_MUX_NAME
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!current()) return false;
+    this.guardRemoteReconnect(sessionId);
+    const format = '#{session_name}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{session_windows}|#{window_panes}';
+    const fields = ['session_name', 'session_id', 'pane_id', 'pane_pid', 'pid', 'session_windows', 'window_panes'];
+    const parse = (text: string, name: string): string[] | undefined => {
+      const row = text.endsWith('\n') ? text.slice(0, -1).split('|') : [];
+      return row.length === 7 &&
+        row[0] === name &&
+        /^\$[0-9]+$/.test(row[1]) &&
+        /^%[0-9]+$/.test(row[2]) &&
+        [row[3], row[4]].every((value) => /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value))) &&
+        row[5] === '1' &&
+        row[6] === '1'
+        ? row
+        : undefined;
+    };
+    const remote = structuredClone(expected.remote!);
+    const remoteCommand = (command: string) =>
+      [...buildSshConnectionArgs(remote), remoteSshTarget(remote), shellescape(command)].join(' ');
+    const read = async (command: string, name: string) => {
+      if (!current()) return undefined;
+      const result = await execAsync(command, { timeout: EXEC_TIMEOUT_MS, maxBuffer: 16384 });
+      return current() && !result.stderr ? parse(result.stdout, name) : undefined;
+    };
+    const killCommand = (tmux: string, row: string[]) => {
+      const terms = fields.map((key, index) => '#{==:#{' + key + '},' + row[index] + '}');
+      const predicate = terms.reduce((a, b) => '#{&&:' + a + ',' + b + '}');
+      return `${tmux} if-shell -F -t ${shellescape(row[2])} ${shellescape(predicate)} ${shellescape('kill-session -t ' + shellescape(row[1]))} ${shellescape('display-message -p CODEMAN_OWNED_KILL_REFUSED')} && printf 'CODEMAN_OWNED_KILL_ACK\\n'`;
+    };
+    try {
+      const local = await read(
+        `${this.tmux()} list-panes -t ${shellescape(expected.muxName)} -F ${shellescape(format)}`,
+        expected.muxName
+      );
+      if (!local || Number(local[3]) !== expected.pid || !current()) return false;
+      const remoteName = remoteTmuxSessionName(sessionId),
+        remoteTmux = `tmux -L ${REMOTE_TMUX_SOCKET}`;
+      const remotePane = await read(
+        remoteCommand(`${remoteTmux} list-panes -t ${shellescape(remoteName)} -F ${shellescape(format)}`),
+        remoteName
+      );
+      if (!remotePane || !current()) return false;
+      const remoteKilled = await execAsync(remoteCommand(killCommand(remoteTmux, remotePane)), {
+        timeout: EXEC_TIMEOUT_MS,
+        maxBuffer: 16384,
+      });
+      if (!current() || remoteKilled.stdout !== 'CODEMAN_OWNED_KILL_ACK\n' || remoteKilled.stderr) return false;
+      const localKilled = await execAsync(killCommand(this.tmux(), local), {
+        timeout: EXEC_TIMEOUT_MS,
+        maxBuffer: 16384,
+      });
+      if (!current() || localKilled.stdout !== 'CODEMAN_OWNED_KILL_ACK\n' || localKilled.stderr) return false;
+      // Neither effect uses the ordinary kill's fire-and-forget SSH leg: an ABA
+      // replacement must never receive a second name-based remote kill.
+      this.supervisorManagerLaunches?.delete(sessionId);
+      this.lastPaneCount.delete(expected.muxName);
+      this.clearPaneExit(expected.muxName);
+      this.sessions.delete(sessionId);
+      this.inputBrokers.delete(sessionId);
+      this.inputBrokerLoads.delete(sessionId);
+      this.clearRemoteReconnectState(sessionId);
+      this.saveSessions();
+      this.emit('sessionKilled', { sessionId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * Kill a tmux session and all its child processes.
    * Uses a 4-strategy approach (children → process group → tmux kill → SIGKILL).

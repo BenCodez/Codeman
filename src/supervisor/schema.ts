@@ -22,6 +22,9 @@ export const SupervisorWorkerSchema = z
     assignments: z.number().int().min(0).max(10).default(0),
     startedAt: z.number().optional(),
     lastRequestId: RequestId.optional(),
+    allowMessages: z.boolean().optional(),
+    maxMessages: z.number().int().min(1).max(100).optional(),
+    messages: z.number().int().min(0).max(100).optional(),
   })
   .strict();
 
@@ -32,7 +35,7 @@ export const SupervisorConfigSchema = z
       .refine((value) => value.trim().length > 0, 'Supervisor objective must contain non-whitespace text'),
     enabled: z.boolean(),
     workers: z
-      .array(SupervisorWorkerSchema.omit({ assignments: true, startedAt: true, lastRequestId: true }))
+      .array(SupervisorWorkerSchema.omit({ assignments: true, startedAt: true, lastRequestId: true, messages: true }))
       .min(1)
       .max(12),
   })
@@ -68,14 +71,30 @@ export const SupervisorStateSchema = z
       .object({
         requestId: RequestId,
         workerId: SessionId,
-        action: z.enum(['assign', 'retry']),
+        action: z.enum(['assign', 'retry', 'message']),
+        payloadHash: z
+          .string()
+          .regex(/^[a-f0-9]{64}$/)
+          .optional(),
         reservedAt: z.number(),
       })
       .strict()
       .optional(),
     handledRequestIds: z.array(RequestId).max(128),
     handledRequestBindings: z
-      .array(z.object({ requestId: RequestId, workerId: SessionId, action: z.enum(['assign', 'retry']) }).strict())
+      .array(
+        z
+          .object({
+            requestId: RequestId,
+            workerId: SessionId,
+            action: z.enum(['assign', 'retry', 'message']),
+            payloadHash: z
+              .string()
+              .regex(/^[a-f0-9]{64}$/)
+              .optional(),
+          })
+          .strict()
+      )
       .max(128),
     history: z
       .array(
@@ -92,6 +111,13 @@ export const SupervisorStateSchema = z
         state.handledRequestBindings.length &&
       state.handledRequestIds.every((id) => state.handledRequestBindings.some((entry) => entry.requestId === id)),
     'Handled supervisor requests require durable operation bindings'
+  )
+  .refine(
+    (state) =>
+      [...state.handledRequestBindings, ...(state.inFlight ? [state.inFlight] : [])].every((binding) =>
+        binding.action === 'message' ? binding.payloadHash !== undefined : binding.payloadHash === undefined
+      ),
+    'Message operations require exact payload bindings'
   );
 
 type ParsedSupervisorState = z.infer<typeof SupervisorStateSchema>;

@@ -5,7 +5,12 @@ import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { SupervisorActionSchema, SupervisorConfigSchema, SupervisorRequestSchema } from '../../supervisor/schema.js';
 import { SupervisorValidationError } from '../../supervisor/controller.js';
 import { TaskValidationError } from '../../supervision/controller.js';
-import { findSessionOrFail, parseBody } from '../route-helpers.js';
+import {
+  SupervisorAutomationConfigSchema,
+  SupervisorAutomationRequestSchema,
+} from '../../supervisor/automation-schema.js';
+import { SupervisorAutomationError } from '../../supervisor/automation.js';
+import { canAccessOwned, getAuthUser, findSessionOrFail, parseBody } from '../route-helpers.js';
 import type { SessionPort, SupervisorPort } from '../ports/index.js';
 
 function attributedSupervisor(req: FastifyRequest): string | undefined {
@@ -15,7 +20,10 @@ function attributedSupervisor(req: FastifyRequest): string | undefined {
 
 function operationFailure(reply: FastifyReply, error: unknown, validationMessage: string) {
   const validation =
-    error instanceof SupervisorValidationError || error instanceof TaskValidationError || error instanceof ZodError;
+    error instanceof SupervisorValidationError ||
+    error instanceof TaskValidationError ||
+    error instanceof SupervisorAutomationError ||
+    error instanceof ZodError;
   return reply
     .code(validation ? 400 : 500)
     .send(
@@ -27,6 +35,22 @@ function operationFailure(reply: FastifyReply, error: unknown, validationMessage
 }
 
 export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort & SupervisorPort): void {
+  const ownerCurrent = (req: FastifyRequest, reply: FastifyReply, session: ReturnType<typeof findSessionOrFail>) => {
+    const owner = session.owner;
+    let cancelled = req.raw.aborted || reply.raw.destroyed;
+    req.raw.once('aborted', () => {
+      cancelled = true;
+    });
+    reply.raw.once('close', () => {
+      if (!reply.raw.writableFinished) cancelled = true;
+    });
+    return () =>
+      !cancelled &&
+      !req.raw.aborted &&
+      ctx.sessions.get(session.id) === session &&
+      session.owner === owner &&
+      canAccessOwned(getAuthUser(req), session.owner);
+  };
   const controller = (req: FastifyRequest) => {
     const id = (req.params as { id: string }).id;
     const session = findSessionOrFail(ctx, id, req);
@@ -86,7 +110,80 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
     }
   });
 
-  app.get('/api/sessions/:id/supervisor', async (req) => ({ success: true, data: controller(req).result.getStatus() }));
+  app.get('/api/sessions/:id/supervisor', async (req) => {
+    const scoped = controller(req).result;
+    return {
+      success: true,
+      data: { ...scoped.getStatus(), ...(scoped.getManagerUsage?.() ? { usage: scoped.getManagerUsage() } : {}) },
+    };
+  });
+  app.get('/api/sessions/:id/supervisor/automation', async (req, reply) => {
+    const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req);
+    const scoped = ctx.getSupervisorAutomation?.(session);
+    if (!scoped)
+      return reply
+        .code(400)
+        .send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Management automation is unavailable'));
+    return { success: true, data: scoped.getStatus() };
+  });
+  app.put('/api/sessions/:id/supervisor/automation', async (req, reply) => {
+    const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req),
+      current = ownerCurrent(req, reply, session);
+    const config = parseBody(SupervisorAutomationConfigSchema, req.body, 'Invalid management schedule');
+    try {
+      const scoped = ctx.getSupervisorAutomation?.(session);
+      if (!scoped) throw new SupervisorValidationError('Management automation is unavailable');
+      return { success: true, data: await scoped.configure(config, current) };
+    } catch (error) {
+      return operationFailure(reply, error, 'Management schedule is invalid or unavailable');
+    }
+  });
+  app.post('/api/sessions/:id/supervisor/automation/tasks/:taskId/run', async (req, reply) => {
+    const { id, taskId } = req.params as { id: string; taskId: string },
+      session = findSessionOrFail(ctx, id, req),
+      current = ownerCurrent(req, reply, session);
+    const { requestId } = parseBody(SupervisorAutomationRequestSchema, req.body, 'Invalid management run request');
+    try {
+      const scoped = ctx.getSupervisorAutomation?.(session);
+      if (!scoped) throw new SupervisorValidationError('Management automation is unavailable');
+      return { success: true, data: await scoped.runTask(taskId, requestId, current) };
+    } catch (error) {
+      return operationFailure(reply, error, 'Management run was refused or remains unresolved; retain requestId');
+    }
+  });
+  app.get('/api/sessions/:id/supervisor/brain', async (req, reply) => {
+    const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req),
+      current = ownerCurrent(req, reply, session);
+    try {
+      if (!ctx.supervisorBrain || !ctx.getSupervisorController(session))
+        throw new SupervisorValidationError('Manager brain is unavailable');
+      const data = await ctx.supervisorBrain.read(session, current);
+      if (!current()) throw new SupervisorValidationError('Brain request is no longer current');
+      return { success: true, data };
+    } catch (error) {
+      return operationFailure(reply, error, 'Manager brain is unavailable');
+    }
+  });
+  app.put('/api/sessions/:id/supervisor/brain', async (req, reply) => {
+    const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req),
+      current = ownerCurrent(req, reply, session);
+    const body = parseBody(
+      z.object({ markdown: z.string().max(32768), ifMatch: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
+      req.body,
+      'Invalid brain update'
+    );
+    try {
+      if (!ctx.supervisorBrain || !ctx.getSupervisorController(session))
+        throw new SupervisorValidationError('Manager brain is unavailable');
+      return { success: true, data: await ctx.supervisorBrain.replace(session, body.markdown, body.ifMatch, current) };
+    } catch (error) {
+      if (error && typeof error === 'object' && Reflect.get(error, 'code') === 'conflict')
+        return reply
+          .code(409)
+          .send(createErrorResponse(ApiErrorCode.OPERATION_FAILED, 'Brain changed; reload before saving'));
+      return operationFailure(reply, error, 'Brain update was refused; reload before retrying');
+    }
+  });
   app.put('/api/sessions/:id/supervisor', async (req, reply) => {
     const scoped = controller(req).result;
     const config = parseBody(SupervisorConfigSchema, req.body, 'Invalid supervisor configuration');

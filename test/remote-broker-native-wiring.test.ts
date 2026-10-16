@@ -668,3 +668,98 @@ it.each(['missing-home', 'relative-home', 'unsupported-broker'] as const)(
     expect(session.toLightDetailedState().taskSupported).toBe(false);
   }
 );
+
+it.each([
+  'ack',
+  'remote-lost',
+  'remote-refused',
+  'local-lost',
+  'owner',
+  'cancel',
+  'aba',
+  'malformed',
+  'foreign',
+  'held-owner',
+] as const)('requires exact awaited native teardown acknowledgements for persisted owned SSH (%s)', async (kind) => {
+  const { manager, options } = fixture();
+  const native: MuxSession = {
+    sessionId: options.sessionId,
+    muxName: 'codeman-' + options.sessionId.slice(0, 8),
+    pid: 600,
+    createdAt: Date.now(),
+    workingDir: root,
+    owner: options.owner,
+    remote: options.remote,
+    mode: 'codex',
+    attached: false,
+  };
+  if (kind === 'foreign') native.remote = { ...native.remote!, owned: false };
+  Reflect.get(manager, 'sessions').set(native.sessionId, native);
+  Reflect.set(manager, 'reconnectGuard', new Set());
+  Reflect.set(manager, 'lastPaneCount', new Map());
+  let current = true;
+  let entered!: () => void, release!: () => void;
+  const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    }),
+    held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  effects.exec.mockImplementation(async (command: string) => {
+    const ssh = command.startsWith('ssh ');
+    if (command.includes('list-panes')) {
+      if (ssh) {
+        if (kind === 'owner') native.owner = 'replacement-owner';
+        if (kind === 'cancel') current = false;
+        return {
+          stdout:
+            kind === 'malformed'
+              ? 'uncertain\n'
+              : `codeman-ssh-${native.sessionId.slice(0, 8)}|$17|%9|9009|17000|1|1\n`,
+          stderr: '',
+        };
+      }
+      return { stdout: `${native.muxName}|$1|%7|600|88|1|1\n`, stderr: '' };
+    }
+    expect(command).toContain('if-shell -F');
+    expect(command).toContain('kill-session -t');
+    if (ssh) {
+      expect(command).toContain('codeman-remote');
+      expect(command).toContain('pane_pid},9009');
+      expect(command).toContain('pid},17000');
+      if (kind === 'held-owner') {
+        entered();
+        await held;
+      }
+      if (kind === 'remote-lost') throw Error('SSH acknowledgment lost');
+      if (kind === 'remote-refused')
+        return { stdout: 'CODEMAN_OWNED_KILL_REFUSED\nCODEMAN_OWNED_KILL_ACK\n', stderr: '' };
+      if (kind === 'aba') Reflect.get(manager, 'sessions').set(native.sessionId, { ...native });
+    } else if (kind === 'local-lost') throw Error('local acknowledgement lost');
+    return { stdout: 'CODEMAN_OWNED_KILL_ACK\n', stderr: '' };
+  });
+  const pending = manager.killPersistedOwnedRemoteSession(native.sessionId, native, () => current);
+  try {
+    if (kind === 'held-owner') {
+      await reached;
+      expect(manager.getSession(native.sessionId)).toBe(native);
+      expect(
+        effects.exec.mock.calls.filter(([command]) => !command.startsWith('ssh ') && command.includes('if-shell -F'))
+      ).toHaveLength(0);
+      native.owner = 'replacement-owner';
+    }
+  } finally {
+    release();
+  }
+  expect(await pending).toBe(kind === 'ack');
+  expect(manager.getSession(native.sessionId) === undefined).toBe(kind === 'ack');
+  const kills = effects.exec.mock.calls.filter(([command]) => command.includes('if-shell -F'));
+  expect(kills.length).toBe(
+    kind === 'ack' || kind === 'local-lost'
+      ? 2
+      : ['remote-lost', 'remote-refused', 'aba', 'held-owner'].includes(kind)
+        ? 1
+        : 0
+  );
+  expect(effects.sync).not.toHaveBeenCalled();
+});

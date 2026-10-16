@@ -28,6 +28,17 @@ const SUPERVISOR_UI_REASONS = Object.freeze({
 function supervisorUiTranslate(text) {
   return window.CodemanI18n?.t(text) ?? text;
 }
+function supervisorUiUsageText(usage) {
+  if (usage?.source !== 'codeman-session-counter-estimate' || usage.available !== true)
+    return supervisorUiTranslate('Usage unavailable; provider quota unknown');
+  const parts = [];
+  const positive = (value) => typeof value === 'number' && Number.isFinite(value) && value > 0;
+  if (positive(usage.inputTokens)) parts.push(`${usage.inputTokens.toLocaleString()} input tokens`);
+  if (positive(usage.outputTokens)) parts.push(`${usage.outputTokens.toLocaleString()} output tokens`);
+  if (positive(usage.costEstimate)) parts.push(`$${usage.costEstimate.toFixed(4)} cost estimate`);
+  if (!parts.length) return supervisorUiTranslate('Usage unavailable; provider quota unknown');
+  return `${parts.join(', ')} — counter estimate; age unknown; provider quota unknown`;
+}
 const SUPERVISOR_UI_REQUEST_STORAGE = 'codeman:supervisorWorkerRequests:v1';
 function supervisorUiRequestLedger() {
   const raw = sessionStorage.getItem(SUPERVISOR_UI_REQUEST_STORAGE);
@@ -112,6 +123,11 @@ function supervisorUiStateValid(state, sessionId) {
     /^[^\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f]*$/.test(value);
   const number = (value) => typeof value === 'number' && Number.isFinite(value);
   const range = (value, min, max) => Number.isInteger(value) && value >= min && value <= max;
+  const operation = (value) =>
+    ['assign', 'retry', 'message'].includes(value.action) &&
+    (value.action === 'message'
+      ? typeof value.payloadHash === 'string' && /^[a-f0-9]{64}$/.test(value.payloadHash)
+      : value.payloadHash === undefined);
   const workers = new Set();
   for (const worker of state.workers) {
     if (
@@ -122,6 +138,9 @@ function supervisorUiStateValid(state, sessionId) {
       !range(worker.assignments, 0, 10) ||
       !range(worker.maxAssignments, 1, 10) ||
       !range(worker.maxRuntimeMs, 1000, 86400000) ||
+      (worker.allowMessages !== undefined && typeof worker.allowMessages !== 'boolean') ||
+      (worker.maxMessages !== undefined && !range(worker.maxMessages, 1, 100)) ||
+      (worker.messages !== undefined && !range(worker.messages, 0, 100)) ||
       (worker.startedAt !== undefined && !number(worker.startedAt)) ||
       (worker.lastRequestId !== undefined && !requestId(worker.lastRequestId)) ||
       !Array.isArray(worker.criteria) ||
@@ -165,7 +184,7 @@ function supervisorUiStateValid(state, sessionId) {
       !flight ||
       !requestId(flight.requestId) ||
       !id(flight.workerId) ||
-      !['assign', 'retry'].includes(flight.action) ||
+      !operation(flight) ||
       !number(flight.reservedAt)
     )
       return false;
@@ -179,7 +198,7 @@ function supervisorUiStateValid(state, sessionId) {
       !requestId(binding.requestId) ||
       typeof binding.workerId !== 'string' ||
       !/^[\w-]{8,100}$/.test(binding.workerId) ||
-      !['assign', 'retry'].includes(binding.action) ||
+      !operation(binding) ||
       !ids.has(binding.requestId) ||
       boundIds.has(binding.requestId)
     )
@@ -265,6 +284,8 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('supervisorReason').textContent = supervisorUiTranslate(
       SUPERVISOR_UI_REASONS[state?.reason] ?? state?.reason ?? '—'
     );
+    const usage = document.getElementById('supervisorUsage');
+    if (usage) usage.textContent = supervisorUiUsageText(state?.usage);
     document.getElementById('supervisorSettings').disabled = !available;
     document.getElementById('supervisorPrepareBtn').disabled =
       !available || state.phase === 'active' || !!state.inFlight;
@@ -281,16 +302,25 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('supervisorObjective').value = state.objective;
       document.getElementById('supervisorEnabled').checked = state.enabled;
       document.getElementById('supervisorWorkers').value = JSON.stringify(
-        state.workers.map(({ sessionId, task, criteria, maxAssignments, maxRuntimeMs }) => ({
-          sessionId,
-          task,
-          criteria,
-          maxAssignments,
-          maxRuntimeMs,
-        })),
+        state.workers.map(
+          ({ sessionId, task, criteria, maxAssignments, maxRuntimeMs, allowMessages, maxMessages }) => ({
+            sessionId,
+            task,
+            criteria,
+            maxAssignments,
+            maxRuntimeMs,
+            ...(allowMessages === undefined ? {} : { allowMessages }),
+            ...(maxMessages === undefined ? {} : { maxMessages }),
+          })
+        ),
         null,
         2
       );
+      const messageGrant = document.getElementById('supervisorAllowMessages');
+      const allowed = state.workers.filter((worker) => worker.allowMessages === true).length;
+      messageGrant.checked = state.workers.length > 0 && allowed === state.workers.length;
+      messageGrant.indeterminate = allowed > 0 && allowed < state.workers.length;
+      view.messageGrantEdited = false;
     }
     const inspections = new Map((view?.workerStatus ?? []).map((worker) => [worker.sessionId, worker]));
     const list = document.getElementById('supervisorWorkerStatus');
@@ -309,6 +339,9 @@ Object.assign(CodemanApp.prototype, {
       const stale = uncertainty ? ` (${uncertainty})` : inspection?.stale ? ' (stale)' : '';
       evidence.textContent = `${worker.sessionId.slice(0, 8)} — ${worker.assignments}/${worker.maxAssignments} assignments — ${inspection?.health ?? 'not inspected'}${stale}${inspection?.task?.phase ? ` — task ${inspection.task.phase}` : ''}`;
       row.appendChild(evidence);
+      const usageEvidence = document.createElement('span');
+      usageEvidence.textContent = supervisorUiUsageText(inspection?.usage);
+      row.appendChild(usageEvidence);
       const assign = document.createElement('button');
       assign.className = 'btn-toolbar btn-sm';
       assign.textContent = 'Assign task';
@@ -410,6 +443,10 @@ Object.assign(CodemanApp.prototype, {
     if (!Array.isArray(workers)) {
       this.showToast(supervisorUiTranslate('Worker configuration must be a JSON array'), 'warning');
       return;
+    }
+    if (view.messageGrantEdited) {
+      const allowed = document.getElementById('supervisorAllowMessages').checked;
+      workers = workers.map((worker) => ({ ...worker, allowMessages: allowed }));
     }
     await this._performSupervisorRequest('', 'PUT', {
       objective: document.getElementById('supervisorObjective').value.trim(),

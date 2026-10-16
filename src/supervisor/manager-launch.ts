@@ -368,7 +368,14 @@ export async function prepareSupervisorManagerLaunch(options: {
           codeman_supervisor: {
             command: options.bridgeCommand,
             args: [...options.bridgeArgs, '--credential-file', credentialFile],
-            enabled_tools: ['supervisor_status', 'supervisor_workers', 'supervisor_assign', 'supervisor_retry'],
+            enabled_tools: [
+              'supervisor_status',
+              'supervisor_workers',
+              'supervisor_assign',
+              'supervisor_retry',
+              'supervisor_message',
+              'supervisor_brain',
+            ],
             required: true,
           },
         },

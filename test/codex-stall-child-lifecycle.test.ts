@@ -33,7 +33,8 @@ vi.mock('../src/recovery/remote-clock.js', async (original) => ({
 }));
 const clockAt = (at = Date.now()) => ({ localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at });
 
-vi.mock('../src/session-env-clamp.js', () => ({
+vi.mock('../src/session-env-clamp.js', async (original) => ({
+  ...(await original<typeof import('../src/session-env-clamp.js')>()),
   clampExternalCliConfigsForOwner: vi.fn(async (_owner, configs) => configs),
   clampEnvOverridesForOwner: vi.fn(async (_owner, env) => env),
 }));
@@ -51,6 +52,75 @@ beforeEach(() => {
 afterEach(() => vi.useRealTimers());
 
 describe('actual local stall controller with an abnormally dead owned pane', () => {
+  it.each(['pane-id', 'pane-pid', 'missing', 'unchanged', 'actual-failure', 'unknown'] as const)(
+    'certifies only late Session pane evidence withdrawal before native effects: %s',
+    async (change) => {
+      const f = await createChildLifecycleFixture(
+        returnedChildTail('collab_resume_end', 'completed'),
+        true,
+        false,
+        true,
+        { maxRetries: 1 }
+      );
+      // Exercise the real Session lifecycle boundary, not the helper's delivery
+      // stub. The multiplexer below owns every possible worker effect.
+      f.delivered.mockRestore();
+      const mux = Reflect.get(f.session, '_mux');
+      const respawn = vi.fn(async (options) => {
+        if (change === 'actual-failure') {
+          options.recoveryDispatchGuard.noteRefusal();
+          return null;
+        }
+        options.recoveryDispatchGuard.noteDispatch();
+        if (change === 'unknown') throw new Error('Fixture uncertain native dispatch');
+        return 701;
+      });
+      mux.respawnPane = respawn;
+      const inspect = f.session.inspectRecoveryPane.bind(f.session);
+      let finalReads = 0;
+      const inspection = vi.spyOn(f.session, 'inspectRecoveryPane').mockImplementation(async () => {
+        const pane = await inspect();
+        if (!Reflect.get(f.session, '_recoveryDelivering')) return pane;
+        finalReads++;
+        if (change === 'missing') return null;
+        if (change === 'pane-id') return { ...pane!, paneId: '%8' };
+        if (change === 'pane-pid') return { ...pane!, panePid: 701 };
+        return pane;
+      });
+      try {
+        await f.controller.refresh();
+        vi.setSystemTime(CHILD_NOW + 2000);
+        await f.controller.refresh();
+        expect(f.controller.getStatus().pending).toMatchObject({ action: 'restart', reason: 'stalled' });
+        vi.setSystemTime(CHILD_NOW + 3000);
+        await f.controller.refresh();
+        expect(finalReads).toBe(1);
+        const withdrawn = ['pane-id', 'pane-pid', 'missing'].includes(change);
+        expect(respawn).toHaveBeenCalledTimes(withdrawn ? 0 : 1);
+        const state = f.controller.getStatus();
+        expect(state).toMatchObject({
+          attempts: withdrawn ? 0 : 1,
+          failedAttempts: change === 'actual-failure' || change === 'unknown' ? 1 : 0,
+          circuitOpen: change === 'actual-failure',
+        });
+        expect(!!state.inFlight).toBe(change === 'unchanged' || change === 'unknown');
+        const reloaded = new RecoveryStore(Reflect.get(f.store, 'path')).get(f.session.id);
+        expect(reloaded.attempts).toBe(state.attempts);
+        expect(reloaded.failedAttempts).toBe(state.failedAttempts);
+        expect(reloaded.inFlight).toEqual(state.inFlight);
+        if (withdrawn) {
+          expect(state.pending).toBeUndefined();
+          expect(state.nextRetryAt).toBeUndefined();
+          expect(state.history.some((event) => event.reason === 'delivery-failed')).toBe(false);
+        } else if (change === 'actual-failure') expect(state.lastReason).toBe('delivery-failed');
+        else if (change === 'unknown') expect(state.lastReason).toBe('acceptance-unverified');
+      } finally {
+        inspection.mockRestore();
+        await f.cleanup();
+      }
+    }
+  );
+
   it.each([false, true].flatMap((remote) => [false, true].map((recentStop) => ({ remote, recentStop }))))(
     'does not reclassify an owner-stopped unfinished worker as live silence (SSH=$remote, recent stop=$recentStop)',
     async ({ remote, recentStop }) => {

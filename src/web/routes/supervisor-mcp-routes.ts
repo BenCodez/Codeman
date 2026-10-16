@@ -1,6 +1,7 @@
-/** Four manager tools; authenticated launch scope supplies the manager identity. */
+/** Scoped manager tools; authenticated launch scope supplies the manager identity. */
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { PromptTextSchema } from '../../supervision/schema.js';
 import type { SupervisorController } from '../../supervisor/controller.js';
 import { ManagerCredentialRegistry, type SupervisorManagerScope } from '../../supervisor/manager-credentials.js';
 import { getSupervisorManagerScope, SUPERVISOR_MCP_PATH } from '../middleware/supervisor-manager-auth.js';
@@ -19,8 +20,21 @@ export interface SupervisorMcpContext {
           requestId: string,
           isCurrent?: () => boolean
         ): ReturnType<SupervisorController['retry']>;
+        message?(workerId: string, requestId: string, message: string, isCurrent?: () => boolean): Promise<unknown>;
+        getManagerUsage?(): unknown;
+        captureBrainAuthority?(isCurrent: () => boolean): Promise<(() => boolean) | undefined>;
       })
     | undefined;
+  brain?: {
+    read(scope: SupervisorManagerScope, current: () => boolean): Promise<unknown>;
+    append(
+      scope: SupervisorManagerScope,
+      requestId: string,
+      note: string,
+      ifMatch: string,
+      current: () => boolean
+    ): Promise<unknown>;
+  };
 }
 const Empty = z.object({}).strict();
 const Operation = z
@@ -29,6 +43,22 @@ const Operation = z
     requestId: z.string().regex(/^[\w:.-]{8,120}$/),
   })
   .strict();
+const Message = Operation.extend({
+  message: PromptTextSchema.min(1)
+    .max(4000)
+    .refine((text) => !!text.trim()),
+});
+const Brain = z.discriminatedUnion('mode', [
+  z.object({ mode: z.literal('read') }).strict(),
+  z
+    .object({
+      mode: z.literal('append'),
+      requestId: z.string().regex(/^[\w-]{8,100}$/),
+      note: PromptTextSchema.min(1).max(2000),
+      ifMatch: z.string().regex(/^[a-f0-9]{64}$/),
+    })
+    .strict(),
+]);
 const Request = z
   .object({
     jsonrpc: z.literal('2.0'),
@@ -37,7 +67,14 @@ const Request = z
     params: z.unknown().optional(),
   })
   .strict();
-const toolNames = ['supervisor_status', 'supervisor_workers', 'supervisor_assign', 'supervisor_retry'] as const;
+const toolNames = [
+  'supervisor_status',
+  'supervisor_workers',
+  'supervisor_assign',
+  'supervisor_retry',
+  'supervisor_message',
+  'supervisor_brain',
+] as const;
 const tools = toolNames.map((name) => ({
   name,
   description: {
@@ -45,19 +82,36 @@ const tools = toolNames.map((name) => ({
     supervisor_workers: "Inspect only this role's owner-selected workers.",
     supervisor_assign: 'Start an owner-configured worker task; retain requestId after an uncertain response.',
     supervisor_retry: 'Retry a verified worker crash; retain requestId after an uncertain response.',
+    supervisor_message:
+      'Send a concise owner-authorized instruction only to a selected idle worker with an explicit messaging grant. Retain requestId on uncertainty.',
+    supervisor_brain:
+      'Read owner-taught brain.md, or append a bounded management note with its exact revision and a durable requestId. Never changes owner instructions silently.',
   }[name],
   inputSchema:
-    name === 'supervisor_assign' || name === 'supervisor_retry'
+    name === 'supervisor_brain'
       ? {
           type: 'object',
           properties: {
-            workerId: { type: 'string', pattern: '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' },
-            requestId: { type: 'string', minLength: 8, maxLength: 120, pattern: '^[A-Za-z0-9_:.-]+$' },
+            mode: { enum: ['read', 'append'] },
+            requestId: { type: 'string', minLength: 8, maxLength: 100, pattern: '^[A-Za-z0-9_-]+$' },
+            note: { type: 'string', minLength: 1, maxLength: 2000 },
+            ifMatch: { type: 'string', pattern: '^[a-f0-9]{64}$' },
           },
-          required: ['workerId', 'requestId'],
+          required: ['mode'],
           additionalProperties: false,
         }
-      : { type: 'object', properties: {}, additionalProperties: false },
+      : name === 'supervisor_assign' || name === 'supervisor_retry' || name === 'supervisor_message'
+        ? {
+            type: 'object',
+            properties: {
+              workerId: { type: 'string', pattern: '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' },
+              requestId: { type: 'string', minLength: 8, maxLength: 120, pattern: '^[A-Za-z0-9_:.-]+$' },
+              ...(name === 'supervisor_message' ? { message: { type: 'string', minLength: 1, maxLength: 4000 } } : {}),
+            },
+            required: ['workerId', 'requestId', ...(name === 'supervisor_message' ? ['message'] : [])],
+            additionalProperties: false,
+          }
+        : { type: 'object', properties: {}, additionalProperties: false },
 }));
 
 export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: SupervisorMcpContext): void {
@@ -142,26 +196,67 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
       if (method !== 'tools/call') return fail(id, -32601, 'Unknown manager RPC method');
       const call = z
         .object({
-          name: z.enum(['supervisor_status', 'supervisor_workers', 'supervisor_assign', 'supervisor_retry']),
+          name: z.enum(toolNames),
           arguments: z.unknown().optional(),
         })
         .strict()
         .safeParse(params);
       if (!call.success) return fail(id, -32602, 'Unknown or invalid manager tool');
-      operation = call.data.name === 'supervisor_assign' || call.data.name === 'supervisor_retry';
+      const rawArguments = call.data.arguments === undefined ? {} : call.data.arguments;
+      const brain = call.data.name === 'supervisor_brain' ? Brain.safeParse(rawArguments) : undefined;
+      operation =
+        call.data.name === 'supervisor_assign' ||
+        call.data.name === 'supervisor_retry' ||
+        call.data.name === 'supervisor_message' ||
+        (brain?.success === true && brain.data.mode === 'append');
       if (operation && !ctx.credentials.canOperate(scope))
         return fail(id, -32001, 'Manager preparation is uncertain; only status and worker inspection are available');
-      const args = (operation ? Operation : Empty).safeParse(
-        call.data.arguments === undefined ? {} : call.data.arguments
-      );
+      const args = (
+        call.data.name === 'supervisor_brain'
+          ? Brain
+          : call.data.name === 'supervisor_message'
+            ? Message
+            : operation
+              ? Operation
+              : Empty
+      ).safeParse(rawArguments);
       if (!args.success) return fail(id, -32602, 'Invalid manager tool arguments');
       const controller = ctx.resolveController(scope);
       if (!controller || !current()) return fail(id, -32001, 'Manager role is no longer current');
       let result: unknown;
-      if (call.data.name === 'supervisor_status') result = controller.getStatus();
+      if (call.data.name === 'supervisor_status')
+        result = {
+          ...controller.getStatus(),
+          usage: controller.getManagerUsage?.() ?? {
+            source: 'codeman-session-counter-estimate',
+            available: false,
+            stale: true,
+            providerQuota: 'unknown',
+          },
+        };
       else if (call.data.name === 'supervisor_workers')
         result = await controller.inspectWorkers(!ctx.credentials.canOperate(scope));
-      else {
+      else if (call.data.name === 'supervisor_brain') {
+        const selected = Brain.parse(args.data);
+        if (!ctx.brain) return fail(id, -32001, 'Manager brain is unavailable');
+        if (selected.mode === 'read') result = await ctx.brain.read(scope, current);
+        else {
+          const authority = await controller.captureBrainAuthority?.(current);
+          if (!authority || !authority()) return fail(id, -32001, 'Current prepared manager authority is required');
+          result = await ctx.brain.append(
+            scope,
+            selected.requestId,
+            selected.note,
+            selected.ifMatch,
+            () => current() && authority()
+          );
+        }
+      } else if (call.data.name === 'supervisor_message') {
+        const selected = Message.parse(args.data);
+        if (selected.workerId === scope.sessionId || !controller.message)
+          return fail(id, -32602, 'Worker messaging is unavailable');
+        result = await controller.message(selected.workerId, selected.requestId, selected.message, current);
+      } else {
         const selected = Operation.parse(args.data);
         if (selected.workerId === scope.sessionId) return fail(id, -32602, 'A manager cannot operate on itself');
         result = await controller[call.data.name === 'supervisor_assign' ? 'assign' : 'retry'](

@@ -1658,16 +1658,40 @@
               <p class="set-section-blurb">Assign this local isolated Codex session to manage selected owned Codex workers through guarded task and recovery controllers. The role is off by default and requires server authentication. The manager and local workers need distinct authorized <code>CODEX_HOME</code> directories. Submit an ordinary prompt through Codeman in each current isolated <code>--no-daemon</code> conversation to establish its verified Codex identity, then wait for the manager to become idle. A launch or resume seed alone cannot authorize automatic input.</p>
               <p id="supervisorError" role="alert" hidden>Supervisor is unavailable for this session. Local managed Codex, isolation, owner access, and verified identity are required.</p>
               <div class="set-group"><h4>Codex process isolation</h4><p class="set-group-hint">To create an isolated conversation, set the <code>--no-daemon</code> and <code>--no-alt-screen</code> launch defaults under App Settings → Codex, then create a new local session and submit its first prompt. Select Prepare restricted manager to explicitly resume the verified manager conversation with restricted supervisor tools and a scoped credential. Preparation refuses active work, pending child work, unknown identity and uncertain delivery. Start requires a verified restricted launch; an ordinary Codex process cannot adopt the role.</p></div>
-              <div class="set-group"><h4>Supervisor status</h4><dl class="task-status-grid"><dt>Phase</dt><dd id="supervisorPhase">Loading</dd><dt>Reason</dt><dd id="supervisorReason">—</dd></dl>
+              <div class="set-group"><h4>Supervisor status</h4><dl class="task-status-grid"><dt>Phase</dt><dd id="supervisorPhase">Loading</dd><dt>Reason</dt><dd id="supervisorReason">—</dd><dt>Usage</dt><dd id="supervisorUsage">Unknown</dd></dl>
                 <div class="task-actions"><button class="btn-toolbar" id="supervisorPrepareBtn" onclick="app.prepareSupervisorManager()">Prepare restricted manager</button><button class="btn-toolbar" id="supervisorStartBtn" onclick="app.supervisorAction('start')">Start manager</button><button class="btn-toolbar" id="supervisorPauseBtn" onclick="app.supervisorAction('pause')">Pause</button><button class="btn-toolbar" id="supervisorResetBtn" onclick="app.supervisorAction('reset')">Reset</button><button class="btn-toolbar" onclick="app.loadSupervisorStatus()">Refresh</button></div>
               </div>
               <fieldset class="set-group task-form" id="supervisorSettings" disabled><legend>Owner configuration</legend>
                 <label for="supervisorObjective">Manager objective</label><textarea class="set-textarea" id="supervisorObjective" maxlength="3000" rows="3"></textarea>
                 <label><input type="checkbox" id="supervisorEnabled"> Enable supervisor role</label>
+                <label><input type="checkbox" id="supervisorAllowMessages" onchange="if(app._supervisorView) app._supervisorView.messageGrantEdited = true"> Allow the manager to send instructions to all selected workers on my behalf</label>
+                <p class="set-group-hint">Messages are attributed to this manager and retain delivery, ownership and approval checks. You can grant individual workers permission with <code>allowMessages</code> and bound it with <code>maxMessages</code> in their plans.</p>
                 <label for="supervisorWorkers">Worker plans (JSON)</label><textarea class="set-textarea" id="supervisorWorkers" rows="12" spellcheck="false" placeholder='[{"sessionId":"...","task":"...","criteria":[{"id":"tests","description":"Tests pass","kind":"command","command":"npm test"}],"maxAssignments":3,"maxRuntimeMs":900000}]'></textarea>
                 <p class="set-group-hint">Each worker needs an explicit task, acceptance criteria, assignment budget, and runtime. Manual criteria remain owner-only. Unsupported or discovered remote transports, Docker, foreign-owner, self, cyclic, and already-leased workers are refused.</p>
                 <button class="btn-toolbar" onclick="app.saveSupervisorConfiguration()">Save supervisor configuration</button>
               </fieldset>
+              <details class="set-group" id="supervisorAutomationPanel" ontoggle="if(this.open) app.loadSupervisorAutomation()">
+                <summary>Scheduled check-ins and custom tasks</summary>
+                <p class="set-group-hint">Reuse this prepared manager. Runs wait for idle state and respect pauses, approvals and existing runtime limits. A missed interval does not launch a burst of catch-up work.</p>
+                <p id="supervisorAutomationStatus" role="status">Open to load schedules.</p>
+                <button class="btn-toolbar" onclick="app.loadSupervisorAutomation(true)">Refresh schedules</button>
+                <fieldset class="task-form" id="supervisorAutomationSettings" disabled>
+                  <label><input type="checkbox" id="supervisorCheckInsEnabled"> Enable periodic check-ins</label>
+                  <label for="supervisorCheckInMinutes">Check every (minutes)</label><input class="set-input" id="supervisorCheckInMinutes" type="number" min="1" max="1440" value="60">
+                  <div id="supervisorCustomTasks"></div>
+                  <div class="task-actions"><button class="btn-toolbar" onclick="app.addSupervisorCustomTask()">Add custom task</button><button class="btn-toolbar" onclick="app.saveSupervisorAutomation()">Save schedules</button></div>
+                </fieldset>
+              </details>
+              <details class="set-group" id="supervisorBrainPanel" ontoggle="if(this.open) app.loadSupervisorBrain()">
+                <summary>Manager memory — brain.md</summary>
+                <p class="set-group-hint">Teach the manager your goals, worker roles, preferences and prompting conventions. The manager can retain compact notes here. Memory persists across check-ins; live worker and usage evidence still takes precedence over old notes.</p>
+                <p id="supervisorBrainStatus" role="status">Open to load memory.</p>
+                <button class="btn-toolbar" onclick="app.loadSupervisorBrain(true)">Refresh memory</button>
+                <fieldset class="task-form" id="supervisorBrainSettings" disabled>
+                  <label for="supervisorBrainMarkdown">brain.md</label><textarea class="set-textarea" id="supervisorBrainMarkdown" rows="12" maxlength="32768" spellcheck="false" placeholder="# Manager instructions&#10;&#10;## Goals&#10;&#10;## Worker roles&#10;&#10;## Prompting conventions&#10;&#10;## Usage and budgets"></textarea>
+                  <button class="btn-toolbar" onclick="app.saveSupervisorBrain()">Save memory</button>
+                </fieldset>
+              </details>
               <div class="set-group"><h4>Selected workers</h4><p class="set-group-hint">Health and task state come from bounded controller inspection. Stale or unknown evidence never enables crash retry.</p><div class="task-actions"><button class="btn-toolbar" onclick="app.loadSupervisorWorkers()">Refresh worker evidence</button></div><ol id="supervisorWorkerStatus" class="task-history"></ol></div>
             </section>
 
@@ -4294,6 +4318,8 @@
   <script defer src="recovery-ui.js"></script>
   <script defer src="supervision-ui.js"></script>
   <script defer src="supervisor-ui.js"></script>
+  <script defer src="supervisor-automation-ui.js"></script>
+  <script defer src="supervisor-brain-ui.js"></script>
   <script defer src="ralph-panel.js"></script>
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>

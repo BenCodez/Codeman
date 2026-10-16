@@ -308,6 +308,8 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
     'supervisor_workers',
     'supervisor_assign',
     'supervisor_retry',
+    'supervisor_message',
+    'supervisor_brain',
   ]);
   const credentialFile = servers.codeman_supervisor.args.at(-1)!;
   expect(JSON.parse(await fs.readFile(credentialFile, 'utf8'))).toEqual({

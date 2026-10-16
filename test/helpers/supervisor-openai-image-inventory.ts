@@ -127,6 +127,48 @@ try {
     { mode: 0o600 }
   );
   await fs.writeFile(join(home, 'config.toml'), '[features]\nimage_generation = true\n', { mode: 0o600 });
+  const toolNames = [
+    'supervisor_status',
+    'supervisor_workers',
+    'supervisor_assign',
+    'supervisor_retry',
+    'supervisor_message',
+    'supervisor_brain',
+  ];
+  const operationProperties = {
+    workerId: { type: 'string', pattern: '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' },
+    requestId: { type: 'string', minLength: 8, maxLength: 120, pattern: '^[A-Za-z0-9_:.-]+$' },
+  };
+  const inventoryTools = toolNames.map((name) => ({
+    name,
+    description: 'Inert inventory only; calls never dispatch',
+    inputSchema:
+      name === 'supervisor_brain'
+        ? {
+            type: 'object',
+            properties: {
+              mode: { enum: ['read', 'append'] },
+              requestId: { type: 'string', minLength: 8, maxLength: 100, pattern: '^[A-Za-z0-9_-]+$' },
+              note: { type: 'string', minLength: 1, maxLength: 2000 },
+              ifMatch: { type: 'string', pattern: '^[a-f0-9]{64}$' },
+            },
+            required: ['mode'],
+            additionalProperties: false,
+          }
+        : ['supervisor_assign', 'supervisor_retry', 'supervisor_message'].includes(name)
+          ? {
+              type: 'object',
+              properties: {
+                ...operationProperties,
+                ...(name === 'supervisor_message'
+                  ? { message: { type: 'string', minLength: 1, maxLength: 4000 } }
+                  : {}),
+              },
+              required: ['workerId', 'requestId', ...(name === 'supervisor_message' ? ['message'] : [])],
+              additionalProperties: false,
+            }
+          : { type: 'object', properties: {}, additionalProperties: false },
+  }));
   const mcp = join(root, 'inert-mcp.mjs');
   await fs.writeFile(
     mcp,
@@ -135,7 +177,7 @@ for await(const line of readline.createInterface({input:process.stdin})) {
  const q=JSON.parse(line); if(q.id===undefined)continue;
  let result;
  if(q.method==='initialize')result={protocolVersion:q.params.protocolVersion,capabilities:{tools:{}},serverInfo:{name:'inventory-only',version:'1'}};
- else if(q.method==='tools/list')result={tools:['supervisor_status','supervisor_workers','supervisor_assign','supervisor_retry'].map(name=>({name,description:'Inert inventory only',inputSchema:{type:'object',properties:{}}}))};
+ else if(q.method==='tools/list')result={tools:${JSON.stringify(inventoryTools)}};
  else if(q.method==='ping')result={};
  else {process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,error:{code:-32601,message:'No actions permitted'}})+'\\n');continue;}
  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result})+'\\n');
@@ -219,11 +261,19 @@ for await(const line of readline.createInterface({input:process.stdin})) {
       mode === 'image-enabled-control',
       `Incorrect image-generation exposure in ${mode}: ${JSON.stringify(record.tools)}`
     );
-    for (const tool of ['supervisor_status', 'supervisor_workers', 'supervisor_assign', 'supervisor_retry'])
+    for (const tool of toolNames)
       assert(
         record.tools.some((name) => name === tool || name.endsWith(`__${tool}`) || name.endsWith(`.${tool}`)),
         `Missing direct ${tool} in ${mode}`
       );
+    assert.deepEqual(
+      record.tools
+        .filter((name) => /(?:^|__|\.)supervisor_/.test(name))
+        .map((name) => name.split(/__|\./).at(-1))
+        .sort(),
+      [...toolNames].sort(),
+      'Unexpected manager tool exposure'
+    );
     assert(
       !record.tools.some((name) => ['exec', 'wait', 'apply_patch', 'exec_command', 'view_image'].includes(name)),
       'Unexpected worker tool exposure'

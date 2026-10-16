@@ -170,6 +170,29 @@ describe('server supervisor lease reconciliation', () => {
   });
 
   it.each(['stopped', 'breaker'] as const)(
+    'rejects re-enabling an ineligible existing manager before leasing workers (%s)',
+    async (kind) => {
+      internals.sessions.set(OLD, old);
+      const manager = internals.getSupervisorController(old)!;
+      await manager.reset();
+      await revoke(kind);
+      const app = await route();
+      const enabling = await app.inject({ method: 'PUT', url: `/api/sessions/${OLD}/supervisor`, payload: config });
+      expect(enabling.statusCode).toBe(400);
+      expect(manager.getStatus().enabled).toBe(false);
+      expect(internals.supervisorStore.get(OLD).enabled).toBe(false);
+      expect(internals.supervisorLeaseHolder(WORKER, NEXT)).toBeUndefined();
+      const disabling = await app.inject({
+        method: 'PUT',
+        url: `/api/sessions/${OLD}/supervisor`,
+        payload: { ...config, enabled: false },
+      });
+      expect(disabling.statusCode).toBe(200);
+      expect((await app.inject({ method: 'POST', url: `/api/sessions/${OLD}/supervisor/reset` })).statusCode).toBe(200);
+    }
+  );
+
+  it.each(['stopped', 'breaker'] as const)(
     'keeps owner status/pause/reset available for an existing %s manager and releases its durable lease',
     async (kind) => {
       internals.sessions.set(OLD, old);

@@ -223,16 +223,20 @@ def supervisor_rows_valid(value):
         if not isinstance(workers,list) or len(workers)>12: return False
         for worker in workers:
             needed={'sessionId','task','criteria','maxAssignments','maxRuntimeMs','assignments'}
-            if not isinstance(worker,dict) or not needed<=set(worker)<=needed|{'startedAt','lastRequestId'} or not supervisor_identity(worker['sessionId']) or not bounded_text(worker['task'],4000,1,True) or not task_criteria_valid(worker['criteria'],False): return False
+            if not isinstance(worker,dict) or not needed<=set(worker)<=needed|{'startedAt','lastRequestId','allowMessages','maxMessages','messages'} or not supervisor_identity(worker['sessionId']) or not bounded_text(worker['task'],4000,1,True) or not task_criteria_valid(worker['criteria'],False): return False
             # Python \w accepts Unicode; the application schema's JavaScript
             # identifiers are ASCII. Preserve that stricter native boundary.
             if any(not re.fullmatch(r'[A-Za-z0-9_-]{1,80}',c['id']) for c in worker['criteria']): return False
             if not bounded_integer(worker['maxAssignments'],1,10) or not bounded_integer(worker['maxRuntimeMs'],1000,86400000) or not bounded_integer(worker['assignments'],0,10): return False
             if ('startedAt' in worker and not finite_number(worker['startedAt'])) or ('lastRequestId' in worker and not supervisor_request(worker['lastRequestId'])): return False
+            if ('allowMessages' in worker and type(worker['allowMessages']) is not bool) or ('maxMessages' in worker and not bounded_integer(worker['maxMessages'],1,100)) or ('messages' in worker and not bounded_integer(worker['messages'],0,100)): return False
         requests=row['handledRequestIds']; bindings=row['handledRequestBindings']
         if not isinstance(requests,list) or len(requests)>128 or any(not supervisor_request(v) for v in requests) or len(set(requests))!=len(requests) or not isinstance(bindings,list) or len(bindings)>128: return False
         for binding in bindings:
-            if not isinstance(binding,dict) or set(binding)!={'requestId','workerId','action'} or not supervisor_request(binding['requestId']) or not supervisor_identity(binding['workerId']) or binding['action'] not in ('assign','retry'): return False
+            if not isinstance(binding,dict) or not {'requestId','workerId','action'}<=set(binding)<={'requestId','workerId','action','payloadHash'} or not supervisor_request(binding['requestId']) or not supervisor_identity(binding['workerId']) or binding['action'] not in ('assign','retry','message'): return False
+            if binding['action']=='message':
+                if not isinstance(binding.get('payloadHash'),str) or not re.fullmatch(r'[a-f0-9]{64}',binding['payloadHash']): return False
+            elif 'payloadHash' in binding: return False
         if len(bindings)!=len(requests) or len({b['requestId'] for b in bindings})!=len(bindings) or {b['requestId'] for b in bindings}!=set(requests): return False
         events=row['history']
         if not isinstance(events,list) or len(events)>100: return False

@@ -4,6 +4,7 @@ import {
   initialTaskState,
   TaskUpdateSchema,
   TaskProgressSchema,
+  PromptTextSchema,
   type TaskState,
   type TaskUpdate,
   type TaskProgress,
@@ -16,6 +17,7 @@ import {
 } from './evidence.js';
 import { formatTaskPrompt, taskPromptFits } from './prompt.js';
 import { earliestActionDeadline } from '../recovery/action-deadline.js';
+import { delegatedInstructionPrompt } from './delegated-instruction.js';
 import type { TaskSaveAuthority } from './store.js';
 import {
   CONTINUATION_PROMPT,
@@ -116,6 +118,103 @@ export class TaskController {
       !this.state.agentProgressVeto &&
       !['blocked', 'completed'].includes(this.state.outcome) &&
       this.state.continuations < this.state.config.maxContinuations;
+  }
+  /** An already-reserved instruction may spend the final budget slot; owner intent still revokes it. */
+  captureInstructionAuthority(): () => boolean {
+    const revision = this.revision;
+    return () =>
+      this.actionIsCurrent(revision) &&
+      this.state.config.enabled &&
+      this.state.phase === 'watching' &&
+      !this.state.agentProgressVeto &&
+      !['blocked', 'completed'].includes(this.state.outcome);
+  }
+
+  /** Accounted, serialized delegated input into an idle unfinished task; never raw owner input. */
+  deliverInstruction(
+    instructions: string,
+    source: string,
+    external: RecoveryActionAuthority
+  ): Promise<'sent' | 'not-sent' | 'unknown'> {
+    PromptTextSchema.min(1).max(4000).parse(instructions);
+    if (!/^[\w:.-]{1,140}$/.test(source)) throw new TaskValidationError('Invalid delegated instruction source');
+    const revision = this.revision;
+    return this.enqueue(async () => {
+      this.requireCurrent(revision);
+      if (
+        !external() ||
+        !this.state.config.enabled ||
+        this.state.phase !== 'watching' ||
+        this.state.agentProgressVeto ||
+        this.state.inFlight ||
+        this.state.outcome !== 'unfinished' ||
+        !this.state.checkpoint ||
+        !this.state.nextAction ||
+        acceptanceCriteriaComplete(this.state) ||
+        this.runtimeBudgetExpired() ||
+        this.state.continuations >= this.state.config.maxContinuations
+      )
+        return 'not-sent';
+      const observed = await this.deps.observe(),
+        o = observed.observation;
+      const authority = this.actionAuthority(revision, external);
+      if (
+        !authority() ||
+        !this.completedTurnIsCurrent(o) ||
+        o.activity !== 'completed' ||
+        !o.turnId ||
+        !o.conversationId ||
+        !o.processReady
+      )
+        return 'not-sent';
+      const key = `${o.conversationId}:task:${o.turnId}`;
+      if (this.state.handledEvidence.includes(key) || o.at < this.evidenceBoundary()) return 'not-sent';
+      const prompt = delegatedInstructionPrompt(this.state, instructions, source);
+      try {
+        await this.requirePromptAdmission(prompt, authority, observed);
+      } catch {
+        return 'not-sent';
+      }
+      if (!authority()) return 'not-sent';
+      this.state.inFlight = {
+        key,
+        startedAt: this.now(),
+        action: 'continue',
+        promptHash: createHash('sha256').update(prompt.trim()).digest('hex'),
+        previousSubmissionKey: o.submissionKey,
+      };
+      this.state.handledEvidence = [...this.state.handledEvidence, key].slice(-32);
+      this.state.continuations++;
+      this.reserveProgressBoundary(o, observed.marker, true);
+      await this.save('delegated-instruction-reserved');
+      const cancelledBefore = this.preserveCancelledDelivery(revision, 'not-sent', false, external);
+      if (cancelledBefore) {
+        await cancelledBefore;
+        return 'not-sent';
+      }
+      let result: 'sent' | 'not-sent' | 'unknown';
+      try {
+        result = await this.deps.act(key, o.conversationId, prompt, authority);
+      } catch {
+        result = 'unknown';
+      }
+      const cancelled = this.preserveCancelledDelivery(revision, result, false, external);
+      if (cancelled) {
+        await cancelled;
+        return result === 'not-sent' ? 'not-sent' : 'unknown';
+      }
+      if (result === 'not-sent') this.releaseUnsentFlight();
+      if (result !== 'sent') this.state.phase = 'paused';
+      if (result === 'sent') this.state.outcome = 'unknown';
+      await this.save(
+        result === 'sent'
+          ? 'delegated-instruction-sent'
+          : result === 'not-sent'
+            ? 'delegated-instruction-refused'
+            : 'delivery-unknown'
+      );
+      return result;
+    });
   }
   private now(): number {
     return (this.deps.now ?? Date.now)();
