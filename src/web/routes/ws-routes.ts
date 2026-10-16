@@ -184,6 +184,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
 
       const notedOwnerIntent = new WeakSet<object>();
       const noteLifecycleOwnerIntent = (msg: Record<string, unknown>) => {
+        if (typeof msg.cid === 'string' && Number.isSafeInteger(msg.seq) && session.paneExit) return;
         if (
           typeof msg.cid === 'string' &&
           Number.isSafeInteger(msg.seq) &&
@@ -245,6 +246,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             // (legacy/other tools) are applied as-is — no behavior change.
             const cid = typeof msg.cid === 'string' ? msg.cid : null;
             const seq = Number.isSafeInteger(msg.seq) ? (msg.seq as number) : null;
+            if (cid && seq !== null && session.paneExit) return;
             // A rejected frame must not claim a delivery identity. Otherwise a
             // burst during recovery can manufacture a watermark for lost bytes.
             if (session.recoveryInputReserved) {
@@ -264,6 +266,7 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
                   isCurrent: () =>
                     socket.readyState === 1 &&
                     ctx.sessions.get(id) === session &&
+                    !(cid && seq !== null && session.paneExit) &&
                     canAccessOwned(getAuthUser(req), session.owner),
                   ...(cid && seq !== null ? { inputSeq: { clientId: cid, seq } } : {}),
                 };
@@ -289,9 +292,10 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
               // burnt, so the retry that reliable delivery exists for was rejected as
               // a duplicate: the input was lost for good.
               if (!delivered && cid && seq !== null) session.forgetInputSeq(cid, seq);
-              if (delivered && cid && seq !== null) session.commitInputSeq(cid, seq);
+              if (delivered && cid && seq !== null && !session.paneExit) session.commitInputSeq(cid, seq);
               if (!delivered) rejectLegacyInput(msg);
             }
+            if (cid && seq !== null && session.paneExit) return;
             if (seq !== null && socket.readyState === 1) {
               if (apply) {
                 if (delivered) socket.send(`{"t":"ia","seq":${seq}}`);
@@ -393,6 +397,9 @@ export function registerWsRoutes(app: FastifyInstance, ctx: SessionPort, getHost
             if (socket.readyState === 1) socket.close(4008, 'Input backlog full');
             return;
           }
+          // Retain reliable FIFO admission, but never queue or ACK a known
+          // exited local worker. Remote transport ambiguity stays unchanged.
+          if (cid && seq !== null && session.paneExit) return;
           const paneStartedAt = session.paneStartedAt;
           noteLifecycleOwnerIntent(msg);
           void queueInputDispatch(session, Buffer.byteLength(msg.d, 'utf8'), async () => {

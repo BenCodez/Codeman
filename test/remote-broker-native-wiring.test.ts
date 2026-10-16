@@ -190,6 +190,151 @@ function fixture() {
   };
   return { manager, options };
 }
+
+it.each(['owner', 'config', 'remote'] as const)(
+  'rolls back repeated initial preparations cancelled by %s before reservation',
+  async (change) => {
+    const { manager, options } = fixture();
+    let ownerCurrent = true;
+    options.remoteLaunchCurrent = () => ownerCurrent;
+    const originalConfig = options.codexConfig;
+    const originalHost = options.remote!.host;
+    const prepare = ownedRemoteBrokerCache.prepare.bind(ownedRemoteBrokerCache);
+    const reserve = vi.spyOn(manager, 'reserveOwnedRemoteInputBroker');
+    for (let attempt = 0; attempt < 2; attempt++) {
+      let entered!: () => void, release!: () => void;
+      const reached = new Promise<void>((resolve) => (entered = resolve));
+      const held = new Promise<void>((resolve) => (release = resolve));
+      let prepared: Awaited<ReturnType<typeof prepare>>;
+      let preparedScope: Parameters<typeof prepare>[0] | undefined;
+      const spy = vi.spyOn(ownedRemoteBrokerCache, 'prepare').mockImplementationOnce(async (...args) => {
+        prepared = await prepare(...args);
+        preparedScope = args[0];
+        entered();
+        await held;
+        return prepared;
+      });
+      const creating = manager.createSession(options);
+      try {
+        await reached;
+        expect(prepared).toBeDefined();
+        const file = join(root, 'remote-input-brokers', options.sessionId, prepared!.incarnation, 'private.json');
+        expect((await fs.stat(file)).isFile()).toBe(true);
+        if (change === 'owner') ownerCurrent = false;
+        else if (change === 'remote') options.remote!.host = 'changed-during-prepare.invalid';
+        else options.codexConfig = { ...originalConfig, model: 'changed-during-prepare' };
+        release();
+        await expect(creating).rejects.toThrow('material unavailable');
+        await expect(fs.lstat(file)).rejects.toMatchObject({ code: 'ENOENT' });
+        expect(ownedRemoteBrokerCache.get(preparedScope!, prepared!.incarnation)).toBeUndefined();
+        expect(reserve).not.toHaveBeenCalled();
+        expect(effects.provision.mock.calls.every((call) => call[3]?.planOnly === true)).toBe(true);
+        expect(effects.observe).not.toHaveBeenCalled();
+        expect(effects.sync).not.toHaveBeenCalled();
+        expect(manager.getSession(options.sessionId)).toBeUndefined();
+      } finally {
+        release();
+        await creating.catch(() => {});
+        spy.mockRestore();
+        ownerCurrent = true;
+        options.codexConfig = originalConfig;
+        options.remote!.host = originalHost;
+      }
+    }
+    // The same logical session still has its full two-incarnation capacity.
+    const healthy = await manager.createSession(options);
+    expect(reserve).toHaveBeenCalledOnce();
+    expect(healthy.recoveryInputBroker).toBeDefined();
+    expect(healthy.recoveryInputBrokerPending).toBeUndefined();
+    expect(effects.observe).toHaveBeenCalledOnce();
+  }
+);
+
+it('preserves a same-byte replacement when initial preparation authority is cancelled', async () => {
+  const { manager, options } = fixture();
+  let current = true,
+    entered!: () => void,
+    release!: () => void;
+  options.remoteLaunchCurrent = () => current;
+  const reached = new Promise<void>((resolve) => (entered = resolve));
+  const held = new Promise<void>((resolve) => (release = resolve));
+  const prepare = ownedRemoteBrokerCache.prepare.bind(ownedRemoteBrokerCache);
+  let prepared: Awaited<ReturnType<typeof prepare>>;
+  const spy = vi.spyOn(ownedRemoteBrokerCache, 'prepare').mockImplementationOnce(async (...args) => {
+    prepared = await prepare(...args);
+    entered();
+    await held;
+    return prepared;
+  });
+  const reserve = vi.spyOn(manager, 'reserveOwnedRemoteInputBroker');
+  const discard = vi.spyOn(ownedRemoteBrokerCache, 'discardUnreservedPreparation');
+  const creating = manager.createSession(options);
+  try {
+    await reached;
+    expect(prepared).toBeDefined();
+    const file = join(root, 'remote-input-brokers', options.sessionId, prepared!.incarnation, 'private.json');
+    const bytes = await fs.readFile(file);
+    await fs.rename(file, file + '.original');
+    await fs.writeFile(file, bytes, { mode: 0o600 });
+    const replacement = await fs.lstat(file);
+    current = false;
+    release();
+    await expect(creating).rejects.toThrow('material unavailable');
+    expect(discard).toHaveBeenCalledOnce();
+    expect(await discard.mock.results[0].value).toBe(false);
+    expect((await fs.lstat(file)).ino).toBe(replacement.ino);
+    expect(await fs.readFile(file)).toEqual(bytes);
+    expect(reserve).not.toHaveBeenCalled();
+    expect(effects.provision).toHaveBeenCalledOnce();
+    expect(effects.observe).not.toHaveBeenCalled();
+    expect(effects.sync).not.toHaveBeenCalled();
+  } finally {
+    release();
+    await creating.catch(() => {});
+    spy.mockRestore();
+  }
+});
+
+it.each(['reservation-false', 'reservation-throw', 'provision-unknown', 'observe-unknown'] as const)(
+  'retains exact initial material once reservation may have started: %s',
+  async (failure) => {
+    const { manager, options } = fixture();
+    const prepare = ownedRemoteBrokerCache.prepare.bind(ownedRemoteBrokerCache);
+    let prepared: Awaited<ReturnType<typeof prepare>>;
+    let scope: Parameters<typeof prepare>[0] | undefined;
+    vi.spyOn(ownedRemoteBrokerCache, 'prepare').mockImplementationOnce(async (...args) => {
+      prepared = await prepare(...args);
+      scope = args[0];
+      return prepared;
+    });
+    const reserve = manager.reserveOwnedRemoteInputBroker.bind(manager);
+    if (failure.startsWith('reservation'))
+      vi.spyOn(manager, 'reserveOwnedRemoteInputBroker').mockImplementationOnce(async (...args) => {
+        expect(await reserve(...args)).toBe(true);
+        if (failure === 'reservation-throw') throw Error('Reservation reply lost');
+        return false;
+      });
+    if (failure === 'provision-unknown') {
+      const provision = effects.provision.getMockImplementation()!;
+      effects.provision.mockImplementation(async (...args) =>
+        args[3]?.planOnly ? provision(...args) : { status: 'unknown' }
+      );
+    }
+    if (failure === 'observe-unknown') effects.observe.mockResolvedValue({ status: 'unknown' });
+    const discard = vi.spyOn(ownedRemoteBrokerCache, 'discardUnreservedPreparation');
+    await expect(manager.createSession(options)).rejects.toThrow();
+    expect(prepared).toBeDefined();
+    expect(discard).not.toHaveBeenCalled();
+    expect(manager.getSession(options.sessionId)?.recoveryInputBrokerPending).toBe(prepared!.incarnation);
+    const file = join(root, 'remote-input-brokers', options.sessionId, prepared!.incarnation, 'private.json');
+    const bytes = await fs.readFile(file);
+    expect(bytes.length).toBeGreaterThan(0);
+    expect(await ownedRemoteBrokerCache.discardUnreservedPreparation(scope!, prepared!)).toBe(false);
+    expect(await fs.readFile(file)).toEqual(bytes);
+    expect(effects.sync).not.toHaveBeenCalled();
+  }
+);
+
 it('persists the exact pending incarnation before remote fork and commits before local SSH attachment', async () => {
   const { manager, options } = fixture();
   const session = await manager.createSession(options);
