@@ -3,12 +3,9 @@ import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vite
 import * as fsPromises from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
-import { dataPath } from '../src/config/instance.js';
+import { dataPath, getDataDirPath } from '../src/config/instance.js';
 import type { TmuxManager as Manager } from '../src/tmux-manager.js';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { getDataDirPath } from '../src/config/instance.js';
 
 const durableSnapshots: Array<{ recoveryInputBrokerPending?: string; codexRestoreUncertain?: boolean }> = [];
 
@@ -18,6 +15,7 @@ function nativeReply(command: string): string {
   if (command.includes('respawn-pane')) return '';
   return '700\n';
 }
+import * as cliRegistry from '../src/config/cli-registry/registry.js';
 
 vi.mock('../src/recovery/codex-broker-cleanup.js', async (original) => {
   const actual = await original<typeof import('../src/recovery/codex-broker-cleanup.js')>();
@@ -1029,4 +1027,159 @@ it('allows inspection-only attachment of a retained uncertain pane without anoth
   } finally {
     await session.stop(false);
   }
+});
+
+it.each([
+  ['broker', 'pin'],
+  ['no-broker', 'pin'],
+  ['daemon', 'pin'],
+  ['custom', 'pin'],
+  ['broker', 'env'],
+  ['daemon', 'resize'],
+  ['no-broker', 'authority'],
+  ['custom', 'authority'],
+] as const)('retains the confirmed %s native shell when pre-dispatch %s setup fails', async (kind, failure) => {
+  let mode = options.mode;
+  if (kind === 'custom') {
+    const original = cliRegistry.getCli;
+    const entry = { ...original('codex')!, id: cliRegistry.asCliId('fixture-codex'), stock: false };
+    vi.spyOn(cliRegistry, 'getCli').mockImplementation((id) => (id === 'fixture-codex' ? entry : original(id)));
+    mode = 'fixture-codex' as typeof mode;
+  }
+  const broker = successfulBroker();
+  const rollback = vi.fn(async () => {});
+  Object.assign(broker, { rollbackUnlaunchedProvisioning: rollback });
+  if (kind === 'broker') vi.spyOn(CodexInputBroker, 'create').mockResolvedValue(broker);
+  else vi.spyOn(CodexInputBroker, 'create').mockRejectedValue(Error('optional guard unavailable'));
+  let current = true;
+  const launch = {
+    ...options,
+    mode,
+    owner: 'alice',
+    name: 'Exact pending owner launch',
+    ...(kind === 'daemon' || kind === 'custom' ? { codexConfig: { ...options.codexConfig, noDaemon: false } } : {}),
+    ownerLaunchIsCurrent: () => current,
+  };
+  const native = effects.sync.getMockImplementation()!;
+  let observed = false;
+  effects.sync.mockImplementation((command: string) => {
+    if (command.includes(' setenv ') && command.includes(' CODEX_HOME ')) {
+      observed = true;
+      expect(manager.getSession(SID)).toMatchObject({
+        sessionId: SID,
+        muxName: 'codeman-aaaaaaaa',
+        pid: 0,
+        recoveryCodexHome: '/fixture/codex',
+        owner: 'alice',
+        mode,
+      });
+      if (failure === 'pin') throw Error('fixture home pin failed');
+      if (failure === 'authority') current = false;
+    }
+    return native(command);
+  });
+  if (failure === 'env')
+    vi.spyOn(manager as unknown as { _configureCliEnv: () => void }, '_configureCliEnv').mockImplementation(() => {
+      throw Error('fixture env setup failed');
+    });
+  if (failure === 'resize')
+    vi.spyOn(manager, 'resizeWindow').mockImplementation(() => {
+      throw Error('fixture resize failed');
+    });
+  await expect(manager.createSession(launch)).rejects.toThrow(
+    failure === 'authority' ? 'Owner launch authority changed' : 'fixture'
+  );
+  const retained = manager.getSession(SID)!;
+  expect(retained).toMatchObject({
+    sessionId: SID,
+    muxName: 'codeman-aaaaaaaa',
+    pid: 0,
+    workingDir: options.workingDir,
+    recoveryCodexHome: '/fixture/codex',
+    owner: 'alice',
+    mode,
+    name: launch.name,
+    attached: false,
+  });
+  expect(retained.recoveryInputBroker).toBe(kind === 'broker' ? broker.incarnation : undefined);
+  // Layer 2 withholds isolation until its durable startup receipt is committed.
+  expect(retained.recoveryIsolated).toBe(false);
+  expect(durableSnapshots).toContainEqual(
+    expect.objectContaining({ sessionId: SID, pid: 0, recoveryCodexHome: '/fixture/codex' })
+  );
+  expect(commands().filter((command) => command.includes(' new-session '))).toHaveLength(1);
+  expect(commands().filter((command) => command.includes('respawn-pane'))).toEqual([]);
+  expect(commands().some((command) => command.includes('kill-session'))).toBe(false);
+  for (const cleanup of commands().filter((command) => command.includes('kill-pane'))) {
+    // Only the layer-2 new inert pane's exact native tuple may be retired.
+    expect(cleanup).toContain('if-shell -F');
+    expect(cleanup).toContain('#{==:#{session_id},$1}');
+    expect(cleanup).toContain('#{==:#{pane_id},%7}');
+    expect(cleanup).toContain('#{==:#{pane_pid},650}');
+    expect(cleanup).toContain('#{==:#{pid},800}');
+  }
+  expect(broker.startupReceipt).not.toHaveBeenCalled();
+  expect(rollback).toHaveBeenCalledTimes(kind === 'broker' ? 1 : 0);
+  expect(effects.pty).not.toHaveBeenCalled();
+  if (failure === 'pin' || failure === 'authority') expect(observed).toBe(true);
+});
+
+it('durably retains the original UUID and home after a no-broker home-pin failure', async () => {
+  vi.spyOn(CodexInputBroker, 'create').mockRejectedValue(Error('optional guard unavailable'));
+  vi.mocked(Reflect.get(manager, 'saveSessions')).mockRestore();
+  vi.mocked(manager.flushSessionsDurably).mockRestore();
+  const original = effects.sync.getMockImplementation()!;
+  effects.sync.mockImplementation((command: string) => {
+    if (command.includes(' setenv ') && command.includes(' CODEX_HOME ')) throw Error('fixture home pin failed');
+    return original(command);
+  });
+  const file = dataPath('mux-sessions.json');
+  let reloaded: Manager | undefined;
+  try {
+    await expect(manager.createSession({ ...options, owner: 'alice', name: 'Retained shell' })).rejects.toThrow(
+      'fixture home pin failed'
+    );
+    await manager.drainSessionSaves();
+    const retained = manager.getSession(SID)!;
+    expect(JSON.parse(await fsPromises.readFile(file, 'utf8'))).toContainEqual(retained);
+    reloaded = new TmuxManager();
+    expect(reloaded.getSession(SID)).toEqual(retained);
+    expect(retained).toMatchObject({
+      sessionId: SID,
+      muxName: 'codeman-aaaaaaaa',
+      pid: 0,
+      recoveryCodexHome: '/fixture/codex',
+      recoveryIsolated: false,
+      owner: 'alice',
+      name: 'Retained shell',
+    });
+    expect(commands().filter((command) => command.includes('respawn-pane'))).toEqual([]);
+  } finally {
+    reloaded?.destroy();
+    await fsPromises.unlink(file).catch(() => {});
+  }
+});
+
+it('refuses cancelled no-broker owner authority before native creation without replacing history', async () => {
+  registerOrdinary();
+  const historical = manager.getSession(SID)!;
+  const before = structuredClone(historical);
+  await expect(
+    manager.createSession({ ...options, codexConfig: { noDaemon: false }, ownerLaunchIsCurrent: () => false })
+  ).rejects.toThrow('Owner launch authority changed');
+  expect(manager.getSession(SID)).toBe(historical);
+  expect(historical).toEqual(before);
+  expect(commands().filter((command) => command.includes(' new-session ') || command.includes('respawn-pane'))).toEqual(
+    []
+  );
+});
+
+it('preserves non-Codex setup refusal behavior without manufacturing a Codex reservation', async () => {
+  vi.spyOn(manager as unknown as { _configureCliEnv: () => void }, '_configureCliEnv').mockImplementation(() => {
+    throw Error('fixture non-Codex setup failed');
+  });
+  await expect(manager.createSession({ ...options, mode: 'shell' })).rejects.toThrow('fixture non-Codex setup failed');
+  expect(manager.getSession(SID)).toBeUndefined();
+  expect(commands().some((command) => command.includes(' CODEX_HOME '))).toBe(false);
+  expect(commands().filter((command) => command.includes('respawn-pane'))).toEqual([]);
 });

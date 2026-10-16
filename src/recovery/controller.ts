@@ -272,6 +272,7 @@ export class RecoveryController {
       const enabledNow = config.enabled && !this.state.config.enabled;
       const stallEnabledNow = config.detectStalls && !this.state.config.detectStalls;
       const stallRestartEnabledNow = config.restartStalls && !this.state.config.restartStalls;
+      const stallThresholdChanged = config.stalledAfterMs !== this.state.config.stalledAfterMs;
       const confirmationPolicyChanged = (
         ['enabled', 'recoverCrashes', 'recoverInterrupted', 'detectStalls', 'restartStalls', 'stalledAfterMs'] as const
       ).some((key) => config[key] !== this.state.config[key]);
@@ -291,9 +292,17 @@ export class RecoveryController {
       if (enabledNow || stallEnabledNow || stallRestartEnabledNow) this.state.armedAt = this.now();
       if (!(config.detectStalls && config.restartStalls) && this.state.pending?.reason === 'stalled') {
         this.state.pending = undefined;
+        this.pendingStallProof = undefined;
         this.state.nextRetryAt = undefined;
         this.confirmation = undefined;
         this.state.phase = config.enabled ? 'watching' : 'idle';
+      }
+      if (stallThresholdChanged && this.state.pending?.reason === 'stalled') {
+        // The old intention's delay belongs to the prior quiet-period policy.
+        // Fresh confirmations must schedule their own full retry delay.
+        this.state.pending = undefined;
+        this.pendingStallProof = undefined;
+        this.state.nextRetryAt = undefined;
       }
       if (!config.enabled) {
         this.state.pending = undefined;
