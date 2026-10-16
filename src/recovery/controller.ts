@@ -130,8 +130,10 @@ export class RecoveryController {
       }
     }
     this.restoredFlight = !!this.state.inFlight;
-    if (this.restoredFlight) {
-      // The write may have landed before the server died. Observations may confirm it, never replay it.
+    if (this.restoredFlight && !this.state.inFlight?.accepted) {
+      // An unaccepted write may have landed before the server died. Observations
+      // may confirm it, never replay it. Durable acceptance needs receipt cleanup
+      // only; retain its phase and any newer owner/authority warning.
       this.state.phase = 'paused';
       this.state.needsAttention = true;
       this.state.lastReason = 'restart-in-flight';
