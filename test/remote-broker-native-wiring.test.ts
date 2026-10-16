@@ -210,6 +210,22 @@ it('persists the exact pending incarnation before remote fork and commits before
   expect(manager.canDeliverCodexOwnerInput(options.sessionId)).toBe(true);
   const descriptor = await manager.getOwnedRemoteInputBroker(options.sessionId);
   expect(descriptor?.incarnation).toBe(session.recoveryInputBroker);
+  const controlled = new Session({
+    id: options.sessionId,
+    workingDir: root,
+    mode: 'codex',
+    useMux: true,
+    mux: manager,
+    muxSession: session,
+    codexConfig: options.codexConfig,
+    envOverrides: options.envOverrides,
+    remote: options.remote,
+    owner: options.owner,
+  });
+  sessions.push(controlled);
+  expect(controlled.getRecoveryContext().noDaemon).toBe(true);
+  expect(controlled.taskSupervisionSupported).toBe(true);
+  expect(controlled.toLightDetailedState().taskSupported).toBe(true);
 });
 it.each(['unknown', 'not-sent'] as const)(
   'keeps %s launch sealed without native/local or fresh-worker fallback',
@@ -360,3 +376,35 @@ it('retains the exact pending registration when ordinary remote provisioning los
   expect(effects.observe).not.toHaveBeenCalled();
   expect(effects.sync).not.toHaveBeenCalled();
 });
+
+it.each(['missing-home', 'relative-home', 'unsupported-broker'] as const)(
+  'the actual native %s owner fallback remains manual-only despite requested noDaemon',
+  async (kind) => {
+    const { manager, options } = fixture();
+    if (kind === 'missing-home') options.envOverrides = undefined;
+    if (kind === 'relative-home') options.envOverrides = { CODEX_HOME: 'relative-home' };
+    if (kind === 'unsupported-broker') effects.provision.mockResolvedValue({ status: 'unsupported' });
+    const record = await manager.createSession(options);
+    expect(record.recoveryInputBroker).toBeUndefined();
+    expect(record.recoveryIsolated).toBe(true);
+    expect(effects.observe).not.toHaveBeenCalled();
+    if (kind !== 'unsupported-broker') expect(effects.provision).not.toHaveBeenCalled();
+    const session = new Session({
+      id: options.sessionId,
+      workingDir: root,
+      mode: 'codex',
+      useMux: true,
+      mux: manager,
+      muxSession: record,
+      codexConfig: options.codexConfig,
+      envOverrides: options.envOverrides,
+      remote: options.remote,
+      owner: options.owner,
+    });
+    sessions.push(session);
+    expect(session.toLightDetailedState().codexConfig?.noDaemon).toBe(true);
+    expect(session.getRecoveryContext().noDaemon).toBe(kind === 'unsupported-broker');
+    expect(session.taskSupervisionSupported).toBe(false);
+    expect(session.toLightDetailedState().taskSupported).toBe(false);
+  }
+);

@@ -188,6 +188,23 @@ describe('task and recovery server action wiring', () => {
       useMux: true,
       codexConfig: { noDaemon: true },
       ...location,
+      ...('remote' in location
+        ? {
+            envOverrides: { CODEX_HOME: '/fixture/codex-home' },
+            muxSession: {
+              sessionId: id,
+              muxName: 'fixture-remote-task',
+              pid: 777,
+              createdAt: 1,
+              workingDir: '/fixture',
+              mode: 'codex',
+              attached: false,
+              recoveryIsolated: true,
+              recoveryCodexHome: '/fixture/codex-home',
+              recoveryInputBroker: '11111111-2222-3333-4444-555555555555',
+            },
+          }
+        : {}),
     });
     internals.sessions.set(id, session);
     const controller = internals.getTaskController(session);

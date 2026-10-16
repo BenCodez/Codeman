@@ -30,6 +30,7 @@ function loadCodemanAppClass() {
     clearInterval: vi.fn(),
     setTimeout,
     clearTimeout,
+    AbortController,
     requestAnimationFrame: vi.fn(),
     HTMLCanvasElement: class HTMLCanvasElement {},
     WebSocket: { OPEN: 1 },

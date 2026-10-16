@@ -31,7 +31,38 @@ beforeEach(() => {
   vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
   server = new WebServer(0, false, true);
   internals = server as unknown as Internals;
-  const worker = new Session({ id: ID, workingDir: process.cwd(), mode: 'codex', useMux: false });
+  const remote = {
+    hostId: 'fixture-host',
+    label: 'Fixture',
+    host: 'worker.invalid',
+    username: 'runner',
+    port: 22,
+    remotePath: '/fixture/work',
+    owned: true,
+  };
+  const worker = new Session({
+    id: ID,
+    workingDir: process.cwd(),
+    mode: 'codex',
+    useMux: true,
+    remote,
+    codexConfig: { noDaemon: true },
+    envOverrides: { CODEX_HOME: '/fixture/codex-home' },
+    muxSession: {
+      sessionId: ID,
+      muxName: 'fixture-remote-task-veto',
+      pid: 777,
+      createdAt: 1,
+      workingDir: '/fixture/work',
+      mode: 'codex',
+      attached: false,
+      remote,
+      recoveryIsolated: true,
+      recoveryCodexHome: '/fixture/codex-home',
+      recoveryInputBroker: '33333333-3333-4333-8333-333333333333',
+    },
+  });
+  expect(worker.taskSupervisionSupported).toBe(true);
   internals.sessions.set(ID, worker);
   task = internals.getTaskController(worker)!;
   recovery = internals.getRecoveryController(worker)!;

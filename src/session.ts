@@ -2903,9 +2903,16 @@ export class Session extends EventEmitter {
 
   /** Launch-shape eligibility only; admission still verifies current identity and permission evidence. */
   get taskSupervisionSupported(): boolean {
+    const incarnation = this._muxSession?.recoveryInputBroker;
     return (
       getCli(this.mode)?.capabilities.recovery === 'codex-rollout' &&
-      (!this._remote || this._remote.owned !== false) &&
+      (!this._remote ||
+        (this._remote.owned !== false &&
+          // Requested flags survive manual-only SSH launch fallbacks. Only
+          // pinned native launch metadata and a committed broker grant tasks.
+          this.getRecoveryContext().noDaemon &&
+          typeof incarnation === 'string' &&
+          /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(incarnation))) &&
       !this._docker &&
       !this._discoveredMuxSession &&
       this._useMux &&
