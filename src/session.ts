@@ -3135,9 +3135,8 @@ export class Session extends EventEmitter {
                 normalizedCodexHome(this._muxSession.recoveryCodexHome))) &&
         this._codexConfig?.noDaemon === true &&
         /(?:^|\s)--no-daemon(?:\s|$)/.test(command ?? ''),
-      codexHome: this._remote
-        ? this._envOverrides?.CODEX_HOME
-        : normalizedCodexHome(this._muxSession?.recoveryCodexHome),
+      // Both local and owned SSH launch material bind the normalized pinned home.
+      codexHome: normalizedCodexHome(this._muxSession?.recoveryCodexHome),
     };
   }
 

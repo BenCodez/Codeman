@@ -1,4 +1,4 @@
-/** Actual generated fake-SSH/native reader and disposable workers only. No real SSH or pane. */
+/** @fileoverview Actual generated fake-SSH/native reader and disposable workers only. No real SSH or pane. */
 import { afterEach, expect, it, vi } from 'vitest';
 import fs from 'node:fs/promises';
 import { join } from 'node:path';
@@ -146,3 +146,48 @@ it('creates and commits a healthy missing worker only after its material and res
   expect(prepare.mock.invocationCallOrder[0]).toBeLessThan(provision.mock.invocationCallOrder[0]);
   expect(await f.starts()).toBe(2);
 });
+
+it.each(
+  (['restart', 'restore'] as const).flatMap((kind) =>
+    (['regular', 'dotted', 'trailing'] as const).map((form) => ({ kind, form }))
+  )
+)(
+  'keeps the initial broker home bound through Session recovery $kind with a $form owner home',
+  async ({ kind, form }) => {
+    vi.stubEnv('CODEMAN_MULTIUSER', '0');
+    const f = await fixture(),
+      conversationId = '11111111-2222-3333-4444-555555555555';
+    const rawHome = form === 'dotted' ? f.home + '/temporary/../' : form === 'trailing' ? f.home + '/' : f.home;
+    const session = new Session({
+      id: f.scope.sessionId,
+      workingDir: f.scope.workingDir,
+      mode: 'codex',
+      remote: f.remote,
+      useMux: true,
+      mux: { isAvailable: () => true } as TerminalMultiplexer,
+      muxSession: { muxName: 'codeman-aaaaaaaa', recoveryIsolated: true, recoveryCodexHome: f.home } as MuxSession,
+      codexConfig: { noDaemon: true, resumeSessionId: conversationId },
+      envOverrides: { CODEX_HOME: rawHome },
+    });
+    sessions.push(session);
+    expect(await session.ensureRecoveryIdentityFence()).toBe(true);
+    const context = session.getRecoveryContext();
+    expect(context).toMatchObject({ managed: true, remoteOwned: true, noDaemon: true });
+    const configuration = session.remoteRecoveryConfiguration();
+    const result = await f.rotate(
+      kind,
+      (authority) => {
+        authority.check = () => session.confirmRemoteRecoveryAuthority(conversationId, 0, () => true, configuration);
+        authority.isCurrent = () =>
+          session.isRemoteRecoveryAuthorityCurrent(conversationId, 0, () => true, configuration);
+      },
+      undefined,
+      context.codexHome
+    );
+    expect(result.result).toBe('sent');
+    expect(context.codexHome).toBe(f.home);
+    expect(result.pending).toBe(result.promoted);
+    expect(await f.starts()).toBe(2);
+    expect(session.getEnvOverridesForPersist()).toEqual({ CODEX_HOME: rawHome });
+  }
+);

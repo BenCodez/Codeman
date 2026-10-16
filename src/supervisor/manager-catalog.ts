@@ -42,6 +42,7 @@ export function sanitizeSupervisorManagerCatalog(raw: string): string | undefine
         (model.tool_mode !== undefined &&
           model.tool_mode !== null &&
           !['direct', 'code_mode', 'code_mode_only'].includes(model.tool_mode)) ||
+        (model.supports_search_tool !== undefined && typeof model.supports_search_tool !== 'boolean') ||
         (model.experimental_supported_tools !== undefined &&
           (!Array.isArray(model.experimental_supported_tools) ||
             !model.experimental_supported_tools.every((tool: unknown) => typeof tool === 'string')))
@@ -50,6 +51,8 @@ export function sanitizeSupervisorManagerCatalog(raw: string): string | undefine
       slugs.add(model.slug);
       model.apply_patch_tool_type = null;
       model.tool_mode = 'direct';
+      // Namespace-capable providers otherwise defer MCP tools behind tool_search.
+      model.supports_search_tool = false;
       model.experimental_supported_tools = [];
     }
     const result = JSON.stringify(value);

@@ -140,3 +140,17 @@ describe('persisted custom profile workspace', () => {
     expect(existsSync(join(configDir, 'settings.json'))).toBe(false);
   });
 });
+
+it('ordinary persisted-state reapplication still rebuilds custom environment', async () => {
+  const env = { ANTHROPIC_API_KEY: 'fixture-current-key' };
+  const rebuild = vi.fn(async () => env);
+  const session = { setCustomModel: vi.fn() } as unknown as Session;
+  await WebServer.prototype.reapplyPersistedSessionState.call(
+    { _rebuildCustomModelEnv: rebuild } as never,
+    session,
+    { __customModel: saved } as never,
+    'before-spawn'
+  );
+  expect(rebuild).toHaveBeenCalledWith(session, saved);
+  expect(session.setCustomModel).toHaveBeenCalledWith(saved, env);
+});

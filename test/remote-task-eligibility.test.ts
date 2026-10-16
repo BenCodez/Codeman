@@ -1,4 +1,4 @@
-/** Actual launch metadata/API/markup controls, with inert native records and no worker effects. */
+/** @fileoverview Actual launch metadata/API/markup controls, with inert native records and no worker effects. */
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -21,6 +21,7 @@ let internal: {
   stopRecoveryController(id: string, drop: boolean): Promise<void>;
 };
 const sessions: Session[] = [];
+const ownerHeaders = { authorization: 'Basic ' + Buffer.from('fixture-owner:fixture-password').toString('base64') };
 type TaskUI = {
   sessions: Map<string, unknown>;
   editingSessionId: string;
@@ -30,6 +31,9 @@ type TaskUI = {
   openTaskOptions(id: string): boolean;
 };
 beforeAll(async () => {
+  vi.stubEnv('CODEMAN_MULTIUSER', '0');
+  vi.stubEnv('CODEMAN_USERNAME', 'fixture-owner');
+  vi.stubEnv('CODEMAN_PASSWORD', 'fixture-password');
   vi.spyOn(CodexTaskAdapter.prototype, 'observe').mockResolvedValue({
     observation: {
       activity: 'idle',
@@ -53,6 +57,7 @@ afterAll(async () => {
   }
   await server.stop();
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
 });
 const cases = [
   ['controlled owned SSH', true],
@@ -139,7 +144,7 @@ function view(session: Session) {
   ui.editingSessionId = session.id;
   ui.showToast = vi.fn();
   ui._apiJson = vi.fn(async (url: string) => {
-    const response = await app.inject({ method: 'GET', url });
+    const response = await app.inject({ headers: ownerHeaders, method: 'GET', url });
     if (response.statusCode !== 200) throw Error('Task API refused');
     return response.json().data;
   });
@@ -153,7 +158,11 @@ it.each(cases)(
     expect(session.toState().taskSupported).toBe(supported);
     expect(session.toLightDetailedState().taskSupported).toBe(supported);
     expect(!!internal.getTaskController(session)).toBe(supported);
-    const response = await app.inject({ method: 'GET', url: `/api/sessions/${session.id}/task` });
+    const response = await app.inject({
+      headers: ownerHeaders,
+      method: 'GET',
+      url: `/api/sessions/${session.id}/task`,
+    });
     expect(response.statusCode).toBe(supported ? 200 : 400);
     const { dom, ui } = view(session);
     try {
@@ -165,6 +174,7 @@ it.each(cases)(
       ).toBe(supported ? '' : 'none');
       if (!supported) {
         const enable = await app.inject({
+          headers: ownerHeaders,
           method: 'PUT',
           url: `/api/sessions/${session.id}/task`,
           payload: { config: { enabled: true } },
@@ -185,6 +195,7 @@ it.each(['paused', 'blocked'] as const)(
     expect(
       (
         await app.inject({
+          headers: ownerHeaders,
           method: 'PUT',
           url,
           payload: {
@@ -194,18 +205,20 @@ it.each(['paused', 'blocked'] as const)(
         })
       ).statusCode
     ).toBe(200);
-    if (phase === 'paused') expect((await app.inject({ method: 'POST', url: url + '/pause' })).statusCode).toBe(200);
+    if (phase === 'paused')
+      expect((await app.inject({ headers: ownerHeaders, method: 'POST', url: url + '/pause' })).statusCode).toBe(200);
     else
       expect(
         (
           await app.inject({
+            headers: ownerHeaders,
             method: 'POST',
             url: url + '/progress',
             payload: { outcome: 'blocked', checkpoint: 'Owner is waiting' },
           })
         ).statusCode
       ).toBe(200);
-    const response = await app.inject({ method: 'GET', url });
+    const response = await app.inject({ headers: ownerHeaders, method: 'GET', url });
     expect(response.statusCode).toBe(200);
     expect(response.json().data.phase).toBe(phase);
     expect(session.toLightDetailedState().taskSupported).toBe(true);

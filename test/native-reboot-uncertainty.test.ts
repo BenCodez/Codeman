@@ -3057,3 +3057,138 @@ it.each(['codex', 'claude'] as const)('binds %s guarded cwd across a post-proof 
     invalidateUsersCache();
   }
 });
+
+describe('reboot profile reuse through actual persisted-state reapplication', () => {
+  it.each(
+    (['codex', 'claude'] as const).flatMap((mode) =>
+      (['healthy', 'changed-profile', 'cancelled'] as const).map((kind) => ({ mode, kind }))
+    )
+  )('restores the verified $mode profile once and retains final $kind vetoes', async ({ mode, kind }) => {
+    const { writeCustomModelHosts } = await import('../src/custom-model-hosts.js');
+    const { customModelConfigDir } = await import('../src/custom-model-injection-apply.js');
+    const { rebuildPersistedCustomModelEnv } = await import('../src/custom-model-recovery.js');
+    const hooks = await import('../src/hooks-config.js');
+    vi.spyOn(hooks, 'readPlanUsageTelemetryEnabled').mockResolvedValue(false);
+    vi.spyOn(hooks, 'resolveStatusLineCliCommand').mockResolvedValue(undefined);
+    const endpoint = {
+      id: 'single-rebuild-profile',
+      label: 'fixture',
+      baseUrl: 'http://endpoint.invalid',
+      apiKey: 'fixture-current-key',
+      models: ['fixture-model'],
+    };
+    await writeCustomModelHosts(root, [endpoint]);
+    const profile = customModelConfigDir(ID);
+    rmSync(profile, { recursive: true, force: true });
+    const bookkeeping = {
+      endpointId: endpoint.id,
+      modelId: 'fixture-model',
+      envKeys:
+        mode === 'codex' ? ['CODEX_HOME', 'CODEMAN_CUSTOM_MODEL_API_KEY'] : ['CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY'],
+      configDir: profile,
+    };
+    const env = await rebuildPersistedCustomModelEnv(mode, ID, bookkeeping, root);
+    expect(env).toBeDefined();
+    if (mode === 'codex') {
+      mkdirSync(join(profile, 'sessions'), { recursive: true });
+      writeFileSync(
+        join(profile, 'sessions', `rollout-2026-10-13T15-00-00-${THREAD}.jsonl`),
+        JSON.stringify({
+          type: 'session_meta',
+          timestamp: '2026-10-13T15:00:00Z',
+          payload: { id: THREAD, cwd: root, originator: `codeman_${ID}` },
+        }) + '\n'
+      );
+    }
+    const { manager } = fixture();
+    vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+    vi.mocked(Reflect.get(manager, 'createInputBroker')).mockImplementation(
+      async (id: string, command: string, home: string) => {
+        const broker = await CodexInputBroker.create(join(root, randomUUID()), id, command, home);
+        vi.spyOn(broker, 'startupReceipt').mockResolvedValue('started');
+        return broker;
+      }
+    );
+    const server = new WebServer(0, false, true);
+    servers.push(server);
+    Reflect.set(server, 'mux', manager);
+    for (const method of [
+      'startStatsCollection',
+      'startMouseModeSync',
+      'startPaneExitWatcher',
+      'startRemoteReconnectWatcher',
+      'destroy',
+    ] as const)
+      vi.spyOn(manager, method).mockImplementation(() => {});
+    const secondRebuild = vi.spyOn(
+      server as unknown as { _rebuildCustomModelEnv(): Promise<Record<string, string> | undefined> },
+      '_rebuildCustomModelEnv'
+    );
+    const saved = {
+      id: ID,
+      mode,
+      workingDir: root,
+      pid: 1234,
+      status: 'idle',
+      currentTaskId: null,
+      createdAt: Date.now() - 60_000,
+      __customModel: bookkeeping,
+      __envOverrides: env,
+      ...(mode === 'codex' ? { codexConfig: config, __codexRecoveryHome: profile } : {}),
+    } as SessionState;
+    const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+    store.setSession(ID, saved);
+    store.flush();
+    const historical = structuredClone(store.getSession(ID));
+    const plan = await planVerifiedRebootRestore([ID], { [ID]: saved }, async () => ({
+      status: 'present' as const,
+      dev: 1,
+      ino: 1,
+    }));
+    expect(plan.skipped).toEqual([]);
+    await rebootRestoreRegistry.set(plan.restore);
+    const ctx = Reflect.get(server, 'createRouteContext').call(server) as Parameters<
+      typeof registerRebootRestoreRoutes
+    >[1];
+    ctx.getWorkspaceHooksEnabled = async () => false;
+    ctx.getAgentSkillEnabled = async () => false;
+    const reapply = ctx.reapplyPersistedSessionState;
+    let beforeApplied = false;
+    ctx.reapplyPersistedSessionState = async (...args) => {
+      await reapply(...args);
+      if (args[2] !== 'before-spawn') return;
+      beforeApplied = true;
+      expect(Reflect.get(args[0], '_envOverrides')).toMatchObject(env!);
+      expect(args[0].getCustomModelForPersist()).toEqual(bookkeeping);
+      if (kind === 'changed-profile') {
+        await writeCustomModelHosts(root, [{ ...endpoint, apiKey: 'fixture-replaced-key' }]);
+      }
+      if (kind === 'cancelled') await rebootRestoreRegistry.clear(() => true);
+    };
+    const app = Fastify({ logger: false });
+    await app.register(fastifyCookie);
+    registerRebootRestoreRoutes(app, ctx);
+    installRouteErrorHandler(app);
+    await app.ready();
+    try {
+      const response = (await app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} })).json();
+      expect(beforeApplied).toBe(true);
+      expect(response.restored).toHaveLength(kind === 'healthy' ? 1 : 0);
+      expect(effects.sync.mock.calls.filter(([command]) => command.includes('respawn-pane '))).toHaveLength(
+        kind === 'healthy' ? 1 : 0
+      );
+      expect(secondRebuild).not.toHaveBeenCalled();
+      const session = ctx.sessions.get(ID);
+      if (kind === 'healthy') {
+        expect(session).toBeDefined();
+        sessions.push(session!);
+        expect(session!.getCustomModelForPersist()).toEqual(bookkeeping);
+      } else {
+        expect(session).toBeUndefined();
+        expect(store.getSession(ID)).toEqual(historical);
+      }
+    } finally {
+      await app.close();
+    }
+  });
+});

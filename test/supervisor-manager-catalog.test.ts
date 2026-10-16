@@ -41,6 +41,7 @@ const catalog = () => ({
       slug: 'fixture-sol',
       apply_patch_tool_type: 'freeform',
       tool_mode: 'code_mode_only',
+      supports_search_tool: true,
       experimental_supported_tools: ['clock', 'send_user_message_async', 'test_sync_tool'],
       context_window: 200000,
       instructions: 'Private fixture café 🧭',
@@ -115,6 +116,7 @@ it('clears patch selectors, pins direct mode and preserves other bundled setting
   for (const model of expected.models) {
     model.apply_patch_tool_type = null;
     model.tool_mode = 'direct';
+    model.supports_search_tool = false;
     model.experimental_supported_tools = [];
   }
   expect(JSON.parse(sanitizeSupervisorManagerCatalog(raw())!)).toEqual(expected);
@@ -127,8 +129,43 @@ it.each(['direct', 'code_mode', 'code_mode_only', null, undefined])(
       slug: 'fixture',
       apply_patch_tool_type: null,
       tool_mode: 'direct',
+      supports_search_tool: false,
       experimental_supported_tools: [],
     });
+  }
+);
+it.each([true, false, undefined])(
+  'disables deferred MCP tool search for the model selector %s',
+  (supports_search_tool) => {
+    const source = {
+      models: [
+        {
+          slug: 'gpt-5.6-sol',
+          apply_patch_tool_type: null,
+          tool_mode: 'direct',
+          supports_search_tool,
+          context_window: 200000,
+        },
+      ],
+    };
+    const output = JSON.parse(sanitizeSupervisorManagerCatalog(JSON.stringify(source))!);
+    expect(output.models[0]).toMatchObject({
+      slug: 'gpt-5.6-sol',
+      tool_mode: 'direct',
+      supports_search_tool: false,
+      context_window: 200000,
+    });
+    expect(source.models[0].supports_search_tool).toBe(supports_search_tool);
+  }
+);
+it.each([null, 0, 'false', {}, []].map((value) => [value]))(
+  'rejects an unknown MCP search selector %#',
+  (supports_search_tool) => {
+    expect(
+      sanitizeSupervisorManagerCatalog(
+        JSON.stringify({ models: [{ slug: 'fixture', apply_patch_tool_type: null, supports_search_tool }] })
+      )
+    ).toBeUndefined();
   }
 );
 it.each([[], ['clock'], ['send_user_message_async', 'test_sync_tool'], ['future_utility']].map((value) => [value]))(
@@ -212,6 +249,9 @@ it('reads only the bundled offline command in a new credential-free HOME/cwd', a
     true
   );
   expect(result.models.every((model: { tool_mode: unknown }) => model.tool_mode === 'direct')).toBe(true);
+  expect(result.models.every((model: { supports_search_tool: unknown }) => model.supports_search_tool === false)).toBe(
+    true
+  );
   expect(
     result.models.every(
       (model: { experimental_supported_tools: unknown[] }) => model.experimental_supported_tools.length === 0
