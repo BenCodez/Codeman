@@ -665,6 +665,9 @@ export class TaskController {
         this.state.phase = 'blocked';
         return this.save('budget-exhausted');
       }
+      // Explicit Resume withdraws the old blocker, but does not certify a
+      // continuation from its old checkpoint. New evidence must establish it.
+      if (this.state.outcome === 'blocked') this.state.outcome = 'unknown';
       if (this.state.kickoffAt !== undefined) {
         this.state.phase = 'watching';
         const result = await this.save('owner-resumed');

@@ -440,4 +440,76 @@ describe('Session Options responsive layout in Chromium', () => {
     await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
     await page.evaluate(() => (window as any).app.closeTaskOptions());
   });
+  it.each([390, 1280])('preserves original and edited checkpoint whitespace at %spx', async (width) => {
+    await page.close();
+    page = await browser.newPage();
+    await renderAt(width);
+    await page.addScriptTag({ content: 'window.CodemanApp = class {};' });
+    for (const file of ['api-client.js', 'recovery-ui.js', 'supervision-ui.js'])
+      await page.addScriptTag({ content: readFileSync(resolve(publicDir, file), 'utf8') });
+    const original = { checkpoint: ' \tOwner checkpoint\r\n界\r\n  ', nextAction: '\r\n  Next action\r\n\t ' };
+    await page.evaluate(async (text) => {
+      const w = window as any;
+      document.getElementById('context-tab')!.classList.add('hidden');
+      document.getElementById('task-tab')!.classList.remove('hidden');
+      w.__codemanCliCatalog = [{ id: 'codex', recovery: 'codex-rollout' }];
+      w.app = new w.CodemanApp();
+      w.app.sessions = new Map([['a', { mode: 'codex', taskSupported: true }]]);
+      w.app.editingSessionId = 'a';
+      w.app.showToast = () => {};
+      w.taskState = {
+        version: 1,
+        objective: 'Owner review',
+        criteria: [{ id: 'owner', kind: 'manual', description: 'Owner acceptance', verified: false }],
+        config: { enabled: false, maxContinuations: 3, maxRuntimeMs: 900000 },
+        phase: 'paused',
+        outcome: 'unknown',
+        reason: 'configured',
+        continuations: 0,
+        history: [],
+        ...text,
+      };
+      w.progressWrites = [];
+      w.fetch = async (_url: string, options?: { method?: string; body?: string }) => {
+        if (options?.method === 'POST') {
+          const patch = JSON.parse(options.body!);
+          w.progressWrites.push(patch);
+          w.taskState = {
+            ...w.taskState,
+            checkpoint: patch.checkpoint,
+            nextAction: patch.nextAction,
+            outcome: patch.outcome,
+            phase: patch.outcome === 'blocked' ? 'blocked' : 'paused',
+            agentProgressVeto: true,
+            reason: 'progress-recorded',
+            criteria: w.taskState.criteria.map((criterion: any) =>
+              patch.verifiedCriteria.includes(criterion.id)
+                ? { ...criterion, verified: true, evidence: { source: 'owner', at: 10000 } }
+                : criterion
+            ),
+          };
+        }
+        return new Response(JSON.stringify({ success: true, data: w.taskState }), { status: 200 });
+      };
+      w.app.openTaskOptions('a');
+      await w.app.loadTaskStatus();
+    }, original);
+    expect(await page.locator('#taskCheckpoint').inputValue()).toBe(original.checkpoint.replace(/\r\n/g, '\n'));
+    await page.locator('#taskCriteriaEvidence input').check();
+    await page.locator('#taskProgressOutcome').selectOption('blocked');
+    await page.getByRole('button', { name: 'Save checkpoint / verification', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
+    const first = await page.evaluate(() => (window as any).progressWrites[0]);
+    expect(first).toEqual({ ...original, outcome: 'blocked', verifiedCriteria: ['owner'] });
+    const edited = ' \n Edited owner checkpoint 界\n\t ';
+    await page.locator('#taskCheckpoint').fill(edited);
+    await page.locator('#taskProgressOutcome').selectOption('unknown');
+    await page.getByRole('button', { name: 'Save checkpoint / verification', exact: true }).click();
+    await expect.poll(() => page.evaluate(() => (window as any).app._taskView.dirty)).toBe(false);
+    const second = await page.evaluate(() => (window as any).progressWrites[1]);
+    expect(second).toMatchObject({ checkpoint: edited, nextAction: original.nextAction, outcome: 'unknown' });
+    expect(await page.locator('#taskCheckpoint').inputValue()).toBe(edited);
+    expect(await page.evaluate(() => (window as any).app._taskView.state.nextAction)).toBe(original.nextAction);
+    await page.evaluate(() => (window as any).app.closeTaskOptions());
+  });
 });

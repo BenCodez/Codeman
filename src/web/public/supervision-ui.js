@@ -297,8 +297,16 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('taskEnabled').checked = state?.config.enabled ?? false;
       document.getElementById('taskMaxContinuations').value = state?.config.maxContinuations ?? '';
       document.getElementById('taskMaxRuntime').value = state ? state.config.maxRuntimeMs / 1000 : '';
-      document.getElementById('taskCheckpoint').value = state?.checkpoint ?? '';
-      document.getElementById('taskNextAction').value = state?.nextAction ?? '';
+      view.progressTextBaseline = {};
+      for (const [id, key] of [
+        ['taskCheckpoint', 'checkpoint'],
+        ['taskNextAction', 'nextAction'],
+      ]) {
+        const input = document.getElementById(id);
+        const original = state?.[key] ?? '';
+        input.value = original;
+        view.progressTextBaseline[key] = { original, baseline: input.value };
+      }
       document.getElementById('taskProgressOutcome').value = state?.outcome ?? 'unknown';
     }
     const evidence = document.getElementById('taskCriteriaEvidence');
@@ -392,10 +400,15 @@ Object.assign(CodemanApp.prototype, {
     });
   },
   async saveTaskProgress() {
+    const read = (id, key) => {
+      const value = document.getElementById(id).value;
+      const field = this._taskView?.progressTextBaseline?.[key];
+      return field && value === field.baseline ? field.original : value;
+    };
     await this._performTaskRequest('/progress', 'POST', {
       outcome: document.getElementById('taskProgressOutcome').value,
-      checkpoint: document.getElementById('taskCheckpoint').value.trim(),
-      nextAction: document.getElementById('taskNextAction').value.trim(),
+      checkpoint: read('taskCheckpoint', 'checkpoint'),
+      nextAction: read('taskNextAction', 'nextAction'),
       verifiedCriteria: [...document.querySelectorAll('#taskCriteriaEvidence input:checked:not(:disabled)')].map(
         (input) => input.value
       ),
