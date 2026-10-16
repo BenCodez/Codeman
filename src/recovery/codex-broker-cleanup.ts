@@ -390,16 +390,18 @@ function attemptRollback(key: string, pending: PendingRollback): Promise<boolean
     : Promise.resolve();
   const work = publication
     .then(() =>
-      runBrokerCleanup(
-        { rollback: request },
-        (value) =>
-          Object.keys(value).join(',') === 'rollback' &&
-          value.rollback === `${request.sessionId}/${request.incarnation}`,
-        pending.spawn,
-        (value) =>
-          Object.keys(value).join(',') === 'rolledBack' &&
-          value.rolledBack === `${request.sessionId}/${request.incarnation}`
-      )
+      pending.retryPublication
+        ? false
+        : runBrokerCleanup(
+            { rollback: request },
+            (value) =>
+              Object.keys(value).join(',') === 'rollback' &&
+              value.rollback === `${request.sessionId}/${request.incarnation}`,
+            pending.spawn,
+            (value) =>
+              Object.keys(value).join(',') === 'rolledBack' &&
+              value.rolledBack === `${request.sessionId}/${request.incarnation}`
+          )
     )
     .catch(() => false)
     .then((removed) => {
