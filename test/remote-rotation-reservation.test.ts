@@ -136,6 +136,62 @@ it('reserves the exact new incarnation before a missing remote pane can be creat
   expect(await fs.readFile(join(f.root, 'missing'), 'utf8')).toBe('1');
   expect(await f.starts()).toBe(1);
 });
+
+it.each(['restart', 'restore'] as const)(
+  'releases certified no-send %s reservations before deleting exact provisional keys',
+  async (kind) => {
+    const f = await fixture();
+    const prepared = vi.spyOn(f.cache, 'prepare');
+    const discard = vi.spyOn(f.cache, 'discardUnreservedPreparation');
+    const transport = vi.spyOn(f.options.provisionTransport, 'run').mockResolvedValue({
+      stdout:
+        'CODEMAN_REMOTE_BROKER_V1:' + Buffer.from(JSON.stringify({ status: 'not-sent' })).toString('base64') + '\n',
+    });
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const rollback = vi.fn(async () => true);
+      const result = await f.rotate(kind, (authority) => {
+        const actual = Reflect.get(authority, 'rollbackInputBroker');
+        Object.assign(authority, {
+          rollbackInputBroker: async (...args: string[]) => {
+            const ok = await actual(...args);
+            await rollback();
+            return ok;
+          },
+        });
+      });
+      expect(result.result).toBe('not-sent');
+      expect(result.pending).toBeUndefined();
+      expect(rollback).toHaveBeenCalledOnce();
+      const receipt = prepared.mock.results.at(-1) && (await prepared.mock.results.at(-1)!.value);
+      expect(receipt).toBeDefined();
+      expect(f.cache.get(f.scope, receipt!.incarnation)).toBeUndefined();
+      expect(discard.mock.invocationCallOrder.at(-1)).toBeGreaterThan(rollback.mock.invocationCallOrder[0]);
+    }
+    expect(transport).toHaveBeenCalledTimes(3);
+    expect(await f.starts()).toBe(1);
+  }
+);
+
+it.each(['unknown', 'journal-failed'] as const)('retains reserved keys when provisioning is %s', async (failure) => {
+  const f = await fixture(),
+    prepared = vi.spyOn(f.cache, 'prepare'),
+    discard = vi.spyOn(f.cache, 'discardUnreservedPreparation');
+  vi.spyOn(f.options.provisionTransport, 'run').mockResolvedValue({
+    stdout:
+      'CODEMAN_REMOTE_BROKER_V1:' +
+      Buffer.from(JSON.stringify({ status: failure === 'unknown' ? 'unknown' : 'not-sent' })).toString('base64') +
+      '\n',
+  });
+  const rollback = vi.fn(async () => false);
+  const result = await f.rotate('restore', (authority) => Object.assign(authority, { rollbackInputBroker: rollback }));
+  expect(result.result).toBe('unknown');
+  expect(result.pending).toBeDefined();
+  const receipt = await prepared.mock.results.at(-1)!.value;
+  expect(f.cache.get(f.scope, receipt!.incarnation)).toEqual(receipt);
+  expect(discard).not.toHaveBeenCalled();
+  expect(rollback).toHaveBeenCalledTimes(failure === 'unknown' ? 0 : 1);
+  expect(await f.starts()).toBe(1);
+});
 it('creates and commits a healthy missing worker only after its material and reservation are retained', async () => {
   const f = await fixture(),
     prepare = vi.spyOn(f.cache, 'prepare'),

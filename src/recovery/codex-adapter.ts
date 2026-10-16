@@ -856,6 +856,8 @@ export class CodexRecoveryAdapter {
       reserveInputBroker: (oldInc: string, newInc: string) =>
         this.session.reserveOwnedRemoteInputBroker(oldInc, newInc),
       commitInputBroker: (oldInc: string, newInc: string) => this.session.commitOwnedRemoteInputBroker(oldInc, newInc),
+      rollbackInputBroker: (oldInc: string, newInc: string) =>
+        this.session.rollbackOwnedRemoteInputBroker(oldInc, newInc),
     };
   }
 

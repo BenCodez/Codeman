@@ -1785,6 +1785,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private sessions: Map<string, MuxSession> = new Map();
   private sessionSaves: Promise<void> = Promise.resolve();
   private sessionPersistenceUnknown = false;
+  private remoteBrokerRollbacks?: WeakSet<MuxSession>;
+  private clearedRemoteBrokerReservations?: WeakMap<MuxSession, { oldInc: string; newInc: string }>;
   private readonly inputBrokers = new Map<string, CodexInputBroker>();
   private readonly inputBrokerLoads = new Map<string, Promise<CodexInputBroker | undefined>>();
   private readonly inputQueues = new Map<string, Promise<unknown>>();
@@ -1847,6 +1849,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     if (
       !session ||
       !scope ||
+      this.remoteBrokerRollbacks?.has(session) ||
       !ownedRemoteBrokerCache.get(scope, newInc) ||
       session.recoveryInputBroker !== expectedOldInc ||
       session.recoveryInputBrokerPending !== undefined ||
@@ -1877,6 +1880,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     if (
       !session ||
       !scope ||
+      this.remoteBrokerRollbacks?.has(session) ||
       session.recoveryInputBroker !== expectedOldInc ||
       session.recoveryInputBrokerPending !== newInc ||
       !ownedRemoteBrokerCache.signer(scope, newInc)?.canFrame
@@ -1898,6 +1902,45 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         session.recoveryInputBrokerPending = newInc;
       }
       return false;
+    }
+  }
+
+  /** A certified pre-provision refusal can release only its exact acknowledged reservation. */
+  async rollbackOwnedRemoteInputBroker(sessionId: string, oldInc: string, newInc: string): Promise<boolean> {
+    const session = this.sessions.get(sessionId),
+      scope = session && this.remoteBrokerScope(session);
+    if (
+      !session ||
+      !scope ||
+      session.recoveryInputBroker !== oldInc ||
+      session.recoveryInputBrokerPending !== newInc ||
+      this.remoteBrokerRollbacks?.has(session)
+    )
+      return false;
+    const descriptor = ownedRemoteBrokerCache.get(scope, newInc);
+    if (!descriptor || ownedRemoteBrokerCache.signer(scope, newInc)) return false;
+    const locks = (this.remoteBrokerRollbacks ??= new WeakSet<MuxSession>());
+    locks.add(session);
+    const binding = JSON.stringify(session);
+    let acknowledged = false;
+    const current = () =>
+      this.sessions.get(sessionId) === session &&
+      JSON.stringify(session) === binding &&
+      JSON.stringify(ownedRemoteBrokerCache.get(scope, newInc)) === JSON.stringify(descriptor) &&
+      !ownedRemoteBrokerCache.signer(scope, newInc);
+    try {
+      await this.flushSessionsDurably(current, undefined, { record: session, incarnation: newInc });
+      acknowledged = current();
+      if (acknowledged) {
+        delete session.recoveryInputBrokerPending;
+        (this.clearedRemoteBrokerReservations ??= new WeakMap()).set(session, { oldInc, newInc });
+      }
+      return acknowledged;
+    } catch {
+      return false;
+    } finally {
+      // Failed/lost ACK never removed the live no-replay marker.
+      locks.delete(session);
     }
   }
 
@@ -2828,13 +2871,30 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   private saveSessions(): void {
     if (IS_TEST_MODE) return;
     try {
-      const json = JSON.stringify(Array.from(this.sessions.values()), null, 2);
+      const records = Array.from(this.sessions.values());
+      const json = JSON.stringify(records, null, 2);
       const tempPath = MUX_SESSIONS_FILE + '.tmp';
       this.sessionSaves = this.sessionSaves
         .then(async () => {
           if (this.sessionPersistenceUnknown) throw new Error('Mux metadata requires durable repair');
+          // Preserve the original ordinary-save snapshot (including tentative
+          // registration isolation), except an exact pending marker already
+          // durably cleared while this save waited in the same queue.
+          const snapshot = JSON.parse(json) as MuxSession[];
+          for (const [index, record] of records.entries()) {
+            const cleared = this.clearedRemoteBrokerReservations?.get(record);
+            if (
+              cleared &&
+              this.sessions.get(record.sessionId) === record &&
+              record.recoveryInputBroker === cleared.oldInc &&
+              record.recoveryInputBrokerPending === undefined &&
+              snapshot[index].recoveryInputBroker === cleared.oldInc &&
+              snapshot[index].recoveryInputBrokerPending === cleared.newInc
+            )
+              delete snapshot[index].recoveryInputBrokerPending;
+          }
           await mkdir(dirname(MUX_SESSIONS_FILE), { recursive: true, mode: 0o700 });
-          await writeFile(tempPath, json, 'utf-8');
+          await writeFile(tempPath, JSON.stringify(snapshot, null, 2), 'utf-8');
           await rename(tempPath, MUX_SESSIONS_FILE);
         })
         .catch((err) => {
@@ -2857,9 +2917,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   /** Join the write queue and acknowledge file plus directory durability before proceeding. */
   flushSessionsDurably(
     isCurrent: () => boolean | Promise<boolean> = () => true,
-    currentAfterAwait?: () => boolean
+    currentAfterAwait?: () => boolean,
+    clearedReservation?: { record: MuxSession; incarnation: string }
   ): Promise<void> {
-    const writing = this.sessionSaves.then(() => this.persistSessionsDurably(isCurrent, currentAfterAwait));
+    const writing = this.sessionSaves.then(() =>
+      this.persistSessionsDurably(isCurrent, currentAfterAwait, clearedReservation)
+    );
     // Waiters remain live after this operation fails; its own caller still gets
     // the original rejection and retains its native launch uncertainty.
     this.sessionSaves = writing.catch(() => {});
@@ -2868,11 +2931,26 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
   private async persistSessionsDurably(
     isCurrent: () => boolean | Promise<boolean>,
-    currentAfterAwait?: () => boolean
+    currentAfterAwait?: () => boolean,
+    clearedReservation?: { record: MuxSession; incarnation: string }
   ): Promise<void> {
     const map = this.sessions;
     const entries = [...map.entries()];
-    const json = JSON.stringify(Array.from(map.values()), null, 2);
+    const liveJson = JSON.stringify(Array.from(map.values()), null, 2);
+    const json = clearedReservation
+      ? JSON.stringify(
+          Array.from(map.values(), (record) => {
+            if (record !== clearedReservation.record) return record;
+            if (record.recoveryInputBrokerPending !== clearedReservation.incarnation)
+              throw Error('Reservation changed');
+            const copy = { ...record };
+            delete copy.recoveryInputBrokerPending;
+            return copy;
+          }),
+          null,
+          2
+        )
+      : liveJson;
     const assertCurrent = () => {
       const verdict = currentAfterAwait ? currentAfterAwait() : isCurrent();
       if (typeof verdict !== 'boolean') void Promise.resolve(verdict).catch(() => {});
@@ -2881,7 +2959,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         this.sessions !== map ||
         this.sessions.size !== entries.length ||
         entries.some(([id, record]) => this.sessions.get(id) !== record) ||
-        JSON.stringify(Array.from(this.sessions.values()), null, 2) !== json
+        JSON.stringify(Array.from(this.sessions.values()), null, 2) !== liveJson
       )
         throw new Error('Reboot restoration was cancelled before mux persistence');
     };

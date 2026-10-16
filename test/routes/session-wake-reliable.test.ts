@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, expect, it, vi } from 'vitest';
 import { Session } from '../../src/session.js';
+import { WebServer } from '../../src/web/server.js';
 import { RemoteWakeRegistry, REMOTE_WAKE_REQUEST_READY_TIMEOUT_MS } from '../../src/remote-wake.js';
 import { registerSessionRoutes } from '../../src/web/routes/session-routes.js';
 import { registerWsRoutes } from '../../src/web/routes/ws-routes.js';
@@ -138,6 +139,72 @@ async function harness(options: { partial?: boolean; authenticated?: boolean } =
     ensureAwakeForInput,
   };
 }
+
+it('keeps external WS and native input behind the entire accepted FIFO during a held second proof', async () => {
+  const h = await harness();
+  const held = Promise.withResolvers<boolean>(),
+    checking = Promise.withResolvers<void>();
+  vi.spyOn(h.session, 'confirmRemoteWakeReady')
+    .mockResolvedValueOnce(true)
+    .mockImplementationOnce(async () => {
+      checking.resolve();
+      return held.promise;
+    });
+  await h.registry.handleInput(h.session, 'first');
+  await h.registry.handleInput(h.session, 'second');
+  h.readiness.resolve(true);
+  const waking = h.registry.wake(h.session);
+  await checking.promise;
+  expect(h.written).toEqual(['first']);
+  h.socket.emit('message', JSON.stringify({ t: 'i', d: 'external', cid: CID, seq: 1 }));
+  await queueInputDispatch(h.session, 0, async () => {});
+  expect(h.written).toEqual(['first']);
+  expect(h.acknowledgements).toEqual([]);
+  expect(h.session.inputDispatchAllowed).toBe(false);
+  expect(h.session.write('native')).toBe(false);
+  expect(await h.session.writeViaMux('external-mux')).toBe(false);
+  expect(h.written).toEqual(['first']);
+  held.resolve(true);
+  expect(await waking).toBe(true);
+  expect(h.written).toEqual(['first', 'second']);
+  expect(h.session.inputDispatchAllowed).toBe(true);
+  h.socket.emit('message', JSON.stringify({ t: 'i', d: 'external', cid: CID, seq: 1 }));
+  await queueInputDispatch(h.session, 0, async () => {});
+  expect(h.written).toEqual(['first', 'second', 'external']);
+  expect(h.acknowledgements).toEqual([{ t: 'ia', seq: 1 }]);
+});
+
+it.each([true, false])(
+  'feeds generic COD-108 reconnect into retained readiness without a wake target: proof=%s',
+  async (verified) => {
+    const h = await harness();
+    const proof = vi.spyOn(h.session, 'confirmRemoteWakeReady').mockResolvedValue(false);
+    h.readiness.resolve(true);
+    expect(await h.registry.wake(h.session)).toBe(false);
+    h.session.remote!.wakeCommand = undefined;
+    expect(await h.registry.handleInput(h.session, 'retained')).toBe('buffered');
+    proof.mockResolvedValue(verified);
+    const persist = vi.fn(),
+      report = vi.fn();
+    await Reflect.get(WebServer.prototype, 'handleRemoteSessionDropped').call(
+      {
+        sessions: h.ctx.sessions,
+        remoteWake: h.registry,
+        noteRemoteReconnect: report,
+        persistSessionState: persist,
+        broadcast: vi.fn(),
+      },
+      SID
+    );
+    expect(report).toHaveBeenLastCalledWith(SID, verified);
+    expect(h.written).toEqual(verified ? ['retained'] : []);
+    expect(h.session.inputDispatchAllowed).toBe(verified);
+    expect(h.registry.pendingBytes(SID)).toBe(verified ? 0 : Buffer.byteLength('retained'));
+    expect(persist).toHaveBeenCalledTimes(verified ? 1 : 0);
+    expect(await h.session.writeAsync('next')).toBe(verified);
+    expect(h.written).toEqual(verified ? ['retained', 'next'] : []);
+  }
+);
 
 it.each(['reattach', 'broker'] as const)(
   'retains failed %s admission after wake settings removal across HTTP, WS and native input',
