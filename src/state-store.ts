@@ -82,6 +82,18 @@ const MAX_REBOOT_SNAPSHOT_ATTEMPTS = 3;
 /** Only a verified concurrent snapshot change permits restaging, never an I/O error. */
 class RebootSnapshotChanged extends Error {}
 
+/** Output accounting may restage; every owner/launch/identity field remains an authority anchor. */
+function rebootRecordAuthorityJson(record: AppState['sessions'][string]): string {
+  return JSON.stringify({
+    ...record,
+    status: undefined,
+    lastActivityAt: undefined,
+    inputTokens: undefined,
+    outputTokens: undefined,
+    totalCost: undefined,
+  });
+}
+
 export class StateStore {
   private state: AppState;
   private filePath: string;
@@ -249,13 +261,13 @@ export class StateStore {
     const originalSession = this.state.sessions[id];
     const originalSessionJson = JSON.stringify(originalSession);
     const currentRecord = () => (typeof session === 'function' ? session() : session);
-    const recordJson = JSON.stringify(currentRecord());
+    const recordAuthority = rebootRecordAuthorityJson(currentRecord());
     const current = () =>
       isCurrent() === true &&
       this.state === originalState &&
       this.state.sessions[id] === originalSession &&
       JSON.stringify(originalSession) === originalSessionJson &&
-      JSON.stringify(currentRecord()) === recordJson;
+      rebootRecordAuthorityJson(currentRecord()) === recordAuthority;
     // Keep one save lease across a bounded number of restages. Ordinary writers
     // cannot overtake the restore, while unrelated owner edits remain in memory.
     for (let attempt = 0; attempt < MAX_REBOOT_SNAPSHOT_ATTEMPTS; attempt++) {
@@ -285,6 +297,7 @@ export class StateStore {
     const currentRecord = () => (typeof session === 'function' ? session() : session);
     const recordJson = JSON.stringify(currentRecord());
     const record = JSON.parse(recordJson) as AppState['sessions'][string];
+    const recordAuthority = rebootRecordAuthorityJson(record);
     const json = JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } });
     const assertCurrent = () => {
       if (
@@ -292,13 +305,16 @@ export class StateStore {
         this.state !== originalState ||
         this.state.sessions[id] !== originalSession ||
         JSON.stringify(this.state.sessions[id]) !== originalSessionJson ||
-        JSON.stringify(currentRecord()) !== recordJson
+        rebootRecordAuthorityJson(currentRecord()) !== recordAuthority
       )
         throw new Error('Reboot restoration was cancelled before durable commit');
     };
     const assertSnapshotCurrent = () => {
       assertCurrent();
-      if (JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } }) !== json)
+      if (
+        JSON.stringify(currentRecord()) !== recordJson ||
+        JSON.stringify({ ...this.state, sessions: { ...this.state.sessions, [id]: record } }) !== json
+      )
         throw new RebootSnapshotChanged('Concurrent state edit requires a fresh durable restore snapshot');
     };
     assertCurrent();
