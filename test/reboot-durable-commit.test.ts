@@ -282,6 +282,7 @@ it.each(['complete', 'cancel', 'state-failure'] as const)(
     const entered = createDeferred<void>();
     const flush = f.ctx.mux.flushSessionsDurably.bind(f.ctx.mux);
     const kill = vi.spyOn(f.ctx.mux, 'killSession');
+    const cancel = vi.spyOn(f.ctx.mux, 'cancelAcknowledgedRebootLaunch');
     let held = false;
     vi.spyOn(f.ctx.mux, 'flushSessionsDurably').mockImplementation(async (current) => {
       await flush(current);
@@ -322,6 +323,19 @@ it.each(['complete', 'cancel', 'state-failure'] as const)(
     expect(reply.restored).toHaveLength(outcome === 'complete' ? 1 : 0);
     expect(kill).not.toHaveBeenCalled();
     expect(offers()).toHaveLength(outcome === 'state-failure' ? 1 : 0);
+    expect(cancel).toHaveBeenCalledTimes(outcome === 'cancel' ? 1 : 0);
+    if (outcome === 'cancel') {
+      // Dismiss now consumes the exact acknowledged launch receipt even when
+      // the in-progress durable commit rejects its revoked offer authority.
+      expect(f.ctx.mux.getSession(f.id)).toBeUndefined();
+      expect(f.ctx.sessions.has(f.id)).toBe(false);
+      expect(JSON.parse(fs.readFileSync(dataPath('mux-sessions.json'), 'utf8'))).not.toEqual(
+        expect.arrayContaining([expect.objectContaining({ sessionId: f.id })])
+      );
+      expect(fs.readFileSync(dataPath('state.json'), 'utf8')).toBe(f.historical);
+      expect(f.store.getSession(f.id)).toEqual(f.state);
+      return;
+    }
     const record = f.ctx.mux.getSession(f.id)!;
     expect(record.codexRestoreUncertain).toBe(outcome !== 'complete');
     expect(record.codexRestoreConfig).toEqual(f.state.codexConfig);

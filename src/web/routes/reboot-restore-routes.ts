@@ -761,7 +761,18 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
               untrackedInput: identity.untrackedInput,
             });
           }
-          await ctx.persistRebootRestoreDurably(session, () => rebootRestoreRegistry.isHeld(entry, owner));
+          try {
+            await ctx.persistRebootRestoreDurably(session, () => rebootRestoreRegistry.isHeld(entry, owner));
+          } catch (error) {
+            // Dismiss revokes the held offer while the durable commit is awaiting
+            // I/O. Its rejection must still cancel our acknowledged exact worker,
+            // using the same native/owner proof as a normally returned commit.
+            if (!rebootRestoreRegistry.isHeld(entry, owner)) {
+              await discardCancelledRestore();
+              continue;
+            }
+            throw error;
+          }
           if (!rebootRestoreRegistry.isHeld(entry, owner)) {
             await discardCancelledRestore();
             continue;

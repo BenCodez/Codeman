@@ -2023,6 +2023,168 @@ describe('non-Codex reboot restore at the actual native launch boundary', () => 
   );
 });
 
+describe('Dismiss during the acknowledged restore durability wait', () => {
+  it.each(
+    (['codex', 'claude'] as const).flatMap((mode) =>
+      (['cancelled', 'owner-changed', 'native-replaced', 'lost-ack', 'state-error', 'complete'] as const).map(
+        (outcome) => ({ mode, outcome })
+      )
+    )
+  )('keeps the exact acknowledged worker cancellation proof for $mode: $outcome', async ({ mode, outcome }) => {
+    const { manager, home } = fixture();
+    const hooks = await import('../src/hooks-config.js');
+    vi.spyOn(hooks, 'readPlanUsageTelemetryEnabled').mockResolvedValue(false);
+    vi.spyOn(hooks, 'resolveStatusLineCliCommand').mockResolvedValue(undefined);
+    if (mode === 'codex') {
+      mkdirSync(join(home, 'sessions'), { recursive: true });
+      writeFileSync(
+        join(home, 'sessions', `rollout-2026-10-13T15-00-00-${THREAD}.jsonl`),
+        JSON.stringify({
+          type: 'session_meta',
+          timestamp: '2026-10-13T15:00:00Z',
+          payload: { id: THREAD, cwd: root, originator: `codeman_${ID}` },
+        }) + '\n'
+      );
+    }
+    vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+    const server = new WebServer(0, false, true);
+    servers.push(server);
+    Reflect.set(server, 'mux', manager);
+    for (const method of [
+      'startStatsCollection',
+      'startMouseModeSync',
+      'startPaneExitWatcher',
+      'startRemoteReconnectWatcher',
+      'destroy',
+    ] as const)
+      vi.spyOn(manager, method).mockImplementation(() => {});
+    const board = Reflect.get(server, 'sessions') as Map<string, SessionType>;
+    const state: SessionState = {
+      id: ID,
+      mode,
+      pid: 1234,
+      status: 'idle',
+      workingDir: root,
+      currentTaskId: null,
+      createdAt: Date.now() - 60000,
+      ...(mode === 'codex'
+        ? { codexConfig: config, __codexRecoveryHome: home, __envOverrides: { CODEX_HOME: home } }
+        : {}),
+    };
+    const plan =
+      mode === 'codex'
+        ? (
+            await planVerifiedRebootRestore([ID], { [ID]: state }, async () => ({
+              status: 'present' as const,
+              dev: 1,
+              ino: 1,
+            }))
+          ).restore
+        : [{ sessionId: ID, mode, name: 'fixture', workingDir: root, resumeConversationId: THREAD, state }];
+    expect(plan).toHaveLength(1);
+    await rebootRestoreRegistry.set(plan);
+    const store = Reflect.get(server, 'store') as import('../src/state-store.js').StateStore;
+    store.setSession(ID, state);
+    store.flush();
+    const historical = structuredClone(store.getSession(ID));
+    const ctx = Reflect.get(server, 'createRouteContext').call(server) as Parameters<
+      typeof registerRebootRestoreRoutes
+    >[1];
+    ctx.getWorkspaceHooksEnabled = async () => false;
+    ctx.getAgentSkillEnabled = async () => false;
+    const app = Fastify({ logger: false });
+    await app.register(fastifyCookie);
+    registerRebootRestoreRoutes(app, ctx);
+    installRouteErrorHandler(app);
+    await app.ready();
+    let entered!: () => void, release!: () => void;
+    const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const persist = store.persistSessionDurably.bind(store);
+    vi.spyOn(store, 'persistSessionDurably').mockImplementation(async (...args) => {
+      // This stage is after startInteractive returned its exact startup ACK,
+      // before the historical session snapshot can be replaced durably.
+      entered();
+      await held;
+      if (outcome === 'state-error') throw Error('Fixture state write failed with offer still held');
+      return persist(...args);
+    });
+    let exactNativeKills = 0;
+    const native = effects.sync.getMockImplementation()!;
+    effects.sync.mockImplementation((command: string) => {
+      if (command.includes('CODEMAN_REBOOT_CANCEL_REFUSED')) {
+        for (const term of [
+          '#{==:#{pid},88}',
+          '#{==:#{session_id},$1}',
+          '#{==:#{pane_id},%7}',
+          '#{==:#{pane_pid},99999}',
+        ])
+          expect(command).toContain(term);
+        if (outcome === 'native-replaced') return 'CODEMAN_REBOOT_CANCEL_REFUSED\n';
+        exactNativeKills++;
+        if (outcome === 'lost-ack') throw Error('Fixture exact native cancellation ACK lost');
+        return '';
+      }
+      return native(command);
+    });
+    const legacyKill = vi.spyOn(manager, 'killSession');
+    try {
+      const pending = app.inject({ method: 'POST', url: '/api/reboot-restore/restore', payload: {} });
+      await Promise.race([
+        reached,
+        pending.then(() => {
+          throw Error('Restore returned before the durable-state stage');
+        }),
+      ]);
+      const session = board.get(ID)!;
+      expect(session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist).toBe(true);
+      expect(effects.attach).toHaveBeenCalledTimes(1);
+      expect(store.getSession(ID)).toEqual(historical);
+      expect(exactNativeKills).toBe(0);
+      if (outcome !== 'state-error' && outcome !== 'complete') {
+        const dismissed = await app.inject({ method: 'POST', url: '/api/reboot-restore/dismiss', payload: {} });
+        expect(dismissed.statusCode).toBe(200);
+        expect(rebootRestoreRegistry.list(() => true)).toEqual([]);
+      }
+      if (outcome === 'owner-changed') session.owner = 'replacement-owner';
+      release();
+      const result = (await pending).json();
+      expect(result.restored).toHaveLength(outcome === 'complete' ? 1 : 0);
+      expect(legacyKill).not.toHaveBeenCalled();
+      expect(effects.sync.mock.calls.some(([command]) => command.includes('kill-session '))).toBe(false);
+      expect(exactNativeKills).toBe(outcome === 'cancelled' || outcome === 'lost-ack' ? 1 : 0);
+      if (outcome === 'complete') {
+        expect(board.get(ID)).toBe(session);
+        expect(session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist).toBe(false);
+        expect(store.getSession(ID)?.pid).not.toBe(historical!.pid);
+      } else {
+        expect(store.getSession(ID)).toEqual(historical);
+        expect(JSON.parse(readFileSync(join(root, 'state.json'), 'utf8')).sessions[ID]).toEqual(historical);
+        expect(result.skipped).toEqual([
+          { sessionId: ID, reason: outcome === 'cancelled' ? 'restore-cancelled' : 'restore-uncertain' },
+        ]);
+        if (outcome === 'cancelled') {
+          expect(board.has(ID)).toBe(false);
+          expect(manager.getSession(ID)).toBeUndefined();
+        } else {
+          expect(manager.getSession(ID)).toMatchObject(
+            mode === 'codex' ? { codexRestoreUncertain: true } : { restoreUncertain: true }
+          );
+          expect(session.codexRestoreWorkerMayExist || session.restoreLaunchMayExist).toBe(true);
+        }
+        expect(rebootRestoreRegistry.list(() => true)).toHaveLength(outcome === 'state-error' ? 1 : 0);
+      }
+    } finally {
+      release();
+      await app.close();
+    }
+  });
+});
+
 describe('acknowledged reboot launch cancellation native scope', () => {
   it.each([
     'healthy',
