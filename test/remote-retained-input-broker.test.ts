@@ -248,6 +248,56 @@ it('recreates only the local attach wrapper while retaining the verified origina
   expect(persisted).toEqual([next]);
 });
 
+it.each(['ack', 'journal-failure', 'replacement', 'changed-proof', 'concurrent-reserve', 'queued-save'] as const)(
+  'clears only an exactly acknowledged no-send rotation reservation: %s',
+  async (change) => {
+    const f = fixture(),
+      next = { ...f.descriptor, incarnation: '22222222-3333-4444-5555-666666666666', startupNonce: 'new-nonce' };
+    const currentDescriptor = { value: next };
+    vi.mocked(ownedRemoteBrokerCache.get).mockImplementation((_scope, inc) =>
+      inc === next.incarnation ? { ...currentDescriptor.value } : f.descriptor
+    );
+    vi.mocked(ownedRemoteBrokerCache.signer).mockReturnValue(undefined);
+    f.record.recoveryInputBrokerPending = next.incarnation;
+    const actual = f.manager.flushSessionsDurably.bind(f.manager);
+    const held = Promise.withResolvers<void>(),
+      entered = Promise.withResolvers<void>();
+    vi.spyOn(f.manager, 'flushSessionsDurably').mockImplementation(async (...args) => {
+      entered.resolve();
+      await held.promise;
+      if (change === 'journal-failure') throw Error('Fixture lost durable clear ACK');
+      await actual(...args);
+    });
+    const clearing = f.manager.rollbackOwnedRemoteInputBroker(ID, f.broker.incarnation, next.incarnation);
+    await entered.promise;
+    expect(f.record.recoveryInputBrokerPending).toBe(next.incarnation);
+    const replacement = { ...f.record, recoveryInputBrokerPending: 'foreign-reservation' };
+    if (change === 'replacement') Reflect.get(f.manager, 'sessions').set(ID, replacement);
+    if (change === 'changed-proof') currentDescriptor.value = { ...next, startupNonce: 'replacement' };
+    if (change === 'concurrent-reserve')
+      expect(await f.manager.reserveOwnedRemoteInputBroker(ID, f.broker.incarnation, 'other')).toBe(false);
+    if (change === 'queued-save') {
+      vi.mocked(Reflect.get(f.manager, 'saveSessions')).mockRestore();
+      Reflect.get(f.manager, 'saveSessions').call(f.manager);
+    }
+    held.resolve();
+    const healthy = change === 'ack' || change === 'concurrent-reserve' || change === 'queued-save';
+    expect(await clearing).toBe(healthy);
+    await f.manager.drainSessionSaves();
+    if (change === 'replacement') expect(replacement.recoveryInputBrokerPending).toBe('foreign-reservation');
+    else expect(f.record.recoveryInputBrokerPending).toBe(healthy ? undefined : next.incarnation);
+    if (healthy) {
+      const persisted = JSON.parse(await fs.readFile(join(root, 'mux-sessions.json'), 'utf8')) as MuxSession[];
+      expect(persisted.find((record) => record.sessionId === ID)).toMatchObject({
+        recoveryInputBroker: f.broker.incarnation,
+      });
+      expect(persisted.find((record) => record.sessionId === ID)?.recoveryInputBrokerPending).toBeUndefined();
+    }
+    expect(effects.exec).not.toHaveBeenCalled();
+    expect(effects.sync).not.toHaveBeenCalled();
+  }
+);
+
 it.each([
   'missing-cache',
   'bad-launch',

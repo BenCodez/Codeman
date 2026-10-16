@@ -249,6 +249,8 @@ export interface WakeableSession {
   remoteWakeInputScope?(): { configuration: string; conversationId?: string; incarnation?: string } | undefined;
   /** Write bytes to the session's pane. `fromUser` marks input a person typed (or an agent sent for them). */
   writeViaMux(data: string, options?: { fromUser?: boolean }): Promise<boolean>;
+  /** Exact internal FIFO permission, without reopening external input admission. */
+  writeRemoteWakeBufferedInput?(data: string, isCurrent: () => boolean): Promise<boolean>;
 }
 
 /** Injected IO so the registry holds no direct dependency on ssh/net/child_process in tests. */
@@ -706,8 +708,7 @@ export class RemoteWakeRegistry {
         // worker may have disappeared while the host was asleep.
         if ((session.confirmRemoteWakeReady && (await session.confirmRemoteWakeReady()) !== true) || !current())
           return false;
-        attachmentReady(true);
-        if (!(await this._flush(state, session, current, scopeCurrent))) {
+        if (!(await this._drainVerifiedInput(state, session, current, scopeCurrent, () => attachmentReady(true)))) {
           attachmentReady(false);
           return false;
         }
@@ -727,6 +728,52 @@ export class RemoteWakeRegistry {
       }
     })();
 
+    return state.waking;
+  }
+
+  /** COD-108 already reattached and verified the target; drain before external admission. */
+  async acceptVerifiedReattachment(session: WakeableSession, callerCurrent: () => boolean): Promise<boolean> {
+    const state = this.states.get(session.id);
+    if (!state) return callerCurrent() === true;
+    if (this.stopped) return false;
+    if (state.waking) return state.waking;
+    const scope = session.remoteWakeScope?.(),
+      remote = JSON.stringify(session.remote),
+      epoch = session.paneStartedAt;
+    const scopeCurrent = () =>
+      !this.stopped &&
+      this.states.get(session.id) === state &&
+      callerCurrent() === true &&
+      scope === session.remoteWakeScope?.() &&
+      remote === JSON.stringify(session.remote) &&
+      epoch === session.paneStartedAt &&
+      this._queuedInputCurrent(state, session);
+    const current = () =>
+      scopeCurrent() && (!session.isRemoteWakeReadyCurrent || session.isRemoteWakeReadyCurrent() === true);
+    session.setRemoteWakeAttachmentReady?.(false);
+    state.attachmentReady = false;
+    state.waking = (async () => {
+      try {
+        if (
+          !scopeCurrent() ||
+          (session.confirmRemoteWakeReady && (await session.confirmRemoteWakeReady()) !== true) ||
+          !current()
+        )
+          return false;
+        if (
+          !(await this._drainVerifiedInput(state, session, current, scopeCurrent, () => {
+            state.attachmentReady = true;
+            session.setRemoteWakeAttachmentReady?.(true);
+          }))
+        )
+          return false;
+        return true;
+      } catch {
+        return false;
+      } finally {
+        state.waking = null;
+      }
+    })();
     return state.waking;
   }
 
@@ -922,6 +969,26 @@ export class RemoteWakeRegistry {
     );
   }
 
+  private async _drainVerifiedInput(
+    state: WakeState,
+    session: WakeableSession,
+    current: () => boolean,
+    scopeCurrent: () => boolean,
+    release: () => void
+  ): Promise<boolean> {
+    for (;;) {
+      if (!(await this._flush(state, session, current, scopeCurrent))) return false;
+      // A producer may append while the completed async flush resumes. Check
+      // the FIFO and release external admission in the same synchronous turn.
+      if (state.pending.length === 0) {
+        if (!scopeCurrent()) return false;
+        release();
+        return true;
+      }
+      if (session.confirmRemoteWakeReady && (await session.confirmRemoteWakeReady()) !== true) return false;
+    }
+  }
+
   private async _flush(
     state: WakeState,
     session: WakeableSession,
@@ -942,7 +1009,9 @@ export class RemoteWakeRegistry {
       state.inFlightBytes = Buffer.byteLength(chunk);
       let ok: boolean;
       try {
-        ok = await session.writeViaMux(chunk, { fromUser: true });
+        ok = session.writeRemoteWakeBufferedInput
+          ? await session.writeRemoteWakeBufferedInput(chunk, scopeCurrent)
+          : await session.writeViaMux(chunk, { fromUser: true });
       } catch {
         // A thrown dispatch may have written bytes. Seal the attempted chunk
         // and trailing queue; replay could execute an unintended later command.

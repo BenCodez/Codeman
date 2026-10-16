@@ -536,7 +536,7 @@ export class RecoveryController {
       progress <= this.now() &&
       ((observation.progressEvidenceKey === undefined && observation.progressLowerBound === undefined) ||
         (typeof observation.progressEvidenceKey === 'string' &&
-          /^remote:[a-f0-9]{64}$/.test(observation.progressEvidenceKey) &&
+          /^(?:local|remote):[a-f0-9]{64}$/.test(observation.progressEvidenceKey) &&
           typeof observation.progressLowerBound === 'number' &&
           Number.isSafeInteger(observation.progressLowerBound) &&
           observation.progressLowerBound > 0 &&
@@ -881,7 +881,7 @@ export class RecoveryController {
         (previousCycles.length > 0 &&
           previousCycles.some((entry) => {
             const suffix = entry.slice(prefix.length);
-            const remote = /^(remote:[a-f0-9]{64})(?::([0-9]+))?$/.exec(suffix);
+            const remote = /^((?:local|remote):[a-f0-9]{64})(?::([0-9]+))?$/.exec(suffix);
             if (remote) {
               // Old native-only records have no reserved clock baseline. Retain
               // their veto; a probe's later acceptance time is never progress.
@@ -1013,6 +1013,7 @@ export class RecoveryController {
     // cannot revive it while the common reservation's cleanup is awaited.
     const retainedStallAlert = restartableStall ? (this.state.stallAlert ?? this.legacyStallAlert) : undefined;
     let authorityWithdrawn = false;
+    let evidenceWithdrawn = false;
     const isCurrent: RecoveryActionAuthority = () => {
       if (
         this.stopped ||
@@ -1023,6 +1024,12 @@ export class RecoveryController {
       )
         authorityWithdrawn = true;
       return !authorityWithdrawn;
+    };
+    isCurrent.withdrawEvidence = () => {
+      // A certificate is valid only with the final not-sent result; an unknown
+      // effect or failed shared-journal release must keep its replay fence.
+      evidenceWithdrawn = true;
+      authorityWithdrawn = true;
     };
     isCurrent.getActionDeadline = () => (this.state.windowStartedAt ?? NaN) + this.state.config.maxRecoveryDurationMs;
     let outcome: 'sent' | 'not-sent' | 'unknown';
@@ -1041,17 +1048,26 @@ export class RecoveryController {
       // without consuming a retry or labelling an explicit disable/shutdown as a failure.
       this.state.inFlight = undefined;
       this.state.attempts--;
+      if (evidenceWithdrawn) {
+        this.confirmation = undefined;
+        this.pendingStallProof = undefined;
+      }
       if (this.recoveryWindowExpired()) {
         // A certified unsent deadline refusal refunds the attempt, never its elapsed window.
         this.block('recovery-window-exhausted', true);
       } else {
         if (this.state.attempts === 0) this.state.windowStartedAt = undefined;
-        this.state.phase = 'idle';
-        this.state.needsAttention = false;
+        // Receipt cleanup cannot dismiss a newer owner/authority warning.
+        if (!this.state.needsAttention || this.state.lastReason === 'scheduled') {
+          this.state.phase = evidenceWithdrawn && this.state.config.enabled ? 'watching' : 'idle';
+          this.state.needsAttention = false;
+          if (evidenceWithdrawn && this.state.lastReason === 'scheduled')
+            this.event('state', this.state.config.enabled ? 'observing' : 'disabled');
+        }
         if (
           retainedStallAlert &&
           retainedStallAlert === (this.state.stallAlert ?? this.legacyStallAlert) &&
-          this.state.lastReason === 'scheduled'
+          (this.state.lastReason === 'scheduled' || (evidenceWithdrawn && this.state.lastReason === 'observing'))
         ) {
           // A certified canceled stall attempt relinquishes its reservation to the
           // same unresolved warning. Owner input and newer attention revoke that marker.

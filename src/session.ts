@@ -2394,6 +2394,7 @@ export class Session extends EventEmitter {
   private _remoteWakeReadinessWork?: Promise<boolean>;
   private _remoteWakeReadinessRevision = 0;
   private _remoteWakeAttachmentReady?: boolean;
+  private readonly _remoteWakeFlushPermits = new WeakMap<SessionWriteOptions, () => boolean>();
   private readonly _remoteBrokerRecords = new WeakSet<MuxSession>();
 
   /** Stable private scope across acknowledged owner input, without exposing environment values. */
@@ -2622,6 +2623,27 @@ export class Session extends EventEmitter {
     this._remoteWakeAttachmentReady = ready;
     if (!ready) this._submitVerifier?.cancel();
   }
+
+  /** One exact registry-owned FIFO write; never opens admission to external input. */
+  async writeRemoteWakeBufferedInput(data: string, isCurrent: () => boolean): Promise<boolean> {
+    const options: SessionWriteOptions = { fromUser: true, isCurrent };
+    this._remoteWakeFlushPermits.set(options, isCurrent);
+    try {
+      return await this.writeViaMux(data, options);
+    } finally {
+      this._remoteWakeFlushPermits.delete(options);
+    }
+  }
+
+  private _remoteWakeInputAllowed(options: SessionWriteOptions): boolean {
+    if (this._remoteWakeAttachmentReady !== false) return true;
+    const permit = this._remoteWakeFlushPermits.get(options);
+    return !!permit && this._inputCallerCurrent(options);
+  }
+
+  private _inputDispatchAllowed(options: SessionWriteOptions): boolean {
+    return !this._closing && !this._isStopped && this._paneLifecycleOps === 0 && this._remoteWakeInputAllowed(options);
+  }
   private _ownedInputTail: Promise<unknown> = Promise.resolve();
   private _ownedInputQueued = 0;
   private _ownedInputBytes = 0;
@@ -2710,7 +2732,7 @@ export class Session extends EventEmitter {
       this._noteRejectedOwnedInput(options);
       return false;
     }
-    if (!taintOnly && this._remoteWakeAttachmentReady === false) return false;
+    if (!taintOnly && !this._remoteWakeInputAllowed(options)) return false;
     if (this._ownedInputQueued >= 256 || this._ownedInputBytes + bytes > 2_097_152) return false;
     this._ownedInputQueued++;
     this._ownedInputBytes += bytes;
@@ -2722,7 +2744,7 @@ export class Session extends EventEmitter {
           this._isStopped ||
           this._paneLifecycleOps !== lifecycle ||
           (!taintOnly && lifecycle > 0) ||
-          (!taintOnly && this._remoteWakeAttachmentReady === false) ||
+          (!taintOnly && !this._remoteWakeInputAllowed(options)) ||
           epoch !== this._paneStartedAt ||
           scope !== this._identityInputScope()
         )
@@ -2776,7 +2798,7 @@ export class Session extends EventEmitter {
       !this._isStopped &&
       this._paneLifecycleOps === lifecycle &&
       (taintOnly || lifecycle === 0) &&
-      (taintOnly || this._remoteWakeAttachmentReady !== false) &&
+      (taintOnly || this._remoteWakeInputAllowed(options)) &&
       epoch === this._paneStartedAt &&
       generation === this._recoveryGeneration &&
       scope === this._identityInputScope() &&
@@ -3483,6 +3505,28 @@ export class Session extends EventEmitter {
       this._mux === mux &&
       this._muxSession === registered &&
       registered.recoveryInputBroker === newInc &&
+      registered.recoveryInputBrokerPending === undefined
+    );
+  }
+
+  async rollbackOwnedRemoteInputBroker(oldInc: string, newInc: string): Promise<boolean> {
+    const mux = this._mux,
+      registered = this._muxSession;
+    if (
+      !this._remote ||
+      this._remote.owned === false ||
+      this._docker ||
+      !registered ||
+      registered.recoveryInputBroker !== oldInc ||
+      registered.recoveryInputBrokerPending !== newInc ||
+      !mux?.rollbackOwnedRemoteInputBroker
+    )
+      return false;
+    return (
+      (await mux.rollbackOwnedRemoteInputBroker(this.id, oldInc, newInc)) === true &&
+      this._mux === mux &&
+      this._muxSession === registered &&
+      registered.recoveryInputBroker === oldInc &&
       registered.recoveryInputBrokerPending === undefined
     );
   }
@@ -6348,7 +6392,7 @@ export class Session extends EventEmitter {
   private _doWritePreparedInput(data: string, options: SessionWriteOptions): boolean {
     if (this._rejectUnavailableTaggedInput(options)) return false;
     if (!this._inputCallerCurrent(options)) return false;
-    if (!this.inputDispatchAllowed || this.recoveryInputReserved) {
+    if (!this._inputDispatchAllowed(options) || this.recoveryInputReserved) {
       this._rejectLifecycleOwnerInput(data, options);
       return false;
     }
@@ -6365,7 +6409,7 @@ export class Session extends EventEmitter {
         return false;
       }
       if (this._rejectUnavailableTaggedInput(options)) return false;
-      if (!this.inputDispatchAllowed) return false;
+      if (!this._inputDispatchAllowed(options)) return false;
       const submittedPrompt = this._trackSubmit(data, options);
       try {
         this.ptyProcess.write(input);
@@ -6850,7 +6894,7 @@ export class Session extends EventEmitter {
    */
   async writeViaMux(data: string, options: SessionWriteOptions = {}): Promise<boolean> {
     if (this._rejectUnavailableTaggedInput(options)) return false;
-    if (!this.inputDispatchAllowed || this.recoveryInputReserved) {
+    if (!this._inputDispatchAllowed(options) || this.recoveryInputReserved) {
       this._rejectLifecycleOwnerInput(data, options);
       return false;
     }
@@ -6901,7 +6945,7 @@ export class Session extends EventEmitter {
       return false;
     }
     if (this._rejectUnavailableTaggedInput(options)) return false;
-    if (!this.inputDispatchAllowed) return false;
+    if (!this._inputDispatchAllowed(options)) return false;
     const submittedPrompt = this._trackSubmit(data, options, viaMux);
     if (this._mux && this._muxSession) {
       let sent: boolean;

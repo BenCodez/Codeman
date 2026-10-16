@@ -475,6 +475,11 @@ if op == 'if-shell':`
         promoted = next;
         return cache.activate(scope, next);
       },
+      rollbackInputBroker: async (old: string, next: string) => {
+        if (old !== descriptor.incarnation || pending !== next || promoted) return false;
+        pending = undefined;
+        return true;
+      },
     };
     veto?.(authority);
     const q = {

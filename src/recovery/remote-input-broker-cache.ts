@@ -1049,7 +1049,7 @@ export class OwnedRemoteBrokerCache {
       })) === true
     );
   }
-  /** Caller certifies no reservation/remote dispatch was attempted for this exact prepare receipt. */
+  /** Caller certifies no remote effects and no outstanding reservation (never attempted, or durably cleared). */
   async discardUnreservedPreparation(
     scope: OwnedRemoteBrokerScope,
     receipt: OwnedRemoteBrokerDescriptor
@@ -1184,7 +1184,7 @@ export class OwnedRemoteBrokerCache {
       })) === true
     );
   }
-  /** Reservation/dispatch permanently ends local known-unsent rollback authority. */
+  /** Uncertain reservation or possible remote effects end known-unsent rollback authority. */
   sealPreparation(receipt: OwnedRemoteBrokerDescriptor): void {
     this.preparations.delete(receipt);
     this.emptyPreparations.delete(receipt);
