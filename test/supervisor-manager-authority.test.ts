@@ -469,6 +469,31 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it('retains the manager task pause and runtime veto for global worker wake authority', async () => {
+    const service = Reflect.get(server, 'managementService') as import('../src/management/store.js').ManagementService;
+    const saved = await service.read('alice');
+    await service.configure('alice', {
+      ifMatch: saved.revision,
+      managerSessionId: MANAGER,
+      agents: [{ sessionId: WORKER, role: 'Backend', notes: '', allowMessages: true }],
+    });
+    const capture = () =>
+      Reflect.get(server, 'captureManagementDeliveryAuthority').call(server, {
+        owner: 'alice',
+        sessionId: WORKER,
+        kind: 'message',
+        requestId: 'owner-inbox-wake',
+        prompt: '',
+        current: () => true,
+      }) as Promise<RecoveryActionAuthority | undefined>;
+    const authority = await capture();
+    expect(authority?.()).toBe(true);
+    await managerTask.pause();
+    expect(authority?.()).toBe(false);
+    expect(await capture()).toBeUndefined();
+    expect(taskAct).not.toHaveBeenCalled();
+  });
+
   it('carries fresh scoped manager issuer proof into a coupled worker delivery barrier', async () => {
     observation = { ...observation, activity: 'working', reason: 'turn-running', processReady: false };
     const authority = (await manager.captureBrainAuthority(() => true)) as RecoveryActionAuthority;

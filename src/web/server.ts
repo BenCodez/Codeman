@@ -444,6 +444,28 @@ export class WebServer extends EventEmitter {
     const manager = managerId ? this.sessions.get(managerId) : undefined;
     const worker = this.sessions.get(request.sessionId);
     if (!manager || !worker || manager === worker) return undefined;
+    const managerTask = this.taskControllers.get(manager.id);
+    if (!managerTask) return undefined;
+    const managerIntent = managerTask.captureActionAuthority();
+    const managerWorkCurrent = () => {
+      if (!managerIntent() || this.taskControllers.get(manager.id) !== managerTask) return false;
+      const live = managerTask.getStatus(),
+        durable = this.taskStore.get(manager.id);
+      return (
+        [live, durable].every(
+          (state) =>
+            state.config.enabled &&
+            state.phase === 'watching' &&
+            !state.inFlight &&
+            !state.agentProgressVeto &&
+            state.outcome !== 'blocked' &&
+            state.outcome !== 'completed' &&
+            state.conversationId === manager.codexConfig?.resumeSessionId
+        ) &&
+        JSON.stringify(live.config) === JSON.stringify(durable.config) &&
+        live.objective === durable.objective
+      );
+    };
     const workerBinding = () =>
       JSON.stringify([
         worker.owner,
@@ -458,6 +480,7 @@ export class WebServer extends EventEmitter {
     const current = () =>
       request.current() &&
       captured.current() &&
+      managerWorkCurrent() &&
       !this.recoveryStopping &&
       !this.cleaningUp.has(manager.id) &&
       !this.cleaningUp.has(worker.id) &&
