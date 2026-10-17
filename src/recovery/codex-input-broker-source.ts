@@ -414,12 +414,17 @@ def run():
     # protocol reply to a recently observed query; all other raw bytes still taint.
     terminal_queries = []
     terminal_tail = b''
+    focus_reporting = False
+    focus_mode_pattern = re.compile(rb'\x1b\[\?1004([hl])')
     query_pattern = re.compile(rb'\x1b(?:\[(?:(?:[>?]?|0)c|[56]n|\?u|\?(?:2026|2004|1004)\$p)|\](?:10|11|12);\?(?:\x07|\x1b\\))')
     def track_terminal_queries(output):
-        nonlocal terminal_tail
+        nonlocal terminal_tail, focus_reporting
         now = time.monotonic()
         terminal_queries[:] = [item for item in terminal_queries if item[1] > now]
         combined = terminal_tail + output
+        for match in focus_mode_pattern.finditer(combined):
+            if match.end() > len(terminal_tail):
+                focus_reporting = match.group(1) == b'h'
         for match in query_pattern.finditer(combined):
             if match.end() > len(terminal_tail) and len(terminal_queries) < 32:
                 terminal_queries.append((match.group(), now + 2))
@@ -428,6 +433,13 @@ def run():
         if expired: return 0
         now = time.monotonic()
         terminal_queries[:] = [item for item in terminal_queries if item[1] > now]
+        # Focus reports are notifications, not owner commands. Admit them only
+        # while this exact child has explicitly enabled DEC mode 1004; disabling
+        # it revokes admission immediately. Partial/other raw input still taints.
+        if focus_reporting:
+            for report in (b'\x1b[I', b'\x1b[O'):
+                if pending.startswith(report): return len(report)
+                if report.startswith(bytes(pending)): return -1
         if not terminal_queries or not pending.startswith(b'\x1b'): return 0
         data = bytes(pending[:128])
         end = None

@@ -1426,3 +1426,64 @@ it('does not accept a terminal reply after its query expires', async () => {
   await eventually(async () => (await broker.readState())?.tainted === true);
   expect(await broker.prove(child.pid!)).toBeUndefined();
 });
+
+it('admits native focus notifications only while the exact child enables mode1004, including fragments', async () => {
+  const { broker, child, bytes } = await fixture(0, undefined, (source) =>
+    source.replace(
+      "os.write(1, b'FAKE_CHILD_READY\\n')",
+      "os.write(1, b'\\x1b[?10'); os.write(1, b'04hFAKE_CHILD_READY\\n')"
+    )
+  );
+  for (const report of ['\x1b[I', '\x1b[O', '\x1b[I']) {
+    child.stdin.write(report.slice(0, 2));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    child.stdin.write(report.slice(2));
+  }
+  await eventually(async () => (await bytes()).toString() === '\x1b[I\x1b[O\x1b[I');
+  expect(await broker.prove(child.pid!)).toMatchObject({ rawGeneration: 0 });
+  const frame = broker.frame('auto', 'Known input', CID, undefined, [], OWNERS)!;
+  child.stdin.write(frame.data);
+  expect(await broker.receipt(frame.receipt)).toBe('sent');
+});
+
+it.each(['\x1b[I', '\x1b[O'])('keeps unsolicited or disabled focus reports tainted: %j', async (report) => {
+  for (const mode of ['', '\\x1b[?1004h\\x1b[?1004l']) {
+    const { broker, child } = await fixture(0, undefined, (source) =>
+      source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", `os.write(1, b'${mode}FAKE_CHILD_READY\\n')`)
+    );
+    child.stdin.write(report);
+    await eventually(async () => (await broker.readState())?.tainted === true);
+    expect(await broker.prove(child.pid!)).toBeUndefined();
+  }
+});
+
+it.each(['/resume unsafe\r', '\x1b[<0;1;1M', '\x1b[IX', '\x1b[200~unsafe\x1b[201~'])(
+  'retains the raw-input veto for arbitrary or mixed bytes while focus reporting is enabled: %j',
+  async (data) => {
+    const { broker, child } = await fixture(0, undefined, (source) =>
+      source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[?1004hFAKE_CHILD_READY\\n')")
+    );
+    child.stdin.write(data);
+    await eventually(async () => (await broker.readState())?.tainted === true);
+    expect(await broker.prove(child.pid!)).toBeUndefined();
+  }
+);
+
+it('revokes focus reporting immediately when the live child disables1004', async () => {
+  const f = await fixture(0, undefined, (source) =>
+    source
+      .replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[?1004hFAKE_CHILD_READY\\n')")
+      .replace(
+        "while not os.path.exists(os.path.join(root, 'stop')):",
+        "while not os.path.exists(os.path.join(root, 'stop')):\n    if os.path.exists(os.path.join(root, 'disable-focus')):\n        os.unlink(os.path.join(root, 'disable-focus'))\n        os.write(1, b'\\x1b[?1004lFOCUS_DISABLED\\n')"
+      )
+  );
+  f.child.stdin.write('\x1b[I');
+  await eventually(async () => (await f.bytes()).toString() === '\x1b[I');
+  expect(await f.broker.prove(f.child.pid!)).toMatchObject({ rawGeneration: 0 });
+  await fs.writeFile(join(f.root, 'disable-focus'), 'disable');
+  await eventually(async () => f.output().includes('FOCUS_DISABLED'));
+  f.child.stdin.write('\x1b[O');
+  await eventually(async () => (await f.broker.readState())?.tainted === true);
+  expect(await f.broker.prove(f.child.pid!)).toBeUndefined();
+});
