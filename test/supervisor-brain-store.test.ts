@@ -346,3 +346,58 @@ it('binds manager rewrites to exact content and revisions without replaying over
     store.replaceManaged(ID, 'canceled-rewrite', next, ownerEdit.revision, () => false)
   ).rejects.toMatchObject({ code: 'forbidden' });
 });
+
+it('imports a selected legacy brain with its note receipts and keeps the source intact', async () => {
+  const original = await seeded('Legacy owner instructions');
+  const noted = await store.append(ID, 'legacy-note-id', 'Agent A owns backend.', original.revision, current);
+  const global = new BrainStore(join(root, 'global-brains'));
+  const imported = await global.importIfAbsent(OTHER, store, ID, current);
+  expect(imported).toMatchObject({ markdown: noted.markdown, noteCount: 1, exists: true });
+  expect(await store.read(ID, current)).toMatchObject({
+    markdown: noted.markdown,
+    revision: noted.revision,
+    noteCount: 1,
+  });
+  expect(
+    (await global.append(OTHER, 'legacy-note-id', 'Agent A owns backend.', original.revision, current)).duplicate
+  ).toBe(true);
+  expect((await global.read(OTHER, current)).markdown).toBe(noted.markdown);
+});
+
+it('preserves existing shared memory, including intentional emptiness, instead of replacing it from a legacy file', async () => {
+  await seeded('Legacy text');
+  const global = new BrainStore(join(root, 'global-brains'));
+  const empty = await global.read(OTHER, current);
+  const deliberate = await global.replace(OTHER, '', empty.revision, current);
+  expect(await global.importIfAbsent(OTHER, store, ID, current)).toEqual(deliberate);
+  await expect(global.importIfAbsent(OTHER, store, ID, () => false)).rejects.toMatchObject({ code: 'forbidden' });
+});
+
+it('does not turn missing or malformed legacy evidence into an empty shared brain', async () => {
+  const global = new BrainStore(join(root, 'global-brains'));
+  expect((await global.importIfAbsent(OTHER, store, ID, current)).exists).toBe(false);
+  await seeded('Keep this source');
+  await fs.writeFile(path, 'malformed legacy');
+  await expect(global.importIfAbsent(OTHER, store, ID, current)).rejects.toMatchObject({ code: 'unavailable' });
+  expect((await global.read(OTHER, current)).exists).toBe(false);
+  expect(await fs.readFile(path, 'utf8')).toBe('malformed legacy');
+});
+
+it('refuses an import when the legacy file changes during staging', async () => {
+  await seeded('Legacy memory');
+  const global = new BrainStore(join(root, 'global-brains'));
+  const open = fs.open.bind(fs);
+  let changed = false;
+  vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+    if (!changed && String(args[0]).includes('global-brains') && String(args[0]).endsWith('.tmp')) {
+      changed = true;
+      const bytes = await fs.readFile(path, 'utf8');
+      await fs.writeFile(path, bytes.replace('Legacy memory', 'Changed memory'));
+    }
+    return open(...args);
+  });
+  await expect(global.importIfAbsent(OTHER, store, ID, current)).rejects.toMatchObject({ code: 'forbidden' });
+  expect(changed).toBe(true);
+  expect((await global.read(OTHER, current)).exists).toBe(false);
+  expect((await store.read(ID, current)).markdown).toBe('Changed memory');
+});

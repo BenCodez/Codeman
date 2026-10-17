@@ -31,7 +31,8 @@ async function fixture(
   multiuser = false,
   initiallyAborted = false,
   initiallyReady = true,
-  withManagement = false
+  withManagement = false,
+  withGitLab = false
 ) {
   vi.stubEnv('CODEMAN_MULTIUSER', multiuser ? '1' : '0');
   vi.stubEnv('CODEMAN_PASSWORD', password);
@@ -111,11 +112,18 @@ async function fixture(
       return { revision: 'b'.repeat(64) };
     }),
   };
+  const gitlab = {
+    operate: vi.fn(async (_scope, _input, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { projects: [] };
+    }),
+  };
   registerSupervisorMcpRoutes(app, {
     credentials: registry,
     resolveController: resolve,
     brain,
     ...(withManagement ? { management } : {}),
+    ...(withGitLab ? { gitlab } : {}),
   } as never);
   const generic = vi.fn(async () => ({ success: true }));
   for (const path of [
@@ -145,6 +153,7 @@ async function fixture(
     issued,
     controller,
     brain,
+    gitlab,
     management,
     resolve,
     generic,
@@ -654,4 +663,32 @@ it('allows revision-checked brain rewrites only with fresh prepared-manager auth
     ).json().error.code
   ).toBe(-32001);
   expect(f.brain.replace).toHaveBeenCalledOnce();
+});
+
+it('gates GitLab reads and writes on current prepared manager authority and strict inputs', async () => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  const listed = (await f.rpc('tools/list')).json().result.tools;
+  expect(listed.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS, 'supervisor_gitlab']);
+  const call = (args: unknown) => f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: args });
+  expect((await call({ operation: 'projects' })).json().error).toBeUndefined();
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  f.setReady(false);
+  expect((await call({ operation: 'projects' })).json().error.code).toBe(-32001);
+  f.setReady(true);
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+  expect((await call({ operation: 'projects' })).json().error.code).toBe(-32001);
+  for (const args of [
+    { operation: 'projects', token: 'synthetic' },
+    { operation: 'merge', projectId: 1 },
+    { operation: 'update_file', projectId: 1, branch: 'codeman/fix', path: '../unsafe' },
+  ])
+    expect((await call(args)).json().error.code).toBe(-32602);
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  f.controller.captureBrainAuthority.mockImplementationOnce(async (current) => {
+    f.revoke();
+    return current;
+  });
+  expect((await call({ operation: 'projects' })).json().error.code).toBe(-32001);
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  expect(f.generic).not.toHaveBeenCalled();
 });

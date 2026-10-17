@@ -159,4 +159,99 @@ describe('Global management controls in Chromium', () => {
       await page.close();
     }
   });
+  it('offers an empty manager picker a safe explicit local-session setup flow', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+    try {
+      await page.route('**/*', async (route) => {
+        if (route.request().isNavigationRequest())
+          await route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: `<!doctype html><html><head><style>${read('styles.css')}</style><style>${read('mobile.css')}</style></head><body>${html.slice(start, end)}</body></html>`,
+          });
+        else await route.fulfill({ status: 204, body: '' });
+      });
+      await page.goto('http://codeman-management.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp = CodemanApp;' });
+      await page.addScriptTag({ content: read('supervisor-brain-ui.js') });
+      await page.addScriptTag({ content: read('management-ui.js') });
+      await page.evaluate(
+        async ({ worker, manager }) => {
+          const calls: any[] = [];
+          const app = new (window as any).CodemanApp();
+          app.showToast = () => undefined;
+          app._ensureCreatedSessionVisible = async (id: string) => calls.push({ upsert: id });
+          app.selectSession = async (id: string) => calls.push({ opened: id });
+          app.closeAppSettings = () => document.getElementById('appSettingsModal')!.classList.remove('active');
+          app._apiJson = async (url: string, options?: any) => {
+            calls.push({ url, options });
+            if (url === '/api/sessions')
+              return { session: { id: manager, mode: 'codex', name: 'Management Codex', pid: null } };
+            return {
+              revision: 'a'.repeat(64),
+              managerSessionId: null,
+              brain: { markdown: '', revision: 'b'.repeat(64), exists: false, noteCount: 0 },
+              agents: [
+                {
+                  sessionId: worker,
+                  name: 'Existing SSH shell',
+                  mode: 'shell',
+                  remote: true,
+                  status: 'idle',
+                  role: '',
+                  notes: '',
+                  allowMessages: false,
+                  enrolled: false,
+                  pendingMessages: 0,
+                  managerAvailable: false,
+                },
+              ],
+            };
+          };
+          (window as any).app = app;
+          (window as any).managementCalls = calls;
+          document.getElementById('appSettingsModal')!.classList.add('active');
+          await app.loadManagementSettings();
+          document.getElementById('settings-management')!.scrollIntoView();
+        },
+        { worker, manager }
+      );
+      expect(await page.locator('#managementManager option').count()).toBe(1);
+      expect(await page.locator('#managementCreateStatus').textContent()).toContain('existing directory');
+      await page.locator('#managementCreateWorkingDir').fill('/tmp/owner-project');
+      await page.getByRole('button', { name: 'Create local management Codex', exact: true }).click();
+      await page.waitForFunction(() => !document.getElementById('managementOpenCreatedSession')!.hidden);
+      expect(
+        await page.evaluate(() =>
+          (window as any).managementCalls
+            .filter((call: any) => call.url === '/api/sessions')
+            .map((call: any) => call.options.body)
+        )
+      ).toEqual([
+        {
+          name: 'Management Codex',
+          workingDir: '/tmp/owner-project',
+          mode: 'codex',
+          codexConfig: { noDaemon: true, noAltScreen: true, dangerouslyBypassApprovals: false },
+        },
+      ]);
+      expect(await page.evaluate(() => (window as any).managementCalls.some((call: any) => call.opened))).toBe(false);
+      expect(await page.locator('#managementCreateStatus').textContent()).toContain('one normal turn');
+      await page.getByRole('button', { name: 'Open new manager session', exact: true }).click();
+      expect(
+        await page.evaluate(() =>
+          (window as any).managementCalls.filter((call: any) => call.opened).map((call: any) => call.opened)
+        )
+      ).toEqual([manager]);
+      expect(
+        await page.evaluate(() =>
+          (window as any).managementCalls.some(
+            (call: any) => call.url?.includes('/supervisor/start') || call.url?.includes('/prepare-manager')
+          )
+        )
+      ).toBe(false);
+    } finally {
+      await page.close();
+    }
+  });
 });

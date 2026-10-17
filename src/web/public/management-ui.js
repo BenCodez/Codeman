@@ -44,8 +44,75 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('managementAgentTools').hidden = true;
   },
   _renderManagementBusy(view) {
-    document.getElementById('managementSettings').disabled = !view?.snapshot || !!view.busy;
-    document.getElementById('managementBrainSettings').disabled = !view?.brain || !!view.brainBusy;
+    document.getElementById('managementSettings').disabled = !view?.snapshot || !!view.busy || !!view.brainBusy;
+    document.getElementById('managementBrainSettings').disabled = !view?.brain || !!view.brainBusy || !!view.busy;
+    this.renderManagementCreation();
+  },
+  renderManagementCreation() {
+    const creation = this._managementCreation;
+    document.getElementById('managementCreateSettings').disabled = !this._managementView?.snapshot || !!creation;
+    const open = document.getElementById('managementOpenCreatedSession');
+    open.hidden = !creation?.sessionId;
+    const status = document.getElementById('managementCreateStatus');
+    if (creation?.sessionId)
+      status.textContent =
+        'Local Codex session created. Open it, finish one normal turn and let it become idle. Then refresh this directory and select it as your manager.';
+    else if (creation?.busy) status.textContent = 'Creating one ordinary local Codex session…';
+    else if (creation?.uncertain)
+      status.textContent =
+        'Creation was not confirmed. Check the session list before trying again; this page will not repeat the request.';
+    else status.textContent = 'Use an existing directory where this owner may work.';
+  },
+  async createGlobalManagementSession() {
+    const view = this._managementView;
+    if (!view?.snapshot || this._managementCreation) return;
+    const workingDir = document.getElementById('managementCreateWorkingDir').value.trim();
+    if (!workingDir.startsWith('/') || workingDir.length > 4096 || /[\x00-\x1f\x7f]/.test(workingDir)) {
+      this.showToast('Enter an absolute local working directory on the Codeman server.', 'warning');
+      return;
+    }
+    const creation = { busy: true, uncertain: false, sessionId: null };
+    this._managementCreation = creation;
+    this.renderManagementCreation();
+    let result;
+    try {
+      result = await this._apiJson('/api/sessions', {
+        method: 'POST',
+        body: {
+          name: 'Management Codex',
+          workingDir,
+          mode: 'codex',
+          codexConfig: { noDaemon: true, noAltScreen: true, dangerouslyBypassApprovals: false },
+        },
+      });
+    } catch {
+      result = null;
+    }
+    creation.busy = false;
+    if (
+      typeof result?.session?.id !== 'string' ||
+      result.session.mode !== 'codex' ||
+      result.session.remote ||
+      result.session.docker
+    ) {
+      creation.uncertain = true;
+    } else {
+      creation.sessionId = result.session.id;
+      // The ordinary session creation helper upserts tabs without launching a CLI.
+      try {
+        await this._ensureCreatedSessionVisible?.(creation.sessionId, result.session, result.tabLayout);
+      } catch {
+        // Creation succeeded; retain its ID rather than creating a duplicate.
+      }
+    }
+    if (this._managementView && this._managementCreation === creation) this.renderManagementCreation();
+  },
+  async openCreatedManagementSession() {
+    const sessionId = this._managementCreation?.sessionId;
+    if (!sessionId) return;
+    this.closeAppSettings();
+    // The owner's explicit Open starts this ordinary local session through the normal UI path.
+    await this.selectSession(sessionId);
   },
   async loadManagementSettings(force = false) {
     if (this._managementView && !force) return;
@@ -146,7 +213,7 @@ Object.assign(CodemanApp.prototype, {
   },
   async saveManagementSettings() {
     const view = this._managementView;
-    if (!view?.snapshot || view.busy) return;
+    if (!view?.snapshot || view.busy || view.brainBusy) return;
     const agents = view.rows
       .filter(
         ({ role, notes, grant, agent }) =>
@@ -181,6 +248,17 @@ Object.assign(CodemanApp.prototype, {
       document.getElementById('managementStatus').textContent =
         'Save was not confirmed or settings changed. Your edits are retained. Copy them before refreshing.';
     } else {
+      const previousBrain = view.brain;
+      const editor = document.getElementById('managementBrainMarkdown');
+      if (previousBrain && editor.value === previousBrain.markdown) {
+        view.brain = snapshot.brain;
+        editor.value = snapshot.brain.markdown;
+        document.getElementById('managementBrainStatus').textContent = 'Shared manager memory loaded.';
+      } else if (!previousBrain || previousBrain.revision !== snapshot.brain.revision) {
+        view.brain = null;
+        document.getElementById('managementBrainStatus').textContent =
+          'Shared memory changed. Your unsaved draft is retained. Copy it before refreshing and merge it with the latest memory.';
+      }
       view.snapshot = snapshot;
       this._renderManagementDirectory(view);
       document.getElementById('managementStatus').textContent = 'Global management settings saved.';
@@ -245,7 +323,7 @@ Object.assign(CodemanApp.prototype, {
   },
   async saveManagementBrain() {
     const view = this._managementView;
-    if (!view?.brain || view.brainBusy) return;
+    if (!view?.brain || view.brainBusy || view.busy) return;
     const markdown = document.getElementById('managementBrainMarkdown').value;
     if (new TextEncoder().encode(markdown).length > 32768 || /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(markdown)) {
       this.showToast('Memory must be plain text within 32 KiB.', 'warning');

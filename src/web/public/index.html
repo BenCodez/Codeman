@@ -3404,6 +3404,18 @@
               <p class="set-group-hint">Shared across this Codeman server and all your browser devices. Choose one local manager to coordinate your agents, including Codex running inside SSH shell sessions.</p>
               <p id="managementStatus" role="status" aria-live="polite">Loading management settings…</p>
               <button type="button" class="btn-toolbar" onclick="app.loadManagementSettings(true)">Refresh management settings</button>
+              <div class="set-group task-form">
+                <h4>Set up a local management Codex</h4>
+                <p class="set-group-hint">Existing SSH shell sessions are workers. The manager is a separate local Codex on this Codeman server. Create it here without changing your SSH sessions or starting manager automation.</p>
+                <fieldset class="task-form" id="managementCreateSettings" disabled>
+                  <label for="managementCreateWorkingDir">Manager working directory on this server (absolute path)</label>
+                  <input class="set-input" id="managementCreateWorkingDir" type="text" maxlength="4096" placeholder="Enter an existing local working directory" autocomplete="off" spellcheck="false">
+                  <button type="button" class="btn-toolbar" onclick="app.createGlobalManagementSession()">Create local management Codex</button>
+                </fieldset>
+                <p id="managementCreateStatus" role="status" aria-live="polite">Use an existing directory where this owner may work.</p>
+                <button type="button" class="btn-toolbar" id="managementOpenCreatedSession" hidden onclick="app.openCreatedManagementSession()">Open new manager session</button>
+                <p class="set-group-hint">Creation uses an ordinary Codex session with --no-daemon and --no-alt-screen and keeps approval bypass off. Open it, finish one normal conversation turn, and let it become idle. Then return here, refresh, select and save it, and explicitly prepare and start the restricted manager.</p>
+              </div>
               <fieldset class="set-group task-form" id="managementSettings" disabled>
                 <legend>Global manager and agent directory</legend>
                 <label for="managementManager">Local management Codex</label>
@@ -4508,6 +4520,7 @@
   <script defer src="cron-ui.js"></script>
   <script defer src="settings-ui.js"></script>
   <script defer src="management-ui.js"></script>
+  <script defer src="management-gitlab-ui.js"></script>
   <script defer src="panels-ui.js"></script>
   <script defer src="readmymind-ui.js"></script>
   <script defer src="ultracode-panel.js"></script>

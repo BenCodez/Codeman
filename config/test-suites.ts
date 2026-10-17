@@ -29,6 +29,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/session-options-responsive.browser.test.ts',
   'test/supervisor-ui.browser.test.ts',
   'test/management-ui.browser.test.ts',
+  'test/management-gitlab-ui.browser.test.ts',
   'test/codex-launch-default-authority.browser.test.ts',
   'test/recovery-stall-consent.browser.test.ts',
   'test/inline-rename.test.ts',

@@ -200,6 +200,106 @@ describe('Global management settings', () => {
     expect(get('supervisorBrainPanel').hidden).toBe(false);
     expect(app.closeSupervisorOptions).toHaveBeenCalledTimes(1);
   });
+  it('creates one ordinary local manager candidate from an empty manager picker only on owner action', async () => {
+    const { app, get } = harness();
+    const empty = { ...snapshot(), managerSessionId: null, agents: [snapshot().agents[1]] };
+    app._apiJson.mockResolvedValueOnce(empty);
+    await app.loadManagementSettings();
+    expect(get('managementManager').options.length).toBe(1);
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    get('managementCreateWorkingDir').value = '/tmp/owner-project';
+    const session = { id: manager, mode: 'codex', name: 'Management Codex', remote: undefined, pid: null };
+    app._apiJson.mockResolvedValueOnce({ session });
+    app._ensureCreatedSessionVisible = vi.fn();
+    app.selectSession = vi.fn();
+    app.closeAppSettings = vi.fn();
+    await app.createGlobalManagementSession();
+    expect(app._apiJson.mock.calls[1]).toEqual([
+      '/api/sessions',
+      {
+        method: 'POST',
+        body: {
+          name: 'Management Codex',
+          workingDir: '/tmp/owner-project',
+          mode: 'codex',
+          codexConfig: { noDaemon: true, noAltScreen: true, dangerouslyBypassApprovals: false },
+        },
+      },
+    ]);
+    expect(app._ensureCreatedSessionVisible).toHaveBeenCalledWith(manager, session, undefined);
+    expect(app.selectSession).not.toHaveBeenCalled();
+    expect(get('managementOpenCreatedSession').hidden).toBe(false);
+    await app.createGlobalManagementSession();
+    expect(app._apiJson).toHaveBeenCalledTimes(2);
+    await app.openCreatedManagementSession();
+    expect(app.selectSession).toHaveBeenCalledWith(manager);
+    expect(
+      app._apiJson.mock.calls.every(
+        ([path]: [string]) => !path.includes('/supervisor/start') && !path.includes('/prepare-manager')
+      )
+    ).toBe(true);
+  });
+  it('retains the one created session across closing and reopening settings while creation is pending', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementCreateWorkingDir').value = '/tmp/owner-project';
+    let finish!: (value: unknown) => void;
+    app._apiJson.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    app._ensureCreatedSessionVisible = vi.fn();
+    const pending = app.createGlobalManagementSession();
+    app.closeManagementSettings();
+    app._apiJson.mockResolvedValueOnce(snapshot());
+    await app.loadManagementSettings();
+    finish({ session: { id: manager, mode: 'codex', pid: null } });
+    await pending;
+    expect(get('managementOpenCreatedSession').hidden).toBe(false);
+    expect(get('managementCreateStatus').textContent).toContain('session created');
+    expect(app._ensureCreatedSessionVisible).toHaveBeenCalledTimes(1);
+    expect(app._apiJson.mock.calls.filter(([path]: [string]) => path === '/api/sessions')).toHaveLength(1);
+  });
+  it('seals an uncertain local session creation and refuses unsafe directory text', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementCreateWorkingDir').value = 'remote-relative';
+    await app.createGlobalManagementSession();
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    get('managementCreateWorkingDir').value = '/tmp/owner-project';
+    app._apiJson.mockResolvedValueOnce(null);
+    await app.createGlobalManagementSession();
+    await app.createGlobalManagementSession();
+    expect(app._apiJson).toHaveBeenCalledTimes(2);
+    expect(get('managementCreateSettings').disabled).toBe(true);
+    expect(get('managementCreateStatus').textContent).toContain('not confirmed');
+  });
+  it('adopts imported memory from a settings save when the brain editor is pristine', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    const importedBrain = { ...brain, markdown: 'Legacy manager instructions', revision: 'c'.repeat(64) };
+    app._apiJson.mockResolvedValueOnce({ ...snapshot(), brain: importedBrain });
+    await app.saveManagementSettings();
+    expect(get('managementBrainMarkdown').value).toBe(importedBrain.markdown);
+    expect(app._managementView.brain.revision).toBe(importedBrain.revision);
+  });
+  it('preserves an unsaved brain draft and requires reconciliation after settings import newer memory', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementBrainMarkdown').value = 'Unsaved owner draft';
+    app._apiJson.mockResolvedValueOnce({
+      ...snapshot(),
+      brain: { ...brain, markdown: 'Imported instructions', revision: 'c'.repeat(64) },
+    });
+    await app.saveManagementSettings();
+    expect(get('managementBrainMarkdown').value).toBe('Unsaved owner draft');
+    expect(app._managementView.brain).toBeNull();
+    expect(get('managementBrainStatus').textContent).toContain('unsaved draft is retained');
+    await app.saveManagementBrain();
+    expect(app._apiJson).toHaveBeenCalledTimes(2);
+  });
   it('does not render late replies into a different selected agent', async () => {
     const { app, get } = harness();
     await app.loadManagementSettings();

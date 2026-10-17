@@ -118,6 +118,12 @@ export class ManagementService {
     );
     return { revision: record.revision, ...record.value };
   }
+  async captureConfiguration(owner: string, extraCurrent = () => true) {
+    const epoch = this.epochs.get(owner) ?? 0;
+    const current = this.authority(owner, undefined, () => extraCurrent() && epoch === (this.epochs.get(owner) ?? 0));
+    const config = await this.read(owner, current);
+    return { config, current };
+  }
   async captureManager(owner: string, managerId: string, extraCurrent = () => true): Promise<() => boolean> {
     const epoch = this.epochs.get(owner) ?? 0;
     const current = this.authority(

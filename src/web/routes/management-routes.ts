@@ -61,17 +61,27 @@ export function registerManagementRoutes(app: FastifyInstance, context: Manageme
     if (req.url.startsWith('/api/management')) reply.header('Cache-Control', 'no-store');
     return payload;
   });
+  const combinedSnapshot = async (
+    req: FastifyRequest,
+    operation: (owner: string, authority: () => boolean) => ReturnType<ManagementService['directory']>
+  ) => {
+    const username = owner(req);
+    const requestCurrent = current(req);
+    const authority = () => requestCurrent() && owner(req) === username;
+    const directory = await operation(username, authority);
+    const brain = await context.globalBrain.read(username, authority);
+    if (!authority()) throw new BrainStoreError('forbidden');
+    return { ...directory, brain };
+  };
   app.get('/api/management', async (req) =>
-    guarded(async () => {
-      const authority = current(req);
-      const directory = await context.service.directory(owner(req), authority);
-      const brain = await context.globalBrain.read(owner(req), authority);
-      if (!authority()) throw new BrainStoreError('forbidden');
-      return { ...directory, brain };
-    })
+    guarded(() => combinedSnapshot(req, (username, authority) => context.service.directory(username, authority)))
   );
   app.put('/api/management', async (req) =>
-    guarded(() => context.service.configure(owner(req), Configure.parse(req.body), current(req)))
+    guarded(() =>
+      combinedSnapshot(req, (username, authority) =>
+        context.service.configure(username, Configure.parse(req.body), authority)
+      )
+    )
   );
   app.get('/api/management/brain', async (req) => guarded(() => context.globalBrain.read(owner(req), current(req))));
   app.put('/api/management/brain', async (req) =>

@@ -66,6 +66,7 @@ describe('actual server restricted manager credential', () => {
       'supervisor_brain',
       'supervisor_agents',
       'supervisor_agent',
+      'supervisor_gitlab',
     ]);
     const arbitrary = await h.rpc('tools/call', { name: 'send_input', arguments: { input: 'unsafe' } });
     expect(arbitrary.json()).toMatchObject({ error: { code: -32602 } });
@@ -198,3 +199,40 @@ it.each([
     expect(eligible()).toBe(false);
   }
 );
+
+it('keeps GitLab connection credentials owner-only through actual server authentication', async () => {
+  const h = await fixture();
+  const ownerHeaders = { host: '127.0.0.1', authorization: OWNER };
+  const read = await h.app.inject({ method: 'GET', url: '/api/management/gitlab', headers: ownerHeaders });
+  expect(read.statusCode).toBe(200);
+  expect(read.headers['cache-control']).toBe('no-store');
+  const data = read.json().data;
+  const payload = {
+    ifMatch: data.revision,
+    url: 'https://gitlab.example.invalid',
+    token: 'synthetic-private-token',
+    projectIds: [],
+    allowAllProjects: true,
+    allowWrite: true,
+    writeBranchPrefix: 'codeman/',
+  };
+  const saved = await h.app.inject({ method: 'PUT', url: '/api/management/gitlab', headers: ownerHeaders, payload });
+  expect(saved.statusCode).toBe(200);
+  expect(saved.json().data).toMatchObject({ credentialConfigured: true, allowWrite: true, allowAllProjects: true });
+  expect(saved.body).not.toContain('synthetic-private-token');
+  expect(saved.json().data).not.toHaveProperty('token');
+  for (const method of ['GET', 'PUT'] as const) {
+    const result = await h.app.inject({
+      method,
+      url: '/api/management/gitlab',
+      headers: h.headers,
+      ...(method === 'PUT' ? { payload } : {}),
+    });
+    expect(result.statusCode).toBe(403);
+  }
+  expect(
+    (await h.app.inject({ method: 'POST', url: '/api/management/gitlab/check', headers: h.headers, payload: {} }))
+      .statusCode
+  ).toBe(403);
+  expect(h.effect).not.toHaveBeenCalled();
+});

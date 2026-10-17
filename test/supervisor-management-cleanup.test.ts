@@ -217,13 +217,13 @@ async function serverFixture(
   }
 }
 
-it('removes durable automation and brain only after actual successful final Session retirement', async () =>
+it('retires automation while preserving legacy brain migration sources after final Session retirement', async () =>
   serverFixture(async ({ internal, stop }) => {
     await internal._doCleanupSession(ID, true, 'fixture final deletion', false);
     expect(stop).toHaveBeenCalledWith(true);
     expect(internal.sessions.has(ID)).toBe(false);
     expect(internal.supervisorAutomationStore.ids()).not.toContain(ID);
-    expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(false);
+    expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(true);
   }));
 
 it('preserves schedules and brain on detach and server restart shutdown', async () =>
@@ -245,7 +245,7 @@ it('preserves metadata on a failed native stop, then cleans it when deletion is 
     expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(true);
     await internal._doCleanupSession(ID, true, 'fixture retry', false);
     expect(internal.supervisorAutomationStore.ids()).not.toContain(ID);
-    expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(false);
+    expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(true);
   }));
 
 it('retains both metadata domains when a new Session with the same ID appears before optional cleanup', async () =>
@@ -262,7 +262,7 @@ it('retains both metadata domains when a new Session with the same ID appears be
     expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(true);
   }));
 
-it('startup stale cleanup prunes settled orphan metadata and preserves current history and unknown flights', async () =>
+it('startup stale cleanup prunes settled schedules but preserves legacy memory and unknown flights', async () =>
   serverFixture(async ({ internal }) => {
     await internal.supervisorAutomationStore.save(OTHER, initialSupervisorAutomationRecord(OTHER));
     const unresolved = initialSupervisorAutomationRecord(UNKNOWN);
@@ -279,7 +279,7 @@ it('startup stale cleanup prunes settled orphan metadata and preserves current h
     await internal.cleanupStaleSessions();
     expect(internal.supervisorAutomationStore.ids().sort()).toEqual([ID, UNKNOWN].sort());
     expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(true);
-    expect((await internal.supervisorBrainStore.read(OTHER, current)).exists).toBe(false);
+    expect((await internal.supervisorBrainStore.read(OTHER, current)).exists).toBe(true);
     expect((await internal.supervisorBrainStore.read(UNKNOWN, current)).exists).toBe(true);
   }));
 
@@ -388,7 +388,7 @@ it.each([
       const removed = ['delete', 'pinned', 'remote-delete'].includes(kind);
       expect(internal.supervisorAutomationStore.ids().includes(ID)).toBe(!removed);
       expect(new SupervisorAutomationStore(join(root, 'automation.json')).ids().includes(ID)).toBe(!removed);
-      expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(!removed);
+      expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(true);
       if (kind === 'pinned')
         expect(internal.store.getSession(ID)).toMatchObject({
           pinned: true,

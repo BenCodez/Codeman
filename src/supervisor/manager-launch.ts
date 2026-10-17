@@ -377,6 +377,7 @@ export async function prepareSupervisorManagerLaunch(options: {
               'supervisor_brain',
               'supervisor_agents',
               'supervisor_agent',
+              'supervisor_gitlab',
             ],
             required: true,
           },

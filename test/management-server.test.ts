@@ -1,6 +1,9 @@
 /** Real WebServer hooks and routes, isolated data and dormant Session objects only. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, rm } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+import { JSDOM } from 'jsdom';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { FastifyInstance } from 'fastify';
@@ -8,6 +11,7 @@ import { WebServer } from '../src/web/server.js';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
 import { createUser } from '../src/user-store.js';
+import { SessionLifecycleLog } from '../src/session-lifecycle-log.js';
 
 const SHELL = '11111111-1111-4111-8111-111111111111';
 const MANAGER = '22222222-2222-4222-8222-222222222222';
@@ -35,6 +39,7 @@ async function fixture(directory?: string, multiUser = false) {
   vi.stubEnv('CODEMAN_USERNAME', 'fixture-owner');
   vi.stubEnv('CODEMAN_PASSWORD', 'fixture-password');
   vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
+  vi.spyOn(SessionLifecycleLog.prototype, 'log').mockImplementation(() => {});
   const server = new WebServer(0, false, true);
   servers.push(server);
   const sessions = Reflect.get(server, 'sessions') as Map<string, Session>;
@@ -119,6 +124,9 @@ describe('actual WebServer global management integration', () => {
       },
     });
     expect(saved.statusCode).toBe(200);
+    expect(saved.json().data.brain).toEqual(config.brain);
+    const readback = await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders });
+    expect(saved.json().data).toEqual(readback.json().data);
     const memory = await h.app.inject({
       method: 'PUT',
       url: '/api/management/brain',
@@ -227,6 +235,60 @@ describe('actual WebServer global management integration', () => {
     expect(h.shell.toState()).toEqual(before);
     for (const effect of [...h.effects, ...restored.effects]) expect(effect).not.toHaveBeenCalled();
   });
+  it('confirms a settings save in the actual UI using the real API response', async () => {
+    const h = await fixture();
+    const publicRoot = join(import.meta.dirname, '../src/web/public');
+    const read = (name: string) => readFileSync(join(publicRoot, name), 'utf8');
+    const dom = new JSDOM(read('index.html'), { runScripts: 'outside-only', url: 'http://localhost/' });
+    try {
+      const context = dom.getInternalVMContext();
+      context.TextEncoder = TextEncoder;
+      vm.runInContext('class CodemanApp {}', context);
+      vm.runInContext(read('supervisor-brain-ui.js'), context);
+      vm.runInContext(read('management-ui.js'), context);
+      const app = vm.runInContext('new CodemanApp()', context);
+      const snapshot = (await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders })).json()
+        .data;
+      const view = {
+        snapshot,
+        busy: false,
+        rows: snapshot.agents.map((agent: { sessionId: string }) => ({
+          agent,
+          role: { value: agent.sessionId === SHELL ? 'Backend tests' : '' },
+          notes: { value: '' },
+          grant: { checked: agent.sessionId === SHELL },
+        })),
+      };
+      app._managementView = view;
+      app._renderManagementDirectory = vi.fn();
+      app._renderManagementBusy = vi.fn();
+      app._apiJson = async (url: string, options: { method: 'PUT'; body: unknown }) => {
+        const response = await h.app.inject({
+          method: options.method,
+          url,
+          headers: ownerHeaders,
+          payload: options.body as object,
+        });
+        expect(response.statusCode).toBe(200);
+        return response.json().data;
+      };
+      await app.saveManagementSettings();
+      expect(dom.window.document.getElementById('managementStatus')!.textContent).toBe(
+        'Global management settings saved.'
+      );
+      expect(view.snapshot).not.toBeNull();
+      expect(view.snapshot.brain).toEqual(snapshot.brain);
+      expect(app._renderManagementDirectory).toHaveBeenCalledWith(view);
+      const readback = (await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders })).json()
+        .data;
+      expect(view.snapshot).toEqual(readback);
+      expect(readback.agents.find((agent: { sessionId: string }) => agent.sessionId === SHELL).role).toBe(
+        'Backend tests'
+      );
+    } finally {
+      dom.window.close();
+    }
+  });
   it('keeps other owners private even from an administrative dashboard identity', async () => {
     const h = await fixture(undefined, true);
     await createUser({ username: 'alice', password: 'alice-password', role: 'admin' });
@@ -264,4 +326,36 @@ describe('actual WebServer global management integration', () => {
     ).toBe('');
     for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
   });
+});
+
+it('imports the selected manager memory and its receipts on the first global configuration save', async () => {
+  const h = await fixture();
+  const legacy = Reflect.get(h.server, 'supervisorBrainStore') as import('../src/supervisor/brain.js').BrainStore;
+  const missing = await legacy.read(MANAGER, () => true);
+  const taught = await legacy.replace(MANAGER, '# Prior manager context', missing.revision, () => true);
+  const noted = await legacy.append(MANAGER, 'old-agent-note', 'Worker A owns the API.', taught.revision, () => true);
+  const before = (await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders })).json().data;
+  expect(before.brain.exists).toBe(false);
+  const saved = await h.app.inject({
+    method: 'PUT',
+    url: '/api/management',
+    headers: ownerHeaders,
+    payload: { ifMatch: before.revision, managerSessionId: MANAGER, agents: [] },
+  });
+  expect(saved.statusCode).toBe(200);
+  expect(saved.json().data.brain).toMatchObject({ markdown: noted.markdown, noteCount: 1 });
+  const global = Reflect.get(h.server, 'managementBrainStore') as import('../src/supervisor/brain.js').BrainStore;
+  const id = Reflect.get(h.server, 'managementBrainId').call(h.server, 'admin') as string;
+  expect(
+    (await global.append(id, 'old-agent-note', 'Worker A owns the API.', taught.revision, () => true)).duplicate
+  ).toBe(true);
+  expect(await legacy.read(MANAGER, () => true)).toMatchObject({
+    markdown: noted.markdown,
+    revision: noted.revision,
+    noteCount: 1,
+  });
+  expect(
+    (await h.app.inject({ method: 'GET', url: '/api/management/brain', headers: ownerHeaders })).json().data.markdown
+  ).toBe(noted.markdown);
+  for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
 });

@@ -85,6 +85,31 @@ are context, not permission grants, proof of successful commands, or reliable
 provider quota evidence. Guarded assignment and recovery keep their existing
 verified-worker requirements. Pause an active manager before selecting a replacement.
 
-Existing per-manager memory files are retained. Copy any prior notes you want to
-keep into the shared memory editor. The restricted-manager preparation requirements
+The selected manager's prior memory is imported when shared memory is first read,
+including its durable note receipts. An existing shared brain, even an intentionally
+empty one, is never overwritten. Legacy manager memory files remain as private
+migration sources and are not removed by session cleanup. The restricted-manager preparation requirements
 above still apply; global settings do not expand its authentication or tool grants.
+
+### Direct GitLab access
+
+App Settings → Management → GitLab accepts an HTTPS GitLab origin and a private
+credential. Select project IDs or explicitly allow every project accessible to
+that credential. File edits require a separate owner writing grant. Codeman does
+not reuse credentials from a read-only gateway. Saved connection responses and
+manager tools never return the credential.
+
+`supervisor_gitlab` lists projects, reads repository trees/files, creates feature
+branches from exact commit IDs, and creates or updates bounded files. Updates
+require the last observed file commit. Writes are confined to the configured
+branch prefix and refuse default/protected branches. Merge, delete, force-push and
+generic API requests are unavailable. Durable request IDs seal uncertain writes;
+inspect the repository before deciding how to proceed. Connection checks only
+read access and do not prove write permission. Server-side TLS verification stays
+enabled. Tests use synthetic credentials and fake transports.
+
+ChatGPT device-code login authenticates ordinary Codex sessions. The current
+restricted manager preparation accepts API-key authentication only: ChatGPT login
+may introduce managed configuration that this launcher cannot yet prove preserves
+its restricted tool catalog. Device-code login alone does not make that session
+eligible as a restricted manager.
