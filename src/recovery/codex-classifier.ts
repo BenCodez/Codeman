@@ -1014,7 +1014,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     if (/sign in|log in|authentication failed/i.test(screen)) {
       return { ...result, activity: 'blocked', reason: 'authentication-required', safeToAct: false };
     }
-    if (/usage limit|limit reached/i.test(screen)) {
+    if (/\busage limit\b|\blimit reached\b/i.test(screen)) {
       return { ...result, activity: 'blocked', reason: 'usage-limit', safeToAct: false };
     }
     if (/would you like|approve this|allow this|press enter to confirm/i.test(screen)) {

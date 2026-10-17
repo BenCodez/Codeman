@@ -932,3 +932,29 @@ describe('native MCP item lifecycle', () => {
     });
   });
 });
+
+it('does not mistake plural usage-policy prose for a native singular limit notice', () => {
+  const prose =
+    'Consider usage limits and rate limits when choosing worker prompts.\nThe owner wrote "usage limits" in the objective.\n';
+  expect(classifyCodexTail(tail(start(), complete()), context({ screen: prose + READY })).activity).toBe('completed');
+  expect(classifyCodexTail(failed(), context({ screen: prose + READY }))).toMatchObject({
+    activity: 'interrupted',
+    safeToAct: true,
+  });
+  for (const notice of ['Usage limit reached', "You've hit your usage limit. Try again later.", 'Limit reached'])
+    expect(classifyCodexTail(tail(start(), complete()), context({ screen: notice + '\n' + READY }))).toMatchObject({
+      activity: 'blocked',
+      reason: 'usage-limit',
+      safeToAct: false,
+    });
+  expect(
+    classifyCodexTail(
+      tail(
+        start(),
+        { type: 'error', message: 'Usage limit reached', codex_error_info: 'UsageLimitExceeded' },
+        complete()
+      ),
+      context({ screen: prose + READY })
+    )
+  ).toMatchObject({ activity: 'blocked', reason: 'usage-limit', safeToAct: false });
+});
