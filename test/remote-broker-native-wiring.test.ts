@@ -1,6 +1,8 @@
 /** Native manager branches with every process effect injected; only temporary metadata is real. */
 import { createHash, randomUUID } from 'node:crypto';
 import fs from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
+import { createDeferred } from './mocks/index.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from 'vitest';
@@ -67,6 +69,8 @@ afterEach(async () => {
   for (const session of sessions.splice(0)) await session.stop(false);
   for (const manager of managers.splice(0)) await Reflect.get(manager, 'sessionSaves');
   vi.restoreAllMocks();
+  syncBuiltinESMExports();
+  vi.unstubAllEnvs();
 });
 beforeEach(async () => {
   effects.sync.mockReset().mockImplementation((command: string) => {
@@ -666,5 +670,261 @@ it.each(['missing-home', 'relative-home', 'unsupported-broker'] as const)(
     expect(session.getRecoveryContext().noDaemon).toBe(kind === 'unsupported-broker');
     expect(session.taskSupervisionSupported).toBe(false);
     expect(session.toLightDetailedState().taskSupported).toBe(false);
+  }
+);
+
+it.each([
+  'ack',
+  'remote-lost',
+  'remote-refused',
+  'local-lost',
+  'owner',
+  'cancel',
+  'aba',
+  'malformed',
+  'foreign',
+  'held-owner',
+] as const)('requires exact awaited native teardown acknowledgements for persisted owned SSH (%s)', async (kind) => {
+  const { manager, options } = fixture();
+  const native: MuxSession = {
+    sessionId: options.sessionId,
+    muxName: 'codeman-' + options.sessionId.slice(0, 8),
+    pid: 600,
+    createdAt: Date.now(),
+    workingDir: root,
+    owner: options.owner,
+    remote: options.remote,
+    mode: 'codex',
+    attached: false,
+  };
+  if (kind === 'foreign') native.remote = { ...native.remote!, owned: false };
+  Reflect.get(manager, 'sessions').set(native.sessionId, native);
+  Reflect.set(manager, 'reconnectGuard', new Set());
+  Reflect.set(manager, 'lastPaneCount', new Map());
+  let current = true;
+  let entered!: () => void, release!: () => void;
+  const reached = new Promise<void>((resolve) => {
+      entered = resolve;
+    }),
+    held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+  effects.exec.mockImplementation(async (command: string) => {
+    const ssh = command.startsWith('ssh ');
+    if (command.includes('list-panes')) {
+      if (ssh) {
+        if (kind === 'owner') native.owner = 'replacement-owner';
+        if (kind === 'cancel') current = false;
+        return {
+          stdout:
+            kind === 'malformed'
+              ? 'uncertain\n'
+              : `codeman-ssh-${native.sessionId.slice(0, 8)}|$17|%9|9009|17000|1|1\n`,
+          stderr: '',
+        };
+      }
+      return { stdout: `${native.muxName}|$1|%7|600|88|1|1\n`, stderr: '' };
+    }
+    expect(command).toContain('if-shell -F');
+    expect(command).toContain('kill-session -t');
+    if (ssh) {
+      expect(command).toContain('codeman-remote');
+      expect(command).toContain('pane_pid},9009');
+      expect(command).toContain('pid},17000');
+      if (kind === 'held-owner') {
+        entered();
+        await held;
+      }
+      if (kind === 'remote-lost') throw Error('SSH acknowledgment lost');
+      if (kind === 'remote-refused')
+        return { stdout: 'CODEMAN_OWNED_KILL_REFUSED\nCODEMAN_OWNED_KILL_ACK\n', stderr: '' };
+      if (kind === 'aba') Reflect.get(manager, 'sessions').set(native.sessionId, { ...native });
+    } else if (kind === 'local-lost') throw Error('local acknowledgement lost');
+    return { stdout: 'CODEMAN_OWNED_KILL_ACK\n', stderr: '' };
+  });
+  const pending = manager.killPersistedOwnedRemoteSession(native.sessionId, native, () => current);
+  try {
+    if (kind === 'held-owner') {
+      await reached;
+      expect(manager.getSession(native.sessionId)).toBe(native);
+      expect(
+        effects.exec.mock.calls.filter(([command]) => !command.startsWith('ssh ') && command.includes('if-shell -F'))
+      ).toHaveLength(0);
+      native.owner = 'replacement-owner';
+    }
+  } finally {
+    release();
+  }
+  expect(await pending).toBe(kind === 'ack');
+  expect(manager.getSession(native.sessionId) === undefined).toBe(kind === 'ack');
+  const kills = effects.exec.mock.calls.filter(([command]) => command.includes('if-shell -F'));
+  expect(kills.length).toBe(
+    kind === 'ack' || kind === 'local-lost'
+      ? 2
+      : ['remote-lost', 'remote-refused', 'aba', 'held-owner'].includes(kind)
+        ? 1
+        : 0
+  );
+  expect(effects.sync).not.toHaveBeenCalled();
+});
+
+it.each([
+  'local-present',
+  'local-absent',
+  'request-aborted',
+  'restart',
+  'owner-drift',
+  'native-drift',
+  'unknown-remote',
+  'corrupt-receipt',
+  'malformed-native',
+  'unreadable-local',
+  'missing-socket',
+  'wrong-socket',
+  'blocked-cleanup',
+] as const)(
+  'reuses only durable exact remote kill acknowledgement for explicit local completion (%s)',
+  async (kind) => {
+    const initial = fixture();
+    const options = initial.options;
+    let manager = initial.manager;
+    if (kind === 'missing-socket' || kind === 'wrong-socket') vi.stubEnv('TMUX_TMPDIR', root);
+    let native: MuxSession = {
+      sessionId: options.sessionId,
+      muxName: 'codeman-' + options.sessionId.slice(0, 8),
+      pid: 600,
+      createdAt: Date.now(),
+      workingDir: root,
+      owner: options.owner,
+      remote: options.remote,
+      mode: 'codex',
+      attached: false,
+    };
+    Reflect.get(manager, 'sessions').set(native.sessionId, native);
+    Reflect.set(manager, 'reconnectGuard', new Set());
+    Reflect.set(manager, 'lastPaneCount', new Map());
+    await manager.flushSessionsDurably();
+    let current = true,
+      phase = 1;
+    const local = `${native.muxName}|$1|%7|600|88|1|1\n`;
+    effects.exec.mockImplementation(async (command: string) => {
+      const ssh = command.startsWith('ssh ');
+      if (command.includes('list-panes')) {
+        if (ssh) {
+          if (phase === 2) throw Error('remote pane is already absent');
+          return { stdout: `codeman-ssh-${native.sessionId.slice(0, 8)}|$17|%9|9009|17000|1|1\n`, stderr: '' };
+        }
+        if (phase === 2 && kind === 'unreadable-local') throw Error('local socket is unreadable');
+        if (phase === 2 && (kind === 'missing-socket' || kind === 'wrong-socket'))
+          throw Object.assign(Error('socket missing'), {
+            code: 1,
+            stdout: '',
+            stderr: `error connecting to ${join(root, 'tmux-' + process.getuid!(), kind === 'wrong-socket' ? 'foreign-socket' : manager.muxSocket)} (No such file or directory)\n`,
+          });
+        return {
+          stdout:
+            phase === 2 && kind === 'local-absent'
+              ? 'codeman-other|$18|%10|601|88|1|1\n'
+              : phase === 2 && kind === 'native-drift'
+                ? local.replace('|600|', '|602|')
+                : local,
+          stderr: '',
+        };
+      }
+      if (ssh) {
+        if (phase === 2) throw Error('must not repeat the remote kill');
+        if (kind === 'unknown-remote') throw Error('remote kill ACK lost');
+        if (kind === 'request-aborted') current = false;
+      } else if (phase === 1) throw Error('local kill ACK lost');
+      return { stdout: 'CODEMAN_OWNED_KILL_ACK\n', stderr: '' };
+    });
+    const receipt = join(
+      root,
+      'owned-remote-deletions',
+      hash(JSON.stringify([process.env.TMUX_TMPDIR || '/tmp', manager.muxSocket, JSON.stringify(native)])) + '.json'
+    );
+    expect(await manager.killPersistedOwnedRemoteSession(native.sessionId, native, () => current)).toBe(false);
+    expect(manager.getSession(native.sessionId)).toBe(native);
+    if (kind === 'unknown-remote') await expect(fs.lstat(receipt)).rejects.toMatchObject({ code: 'ENOENT' });
+    else {
+      expect(JSON.parse(await fs.readFile(receipt, 'utf8'))).toMatchObject({
+        version: 1,
+        local: ['' + native.muxName, '$1', '%7', '600', '88', '1', '1'],
+      });
+      expect((await fs.stat(receipt)).mode & 0o777).toBe(0o600);
+    }
+    if (kind === 'restart') {
+      manager = new TmuxManager();
+      managers.push(manager);
+      Reflect.set(manager, 'tmuxSocket', 'fixture-socket');
+      native = manager.getSession(native.sessionId)!;
+      expect(native).toBeDefined();
+    }
+    if (kind === 'owner-drift') native.owner = 'new-owner';
+    if (kind === 'corrupt-receipt') await fs.writeFile(receipt, '{incomplete');
+    if (kind === 'malformed-native') {
+      const record = JSON.parse(await fs.readFile(receipt, 'utf8'));
+      record.remote[3] = 9009;
+      await fs.writeFile(receipt, JSON.stringify(record));
+    }
+    current = true;
+    phase = 2;
+    effects.exec.mockClear();
+    const cleanupEntered = createDeferred<void>(),
+      cleanupRelease = createDeferred<void>(),
+      cleanupFinished = createDeferred<void>();
+    if (kind === 'blocked-cleanup') {
+      const remove = fs.unlink.bind(fs);
+      vi.spyOn(fs, 'unlink').mockImplementation(async (path) => {
+        if (path !== receipt) return remove(path);
+        cleanupEntered.resolve();
+        await cleanupRelease.promise;
+        try {
+          await remove(path);
+        } finally {
+          cleanupFinished.resolve();
+        }
+      });
+      syncBuiltinESMExports();
+    }
+    const accepted = [
+      'local-present',
+      'local-absent',
+      'missing-socket',
+      'request-aborted',
+      'restart',
+      'blocked-cleanup',
+    ].includes(kind);
+    let completed = false;
+    const finishing = manager
+      .killPersistedOwnedRemoteSession(native.sessionId, native, () => current)
+      .then((result) => {
+        completed = true;
+        return result;
+      });
+    try {
+      if (kind === 'blocked-cleanup') {
+        await cleanupEntered.promise;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(completed).toBe(true);
+        expect(manager.getSession(native.sessionId)).toBeUndefined();
+        expect((await fs.lstat(receipt)).isFile()).toBe(true);
+      }
+    } finally {
+      cleanupRelease.resolve();
+    }
+    expect(await finishing).toBe(accepted);
+    if (kind === 'blocked-cleanup') await cleanupFinished.promise;
+    expect(manager.getSession(native.sessionId) === undefined).toBe(accepted);
+    expect(
+      effects.exec.mock.calls.filter(([command]) => command.startsWith('ssh ') && command.includes('if-shell'))
+    ).toHaveLength(0);
+    if (accepted) {
+      expect(effects.exec.mock.calls.some(([command]) => command.startsWith('ssh '))).toBe(false);
+      expect(effects.exec.mock.calls.filter(([command]) => command.includes('if-shell'))).toHaveLength(
+        kind === 'local-absent' || kind === 'missing-socket' ? 0 : 1
+      );
+      await vi.waitFor(async () => await expect(fs.lstat(receipt)).rejects.toMatchObject({ code: 'ENOENT' }));
+    } else if (kind !== 'unknown-remote') expect((await fs.lstat(receipt)).isFile()).toBe(true);
   }
 );

@@ -27,6 +27,7 @@ import type { RecoveryActionAuthority, RecoveryEvidenceSource, RecoveryObservati
 import { RecoveryController, type RecoveryDependencies } from '../src/recovery/controller.js';
 import { SupervisorController, type SupervisorDependencies } from '../src/supervisor/controller.js';
 import type { SupervisorStore } from '../src/supervisor/store.js';
+import { initialSupervisorState } from '../src/supervisor/schema.js';
 import { createDeferred } from './mocks/index.js';
 import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
 import type { CodexBrokerProof } from '../src/recovery/codex-input-broker.js';
@@ -429,6 +430,158 @@ describe('manager authority at the real server boundary', () => {
     expect(revoke).toHaveBeenCalledTimes(2);
     expect(effects).not.toHaveBeenCalled();
   });
+
+  it.each([
+    'live-paused',
+    'live-blocked',
+    'durable-paused',
+    'durable-blocked',
+    'matching',
+    'without-launch',
+    'disabled',
+    'late-task',
+  ] as const)('preserves owner task ownership during manager preparation (%s)', async (kind) => {
+    await manager.pause();
+    observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+    const original = managerTask.getStatus();
+    const changed: TaskState = {
+      ...original,
+      objective: 'Preserve the owner repair objective',
+      checkpoint: 'Keep the owner checkpoint',
+      phase: kind.includes('blocked') ? 'blocked' : 'paused',
+      config: { ...original.config, enabled: kind !== 'disabled' },
+    };
+    if (kind.startsWith('live-') || kind === 'disabled') Reflect.set(managerTask, 'state', changed);
+    if (kind.startsWith('durable-')) await internals.taskStore.save(MANAGER, changed);
+    if (kind === 'without-launch') vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockReturnValue(false);
+    const beforeLive = managerTask.getStatus(),
+      beforeDurable = internals.taskStore.get(MANAGER);
+    const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      if (kind === 'late-task') Reflect.set(managerTask, 'state', changed);
+      return options.isCurrent();
+    });
+    const result = await internals.prepareSupervisorManager(managerSession, () => true);
+    expect(result).toBe(kind === 'matching' || kind === 'disabled');
+    if (['matching', 'disabled', 'late-task'].includes(kind)) expect(prepare).toHaveBeenCalledOnce();
+    else expect(prepare).not.toHaveBeenCalled();
+    expect(managerTask.getStatus()).toEqual(kind === 'late-task' ? changed : beforeLive);
+    expect(internals.taskStore.get(MANAGER)).toEqual(beforeDurable);
+    expect(effects).not.toHaveBeenCalled();
+  });
+
+  it.each(['existing', 'queued', 'late'] as const)(
+    'keeps a leased worker out of manager conversion through %s authority',
+    async (kind) => {
+      await manager.pause();
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      const otherId = '66666666-6666-4666-8666-666666666666';
+      const other = await fakeSession(otherId, OTHER_THREAD);
+      internals.sessions.set(otherId, other);
+      const lease = () =>
+        internals.supervisorStore.save(otherId, {
+          ...initialSupervisorState(otherId),
+          ...config,
+          phase: 'ready',
+          workers: [{ ...config.workers[0], sessionId: MANAGER, assignments: 0 }],
+        });
+      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        if (kind === 'late') await lease();
+        return options.isCurrent();
+      });
+      const entered = createDeferred(),
+        release = createDeferred();
+      let held: Promise<unknown> | undefined;
+      try {
+        if (kind === 'existing') await lease();
+        if (kind === 'queued') {
+          held = Reflect.get(server, 'withSupervisorLeases').call(server, async () => {
+            await lease();
+            entered.resolve();
+            await release.promise;
+          });
+          await entered.promise;
+        }
+        const converting = internals.prepareSupervisorManager(managerSession, () => true);
+        if (kind === 'queued') {
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          expect(prepare).not.toHaveBeenCalled();
+          release.resolve();
+          await held;
+        }
+        expect(await converting).toBe(false);
+        if (kind === 'late') expect(prepare).toHaveBeenCalledOnce();
+        else expect(prepare).not.toHaveBeenCalled();
+        expect(internals.supervisorStore.get(otherId).enabled).toBe(true);
+        expect(effects).not.toHaveBeenCalled();
+      } finally {
+        release.resolve();
+        await held;
+        internals.sessions.delete(otherId);
+        await other.stop(false);
+      }
+    }
+  );
+
+  it.each(['teaching', 'owner-changed', 'untracked-input'] as const)(
+    'keeps paused owner teaching separate from worker authority through the actual server (%s)',
+    async (kind) => {
+      await manager.pause();
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      const revoke = vi.fn(async () => {});
+      vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        // Native launch is a fixture; retain the REAL server preparation scope
+        // and exercise Session's real profile lifecycle after acknowledgment.
+        Reflect.set(managerSession, '_supervisorManagerProfile', {
+          isCurrent: () =>
+            options.isCurrent() &&
+            !managerSession.getRecoveryContext().switchPending &&
+            !managerSession.getRecoveryContext().untrackedInput,
+          revoke,
+        });
+        const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
+        Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', () => true);
+        return options.isCurrent();
+      });
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+      vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+      expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(true);
+      managerTask.noteUserInput();
+      // Hold the tracked input publication boundary. It grants no manager
+      // operations while pending and must not destroy the exact profile.
+      Reflect.set(managerSession, '_recoverySwitchPending', true);
+      expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(false);
+      expect(managerSession.hasSupervisorManagerLaunch()).toBe(true);
+      expect(revoke).not.toHaveBeenCalled();
+      expect(await manager.captureBrainAuthority(() => true)).toBeUndefined();
+      Reflect.set(managerSession, '_recoverySwitchPending', false);
+      expect(managerTask.getStatus().phase).toBe('paused');
+      if (kind === 'owner-changed') Reflect.set(managerSession, 'owner', 'different-owner');
+      if (kind === 'untracked-input') Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+      const authority = await manager.captureBrainAuthority(() => true);
+      const brain = Reflect.get(server, 'supervisorBrainStore') as import('../src/supervisor/brain.js').BrainStore;
+      if (kind === 'teaching') {
+        expect(authority?.()).toBe(true);
+        const before = await brain.read(MANAGER, authority!);
+        const saved = await brain.append(
+          MANAGER,
+          'owner-teaching-0001',
+          'API worker owns backend changes. Keep prompts concise.',
+          before.revision,
+          authority!
+        );
+        expect(saved.markdown).toContain('API worker owns backend changes.');
+        expect(saved.noteCount).toBe(1);
+      } else {
+        expect(authority).toBeUndefined();
+        expect((await brain.read(MANAGER, () => true)).exists).toBe(false);
+      }
+      await expect(manager.assign(WORKER, 'no-worker-action-after-owner-input')).rejects.toThrow();
+      expect(effects).not.toHaveBeenCalled();
+      expect(taskAct).not.toHaveBeenCalled();
+      expect(recoveryAct).not.toHaveBeenCalled();
+    }
+  );
 
   it('prepares only a verified idle manager with explicit request scope, retaining UUID and private startup evidence', async () => {
     await manager.pause();

@@ -392,6 +392,8 @@ export interface TerminalMultiplexer extends EventEmitter {
    * Uses a multi-strategy approach (children → process group → mux kill → SIGKILL).
    */
   killSession(sessionId: string): Promise<boolean>;
+  /** Explicit persisted-owner deletion: positive remote and local native kill acknowledgements. */
+  killPersistedOwnedRemoteSession?(sessionId: string, expected: MuxSession, isCurrent: () => boolean): Promise<boolean>;
   /** Cancel only a locally acknowledged reboot worker, with exact native ownership. */
   cancelAcknowledgedRebootLaunch?(record: MuxSession, isCurrent: () => boolean): Promise<boolean>;
   /** Clear only our acknowledged generic launch marker after the caller has committed main state. */

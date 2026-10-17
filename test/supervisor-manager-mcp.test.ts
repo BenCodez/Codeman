@@ -1,6 +1,7 @@
 /** Real authentication hooks and MCP routes via inject; no socket or native/worker effects. */
 import Fastify, { type FastifyInstance } from 'fastify';
 import cookie from '@fastify/cookie';
+import Ajv from 'ajv';
 import { afterEach, expect, it, vi } from 'vitest';
 import { ManagerCredentialRegistry } from '../src/supervisor/manager-credentials.js';
 import { registerAuthMiddleware, registerHostGuard } from '../src/web/middleware/auth.js';
@@ -15,6 +16,15 @@ vi.mock('../src/user-store.js', async (original) => ({
 const SID = '11111111-2222-4333-8444-555555555555';
 const WORKER = '22222222-3333-4444-8555-666666666666';
 const REQUEST = '33333333-4444-4555-8666-777777777777';
+const TOOLS = [
+  'supervisor_status',
+  'supervisor_workers',
+  'supervisor_assign',
+  'supervisor_retry',
+  'supervisor_message',
+  'supervisor_brain',
+];
+const REVISION = 'a'.repeat(64);
 const apps: FastifyInstance[] = [];
 async function fixture(
   password = 'owner-password',
@@ -63,11 +73,26 @@ async function fixture(
       if (!isCurrent?.()) throw Error('cancelled');
       return state;
     }),
+    message: vi.fn(async (_worker: string, _request: string, _message: string, isCurrent?: () => boolean) => {
+      if (!isCurrent?.()) throw Error('cancelled');
+      return state;
+    }),
+    captureBrainAuthority: vi.fn(async (isCurrent: () => boolean) => (isCurrent() ? isCurrent : undefined)),
   };
   const resolve = vi.fn((scope) =>
     scope.sessionId === SID && scope.owner === (multiuser ? 'alice' : undefined) ? controller : undefined
   );
-  registerSupervisorMcpRoutes(app, { credentials: registry, resolveController: resolve } as never);
+  const brain = {
+    read: vi.fn(async (_scope, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { content: 'Owner teaching', revision: REVISION };
+    }),
+    append: vi.fn(async (_scope, _id: string, _note: string, _revision: string, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { revision: 'b'.repeat(64) };
+    }),
+  };
+  registerSupervisorMcpRoutes(app, { credentials: registry, resolveController: resolve, brain } as never);
   const generic = vi.fn(async () => ({ success: true }));
   for (const path of [
     '/api/sessions',
@@ -95,6 +120,7 @@ async function fixture(
     registry,
     issued,
     controller,
+    brain,
     resolve,
     generic,
     rpc,
@@ -110,7 +136,7 @@ afterEach(async () => {
   vi.resetAllMocks();
 });
 
-it('initializes and lists only four tools, then invokes exact owner-selected operations', async () => {
+it('initializes and lists exactly six scoped tools, then invokes exact owner-selected operations', async () => {
   const f = await fixture();
   expect(
     (
@@ -122,16 +148,35 @@ it('initializes and lists only four tools, then invokes exact owner-selected ope
     ).json()
   ).toMatchObject({ jsonrpc: '2.0', id: 1, result: { protocolVersion: '2025-03-26' } });
   const listed = (await f.rpc('tools/list')).json();
-  expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual([
-    'supervisor_status',
-    'supervisor_workers',
-    'supervisor_assign',
-    'supervisor_retry',
-  ]);
-  for (const name of ['supervisor_status', 'supervisor_workers', 'supervisor_assign', 'supervisor_retry']) {
+  expect(listed.result.tools.map((tool: { name: string }) => tool.name)).toEqual(TOOLS);
+  const schemas = Object.fromEntries(
+    listed.result.tools.map((tool: { name: string; inputSchema: unknown }) => [tool.name, tool.inputSchema])
+  );
+  expect(schemas.supervisor_message).toMatchObject({
+    required: ['workerId', 'requestId', 'message'],
+    additionalProperties: false,
+    properties: { message: { maxLength: 4000 } },
+  });
+  expect(schemas.supervisor_brain).toMatchObject({
+    required: ['mode'],
+    additionalProperties: false,
+    properties: {
+      mode: { enum: ['read', 'append'] },
+      note: { maxLength: 2000 },
+      ifMatch: { pattern: '^[a-f0-9]{64}$' },
+    },
+  });
+  for (const name of TOOLS) {
     const result = await f.rpc('tools/call', {
       name,
-      arguments: name.endsWith('assign') || name.endsWith('retry') ? { workerId: WORKER, requestId: REQUEST } : {},
+      arguments:
+        name === 'supervisor_brain'
+          ? { mode: 'read' }
+          : name === 'supervisor_message'
+            ? { workerId: WORKER, requestId: REQUEST, message: 'Continue from the owner checkpoint' }
+            : name.endsWith('assign') || name.endsWith('retry')
+              ? { workerId: WORKER, requestId: REQUEST }
+              : {},
     });
     expect(result.statusCode).toBe(200);
     expect(result.json().error).toBeUndefined();
@@ -139,6 +184,13 @@ it('initializes and lists only four tools, then invokes exact owner-selected ope
   }
   expect(f.controller.assign).toHaveBeenCalledWith(WORKER, REQUEST, expect.any(Function));
   expect(f.controller.retry).toHaveBeenCalledWith(WORKER, REQUEST, expect.any(Function));
+  expect(f.controller.message).toHaveBeenCalledWith(
+    WORKER,
+    REQUEST,
+    'Continue from the owner checkpoint',
+    expect.any(Function)
+  );
+  expect(f.brain.read).toHaveBeenCalledWith(f.registry.resolve(f.issued.token), expect.any(Function));
   expect(f.generic).not.toHaveBeenCalled();
 });
 
@@ -167,7 +219,7 @@ it('keeps implicit resource discovery empty and never dispatches a resource URI'
   expect(f.generic).not.toHaveBeenCalled();
   expect(f.controller.assign).not.toHaveBeenCalled();
   expect(f.controller.retry).not.toHaveBeenCalled();
-  expect((await f.rpc('tools/list')).json().result.tools).toHaveLength(4);
+  expect((await f.rpc('tools/list')).json().result.tools.map((tool: { name: string }) => tool.name)).toEqual(TOOLS);
   f.revoke();
   for (const method of ['resources/list', 'resources/templates/list', 'resources/read'])
     expect((await f.rpc(method, method === 'resources/read' ? { uri: 'file:///private' } : undefined)).statusCode).toBe(
@@ -244,11 +296,25 @@ it.each([
   { name: 'supervisor_assign', arguments: { workerId: WORKER, requestId: REQUEST, task: 'unowned task' } },
   { name: 'supervisor_retry', arguments: { workerId: WORKER } },
   { name: 'supervisor_status', arguments: { sessionId: WORKER } },
+  { name: 'supervisor_message', arguments: { workerId: SID, requestId: REQUEST, message: 'self' } },
+  { name: 'supervisor_message', arguments: { workerId: WORKER, requestId: REQUEST, message: '   ' } },
+  { name: 'supervisor_message', arguments: { workerId: WORKER, requestId: REQUEST, message: 'x'.repeat(4001) } },
+  { name: 'supervisor_message', arguments: { workerId: WORKER, requestId: REQUEST, message: '\x1b' } },
+  { name: 'supervisor_message', arguments: { workerId: WORKER, requestId: REQUEST, message: 'text', raw: true } },
+  { name: 'supervisor_brain', arguments: { mode: 'read', path: '/private' } },
+  { name: 'supervisor_brain', arguments: { mode: 'append', requestId: REQUEST, note: 'teaching' } },
+  {
+    name: 'supervisor_brain',
+    arguments: { mode: 'append', requestId: REQUEST, note: 'x'.repeat(2001), ifMatch: REVISION },
+  },
+  { name: 'supervisor_brain', arguments: { mode: 'append', requestId: REQUEST, note: 'teaching', ifMatch: 'unknown' } },
 ])('refuses invalid or expanded tool $name arguments before controller dispatch', async (params) => {
   const f = await fixture();
   expect((await f.rpc('tools/call', params)).json().error.code).toBe(-32602);
   expect(f.controller.assign).not.toHaveBeenCalled();
   expect(f.controller.retry).not.toHaveBeenCalled();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.brain.append).not.toHaveBeenCalled();
 });
 
 it('does not execute a mutation notification or arbitrary RPC method', async () => {
@@ -353,14 +419,27 @@ it('keeps an uncertain launch usable for inspection while refusing every worker 
     expect(response.statusCode).toBe(200);
     expect(response.json().result.content[0].type).toBe('text');
   }
-  for (const name of ['supervisor_assign', 'supervisor_retry']) {
-    const response = await f.rpc('tools/call', { name, arguments: { workerId: WORKER, requestId: REQUEST } });
+  for (const name of ['supervisor_assign', 'supervisor_retry', 'supervisor_message', 'supervisor_brain']) {
+    const args =
+      name === 'supervisor_brain'
+        ? { mode: 'append', requestId: REQUEST, note: 'teaching', ifMatch: REVISION }
+        : {
+            workerId: WORKER,
+            requestId: REQUEST,
+            ...(name === 'supervisor_message' ? { message: 'Instruction' } : {}),
+          };
+    const response = await f.rpc('tools/call', { name, arguments: args });
     expect(response.json().error).toMatchObject({ code: -32001 });
   }
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { mode: 'read' } })).json().error
+  ).toBeUndefined();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.brain.append).not.toHaveBeenCalled();
   expect(f.controller.inspectWorkers).toHaveBeenCalledWith(true);
   expect(f.controller.assign).not.toHaveBeenCalled();
   expect(f.controller.retry).not.toHaveBeenCalled();
-  expect((await f.rpc('tools/list')).json().result.tools).toHaveLength(4);
+  expect((await f.rpc('tools/list')).json().result.tools.map((tool: { name: string }) => tool.name)).toEqual(TOOLS);
   f.setReady(true);
   expect(f.registry.resolve(f.issued.token)).toBe(scope);
   expect(
@@ -371,4 +450,128 @@ it('keeps an uncertain launch usable for inspection while refusing every worker 
   expect(f.controller.assign).toHaveBeenCalledOnce();
   f.revoke();
   expect((await f.rpc('tools/call', { name: 'supervisor_status' })).statusCode).toBe(401);
+});
+
+it('permits scoped owner teaching while paused without granting worker actions', async () => {
+  const f = await fixture();
+  f.controller.getStatus().phase = 'paused';
+  f.controller.assign.mockRejectedValue(Error('paused owner intent'));
+  const teaching = await f.rpc('tools/call', {
+    name: 'supervisor_brain',
+    arguments: { mode: 'append', requestId: REQUEST, note: 'Preserve the owner review checkpoint', ifMatch: REVISION },
+  });
+  expect(teaching.json().error).toBeUndefined();
+  expect(f.controller.captureBrainAuthority).toHaveBeenCalledWith(expect.any(Function));
+  expect(f.brain.append).toHaveBeenCalledWith(
+    f.registry.resolve(f.issued.token),
+    REQUEST,
+    'Preserve the owner review checkpoint',
+    REVISION,
+    expect.any(Function)
+  );
+  const assigning = await f.rpc('tools/call', {
+    name: 'supervisor_assign',
+    arguments: { workerId: WORKER, requestId: REQUEST },
+  });
+  expect(assigning.json().error.code).toBe(-32000);
+  expect(f.controller.getStatus().phase).toBe('paused');
+  expect(f.generic).not.toHaveBeenCalled();
+});
+
+it('advertises brain read and append arguments that match runtime admission', async () => {
+  const f = await fixture();
+  const tools = (await f.rpc('tools/list')).json().result.tools;
+  const schema = tools.find((tool: { name: string }) => tool.name === 'supervisor_brain').inputSchema;
+  const validate = new Ajv({ allErrors: true }).compile(schema);
+  const append = { mode: 'append', requestId: REQUEST, note: 'Owner checkpoint', ifMatch: REVISION };
+  const cases: { args: Record<string, unknown>; valid: boolean }[] = [
+    { args: { mode: 'read' }, valid: true },
+    { args: append, valid: true },
+    ...['requestId', 'note', 'ifMatch'].flatMap((field) => [
+      { args: Object.fromEntries(Object.entries(append).filter(([key]) => key !== field)), valid: false },
+      { args: { mode: 'read', [field]: append[field as keyof typeof append] }, valid: false },
+    ]),
+    { args: { ...append, ifMatch: 'unknown' }, valid: false },
+    { args: { ...append, note: '' }, valid: false },
+    { args: { ...append, path: '/private' }, valid: false },
+    { args: { mode: 'unknown' }, valid: false },
+  ];
+  for (const { args, valid } of cases) {
+    expect(validate(args), JSON.stringify(args)).toBe(valid);
+    const result = (await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json();
+    if (valid) expect(result.error).toBeUndefined();
+    else expect(result.error).toMatchObject({ code: -32602 });
+  }
+  expect(f.brain.read).toHaveBeenCalledOnce();
+  expect(f.brain.append).toHaveBeenCalledOnce();
+});
+
+it('rechecks credential authority after held brain authorization before appending', async () => {
+  const f = await fixture();
+  const entered = createDeferred<void>(),
+    release = createDeferred<void>();
+  f.controller.captureBrainAuthority.mockImplementation(async (current) => {
+    entered.resolve();
+    await release.promise;
+    return current() ? current : undefined;
+  });
+  const response = Promise.resolve(
+    f.rpc('tools/call', {
+      name: 'supervisor_brain',
+      arguments: { mode: 'append', requestId: REQUEST, note: 'Owner teaching', ifMatch: REVISION },
+    })
+  );
+  try {
+    await entered.promise;
+    f.revoke();
+  } finally {
+    release.resolve();
+  }
+  expect((await response).json().error).toBeDefined();
+  expect(f.brain.append).not.toHaveBeenCalled();
+});
+
+it('aligns advertised and admitted Unicode note sizes, rejecting oversized notes before memory effects', async () => {
+  const f = await fixture();
+  const schema = (await f.rpc('tools/list'))
+    .json()
+    .result.tools.find((tool: { name: string }) => tool.name === 'supervisor_brain').inputSchema;
+  const validate = new Ajv({ allErrors: true }).compile(schema);
+  for (const note of ['é'.repeat(1025), '界'.repeat(2000), '🙂'.repeat(2000)]) {
+    const args = { mode: 'append', requestId: REQUEST, note, ifMatch: REVISION };
+    expect(validate(args)).toBe(true);
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toBeUndefined();
+  }
+  expect(f.brain.append).toHaveBeenCalledTimes(3);
+  for (const note of ['a'.repeat(2001), '🙂'.repeat(2001), '   ']) {
+    const args = { mode: 'append', requestId: REQUEST, note, ifMatch: REVISION };
+    expect(validate(args)).toBe(false);
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toMatchObject({
+      code: -32602,
+    });
+  }
+  expect(f.brain.append).toHaveBeenCalledTimes(3);
+});
+
+it('advertises the same non-whitespace message constraint that runtime admission enforces', async () => {
+  const f = await fixture();
+  const schema = (await f.rpc('tools/list'))
+    .json()
+    .result.tools.find((tool: { name: string }) => tool.name === 'supervisor_message').inputSchema;
+  const validate = new Ajv({ allErrors: true }).compile(schema);
+  for (const message of ['   ', '\r\n', '\u00a0\u2003']) {
+    const args = { workerId: WORKER, requestId: REQUEST, message };
+    expect(validate(args)).toBe(false);
+    expect((await f.rpc('tools/call', { name: 'supervisor_message', arguments: args })).json().error).toMatchObject({
+      code: -32602,
+    });
+  }
+  expect(f.controller.message).not.toHaveBeenCalled();
+  for (const message of ['Inspect the checkpoint', '  Preserve spacing.\nInspect next.  ', '\u2003界\u2003']) {
+    const args = { workerId: WORKER, requestId: REQUEST, message };
+    expect(validate(args)).toBe(true);
+    expect((await f.rpc('tools/call', { name: 'supervisor_message', arguments: args })).json().error).toBeUndefined();
+    expect(f.controller.message).toHaveBeenLastCalledWith(WORKER, REQUEST, message, expect.any(Function));
+  }
+  expect(f.controller.message).toHaveBeenCalledTimes(3);
 });

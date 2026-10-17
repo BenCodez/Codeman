@@ -1487,7 +1487,7 @@ export function registerSessionRoutes(
 
   // ========== Delete Session ==========
 
-  app.delete('/api/sessions/:id', async (req) => {
+  app.delete('/api/sessions/:id', async (req, reply) => {
     const { id } = req.params as { id: string };
     const query = req.query as { killMux?: string };
     const killMux = query.killMux !== 'false'; // Default to true
@@ -1504,28 +1504,72 @@ export function registerSessionRoutes(
       // below re-looks-up the record by id, so the returned SessionState is unused here.
       const before = findPersistedSessionOrFail(ctx.store, id, req);
       const beforeText = JSON.stringify(before);
+      const rowCurrent = () =>
+        !req.raw.aborted &&
+        !reply.raw.destroyed &&
+        canAccessOwned(getAuthUser(req), before.owner) &&
+        !ctx.sessions.has(id) &&
+        ctx.store.getSession(id) === before &&
+        JSON.stringify(before) === beforeText;
+      const ownedRemote = killMux && before.remote && before.remote.owned !== false;
+      const native = ctx.mux.getSession(id);
+      const nativeText = JSON.stringify(native);
+      const nativeCurrent = () =>
+        !!native &&
+        !native.discovered &&
+        native.sessionId === id &&
+        native.owner === before.owner &&
+        native.mode === before.mode &&
+        !!native.remote &&
+        native.remote.owned !== false &&
+        JSON.stringify(native.remote) === JSON.stringify(before.remote) &&
+        ctx.mux.getSession(id) === native &&
+        JSON.stringify(native) === nativeText;
+      if (ownedRemote && (!rowCurrent() || !nativeCurrent()))
+        throw Error('Owned remote session has no current exact mux target');
       if (killMux) {
         await ownedRemoteBrokerCache.stageFinalCleanup(
           id,
           before.pinned ? { ...before, status: 'stopped', pid: null } : undefined,
-          () => !ctx.sessions.has(id) && ctx.store.getSession(id) === before && JSON.stringify(before) === beforeText,
+          () => rowCurrent() && (!ownedRemote || nativeCurrent()),
           before.remote && before.remote.owned !== false ? { remote: before.remote, owner: before.owner } : undefined
         );
-        if (ctx.sessions.has(id) || ctx.store.getSession(id) !== before || JSON.stringify(before) !== beforeText)
+        if (!rowCurrent() || (ownedRemote && !nativeCurrent()))
           throw Error('Session changed while preparing final cleanup');
+        if (ownedRemote) {
+          // A persisted row can still own a live SSH wrapper after Session restore
+          // failed. Its teardown must be acknowledged before retiring its record.
+          const killed = await ctx.mux.killPersistedOwnedRemoteSession?.(
+            id,
+            native!,
+            () => rowCurrent() && nativeCurrent()
+          );
+          if (killed !== true || !rowCurrent() || ctx.mux.getSession(id))
+            throw Error('Owned remote session teardown was not acknowledged');
+        }
       }
+      const retiredOwner = before.owner;
+      const expectedRetiredText = JSON.stringify(
+        before.pinned ? { ...before, status: 'stopped', pid: null } : undefined
+      );
       ctx.store.demoteOrRemoveSession(id);
       if (killMux) {
         const retiredState = ctx.store.getSessions()[id];
         const retiredStateText = JSON.stringify(retiredState);
-        await ownedRemoteBrokerCache.finishFinalCleanup(
-          id,
-          () =>
-            !ctx.sessions.has(id) &&
-            ctx.store.getSessions()[id] === retiredState &&
-            JSON.stringify(retiredState) === retiredStateText,
-          retiredState
-        );
+        const retiredCurrent = () =>
+          !req.raw.aborted &&
+          !reply.raw.destroyed &&
+          before.owner === retiredOwner &&
+          canAccessOwned(getAuthUser(req), retiredOwner) &&
+          !ctx.sessions.has(id) &&
+          ctx.store.getSessions()[id] === retiredState &&
+          JSON.stringify(retiredState) === retiredStateText &&
+          retiredStateText === expectedRetiredText &&
+          (ownedRemote
+            ? !ctx.mux.getSession(id)
+            : ctx.mux.getSession(id) === native && JSON.stringify(native) === nativeText);
+        await ctx.dropSupervisorManagementState(id, retiredCurrent);
+        await ownedRemoteBrokerCache.finishFinalCleanup(id, retiredCurrent, retiredState);
       }
       // Mirrors the broadcast at the tail of the live-session cleanup path
       // (_doCleanupSession in server.ts) — without it, other open tabs keep

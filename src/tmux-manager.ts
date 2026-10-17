@@ -43,7 +43,7 @@ import { promisify } from 'node:util';
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
 import { existsSync, readFileSync, constants } from 'node:fs';
-import { writeFile, rename, mkdir, open, unlink, lstat } from 'node:fs/promises';
+import { writeFile, rename, mkdir, open, unlink, lstat, link } from 'node:fs/promises';
 import { dirname, join, isAbsolute, posix } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
@@ -4900,6 +4900,291 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       }
       this.acknowledgedRebootLaunches.delete(record);
       this.emit('sessionKilled', { sessionId: record.sessionId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Owner deletion of a retained SSH row must not mistake a local kill for a remote ACK. */
+  async killPersistedOwnedRemoteSession(
+    sessionId: string,
+    expected: MuxSession,
+    isCurrent: () => boolean
+  ): Promise<boolean> {
+    if (IS_TEST_MODE) return false; // Native-effect fixtures explicitly replace every process boundary.
+    const binding = JSON.stringify(expected);
+    const socketRoot = process.env.TMUX_TMPDIR || '/tmp';
+    const recordCurrent = () => this.sessions.get(sessionId) === expected && JSON.stringify(expected) === binding;
+    const current = () => {
+      try {
+        return (
+          isCurrent() === true &&
+          (process.env.TMUX_TMPDIR || '/tmp') === socketRoot &&
+          isAbsolute(socketRoot) &&
+          recordCurrent() &&
+          JSON.stringify(expected) === binding &&
+          !expected.discovered &&
+          expected.sessionId === sessionId &&
+          /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(sessionId) &&
+          !!expected.remote &&
+          expected.remote.owned !== false &&
+          isValidMuxName(expected.muxName) &&
+          expected.muxName !== process.env.CODEMAN_MUX_NAME
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!current()) return false;
+    this.guardRemoteReconnect(sessionId);
+    const format = '#{session_name}|#{session_id}|#{pane_id}|#{pane_pid}|#{pid}|#{session_windows}|#{window_panes}';
+    const fields = ['session_name', 'session_id', 'pane_id', 'pane_pid', 'pid', 'session_windows', 'window_panes'];
+    const parse = (text: string, name: string): string[] | undefined => {
+      const row = text.endsWith('\n') ? text.slice(0, -1).split('|') : [];
+      return row.length === 7 &&
+        row[0] === name &&
+        /^\$[0-9]+$/.test(row[1]) &&
+        /^%[0-9]+$/.test(row[2]) &&
+        [row[3], row[4]].every((value) => /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value))) &&
+        row[5] === '1' &&
+        row[6] === '1'
+        ? row
+        : undefined;
+    };
+    const remote = structuredClone(expected.remote!);
+    const remoteCommand = (command: string) =>
+      [...buildSshConnectionArgs(remote), remoteSshTarget(remote), shellescape(command)].join(' ');
+    const read = async (command: string, name: string) => {
+      if (!current()) return undefined;
+      const result = await execAsync(command, { timeout: EXEC_TIMEOUT_MS, maxBuffer: 16384 });
+      return current() && !result.stderr ? parse(result.stdout, name) : undefined;
+    };
+    const killCommand = (tmux: string, row: string[]) => {
+      const terms = fields.map((key, index) => '#{==:#{' + key + '},' + row[index] + '}');
+      const predicate = terms.reduce((a, b) => '#{&&:' + a + ',' + b + '}');
+      return `${tmux} if-shell -F -t ${shellescape(row[2])} ${shellescape(predicate)} ${shellescape('kill-session -t ' + shellescape(row[1]))} ${shellescape('display-message -p CODEMAN_OWNED_KILL_REFUSED')} && printf 'CODEMAN_OWNED_KILL_ACK\\n'`;
+    };
+    try {
+      const remoteName = remoteTmuxSessionName(sessionId),
+        remoteTmux = `tmux -L ${REMOTE_TMUX_SOCKET}`;
+      const scope = createHash('sha256')
+        .update(JSON.stringify([socketRoot, this.muxSocket, binding]))
+        .digest('hex');
+      const receiptRoot = join(getDataDirPath(), 'owned-remote-deletions');
+      const receiptPath = join(receiptRoot, scope + '.json');
+      const safeDirectory = async () => {
+        const info = await lstat(receiptRoot);
+        if (!info.isDirectory() || info.isSymbolicLink() || info.uid !== process.getuid?.() || info.mode & 0o077)
+          throw Error('Unknown remote deletion receipt directory');
+      };
+      const same = (a: Awaited<ReturnType<typeof lstat>>, b: Awaited<ReturnType<typeof lstat>>) =>
+        ['dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'mode', 'uid'].every(
+          (key) => a[key as keyof typeof a] === b[key as keyof typeof b]
+        );
+      const loadReceipt = async () => {
+        try {
+          await safeDirectory();
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
+        }
+        let file: Awaited<ReturnType<typeof open>>;
+        try {
+          file = await open(receiptPath, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+          throw error;
+        }
+        try {
+          const info = await file.stat();
+          if (!info.isFile() || info.uid !== process.getuid?.() || info.mode & 0o077 || info.size > 4096)
+            throw Error('Unknown remote deletion receipt');
+          const bytes = Buffer.alloc(info.size + 1);
+          let size = 0;
+          while (size < bytes.length) {
+            const part = await file.read(bytes, size, bytes.length - size, size);
+            if (!part.bytesRead) break;
+            size += part.bytesRead;
+          }
+          const text = bytes.subarray(0, size).toString('utf8');
+          if (
+            size !== info.size ||
+            !same(info, await file.stat()) ||
+            !same(info, await lstat(receiptPath)) ||
+            !Buffer.from(text).equals(bytes.subarray(0, size))
+          )
+            throw Error('Changed remote deletion receipt');
+          const value = JSON.parse(text);
+          if (
+            Object.keys(value).sort().join(',') !== 'local,remote,scope,version' ||
+            value.version !== 1 ||
+            value.scope !== scope ||
+            !Array.isArray(value.local) ||
+            !value.local.every((field: unknown) => typeof field === 'string') ||
+            !parse(value.local.join('|') + '\n', expected.muxName) ||
+            Number(value.local[3]) !== expected.pid ||
+            !Array.isArray(value.remote) ||
+            !value.remote.every((field: unknown) => typeof field === 'string') ||
+            !parse(value.remote.join('|') + '\n', remoteName)
+          )
+            throw Error('Invalid remote deletion receipt');
+          await safeDirectory();
+          return { info, text, local: value.local as string[] };
+        } finally {
+          await file.close();
+        }
+      };
+      let receipt = await loadReceipt();
+      if (!current()) return false;
+      let local: string[] | undefined,
+        localAbsent = false;
+      if (receipt) {
+        // A successful complete socket snapshot can certify a lost local kill
+        // ACK. A failed query alone never proves that its target disappeared.
+        let rows: string[][] | undefined;
+        try {
+          const result = await execAsync(`${this.tmux()} list-panes -a -F ${shellescape(format)}`, {
+            timeout: EXEC_TIMEOUT_MS,
+            maxBuffer: 16384,
+          });
+          if (!current() || result.stderr) return false;
+          const lines =
+            result.stdout === ''
+              ? []
+              : result.stdout.endsWith('\n')
+                ? result.stdout.slice(0, -1).split('\n')
+                : undefined;
+          if (!lines) return false;
+          rows = [];
+          for (const line of lines) {
+            const row = parse(line + '\n', line.split('|')[0]);
+            if (!row) return false;
+            rows.push(row);
+          }
+        } catch (error) {
+          const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown };
+          const socket = join(socketRoot, 'tmux-' + process.getuid?.(), this.muxSocket);
+          if (
+            !isAbsolute(socketRoot) ||
+            failure.code !== 1 ||
+            failure.stdout !== '' ||
+            ![
+              `no server running on ${socket}\n`,
+              `error connecting to ${socket} (No such file or directory)\n`,
+            ].includes(String(failure.stderr))
+          )
+            return false;
+          try {
+            await lstat(socket);
+            return false;
+          } catch (missing) {
+            if ((missing as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+          }
+          rows = [];
+        }
+        if (!current()) return false;
+        const candidates = rows.filter(
+          (row) =>
+            row[0] === expected.muxName ||
+            (row[4] === receipt!.local[4] && (row[1] === receipt!.local[1] || row[2] === receipt!.local[2]))
+        );
+        localAbsent = candidates.length === 0;
+        if (
+          !localAbsent &&
+          (candidates.length !== 1 || JSON.stringify(candidates[0]) !== JSON.stringify(receipt.local))
+        )
+          return false;
+        local = receipt.local;
+      } else {
+        local = await read(
+          `${this.tmux()} list-panes -t ${shellescape(expected.muxName)} -F ${shellescape(format)}`,
+          expected.muxName
+        );
+        if (!local || Number(local[3]) !== expected.pid || !current()) return false;
+      }
+      if (!receipt) {
+        const remotePane = await read(
+          remoteCommand(`${remoteTmux} list-panes -t ${shellescape(remoteName)} -F ${shellescape(format)}`),
+          remoteName
+        );
+        if (!remotePane || !current()) return false;
+        const remoteKilled = await execAsync(remoteCommand(killCommand(remoteTmux, remotePane)), {
+          timeout: EXEC_TIMEOUT_MS,
+          maxBuffer: 16384,
+        });
+        if (remoteKilled.stdout !== 'CODEMAN_OWNED_KILL_ACK\n' || remoteKilled.stderr || !recordCurrent()) return false;
+        // Persist an acknowledged effect even when its request was cancelled.
+        // This fact never grants authority to a changed owner or native pane.
+        await mkdir(receiptRoot, { recursive: true, mode: 0o700 });
+        await safeDirectory();
+        if (!recordCurrent()) return false;
+        const text = JSON.stringify({ version: 1, scope, local, remote: remotePane });
+        const temporary = receiptPath + '.' + randomUUID() + '.tmp';
+        const file = await open(temporary, 'wx', 0o600);
+        let staged: Awaited<ReturnType<typeof lstat>> | undefined;
+        try {
+          await file.writeFile(text, 'utf8');
+          await file.sync();
+          staged = await file.stat();
+        } finally {
+          await file.close();
+        }
+        try {
+          if (!recordCurrent()) return false;
+          try {
+            await link(temporary, receiptPath);
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+          }
+        } finally {
+          if (staged) {
+            const pending = await lstat(temporary);
+            if (
+              ['dev', 'ino', 'size', 'mtimeMs', 'mode', 'uid'].every(
+                (key) => staged![key as keyof typeof pending] === pending[key as keyof typeof pending]
+              )
+            )
+              await unlink(temporary);
+          }
+        }
+        const directory = await open(receiptRoot, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+        try {
+          await directory.sync();
+        } finally {
+          await directory.close();
+        }
+        receipt = await loadReceipt();
+        if (!receipt) return false;
+      }
+      if (!current()) return false;
+      const confirmed = await loadReceipt();
+      if (!confirmed || !same(receipt.info, confirmed.info) || confirmed.text !== receipt.text || !current())
+        return false;
+      if (!localAbsent) {
+        const localKilled = await execAsync(killCommand(this.tmux(), local!), {
+          timeout: EXEC_TIMEOUT_MS,
+          maxBuffer: 16384,
+        });
+        if (!current() || localKilled.stdout !== 'CODEMAN_OWNED_KILL_ACK\n' || localKilled.stderr) return false;
+      }
+      // Neither effect uses the ordinary kill's fire-and-forget SSH leg: an ABA
+      // replacement must never receive a second name-based remote kill.
+      this.supervisorManagerLaunches?.delete(sessionId);
+      this.lastPaneCount.delete(expected.muxName);
+      this.clearPaneExit(expected.muxName);
+      this.sessions.delete(sessionId);
+      this.inputBrokers.delete(sessionId);
+      this.inputBrokerLoads.delete(sessionId);
+      this.clearRemoteReconnectState(sessionId);
+      this.saveSessions();
+      this.emit('sessionKilled', { sessionId });
+      // Clear only our exact receipt after the exact local teardown was ACKed.
+      void (async () => {
+        if (same(receipt.info, await lstat(receiptPath))) await unlink(receiptPath);
+      })().catch(() => {
+        /* A retained receipt cannot authorize a different native tuple. */
+      });
       return true;
     } catch {
       return false;

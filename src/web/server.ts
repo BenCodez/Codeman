@@ -177,6 +177,10 @@ import { drainSupervisorManagerRetirements } from '../supervisor/manager-launch.
 import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
 import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
 import { SupervisorStore } from '../supervisor/store.js';
+import { SupervisorAutomationController } from '../supervisor/automation.js';
+import { SupervisorAutomationStore } from '../supervisor/automation-store.js';
+import { BrainStore } from '../supervisor/brain.js';
+import type { SupervisorUsage } from '../types/supervisor.js';
 import { SupervisorStateSchema } from '../supervisor/schema.js';
 import { RecoveryController } from '../recovery/controller.js';
 import { hasFreshProcessReady, isRecoveryEvidenceSourceCurrent, type RecoveryObservation } from '../recovery/types.js';
@@ -342,6 +346,9 @@ export class WebServer extends EventEmitter {
   private supervisorManagerCredentials = new ManagerCredentialRegistry();
   private supervisorControllers = new Map<string, SupervisorController>();
   private supervisorStore = new SupervisorStore();
+  private supervisorAutomationStore = new SupervisorAutomationStore();
+  private supervisorAutomations = new Map<string, SupervisorAutomationController>();
+  private supervisorBrainStore = new BrainStore();
   private supervisorLeaseQueue: Promise<unknown> = Promise.resolve();
   private recoveryControllers = new Map<string, RecoveryController>();
   private recoveryInputListeners = new Map<string, () => void>();
@@ -791,6 +798,7 @@ export class WebServer extends EventEmitter {
       persistRebootRestoreDurably: this.persistRebootRestoreDurably.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
+      dropSupervisorManagementState: this.dropSupervisorManagementState.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
       persistSessionState: this.persistSessionState.bind(this),
       persistSessionStateNow: this._persistSessionStateNow.bind(this),
@@ -802,6 +810,12 @@ export class WebServer extends EventEmitter {
       getTaskController: this.getTaskController.bind(this),
       getSupervisorController: this.getSupervisorController.bind(this),
       prepareSupervisorManager: this.prepareSupervisorManager.bind(this),
+      getSupervisorAutomation: this.getSupervisorAutomation.bind(this),
+      supervisorBrain: {
+        read: (session: Session, current: () => boolean) => this.supervisorBrainStore.read(session.id, current),
+        replace: (session: Session, markdown: string, ifMatch: string, current: () => boolean) =>
+          this.supervisorBrainStore.replace(session.id, markdown, ifMatch, current),
+      },
       // EventPort
       broadcast: this.broadcast.bind(this),
       sendPushNotifications: this.sendPushNotifications.bind(this),
@@ -1220,6 +1234,35 @@ export class WebServer extends EventEmitter {
           ? this.getSupervisorController(session)
           : undefined;
       },
+      brain: {
+        read: (scope, current) => {
+          const session = this.sessions.get(scope.sessionId);
+          return this.supervisorBrainStore.read(
+            scope.sessionId,
+            () =>
+              current() &&
+              !!session &&
+              this.sessions.get(scope.sessionId) === session &&
+              session.owner === scope.owner &&
+              session.isSupervisorManagerLaunchCurrent()
+          );
+        },
+        append: (scope, requestId, note, ifMatch, current) => {
+          const session = this.sessions.get(scope.sessionId);
+          return this.supervisorBrainStore.append(
+            scope.sessionId,
+            requestId,
+            note,
+            ifMatch,
+            () =>
+              current() &&
+              !!session &&
+              this.sessions.get(scope.sessionId) === session &&
+              session.owner === scope.owner &&
+              session.isSupervisorManagerLaunchCurrent()
+          );
+        },
+      },
     });
     registerRalphRoutes(this.app, ctx);
     registerPlanRoutes(this.app, ctx);
@@ -1537,6 +1580,11 @@ export class WebServer extends EventEmitter {
   ): Promise<void> {
     const session = this.sessions.get(sessionId);
     const pinned = session?.pinned === true || this.store.getSession(sessionId)?.pinned === true;
+    const ownsManagement =
+      this.supervisorAutomations?.has(sessionId) ||
+      this.supervisorStore.has(sessionId) ||
+      this.supervisorAutomationStore?.ids().includes(sessionId) ||
+      getCli(session?.mode ?? this.store.getSession(sessionId)?.mode ?? '')?.capabilities.recovery === 'codex-rollout';
     if (coordinateLayout && session && killMux && !pinned) {
       return this.tabLayouts.runSessionDeletion([{ id: sessionId, owner: session.owner }], () =>
         this._doCleanupSession(sessionId, killMux, reason, false)
@@ -1746,6 +1794,15 @@ export class WebServer extends EventEmitter {
         const retiredState = this.store.getSessions()[sessionId];
         const retiredStateText = JSON.stringify(retiredState);
         const retiredOwner = session.owner;
+        if (ownsManagement)
+          await this.dropSupervisorManagementState(
+            sessionId,
+            () =>
+              !this.sessions.has(sessionId) &&
+              session.owner === retiredOwner &&
+              this.store.getSessions()[sessionId] === retiredState &&
+              JSON.stringify(retiredState) === retiredStateText
+          );
         await ownedRemoteBrokerCache.finishFinalCleanup(
           sessionId,
           () =>
@@ -2573,7 +2630,65 @@ export class WebServer extends EventEmitter {
     ((isCurrent: () => boolean) => Promise<boolean | { inspectionOnly: true }>) & { canOperate?: () => boolean }
   >();
 
-  private async prepareSupervisorManager(
+  /** An unrelated enabled objective keeps its owner-defined task and progress. */
+  private managerTaskAllowsPreparation(
+    session: Session,
+    retainedManagerCurrent: () => boolean = () => session.isSupervisorManagerLaunchCurrent()
+  ): boolean {
+    if (this.taskStore.loadFailed || this.supervisorStore.loadFailed) return false;
+    const live = this.taskControllers.get(session.id)?.getStatus();
+    const states = [...(live ? [live] : []), this.taskStore.get(session.id)];
+    return states.every((state) => {
+      if (!TaskStateSchema.safeParse(state).success || state.phase === 'watching') return false;
+      if (
+        !state.config.enabled ||
+        (state.phase === 'completed' &&
+          state.outcome === 'completed' &&
+          state.criteria.length > 0 &&
+          state.criteria.every((criterion) => criterion.verified))
+      )
+        return true;
+      const role = this.supervisorControllers.get(session.id)?.getStatus() ?? this.supervisorStore.get(session.id);
+      const durableRole = this.supervisorStore.get(session.id);
+      if (
+        !SupervisorStateSchema.safeParse(role).success ||
+        !SupervisorStateSchema.safeParse(durableRole).success ||
+        !role.enabled ||
+        !durableRole.enabled ||
+        role.objective !== durableRole.objective ||
+        !['paused', 'blocked'].includes(state.phase)
+      )
+        return false;
+      const expected = buildSupervisorManagerTask(role.objective);
+      return (
+        state.conversationId === session.codexConfig?.resumeSessionId &&
+        state.objective === expected.objective &&
+        state.config.maxContinuations === expected.config?.maxContinuations &&
+        state.config.maxRuntimeMs === expected.config?.maxRuntimeMs &&
+        state.criteria.length === expected.criteria?.length &&
+        state.criteria.every((criterion, index) => {
+          const wanted = expected.criteria![index];
+          return (
+            criterion.id === wanted.id &&
+            criterion.description === wanted.description &&
+            criterion.kind === wanted.kind &&
+            criterion.command === wanted.command
+          );
+        }) &&
+        retainedManagerCurrent() === true
+      );
+    });
+  }
+
+  private prepareSupervisorManager(
+    session: Session,
+    callerCurrent: () => boolean
+  ): Promise<boolean | { inspectionOnly: true }> {
+    // Configuration and conversion share one lease authority through every await.
+    return this.withSupervisorLeases(() => this.prepareSupervisorManagerWithLeases(session, callerCurrent));
+  }
+
+  private async prepareSupervisorManagerWithLeases(
     session: Session,
     callerCurrent: () => boolean
   ): Promise<boolean | { inspectionOnly: true }> {
@@ -2582,7 +2697,9 @@ export class WebServer extends EventEmitter {
       !this.supervisorManagerAuthenticationAvailable() ||
       this.recoveryStopping ||
       this.cleaningUp.has(session.id) ||
-      this.sessions.get(session.id) !== session
+      this.sessions.get(session.id) !== session ||
+      !!this.supervisorLeaseHolder(session.id, session.id) ||
+      !this.managerTaskAllowsPreparation(session)
     )
       return false;
     const retained = this.supervisorManagerPreparationChecks.get(session);
@@ -2596,8 +2713,27 @@ export class WebServer extends EventEmitter {
         return prepared;
       // A retired exact launch no longer owns this request. Re-enter all fresh
       // admission checks; a pending callback or replacement profile never does.
-      return this.prepareSupervisorManager(session, callerCurrent);
+      return this.prepareSupervisorManagerWithLeases(session, callerCurrent);
     }
+    const retainedManager = session.isSupervisorManagerLaunchCurrent();
+    const taskBinding = () =>
+      JSON.stringify(
+        [this.taskControllers.get(session.id)?.getStatus(), this.taskStore.get(session.id)].map(
+          (state) =>
+            state && [
+              state.objective,
+              state.criteria,
+              state.config,
+              state.conversationId,
+              state.configuredAt,
+              state.resumedAt,
+              state.startedAt,
+            ]
+        )
+      );
+    const capturedTask = taskBinding();
+    const taskCurrent = () =>
+      this.managerTaskAllowsPreparation(session, () => retainedManager && taskBinding() === capturedTask);
     // Serialize owner preparation/rechecks before their first asynchronous proof.
     const pending = Object.assign(async () => false, { canOperate: () => false });
     this.supervisorManagerPreparationChecks.set(session, pending);
@@ -2629,7 +2765,8 @@ export class WebServer extends EventEmitter {
         !this.supervisorControllers.get(session.id)?.getStatus().inFlight &&
         !this.supervisorStore.get(session.id).inFlight &&
         this.supervisorControllers.get(session.id)?.getStatus().phase !== 'active' &&
-        this.taskControllers.get(session.id)?.getStatus().phase !== 'watching';
+        this.taskControllers.get(session.id)?.getStatus().phase !== 'watching' &&
+        taskCurrent();
       const scopeCurrent = () => {
         try {
           return (
@@ -2638,6 +2775,7 @@ export class WebServer extends EventEmitter {
             !this.recoveryStopping &&
             !this.cleaningUp.has(session.id) &&
             this.sessions.get(session.id) === session &&
+            !this.supervisorLeaseHolder(session.id, session.id) &&
             configuration() === captured &&
             authentication ===
               JSON.stringify([isMultiUserMode(), process.env.CODEMAN_USERNAME, process.env.CODEMAN_PASSWORD])
@@ -2855,6 +2993,57 @@ export class WebServer extends EventEmitter {
     );
   }
 
+  private supervisorUsage(session: Session): SupervisorUsage {
+    const state = session.toState();
+    const positive = (value: unknown) =>
+      typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
+    const inputTokens = positive(state.inputTokens),
+      outputTokens = positive(state.outputTokens),
+      costEstimate = positive(state.totalCost);
+    return {
+      source: 'codeman-session-counter-estimate',
+      available: inputTokens !== undefined || outputTokens !== undefined || costEstimate !== undefined,
+      observedAt: Date.now(),
+      stale: true,
+      providerQuota: 'unknown',
+      ...(inputTokens === undefined ? {} : { inputTokens }),
+      ...(outputTokens === undefined ? {} : { outputTokens }),
+      ...(costEstimate === undefined ? {} : { costEstimate }),
+    };
+  }
+
+  private getSupervisorAutomation(session: Session): SupervisorAutomationController | undefined {
+    const journal = (this.supervisorAutomationStore ??= new SupervisorAutomationStore());
+    this.supervisorAutomations ??= new Map();
+    if (
+      this.recoveryStopping ||
+      this.cleaningUp.has(session.id) ||
+      this.sessions.get(session.id) !== session ||
+      journal.loadFailed
+    )
+      return undefined;
+    const role = this.getSupervisorController(session);
+    if (!role) return undefined;
+    const existing = this.supervisorAutomations.get(session.id);
+    if (existing) return existing;
+    const current = () =>
+      !this.recoveryStopping &&
+      !this.cleaningUp.has(session.id) &&
+      this.sessions.get(session.id) === session &&
+      this.supervisorControllers.get(session.id) === role;
+    const controller = new SupervisorAutomationController(
+      {
+        canRun: () => current() && role.canRunManagementInstruction(),
+        dispatch: (instructions, authority) => role.runManagementInstruction(instructions, authority),
+        persist: (state) => journal.save(session.id, state),
+      },
+      session.id,
+      journal.get(session.id)
+    );
+    this.supervisorAutomations.set(session.id, controller);
+    return controller;
+  }
+
   private getSupervisorController(session: Session): SupervisorController | undefined {
     if (this.recoveryStopping || this.cleaningUp.has(session.id) || this.sessions.get(session.id) !== session)
       return undefined;
@@ -3068,6 +3257,7 @@ export class WebServer extends EventEmitter {
     };
     const controller = new SupervisorController(
       {
+        managerIsEligible,
         validateWorkers: (ids) => {
           const workers: Session[] = [];
           for (const id of ids) {
@@ -3102,6 +3292,7 @@ export class WebServer extends EventEmitter {
             ? {
                 task,
                 recovery,
+                usage: () => this.supervisorUsage(worker),
                 admitPrompt: (prompt, authority) =>
                   new CodexTaskAdapter(worker, () => this._persistSessionStateNow(worker)).admitPrompt(
                     prompt,
@@ -3126,6 +3317,106 @@ export class WebServer extends EventEmitter {
           this.taskStore.get(id).agentProgressVeto === true,
         hasManagerAuthority,
         prepareManagerAuthority,
+        managerUsage: () => this.supervisorUsage(session),
+        managerInstructionAvailable: () => {
+          const grant = managerGrant;
+          return (
+            !!grant &&
+            !this.recoveryStopping &&
+            !this.cleaningUp.has(session.id) &&
+            this.sessions.get(session.id) === session &&
+            this.taskControllers.get(session.id) === grant.task &&
+            managerIsEligible() &&
+            session.isSupervisorManagerLaunchCurrent() &&
+            grant.isCurrent()
+          );
+        },
+        dispatchManagerInstruction: async (instructions, authority) => {
+          const grant = managerGrant,
+            task = grant?.task;
+          const launch = session.captureSupervisorManagerLaunchAuthority();
+          if (!grant || !task || !launch?.() || !authority()) return 'not-sent';
+          const configuration = JSON.stringify([
+            session.owner,
+            session.workingDir,
+            session.codexConfig,
+            session.getEnvOverridesForPersist(),
+          ]);
+          const current: import('../recovery/types.js').RecoveryActionAuthority = () =>
+            authority() &&
+            launch() &&
+            grant.isCurrent() &&
+            !this.recoveryStopping &&
+            !this.cleaningUp.has(session.id) &&
+            this.sessions.get(session.id) === session &&
+            this.taskControllers.get(session.id) === task &&
+            managerGrant === grant &&
+            configuration ===
+              JSON.stringify([
+                session.owner,
+                session.workingDir,
+                session.codexConfig,
+                session.getEnvOverridesForPersist(),
+              ]);
+          current.getActionDeadline = authority.getActionDeadline;
+          const result = await task.deliverInstruction(instructions, 'owner-management-schedule', current);
+          managerEvidence = undefined;
+          if (result === 'sent' && current())
+            managerGrant = {
+              task,
+              state: task.getStatus(),
+              isCurrent: task.captureInstructionAuthority(),
+              scope: managerScope(),
+            };
+          return result;
+        },
+        captureBrainAuthority: async (caller) => {
+          const launch = session.captureSupervisorManagerLaunchAuthority();
+          const configuration = JSON.stringify([
+            session.owner,
+            session.workingDir,
+            session.codexConfig,
+            session.getEnvOverridesForPersist(),
+          ]);
+          const current = () =>
+            caller() === true &&
+            !!launch?.() &&
+            !this.recoveryStopping &&
+            !this.cleaningUp.has(session.id) &&
+            this.sessions.get(session.id) === session &&
+            managerIsEligible() &&
+            configuration ===
+              JSON.stringify([
+                session.owner,
+                session.workingDir,
+                session.codexConfig,
+                session.getEnvOverridesForPersist(),
+              ]);
+          if (!current()) return undefined;
+          const config = session.codexConfig,
+            env = session.getEnvOverridesForPersist();
+          const grant = await clampRecoveryLaunchForOwner(session.owner, { codexConfig: config }, env);
+          const observation = await managerAdapter.observe(),
+            context = session.getRecoveryContext();
+          if (
+            !current() ||
+            !grant.isCurrent() ||
+            JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(config) ||
+            JSON.stringify(grant.env) !== JSON.stringify(env) ||
+            !context.managed ||
+            context.switchPending ||
+            context.untrackedInput ||
+            context.inputBrokerPending ||
+            observation.conversationId !== config?.resumeSessionId ||
+            !hasFreshProcessReady(observation, 0, Date.now()) ||
+            ['unknown', 'blocked', 'paused', 'crashed', 'exited'].includes(observation.activity) ||
+            !(await managerAdapter.confirmLocalEvidence(observation.conversationId!, context.generation)) ||
+            !current() ||
+            !grant.isCurrent()
+          )
+            return undefined;
+          return () => current() && grant.isCurrent();
+        },
         getInputIssuer: () => {
           const evidence = managerEvidence;
           if (!evidence || !hasManagerAuthority()) return undefined;
@@ -3221,7 +3512,12 @@ export class WebServer extends EventEmitter {
           const outcome = classifyTaskKickoff(started);
           if (outcome === 'uncertain') throw new Error('Manager task delivery acceptance is uncertain');
           if (outcome === 'accepted')
-            managerGrant = { task, state: started, isCurrent: task.captureActionAuthority(), scope: managerScope() };
+            managerGrant = {
+              task,
+              state: started,
+              isCurrent: task.captureInstructionAuthority(),
+              scope: managerScope(),
+            };
           return outcome === 'accepted';
         },
         pauseManager: async () => {
@@ -3235,7 +3531,16 @@ export class WebServer extends EventEmitter {
           await session.revokeSupervisorManagerLaunch();
           await this.getTaskController(session)?.reset();
         },
-        changed: () => this.persistSessionState(session),
+        changed: (state) => {
+          this.persistSessionState(session);
+          if (state.phase === 'active') {
+            try {
+              this.getSupervisorAutomation(session);
+            } catch {
+              /* A failed optional schedule journal cannot grant timer authority. */
+            }
+          }
+        },
       },
       session.id,
       restored ?? this.supervisorStore.get(session.id)
@@ -3392,6 +3697,7 @@ export class WebServer extends EventEmitter {
   }
 
   private async stopRecoveryController(id: string, drop: boolean): Promise<void> {
+    const management = this.supervisorAutomations?.get(id);
     const supervisor = this.supervisorControllers.get(id);
     const supervisorMode = this.sessions.get(id)?.mode ?? this.store.getSession(id)?.mode;
     const ownsSupervisorState =
@@ -3422,9 +3728,11 @@ export class WebServer extends EventEmitter {
     // Worker and manager controllers may still be writing shared ownership.
     // Revoke all synchronously, then finish every receipt before deletion.
     supervisor?.stop();
+    management?.stop();
     task?.stop();
     controller?.stop();
-    await Promise.all([supervisor?.drain(), task?.drain(), controller?.drain()]);
+    await Promise.all([supervisor?.drain(), management?.drain(), task?.drain(), controller?.drain()]);
+    this.supervisorAutomations?.delete(id);
     if (supervisor) this.supervisorControllers.delete(id);
     if (task) this.taskControllers.delete(id);
     if (controller) this.recoveryControllers.delete(id);
@@ -3443,6 +3751,20 @@ export class WebServer extends EventEmitter {
           // The owner may delete a worker even when optional evidence cannot be removed.
           console.warn(`[Server] ${name} journal deletion failed: ${getErrorMessage(err)}`);
         }
+      }
+    }
+  }
+
+  /** Optional manager data is retired only after the native session/state deletion succeeded. */
+  private async dropSupervisorManagementState(id: string, current: () => boolean): Promise<void> {
+    for (const [name, journal] of [
+      ['Management schedule', this.supervisorAutomationStore],
+      ['Manager memory', this.supervisorBrainStore],
+    ] as const) {
+      try {
+        await journal.drop(id, current);
+      } catch (err) {
+        console.warn(`[Server] ${name} deletion failed: ${getErrorMessage(err)}`);
       }
     }
   }
@@ -3514,11 +3836,35 @@ export class WebServer extends EventEmitter {
         console.warn(`[Server] ${name} journal cleanup failed: ${getErrorMessage(err)}`);
       }
     }
+    // Reuse the authoritative startup cleanup rather than inferring absence
+    // from a missing live controller. Detach, restore and uncertain work veto it.
+    for (const [name, journal] of [
+      ['Management schedule', this.supervisorAutomationStore],
+      ['Manager memory', this.supervisorBrainStore],
+    ] as const) {
+      try {
+        await journal.pruneOrphans((id) => this.supervisorManagementHasOwner(id));
+      } catch (err) {
+        console.warn(`[Server] ${name} cleanup failed: ${getErrorMessage(err)}`);
+      }
+    }
     const lifecycleLog = getLifecycleLog();
     for (const s of result.cleaned) {
       lifecycleLog.log({ event: 'stale_cleaned', sessionId: s.id, name: s.name });
     }
     return result.count;
+  }
+
+  private supervisorManagementHasOwner(id: string): boolean {
+    try {
+      return (
+        this.codexJournalHasOwner(id) ||
+        this.supervisorAutomations.has(id) ||
+        !!this.supervisorAutomationStore.get(id).inFlight
+      );
+    } catch {
+      return true;
+    }
   }
 
   private codexJournalHasOwner(id: string): boolean {
@@ -4285,6 +4631,13 @@ export class WebServer extends EventEmitter {
 
     // Main Codex subscription limits come from the signed-in local CLI. Keep
     // this read-only and host-scoped; multi-user SSE routing makes it admin-only.
+    this.cleanup.setInterval(
+      () => {
+        for (const automation of this.supervisorAutomations.values()) void automation.tick().catch(() => {});
+      },
+      30_000,
+      { description: 'Owner-configured manager check-ins and tasks' }
+    );
     if (!this.testMode) {
       void this.refreshCodexPlanUsage();
       this.cleanup.setInterval(() => void this.refreshCodexPlanUsage(), CODEX_USAGE_POLL_INTERVAL_MS, {
@@ -5383,12 +5736,14 @@ export class WebServer extends EventEmitter {
 
   async stop(): Promise<void> {
     this.recoveryStopping = true;
+    for (const automation of this.supervisorAutomations?.values() ?? []) automation.stop();
     this.supervisorManagerCredentials.revokeAll();
     const managerRetirements = [...this.sessions.values()].map((session) => session.revokeSupervisorManagerLaunch?.());
     for (const controller of this.supervisorControllers.values()) controller.stop();
     for (const controller of this.recoveryControllers.values()) controller.stop();
     for (const controller of this.taskControllers.values()) controller.stop();
     const automationIds = new Set([
+      ...(this.supervisorAutomations?.keys() ?? []),
       ...this.supervisorControllers.keys(),
       ...this.recoveryControllers.keys(),
       ...this.taskControllers.keys(),
@@ -5400,6 +5755,7 @@ export class WebServer extends EventEmitter {
     await this.taskStore.flush();
     await this.actionReservationStore.flush();
     await this.supervisorStore.flush();
+    await this.supervisorAutomationStore?.flush();
     getLifecycleLog().log({ event: 'server_stopped', sessionId: '*' });
     // Set stopping flag to prevent new timer creation during shutdown
     this.sse.setStopping();

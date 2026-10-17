@@ -58,6 +58,7 @@ describe('supervisor routes', () => {
       inspectWorkers: vi.fn(async () => []),
       assign: vi.fn(),
       retry: vi.fn(),
+      message: vi.fn(),
     };
     h = await createRouteTestHarness(
       (app, ctx) => registerSupervisorRoutes(app, { ...ctx, getSupervisorController: () => controller }),
@@ -65,7 +66,7 @@ describe('supervisor routes', () => {
     );
     Object.assign(h.ctx._session, { mode: 'codex', owner: 'alice' });
     const state = initialSupervisorState(h.ctx._sessionId);
-    for (const method of ['getStatus', 'configure', 'start', 'pause', 'reset', 'assign', 'retry'])
+    for (const method of ['getStatus', 'configure', 'start', 'pause', 'reset', 'assign', 'retry', 'message'])
       controller[method].mockResolvedValue?.(state);
     controller.getStatus.mockReturnValue(state);
   });
@@ -333,6 +334,120 @@ describe('supervisor routes', () => {
       ).statusCode
     ).toBe(400);
   });
+
+  it('routes attributed owner messages with exact content and revocable session authority', async () => {
+    controller.message.mockImplementationOnce(async (_worker, _request, _message, current) => {
+      expect(current()).toBe(true);
+      Object.assign(h.ctx._session, { owner: 'bob' });
+      expect(current()).toBe(false);
+      Object.assign(h.ctx._session, { owner: 'alice' });
+      expect(current()).toBe(true);
+      return initialSupervisorState(h.ctx._sessionId);
+    });
+    const response = await h.app.inject({
+      method: 'POST',
+      url: `/api/sessions/${h.ctx._sessionId}/supervisor/workers/${workerId}/message`,
+      headers: { 'x-codeman-supervisor-session': h.ctx._sessionId },
+      payload: {
+        requestId: 'owner-message-1',
+        message: '  Preserve the checkpoint.\nInspect the remaining failure.  ',
+      },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(controller.message).toHaveBeenCalledWith(
+      workerId,
+      'owner-message-1',
+      '  Preserve the checkpoint.\nInspect the remaining failure.  ',
+      expect.any(Function)
+    );
+    const current = controller.message.mock.calls[0][3];
+    expect(current()).toBe(false);
+  });
+
+  it.each(['missing-attribution', 'wrong-attribution', 'foreign-owner'])(
+    'refuses a message before controller effects for %s',
+    async (kind) => {
+      if (kind === 'foreign-owner') Object.assign(h.ctx._session, { owner: 'bob' });
+      const response = await h.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${h.ctx._sessionId}/supervisor/workers/${workerId}/message`,
+        headers:
+          kind === 'missing-attribution'
+            ? {}
+            : {
+                'x-codeman-supervisor-session': kind === 'wrong-attribution' ? 'another-manager' : h.ctx._sessionId,
+              },
+        payload: { requestId: 'owner-message-1', message: 'Inspect the checkpoint' },
+      });
+      expect(response.statusCode).toBe(kind === 'foreign-owner' ? 404 : 403);
+      expect(controller.message).not.toHaveBeenCalled();
+    }
+  );
+
+  it.each([
+    { requestId: 'short', message: 'Inspect' },
+    { requestId: 'owner-message-1', message: '' },
+    { requestId: 'owner-message-1', message: '   ' },
+    { requestId: 'owner-message-1', message: 'x'.repeat(4001) },
+    { requestId: 'owner-message-1', message: 'unsafe\u001b[3~' },
+    { requestId: 'owner-message-1', message: 'Inspect', input: 'raw terminal bytes' },
+  ])('rejects malformed or widened owner messages before dispatch: %j', async (payload) => {
+    const response = await h.app.inject({
+      method: 'POST',
+      url: `/api/sessions/${h.ctx._sessionId}/supervisor/workers/${workerId}/message`,
+      headers: { 'x-codeman-supervisor-session': h.ctx._sessionId },
+      payload,
+    });
+    expect(response.statusCode).toBe(400);
+    expect(controller.message).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    'retains actual message grants, budgets and request-content bindings: grant=%s',
+    async (grant) => {
+      const task = initialTaskState();
+      Object.assign(task, { phase: 'watching', outcome: 'unfinished', objective: config.workers[0].task });
+      task.config.enabled = true;
+      const deliverInstruction = vi.fn(async (_message, _attribution, current) => {
+        expect(current()).toBe(true);
+        return 'sent' as const;
+      });
+      controller = actualController({
+        worker: () => ({
+          task: { getStatus: () => task, update: async () => task, resume: async () => task, deliverInstruction },
+          recovery: {
+            getStatus: initialRecoveryState,
+            inspect: async () => initialRecoveryState(),
+            retry: async () => initialRecoveryState(),
+          },
+        }),
+      });
+      await controller.configure({
+        ...config,
+        workers: config.workers.map((worker) => ({ ...worker, allowMessages: grant, maxMessages: 1 })),
+      });
+      await controller.start();
+      const request = {
+        method: 'POST' as const,
+        url: `/api/sessions/${h.ctx._sessionId}/supervisor/workers/${workerId}/message`,
+        headers: { 'x-codeman-supervisor-session': h.ctx._sessionId },
+        payload: { requestId: 'owner-message-1', message: 'Inspect the checkpoint' },
+      };
+      const first = await h.app.inject(request);
+      expect(first.statusCode).toBe(grant ? 200 : 400);
+      if (grant) {
+        expect((await h.app.inject(request)).statusCode).toBe(200);
+        expect(
+          (await h.app.inject({ ...request, payload: { ...request.payload, message: 'Changed instruction' } }))
+            .statusCode
+        ).toBe(400);
+        expect(
+          (await h.app.inject({ ...request, payload: { ...request.payload, requestId: 'owner-message-2' } })).statusCode
+        ).toBe(400);
+        expect(deliverInstruction).toHaveBeenCalledOnce();
+      } else expect(deliverInstruction).not.toHaveBeenCalled();
+    }
+  );
 
   it('rejects duplicate worker criterion ids before saving the plan', async () => {
     const res = await h.app.inject({

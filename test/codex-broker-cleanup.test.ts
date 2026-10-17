@@ -1069,6 +1069,9 @@ function cleanupSupervisorRow() {
 }
 it.each([
   'healthy',
+  'healthy-message',
+  'invalid-message-hash',
+  'assign-with-message-hash',
   'empty-domain',
   'utf16-boundary',
   'reference',
@@ -1105,6 +1108,14 @@ it.each([
   const worker = (row.workers as Array<Record<string, unknown>>)[0];
   const criteria = worker.criteria as Array<Record<string, unknown>>;
   const bindings = row.handledRequestBindings as Array<Record<string, unknown>>;
+  if (kind === 'healthy-message' || kind === 'invalid-message-hash') {
+    worker.allowMessages = true;
+    worker.maxMessages = 2;
+    worker.messages = 1;
+    bindings[0].action = 'message';
+    bindings[0].payloadHash = kind === 'healthy-message' ? 'a'.repeat(64) : 'invalid';
+  }
+  if (kind === 'assign-with-message-hash') bindings[0].payloadHash = 'a'.repeat(64);
   const history = row.history as Array<Record<string, unknown>>;
   let key: string = SID;
   if (kind === 'reference' || kind === 'escaped-reference') row.objective = 'Prior ' + f.broker.incarnation;
@@ -1139,6 +1150,7 @@ it.each([
     row.objective = '😀'.repeat(kind === 'utf16-boundary' ? 1500 : 1501);
   const valid = [
     'healthy',
+    'healthy-message',
     'empty-domain',
     'utf16-boundary',
     'reference',
@@ -1163,7 +1175,7 @@ it.each([
   }
   await fs.writeFile(join(f.root, 'supervisors.json'), raw, { mode: 0o600 });
   await f.prune();
-  expect(await f.exists()).toBe(!['healthy', 'empty-domain', 'utf16-boundary'].includes(kind));
+  expect(await f.exists()).toBe(!['healthy', 'healthy-message', 'empty-domain', 'utf16-boundary'].includes(kind));
 });
 
 it.each(['create', 'change', 'remove'] as const)(

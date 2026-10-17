@@ -4,24 +4,25 @@ import { randomUUID } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { expect, it, vi } from 'vitest';
-import Fastify from 'fastify';
+import Fastify, { type FastifyRequest } from 'fastify';
 import { Session } from '../src/session.js';
 import { rehydrateRemoteHostFields } from '../src/remote-hosts.js';
 import type { RemoteHost } from '../src/types.js';
 import { WebServer } from '../src/web/server.js';
 import { StateStore } from '../src/state-store.js';
 import { subagentWatcher } from '../src/subagent-watcher.js';
-import type { TerminalMultiplexer } from '../src/mux-interface.js';
+import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import { CodexInputBroker } from '../src/recovery/codex-input-broker.js';
 import { OwnedRemoteBrokerCache, ownedRemoteBrokerCache as cache } from '../src/recovery/remote-input-broker-cache.js';
 import * as remoteCleanup from '../src/recovery/remote-broker-cleanup.js';
 import { registerSessionRoutes } from '../src/web/routes/session-routes.js';
 import { installRouteErrorHandler } from '../src/web/route-error-handler.js';
-import { createMockRouteContext } from './mocks/index.js';
+import { createDeferred, createMockRouteContext } from './mocks/index.js';
 
 type Internal = {
   sessions: Map<string, Session>;
   store: StateStore;
+  routeMux: TerminalMultiplexer;
   cleanupSession(id: string, kill: boolean): Promise<void>;
   stopRecoveryController(id: string, drop: boolean): Promise<void>;
   tabLayouts: { runSessionDeletion: (...args: unknown[]) => Promise<void> };
@@ -46,9 +47,19 @@ async function fixture(
   const server = new WebServer(0, false, true),
     internal = server as unknown as Internal;
   internal.store = new StateStore(join(root, 'state.json'));
-  const kill = vi.fn().mockResolvedValue(true);
+  let native: MuxSession | undefined;
+  const kill = vi.fn(async () => {
+    native = undefined;
+    return true;
+  });
   const mux = {
     killSession: kill,
+    killPersistedOwnedRemoteSession: vi.fn(async (_id, _expected, current) => {
+      if (!current()) return false;
+      native = undefined;
+      return true;
+    }),
+    getSession: vi.fn(() => native),
     flushSessionsDurably: vi.fn().mockResolvedValue(undefined),
   } as unknown as TerminalMultiplexer;
   const remote = {
@@ -71,6 +82,18 @@ async function fixture(
     useMux: true,
     codexConfig: { noDaemon: true },
   });
+  native = {
+    sessionId: session.id,
+    muxName: 'codeman-' + session.id.slice(0, 8),
+    pid: 600,
+    createdAt: Date.now(),
+    workingDir: root,
+    remote: session.remote,
+    owner: session.owner,
+    mode: session.mode,
+    attached: false,
+  };
+  internal.routeMux = mux;
   internal.sessions.set(session.id, session);
   internal.store.setSession(session.id, session.toState());
   const scope = {
@@ -174,7 +197,7 @@ it.each(['delete', 'detach', 'foreign', 'missing', 'state-error'] as const)(
       expect(internal.store.getSession(session.id)).toBeDefined();
       expect(cache.get(scope, material.config.incarnation)).toBeDefined();
       const context = createMockRouteContext();
-      Object.assign(context, { sessions: internal.sessions, store: internal.store });
+      Object.assign(context, { sessions: internal.sessions, store: internal.store, mux: internal.routeMux });
       const app = Fastify();
       installRouteErrorHandler(app);
       vi.stubEnv('CODEMAN_MULTIUSER', '1');
@@ -210,17 +233,19 @@ it.each(['delete', 'detach', 'foreign', 'missing', 'state-error'] as const)(
     })
 );
 
-async function ownerDeleteApp(internal: Internal, session: Session) {
+async function ownerDeleteApp(internal: Internal, session: Session, onRequest?: (req: FastifyRequest) => void) {
   const context = createMockRouteContext();
   Object.assign(context, {
     sessions: internal.sessions,
     store: internal.store,
+    mux: internal.routeMux,
     cleanupSession: internal.cleanupSession.bind(internal),
   });
   const app = Fastify();
   installRouteErrorHandler(app);
   app.addHook('preHandler', async (req) => {
     req.authUser = { username: session.owner!, role: 'user' } as NonNullable<typeof req.authUser>;
+    onRequest?.(req);
   });
   const wake = registerSessionRoutes(app, context);
   return {
@@ -647,3 +672,80 @@ it.each(['changed', 'removed'] as const)(
       expect(await cache.load(scope, material.config.incarnation)).toBeUndefined();
     })
 );
+
+it.each([
+  'ack',
+  'lost',
+  'throw',
+  'owner',
+  'record',
+  'native',
+  'live',
+  'cancel',
+  'missing-native',
+  'foreign-native',
+] as const)('retains persisted owned SSH until exact teardown acknowledgement (%s)', async (kind) =>
+  fixture(async ({ internal, server, session, scope, material }) => {
+    await server.discardPartiallyBuiltSession(session.id, session, { preserveMuxPane: true });
+    const original = internal.store.getSession(session.id)!;
+    const native = internal.routeMux.getSession(session.id)!;
+    const entered = createDeferred<void>(),
+      release = createDeferred<void>();
+    let request: FastifyRequest | undefined;
+    const method = vi.mocked(internal.routeMux.killPersistedOwnedRemoteSession!);
+    method.mockImplementation(async (_id, expected, current) => {
+      expect(expected).toBe(native);
+      expect(current()).toBe(true);
+      entered.resolve();
+      await release.promise;
+      if (kind === 'throw') throw Error('unknown native completion');
+      if (kind === 'lost' || !current()) return false;
+      vi.mocked(internal.routeMux.getSession).mockReturnValue(undefined);
+      return true;
+    });
+    if (kind === 'missing-native') vi.mocked(internal.routeMux.getSession).mockReturnValue(undefined);
+    if (kind === 'foreign-native') native.owner = 'other-owner';
+    const route = await ownerDeleteApp(internal, session, (req) => {
+      request = req;
+    });
+    try {
+      const pending = Promise.resolve(route.app.inject({ method: 'DELETE', url: '/api/sessions/' + session.id }));
+      if (!['missing-native', 'foreign-native'].includes(kind)) {
+        await entered.promise;
+        expect(internal.store.getSession(session.id)).toBe(original);
+        expect(cache.get(scope, material.config.incarnation)).toBeDefined();
+        if (kind === 'owner') original.owner = 'new-owner';
+        if (kind === 'record') internal.store.setSession(session.id, { ...original });
+        if (kind === 'native') vi.mocked(internal.routeMux.getSession).mockReturnValue({ ...native });
+        if (kind === 'live') internal.sessions.set(session.id, session);
+        if (kind === 'cancel') Object.defineProperty(request!.raw, 'aborted', { value: true, configurable: true });
+        release.resolve();
+      }
+      expect((await pending).statusCode).toBe(kind === 'ack' ? 200 : 500);
+      expect(internal.store.getSession(session.id) === null).toBe(kind === 'ack');
+      expect(cache.get(scope, material.config.incarnation) === undefined).toBe(kind === 'ack');
+      expect(internal.routeMux.killSession).not.toHaveBeenCalled();
+      if (['missing-native', 'foreign-native'].includes(kind)) expect(method).not.toHaveBeenCalled();
+    } finally {
+      release.resolve();
+      await route.stop();
+    }
+  })
+);
+
+it('refuses persisted-only deletion when the owned remote teardown is unacknowledged', async () =>
+  fixture(async ({ internal, server, session, scope, material }) => {
+    await server.discardPartiallyBuiltSession(session.id, session, { preserveMuxPane: true });
+    const original = internal.store.getSession(session.id);
+    const teardown = vi.mocked(internal.routeMux.killPersistedOwnedRemoteSession!).mockResolvedValue(false);
+    const route = await ownerDeleteApp(internal, session);
+    try {
+      expect((await route.app.inject({ method: 'DELETE', url: '/api/sessions/' + session.id })).statusCode).toBe(500);
+      expect(teardown).toHaveBeenCalledOnce();
+      expect(internal.store.getSession(session.id)).toBe(original);
+      expect(cache.get(scope, material.config.incarnation)).toBeDefined();
+      expect(internal.routeMux.killSession).not.toHaveBeenCalled();
+    } finally {
+      await route.stop();
+    }
+  }));

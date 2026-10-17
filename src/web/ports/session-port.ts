@@ -16,6 +16,8 @@ export interface SessionPort {
   /** Strict main-state and mux-metadata acknowledgement before a reboot offer is consumed. */
   persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void>;
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
+  /** Retire optional manager data only while final session retirement remains current. */
+  dropSupervisorManagementState(sessionId: string, current: () => boolean): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
   persistSessionState(session: Session): void;
   persistSessionStateNow(session: Session): void;

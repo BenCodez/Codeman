@@ -14,7 +14,40 @@ Manager preparation reads the selected local CLI’s bundled model catalog witho
 
 Both profile and CLI overrides disable inherited planning, user-question, permission-request, deferred-executor, token-budget, clock, sleep and native goal utilities. Model-selected experimental utilities are removed from the private catalog as well. The owner's configuration remains unchanged.
 
-Codex's built-in MCP resource helpers are registered independently of the server tool allowlist. The bridge has no resource catalog: discovery returns empty lists and reads return a fixed unavailable response without accessing any URI. The four supervisor tools remain its only operations.
+Codex's built-in MCP resource helpers are registered independently of the server tool allowlist. The bridge has no resource catalog: discovery returns empty lists and reads return a fixed unavailable response without accessing any URI. Its scoped supervisor tools are its only operations.
+
+## Memory, schedules and delegated instructions
+
+The supervisor panel has **Scheduled check-ins and custom tasks** and **Manager memory — brain.md** controls. Open each section to load its current state. Check-ins default to off with a 60-minute interval. Custom tasks have a name, instructions, a one-off or recurring schedule, and a maximum run count. Save before selecting **Run saved task now**. These instructions target the existing prepared manager; they do not create another session or grant shell access. Paused roles, current work, uncertain delivery, owner intent and existing runtime/continuation budgets remain authoritative. An application restart still requires explicit owner preparation and Start. Schedules share a lifetime capacity of 128 run receipts. Enabled check-ins reserve up to 100 runs; all configured custom tasks must fit in the remaining capacity, including disabled tasks that can still be run manually. Completed attempts and retained request receipts still count after a task is edited or removed. Overallocated saves are refused before dispatch; old receipts are retained to prevent replay. Confirmed session deletion cleans up its saved schedules and private memory. Detach, restart and failed deletion retain them; uncertain cleanup is preserved for a later guarded retry.
+
+Teach the manager your goals, architecture, worker responsibilities and prompt conventions in its conversation or in the memory editor. Keep worker management paused while teaching, or teach before its first Start; ask it to remember stable facts in `brain.md`, then select **Start manager** when you want worker management to resume. The `supervisor_brain` tool reads this manager's private persistent `brain.md` and can append compact notes with a durable request ID. Owner edits use a revision check so concurrent notes cannot be overwritten silently. Unavailable or malformed memory is reported as unavailable rather than replaced. Memory is bounded to 32 KiB and 64 retained note receipts. The manager has no general filesystem tool: it accesses only its scoped memory through Codeman, outside the Codex installation and home.
+
+Worker plans can explicitly set `allowMessages: true` and a bounded `maxMessages`; the panel also offers an all-selected-workers grant. The `supervisor_message` tool sends a structured instruction with the exact worker ID and a durable request ID. Messages are attributed to the manager acting on the owner's behalf. They pass through reliable delivery and current task authority; they do not simulate raw keystrokes, interrupt a worker, certify manual criteria or erase its existing objective, runtime or continuation budget. Reuse the same request ID and exact message when a response is uncertain. Worker assignment grants (including recovery retries) and enabled message grants share 128 lifetime operation receipts. Saving enabled configuration allocates fresh grants only from capacity remaining after retained receipts; disabling messages allocates no message slots. Reset is the explicit owner action that clears this history.
+
+The manager sees sanitized usage counters and cost estimates from Codeman's session observations through status and worker inspection. These snapshots include freshness information. They are not a provider billing statement, and remaining provider quota is explicitly unknown when no verified scoped evidence is available. A usage limit, approval request, unreachable worker or uncertain observation requires waiting or owner attention.
+
+Useful initial memory:
+
+```markdown
+# Goals
+Deliver small, verified changes. Ask me when priorities conflict.
+
+## Worker roles
+- API worker: backend implementation and backend tests.
+- UI worker: frontend implementation and browser tests.
+Use the actual selected worker IDs from supervisor_workers.
+
+## Prompt conventions
+Give one clear objective, necessary context, constraints and acceptance criteria.
+Read the latest checkpoint before sending another instruction.
+Keep prompts concise; do not repeat entire histories.
+
+## Usage
+Inspect usage and current health before assigning work.
+Distinguish estimates from verified limits; report unknown quota honestly.
+```
+
+Memory supplies context, not automatic knowledge or additional permission. Refresh live worker evidence before acting and keep notes focused on durable facts rather than transient output or secrets.
 
 ## Future Claude managers
 
