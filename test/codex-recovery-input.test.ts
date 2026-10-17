@@ -94,7 +94,7 @@ describe('exact append-only recovery input model', () => {
     });
   });
 
-  it.each(['\x1b[D', '\x1b[C', '\x1b[H', '\x1b[3~', '\x1b[A', '\x10', '\t', '\x7f', '\x17', '\x15'])(
+  it.each(['\x1b[D', '\x1b[C', '\x1b[H', '\x1b[3~', '\x1b[A', '\x10', '\t', '\x17', '\x15'])(
     'refuses unsupported editing or recall %j',
     (key) => {
       const tracker = new CodexInputProofTracker();
@@ -103,6 +103,25 @@ describe('exact append-only recovery input model', () => {
     }
   );
 
+  it.each(['\x7f', '\b'])('models ASCII corrections across frames with %j', (key) => {
+    const tracker = new CodexInputProofTracker();
+    tracker.feed('X');
+    tracker.feed(key + key);
+    tracker.feed('RA');
+    tracker.feed(key);
+    tracker.feed('EADY');
+    expect(tracker.feed('\r')).toEqual({ prompts: ['READY'], invalidated: false });
+  });
+  it.each(['é', 'e\u0301', '😀', 'line\nnext', '\x1b[200~paste'])('refuses ambiguous Backspace for %j', (prefix) => {
+    const tracker = new CodexInputProofTracker();
+    expect(tracker.feed(prefix + '\x7f\r').invalidated).toBe(true);
+    expect(tracker.feed('\r').prompts.every((prompt) => prompt === undefined)).toBe(true);
+  });
+  it('cannot repair an unknown draft by deleting its visible suffix', () => {
+    const tracker = new CodexInputProofTracker();
+    tracker.invalidate();
+    expect(tracker.feed('X\x7fREADY\r')).toEqual({ prompts: [undefined], invalidated: true });
+  });
   it('refuses an oversized draft instead of hashing its truncated prefix', async () => {
     const tracker = new CodexInputProofTracker();
     expect(tracker.feed(`${'x'.repeat(8_193)}\r`)).toEqual({ prompts: [undefined], invalidated: true });
@@ -134,6 +153,16 @@ describe('Session records exact delivered browser submissions', () => {
     expect(JSON.stringify(session.toDetailedState())).not.toContain('Fixture first line');
   });
 
+  it('publishes the corrected delivered text instead of discarded typo bytes', async () => {
+    const { session } = fixture(false);
+    attachFakePty(session);
+    await session.writeAsync('RA', { fromUser: true });
+    await session.writeAsync('\x7fEADY\r', { fromUser: true });
+    expect(session.getRecoveryContext()).toMatchObject({
+      switchPending: false,
+      submission: { hash: hashCodexPrompt('READY') },
+    });
+  });
   it('uses the literal Shift+Enter line feed reported outside the write path', async () => {
     const { session } = fixture(false);
     attachFakePty(session);
