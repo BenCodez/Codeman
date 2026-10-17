@@ -17,7 +17,7 @@ import { WebServer } from '../src/web/server.js';
 import { TmuxManager } from '../src/tmux-manager.js';
 import { TunnelManager } from '../src/tunnel-manager.js';
 import { createUser, invalidateUsersCache } from '../src/user-store.js';
-import { AUTH_FAILURE_MAX } from '../src/config/auth-config.js';
+import { LOGIN_FAILURE_GRACE } from '../src/config/auth-config.js';
 
 vi.spyOn(TmuxManager, 'isTmuxAvailable').mockReturnValue(true);
 
@@ -162,8 +162,8 @@ describe('multi-user auth', () => {
     await rateServer.start();
     const rurl = (p: string) => `http://localhost:${rateServer.boundPort}${p}`;
 
-    // Nine wrong passwords (one below the cap) are each rejected 401 — not throttled yet.
-    for (let i = 0; i < AUTH_FAILURE_MAX - 1; i++) {
+    // The initial five wrong passwords are rejected 401 without backoff.
+    for (let i = 0; i < LOGIN_FAILURE_GRACE; i++) {
       const res = await fetch(rurl('/api/status'), { headers: { Authorization: basic('bob', `bad-${i}`) } });
       expect(res.status).toBe(401);
     }
@@ -178,7 +178,7 @@ describe('multi-user auth', () => {
 
     // Sustained wrong passwords ARE still throttled: 429 once the cap is reached.
     let limited = false;
-    for (let i = 0; i < AUTH_FAILURE_MAX + 1 && !limited; i++) {
+    for (let i = 0; i < LOGIN_FAILURE_GRACE + 1 && !limited; i++) {
       const res = await fetch(rurl('/api/status'), { headers: { Authorization: basic('bob', `x-${i}`) } });
       limited = res.status === 429;
     }

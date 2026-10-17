@@ -46,11 +46,11 @@ async function getSessionCookie(baseUrl: string): Promise<string> {
 }
 
 async function exhaustAuthFailures(baseUrl: string, prefix: string): Promise<void> {
-  for (let i = 0; i < 10; i++) {
+  for (let i = 0; i < 6; i++) {
     const res = await fetch(`${baseUrl}/api/status`, {
       headers: { Authorization: basicAuthHeader(TEST_USER, `${prefix}-${i}`) },
     });
-    expect(res.status).toBe(401);
+    expect(res.status).toBe(i < 5 ? 401 : 429);
   }
 }
 

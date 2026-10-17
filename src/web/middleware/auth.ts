@@ -18,6 +18,8 @@ import {
   MAX_AUTH_SESSIONS,
   AUTH_FAILURE_MAX,
   AUTH_FAILURE_WINDOW_MS,
+  LOGIN_FAILURE_GRACE,
+  LOGIN_BACKOFF_MAX_MS,
 } from '../../config/auth-config.js';
 import { getHookSecret, HOOK_SECRET_HEADER } from '../../config/hook-secret.js';
 import { isMultiUserMode } from '../../config/multiuser.js';
@@ -65,11 +67,30 @@ interface AuthState {
 }
 
 /** Rate-limit response for a client that exceeded the failure cap. */
-function sendAuthRateLimit(reply: FastifyReply, failures: StaleExpirationMap<string, number>, key: string): void {
-  const remainingMs = failures.getRemainingTtl(key) ?? AUTH_FAILURE_WINDOW_MS;
+function sendAuthRateLimit(
+  reply: FastifyReply,
+  failures: StaleExpirationMap<string, number>,
+  key: string,
+  remainingMs = failures.getRemainingTtl(key) ?? AUTH_FAILURE_WINDOW_MS
+): void {
   const retryAfterSeconds = Math.max(1, Math.ceil(remainingMs / 1000));
   reply.header('Retry-After', String(retryAfterSeconds));
   reply.code(429).send('Too Many Requests — try again later');
+}
+
+/** Remaining progressive login delay. Blocked retries never refresh this clock. */
+function loginBackoffMs(failures: StaleExpirationMap<string, number>, key: string): number {
+  const count = failures.get(key) ?? 0;
+  if (count <= LOGIN_FAILURE_GRACE) return 0;
+  const delay = Math.min(LOGIN_BACKOFF_MAX_MS, 1000 * 2 ** Math.min(16, count - LOGIN_FAILURE_GRACE - 1));
+  const elapsed = AUTH_FAILURE_WINDOW_MS - (failures.getRemainingTtl(key) ?? 0);
+  return Math.max(0, delay - elapsed);
+}
+
+/** Unauthenticated navigation must still challenge after a restart invalidates cookies. */
+function challengeLogin(reply: FastifyReply): void {
+  reply.header('WWW-Authenticate', 'Basic realm="Codeman"');
+  reply.code(401).send('Unauthorized');
 }
 
 /** Parse a `Basic base64(user:pass)` header into its parts, or null if malformed. */
@@ -466,18 +487,23 @@ export function registerAuthMiddleware(
       return;
     }
 
-    // Rate limit only requests that failed to authenticate on this attempt.
-    const failures = authFailures.get(clientIp) ?? 0;
-    if (failures >= AUTH_FAILURE_MAX) {
-      sendAuthRateLimit(reply, authFailures, clientIp);
+    // Cookie-less refreshes are login challenges, not password guesses.
+    if (!auth) {
+      challengeLogin(reply);
       return;
     }
-
-    // Auth failed — track failure count
-    authFailures.set(clientIp, failures + 1);
-
-    reply.header('WWW-Authenticate', 'Basic realm="Codeman"');
-    reply.code(401).send('Unauthorized');
+    const remainingMs = loginBackoffMs(authFailures, clientIp);
+    if (remainingMs > 0) {
+      sendAuthRateLimit(reply, authFailures, clientIp, remainingMs);
+      return;
+    }
+    authFailures.set(clientIp, (authFailures.get(clientIp) ?? 0) + 1);
+    const delay = loginBackoffMs(authFailures, clientIp);
+    if (delay > 0) {
+      sendAuthRateLimit(reply, authFailures, clientIp, delay);
+      return;
+    }
+    challengeLogin(reply);
   });
 
   return state;
@@ -596,9 +622,14 @@ function registerMultiUserAuthHook(
     // 2. Basic Auth against the user store (scrypt verify).
     // Per-IP pre-gate bounds scrypt CPU cost from one source (does NOT gate on the
     // per-username bucket here; see below).
+    if (!req.headers.authorization) {
+      challengeLogin(reply);
+      return;
+    }
     const ipFail = authFailures.get(clientIp) ?? 0;
-    if (ipFail >= AUTH_FAILURE_MAX) {
-      sendAuthRateLimit(reply, authFailures, clientIp);
+    const remainingMs = loginBackoffMs(authFailures, clientIp);
+    if (remainingMs > 0) {
+      sendAuthRateLimit(reply, authFailures, clientIp, remainingMs);
       return;
     }
     const creds = parseBasicAuth(req.headers.authorization);
@@ -633,26 +664,30 @@ function registerMultiUserAuthHook(
         enforcePasswordChange(req, reply, !!user.mustChangePassword);
         return;
       }
-      // Failed guess: count it against BOTH buckets. Once the per-username bucket
-      // reaches the cap, further FAILED attempts get 429 (throttles distributed
-      // brute-force), but this path is only reached on a wrong password, so it can
-      // never deny a correct one.
+      // Failed guesses advance both buckets. Mirror the account's penalty into
+      // this IP so retries during a distributed account backoff cannot extend it.
+      // Account penalties are consulted only after a wrong password; a correct
+      // password from a fresh IP still self-heals the account.
       const uFail = (userFailures.get(normUser) ?? 0) + 1;
       userFailures.set(normUser, uFail);
-      authFailures.set(clientIp, ipFail + 1);
-      if (uFail >= AUTH_FAILURE_MAX) {
-        sendAuthRateLimit(reply, userFailures, normUser);
+      authFailures.set(clientIp, Math.max(ipFail + 1, uFail));
+      const delay = Math.max(loginBackoffMs(authFailures, clientIp), loginBackoffMs(userFailures, normUser));
+      if (delay > 0) {
+        sendAuthRateLimit(reply, authFailures, clientIp, delay);
         return;
       }
-      reply.header('WWW-Authenticate', 'Basic realm="Codeman"');
-      reply.code(401).send('Unauthorized');
+      challengeLogin(reply);
       return;
     }
 
-    // No credentials presented: count against the per-IP bucket and challenge.
+    // Malformed credentials count as a failed guess, unlike an absent header.
     authFailures.set(clientIp, ipFail + 1);
-    reply.header('WWW-Authenticate', 'Basic realm="Codeman"');
-    reply.code(401).send('Unauthorized');
+    const delay = loginBackoffMs(authFailures, clientIp);
+    if (delay > 0) {
+      sendAuthRateLimit(reply, authFailures, clientIp, delay);
+      return;
+    }
+    challengeLogin(reply);
   });
 }
 
