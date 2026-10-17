@@ -112,6 +112,79 @@ function rateLimits(value: unknown): boolean {
 }
 
 /** Only reviewed passive protocol events may leave a terminal result unchanged. */
+/** Applied settings are owner intent, never an approval or a permission grant. */
+function validThreadSettings(p: JsonObject, conversationId: string): boolean {
+  const settings = object(p.thread_settings);
+  if (p.thread_id !== conversationId || !settings) return false;
+  const text = (value: unknown): value is string =>
+    typeof value === 'string' && value.length > 0 && value.length <= 4096;
+  const absolute = (value: unknown) => text(value) && value.startsWith('/') && !value.includes('\0');
+  const approval = object(settings.approval_policy);
+  const granular = approval && object(approval.granular);
+  const approvalKeys = ['sandbox_approval', 'rules', 'skill_approval', 'request_permissions', 'mcp_elicitations'];
+  const knownApproval =
+    ['untrusted', 'on-failure', 'on-request', 'never'].includes(String(settings.approval_policy)) ||
+    (!!approval &&
+      Object.keys(approval).length === 1 &&
+      !!granular &&
+      Object.keys(granular).length === approvalKeys.length &&
+      approvalKeys.every((key) => typeof granular[key] === 'boolean'));
+  const profile = object(settings.permission_profile);
+  const fileSystem = profile && object(profile.file_system);
+  const collaboration = object(settings.collaboration_mode);
+  const collaborationSettings = collaboration && object(collaboration.settings);
+  return (
+    text(settings.model) &&
+    text(settings.model_provider_id) &&
+    absolute(settings.cwd) &&
+    knownApproval &&
+    ['user', 'guardian_subagent'].includes(String(settings.approvals_reviewer)) &&
+    profile?.type === 'managed' &&
+    fileSystem?.type === 'restricted' &&
+    Array.isArray(fileSystem.entries) &&
+    fileSystem.entries.length <= 1024 &&
+    fileSystem.entries.every((entry) => {
+      const rule = object(entry);
+      const path = rule && object(rule.path);
+      const special = path && object(path.value);
+      const validPath =
+        path?.type === 'path'
+          ? absolute(path.path)
+          : path?.type === 'special' &&
+            !!special &&
+            Object.keys(special).length === 1 &&
+            ['root', 'slash_tmp', 'tmpdir'].includes(String(special.kind));
+      return (
+        !!rule &&
+        validPath &&
+        ['read', 'write', 'none'].includes(String(rule.access)) &&
+        (rule.missing_path_behavior === undefined || rule.missing_path_behavior === 'skip')
+      );
+    }) &&
+    ['restricted', 'enabled'].includes(String(profile.network)) &&
+    (settings.service_tier === undefined || settings.service_tier === null || text(settings.service_tier)) &&
+    (settings.runtime_workspace_roots === undefined ||
+      (Array.isArray(settings.runtime_workspace_roots) &&
+        settings.runtime_workspace_roots.length <= 100 &&
+        settings.runtime_workspace_roots.every(absolute))) &&
+    !!collaboration &&
+    ['default', 'plan'].includes(String(collaboration.mode)) &&
+    !!collaborationSettings &&
+    text(collaborationSettings.model) &&
+    (collaborationSettings.developer_instructions === undefined ||
+      collaborationSettings.developer_instructions === null ||
+      typeof collaborationSettings.developer_instructions === 'string') &&
+    (collaborationSettings.reasoning_effort === undefined ||
+      collaborationSettings.reasoning_effort === null ||
+      CODEX_REASONING_EFFORTS.includes(
+        collaborationSettings.reasoning_effort as (typeof CODEX_REASONING_EFFORTS)[number]
+      )) &&
+    Array.isArray(settings.disabled_plugin_ids) &&
+    settings.disabled_plugin_ids.length <= 100 &&
+    settings.disabled_plugin_ids.every(text)
+  );
+}
+
 function passiveEvent(p: JsonObject): boolean {
   if (p.type === 'agent_message')
     return (
@@ -437,7 +510,13 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
         return undefined;
       return Math.max(at, Number(nativeAt));
     };
-    if (p.type === 'user_message' || (p.type === 'item_completed' && object(p.item)?.type === 'UserMessage')) {
+    if (p.type === 'thread_settings_applied') {
+      if (!validThreadSettings(p, context.conversationId)) return unknown;
+      // Settings changes cannot revive older interrupted work or clear child,
+      // authentication or quota vetoes. A later exact ordinary owner message
+      // must supersede this control change before normal lifecycle evidence.
+      update('paused', 'approval-required');
+    } else if (p.type === 'user_message' || (p.type === 'item_completed' && object(p.item)?.type === 'UserMessage')) {
       const submitted = object(p.item);
       if (
         p.type === 'user_message'

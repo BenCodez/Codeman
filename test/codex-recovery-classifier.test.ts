@@ -611,3 +611,97 @@ describe('fresh uncertain control errors supersede failed-turn evidence', () => 
     }
   );
 });
+
+describe('native thread settings ownership boundary', () => {
+  const settings = () => ({
+    type: 'thread_settings_applied',
+    thread_id: THREAD,
+    thread_settings: {
+      model: 'fixture-model',
+      model_provider_id: 'fixture',
+      approval_policy: 'on-request',
+      approvals_reviewer: 'user',
+      permission_profile: { type: 'managed', file_system: { type: 'restricted', entries: [] }, network: 'restricted' },
+      cwd: '/fixture',
+      runtime_workspace_roots: ['/fixture'],
+      collaboration_mode: { mode: 'default', settings: { model: 'fixture-model' } },
+      disabled_plugin_ids: [],
+    },
+  });
+  it('requires a subsequent owner message and fresh lifecycle after applied settings', () => {
+    expect(classifyCodexTail(failed(settings()), context())).toMatchObject({ activity: 'paused', safeToAct: false });
+    const input = { type: 'user_message', message: 'Owner confirmed next turn', local_images: [] };
+    expect(classifyCodexTail(tail(settings(), input, start(), complete()), context())).toMatchObject({
+      activity: 'completed',
+      safeToAct: false,
+    });
+    expect(classifyCodexTail(tail(settings(), start(), complete()), context())).toMatchObject({
+      activity: 'paused',
+      safeToAct: false,
+    });
+  });
+  it.each([true, false])('validates native granular approval fields without guessing: %s', (valid) => {
+    const event = settings() as Payload;
+    const snapshot = event.thread_settings as Payload;
+    snapshot.approval_policy = {
+      granular: {
+        sandbox_approval: false,
+        rules: false,
+        skill_approval: false,
+        request_permissions: valid ? true : null,
+        mcp_elicitations: true,
+      },
+    };
+    snapshot.permission_profile = {
+      type: 'managed',
+      file_system: {
+        type: 'restricted',
+        entries: [
+          { path: { type: 'special', value: { kind: 'root' } }, access: 'read' },
+          { path: { type: 'path', path: '/fixture' }, access: 'write', missing_path_behavior: 'skip' },
+        ],
+      },
+      network: 'restricted',
+    };
+    expect(
+      classifyCodexTail(tail(event, { type: 'user_message', message: 'Owner request' }, start(), complete()), context())
+    ).toMatchObject({ activity: valid ? 'completed' : 'unknown', safeToAct: false });
+  });
+  it.each(['authentication', 'quota'])('does not clear an existing %s veto', (kind) => {
+    const veto =
+      kind === 'authentication'
+        ? { type: 'error', message: 'Authentication failed', codex_error_info: 'Unauthorized' }
+        : { type: 'error', message: 'Usage limit reached', codex_error_info: 'UsageLimitExceeded' };
+    const result = classifyCodexTail(
+      tail(
+        start(),
+        veto,
+        settings(),
+        { type: 'user_message', message: 'Next owner prompt' },
+        start('next'),
+        complete(undefined, 'next')
+      ),
+      context()
+    );
+    expect(result.safeToAct).toBe(false);
+    expect(['blocked', 'unknown']).toContain(result.activity);
+  });
+  it('refuses an incomplete permission path even after another owner prompt', () => {
+    const event = settings();
+    event.thread_settings.permission_profile.file_system.entries.push({ path: {}, access: 'write' } as never);
+    expect(
+      classifyCodexTail(tail(event, { type: 'user_message', message: 'Next' }, start(), complete()), context())
+    ).toMatchObject({ activity: 'unknown', safeToAct: false });
+  });
+  it.each([{ thread_id: AGENT }, { thread_settings: {} }, { thread_settings: null }])(
+    'refuses incomplete or unrelated settings %j',
+    (patch) => {
+      expect(
+        classifyCodexTail(
+          tail({ ...settings(), ...patch }, { type: 'user_message', message: 'Next' }, start(), complete()),
+          context()
+        )
+      ).toMatchObject({ activity: 'unknown', safeToAct: false });
+    }
+  );
+});
