@@ -6,7 +6,10 @@ import { dirname, isAbsolute, join, parse } from 'node:path';
 import { dataPath } from '../config/instance.js';
 
 export const MAX_BRAIN_BYTES = 32 * 1024;
-export const MAX_BRAIN_NOTE_BYTES = 2 * 1024;
+export const MAX_BRAIN_NOTE_CHARACTERS = 2000;
+// A Unicode scalar occupies at most four UTF-8 bytes. Match the MCP
+// character contract without weakening the separate 32 KiB brain limit.
+export const MAX_BRAIN_NOTE_BYTES = MAX_BRAIN_NOTE_CHARACTERS * 4;
 export const MAX_BRAIN_NOTES = 64;
 const MAX_FILE_BYTES = 64 * 1024;
 const HEADER = '<!-- codeman-supervisor-brain ';
@@ -78,6 +81,13 @@ function validText(text: unknown, limit: number): text is string {
     !CONTROL.test(text) &&
     Buffer.byteLength(text) <= limit &&
     Buffer.from(text).toString('utf8') === text
+  );
+}
+export function isValidBrainNote(text: unknown): text is string {
+  return (
+    validText(text, MAX_BRAIN_NOTE_BYTES) &&
+    text.trim().length > 0 &&
+    Array.from(text).length <= MAX_BRAIN_NOTE_CHARACTERS
   );
 }
 function decode(text: string): Record {
@@ -459,8 +469,7 @@ export class BrainStore {
     if (
       typeof requestId !== 'string' ||
       !REQUEST_ID.test(requestId) ||
-      !validText(note, MAX_BRAIN_NOTE_BYTES) ||
-      !note.trim() ||
+      !isValidBrainNote(note) ||
       typeof ifMatch !== 'string' ||
       !HASH.test(ifMatch)
     )

@@ -8,7 +8,14 @@ import { dataPath } from '../config/instance.js';
 import type { SupervisorAutomationRecord } from '../types/supervisor-automation.js';
 import { initialSupervisorAutomationRecord, SupervisorAutomationRecordSchema } from './automation-schema.js';
 
-const MAX_BYTES = 2 * 1024 * 1024;
+// The admitted journal has at most 100 managers. Each fits below 384 KiB:
+// 12 tasks × (4000 instruction + 100 name) UTF-16 units × 6 JSON bytes/unit
+// (including escaped lone surrogates), plus 128 receipts, 128 run counters,
+// bounded ASCII identifiers, <=24-byte finite numbers, field names and envelope.
+// 100 × 384 KiB plus the root envelope fits below 40 MiB. Read, staging and
+// publication use the same limit so every admitted shape remains reloadable.
+export const MAX_SUPERVISOR_AUTOMATION_JOURNAL_BYTES = 40 * 1024 * 1024;
+const MAX_BYTES = MAX_SUPERVISOR_AUTOMATION_JOURNAL_BYTES;
 const Journal = z
   .object({
     version: z.literal(1),

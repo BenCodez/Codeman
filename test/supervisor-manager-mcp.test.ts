@@ -530,3 +530,25 @@ it('rechecks credential authority after held brain authorization before appendin
   expect((await response).json().error).toBeDefined();
   expect(f.brain.append).not.toHaveBeenCalled();
 });
+
+it('aligns advertised and admitted Unicode note sizes, rejecting oversized notes before memory effects', async () => {
+  const f = await fixture();
+  const schema = (await f.rpc('tools/list'))
+    .json()
+    .result.tools.find((tool: { name: string }) => tool.name === 'supervisor_brain').inputSchema;
+  const validate = new Ajv({ allErrors: true }).compile(schema);
+  for (const note of ['é'.repeat(1025), '界'.repeat(2000), '🙂'.repeat(2000)]) {
+    const args = { mode: 'append', requestId: REQUEST, note, ifMatch: REVISION };
+    expect(validate(args)).toBe(true);
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toBeUndefined();
+  }
+  expect(f.brain.append).toHaveBeenCalledTimes(3);
+  for (const note of ['a'.repeat(2001), '🙂'.repeat(2001), '   ']) {
+    const args = { mode: 'append', requestId: REQUEST, note, ifMatch: REVISION };
+    expect(validate(args)).toBe(false);
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toMatchObject({
+      code: -32602,
+    });
+  }
+  expect(f.brain.append).toHaveBeenCalledTimes(3);
+});

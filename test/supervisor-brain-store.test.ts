@@ -296,3 +296,28 @@ it('requires current validated authority for reads and never treats a thenable a
     store.read(ID, (() => Promise.reject(Error('not authority'))) as unknown as () => boolean)
   ).rejects.toMatchObject({ code: 'forbidden' });
 });
+
+it.each(['é'.repeat(1025), '界'.repeat(2000), '🙂'.repeat(2000)])(
+  'accepts the advertised Unicode note character budget through durable append and reload',
+  async (note) => {
+    const initial = await store.read(ID, current);
+    const saved = await store.append(ID, 'unicode-note', note, initial.revision, current);
+    expect(saved.markdown).toContain(note);
+    expect(saved.noteCount).toBe(1);
+    const reloaded = new BrainStore(base);
+    expect(await reloaded.read(ID, current)).toMatchObject({ markdown: saved.markdown, revision: saved.revision });
+    expect((await reloaded.append(ID, 'unicode-note', note, initial.revision, current)).duplicate).toBe(true);
+    expect((await reloaded.read(ID, current)).noteCount).toBe(1);
+  }
+);
+
+it.each(['a'.repeat(2001), '🙂'.repeat(2001)])(
+  'refuses notes above the Unicode character budget without writing',
+  async (note) => {
+    const initial = await store.read(ID, current);
+    await expect(store.append(ID, 'over-character-budget', note, initial.revision, current)).rejects.toMatchObject({
+      code: 'invalid',
+    });
+    expect(await fs.readdir(root)).toEqual([]);
+  }
+);

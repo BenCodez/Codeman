@@ -3,7 +3,10 @@ import fs from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
-import { SupervisorAutomationStore } from '../src/supervisor/automation-store.js';
+import {
+  MAX_SUPERVISOR_AUTOMATION_JOURNAL_BYTES,
+  SupervisorAutomationStore,
+} from '../src/supervisor/automation-store.js';
 import { initialSupervisorAutomationRecord } from '../src/supervisor/automation-schema.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
@@ -106,14 +109,18 @@ it.each([
   } else
     await fs.writeFile(
       path,
-      kind === 'malformed' ? '{truncated' : kind === 'oversized' ? 'x'.repeat(2 * 1024 * 1024 + 1) : encoded
+      kind === 'malformed'
+        ? '{truncated'
+        : kind === 'oversized'
+          ? encoded.padEnd(MAX_SUPERVISOR_AUTOMATION_JOURNAL_BYTES + 1, ' ')
+          : encoded
     );
   const before = kind === 'directory' ? undefined : await fs.readFile(path);
   const store = new SupervisorAutomationStore(path);
   expect(store.loadFailed).toBe(true);
   expect(() => store.get(ID)).toThrow(/unavailable/);
   await expect(store.save(ID, record())).rejects.toThrow();
-  if (before) expect(await fs.readFile(path)).toEqual(before);
+  if (before) expect((await fs.readFile(path)).equals(before)).toBe(true);
 });
 
 it('preserves all 100 durable managers when refusing new journal capacity', async () => {
@@ -175,4 +182,61 @@ it('seals ambiguous publication ACKs and retains the durable reservation without
   await expect(store.save(ID, record())).rejects.toThrow(/unavailable/);
   expect(await fs.readFile(path)).toEqual(bytes);
   expect(new SupervisorAutomationStore(path).get(ID).inFlight).toEqual(state.inFlight);
+});
+
+it('writes and reloads all 100 maximally sized manager shapes including JSON-escaped prompt text and receipt seals', async () => {
+  // Lone surrogates are valid PromptText UTF-16 units and JSON escapes each to
+  // six ASCII bytes, exceeding both ordinary UTF-8 and quote/backslash cases.
+  const escaped = '\ud800';
+  const taskId = (index: number) => index.toString().padStart(64, 't');
+  const managerId = (index: number) => index.toString().padStart(100, 'm');
+  const maximum = (index: number) => {
+    const state = record(managerId(index));
+    state.tasks = Array.from({ length: 12 }, (_, task) => ({
+      id: taskId(task),
+      name: escaped.repeat(100),
+      instructions: escaped.repeat(4000),
+      enabled: false,
+      kind: 'recurring' as const,
+      intervalMinutes: 1440,
+      maxRuns: 10,
+    }));
+    state.runs = Array.from({ length: 128 }, (_, run) => ({
+      taskId: taskId(run),
+      attempts: 128,
+      nextRunAt: Number.MAX_VALUE,
+    }));
+    const receipt = (run: number) => ({
+      requestId: run.toString().padStart(120, 'r'),
+      taskId: taskId(run),
+      payloadHash: 'f'.repeat(64),
+      startedAt: Number.MAX_VALUE,
+      phase: 'accepted' as const,
+    });
+    state.handled = Array.from({ length: 127 }, (_, run) => receipt(run));
+    state.inFlight = { ...receipt(127), phase: 'unknown' };
+    state.reason = 'r'.repeat(80);
+    return state;
+  };
+  const managers = Object.fromEntries(Array.from({ length: 100 }, (_, index) => [managerId(index), maximum(index)]));
+  const encoded = JSON.stringify({ version: 1, managers });
+  expect(Buffer.byteLength(JSON.stringify(managers[managerId(0)]))).toBeLessThan(384 * 1024);
+  expect(Buffer.byteLength(encoded)).toBeGreaterThan(30 * 1024 * 1024);
+  expect(Buffer.byteLength(encoded)).toBeLessThan(MAX_SUPERVISOR_AUTOMATION_JOURNAL_BYTES);
+  await fs.writeFile(path, encoded, { mode: 0o600 });
+  const store = new SupervisorAutomationStore(path);
+  expect(store.loadFailed).toBe(false);
+  expect(store.ids()).toHaveLength(100);
+  const changed = store.get(managerId(0));
+  changed.reason = 'updated-with-full-journal';
+  await store.save(managerId(0), changed);
+  const loaded = new SupervisorAutomationStore(path);
+  expect(loaded.loadFailed).toBe(false);
+  expect(loaded.ids()).toHaveLength(100);
+  expect(loaded.get(managerId(0))).toEqual(changed);
+  expect(loaded.get(managerId(99))).toEqual(managers[managerId(99)]);
+  const before = await fs.readFile(path);
+  await expect(store.save(ID, record())).rejects.toThrow(/full/);
+  expect((await fs.readFile(path)).equals(before)).toBe(true);
+  expect(await fs.readdir(root)).toEqual(['automation.json']);
 });

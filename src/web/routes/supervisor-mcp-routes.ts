@@ -2,6 +2,7 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import { PromptTextSchema } from '../../supervision/schema.js';
+import { isValidBrainNote, MAX_BRAIN_NOTE_CHARACTERS } from '../../supervisor/brain.js';
 import type { SupervisorController } from '../../supervisor/controller.js';
 import { ManagerCredentialRegistry, type SupervisorManagerScope } from '../../supervisor/manager-credentials.js';
 import { getSupervisorManagerScope, SUPERVISOR_MCP_PATH } from '../middleware/supervisor-manager-auth.js';
@@ -54,7 +55,7 @@ const Brain = z.discriminatedUnion('mode', [
     .object({
       mode: z.literal('append'),
       requestId: z.string().regex(/^[\w-]{8,100}$/),
-      note: PromptTextSchema.min(1).max(2000),
+      note: PromptTextSchema.min(1).refine(isValidBrainNote, 'Note exceeds the bounded Unicode memory contract'),
       ifMatch: z.string().regex(/^[a-f0-9]{64}$/),
     })
     .strict(),
@@ -94,7 +95,14 @@ const tools = toolNames.map((name) => ({
           properties: {
             mode: { enum: ['read', 'append'] },
             requestId: { type: 'string', minLength: 8, maxLength: 100, pattern: '^[A-Za-z0-9_-]+$' },
-            note: { type: 'string', minLength: 1, maxLength: 2000 },
+            note: {
+              type: 'string',
+              minLength: 1,
+              maxLength: MAX_BRAIN_NOTE_CHARACTERS,
+              pattern: '\\S',
+              description:
+                'Nonempty note: at most 2,000 Unicode characters (8,000 UTF-8 bytes). Total memory remains capped at 32 KiB.',
+            },
             ifMatch: { type: 'string', pattern: '^[a-f0-9]{64}$' },
           },
           required: ['mode'],
