@@ -209,6 +209,15 @@ describe('manager authority at the real server boundary', () => {
   let previousMode: string | undefined;
   let previousPassword: string | undefined;
 
+  // Positive mocked launches model the owner's subsequent completed setup turn.
+  // The full WebServer tests below exercise the real bootstrap and stale-startup race.
+  const completeFixtureSetupTurn = () => {
+    const hash = observation.submissionHash ?? managerSession.getRecoveryContext().submission?.hash;
+    if (!hash) throw Error('Fixture setup requires a tracked submission');
+    Reflect.set(managerSession, '_recoverySubmission', { hash, at: Date.now() });
+    observation = { ...observation, submissionHash: hash };
+  };
+
   beforeEach(async () => {
     // Native MCP transport is separately exercised through the real route suite.
     vi.spyOn(ManagerCredentialRegistry.prototype, 'hasToolsDiscovery').mockReturnValue(true);
@@ -468,6 +477,7 @@ describe('manager authority at the real server boundary', () => {
     const beforeLive = managerTask.getStatus(),
       beforeDurable = internals.taskStore.get(MANAGER);
     const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      completeFixtureSetupTurn();
       if (kind === 'late-task') Reflect.set(managerTask, 'state', changed);
       return options.isCurrent();
     });
@@ -496,6 +506,7 @@ describe('manager authority at the real server boundary', () => {
           workers: [{ ...config.workers[0], sessionId: MANAGER, assignments: 0 }],
         });
       const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         if (kind === 'late') await lease();
         return options.isCurrent();
       });
@@ -540,6 +551,7 @@ describe('manager authority at the real server boundary', () => {
       observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
       const revoke = vi.fn(async () => {});
       vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         // Native launch is a fixture; retain the REAL server preparation scope
         // and exercise Session's real profile lifecycle after acknowledgment.
         Reflect.set(managerSession, '_supervisorManagerProfile', {
@@ -612,128 +624,152 @@ describe('manager authority at the real server boundary', () => {
         if (verified) managerSession.pinRecoveryConversation(MANAGER_THREAD);
         return original.call(this);
       });
-      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockResolvedValue(true);
+      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async () => {
+        completeFixtureSetupTurn();
+        return true;
+      });
       expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(verified);
       expect(observe).toHaveBeenCalled();
       expect(prepare).toHaveBeenCalledTimes(verified ? 1 : 0);
     }
   );
 
-  it('prepares and starts through the real WebServer, Session, profile and tmux continuity predicates', async () => {
-    await manager.pause();
-    await managerTask.update({ config: { enabled: false } });
-    observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
-    await appendFile(
-      rolloutPath,
-      JSON.stringify({
-        timestamp: new Date(Date.now()).toISOString(),
-        type: 'event_msg',
-        payload: { type: 'task_complete', turn_id: 'manager-turn' },
-      }) + '\n'
-    );
-    vi.spyOn(ManagerCatalog, 'readSupervisorManagerCatalog').mockResolvedValue(
-      JSON.stringify({
-        models: [{ slug: 'owner-model', description: 'fixture', apply_patch_tool_type: null, tool_mode: 'direct' }],
-      })
-    );
-    vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
-    vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
-    vi.mocked(managerSession.confirmSupervisorManagerLaunch).mockRestore();
-    const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
-    const record = Reflect.get(managerSession, '_muxSession') as MuxSession;
-    Reflect.set(managerSession, 'workingDir', fixtureData);
-    record.workingDir = fixtureData;
-    const preparing = vi.spyOn(managerSession, 'prepareSupervisorManager');
-    const native = Object.create(TmuxManager.prototype) as TmuxManager;
-    const launches = new Map();
-    Reflect.set(native, 'supervisorManagerLaunches', launches);
-    Reflect.set(native, 'sessions', new Map([[MANAGER, record]]));
-    Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', native.isSupervisorManagerLaunchCurrent.bind(native));
-    Reflect.set(mux, 'isSupervisorManagerOwnerInputCurrent', native.isSupervisorManagerOwnerInputCurrent.bind(native));
-    let draft = '';
-    const line = (payload: unknown) =>
-      JSON.stringify({ timestamp: new Date(Date.now()).toISOString(), type: 'event_msg', payload }) + '\n';
-    Reflect.set(mux, 'inspectPaneForRecovery', async () => ({
-      dead: false,
-      paneId: '%7',
-      panePid: record.pid,
-      screen: `› ${draft}\n\n  fixture default · /fixture\n  ? for shortcuts\n`,
-    }));
-    Reflect.set(mux, 'respawnPane', async (options: import('../src/mux-interface.js').RespawnPaneOptions) => {
-      expect(options.ownerLaunchIsCurrent?.()).toBe(true);
-      expect(await options.supervisorManager?.confirm()).toBe(true);
-      record.recoveryInputBroker = inputProofs.get(managerSession)!.incarnation;
-      launches.set(MANAGER, {
-        profile: options.supervisorManager,
-        record,
-        pid: record.pid,
-        incarnation: record.recoveryInputBroker,
-      });
+  it.each(['settings-written', 'settings-delayed'] as const)(
+    'prepares and starts through the real WebServer, Session, profile and tmux continuity predicates (%s)',
+    async (timing) => {
+      await manager.pause();
+      await managerTask.update({ config: { enabled: false } });
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
       await appendFile(
         rolloutPath,
-        line({
-          type: 'thread_settings_applied',
-          thread_id: MANAGER_THREAD,
-          thread_settings: {
-            model: 'owner-model',
-            model_provider_id: 'fixture',
-            approval_policy: 'on-request',
-            approvals_reviewer: 'user',
-            permission_profile: {
-              type: 'managed',
-              file_system: { type: 'restricted', entries: [] },
-              network: 'restricted',
-            },
-            cwd: '/fixture',
-            runtime_workspace_roots: ['/fixture'],
-            collaboration_mode: { mode: 'default', settings: { model: 'owner-model' } },
-            disabled_plugin_ids: [],
-          },
+        JSON.stringify({
+          timestamp: new Date(Date.now()).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'manager-turn' },
+        }) + '\n'
+      );
+      vi.spyOn(ManagerCatalog, 'readSupervisorManagerCatalog').mockResolvedValue(
+        JSON.stringify({
+          models: [{ slug: 'owner-model', description: 'fixture', apply_patch_tool_type: null, tool_mode: 'direct' }],
         })
       );
-      observation = { ...observation, activity: 'paused', reason: 'approval-required' };
-      return record.pid;
-    });
-    const writes: string[] = [];
-    const previousPty = managerSession.ptyProcess;
-    Reflect.set(managerSession, 'ptyProcess', {
-      write: (input: string) => {
-        writes.push(input);
-        if (input !== '\r') draft = input;
-        else {
-          draft = '';
-          appendFileSync(
-            rolloutPath,
-            line({ type: 'user_message', message: writes[0] }) +
-              line({ type: 'task_started', turn_id: 'setup-turn' }) +
-              line({ type: 'task_complete', turn_id: 'setup-turn' })
-          );
-          observation = {
-            ...observation,
-            activity: 'completed',
-            reason: 'turn-completed',
-            submissionHash: createHash('sha256').update(writes[0]).digest('hex'),
-          };
-        }
-      },
-    });
-    try {
-      const result = await Reflect.get(server, 'setupAndStartSupervisorManager').call(
-        server,
-        managerSession,
-        'full-manager-setup-regression',
-        () => true
+      vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+      vi.mocked(managerSession.confirmSupervisorManagerLaunch).mockRestore();
+      const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
+      const record = Reflect.get(managerSession, '_muxSession') as MuxSession;
+      Reflect.set(managerSession, 'workingDir', fixtureData);
+      record.workingDir = fixtureData;
+      const preparing = vi.spyOn(managerSession, 'prepareSupervisorManager');
+      const native = Object.create(TmuxManager.prototype) as TmuxManager;
+      const launches = new Map();
+      Reflect.set(native, 'supervisorManagerLaunches', launches);
+      Reflect.set(native, 'sessions', new Map([[MANAGER, record]]));
+      Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', native.isSupervisorManagerLaunchCurrent.bind(native));
+      Reflect.set(
+        mux,
+        'isSupervisorManagerOwnerInputCurrent',
+        native.isSupervisorManagerOwnerInputCurrent.bind(native)
       );
-      expect(preparing).toHaveBeenCalledOnce();
-      expect(await preparing.mock.results[0].value).toBe(true);
-      expect(result.phase).toBe('started');
-      expect(writes).toEqual(['Reply READY only.', '\r']);
-      expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(true);
-      expect(manager.getStatus().phase).toBe('active');
-    } finally {
-      Reflect.set(managerSession, 'ptyProcess', previousPty);
+      let draft = '';
+      const line = (payload: unknown) =>
+        JSON.stringify({ timestamp: new Date(Date.now()).toISOString(), type: 'event_msg', payload }) + '\n';
+      Reflect.set(mux, 'inspectPaneForRecovery', async () => ({
+        dead: false,
+        paneId: '%7',
+        panePid: record.pid,
+        screen: `› ${draft}\n\n  fixture default · /fixture\n  ? for shortcuts\n`,
+      }));
+      let restricted = false;
+      let postLaunchProbes = 0;
+      let publishSettings: (() => Promise<void>) | undefined;
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const originalObserve = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        if (timing === 'settings-delayed' && restricted && ++postLaunchProbes === 2 && publishSettings)
+          await publishSettings();
+        return originalObserve.call(this);
+      });
+      Reflect.set(mux, 'respawnPane', async (options: import('../src/mux-interface.js').RespawnPaneOptions) => {
+        expect(options.ownerLaunchIsCurrent?.()).toBe(true);
+        expect(await options.supervisorManager?.confirm()).toBe(true);
+        record.recoveryInputBroker = inputProofs.get(managerSession)!.incarnation;
+        launches.set(MANAGER, {
+          profile: options.supervisorManager,
+          record,
+          pid: record.pid,
+          incarnation: record.recoveryInputBroker,
+        });
+        publishSettings = async () => {
+          await appendFile(
+            rolloutPath,
+            line({
+              type: 'thread_settings_applied',
+              thread_id: MANAGER_THREAD,
+              thread_settings: {
+                model: 'owner-model',
+                model_provider_id: 'fixture',
+                approval_policy: 'on-request',
+                approvals_reviewer: 'user',
+                permission_profile: {
+                  type: 'managed',
+                  file_system: { type: 'restricted', entries: [] },
+                  network: 'restricted',
+                },
+                cwd: '/fixture',
+                runtime_workspace_roots: ['/fixture'],
+                collaboration_mode: { mode: 'default', settings: { model: 'owner-model' } },
+                disabled_plugin_ids: [],
+              },
+            })
+          );
+          observation = { ...observation, activity: 'paused', reason: 'approval-required' };
+        };
+        restricted = true;
+        if (timing === 'settings-written') await publishSettings();
+        return record.pid;
+      });
+      const writes: string[] = [];
+      const previousPty = managerSession.ptyProcess;
+      Reflect.set(managerSession, 'ptyProcess', {
+        write: (input: string) => {
+          writes.push(input);
+          if (input !== '\r') draft = input;
+          else {
+            draft = '';
+            appendFileSync(
+              rolloutPath,
+              line({ type: 'user_message', message: writes[0] }) +
+                line({ type: 'task_started', turn_id: 'setup-turn' }) +
+                line({ type: 'task_complete', turn_id: 'setup-turn' })
+            );
+            observation = {
+              ...observation,
+              activity: 'completed',
+              reason: 'turn-completed',
+              submissionHash: createHash('sha256').update(writes[0]).digest('hex'),
+            };
+          }
+        },
+      });
+      try {
+        const result = await Reflect.get(server, 'setupAndStartSupervisorManager').call(
+          server,
+          managerSession,
+          'full-manager-setup-regression',
+          () => true
+        );
+        expect(preparing).toHaveBeenCalledOnce();
+        expect(await preparing.mock.results[0].value).toBe(true);
+        expect(result.phase).toBe('started');
+        expect(writes).toEqual(['Reply READY only.', '\r']);
+        expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(true);
+        expect(manager.getStatus().phase).toBe('active');
+      } finally {
+        Reflect.set(managerSession, 'ptyProcess', previousPty);
+      }
     }
-  });
+  );
 
   it.each(['completed', 'draft-changed', 'owner-cancelled'] as const)(
     'uses real tagged owner writes for the bounded setup turn: %s',
@@ -873,6 +909,7 @@ describe('manager authority at the real server boundary', () => {
       observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
       const revoke = vi.fn(async () => {});
       vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         Reflect.set(managerSession, '_supervisorManagerProfile', { isCurrent: options.isCurrent, revoke });
         Reflect.set(Reflect.get(managerSession, '_mux'), 'isSupervisorManagerLaunchCurrent', () => true);
         return options.isCurrent();
@@ -926,6 +963,7 @@ describe('manager authority at the real server boundary', () => {
       return result;
     });
     const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async () => {
+      completeFixtureSetupTurn();
       launched = true;
       return true;
     });
@@ -947,6 +985,7 @@ describe('manager authority at the real server boundary', () => {
     Reflect.set(server, 'supervisorManagerAuthReady', true);
     observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
     const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      completeFixtureSetupTurn();
       expect(options.isCurrent()).toBe(true);
       expect(options.token).toMatch(/^codeman-manager-v1\.[a-f0-9]{64}$/);
       expect(options.files?.some((file) => file.path === rolloutPath)).toBe(true);
@@ -981,6 +1020,7 @@ describe('manager authority at the real server boundary', () => {
       );
       const profiles: Array<{ isCurrent(): boolean; revoke: ReturnType<typeof vi.fn> }> = [];
       const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         expect(options.isCurrent()).toBe(true);
         const profile = { isCurrent: () => true, revoke: vi.fn(async () => true) };
         profiles.push(profile);
@@ -1110,6 +1150,7 @@ describe('manager authority at the real server boundary', () => {
       });
       const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
       const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         token = options.token;
         launched = true;
         return true;
@@ -1149,6 +1190,7 @@ describe('manager authority at the real server boundary', () => {
         token = '';
       const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
       vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         token = options.token;
         if (kind === 'owner') managerSession.owner = 'changed-owner';
         if (kind === 'config')
@@ -1195,6 +1237,7 @@ describe('manager authority at the real server boundary', () => {
       release = createDeferred();
     let current = true;
     vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      completeFixtureSetupTurn();
       expect(options.isCurrent()).toBe(true);
       entered.resolve();
       await release.promise;

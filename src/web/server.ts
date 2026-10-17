@@ -3202,6 +3202,7 @@ export class WebServer extends EventEmitter {
               performance.now() < readyDeadline
             ) {
               const observed = await adapter.observe();
+              const submission = session.getRecoveryContext().submission;
               if (
                 requestCurrent() === true &&
                 current() &&
@@ -3210,7 +3211,10 @@ export class WebServer extends EventEmitter {
                 !session.isBusy() &&
                 !session.watching &&
                 observed.conversationId === session.codexConfig?.resumeSessionId &&
-                ['idle', 'completed'].includes(observed.activity) &&
+                observed.activity === 'completed' &&
+                !!submission &&
+                submission.at >= launchStartedAt &&
+                observed.submissionHash === submission.hash &&
                 hasFreshProcessReady(observed, launchStartedAt, Date.now())
               ) {
                 ready = true;
