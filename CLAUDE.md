@@ -250,3 +250,123 @@ Codeman is a Claude Code session manager with web interface and autonomous Ralph
 ### Frontend
 
 **Frontend invariants live in [`src/web/CLAUDE.md`](src/web/CLAUDE.md)**: module load-order notes and every `src/web/public/` UI subsystem (tab strip, sidebar, rail and tab layouts, tile grid, split pane, lineage lines, home screens, settings surface, skins and fonts, mobile keyboard/toolbar/composer, terminal touch, copy and paste, file-preview markdown, XLSX preview limits, z-index stack, connection-loss UI, SSE watchdog, keyboard shortcuts incl. the Ctrl+W owner decision). Claude Code loads it automatically when the Read tool opens a file under `src/web/`. ⚠️ Reading files through Bash (`cat`, `sed`, `grep`) does NOT load it, so **Read `src/web/CLAUDE.md` before editing anything in `src/web/public/`** if it is not already in context.
+
+**Gesture control** (camera hand-tracking overlay, opt-in, default OFF): `CODEMAN_GESTURE=1` makes the feature *available*; `gestureControlEnabled` turns it on. The bundle is injected by `renderIndexHtml` only when enabled, which is why that method is `async` and reads settings with `readSettings(true)` (a fresh read: a post-save reload lands inside the 2s cache TTL and would otherwise render the pre-toggle state). **Source lives in `packages/gesture-control/`; edit there, run `npm run build:gesture`, and commit the regenerated bundle** because dev serves the committed bundle with no runtime bundler. The MediaPipe wasm + model are fetched separately and gitignored. ⚠️ Keep `MP_VERSION` in `fetch-gesture-assets.mjs` in sync with `@mediapipe/tasks-vision`. → [architecture-invariants#gesture-control-the-source-package](docs/architecture-invariants.md#gesture-control-the-source-package)
+
+**PTY and browser terminal geometry** (#464): a browser terminal whose width differs from the PTY's garbles Claude's redraws, so `syncTerminalGeometry()` (terminal-ui.js) is the ONE function that may resize the main terminal (never a bare `fitAddon.fit()`), a font change is a geometry change, and the fit is withheld wherever the SIGWINCH is. ⚠️ Resize is answered with `Session.ptyGeometry`, and a client adopts its COLUMNS only (never rows); `ptyGeometry` is null without a live pane. → [architecture-invariants#pty-and-browser-terminal-geometry](docs/architecture-invariants.md#pty-and-browser-terminal-geometry)
+
+**Service worker precache** (`sw.js` + `scripts/build.mjs`): `BUILD_ID` and `HASHED_ASSETS` are build-generated and the build THROWS unless each declaration appears exactly once; `caches.match` must pass `ignoreSearch: true` because `cacheBustAssets` appends `?v=` to hashed names. → [architecture-invariants#service-worker-precache-and-cache-key](docs/architecture-invariants.md#service-worker-precache-and-cache-key)
+
+### Security
+
+**Full model: [`docs/security-architecture.md`](docs/security-architecture.md)** (network binding, auth pipeline, the tunnel caveat, file-serving hardening, supply-chain, instance isolation, recommended setups). **Layer-by-layer detail with the history behind each: [architecture-invariants#security-layers](docs/architecture-invariants.md#security-layers).**
+
+| Layer             | The rule                                                                                                                                                                                                    |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Auth**          | Optional HTTP Basic via `CODEMAN_USERNAME` (default `admin`) / `CODEMAN_PASSWORD`. Active only when `CODEMAN_PASSWORD` is set (`middleware/auth.ts`)                                                        |
+| **Network bind**  | Defaults to loopback. Non-loopback without a password starts but warns loudly. Classifier: `network-auth-policy.ts`                                                                                          |
+| **Host guard**    | Always-on Host-header allowlist blocking DNS rebinding. ⚠️ **Custom reverse-proxy domains are rejected** unless added via `CODEMAN_ALLOWED_HOSTS=host,.suffix`                                              |
+| **CSRF / Origin** | Always-on cross-site Origin guard on state-changing requests. **A missing Origin is allowed** so curl/CLI and hooks keep working. ⚠️ The body parser keeps `text/plain` RAW; auto-JSON-parsing it enabled simple-request CSRF |
+| **QR Auth**       | Single-use 6-char tokens (60s TTL) for tunnel login. See `docs/qr-auth-plan.md`                                                                                                                              |
+| **Sessions**      | 24h cookie (`codeman_session`), auto-extend, device context audit                                                                                                                                           |
+| **Rate limit**    | 10 failed auth/IP → 429 (15min decay). QR and hook-secret have separate buckets, so neither can lock out login                                                                                              |
+| **Hook bypass**   | `/api/hook-event` + `/api/status-telemetry` skip Basic auth (localhost-only, schema-validated), but when auth is active the loopback bypass requires `X-Codeman-Hook-Secret` **unconditionally** (Codeman cannot detect a user's own loopback reverse proxy) |
+| **Lost-frame page** | The THIRD unauthenticated 200, beside the two hook routes, and the only one decided by request headers alone: a `GET`/`HEAD` carrying `Sec-Fetch-Dest: iframe\|frame`, `Accept: text/html` and mode `navigate` (or none), for a path that is NOT a registered route (never `/api/`, `/ws/`, `/q/`), is answered BEFORE the credential checks with the static web-tab recovery page (`lostWebviewFramePage`: no reflected input, `default-src 'none'` plus its own script hash, `no-store`). `/` is the one registered route also admitted, only when the request carries neither `codeman_session` nor `Authorization` (nothing in Codeman frames its own root; a sandboxed frame has neither), since the landing page masks to exactly `/` and its reload otherwise rendered Codeman inside the web tab. ⚠️ A non-browser client can set those headers, so an unauthenticated caller can tell a registered route (401) from a non-route (200) and enumerate the route table; accepted, the routes are public in `docs/api-reference.md`. Pinned by `test/webview-auth-exemption.test.ts` + `test/webview-lost-root-frame.test.ts` |
+| **Tunnel**        | Enabling a tunnel **refuses** without `CODEMAN_PASSWORD` unless exposure is acknowledged via `CODEMAN_ALLOW_UNAUTHENTICATED_NETWORK=1` or the per-request `acknowledgeUnauthTunnel:true` action field (never persisted) |
+| **Validation**    | Zod schemas, Unicode-aware path allowlist regex, env prefix allowlist (`CLAUDE_CODE_*`/`OPENCODE_*`/`CODEX_*`/`GEMINI_*`/`GOOGLE_*`/`ANTIGRAVITY_*`/`PI_*`/`GROK_*`/`XAI_*`/`DSH_*`/`DEEPSEEK_*`)                                                        |
+| **Headers**       | CORS localhost-only, CSP, X-Frame-Options, HSTS if HTTPS                                                                                                                                                     |
+
+**Security-relevant env vars**: `CODEMAN_MUX` (managed session), `CODEMAN_API_URL` (auto-set for hooks), `CODEMAN_ALLOWED_HOSTS` (extra Host/Origin allowlist entries for reverse proxies; bare `.suffix` matches subdomains), `CODEMAN_DOCKER_BRIDGE_HOOKS=1` (opt-in hooks-only listener on the docker bridge gateway).
+
+### SSE Event Registry
+
+Event constants live in `src/web/sse-events.ts` (backend) and `SSE_EVENTS` in `constants.js` (frontend). **Both must be kept in sync**; `test/sse-registry-parity.test.ts` pins it. ⚠️ `hook:agent_working` is the one hook event with no Claude Code hook behind it — the DeepSeek status bridge reports it (see External CLI modes). The backend file's `@fileoverview` carries the per-category breakdown, including the two Web tab events.
+
+### API Routes
+
+One module per domain in `src/web/routes/` (plus a barrel; `ls src/web/routes/` for the current list). Beyond the `/api` routes: the `/webview/:cap/*` proxy, the `/ws/voice/stream` relay and the terminal WebSocket. Each file has `@fileoverview` with endpoint details.
+
+**HTTP contract** (stable since 0.9.x, see `docs/versioning-policy.md`; full envelope/status/error-code/SSE spec in `docs/api-reference.md`): responses use the `ApiResponse<T>` envelope — `{ success: true, data? }` or `{ success: false, error, errorCode }` (`src/types/api.ts`). `/api/v1/*` is a versioned alias of `/api/*` (URL rewrite in `server.ts`).
+
+## Adding Features
+
+- **API endpoint**: Types in `src/types/` domain file, route in `src/web/routes/*-routes.ts`. Return the `ApiResponse` envelope (`{ success: true, data }`; errors via `createErrorResponse()` with proper status code). Validate with Zod schemas in `schemas.ts`.
+- **SSE event**: Add to `src/web/sse-events.ts` + `SSE_EVENTS` in `constants.js`, emit via `broadcast()`, handle in `app.js` (`addListener(`)
+- **Session setting**: Add to `SessionState`, include in `session.toState()`, call `persistSessionState()`
+- **App setting**: decide per-device vs synced first. Per-device keys go in the `displayKeys` set in settings-ui.js and must NOT be added to `SettingsUpdateSchema` (it is `.strict()`). ⚠️ Anything in `PUT /api/settings` that acts on a setting (the `toggleService` watcher calls) must resolve from **`merged`** (persisted + incoming), never from the raw request body: a partial PUT omits keys it doesn't intend to change, and `body.x ?? default` turns every omission into "apply the default" and silently resets live services. Pinned by `test/routes/system-routes-settings-partial-put.test.ts`. ⚠️ A synced setting is admin-only to write in multi-user mode (the PUT 403s a non-admin, whose browser does not send it): a new route that writes `settings.json` takes the same `isMultiUserMode() && !requireAdmin(req, reply)` gate.
+- **Hook event**: Add to `HookEventType`, add hook in `hooks-config.ts:generateHooksConfig()`, update `HookEventSchema`
+- **Mobile feature**: Add to relevant singleton, guard with `MobileDetection.isMobile()`. New header buttons must stay off phones (`test/mobile-header-buttons-policy.test.ts`).
+- **New test**: a test that constructs `WebServer` itself binds port 0 (`new WebServer(0, …)`, then `server.boundPort`), and a raw `http`/`net`/Fastify/`ws` server listens on `0` and reads `address().port`; mobile tests get theirs from `createTestServer()` and read `boundPort` too. `test/test-ports-guard.test.ts` refuses a fixed port in either. Route tests use `app.inject()` (no port needed); see `test/routes/_route-test-utils.ts`.
+
+**Validation**: Zod v4 (different API from v3). Define schemas in `schemas.ts`, use `.parse()`/`.safeParse()`.
+
+## State Files
+
+All in `~/.codeman/`: `state.json` (sessions, settings, respawn, orchestrator, cron jobs/runs, owner tab layouts), `mux-sessions.json` (tmux recovery), `settings.json` (user prefs), `push-keys.json` + `push-subscriptions.json`, `session-lifecycle.jsonl` (audit log), `update-status.json` (self-updater progress, polled across the service restart), `docker-env-applied.json` (Compose deployment only: sha256 of the Dockerfile + compose file the running container was built from, written by `Start-Codeman.sh`, read by the self-updater's environment gate), `docker-build-source.json` (Compose deployment only: the checkout's HEAD commit and `package-lock.json` hash the `codeman-node-modules`/`codeman-dist` volumes currently reflect, written by both `Start-Codeman.sh` and a successful in-place self-update, compared to detect and refresh a volume left stale by an externally-triggered rebuild), `linked-cases.json`, `webviews.json` (saved web-tab dashboard URLs), `remote-hosts.json` + `remote-cases.json`, `docker-hosts.json` + `docker-cases.json` + `docker-exports/`, `subagent-window-states.json` + `subagent-parents.json` (subagent window layout, GET/PUT `/api/subagent-window-states`/`-parents`), `hook-secret` (per-instance), `users.json` (multi-user, mode 0600) + `admin-audit.jsonl`, `intents.json` (Read My Mind intent profiles, mode 0600), `webhook.json` (webhook notifications: enabled/service/scope plus the ntfy/Slack/Discord URL, a bearer secret, so mode 0600, kept out of `settings.json` and never returned by `/api/webhook`, which is admin-only in multi-user mode), `certs/` (self-signed TLS for `--https`), `.env` (CODEMAN_USERNAME/PASSWORD fallback for the `codeman attach` CLI), `install.log` (installer step output, written by `install.sh`'s `run_step`) and `tailscale-rename` (the node name before `install.sh` renamed it, so uninstall can offer it back; both installer-route only). Transient: `self-update-runner.sh`. Multi-user case spaces live OUTSIDE the data dir at `~/codeman-users/<username>/cases` (shared across instances like `~/codeman-cases`, override `CODEMAN_USER_SPACES_DIR`).
+
+**Generated top-level dirs** (all gitignored — don't edit or commit): `dist/` (esbuild output), `out/`, `coverage/`, `test-results/`, `tmp/`, `screenshots-echo-diag/`. The committed gesture bundle (`src/web/public/gesture/gesture-codeman.js`) IS tracked, but its runtime wasm/model assets (`src/web/public/gesture/wasm/`, `*.task`) are fetched and gitignored.
+
+**Videos and GIFs**: only GIFs a public page embeds are tracked (`docs/images/`), and `.gitignore` blocks `*.mp4`/`*.webm`/`*.mov`/`*.gif` everywhere else. Masters, promo cuts, drafts and captures live in the local, gitignored media library `pr/media/` (guide `pr/media/README.md`, generated `INVENTORY.md` via `node pr/media/inventory.mjs`); never leave a render in `tmp/` or `out/`. A GIF leaving `docs/images/` needs a hotlink check first (articles embed raw `master` URLs). → `docs/media-assets.md`
+
+## Testing
+
+**`npm test` is the gate and is safe to run bare** — it runs `config/vitest.ci.config.ts`, exactly what CI runs, so local green means CI green.
+
+```bash
+npm test                                          # The gate — what CI runs
+npm test -- test/<specific-file>.test.ts          # Single file
+npm test -- -t "pattern"                          # By name
+```
+
+Three suites are deliberately left out, because they cannot pass on an arbitrary machine. Each has its own runner, and a failure there means "not runnable here", not a regression:
+
+```bash
+npm run test:browser   # Playwright + chromium, live server; codex-predictive-echo also needs a real codex binary
+npm run test:mobile    # the above plus environment-specific PNG baselines (own config, own pretest vendor step)
+npm run test:perf      # wall-clock benchmarks — need an otherwise idle machine
+npm run test:all       # literally everything; fails ~87 tests on a clean master here, which is why it is not the default
+```
+
+⚠️ **`npm test` cannot see those suites**, so a change touching mobile/gesture/terminal-render behaviour needs the matching runner by hand — diff its FAIL list against master rather than reading it as pass/fail. That blind spot is what let two semantically-conflicting PRs merge green (see the on-screen-keyboard note in `src/web/CLAUDE.md`). The browser suite (not mobile or perf) also runs nightly in `.github/workflows/browser-suite.yml`, which catches a regression after it lands, not before.
+
+⚠️ **A file filter must match the runner.** `npm test -- test/mobile/keyboard.test.ts` matches nothing and exits GREEN having run zero tests, because the gate's config excludes that path — an excluded file needs its own runner (`npm run test:mobile -- <file>`, `npm run test:browser -- <file>`, `npm run test:perf -- <file>`). Vitest treats "no files matched a filter" as success, so read the file count, not just the colour.
+
+Raw `npx vitest` skips the config (and with it `setup.ts`); always use `npm test --` or pass `--config`.
+
+**Config**: Vitest with `globals: true`, `fileParallelism: false`. Timeout 30s, teardown 60s. `config/vitest.config.ts` is the everything-config behind `test:all`; `config/vitest.ci.config.ts` is the gate and derives its excludes from `config/test-suites.ts`, which is also what `vitest.browser.config.ts` and `vitest.perf.config.ts` derive their includes from — so the exclusions and the runners cannot drift apart. Keep shared options in sync across them.
+
+**Tmux safety**: under vitest (`VITEST`), `TmuxManager` no-ops ALL shell commands (`IS_TEST_MODE` in `src/tmux-manager.ts`), docker IO is no-op'd likewise, and `Session` spawns an echo PTY (`TEST_PTY_SCRIPT`) instead of attaching tmux. `test/setup.ts` gives each file a temp `HOME`/`USERPROFILE` and strips `CODEMAN_PASSWORD`/`CODEMAN_USERNAME`, `CODEMAN_GESTURE` and `CODEMAN_INSTANCE`/`CODEMAN_DATA_DIR`/`CODEMAN_TMUX_SOCKET` (pinned by `test/test-env-isolation.test.ts`). ⚠️ `CODEMAN_DATA_DIR` overrides the temp HOME, so never drop its strip; strip `CODEMAN_INSTANCE` in the setup file, never in a hook (captured at first import). ⚠️ Delete case trees only via `safeRmHomeTree()`. ⚠️ Raw `npx vitest` without `--config` skips `setup.ts` and its isolation. → [architecture-invariants#test-isolation-tmux-docker-and-home](docs/architecture-invariants.md#test-isolation-tmux-docker-and-home)
+
+**Ports**: every in-process test server binds port 0 (the one exception, `test/codex-predictive-echo.test.ts`, starts a separate lab server process on 3222). A test that constructs `WebServer` reads `server.boundPort` (mobile tests: `createTestServer()`, then `server.boundPort`); a raw `http`/`net`/Fastify/`ws` server listens on `0` and reads `address().port`. `test/test-ports-guard.test.ts` fails a `WebServer` built on any other port and a raw `listen` on a number or `…PORT` constant. A test that needs a port nothing listens on binds 0, reads it and closes (`closedPort()` in `test/daemon-control.test.ts`), never "the server's port + 1". Never 3000 (the live instance).
+
+⚠️ **Browser tests can pass vacuously on mobile input paths.** Two traps, both hit on 2026-07-27 while fixing the phone Enter button: **(1)** driving input with `app.sendInput('…')` writes PAST the `LocalEchoOverlay`, so `pendingText` stays empty and any overlay bug is invisible — type with `page.keyboard.type()` instead; **(2)** headless Chromium reports `MobileDetection.isTouchDevice()` **false even with `hasTouch: true`**, so `_localEchoEnabled` is off and the local-echo branch never executes. Force it (`app._localEchoEnabled = true`) or the test proves nothing. Assert on real state (`app._localEchoOverlay.pendingText`, plus `tmux -L codeman capture-pane -p -t <pane>` for what actually reached the PTY), not on HTTP 200.
+
+**Testing against the live instance**: prod is HTTPS-only on :3000 (`curl -sk https://localhost:3000/...`). ⚠️ `w1`/`w2`/`w3` are the user's REAL sessions — never send input to them. Create your own throwaway session (`POST /api/sessions` then `POST /api/sessions/:id/shell`; creation alone leaves `pid: null` and no pane), test against that, and `DELETE` it by exact id when done.
+
+**Respawn tests**: Use `MockSession` from `test/mocks/index.ts` (defined in `test/mocks/mock-session.ts`). **Route tests**: `app.inject({ method, url, payload })` in `test/routes/` — no live port needed. **Mobile tests**: Playwright suite in `test/mobile/` (device profiles in `test/mobile/devices.ts`). Browser-testing infra and practices: `docs/browser-testing-guide.md`.
+
+## Debugging
+
+```bash
+tmux -L codeman list-sessions                      # Codeman's own socket (bare `tmux` shows the default one)
+curl -sk https://localhost:3000/api/sessions | jq  # Check sessions (prod is HTTPS-only; dev on :3000 is plain http)
+curl -sk https://localhost:3000/api/status | jq    # Full app state
+curl -sk https://localhost:3000/api/subagents | jq # Background agents
+cat ~/.codeman/state.json | jq                     # Persisted state
+```
+
+Legacy screenshots (deprecated): `GET/POST /api/screenshots` still read and write `~/.codeman/screenshots/`, but the upload page that fed them is gone, they log a one-time deprecation warning, and they are removed in a later MAJOR, after at least one MINOR release that carries the warning (`docs/versioning-policy.md`). To hand a file to an agent use `POST /api/sessions/:id/paste-image` (see Prompt uploads).
+
+## Performance & Limits
+
+Target: 20 sessions, 50 agent windows at 60fps. Limits live in `src/config/` (terminal 32MB, text 1MB, messages 1000, max agents 500, max sessions 50, max SSE clients 100), most env-overridable.
+
+Two constraints worth knowing before you touch them: the env-derived PTY buffer trim is **clamped to ≤75% of max**, because a trim ≥ max would disable `BufferAccumulator` trimming entirely and make memory unbounded; and browser xterm scrollback is a **separate hardcoded 50k** (`DEFAULT_SCROLLBACK` in constants.js), deliberately lower than tmux's 100k history because 100k per tab is a mobile-memory hazard. tmux <3.7 allocates `history-limit` at pane creation, while tmux 3.7+ can resize live panes (lowering the value can discard retained lines); already-evicted lines never return. The settings keys `terminalScrollbackLines`/`terminalBufferMaxBytes`/`terminalBufferTrimBytes` are schema-validated but **inert**; only `tmuxHistoryLimit` is wired. → [architecture-invariants#buffers-uploads-and-terminal-history](docs/architecture-invariants.md#buffers-uploads-and-terminal-history), `docs/terminal-anti-flicker.md`
+
+**Memory leaks (24+ hour sessions)**: use `CleanupManager`, clear Maps in `stop()`, guard async with `if (this.cleanup.isStopped) return`. Frontend: store handler refs, clean in `close*()`. Use `LRUMap` for bounded caches, `StaleExpirationMap` for TTL cleanup. Verify: `npm test -- test/memory-leak-prevention.test.ts`.
+
+## Scripts & Tunnel
+
+**`install.sh`** (repo root) is the public `curl | bash` installer: it installs Node/tmux/git/build tools, clones to `~/.codeman/app`, builds, and offers a systemd/launchd service, asking every question BEFORE the unattended build (log in `~/.codeman/install.log`). Network access is Tailscale / LAN / local-only; re-runs preserve the existing binding AND password (`read_existing_binding()`). ⚠️ Compose the hand-start env only in `start_command_hint`/`export_bind_env`, and call `stop_background_helpers` before `exec`. ⚠️ Tailscale rename is opt-in (default NO, never under `--yes`/non-interactive); NEVER `tailscale serve reset`, touch a mapping it did not create, run `tailscale funnel` or advertise a Service (`test/install-sh-invariants.test.ts`). ⚠️ Stay **bash 3.2** clean (no `declare -A`, `mapfile`, namerefs, `${x,,}`, here-strings, empty-array expansion under `set -u`). ⚠️ Execute only commands from the generated CLI block (`CLI_INSTALL_CMD_TRUSTED`, `npm run generate:cli-catalog`). → [architecture-invariants#installsh-the-public-installer](docs/architecture-invariants.md#installsh-the-public-installer)
+
+Other key scripts: `scripts/tmux-manager.sh` (safe tmux mgmt), `scripts/tunnel.sh [quick|named] start|stop|status|url` (quick = random trycloudflare URL, default; `named setup|enable` = fixed-hostname tunnel via `scripts/codeman-tunnel-named.service`; bare `start|stop|url` still means quick), `scripts/run-beta.sh` (isolated beta instance), `scripts/build-agent-image.mjs` (docker base image), `scripts/self-update.sh` (detached updater). Production services: `scripts/codeman-web.service`, `scripts/codeman-tunnel.service`. **Always set `CODEMAN_PASSWORD`** before exposing via tunnel.
