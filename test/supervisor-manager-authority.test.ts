@@ -469,6 +469,60 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it.each([
+    'native-progress',
+    'continuous-progress',
+    'new-veto',
+    'owner-input',
+    'caller-grant',
+    'broker-counter',
+  ] as const)('bounds scoped-tool read-only evidence refresh while retaining original authority: %s', async (kind) => {
+    observation = { ...observation, activity: 'working', reason: 'turn-running', processReady: false };
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const actual = CodexRecoveryAdapter.prototype.confirmLocalEvidence;
+    const confirm = vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence');
+    let attempts = 0,
+      callerCurrent = true;
+    confirm.mockImplementation(async function (...args) {
+      attempts++;
+      if (attempts === 1 || kind === 'continuous-progress') {
+        await appendFile(
+          rolloutPath,
+          JSON.stringify({
+            timestamp: new Date(Date.now()).toISOString(),
+            type: 'event_msg',
+            payload: { type: 'agent_message', message: 'Synthetic native progress' },
+          }) + '\n'
+        );
+        if (kind === 'new-veto')
+          observation = { ...observation, activity: 'blocked', reason: 'authentication-required' };
+        if (kind === 'owner-input') {
+          managerSession.trackUserInput('New explicit owner instruction\r');
+          await Reflect.get(managerSession, '_recoveryFencePublication');
+        }
+        if (kind === 'caller-grant') callerCurrent = false;
+        if (kind === 'broker-counter') {
+          const proof = inputProofs.get(managerSession)!;
+          updateFakeInputProvenance(proof, {
+            ownerCounters: { ...proof.ownerCounters, 'owner-pty': proof.ownerCounters['owner-pty'] + 1 },
+          });
+        }
+      }
+      return actual.apply(this, args);
+    });
+    const authority = await manager.captureBrainAuthority(() => callerCurrent);
+    expect(!!authority?.()).toBe(kind === 'native-progress');
+    expect(attempts).toBe(kind === 'native-progress' ? 2 : kind === 'continuous-progress' ? 3 : 1);
+    expect(taskAct).not.toHaveBeenCalled();
+    expect(recoveryAct).not.toHaveBeenCalled();
+    const diagnostics = JSON.stringify(warning.mock.calls);
+    expect(diagnostics).toContain('stage');
+    expect(diagnostics).not.toContain(MANAGER);
+    expect(diagnostics).not.toContain(MANAGER_THREAD);
+    expect(diagnostics).not.toContain(rolloutPath);
+    expect(diagnostics).not.toContain('Synthetic native progress');
+  });
+
   it.each(['objective', 'worker-task', 'worker-criteria', 'worker-grants', 'owner-pause'] as const)(
     'binds durable owner setup replay to unchanged role work and current active state: %s',
     async (change) => {

@@ -3898,6 +3898,7 @@ export class WebServer extends EventEmitter {
         confirmManagerLaunch: () => session.confirmSupervisorManagerLaunch(),
         captureBrainAuthority: async (caller) => {
           const launch = session.captureSupervisorManagerLaunchAuthority();
+          const intent = JSON.stringify(session.getRecoveryContext());
           const configuration = JSON.stringify([
             session.owner,
             session.workingDir,
@@ -3911,6 +3912,7 @@ export class WebServer extends EventEmitter {
             !this.cleaningUp.has(session.id) &&
             this.sessions.get(session.id) === session &&
             managerIsEligible() &&
+            intent === JSON.stringify(session.getRecoveryContext()) &&
             configuration ===
               JSON.stringify([
                 session.owner,
@@ -3918,33 +3920,87 @@ export class WebServer extends EventEmitter {
                 session.codexConfig,
                 session.getEnvOverridesForPersist(),
               ]);
-          if (!current() || !(await session.confirmSupervisorManagerLaunch()) || !current()) return undefined;
+          const refuse = (
+            stage: string,
+            attempt = 0,
+            observation?: RecoveryObservation,
+            checks?: Record<string, boolean>
+          ) => {
+            console.warn('[Supervisor] Scoped manager authority evidence', {
+              stage,
+              attempt,
+              current: current(),
+              ...(observation ? { activity: observation.activity, reason: observation.reason } : {}),
+              ...(checks ? { checks } : {}),
+            });
+            return undefined;
+          };
+          if (!current() || !(await session.confirmSupervisorManagerLaunch()) || !current()) return refuse('launch');
           const config = session.codexConfig,
             env = session.getEnvOverridesForPersist();
           const grant = await clampRecoveryLaunchForOwner(session.owner, { codexConfig: config }, env);
-          const observation = await managerAdapter.observe(),
-            context = session.getRecoveryContext();
           if (
             !current() ||
             !grant.isCurrent() ||
             JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(config) ||
-            JSON.stringify(grant.env) !== JSON.stringify(env) ||
-            !context.managed ||
-            context.switchPending ||
-            context.untrackedInput ||
-            context.inputBrokerPending ||
-            observation.conversationId !== config?.resumeSessionId ||
-            !['working', 'idle', 'completed'].includes(observation.activity) ||
-            !managerAdapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation) ||
-            !(await managerAdapter.confirmLocalEvidence(observation.conversationId!, context.generation)) ||
-            !current() ||
-            !grant.isCurrent()
+            JSON.stringify(grant.env) !== JSON.stringify(env)
           )
-            return undefined;
-          return () =>
-            current() &&
-            grant.isCurrent() &&
-            managerAdapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation);
+            return refuse('grant');
+          // A scoped tool gets its own observation state. Background worker/task
+          // validation must not replace its verifiedTail during the final barrier.
+          const adapter = new CodexRecoveryAdapter(session, () => {});
+          let brokerBinding: string | undefined;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            if (!current() || !grant.isCurrent()) return refuse('scope', attempt);
+            const observation = await adapter.observe(),
+              context = session.getRecoveryContext();
+            if (
+              !current() ||
+              !grant.isCurrent() ||
+              !context.managed ||
+              context.switchPending ||
+              context.untrackedInput ||
+              context.inputBrokerPending ||
+              observation.conversationId !== config?.resumeSessionId ||
+              !['working', 'idle', 'completed'].includes(observation.activity) ||
+              !adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation)
+            )
+              return refuse('observation', attempt, observation, {
+                grant: grant.isCurrent(),
+                managed: context.managed,
+                switchPending: context.switchPending,
+                untrackedInput: context.untrackedInput,
+                inputBrokerPending: context.inputBrokerPending,
+                identityMatches: observation.conversationId === config?.resumeSessionId,
+                activityAllowed: ['working', 'idle', 'completed'].includes(observation.activity),
+                liveProof: adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation),
+              });
+            const source = adapter.getLocalEvidenceSource(observation.conversationId!, context.generation);
+            if (!source?.inputBroker || !source.isCurrent()) return refuse('source', attempt, observation);
+            const { fileWitness: _witness, ...proof } = source.inputBroker.proof;
+            const binding = JSON.stringify(proof);
+            if (brokerBinding !== undefined && brokerBinding !== binding)
+              return refuse('broker-binding', attempt, observation);
+            brokerBinding = binding;
+            const confirmed = await adapter.confirmLocalEvidence(observation.conversationId!, context.generation);
+            if (
+              !current() ||
+              !grant.isCurrent() ||
+              !source.isCurrent() ||
+              !adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation)
+            )
+              return refuse('final-scope', attempt, observation);
+            if (confirmed)
+              return () =>
+                current() &&
+                grant.isCurrent() &&
+                adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation);
+            // Only evidence reads repeat. Fresh native progress may replace the
+            // rollout inode; every new observation retains the original owner,
+            // launch, grant and broker/counter binding and reclassifies all vetoes.
+            refuse('final-evidence-changed', attempt, observation);
+          }
+          return undefined;
         },
         getInputIssuer: () => {
           const evidence = managerEvidence;
