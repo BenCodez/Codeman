@@ -469,6 +469,23 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it('carries fresh scoped manager issuer proof into a coupled worker delivery barrier', async () => {
+    observation = { ...observation, activity: 'working', reason: 'turn-running', processReady: false };
+    const authority = (await manager.captureBrainAuthority(() => true)) as RecoveryActionAuthority;
+    expect(authority()).toBe(true);
+    expect(authority.getInputIssuer?.()?.sessionId).toBe(MANAGER);
+    const workerSource = privateEvidenceSource(internals.sessions.get(WORKER)!, workerRolloutPath, WORKER_THREAD);
+    expect(await authority.prepareEvidence?.(workerSource)).toBe(true);
+    // A worker transcript edit after observation revokes the coupled barrier.
+    await appendFile(
+      workerRolloutPath,
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }) + '\n'
+    );
+    expect(await authority.prepareEvidence?.(workerSource)).toBe(false);
+    Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+    expect(authority.getInputIssuer?.()).toBeUndefined();
+  });
+
   it.each([
     'native-progress',
     'continuous-progress',

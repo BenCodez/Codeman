@@ -61,16 +61,25 @@ learning about agents and exchanging cooperative messages.
 
 The directory includes this owner's local and SSH tabs, including plain shell tabs
 containing an independently launched Codex agent. Give each agent a role and notes,
-save its messaging grant, and choose **Connect existing agent**. Copy the private
-enrollment instructions into the intended agent yourself. The agent can then read
-its own inbox and post replies during normal work checkpoints. This does not restart
-or alter the agent, its configuration, or its authentication. It also works for a
-cooperating Claude agent. Enrollment grants inbox access, not terminal or owner API
-access, and does not establish verified native process identity.
+save its messaging grant, and choose **Connect existing agent**. Connect creates a
+private credential and attempts to submit its enrollment prompt to a verified idle
+owned Codex chat automatically. Configure the global **Agent inbox endpoint** with
+the Codeman URL reachable from agents; if unset, Connect saves the current page's
+server URL after confirmation. Busy, unverified or plain SSH shell tabs receive no
+input. Convert an SSH shell using **Convert to Codex**, then complete a normal owner
+conversation turn first. Copyable private instructions remain available for manual
+enrollment, including cooperating Claude agents, without automated Claude input.
+Enrollment grants inbox access, not owner API access, and does not itself establish
+verified native process identity.
 
-Messages for these existing agents are **queued**, not typed into a terminal.
-An agent must fetch them before it can respond; a successful HTTP response does not
-prove that an agent acted on a message. Keep its enrollment credential private.
+Messages are durably queued in the private inbox. For an enrolled, verified idle
+Codex worker, sending also attempts a fixed inbox-check prompt through protected
+Codex delivery. Arbitrary message text stays in the inbox. Current grants, task
+ownership, pending work, approval and usage limits still apply. No manager worker
+plan is required for a free agent; an active task retains its objective and budgets.
+The UI distinguishes queued, prompt submitted, blocked and uncertain delivery from
+an actual agent reply. Duplicate requests never replay input; inspect uncertain
+outcomes before sending anything else. Keep the enrollment credential private.
 Credentials expire after 24 hours; reconnecting rotates and revokes the previous
 credential. Removing the messaging grant or changing session ownership disables
 access. Each inbox retains at most 64 messages within a 32 KiB journal; capacity is
@@ -213,3 +222,27 @@ confirmed succeeded/rejected receipts. Uncertain operations stay active. Durable
 per-request replay fences remain in the private archive, so reusing an archived
 request ID cannot issue the write again. Archival sends no GitLab requests and
 never deletes uncertain records or automatically retires archives.
+
+
+### Shared GitLab memory and PR/MR coordination
+
+Management settings can point shared memory at an existing GitLab project, branch
+and file. Sync starts disabled. Preview both versions, then explicitly publish local
+memory or import reviewed remote suggestions. Writes retain the existing GitLab
+project and `codeman/` branch grants. No branch merge or merge request is created
+implicitly. Backend agents can suggest changes through the project's normal review
+workflow; remote edits pause automatic export instead of being overwritten.
+
+After the initial confirmed sync, optional automatic export runs when owner or
+manager memory changes. Conflicts and uncertain writes stop further automatic
+exports. Manager tools expose `supervisor_brain` modes `sync_status`, `sync_preview`
+and `sync_publish`; destination changes and importing remote memory remain owner
+controls. Local memory saves remain successful if a remote sync fails.
+
+The manager can inventory every project available under the saved all-projects
+read grant, page through repository trees and merge requests, and inspect individual
+MRs. It records project/repository, exact PR/MR link, branch, status, agent ID, evidence
+time and handoff/blockers in shared memory. Reports of ownership are labeled until
+supported; a shared GitLab author alone does not identify a Codeman agent. Large
+inventories need linked project documents and saved cursors rather than copying all
+repository content into the bounded 32 KiB working brain.

@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from '../src/recovery/codex-evidence-limits.js';
 /** Actual temporary profile/identity/fence domains share one bounded final proof. */
 import fs from 'node:fs/promises';
 import { createHash } from 'node:crypto';
@@ -403,7 +404,7 @@ describe('joint reboot launch evidence', () => {
                   ...grant,
                   ...(kind === 'hash' ? { hash: '0'.repeat(64) } : {}),
                   ...(kind === 'size' ? { size: grant.size + 1 } : {}),
-                  ...(kind === 'bound' ? { maxBytes: 2_097_153 } : {}),
+                  ...(kind === 'bound' ? { maxBytes: MAX_CODEX_ROLLOUT_BYTES + 1 } : {}),
                 },
               ];
       expect(await witness(identity, undefined, files as readonly PrivateFileWitness[])).toBe(false);

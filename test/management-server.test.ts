@@ -488,3 +488,175 @@ it('invalidates captured supervisor brain writes when the global selection or ow
   Object.assign(h.manager, { owner: 'bob' });
   expect(selected.current()).toBe(false);
 });
+
+it('connects automatic enrollment and message wake to the real server without writing into SSH shells', async () => {
+  const h = await fixture();
+  const before = (await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders })).json().data;
+  expect(
+    (
+      await h.app.inject({
+        method: 'PUT',
+        url: '/api/management',
+        headers: ownerHeaders,
+        payload: {
+          ifMatch: before.revision,
+          managerSessionId: MANAGER,
+          inboxEndpoint: 'https://codeman.example/api/management/agent-inbox',
+          agents: [{ sessionId: SHELL, role: 'Backend', notes: '', allowMessages: true }],
+        },
+      })
+    ).statusCode
+  ).toBe(200);
+  const connect = (
+    await h.app.inject({
+      method: 'POST',
+      url: `/api/management/agents/${SHELL}/enroll`,
+      headers: ownerHeaders,
+      payload: { autoSend: true, requestId: 'automatic-connect-one' },
+    })
+  ).json().data;
+  expect(connect).toMatchObject({ delivery: { status: 'blocked', needsConversion: true } });
+  const message = (
+    await h.app.inject({
+      method: 'POST',
+      url: `/api/management/agents/${SHELL}/messages`,
+      headers: ownerHeaders,
+      payload: { requestId: 'automatic-message-one', message: 'Report your current work' },
+    })
+  ).json().data;
+  expect(message).toMatchObject({
+    message: { message: 'Report your current work' },
+    delivery: { status: 'blocked', needsConversion: true },
+  });
+  const messages = (
+    await h.app.inject({ method: 'GET', url: `/api/management/agents/${SHELL}/messages`, headers: ownerHeaders })
+  ).json().data;
+  expect(messages.messages).toHaveLength(1);
+  expect(messages.messages[0].delivery).toMatchObject({ status: 'blocked', needsConversion: true });
+  const duplicate = (
+    await h.app.inject({
+      method: 'POST',
+      url: `/api/management/agents/${SHELL}/enroll`,
+      headers: ownerHeaders,
+      payload: { autoSend: true, requestId: 'automatic-connect-one' },
+    })
+  ).json().data;
+  expect(duplicate.duplicate).toBe(true);
+  expect(duplicate.token).toBeUndefined();
+  expect(duplicate.instructions).toBeUndefined();
+  for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
+});
+
+it('keeps a durable local brain save successful when GitLab sync is unavailable', async () => {
+  const h = await fixture();
+  const sync = Reflect.get(
+    h.server,
+    'managementBrainSync'
+  ) as import('../src/management/brain-gitlab-sync.js').BrainGitLabSyncService;
+  const publish = vi.spyOn(sync, 'publishChanged').mockRejectedValue(Error('Synthetic network failure'));
+  const before = (await h.app.inject({ method: 'GET', url: '/api/management/brain', headers: ownerHeaders })).json()
+    .data;
+  const save = await h.app.inject({
+    method: 'PUT',
+    url: '/api/management/brain',
+    headers: ownerHeaders,
+    payload: {
+      markdown: 'Agent backend owns MR 12, reported; verify current GitLab state.',
+      ifMatch: before.revision,
+    },
+  });
+  expect(save.statusCode).toBe(200);
+  expect(save.json().data.markdown).toContain('owns MR 12');
+  expect(publish).toHaveBeenCalledWith('admin', expect.any(Function));
+  expect(
+    (await h.app.inject({ method: 'GET', url: '/api/management/brain', headers: ownerHeaders })).json().data.markdown
+  ).toBe(save.json().data.markdown);
+  for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
+});
+
+it('starts GitLab brain sync disabled and exposes configuration only to the owner', async () => {
+  const h = await fixture();
+  expect(
+    (await h.app.inject({ method: 'GET', url: '/api/management/brain-sync', headers: { host: '127.0.0.1' } }))
+      .statusCode
+  ).toBe(401);
+  const response = await h.app.inject({ method: 'GET', url: '/api/management/brain-sync', headers: ownerHeaders });
+  expect(response.statusCode).toBe(200);
+  expect(response.headers['cache-control']).toContain('no-store');
+  expect(response.json().data).toMatchObject({
+    enabled: false,
+    autoPublish: false,
+    projectId: null,
+    status: 'disabled',
+  });
+  expect(
+    (
+      await h.app.inject({
+        method: 'POST',
+        url: '/api/management/brain-sync/preview',
+        headers: ownerHeaders,
+        payload: {},
+      })
+    ).statusCode
+  ).toBe(403);
+  for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
+});
+
+it('honors revoked agent-thread grants through actual manager MCP while preserving owner history', async () => {
+  const h = await fixture();
+  const service = Reflect.get(h.server, 'managementService') as import('../src/management/store.js').ManagementService;
+  const initial = await service.read('admin');
+  await service.configure('admin', {
+    ifMatch: initial.revision,
+    managerSessionId: MANAGER,
+    agents: [{ sessionId: SHELL, role: 'Backend', notes: '', allowMessages: true }],
+  });
+  await service.send('admin', SHELL, 'Report your current work', 'thread-owner-request');
+  const enrollment = await service.enroll('admin', SHELL);
+  const agent = await service.authenticate(enrollment.token!);
+  await service.reply(agent!, 'Agent reports ownership of MR 12', 'thread-agent-reply');
+  vi.spyOn(h.manager, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
+  vi.spyOn(h.server as never, 'getSupervisorController' as never).mockReturnValue({
+    confirmManagerLaunch: async () => true,
+    captureBrainAuthority: async (current: () => boolean) => current,
+  } as never);
+  const credentials = Reflect.get(
+    h.server,
+    'supervisorManagerCredentials'
+  ) as import('../src/supervisor/manager-credentials.js').ManagerCredentialRegistry;
+  const issued = credentials.issue({ sessionId: MANAGER, isCurrent: () => true, canOperate: () => true });
+  const call = () =>
+    h.app.inject({
+      method: 'POST',
+      url: '/api/supervisor-mcp',
+      headers: {
+        host: '127.0.0.1',
+        authorization: 'Bearer ' + issued.token,
+      },
+      payload: {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'supervisor_agent',
+          arguments: { mode: 'read', agentId: SHELL },
+        },
+      },
+    });
+  expect((await call()).json().error).toBeUndefined();
+  const granted = await service.read('admin');
+  await service.configure('admin', {
+    ifMatch: granted.revision,
+    managerSessionId: MANAGER,
+    agents: [{ sessionId: SHELL, role: 'Backend', notes: '', allowMessages: false }],
+  });
+  expect((await call()).json().error).toBeDefined();
+  const owner = await h.app.inject({
+    method: 'GET',
+    url: `/api/management/agents/${SHELL}/messages`,
+    headers: ownerHeaders,
+  });
+  expect(owner.statusCode).toBe(200);
+  expect(owner.json().data.messages).toHaveLength(2);
+  for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
+});

@@ -87,6 +87,156 @@ describe('private direct GitLab connection', () => {
     vi.useRealTimers();
     await rm(root, { recursive: true, force: true });
   });
+  const mr = (patch: Record<string, unknown> = {}) => ({
+    id: 101,
+    iid: 7,
+    project_id: 1,
+    title: 'Fix owner parser',
+    description: 'Untrusted agent handoff text',
+    author: { id: 9, username: 'agent-bot', name: 'Agent Bot', private_token: secret },
+    source_branch: 'codeman/parser',
+    target_branch: 'main',
+    source_project_id: 1,
+    target_project_id: 1,
+    state: 'opened',
+    draft: false,
+    detailed_merge_status: 'checking',
+    web_url: 'https://gitlab.example.invalid/group/one/-/merge_requests/7',
+    sha,
+    updated_at: '2026-10-17T12:00:00Z',
+    ...patch,
+  });
+  it('pins multi-step authority without network and revokes it on owner or connection changes', async () => {
+    await configure();
+    transport.mockClear();
+    let current = true;
+    const authority = await service.captureAuthority('alice', () => current);
+    expect(authority()).toBe(true);
+    expect(transport).not.toHaveBeenCalled();
+    current = false;
+    expect(authority()).toBe(false);
+    await expect(service.captureAuthority('alice', () => current)).rejects.toMatchObject({ code: 'forbidden' });
+    current = true;
+    const beforeConfigChange = await service.captureAuthority('alice', () => current);
+    await configure({ projectIds: [2] });
+    expect(beforeConfigChange()).toBe(false);
+    expect(transport).not.toHaveBeenCalled();
+    await configure({ token: '' });
+    await expect(service.captureAuthority('alice')).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it('reads scoped merge requests and details without writing grants or attributing GitLab authors to agents', async () => {
+    await configure({ allowWrite: false });
+    transport.mockImplementation(async (url: string, init: RequestInit) => {
+      expect(init.method).toBe('GET');
+      const u = new URL(url);
+      if (u.pathname.endsWith('/merge_requests/7')) return json(mr());
+      expect(u.pathname).toBe('/api/v4/projects/1/merge_requests');
+      expect(Object.fromEntries(u.searchParams)).toEqual({ scope: 'all', state: 'opened', per_page: '50', page: '1' });
+      return json([mr()], 200, { 'x-next-page': '2' });
+    });
+    expect(await service.operate('alice', { operation: 'merge_requests', projectId: 1 })).toMatchObject({
+      mergeRequests: [
+        {
+          iid: 7,
+          projectId: 1,
+          author: { username: 'agent-bot' },
+          sourceBranch: 'codeman/parser',
+          targetBranch: 'main',
+          state: 'opened',
+          mergeStatus: 'checking',
+          sha,
+          untrusted: true,
+          agentAttribution: 'unverified',
+        },
+      ],
+      truncated: true,
+      nextPage: 2,
+      capacityReached: false,
+      untrusted: true,
+    });
+    const detail = await service.operate('alice', { operation: 'merge_request', projectId: 1, iid: 7 });
+    expect(detail).toMatchObject({
+      mergeRequest: { id: 101, iid: 7, description: 'Untrusted agent handoff text', webUrl: mr().web_url },
+      untrusted: true,
+    });
+    expect(JSON.stringify(detail)).not.toContain(secret);
+    expect(JSON.stringify(detail)).not.toContain('private_token');
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+  it('applies explicit all-project grants and bounded merge-request pagination', async () => {
+    await configure({ projectIds: [], allowAllProjects: true, allowWrite: false });
+    transport.mockResolvedValue(
+      json([mr({ project_id: 2, target_project_id: 2, state: 'merged' })], 200, { 'x-next-page': '101' })
+    );
+    expect(
+      await service.operate('alice', { operation: 'merge_requests', projectId: 2, state: 'merged', page: 100 })
+    ).toMatchObject({ truncated: true, nextPage: null, capacityReached: true });
+    expect(String(transport.mock.calls[0][0])).toContain(
+      '/projects/2/merge_requests?scope=all&state=merged&per_page=50&page=100'
+    );
+    await configure({ projectIds: [1], allowAllProjects: false });
+    transport.mockClear();
+    await expect(service.operate('alice', { operation: 'merge_request', projectId: 2, iid: 7 })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+    expect(transport).not.toHaveBeenCalled();
+  });
+  it('bounds UTF-8 descriptions and rejects mismatched, malformed, foreign or secret-bearing MR output', async () => {
+    await configure();
+    transport.mockResolvedValue(json(mr({ description: '😀'.repeat(5000) })));
+    const result = (await service.operate('alice', { operation: 'merge_request', projectId: 1, iid: 7 })) as {
+      mergeRequest: { description: string; descriptionTruncated: boolean };
+    };
+    expect(Buffer.byteLength(result.mergeRequest.description)).toBeLessThanOrEqual(8192);
+    expect(result.mergeRequest.description).not.toContain('�');
+    expect(result.mergeRequest.descriptionTruncated).toBe(true);
+    for (const patch of [
+      { project_id: 2 },
+      { target_project_id: 2 },
+      { iid: 8 },
+      { sha: 'unknown' },
+      { author: { username: 'unverified' } },
+      { web_url: 'https://foreign.invalid/group/one/-/merge_requests/7' },
+      { web_url: 'https://gitlab.example.invalid/group/one/-/merge_requests/7?token=secret' },
+      { web_url: 'https://secret@gitlab.example.invalid/group/one/-/merge_requests/7' },
+      { description: secret },
+    ]) {
+      transport.mockResolvedValue(json(mr(patch)));
+      await expect(
+        service.operate('alice', { operation: 'merge_request', projectId: 1, iid: 7 })
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    }
+  });
+  it('rejects malformed MR pagination, oversized lists and changed owner authority without extra requests', async () => {
+    await configure();
+    for (const cursor of ['1', '02', '3', '-1', 'https://foreign.invalid']) {
+      transport.mockResolvedValue(json([mr()], 200, { 'x-next-page': cursor }));
+      await expect(service.operate('alice', { operation: 'merge_requests', projectId: 1 })).rejects.toMatchObject({
+        code: 'unavailable',
+      });
+    }
+    transport.mockResolvedValue(json(Array.from({ length: 51 }, () => mr())));
+    await expect(service.operate('alice', { operation: 'merge_requests', projectId: 1 })).rejects.toMatchObject({
+      code: 'unavailable',
+    });
+    let current = true;
+    transport.mockImplementation(async () => {
+      current = false;
+      return json([mr()]);
+    });
+    await expect(
+      service.operate('alice', { operation: 'merge_requests', projectId: 1 }, () => current)
+    ).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it.each([
+    { operation: 'merge_requests', projectId: 1, state: 'arbitrary' },
+    { operation: 'merge_requests', projectId: 1, page: 101 },
+    { operation: 'merge_request', projectId: 1, id: 101 },
+    { operation: 'merge_request', projectId: 1, iid: '../7' },
+    { operation: 'merge_request', projectId: 1, iid: 7, url: 'https://foreign.invalid' },
+  ])('rejects arbitrary MR selectors/routes %#', (operation) => {
+    expect(GitLabOperationSchema.safeParse(operation).success).toBe(false);
+  });
   it('keeps tokens private, retains omitted credentials, clears explicitly and scopes owners', async () => {
     const result = await configure();
     expect(result.credentialConfigured).toBe(true);

@@ -26,6 +26,7 @@ const Configure = z
           .strict()
       )
       .max(100),
+    inboxEndpoint: z.string().max(1000).optional(),
   })
   .strict();
 export function registerManagementRoutes(app: FastifyInstance, context: ManagementRouteContext): void {
@@ -106,8 +107,10 @@ export function registerManagementRoutes(app: FastifyInstance, context: Manageme
   );
   app.post('/api/management/agents/:id/enroll', async (req) =>
     guarded(async () => {
-      z.object({}).strict().parse(req.body);
-      return context.service.enroll(owner(req), Id.parse((req.params as { id: string }).id), current(req));
+      const options = z
+        .union([z.object({}).strict(), z.object({ autoSend: z.literal(true), requestId: Id }).strict()])
+        .parse(req.body);
+      return context.service.enroll(owner(req), Id.parse((req.params as { id: string }).id), current(req), options);
     })
   );
   app.get('/api/management/agents/:id/messages', async (req) =>

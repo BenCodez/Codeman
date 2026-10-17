@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** Trusted janitor only: never imports or executes an incarnation's broker.py. */
 export const CODEX_BROKER_CLEANUP_SOURCE = String.raw`
 import errno, fcntl, hashlib, json, math, os, re, select, signal, stat, sys, time
@@ -104,7 +105,7 @@ def paths_valid(paths):
     return isinstance(paths,list) and len(paths)<=2048 and all(isinstance(w,dict) and {'path','kind','dev','ino'}<=set(w)<={'path','kind','dev','ino','size','mtimeMs','ctimeMs'} and w['kind'] in ('directory','file') and canonical(w['path']) and all(type(w[k]) in (int,float) and math.isfinite(w[k]) and w[k]>=0 for k in set(w)-{'path','kind'}) for w in paths)
 
 def files_valid(files):
-    return isinstance(files,list) and len(files)<=8 and all(isinstance(w,dict) and set(w)=={'path','dev','ino','size','mtimeMs','ctimeMs','hash','maxBytes'} and canonical(w['path']) and type(w['maxBytes']) is int and 0<w['maxBytes']<=2097152 and type(w['size']) is int and 0<=w['size']<=w['maxBytes'] and isinstance(w['hash'],str) and re.fullmatch(r'[a-f0-9]{64}',w['hash']) and all(type(w[k]) in (int,float) and math.isfinite(w[k]) and w[k]>=0 for k in ('dev','ino','mtimeMs','ctimeMs')) for w in files)
+    return isinstance(files,list) and len(files)<=8 and all(isinstance(w,dict) and set(w)=={'path','dev','ino','size','mtimeMs','ctimeMs','hash','maxBytes'} and canonical(w['path']) and type(w['maxBytes']) is int and 0<w['maxBytes']<=${MAX_CODEX_ROLLOUT_BYTES} and type(w['size']) is int and 0<=w['size']<=w['maxBytes'] and isinstance(w['hash'],str) and re.fullmatch(r'[a-f0-9]{64}',w['hash']) and all(type(w[k]) in (int,float) and math.isfinite(w[k]) and w[k]>=0 for k in ('dev','ino','mtimeMs','ctimeMs')) for w in files)
 
 def issuer_valid(issuer):
     if issuer is None: return True

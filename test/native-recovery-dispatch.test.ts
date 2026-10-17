@@ -1278,21 +1278,23 @@ describe('native restart final preparation boundary', () => {
 });
 
 describe('usage-policy prose at native input boundaries', () => {
-  it.each(['Consider usage limits and rate limits.', 'Usage limit reached'])(
-    'retains quota notices without treating plural policy prose as one: %s',
-    async (prefix) => {
-      const f = await fixture('continue');
-      f.pane.screen = prefix + '\n' + f.pane.screen;
-      const original = effects.exec.getMockImplementation()!;
-      effects.exec.mockImplementation(async (command: string) => {
-        const result = await original(command);
-        if (isLiteral(command)) f.pane.screen = prefix + '\n' + f.pane.screen;
-        return result;
-      });
-      expect(await f.deliver()).toBe(prefix.startsWith('Consider') ? 'sent' : 'not-sent');
-      expect(childCommands().some(isEnter)).toBe(prefix.startsWith('Consider'));
-    }
-  );
+  it.each([
+    'Consider usage limits and rate limits.',
+    '• What would you like me to tell the worker?',
+    'Usage limit reached',
+    'Would you like to run this command?',
+  ])('retains quota notices without treating plural policy prose as one: %s', async (prefix) => {
+    const f = await fixture('continue');
+    f.pane.screen = prefix + '\n' + f.pane.screen;
+    const original = effects.exec.getMockImplementation()!;
+    effects.exec.mockImplementation(async (command: string) => {
+      const result = await original(command);
+      if (isLiteral(command)) f.pane.screen = prefix + '\n' + f.pane.screen;
+      return result;
+    });
+    expect(await f.deliver()).toBe(prefix.startsWith('Consider') || prefix.startsWith('• What') ? 'sent' : 'not-sent');
+    expect(childCommands().some(isEnter)).toBe(prefix.startsWith('Consider') || prefix.startsWith('• What'));
+  });
 });
 
 describe('native folded literal acknowledgment', () => {

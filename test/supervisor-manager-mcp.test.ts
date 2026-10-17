@@ -117,6 +117,10 @@ async function fixture(
     }),
   };
   const brain = {
+    sync: vi.fn(async (_scope, _input, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { status: 'pending' };
+    }),
     replace: vi.fn(async (_scope, _id, _markdown, _revision, current: () => boolean) => {
       if (!current()) throw Error('cancelled');
       return { revision: 'c'.repeat(64) };
@@ -213,7 +217,7 @@ it('initializes and lists exactly six scoped tools, then invokes exact owner-sel
     required: ['mode'],
     additionalProperties: false,
     properties: {
-      mode: { enum: ['read', 'append', 'replace'] },
+      mode: { enum: ['read', 'append', 'replace', 'sync_status', 'sync_preview', 'sync_publish'] },
       note: { maxLength: 2000 },
       ifMatch: { pattern: '^[a-f0-9]{64}$' },
     },
@@ -884,4 +888,36 @@ it('advertises exact canonical mode arguments in discovery and the manager promp
     });
   expect(f.brain.read).toHaveBeenCalledOnce();
   expect(f.management.usage).not.toHaveBeenCalled();
+});
+
+it.each(['sync_status', 'sync_preview', 'sync_publish'] as const)(
+  'binds GitLab memory %s to prepared manager evidence',
+  async (mode) => {
+    const f = await fixture();
+    const args = {
+      mode,
+      ...(mode === 'sync_publish'
+        ? {
+            requestId: REQUEST,
+            localRevision: REVISION,
+            remoteLastCommitId: 'a'.repeat(40),
+            remoteHash: 'b'.repeat(64),
+          }
+        : {}),
+    };
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toBeUndefined();
+    expect(f.brain.sync).toHaveBeenCalledWith(f.registry.resolve(f.issued.token), args, expect.any(Function));
+    f.brain.sync.mockClear();
+    f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error.code).toBe(-32001);
+    expect(f.brain.sync).not.toHaveBeenCalled();
+  }
+);
+it('does not expose owner-only GitLab brain configuration or import through manager tools', async () => {
+  const f = await fixture();
+  for (const mode of ['sync_configure', 'sync_pull'])
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { mode } })).json().error.code).toBe(
+      -32602
+    );
+  expect(f.brain.sync).not.toHaveBeenCalled();
 });

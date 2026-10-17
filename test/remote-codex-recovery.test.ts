@@ -332,6 +332,10 @@ cp.execFileSync=function(file,args,options){
       expect(await input(q.prompt)).toMatchObject({ status: 'sent' });
       expect((await f.bytes()).toString()).toBe(q.prompt + '\r');
       await f.marker('bytes', '');
+      f.env.FIXTURE_SCREEN_PREFIX = '• What would you like me to tell the worker?\n';
+      expect(await input(q.prompt)).toMatchObject({ status: 'sent' });
+      expect((await f.bytes()).toString()).toBe(q.prompt + '\r');
+      await f.marker('bytes', '');
       f.env.FIXTURE_SCREEN_PREFIX = 'Usage limit reached\n';
       expect(await input(q.prompt)).toMatchObject({ status: 'not-sent' });
       expect(await f.bytes()).toHaveLength(0);

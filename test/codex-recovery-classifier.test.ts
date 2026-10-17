@@ -1161,3 +1161,48 @@ it('allows later owner intent to supersede only an exact failed brain read with 
       )
     ).toMatchObject({ activity: 'blocked', safeToAct: false });
 });
+
+it('distinguishes native approval question rows from assistant conversational questions', () => {
+  const prose = '• What would you like me to tell the worker?\n• The owner asked "would you like a summary?"\n';
+  expect(classifyCodexTail(tail(start()), context({ screen: prose + READY })).activity).toBe('working');
+  for (const notice of [
+    'Would you like to run the following command?',
+    '• Would you like to approve this?',
+    'Press enter to confirm or esc to cancel',
+    'Allow this tool?',
+  ])
+    expect(classifyCodexTail(tail(start()), context({ screen: prose + notice + '\n' + READY }))).toMatchObject({
+      activity: 'paused',
+      reason: 'approval-required',
+      safeToAct: false,
+    });
+  expect(
+    classifyCodexTail(tail(start(), { type: 'exec_approval_request' }), context({ screen: prose + READY }))
+  ).toMatchObject({ activity: 'paused', safeToAct: false });
+});
+
+it('classifies complete history beyond2MiB without losing malformed, truncated or pending-child vetoes', () => {
+  const padding = (JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(1024) } }) + '\n').repeat(2500);
+  const base = line(start()) + '\n' + padding;
+  const failed = base + line(complete(INTERRUPTED)) + '\n';
+  expect(Buffer.byteLength(failed)).toBeGreaterThan(2_097_152);
+  expect(classifyCodexTail(failed, context())).toMatchObject({ activity: 'interrupted', safeToAct: true });
+  expect(classifyCodexTail(failed, context({ tailTruncated: true })).safeToAct).toBe(false);
+  expect(classifyCodexTail(base + '{broken}\n' + line(complete(INTERRUPTED)) + '\n', context())).toMatchObject({
+    activity: 'unknown',
+    safeToAct: false,
+  });
+  const pending =
+    line(start()) +
+    '\n' +
+    line({ type: 'collab_agent_spawn_end', new_thread_id: AGENT, status: 'running' }) +
+    '\n' +
+    padding +
+    line(complete(INTERRUPTED)) +
+    '\n';
+  expect(classifyCodexTail(pending, context())).toMatchObject({
+    activity: 'watching',
+    reason: 'background-work',
+    safeToAct: false,
+  });
+});

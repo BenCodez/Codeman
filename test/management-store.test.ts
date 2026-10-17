@@ -182,6 +182,64 @@ describe('owner-global management and cooperative inbox', () => {
     );
     expect(files).not.toContain(enrollment.token);
   });
+  it('restricts manager thread reads to the current grant while retaining owner history access', async () => {
+    await enable();
+    await service.send('alice', 'session-one', 'Retained owner history', 'manager-history');
+    const thread = await service.messages('alice', 'session-one');
+    expect(await service.grantedMessages('alice', 'session-one')).toEqual(thread);
+    const config = await service.read('alice');
+    await service.configure('alice', {
+      ...config,
+      ifMatch: config.revision,
+      agents: [{ ...config.agents[0], allowMessages: false }],
+    });
+    await expect(service.grantedMessages('alice', 'session-one')).rejects.toMatchObject({ code: 'forbidden' });
+    expect(await service.messages('alice', 'session-one')).toEqual(thread);
+  });
+  it.each([false, true])(
+    'rechecks the saved grant after a suspended thread read (separate writer: %s)',
+    async (separateWriter) => {
+      await enable();
+      await service.send('alice', 'session-one', 'Private cooperative thread', 'grant-read-race');
+      const before = await service.messages('alice', 'session-one');
+      const id = createHash('sha256').update('alice\0session-one').digest('hex');
+      const original = BrainStore.prototype.read;
+      let held = false;
+      let entered!: () => void;
+      let release!: () => void;
+      const waiting = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      vi.spyOn(BrainStore.prototype, 'read').mockImplementation(async function (
+        this: BrainStore,
+        ...args: Parameters<BrainStore['read']>
+      ) {
+        const snapshot = await original.apply(this, args);
+        if (!held && args[0] === id) {
+          held = true;
+          entered();
+          await gate;
+        }
+        return snapshot;
+      });
+      const pending = service.grantedMessages('alice', 'session-one');
+      const rejected = expect(pending).rejects.toMatchObject({ code: 'forbidden' });
+      await waiting;
+      const writer = separateWriter ? new ManagementService({ root, sessions: () => sessions }) : service;
+      const config = await writer.read('alice');
+      await writer.configure('alice', {
+        ...config,
+        ifMatch: config.revision,
+        agents: [{ ...config.agents[0], allowMessages: false }],
+      });
+      release();
+      await rejected;
+      expect(await service.messages('alice', 'session-one')).toEqual(before);
+    }
+  );
   it('rotation, revoked grants, deletion and owner changes invalidate credentials', async () => {
     await enable();
     const first = await service.enroll('alice', 'session-one');

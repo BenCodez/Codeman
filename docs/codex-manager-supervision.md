@@ -68,3 +68,7 @@ The supervisor controller expresses manager authority through dependency interfa
 Native folded-paste acknowledgement is currently supported only for owned local automatic input; an owned SSH worker showing a folded composer requires owner attention and does not receive automatic Enter.
 
 Native MCP tool calls are lifecycle evidence, never proof that an owner objective is complete. Current paginated history must contain exact call identity and valid paired start/end timestamps; an unfinished call blocks automatic continuation. A native approval-policy refusal remains paused until a later ordinary owner submission. Unknown tool errors and incomplete legacy MCP end records remain conservative vetoes.
+
+## GitLab merge request context
+
+The owner-configured GitLab connection supports read-only `merge_requests` for a project (optional `state` and `page`) and `merge_request` for a project-local `iid`. These use the existing allowed-project or all-projects grant; a write grant is unnecessary. Lists contain at most 50 requests per page and stop at page 100, with explicit pagination and capacity flags. Returned context includes author, source and target branches, state, merge status, URL, SHA and a description limited to 8 KiB. All repository text is untrusted. A GitLab author identifies a GitLab account; it does not prove which Codeman agent created the change. Agent attribution and handoffs need separately recorded evidence. These operations do not create, approve or merge requests.

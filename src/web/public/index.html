@@ -3434,6 +3434,9 @@
                 <label for="managementManager">Local management Codex</label>
                 <select class="set-select" id="managementManager" onchange="app.mountGlobalManagerControls()"><option value="">No manager selected</option></select>
                 <p class="set-group-hint">Selecting a manager saves your preference; preparation and starting remain explicit actions. Agent roles, notes and messaging permissions below are shared server settings.</p>
+                <label for="managementInboxEndpoint">Agent inbox endpoint</label>
+                <input type="url" class="set-input" id="managementInboxEndpoint" maxlength="1000" placeholder="https://codeman.example/api/management/agent-inbox">
+                <p class="set-group-hint">Use the Codeman URL reachable from your agents, including any base path. Connect saves this page’s server URL if unset. No credentials, query or fragment belong in this field.</p>
                 <div class="task-actions"><button type="button" class="btn-toolbar" onclick="app.saveManagementSettings()">Save management settings</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration()">Manager objectives and controls</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration('automation')">Manager schedules and custom tasks</button></div>
                 <div id="managementAgents"></div>
               </fieldset>
@@ -3458,13 +3461,29 @@
                 <button type="button" class="btn-toolbar" onclick="app.saveManagementBrain()">Save shared brain.md</button>
                 <p id="managementBrainStatus" role="status" aria-live="polite"></p>
               </fieldset>
+              <div class="set-group task-form" id="managementBrainSyncPanel">
+                <h4>Shared brain.md on GitLab</h4>
+                <p class="set-group-hint">Keep a shared memory file where backend agents can propose updates. Choose an existing file in the intended project. Publishing obeys your GitLab write branch prefix; remote changes pause automatic export until reviewed. Agent and MR ownership claims need attributed evidence.</p>
+                <fieldset class="task-form" id="managementBrainSyncSettings" disabled>
+                  <legend>Owner-approved GitLab memory destination</legend>
+                  <label><input type="checkbox" id="managementBrainSyncEnabled"> Enable GitLab brain sync</label>
+                  <label for="managementBrainSyncProject">GitLab project ID</label><input class="set-input" type="number" min="1" step="1" id="managementBrainSyncProject">
+                  <label for="managementBrainSyncBranch">Existing branch</label><input class="set-input" maxlength="200" id="managementBrainSyncBranch" placeholder="codeman/manager-brain">
+                  <label for="managementBrainSyncPath">Existing memory file</label><input class="set-input" maxlength="1024" id="managementBrainSyncPath" placeholder="brain.md">
+                  <label><input type="checkbox" id="managementBrainSyncAutomatic"> Export local memory changes automatically after initial sync</label>
+                  <button class="btn-toolbar" type="button" onclick="app.saveManagementBrainSync()">Save brain destination</button>
+                </fieldset>
+                <p id="managementBrainSyncStatus" role="status" aria-live="polite">GitLab brain sync is disabled until configured.</p>
+                <div class="task-actions"><button class="btn-toolbar" type="button" onclick="app.loadManagementBrainSync()">Refresh brain sync</button><button class="btn-toolbar" type="button" id="managementBrainSyncPreview" disabled onclick="app.previewManagementBrainSync()">Preview memory sync</button><button class="btn-toolbar" type="button" id="managementBrainSyncPublish" disabled onclick="app.applyManagementBrainSync('publish')">Publish local memory</button><button class="btn-toolbar" type="button" id="managementBrainSyncPull" disabled onclick="app.applyManagementBrainSync('pull')">Import reviewed GitLab memory</button></div>
+                <pre id="managementBrainSyncContent" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:24rem;overflow:auto"></pre>
+              </div>
               <div class="set-group task-form" id="managementAgentTools" hidden>
                 <h4 id="managementAgentToolsTitle">Agent connection</h4>
                 <p id="managementAgentToolsStatus" role="status" aria-live="polite"></p>
                 <label for="managementEnrollmentInstructions">Private enrollment instructions</label>
                 <textarea class="set-textarea" id="managementEnrollmentInstructions" rows="6" readonly spellcheck="false"></textarea>
                 <button type="button" class="btn-toolbar" onclick="app.copyManagementEnrollment()">Copy instructions</button>
-                <p class="set-group-hint">Copy these private instructions into the intended agent yourself. The agent must cooperate to read its inbox and send replies; messages are queued, never typed into a shell automatically.</p>
+                <p class="set-group-hint">Connect attempts automatic enrollment only into a verified idle Codex chat. Messages queue in the private inbox and submit a fixed wake-up prompt when safe. SSH shells need conversion first. Delivery is separate from an agent reply; private instructions remain available for manual enrollment.</p>
                 <pre id="managementMessageThread" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:18rem;overflow:auto"></pre>
                 <label for="managementMessageDraft">Message to this agent</label>
                 <textarea class="set-textarea" id="managementMessageDraft" rows="3" maxlength="2000"></textarea>
@@ -4546,6 +4565,7 @@
   <script defer src="settings-ui.js"></script>
   <script defer src="management-ui.js"></script>
   <script defer src="management-gitlab-ui.js"></script>
+  <script defer src="management-brain-sync-ui.js"></script>
   <script defer src="panels-ui.js"></script>
   <script defer src="readmymind-ui.js"></script>
   <script defer src="ultracode-panel.js"></script>

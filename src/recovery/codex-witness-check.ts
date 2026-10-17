@@ -45,7 +45,7 @@ export async function checkCodexIdentityWitnesses(
       input.size < 0 ||
       !Number.isSafeInteger(input.maxBytes) ||
       input.maxBytes < 0 ||
-      input.maxBytes > 2_097_152 ||
+      input.maxBytes > MAX_CODEX_ROLLOUT_BYTES ||
       input.size > input.maxBytes ||
       typeof input.hash !== 'string' ||
       !/^[a-f0-9]{64}$/.test(input.hash)

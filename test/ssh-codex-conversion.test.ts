@@ -1,7 +1,7 @@
 /** Actual fixed remote helper against disposable proc/tmux fixtures. Never SSH or real panes. */
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, readFile, symlink, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, readFile, symlink, rename, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SessionRemote } from '../src/types.js';
@@ -18,7 +18,7 @@ const roots: string[] = [];
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
-async function fixture() {
+async function fixture(helperSetup = '') {
   const root = await mkdtemp(join(tmpdir(), 'codeman-conversion-'));
   roots.push(root);
   const proc = join(root, 'proc'),
@@ -80,7 +80,7 @@ default:throw Error('Unexpected native command '+a[0]);}
   );
   const source = SSH_CODEX_CONVERSION_SOURCE.replace(
     "const procRoot='/proc';",
-    `const procRoot=${JSON.stringify(proc)};`
+    `const procRoot=${JSON.stringify(proc)};${helperSetup}`
   );
   const transport = {
     run: async (_command: string, input: string) =>
@@ -120,6 +120,85 @@ default:throw Error('Unexpected native command '+a[0]);}
   };
 }
 describe('owned SSH shell conversion', () => {
+  it('sends only the confirmed selection when the complete accepted preview exceeds the apply wire bound', async () => {
+    const f = await fixture();
+    const result = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });
+    if (result.status !== 'ready') throw Error(result.reason);
+    const selected = result.preview.conversations[0];
+    const preview = {
+      ...result.preview,
+      conversations: [
+        selected,
+        ...Array.from({ length: 31 }, (_, i) => ({
+          ...selected,
+          id: `22222222-3333-4444-5555-${String(i).padStart(12, '0')}`,
+          witness: { ...selected.witness, path: `${f.home}/sessions/${'x'.repeat(3950)}/${i}.jsonl` },
+        })),
+      ],
+    };
+    expect(Buffer.byteLength(JSON.stringify(preview))).toBeGreaterThan(131072);
+    const transport = {
+      run: vi.fn(async (command: string, input: string) => {
+        expect(Buffer.byteLength(input)).toBeLessThanOrEqual(131072);
+        const request = JSON.parse(input);
+        expect(request.preview).toEqual({ ...preview, conversations: [selected] });
+        expect(request.conversationId).toBe(CID);
+        return f.transport.run(command, input);
+      }),
+    };
+    expect(
+      (await applySshCodexConversion(f.remote, SID, preview, CID, retained, () => true, { transport })).status
+    ).toBe('converted');
+    expect(transport.run).toHaveBeenCalledOnce();
+    expect((await f.effects()).source).toBe(retained);
+  });
+
+  it.each(['stale-dirent', 'swapped-ancestor-during-read'])(
+    'refuses directory replacement with a symlink during discovery: %s',
+    async (race) => {
+      const setup =
+        race === 'stale-dirent'
+          ? `
+const originalReaddir=fs.readdirSync;let swapped=false;
+fs.readdirSync=function(directory,options){const result=originalReaddir.call(fs,directory,options);if(!swapped&&options&&options.withFileTypes&&fs.realpathSync(directory)===path.join(path.dirname(procRoot),'home','sessions')){swapped=true;const nested=path.join(path.dirname(procRoot),'home','sessions','nested');fs.renameSync(nested,nested+'-original');fs.symlinkSync(path.join(path.dirname(procRoot),'outside'),nested)}return result};
+`
+          : `
+const originalRead=fs.readSync;let swapped=false;
+fs.readSync=function(fd,...args){const result=originalRead.call(fs,fd,...args);if(!swapped&&fs.readlinkSync('/proc/self/fd/'+fd).includes('/sessions/nested/rollout-')){swapped=true;const nested=path.join(path.dirname(procRoot),'home','sessions','nested');fs.renameSync(nested,nested+'-original');fs.symlinkSync(path.join(path.dirname(procRoot),'outside'),nested)}return result};
+`;
+      const f = await fixture(setup);
+      await mkdir(join(f.home, 'sessions', 'nested'));
+      await mkdir(join(f.root, 'outside'));
+      await writeFile(join(f.root, 'outside', 'rollout-outside.jsonl'), await readFile(f.rollout));
+      await rename(f.rollout, join(f.home, 'sessions', 'nested', `rollout-${CID}.jsonl`));
+      const result = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });
+      expect(result.status).toBe('refused');
+      expect((await f.effects()).effects).toEqual([]);
+    }
+  );
+
+  it.each([false, true])(
+    'accepts an unchanged nested directory but refuses a symlink swapped after preview: %s',
+    async (swap) => {
+      const f = await fixture();
+      const directory = join(f.home, 'sessions', 'nested');
+      await mkdir(directory);
+      await rename(f.rollout, join(directory, `rollout-${CID}.jsonl`));
+      const result = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });
+      if (result.status !== 'ready') throw Error(result.reason);
+      expect(result.preview.conversations[0].config).toBeDefined();
+      if (swap) {
+        await rename(directory, directory + '-original');
+        await symlink(directory + '-original', directory);
+      }
+      const applied = await applySshCodexConversion(f.remote, SID, result.preview, CID, retained, () => true, {
+        transport: f.transport,
+      });
+      expect(applied.status).toBe(swap ? 'not-sent' : 'converted');
+      if (swap) expect((await f.effects()).effects).toEqual([]);
+    }
+  );
+
   it.each(['foreground-program', 'codex-pane', 'child-work'])(
     'explains why an idle chat is not a free shell: %s',
     async (kind) => {

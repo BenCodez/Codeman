@@ -460,7 +460,8 @@ describe('corrupt and over-budget stores', () => {
   });
 
   it('verifies the entire larger conversation and its byte witness, never a suffix', async () => {
-    const body = (JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(1024) } }) + '\n').repeat(300);
+    const body = (JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(1024) } }) + '\n').repeat(2500);
+    expect(Buffer.byteLength(body)).toBeGreaterThan(2_097_152);
     const path = await rollout(A, {}, CREATED, store, body);
     const result = await resolveCodexIdentity(request());
     expect(result.tailTruncated).toBe(false);

@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from '../src/recovery/codex-evidence-limits.js';
 /** Real broker and disposable Python child; no tmux, Codex, SSH or live session effects. */
 import { createHash, createHmac } from 'node:crypto';
 import type { PrivateFileWitness } from '../src/recovery/private-file-witness.js';
@@ -576,14 +577,14 @@ async function witness(path: string, maxBytes = 2_097_152): Promise<PrivateFileW
   };
 }
 
-it.each([262_144, 2_097_152])(
+it.each([262_144, 2_097_152, 3_145_728])(
   'verifies actual %i-byte private evidence before startup and automatic delivery',
   async (size) => {
     let file!: PrivateFileWitness;
     const { broker, child, bytes } = await fixture(0, undefined, undefined, async (codec, root) => {
       const path = join(root, 'private-grant');
       await fs.writeFile(path, Buffer.alloc(size, 97), { mode: 0o600 });
-      file = await witness(path);
+      file = await witness(path, MAX_CODEX_ROLLOUT_BYTES);
       await codec.setStartupAuthority([file]);
     });
     expect(await broker.startupReceipt(child.pid!)).toBe('started');

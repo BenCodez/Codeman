@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** Bounded private proof for the exact profile, Codex identity and durable input fence. */
 import { createHash } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
@@ -395,7 +396,7 @@ export async function captureRebootLaunchWitness(
         file.size < 0 ||
         !Number.isInteger(file.maxBytes) ||
         file.maxBytes < 0 ||
-        file.maxBytes > 2_097_152 ||
+        file.maxBytes > MAX_CODEX_ROLLOUT_BYTES ||
         file.size > file.maxBytes ||
         typeof file.hash !== 'string' ||
         !/^[a-f0-9]{64}$/.test(file.hash)

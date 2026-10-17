@@ -1051,7 +1051,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     if (/\busage limit\b|\blimit reached\b/i.test(screen)) {
       return { ...result, activity: 'blocked', reason: 'usage-limit', safeToAct: false };
     }
-    if (/would you like|approve this|allow this|press enter to confirm/i.test(screen)) {
+    if (/(?:^|\n)[ \t]*(?:[•›][ \t]*)?would you like\b|approve this|allow this|press enter to confirm/i.test(screen)) {
       return { ...result, activity: 'paused', reason: 'approval-required', safeToAct: false };
     }
     // Native busy hints cannot clear structured vetoes or active child work.

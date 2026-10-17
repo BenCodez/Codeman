@@ -189,6 +189,9 @@ import { SupervisorAutomationController } from '../supervisor/automation.js';
 import { SupervisorAutomationStore } from '../supervisor/automation-store.js';
 import { BrainStore } from '../supervisor/brain.js';
 import { ManagementService } from '../management/store.js';
+import { BrainGitLabSyncService } from '../management/brain-gitlab-sync.js';
+import { registerManagementBrainSyncRoutes } from './routes/management-brain-sync-routes.js';
+import { ManagementAgentDeliveryKernel, type ManagementAgentDeliveryRequest } from '../management/agent-delivery.js';
 import { GitLabService } from '../management/gitlab.js';
 import { observeManagementAgent } from '../management/observation.js';
 import { ManagementAgentReader } from '../management/agent-reader.js';
@@ -369,9 +372,52 @@ export class WebServer extends EventEmitter {
   private supervisorBrainStore = new BrainStore();
   private managementBrainStore = new BrainStore(dataPath('management-brains'));
   private managementGitLab = new GitLabService();
+  private managementBrainSync = new BrainGitLabSyncService({
+    gitlab: this.managementGitLab,
+    brain: {
+      read: (owner, current) => this.readManagementBrain(owner, current),
+      replace: (owner, markdown, ifMatch, current) =>
+        this.managementBrainStore.replace(this.managementBrainId(owner), markdown, ifMatch, current),
+    },
+  });
   private managementAgentReader = new ManagementAgentReader({
     lookup: (id) => this.sessions.get(id),
     claudeTranscriptPath: (id) => this.transcriptWatchers.get(id)?.getPath() ?? null,
+  });
+  private managementDelivery = new ManagementAgentDeliveryKernel({
+    worker: (owner, id) => {
+      const session = this.sessions.get(id);
+      if (!session || (session.owner ?? 'admin') !== owner) return undefined;
+      return {
+        session,
+        isCurrent: () =>
+          !this.recoveryStopping &&
+          !this.cleaningUp.has(id) &&
+          this.sessions.get(id) === session &&
+          (session.owner ?? 'admin') === owner,
+        journalsReadable: () =>
+          !this.taskStore.loadFailed &&
+          !this.recoveryStore.loadFailed &&
+          !!this.supervisorStore.getBrokerCleanupState() &&
+          !this.actionReservationStore.loadFailed,
+        taskStates: () => [this.taskControllers.get(id)?.getStatus() ?? this.taskStore.get(id), this.taskStore.get(id)],
+        recoveryStates: () => [
+          this.recoveryControllers.get(id)?.getStatus() ?? this.recoveryStore.get(id),
+          this.recoveryStore.get(id),
+        ],
+        task: this.taskControllers.get(id),
+      };
+    },
+    arbiter: (id) => this.getActionArbiter(id),
+    persistSession: (session) => this._persistSessionStateNow(session),
+    canDispatch: (request, worker) =>
+      request.current() &&
+      worker.isCurrent() &&
+      !worker.session.hasSupervisorManagerLaunch() &&
+      !this.supervisorControllers.get(worker.session.id)?.getStatus().enabled &&
+      !this.supervisorStore.get(worker.session.id).enabled &&
+      !this.supervisorLeaseHolder(worker.session.id, '__management_delivery__'),
+    authority: (request) => this.captureManagementDeliveryAuthority(request),
   });
   private managementService = new ManagementService({
     sessions: () =>
@@ -386,7 +432,67 @@ export class WebServer extends EventEmitter {
         managerActive: this.supervisorControllers.get(session.id)?.getStatus().phase === 'active',
       })),
     ownerCurrent: () => !this.recoveryStopping && this.supervisorManagerAuthenticationAvailable(),
+    deliver: (request) => this.managementDelivery.deliver(request),
   });
+  /** Pin the owner request while obtaining the selected manager's native input issuer.
+   * A fresh evidence read never rebinds the original message/configuration grant. */
+  private async captureManagementDeliveryAuthority(
+    request: ManagementAgentDeliveryRequest
+  ): Promise<import('../recovery/types.js').RecoveryActionAuthority | undefined> {
+    const captured = await this.managementService.captureConfiguration(request.owner, request.current);
+    const managerId = captured.config.managerSessionId;
+    const manager = managerId ? this.sessions.get(managerId) : undefined;
+    const worker = this.sessions.get(request.sessionId);
+    if (!manager || !worker || manager === worker) return undefined;
+    const workerBinding = () =>
+      JSON.stringify([
+        worker.owner,
+        worker.mode,
+        worker.workingDir,
+        worker.codexConfig,
+        worker.getEnvOverridesForPersist(),
+        worker.remote,
+        worker.getRecoveryContext().codexHome,
+      ]);
+    const expectedWorker = workerBinding();
+    const current = () =>
+      request.current() &&
+      captured.current() &&
+      !this.recoveryStopping &&
+      !this.cleaningUp.has(manager.id) &&
+      !this.cleaningUp.has(worker.id) &&
+      this.sessions.get(manager.id) === manager &&
+      this.sessions.get(worker.id) === worker &&
+      (manager.owner ?? 'admin') === request.owner &&
+      (worker.owner ?? 'admin') === request.owner &&
+      workerBinding() === expectedWorker &&
+      this.supervisorManagerIsEligible(manager) &&
+      this.supervisorControllers.get(manager.id)?.getStatus().phase === 'active';
+    if (!current()) return undefined;
+    if (
+      !worker.remote &&
+      !(await haveDistinctSupervisorHomes(
+        manager.getRecoveryContext().codexHome,
+        worker.getRecoveryContext().codexHome,
+        current,
+        performance.now() + 2000
+      ))
+    )
+      return undefined;
+    const authority = (await this.supervisorControllers.get(manager.id)?.captureBrainAuthority(current)) as
+      | import('../recovery/types.js').RecoveryActionAuthority
+      | undefined;
+    return current() && authority?.() && authority.getInputIssuer?.() ? authority : undefined;
+  }
+  /** A remote failure must not turn a successful local memory write into a failed write. */
+  private async afterManagementBrainWrite<T>(owner: string, saved: T, current: () => boolean): Promise<T> {
+    try {
+      await this.managementBrainSync.publishChanged(owner, current);
+    } catch {
+      // The sync service retains pending/conflict/uncertain state separately.
+    }
+    return saved;
+  }
   private managementBrainId(owner: string): string {
     return 'management-owner-' + createHash('sha256').update(owner).digest('hex');
   }
@@ -1327,10 +1433,21 @@ export class WebServer extends EventEmitter {
         read: (owner, current) => this.readManagementBrain(owner, current),
         replace: async (owner, markdown, ifMatch, current) => {
           await this.readManagementBrain(owner, current);
-          return this.managementBrainStore.replace(this.managementBrainId(owner), markdown, ifMatch, current);
+          const saved = await this.managementBrainStore.replace(
+            this.managementBrainId(owner),
+            markdown,
+            ifMatch,
+            current
+          );
+          return this.afterManagementBrainWrite(owner, saved, current);
         },
       },
       ownerCurrent: (req) => !this.recoveryStopping && !req.raw.aborted,
+    });
+    registerManagementBrainSyncRoutes(this.app, {
+      service: this.managementBrainSync,
+      ownerCurrent: (req) =>
+        !this.recoveryStopping && !req.raw.aborted && this.supervisorManagerAuthenticationAvailable(),
     });
     registerManagementGitLabRoutes(this.app, {
       service: this.managementGitLab,
@@ -1404,7 +1521,7 @@ export class WebServer extends EventEmitter {
             scope.sessionId,
             current
           );
-          return this.managementService.messages(scope.owner ?? 'admin', agentId, authority);
+          return this.managementService.grantedMessages(scope.owner ?? 'admin', agentId, authority);
         },
         message: async (scope, agentId, requestId, message, current) => {
           const authority = await this.managementService.captureManager(
@@ -1416,6 +1533,14 @@ export class WebServer extends EventEmitter {
         },
       },
       brain: {
+        sync: async (scope, input, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          if (input.mode === 'sync_status') return this.managementBrainSync.read(owner, authority);
+          if (input.mode === 'sync_preview') return this.managementBrainSync.preview(owner, authority);
+          const { mode: _mode, ...request } = input;
+          return this.managementBrainSync.publish(owner, request, authority);
+        },
         read: async (scope, current) => {
           const session = this.sessions.get(scope.sessionId);
           if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
@@ -1428,14 +1553,20 @@ export class WebServer extends EventEmitter {
           if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
             throw Error('Supervisor memory owner changed');
           const brain = await this.captureSupervisorBrain(session, current);
-          return brain.store.append(brain.id, requestId, note, ifMatch, brain.current);
+          const saved = await brain.store.append(brain.id, requestId, note, ifMatch, brain.current);
+          return brain.store === this.managementBrainStore
+            ? this.afterManagementBrainWrite(scope.owner ?? 'admin', saved, brain.current)
+            : saved;
         },
         replace: async (scope, requestId, markdown, ifMatch, current) => {
           const session = this.sessions.get(scope.sessionId);
           if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
             throw Error('Supervisor memory owner changed');
           const brain = await this.captureSupervisorBrain(session, current);
-          return brain.store.replaceManaged(brain.id, requestId, markdown, ifMatch, brain.current);
+          const saved = await brain.store.replaceManaged(brain.id, requestId, markdown, ifMatch, brain.current);
+          return brain.store === this.managementBrainStore
+            ? this.afterManagementBrainWrite(scope.owner ?? 'admin', saved, brain.current)
+            : saved;
         },
       },
     });
@@ -4006,11 +4137,37 @@ export class WebServer extends EventEmitter {
               !adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation)
             )
               return refuse('final-scope', attempt, observation);
-            if (confirmed)
-              return () =>
+            if (confirmed) {
+              const authority: import('../recovery/types.js').RecoveryActionAuthority = () =>
                 current() &&
                 grant.isCurrent() &&
                 adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation);
+              const permissionFiles = () => {
+                const permission = grant.getFileWitness?.() ?? grant.fileWitness;
+                const authentication = session.getSupervisorManagerAuthWitness();
+                return [...(permission ? [permission] : []), ...(authentication ? [authentication] : [])];
+              };
+              authority.getInputIssuer = () => {
+                if (!authority()) return undefined;
+                const issuer = adapter.getLocalEvidenceSource(
+                  observation.conversationId!,
+                  context.generation
+                )?.inputBroker;
+                return issuer && { ...issuer, files: [...(issuer.files ?? []), ...permissionFiles()] };
+              };
+              authority.prepareEvidence = async (workerSource) => {
+                if (!authority() || !(await session.confirmSupervisorManagerLaunch()) || !authority()) return false;
+                const managerSource = adapter.getLocalEvidenceSource(observation.conversationId!, context.generation);
+                const joint = workerSource ?? managerSource;
+                if (!joint || !managerSource?.inputBroker) return false;
+                const accepted = await adapter.confirmLocalEvidence(observation.conversationId!, context.generation, {
+                  ...joint,
+                  files: [...(workerSource?.files ?? []), ...permissionFiles()],
+                });
+                return accepted && authority();
+              };
+              return authority;
+            }
             // Only evidence reads repeat. Fresh native progress may replace the
             // rollout inode; every new observation retains the original owner,
             // launch, grant and broker/counter binding and reclassifies all vetoes.

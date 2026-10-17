@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** @fileoverview Private launch-owned input provenance. No secret is stored in public session metadata. */
 import { createHash, createHmac, randomBytes, randomUUID } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
@@ -367,7 +368,7 @@ const HistoricalFile = z
     mtimeMs: z.number().finite(),
     ctimeMs: z.number().finite(),
     hash: z.string().regex(/^[a-f0-9]{64}$/),
-    maxBytes: z.number().int().nonnegative().max(2_097_152),
+    maxBytes: z.number().int().nonnegative().max(MAX_CODEX_ROLLOUT_BYTES),
   })
   .strict()
   .refine((file) => file.size <= file.maxBytes);

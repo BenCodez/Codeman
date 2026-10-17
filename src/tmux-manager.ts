@@ -6943,7 +6943,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
                   .filter((row) => !(/^\s*›(?:\s|$)/u.test(row) && row.replace(/^\s*› ?/u, '') === expected))
                   .join('\n');
           accepted =
-            !/esc to interrupt|reconnecting|would you like|approve this|sign in|log in|authentication failed|\busage limit\b|\blimit reached\b/i.test(
+            !/esc to interrupt|reconnecting|(?:^|\n)[ \t]*(?:[•›][ \t]*)?would you like\b|approve this|sign in|log in|authentication failed|\busage limit\b|\blimit reached\b/i.test(
               chrome
             ) &&
             (expected === undefined

@@ -102,6 +102,7 @@ describe('Global management controls in Chromium', () => {
             return {
               revision: 'a'.repeat(64),
               managerSessionId: manager,
+              inboxEndpoint: 'http://codeman-management.test/codeman/api/management/agent-inbox',
               brain: { markdown: '', revision: 'b'.repeat(64), exists: false, noteCount: 0 },
               agents: [
                 {
@@ -315,6 +316,164 @@ describe('Global management controls in Chromium', () => {
           )
         )
       ).toBe(false);
+    } finally {
+      await page.close();
+    }
+  });
+  it.each(['submitted', 'blocked', 'unknown'] as const)(
+    'shows automatic enrollment and wake outcomes truthfully: %s',
+    async (status) => {
+      const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+      try {
+        await page.route('**/*', async (route) =>
+          route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: `<!doctype html><html><head><style>${read('styles.css')}</style><style>${read('mobile.css')}</style></head><body>${html.slice(start, end)}</body></html>`,
+          })
+        );
+        await page.goto('http://codeman-management.test', { waitUntil: 'domcontentloaded' });
+        await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp = CodemanApp;' });
+        await page.addScriptTag({ content: read('supervisor-brain-ui.js') });
+        await page.addScriptTag({ content: read('management-ui.js') });
+        await page.evaluate(
+          async ({ worker, status }) => {
+            const app = new (window as any).CodemanApp();
+            const calls: any[] = [];
+            const delivery = { status, ...(status === 'blocked' ? { needsConversion: true } : {}) };
+            app.showToast = () => undefined;
+            app._apiJson = async (url: string, options?: any) => {
+              calls.push({ url, options });
+              if (url.endsWith('/enroll')) return { instructions: 'Synthetic private enrollment', delivery };
+              if (url.endsWith('/messages'))
+                return options?.method === 'POST'
+                  ? { message: { ...options.body, direction: 'owner' }, duplicate: false, delivery }
+                  : { messages: [] };
+              return {
+                revision: 'a'.repeat(64),
+                managerSessionId: null,
+                inboxEndpoint: 'http://codeman-management.test/api/management/agent-inbox',
+                brain: { markdown: '', revision: 'b'.repeat(64), exists: false, noteCount: 0 },
+                agents: [
+                  {
+                    sessionId: worker,
+                    name: 'Backend Codex',
+                    mode: 'codex',
+                    remote: true,
+                    status: 'idle',
+                    role: 'Builds',
+                    notes: '',
+                    allowMessages: true,
+                    enrolled: false,
+                  },
+                ],
+              };
+            };
+            (window as any).app = app;
+            (window as any).managementCalls = calls;
+            document.getElementById('appSettingsModal')!.classList.add('active');
+            await app.loadManagementSettings();
+          },
+          { worker, status }
+        );
+        page.once('dialog', (dialog) => void dialog.accept());
+        await page.getByRole('button', { name: 'Connect existing agent', exact: true }).click();
+        const expected =
+          status === 'submitted'
+            ? 'Enrollment prompt submitted'
+            : status === 'blocked'
+              ? 'Convert this SSH shell'
+              : 'outcome is uncertain';
+        await page.waitForFunction(
+          (expected) => document.getElementById('managementAgentToolsStatus')?.textContent?.includes(expected),
+          expected
+        );
+        expect(await page.locator('#managementEnrollmentInstructions').inputValue()).toContain(
+          'Synthetic private enrollment'
+        );
+        await page.locator('#managementMessageDraft').fill('Report current PR ownership');
+        await page.getByRole('button', { name: 'Queue message', exact: true }).click();
+        expect(await page.locator('#managementAgentToolsStatus').textContent()).toContain(
+          status === 'submitted' ? 'Wake-up prompt submitted' : expected
+        );
+        const calls = await page.evaluate(() => (window as any).managementCalls);
+        expect(calls.find((call: any) => call.url.endsWith('/enroll')).options.body).toMatchObject({
+          autoSend: true,
+          requestId: expect.any(String),
+        });
+        expect(calls.every((call: any) => !call.url.includes('/input'))).toBe(true);
+      } finally {
+        await page.close();
+      }
+    }
+  );
+  it('previews GitLab suggestions and confirms an exact memory publication from the mobile UI', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+    try {
+      await page.route('**/*', async (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: `<!doctype html><html><head><style>${read('styles.css')}</style><style>${read('mobile.css')}</style></head><body>${html.slice(start, end)}</body></html>`,
+        })
+      );
+      await page.goto('https://codeman-management.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({
+        content:
+          'class CodemanApp {}; window.CodemanApp = CodemanApp; CodemanApp.prototype.loadManagementSettings = async function() {}; CodemanApp.prototype.closeManagementSettings = function() {}; function managementRequestId() { return "11111111-1111-4111-8111-111111111111"; }',
+      });
+      await page.addScriptTag({ content: read('management-brain-sync-ui.js') });
+      await page.evaluate(async () => {
+        const app = new (window as any).CodemanApp();
+        const calls: any[] = [];
+        app._managementView = { snapshot: {} };
+        app.showToast = () => undefined;
+        app._apiJson = async (url: string, options?: any) => {
+          calls.push({ url, options });
+          if (url.endsWith('/publish')) return { status: 'synced' };
+          if (url.endsWith('/preview'))
+            return {
+              status: 'different',
+              local: { revision: 'b'.repeat(64), markdown: 'Agent A owns MR 12; verified yesterday.' },
+              remote: {
+                lastCommitId: 'c'.repeat(40),
+                hash: 'd'.repeat(64),
+                markdown: '<img src=x onerror=alert(1)> Agent suggests a handoff.',
+              },
+              target: { projectId: 42, branch: 'codeman/brain', path: 'brain.md' },
+            };
+          return {
+            revision: 'a'.repeat(64),
+            enabled: true,
+            autoPublish: false,
+            projectId: 42,
+            branch: 'codeman/brain',
+            path: 'brain.md',
+            status: 'pending',
+            baseline: null,
+          };
+        };
+        (window as any).app = app;
+        (window as any).brainSyncCalls = calls;
+        document.getElementById('appSettingsModal')!.classList.add('active');
+        await app.loadManagementBrainSync();
+      });
+      expect(await page.locator('#managementBrainSyncPublish').isDisabled()).toBe(true);
+      await page.getByRole('button', { name: 'Preview memory sync', exact: true }).click();
+      expect(await page.locator('#managementBrainSyncContent').textContent()).toContain('untrusted suggestions');
+      expect(await page.locator('#managementBrainSyncContent img').count()).toBe(0);
+      page.once('dialog', (dialog) => void dialog.dismiss());
+      await page.getByRole('button', { name: 'Publish local memory', exact: true }).click();
+      expect(await page.evaluate(() => (window as any).brainSyncCalls.length)).toBe(2);
+      page.once('dialog', (dialog) => void dialog.accept());
+      await page.getByRole('button', { name: 'Publish local memory', exact: true }).click();
+      expect(await page.locator('#managementBrainSyncStatus').textContent()).toContain('synced and verified');
+      const calls = await page.evaluate(() => (window as any).brainSyncCalls);
+      expect(calls[2].options.body).toMatchObject({
+        localRevision: 'b'.repeat(64),
+        remoteLastCommitId: 'c'.repeat(40),
+        remoteHash: 'd'.repeat(64),
+      });
     } finally {
       await page.close();
     }

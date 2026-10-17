@@ -142,3 +142,44 @@ it('refuses to retire an attachment when its expected published mux record was r
   expect(f.attach.data.size).toBe(1);
   expect(f.attach.exit.size).toBe(1);
 });
+
+it('releases both completed shell subscriptions on every exit and preserves a replacement after a queued old exit', async () => {
+  const session = new Session({ workingDir: '/tmp', mode: 'shell', useMux: false });
+  sessions.push(session);
+  for (let attempt = 0; attempt < 4; attempt++) {
+    await session.startShell();
+    const old = spawned.last;
+    const queuedExit = [...old.exit][0] as (event: { exitCode: number }) => void;
+    expect(old.data.size).toBe(1);
+    expect(old.exit.size).toBe(1);
+    queuedExit({ exitCode: 0 });
+    expect(old.data.size).toBe(0);
+    expect(old.exit.size).toBe(0);
+    expect((session as any)._shellPtyDisposables).toHaveLength(0);
+    await session.startShell();
+    const replacement = spawned.last;
+    queuedExit({ exitCode: 1 });
+    expect(replacement.data.size).toBe(1);
+    expect(replacement.exit.size).toBe(1);
+    expect((session as any).ptyProcess).toBe(replacement);
+    expect((session as any)._shellPtyDisposables).toHaveLength(2);
+    ([...replacement.exit][0] as any)({ exitCode: 0 });
+  }
+});
+it('retires stale shell subscriptions before attaching a replacement without waiting for an old exit callback', async () => {
+  const session = new Session({ workingDir: '/tmp', mode: 'shell', useMux: false });
+  sessions.push(session);
+  await session.startShell();
+  const old = spawned.last;
+  const queuedExit = [...old.exit][0] as (event: { exitCode: number }) => void;
+  // Model an attachment already retired by another lifecycle path.
+  (session as any).ptyProcess = null;
+  await session.startShell();
+  const replacement = spawned.last;
+  expect(old.data.size).toBe(0);
+  expect(old.exit.size).toBe(0);
+  queuedExit({ exitCode: 0 });
+  expect(replacement.data.size).toBe(1);
+  expect(replacement.exit.size).toBe(1);
+  expect((session as any).ptyProcess).toBe(replacement);
+});

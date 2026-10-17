@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** @fileoverview Python's standard library owns the child PTY and journals input before forwarding it. */
 export const CODEX_INPUT_BROKER_SOURCE = String.raw`
 import base64, errno, fcntl, hashlib, hmac, json, os, pty, re, select, signal, sys, termios, threading, time, tty
@@ -52,7 +53,7 @@ def files_current(files, own_path, paths=None, missing=None):
     for witness in unique.values():
         if (not isinstance(witness, dict) or set(witness) != {'path', 'dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'hash', 'maxBytes'} or
             not isinstance(witness['path'], str) or not os.path.isabs(witness['path']) or
-            type(witness['maxBytes']) is not int or not 0 < witness['maxBytes'] <= 2097152):
+            type(witness['maxBytes']) is not int or not 0 < witness['maxBytes'] <= ${MAX_CODEX_ROLLOUT_BYTES}):
             return False
         if witness['path'] == own_path:
             continue

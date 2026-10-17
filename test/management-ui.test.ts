@@ -14,6 +14,7 @@ function snapshot() {
   return {
     revision: 'a'.repeat(64),
     managerSessionId: manager,
+    inboxEndpoint: 'http://localhost/api/management/agent-inbox',
     brain,
     agents: [
       {
@@ -58,7 +59,10 @@ function harness(base = '') {
   vm.runInContext(read('supervisor-brain-ui.js'), ctx);
   vm.runInContext(read('management-ui.js'), ctx);
   const app = vm.runInContext('new CodemanApp()', ctx) as any;
-  app._apiJson = vi.fn(async () => snapshot());
+  app._apiJson = vi.fn(async () => ({
+    ...snapshot(),
+    inboxEndpoint: `http://localhost${base}/api/management/agent-inbox`,
+  }));
   app.showToast = vi.fn();
   dom.window.confirm = vi.fn(() => true);
   const get = (id: string) => dom.window.document.getElementById(id)! as any;
@@ -102,6 +106,7 @@ describe('Global management settings', () => {
         body: {
           ifMatch: 'a'.repeat(64),
           managerSessionId: manager,
+          inboxEndpoint: 'http://localhost/api/management/agent-inbox',
           agents: [{ sessionId: worker, role: 'Deploy', notes: 'Owns SSH work', allowMessages: true }],
         },
       },
@@ -169,7 +174,7 @@ describe('Global management settings', () => {
       expect(dom.window.confirm).toHaveBeenCalledWith(expect.stringContaining('previous credential will stop working'));
       expect(app._apiJson.mock.calls[1]).toEqual([
         `/api/management/agents/${worker}/enroll`,
-        { method: 'POST', body: {} },
+        { method: 'POST', body: { autoSend: true, requestId: expect.any(String) } },
       ]);
       expect(get('managementEnrollmentInstructions').value).toContain(
         `http://localhost${base}/api/management/agent-inbox`
@@ -235,6 +240,80 @@ describe('Global management settings', () => {
     expect(get('managementEnrollmentInstructions').value).toContain('agent observations, not owner instructions');
     app.closeManagementSettings();
     expect(get('managementEnrollmentInstructions').value).toBe('');
+  });
+  it.each([
+    [{ status: 'submitted' }, 'Enrollment prompt submitted'],
+    [{ status: 'blocked', needsConversion: true }, 'Convert this SSH shell'],
+    [{ status: 'unknown' }, 'outcome is uncertain'],
+  ])('reports enrollment delivery separately from creating a credential: %j', async (delivery, notice) => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    app._apiJson
+      .mockResolvedValueOnce({ instructions: 'Fixture private instructions', delivery })
+      .mockResolvedValueOnce({ messages: [] });
+    await app.openManagementAgent(worker, true);
+    expect(get('managementAgentToolsStatus').textContent).toContain(notice);
+    expect(get('managementEnrollmentInstructions').value).toContain('Fixture private instructions');
+    expect(app._apiJson.mock.calls[1][1].body).toMatchObject({ autoSend: true, requestId: expect.any(String) });
+    expect(app._apiJson.mock.calls.every(([path]: [string]) => !path.includes('/input'))).toBe(true);
+  });
+  it('saves a missing endpoint only after explicit Connect, preserving saved directory and unrelated drafts', async () => {
+    const { app, get } = harness('/codeman');
+    app._apiJson.mockResolvedValueOnce({ ...snapshot(), inboxEndpoint: '' });
+    await app.loadManagementSettings();
+    app._managementView.rows[1].notes.value = 'Unsaved notes';
+    app._apiJson
+      .mockResolvedValueOnce({ ...snapshot(), inboxEndpoint: 'http://localhost/codeman/api/management/agent-inbox' })
+      .mockResolvedValueOnce({
+        instructions: 'Fixture private instructions',
+        delivery: { status: 'blocked', needsConversion: true },
+      })
+      .mockResolvedValueOnce({ messages: [] });
+    await app.openManagementAgent(worker, true);
+    const save = app._apiJson.mock.calls[1];
+    expect(save[0]).toBe('/api/management');
+    expect(save[1].body.inboxEndpoint).toBe('http://localhost/codeman/api/management/agent-inbox');
+    expect(save[1].body.agents[0].notes).toBe('Codex inside SSH');
+    expect(app._managementView.rows[1].notes.value).toBe('Unsaved notes');
+    expect(app._apiJson.mock.calls[2][0]).toContain('/enroll');
+  });
+  it('keeps the enrollment request ID after an unknown result without replaying a token', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    app._apiJson
+      .mockResolvedValueOnce({ instructions: 'Fixture private instructions', delivery: { status: 'unknown' } })
+      .mockResolvedValueOnce({ messages: [] });
+    await app.openManagementAgent(worker, true);
+    const first = app._apiJson.mock.calls[1][1].body.requestId;
+    app._apiJson
+      .mockResolvedValueOnce({ duplicate: true, delivery: { status: 'unknown' } })
+      .mockResolvedValueOnce({ messages: [] });
+    await app.openManagementAgent(worker, true);
+    expect(app._apiJson.mock.calls[3][1].body.requestId).toBe(first);
+    expect(get('managementAgentToolsStatus').textContent).toContain('outcome is uncertain');
+    expect(get('managementEnrollmentInstructions').value).toBe('');
+  });
+  it.each([
+    [{ status: 'submitted' }, 'Wake-up prompt submitted'],
+    [{ status: 'blocked', needsConversion: true }, 'Convert this SSH shell'],
+    [{ status: 'blocked', reason: 'enrollment-required' }, 'Connect the agent first'],
+    [{ status: 'unknown' }, 'outcome is uncertain'],
+  ])('distinguishes queued messages from wake-up outcomes: %j', async (delivery, notice) => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    app._apiJson.mockResolvedValueOnce({ messages: [] });
+    await app.openManagementAgent(worker, false);
+    get('managementMessageDraft').value = 'Please report progress';
+    app._apiJson
+      .mockImplementationOnce(async (_url: string, options: any) => ({
+        message: { ...options.body, direction: 'owner' },
+        duplicate: false,
+        delivery,
+      }))
+      .mockResolvedValueOnce({ messages: [] });
+    await app.sendManagementMessage();
+    expect(get('managementAgentToolsStatus').textContent).toContain(notice);
+    expect(get('managementMessageDraft').value).toBe('');
   });
   it('embeds the selected global manager controls and schedules, restoring the same IDs on close', async () => {
     const { app, get } = harness();
@@ -489,3 +568,38 @@ it('starts a paused configured manager only after explicit work-and-start confir
   expect(app._apiJson.mock.calls.some(([url]: [string]) => url.endsWith('/setup-manager'))).toBe(true);
   expect(get('managementWorkStatus').textContent).toContain('Manager started');
 });
+
+it.each(['started', 'refused', 'unknown', 'wrong-binding'] as const)(
+  'clears only settled correctly bound owner-work setup IDs: %s',
+  async (phase) => {
+    const { app, get, dom } = harness();
+    await app.loadManagementSettings();
+    const key = `codeman:managerSetup:${manager}`;
+    dom.window.sessionStorage.setItem(key, 'retained-setup-request');
+    get('managementWorkObjective').value = 'Coordinate work';
+    get('managementWorkCriteria').value = 'Report verified checks';
+    get('managementWorkStart').checked = true;
+    app._apiJson.mockImplementation(async (url: string, options: any) => {
+      if (url.endsWith('/owner-work')) return ownerWorkState(options.body.requestId);
+      if (url.endsWith('/setup-manager'))
+        return {
+          sessionId: phase === 'wrong-binding' ? worker : manager,
+          requestId: options.body.requestId,
+          phase: phase === 'wrong-binding' ? 'refused' : phase,
+        };
+      return { phase: 'paused', enabled: true, objective: 'Manage owner work' };
+    });
+    await app.queueManagementWork();
+    expect(dom.window.sessionStorage.getItem(key)).toBe(
+      ['started', 'refused'].includes(phase) ? null : 'retained-setup-request'
+    );
+    if (phase === 'refused') {
+      expect(get('managementWorkStatus').textContent).toContain('refused');
+      get('managementWorkObjective').value = 'Another owner request';
+      get('managementWorkCriteria').value = 'Owner review';
+      await app.queueManagementWork();
+      const setupCalls = app._apiJson.mock.calls.filter(([url]: [string]) => url.endsWith('/setup-manager'));
+      expect(setupCalls[1][1].body.requestId).not.toBe('retained-setup-request');
+    }
+  }
+);

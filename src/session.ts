@@ -4411,7 +4411,7 @@ export class Session extends EventEmitter {
           this.watching ||
           !pane.screen ||
           !hasEmptyCodexComposer(pane.screen) ||
-          /esc to interrupt|reconnecting|would you like|approve this/i.test(pane.screen)
+          /esc to interrupt|reconnecting|(?:^|\n)[ \t]*(?:[•›][ \t]*)?would you like\b|approve this/i.test(pane.screen)
         )
           return 'not-sent';
         // Browser frames report false during this short reservation so durable clients retain and retry them.
@@ -6536,7 +6536,12 @@ export class Session extends EventEmitter {
     console.log('[Session] Shell PTY spawned with PID:', this._pid);
 
     const shellPty = this.ptyProcess;
-    this._shellPtyDisposables.push(
+    // Each attachment owns its subscriptions. An already-queued old exit must
+    // never dispose listeners installed for a replacement attachment.
+    for (const disposable of this._shellPtyDisposables.splice(0)) disposable.dispose();
+    const shellDisposables: Array<{ dispose(): void }> = [];
+    this._shellPtyDisposables = shellDisposables;
+    shellDisposables.push(
       shellPty.onData((rawData: string) => {
         if (this._isStopped || this.ptyProcess !== shellPty) return;
         // Filter out focus escape sequences
@@ -6547,8 +6552,10 @@ export class Session extends EventEmitter {
       })
     );
 
-    this._shellPtyDisposables.push(
+    shellDisposables.push(
       shellPty.onExit(({ exitCode }) => {
+        for (const disposable of shellDisposables.splice(0)) disposable.dispose();
+        if (this._shellPtyDisposables === shellDisposables) this._shellPtyDisposables = [];
         if (this._isStopped || this.ptyProcess !== shellPty) return;
         console.log('[Session] Shell PTY exited with code:', exitCode);
         this.ptyProcess = null;

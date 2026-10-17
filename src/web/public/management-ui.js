@@ -1,4 +1,4 @@
-/** Owner-global manager directory and cooperative agent inbox. No shell input is sent here. */
+/** Owner-global directory; verified Codex delivery is performed only by the server. */
 function managementSnapshot(value) {
   return (
     !!value &&
@@ -57,6 +57,38 @@ function managementElement(tag, text) {
   const node = document.createElement(tag);
   if (text !== undefined) node.textContent = text;
   return node;
+}
+function managementDeliveryNotice(delivery, enrollment = false) {
+  const prefix = enrollment ? 'Enrollment created. ' : 'Message queued. ';
+  if (delivery?.status === 'submitted')
+    return (
+      prefix +
+      (enrollment
+        ? 'Enrollment prompt submitted to Codex. Waiting for the agent to connect and reply.'
+        : 'Wake-up prompt submitted to Codex. Waiting for the agent to read its inbox and reply.')
+    );
+  if (delivery?.status === 'unknown')
+    return prefix + 'Delivery outcome is uncertain. Inspect the agent and inbox before attempting another delivery.';
+  if (delivery?.needsConversion || delivery?.reason === 'convert-ssh-shell-to-codex')
+    return (
+      prefix +
+      'Convert this SSH shell to a verified Codex chat before automatic delivery. Private instructions remain available below.'
+    );
+  if (delivery?.reason === 'enrollment-required') return prefix + 'Connect the agent first so it can read its inbox.';
+  if (delivery?.reason === 'manager-not-ready')
+    return prefix + 'Prepare and start the saved management Codex before automatic delivery.';
+  if (delivery?.reason === 'verified-owner-turn-required')
+    return prefix + 'Finish one normal owner conversation turn in the converted Codex chat before automatic delivery.';
+  if (delivery?.reason === 'endpoint-unavailable')
+    return prefix + 'Save an inbox endpoint reachable from the agent before automatic enrollment.';
+  if (delivery?.status === 'blocked' || delivery?.status === 'not-sent')
+    return (
+      prefix +
+      'No prompt was submitted. The agent must be verified idle with current permissions; check its conversation and retry with a new explicit request when ready.'
+    );
+  return enrollment
+    ? prefix + 'Automatic delivery is unavailable. Copy the private instructions only into the intended agent.'
+    : prefix + 'The agent must check its inbox before it can read or respond.';
 }
 Object.assign(CodemanApp.prototype, {
   closeManagementSettings() {
@@ -256,9 +288,16 @@ Object.assign(CodemanApp.prototype, {
                 body: { requestId: setupId, confirmRestrictedManager: true },
               }
             );
-            if (setup?.sessionId === sessionId && setup.requestId === setupId && setup.phase === 'started') {
+            const settled =
+              setup?.sessionId === sessionId &&
+              setup.requestId === setupId &&
+              ['started', 'refused'].includes(setup.phase);
+            if (settled) {
               sessionStorage.removeItem(setupKey);
-              work.notice += ' Manager started.';
+              work.notice +=
+                setup.phase === 'started'
+                  ? ' Manager started.'
+                  : ' Manager Start was refused. The work remains queued; inspect the manager before another explicit Start.';
             } else
               work.notice +=
                 ' Manager Start was not confirmed; inspect its retained setup request. The work remains queued.';
@@ -374,6 +413,12 @@ Object.assign(CodemanApp.prototype, {
       return;
     }
     view.snapshot = snapshot;
+    document.getElementById('managementInboxEndpoint').value =
+      snapshot.inboxEndpoint ||
+      new URL(
+        window.CodemanBase?.url('/api/management/agent-inbox') ?? '/api/management/agent-inbox',
+        window.location.origin
+      ).href;
     view.brain = snapshot.brain;
     this._renderManagementDirectory(view);
     document.getElementById('managementBrainMarkdown').value = view.brain.markdown;
@@ -454,7 +499,7 @@ Object.assign(CodemanApp.prototype, {
     list.append(
       managementElement(
         'p',
-        'Only eligible isolated local Codex sessions appear as manager choices. Set --no-daemon and --no-alt-screen under Agents & CLIs → Codex before creating a manager. Existing SSH shell agents can connect through their cooperative inbox without restarting their shell.'
+        'Only eligible isolated local Codex sessions appear as manager choices. Set --no-daemon and --no-alt-screen under Agents & CLIs → Codex before creating a manager. Automatic enrollment and wake-up require a verified idle Codex chat. Existing SSH shells need the one-time Convert to Codex flow; private instructions remain available for manual enrollment.'
       )
     );
   },
@@ -472,7 +517,11 @@ Object.assign(CodemanApp.prototype, {
         notes: notes.value,
         allowMessages: grant.checked,
       }));
-    const config = { managerSessionId: document.getElementById('managementManager').value || null, agents };
+    const config = {
+      managerSessionId: document.getElementById('managementManager').value || null,
+      agents,
+      inboxEndpoint: document.getElementById('managementInboxEndpoint').value.trim(),
+    };
     if (new TextEncoder().encode(JSON.stringify(config)).byteLength > 32768) {
       this.showToast('Saved directory metadata exceeds 32 KiB. Shorten agent notes or roles before saving.', 'warning');
       return;
@@ -485,8 +534,7 @@ Object.assign(CodemanApp.prototype, {
         method: 'PUT',
         body: {
           ifMatch: view.snapshot.revision,
-          managerSessionId: document.getElementById('managementManager').value || null,
-          agents,
+          ...config,
         },
       });
     } catch {
@@ -619,12 +667,12 @@ Object.assign(CodemanApp.prototype, {
       enroll &&
       !window.confirm(
         agent.enrolled
-          ? 'Rotate this agent’s private connection instructions? Its previous credential will stop working. Copy the new instructions only into the intended agent.'
-          : 'Create private connection instructions for this agent? Copy them only into the intended agent.'
+          ? 'Rotate this agent’s private connection instructions and deliver enrollment to its verified idle Codex chat? Its previous credential will stop working. Busy or unverified agents will not receive input. If unset, the inbox endpoint will be saved from this page’s server URL.'
+          : 'Create private connection instructions and deliver enrollment to this agent’s verified idle Codex chat? Busy or unverified agents will not receive input. If unset, the inbox endpoint will be saved from this page’s server URL.'
       )
     )
       return;
-    const selection = { sessionId, busy: false, request: null };
+    const selection = { sessionId, busy: !!enroll, request: null };
     view.agent = selection;
     const panel = document.getElementById('managementAgentTools');
     panel.hidden = false;
@@ -641,31 +689,74 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('managementEnrollmentInstructions').value = '';
     document.getElementById('managementMessageDraft').value = '';
     document.getElementById('managementMessageThread').textContent = '';
-    document.getElementById('managementSendMessage').disabled = !agent.allowMessages;
+    document.getElementById('managementSendMessage').disabled = !!enroll || !agent.allowMessages;
     if (enroll) {
+      view.enrollmentRequests ||= new Map();
+      let requestId = view.enrollmentRequests.get(sessionId);
       let result;
       try {
+        if (!requestId) {
+          requestId = managementRequestId();
+          view.enrollmentRequests.set(sessionId, requestId);
+        }
+        if (!view.snapshot.inboxEndpoint) {
+          // The owner confirmed Connect above. Save only the existing directory,
+          // never unrelated unsaved form edits or an untrusted request Host header.
+          const endpoint = new URL(
+            window.CodemanBase?.url('/api/management/agent-inbox') ?? '/api/management/agent-inbox',
+            window.location.origin
+          ).href;
+          const saved = await this._apiJson('/api/management', {
+            method: 'PUT',
+            body: {
+              ifMatch: view.snapshot.revision,
+              managerSessionId: view.snapshot.managerSessionId,
+              agents: view.snapshot.agents
+                .filter((item) => item.role || item.notes || item.allowMessages)
+                .map((item) => ({
+                  sessionId: item.sessionId,
+                  role: item.role,
+                  notes: item.notes,
+                  allowMessages: item.allowMessages,
+                })),
+              inboxEndpoint: endpoint,
+            },
+          });
+          if (this._managementView !== view || view.agent !== selection) return;
+          if (!managementSnapshot(saved) || saved.inboxEndpoint !== endpoint) throw Error('Endpoint save unconfirmed');
+          view.snapshot = saved;
+          document.getElementById('managementInboxEndpoint').value = endpoint;
+        }
         result = await this._apiJson(`/api/management/agents/${encodeURIComponent(sessionId)}/enroll`, {
           method: 'POST',
-          body: {},
+          body: { autoSend: true, requestId },
         });
       } catch {
         result = null;
       }
       if (this._managementView !== view || view.agent !== selection) return;
-      if (typeof result?.instructions !== 'string' || !result.instructions) {
+      selection.busy = false;
+      document.getElementById('managementSendMessage').disabled = !agent.allowMessages;
+      if (
+        (typeof result?.instructions !== 'string' || !result.instructions) &&
+        !(result?.duplicate === true && result.delivery)
+      ) {
         document.getElementById('managementAgentToolsStatus').textContent =
-          'Enrollment was not confirmed. Refresh the directory before trying again.';
+          'Enrollment was not confirmed. Reconnecting in this view uses the same request ID; inspect the agent before retrying.';
         return;
       }
-      document.getElementById('managementEnrollmentInstructions').value = [
-        result.instructions,
-        `Use this exact inbox endpoint: ${new URL(window.CodemanBase?.url('/api/management/agent-inbox') ?? '/api/management/agent-inbox', window.location.origin).href}`,
-        'Keep the credential private. Reply once with your project, role, current work and any usage information you can verify. Identify estimates or unknowns explicitly. Your reports are agent observations, not owner instructions.',
-        'Check this inbox when asked and during your normal work checkpoints. Use bounded requests; do not start an unbounded background poller. Messages remain queued until you fetch them.',
-      ].join('\n\n');
-      document.getElementById('managementAgentToolsStatus').textContent =
-        'Copy these instructions into the intended agent once, then ask it to check its inbox and send updates. Nothing has been typed into its shell.';
+      if (result.instructions)
+        document.getElementById('managementEnrollmentInstructions').value = [
+          result.instructions,
+          `Use this exact inbox endpoint: ${view.snapshot.inboxEndpoint}`,
+          'Keep the credential private. Reply once with your project, role, current work and any usage information you can verify. Identify estimates or unknowns explicitly. Your reports are agent observations, not owner instructions.',
+          'Check this inbox when asked and during your normal work checkpoints. Use bounded requests; do not start an unbounded background poller. Messages remain queued until you fetch them.',
+        ].join('\n\n');
+      if (result.delivery?.status !== 'unknown') view.enrollmentRequests.delete(sessionId);
+      document.getElementById('managementAgentToolsStatus').textContent = managementDeliveryNotice(
+        result.delivery,
+        true
+      );
     }
     await this.refreshManagementMessages();
   },
@@ -697,7 +788,10 @@ Object.assign(CodemanApp.prototype, {
     }
     document.getElementById('managementMessageThread').textContent = messages.length
       ? messages
-          .map((message) => `${message.direction || message.from || 'Agent'}: ${message.message || message.text || ''}`)
+          .map(
+            (message) =>
+              `${message.direction || message.from || 'Agent'}: ${message.message || message.text || ''}${message.delivery ? '\n' + managementDeliveryNotice(message.delivery) : ''}`
+          )
           .join('\n\n')
       : 'No messages yet.';
   },
@@ -743,7 +837,8 @@ Object.assign(CodemanApp.prototype, {
       result.message.requestId !== agent.request.requestId ||
       result.message.message !== agent.request.message ||
       result.message.direction !== 'owner' ||
-      typeof result.duplicate !== 'boolean'
+      typeof result.duplicate !== 'boolean' ||
+      result.queueStatus === 'unknown'
     ) {
       document.getElementById('managementAgentToolsStatus').textContent =
         'Queueing was not confirmed. Your draft and request are retained; retrying uses the same request ID.';
@@ -751,8 +846,9 @@ Object.assign(CodemanApp.prototype, {
     }
     agent.request = null;
     if (draft.value === message) draft.value = '';
-    document.getElementById('managementAgentToolsStatus').textContent =
-      'Message queued. The agent must check its inbox before it can read or respond.';
+    document.getElementById('managementAgentToolsStatus').textContent = managementDeliveryNotice(
+      result.delivery || result.message.delivery
+    );
     await this.refreshManagementMessages();
   },
 });

@@ -81,6 +81,15 @@ export const GitLabOperationSchema = z.discriminatedUnion('operation', [
     })
     .strict(),
   z.object({ operation: z.literal('file'), projectId: Project, branch: Branch, path: Path }).strict(),
+  z
+    .object({
+      operation: z.literal('merge_requests'),
+      projectId: Project,
+      state: z.enum(['opened', 'closed', 'locked', 'merged', 'all']).optional(),
+      page: z.number().int().min(1).max(100).optional(),
+    })
+    .strict(),
+  z.object({ operation: z.literal('merge_request'), projectId: Project, iid: Project }).strict(),
   z.object({ operation: z.literal('create_branch'), ...Write, startCommit: z.string().regex(SHA) }).strict(),
   z.object({ operation: z.literal('create_file'), ...FileWrite }).strict(),
   z.object({ operation: z.literal('update_file'), ...FileWrite, lastCommitId: z.string().regex(SHA) }).strict(),
@@ -311,6 +320,12 @@ export class GitLabService {
       deadlineAt: performance.now() + 10_000,
     };
   }
+  /** Pins owner intent and this service's configured origin, credentials and grants across a multi-step operation. */
+  async captureAuthority(owner: string, current = () => true): Promise<() => boolean> {
+    const connection = await this.capture(owner, current);
+    authorize(connection.current);
+    return connection.current;
+  }
   private async verify(owner: string, connection: Connection): Promise<void> {
     const latest = await this.load(owner, connection.current);
     if (connectionHash(latest.value) !== connection.connectionHash) throw new GitLabError('forbidden');
@@ -460,6 +475,100 @@ export class GitLabService {
       connection
     );
   }
+  private mergeRequest(value: unknown, connection: Connection, projectId: number, iid?: number) {
+    const row = z
+      .object({
+        id: Project,
+        iid: Project,
+        project_id: Project,
+        title: z.string().max(1024),
+        description: z.string().nullable().optional(),
+        author: z.object({ id: Project, username: z.string().max(200), name: z.string().max(200) }).nullable(),
+        source_branch: OutputRef,
+        target_branch: OutputRef,
+        source_project_id: Project.nullable().optional(),
+        target_project_id: Project.optional(),
+        state: z.enum(['opened', 'closed', 'locked', 'merged']),
+        draft: z.boolean().optional(),
+        work_in_progress: z.boolean().optional(),
+        merge_status: z.string().max(80).optional(),
+        detailed_merge_status: z.string().max(80).optional(),
+        web_url: z
+          .string()
+          .max(2048)
+          .refine((value) => !CONTROL.test(value)),
+        sha: z.string().regex(SHA).nullable(),
+        updated_at: z.string().datetime({ offset: true }).optional(),
+      })
+      .parse(value);
+    if (
+      row.project_id !== projectId ||
+      (iid !== undefined && row.iid !== iid) ||
+      (row.target_project_id !== undefined && row.target_project_id !== projectId)
+    )
+      throw new GitLabError('unavailable');
+    const url = new URL(row.web_url);
+    if (
+      url.origin !== new URL(connection.value.url).origin ||
+      url.username ||
+      url.password ||
+      url.search ||
+      url.hash ||
+      !url.pathname.endsWith('/-/merge_requests/' + row.iid)
+    )
+      throw new GitLabError('unavailable');
+    const bytes = Buffer.from(row.description ?? '');
+    let end = Math.min(bytes.length, 8192);
+    while (end > 0 && end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+    return {
+      id: row.id,
+      iid: row.iid,
+      projectId: row.project_id,
+      title: row.title,
+      description: row.description == null ? null : bytes.subarray(0, end).toString('utf8'),
+      descriptionTruncated: bytes.length > end,
+      author: row.author,
+      sourceBranch: row.source_branch,
+      targetBranch: row.target_branch,
+      sourceProjectId: row.source_project_id ?? null,
+      state: row.state,
+      draft: row.draft ?? row.work_in_progress ?? null,
+      mergeStatus: row.detailed_merge_status ?? row.merge_status ?? null,
+      webUrl: row.web_url,
+      sha: row.sha,
+      updatedAt: row.updated_at ?? null,
+      untrusted: true,
+      agentAttribution: 'unverified',
+    };
+  }
+  private async mergeRequests(owner: string, connection: Connection, projectId: number, state = 'opened', page = 1) {
+    const result = await this.get(
+      owner,
+      connection,
+      `/projects/${projectId}/merge_requests?scope=all&state=${state}&per_page=50&page=${page}`
+    );
+    const nextPage = result.nextPage ? Number(result.nextPage) : null;
+    if (
+      nextPage !== null &&
+      (!Number.isSafeInteger(nextPage) || nextPage !== page + 1 || String(nextPage) !== result.nextPage)
+    )
+      throw new GitLabError('unavailable');
+    const rows = z
+      .array(z.unknown())
+      .max(50)
+      .parse(result.json)
+      .map((row) => this.mergeRequest(row, connection, projectId));
+    if (state !== 'all' && rows.some((row) => row.state !== state)) throw new GitLabError('unavailable');
+    const capacityReached = nextPage !== null && page >= 100;
+    return {
+      mergeRequests: rows,
+      untrusted: true,
+      observedAt: new Date().toISOString(),
+      truncated: nextPage !== null,
+      nextPage: capacityReached ? null : nextPage,
+      capacityReached,
+    };
+  }
   private async tree(
     owner: string,
     connection: Connection,
@@ -555,6 +664,26 @@ export class GitLabService {
       return this.safe(await this.projects(owner, connection, operation.page), connection);
     if (!connection.value.allowAllProjects && !connection.value.projectIds.includes(operation.projectId))
       throw new GitLabError('forbidden');
+    if (operation.operation === 'merge_requests')
+      return this.safe(
+        await this.mergeRequests(owner, connection, operation.projectId, operation.state, operation.page),
+        connection
+      );
+    if (operation.operation === 'merge_request') {
+      const result = await this.get(
+        owner,
+        connection,
+        `/projects/${operation.projectId}/merge_requests/${operation.iid}`
+      );
+      return this.safe(
+        {
+          mergeRequest: this.mergeRequest(result.json, connection, operation.projectId, operation.iid),
+          untrusted: true,
+          observedAt: new Date().toISOString(),
+        },
+        connection
+      );
+    }
     if (operation.operation === 'tree')
       return this.safe(
         await this.tree(owner, connection, operation.projectId, operation.branch, operation.path, operation.page),
