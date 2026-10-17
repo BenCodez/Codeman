@@ -340,4 +340,54 @@ describe('Shift/Ctrl+Enter through the shipped key handlers (keypress must be sw
       expect(result.chunks.join('')).toBe(target === 'unchanged' ? '\x1b[200~  α\r🙂\r終  \x1b[201~' : '');
     }
   );
+  it.each([true, false])(
+    'shell Paste negotiates the real terminal mode (%s) and queues no automatic Enter',
+    async (enabled) => {
+      await page.evaluate(
+        async ({ id, enabled }) => {
+          const w = window as any,
+            app = w.app;
+          w.__shellPasteSaved = {
+            id: app.activeSessionId,
+            tile: app._focusedTile,
+            socketFor: app._inputSocketFor,
+            session: app.sessions.get(id),
+            mode: app.terminal.modes.bracketedPasteMode,
+          };
+          app.activeSessionId = id;
+          app._focusedTile = null;
+          app._inputSocketFor = () => null;
+          app.sessions.set(id, { id, mode: 'shell' });
+          w.__queueProbe = { id, reserved: false, requests: [], delivered: [] };
+          await new Promise<void>((resolve) => app.terminal.write(enabled ? '\x1b[?2004h' : '\x1b[?2004l', resolve));
+        },
+        { id: MAIN_ID, enabled }
+      );
+      try {
+        await page.evaluate('KeyboardAccessoryBar.pasteFromClipboard()');
+        await page.locator('.paste-overlay .paste-textarea').fill('  first line\nλ🙂  ');
+        await page.locator('.paste-overlay .paste-send').click();
+        await page.waitForFunction(() => (window as any).__queueProbe.delivered.length === 1);
+        await page.waitForTimeout(150);
+        expect(await page.evaluate(() => (window as any).__queueProbe.delivered)).toEqual([
+          enabled ? '\x1b[200~  first line\rλ🙂  \x1b[201~' : '  first line\rλ🙂  ',
+        ]);
+        expect(await page.locator('.paste-overlay').count()).toBe(0);
+      } finally {
+        await page.evaluate(async (id) => {
+          const w = window as any,
+            app = w.app,
+            saved = w.__shellPasteSaved;
+          document.querySelectorAll('.paste-overlay').forEach((node) => node.remove());
+          app.activeSessionId = saved.id;
+          app._focusedTile = saved.tile;
+          app._inputSocketFor = saved.socketFor;
+          if (saved.session) app.sessions.set(id, saved.session);
+          else app.sessions.delete(id);
+          await new Promise<void>((resolve) => app.terminal.write(saved.mode ? '\x1b[?2004h' : '\x1b[?2004l', resolve));
+          w.__queueProbe = null;
+        }, MAIN_ID);
+      }
+    }
+  );
 });

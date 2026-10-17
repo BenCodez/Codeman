@@ -127,7 +127,7 @@ describe('mobile prompt composer', () => {
     expect((document.querySelector('.prompt-composer-textarea') as HTMLTextAreaElement).value).toBe(input.value);
   });
 
-  it('pins bracketed shell paste to the original session across a tab switch without submitting it', () => {
+  it('pins literal shell paste to the original session across a tab switch without adding Enter', () => {
     const { app, bar, document, runTimers } = loadComposer();
     app.sessions.set('session-1', { mode: 'shell' });
     bar.pasteFromClipboard();
@@ -135,7 +135,7 @@ describe('mobile prompt composer', () => {
     app.activeSessionId = 'session-2';
     (document.querySelector('.paste-send') as HTMLButtonElement).click();
     runTimers();
-    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', '\x1b[200~fixture command\x1b[201~']]);
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'fixture command']]);
   });
 
   it.each([
@@ -772,6 +772,77 @@ describe('mobile shell Paste', () => {
     return { ...harness, input, send };
   }
 
+  it.each([false, undefined, null, 'true', 1])(
+    'uses literal paste without injected markers or Enter for disabled/unknown mode %j',
+    (mode) => {
+      const { app, input, send, runTimers } = openShellPaste();
+      Reflect.set(app.terminal.modes, 'bracketedPasteMode', mode);
+      input.value = '  λ🙂\nsecond line  \t';
+      send.click();
+      runTimers();
+      expect(app._sendInputAsync.mock.calls).toEqual([['session-1', '  λ🙂\rsecond line  \t']]);
+    }
+  );
+
+  it('reads the original shell current mode at Send rather than reusing a stale enabled value from dialog open', () => {
+    const { app, input, send } = openShellPaste();
+    input.value = 'literal command';
+    app.terminal.modes.bracketedPasteMode = false;
+    send.click();
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'literal command']]);
+  });
+
+  it('treats an unreadable negotiation as disabled and retains oversized literal text for trimming', () => {
+    const { app, bar, document, input, send } = openShellPaste();
+    Object.defineProperty(app.terminal, 'modes', {
+      get() {
+        throw Error('mode unavailable');
+      },
+    });
+    input.value = 'literal command';
+    send.click();
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'literal command']]);
+    bar.pasteFromClipboard();
+    const large = document.querySelector('.paste-textarea') as HTMLTextAreaElement;
+    large.value = 'x'.repeat(bar._composerMaxLength + 1);
+    (document.querySelector('.paste-send') as HTMLButtonElement).click();
+    expect(app._sendInputAsync).toHaveBeenCalledOnce();
+    expect(large.isConnected).toBe(true);
+    expect(large.value).toHaveLength(bar._composerMaxLength + 1);
+  });
+
+  it('does not borrow another tab mode through the reused primary terminal', () => {
+    const { app, input, send } = openShellPaste();
+    input.value = 'original\ntarget';
+    app.activeSessionId = 'session-2';
+    app.terminal.modes.bracketedPasteMode = true;
+    send.click();
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'original\rtarget']]);
+  });
+
+  it.each([true, false])(
+    'retains a live exact tile mode only while that tile still owns its target: %s',
+    (retained) => {
+      const { app, bar, document } = loadComposer();
+      app.sessions.set('session-1', { mode: 'shell' });
+      const tile = { sessionId: 'session-1', terminal: app.terminal, _destroyed: false };
+      Reflect.set(app, '_focusedPane', () => ({
+        terminal: tile.terminal,
+        sessionId: 'session-1',
+        isPrimary: false,
+        tile,
+      }));
+      bar.pasteFromClipboard();
+      (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = 'tile paste';
+      app.activeSessionId = 'session-2';
+      if (!retained) tile.sessionId = 'session-2';
+      (document.querySelector('.paste-send') as HTMLButtonElement).click();
+      expect(app._sendInputAsync.mock.calls).toEqual([
+        ['session-1', retained ? '\x1b[200~tile paste\x1b[201~' : 'tile paste'],
+      ]);
+    }
+  );
+
   it('sends a multi-line block once, bracketed, and never presses Enter', () => {
     const { app, document, input, send, runTimers } = openShellPaste();
     expect(document.querySelector('.prompt-composer-overlay')).toBeNull();
@@ -827,7 +898,7 @@ describe('mobile shell Paste', () => {
 
     send.click();
 
-    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[200~ls\rpwd\x1b[201~');
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', 'ls\rpwd');
   });
 
   it('uploads a picked image to the shell it was opened for after a tab switch', () => {

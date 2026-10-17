@@ -1222,7 +1222,7 @@ const KeyboardAccessoryBar = {
    *  bytes a terminal paste produces, so the receiving shell or CLI takes a
    *  multi-line block as one edit. Never presses Enter: callers decide.
    *  `label` names the payload in the too-long toast. */
-  _sendBracketedPaste(sessionId, text, label) {
+  _sendBracketedPaste(sessionId, text, label, bracketed = true) {
     if (!sessionId || !text || typeof app._sendInputAsync !== 'function') return false;
     app._predictiveEcho?.clearPredictions();
     // Match xterm's prepareTextForTerminal(): CR keeps embedded newlines inside
@@ -1234,7 +1234,7 @@ const KeyboardAccessoryBar = {
       app.showToast?.(`${label} is too long to send (maximum ${this._composerMaxLength.toLocaleString()} characters)`, 'error');
       return false;
     }
-    app._sendInputAsync(sessionId, `${COMPOSER_PASTE_START}${pasteText}${COMPOSER_PASTE_END}`);
+    app._sendInputAsync(sessionId, bracketed ? `${COMPOSER_PASTE_START}${pasteText}${COMPOSER_PASTE_END}` : pasteText);
     return true;
   },
 
@@ -1486,6 +1486,23 @@ const KeyboardAccessoryBar = {
     // The shell this overlay was opened for: a tab switch while it is open must
     // not deliver the paste to whatever session is active at Send time.
     const sessionId = app.activeSessionId;
+    const pane = typeof app._focusedPane === 'function'
+      ? app._focusedPane()
+      : { terminal: app.terminal, sessionId, isPrimary: true };
+    const bracketedPasteEnabled = () => {
+      try {
+        if (!pane || pane.sessionId !== sessionId || !pane.terminal) return false;
+        // The primary xterm is reused on tab switches. A retained object alone
+        // must not lend the newly selected shell's mode to the original target.
+        const ownsTarget = pane.isPrimary === true
+          ? app.activeSessionId === sessionId && app.terminal === pane.terminal && !app._tilesOwnTerminal?.()
+          : pane.isPrimary === false && pane.tile && !pane.tile._destroyed &&
+            pane.tile.sessionId === sessionId && pane.tile.terminal === pane.terminal;
+        return !!ownsTarget && pane.terminal.modes?.bracketedPasteMode === true;
+      } catch {
+        return false;
+      }
+    };
 
     // Create overlay
     const overlay = document.createElement('div');
@@ -1507,12 +1524,10 @@ const KeyboardAccessoryBar = {
 
     const close = () => overlay.remove();
 
-    // Only shell sessions reach this overlay (agent bars get Compose instead),
-    // so the text lands at the prompt as one bracketed paste and is NOT run:
-    // sent raw, every newline was an Enter and each line ran on its own as it
-    // arrived. The user reviews the block and presses Enter themselves. A shell
-    // that never enabled bracketed paste (dash, bash before 5.1) gets the
-    // markers stripped by tmux, so there every line but the last still runs.
+    // Match a native terminal paste: bracket only when the original pane still
+    // owns the terminal and advertises DECSET 2004. Legacy/unknown shells get
+    // literal text with no escape markers or extra Enter. Their embedded newlines
+    // retain normal shell semantics; unlike bracketed paste they can execute lines.
     const sendText = () => {
       const text = textarea.value;
       if (!text) {
@@ -1520,7 +1535,7 @@ const KeyboardAccessoryBar = {
         return;
       }
       // A refused (too-long) paste keeps the dialog and its text for trimming.
-      if (this._sendBracketedPaste(sessionId, text, 'Paste')) close();
+      if (this._sendBracketedPaste(sessionId, text, 'Paste', bracketedPasteEnabled())) close();
     };
 
     // Filter to what the server admits, close the dialog, and hand off to the
