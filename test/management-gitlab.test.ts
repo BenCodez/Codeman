@@ -219,6 +219,47 @@ describe('private direct GitLab connection', () => {
       ).rejects.toMatchObject({ code: 'unavailable' });
     }
   });
+  it.each(['release@2026', 'feature+test', '发布/版本+test'])(
+    'accepts valid GitLab default ref %s in listing, connection checks and write preflight',
+    async (defaultBranch) => {
+      await configure();
+      const original = transport.getMockImplementation()!;
+      const project = { id: 1, name: 'One', path_with_namespace: 'group/one', default_branch: defaultBranch };
+      transport.mockImplementation(async (url: string, init: RequestInit) => {
+        const path = new URL(url).pathname;
+        if (path === '/api/v4/projects/1') return json(project);
+        if (path === '/api/v4/projects') return json([project]);
+        return original(url, init);
+      });
+      expect(await service.operate('alice', { operation: 'projects' })).toMatchObject({ projects: [project] });
+      expect(await service.check('alice')).toMatchObject({ available: true, projectCount: 1 });
+      expect(await service.operate('alice', branchOperation)).toMatchObject({ status: 'succeeded' });
+      expect(await service.operate('alice', fileOperation)).toMatchObject({ status: 'succeeded' });
+      await configure({ projectIds: [], allowAllProjects: true });
+      expect(await service.operate('alice', { operation: 'projects' })).toMatchObject({ projects: [project] });
+      expect(GitLabOperationSchema.safeParse({ ...fileOperation, branch: defaultBranch }).success).toBe(false);
+    }
+  );
+  it('still rejects malformed default refs and refuses writes to the actual default branch', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    let defaultBranch = '';
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      new URL(url).pathname === '/api/v4/projects/1'
+        ? json({ id: 1, name: 'One', path_with_namespace: 'group/one', default_branch: defaultBranch })
+        : original(url, init)
+    );
+    for (const invalid of ['', 'feature test', 'refs/../main', 'feature@{1}', 'release.lock/main', 'x'.repeat(1025)]) {
+      defaultBranch = invalid;
+      await expect(service.operate('alice', { operation: 'projects' })).rejects.toMatchObject({ code: 'unavailable' });
+      await expect(service.check('alice')).rejects.toThrow();
+      await expect(service.operate('alice', branchOperation)).rejects.toMatchObject({ code: 'unavailable' });
+    }
+    defaultBranch = 'codeman/fix';
+    await expect(service.operate('alice', branchOperation)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(service.operate('alice', fileOperation)).rejects.toMatchObject({ code: 'forbidden' });
+    expect(transport.mock.calls.some(([, init]) => init.method === 'POST' || init.method === 'PUT')).toBe(false);
+  });
   it('checks actual selected project access and the all-project endpoint', async () => {
     await configure();
     const original = transport.getMockImplementation()!;

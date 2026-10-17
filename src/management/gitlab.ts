@@ -18,6 +18,24 @@ const Branch = z
   .refine(
     (s) => !s.includes('..') && !s.includes('//') && !s.endsWith('/') && !s.endsWith('.lock') && !s.endsWith('.')
   );
+// GitLab metadata can name refs outside our deliberately narrower operation
+// inputs. Validate bounded Git ref syntax without imposing that input allowlist.
+const OutputRef = z
+  .string()
+  .min(1)
+  .max(1024)
+  .refine(
+    (s) =>
+      Buffer.byteLength(s) <= 1024 &&
+      Buffer.from(s).toString('utf8') === s &&
+      !CONTROL.test(s) &&
+      !Array.from(' ~^:?*[\\').some((character) => s.includes(character)) &&
+      !s.includes('..') &&
+      !s.includes('@{') &&
+      s !== '@' &&
+      !s.endsWith('.') &&
+      s.split('/').every((part) => !!part && !part.startsWith('.') && !part.endsWith('.lock'))
+  );
 const Path = z
   .string()
   .min(1)
@@ -38,7 +56,7 @@ const ProjectInfo = z.object({
   id: Project,
   name: z.string().max(500),
   path_with_namespace: z.string().max(1024),
-  default_branch: Branch.nullable(),
+  default_branch: OutputRef.nullable(),
 });
 const Write = { projectId: Project, branch: Branch, requestId: z.string().regex(/^[\w-]{8,80}$/) };
 const FileWrite = {
@@ -563,7 +581,7 @@ export class GitLabService {
     }
     if (connection.value.receipts.length >= 128) throw new GitLabError('capacity');
     const project = z
-      .object({ id: Project, default_branch: Branch.nullable() })
+      .object({ id: Project, default_branch: OutputRef.nullable() })
       .parse((await this.get(owner, connection, `/projects/${operation.projectId}`)).json);
     if (project.id !== operation.projectId || project.default_branch === operation.branch)
       throw new GitLabError('forbidden');
