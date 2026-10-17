@@ -256,3 +256,23 @@ it('classifies invalid store input as 400 while keeping real persistence failure
   expect(failed.json().errorCode).toBe('OPERATION_FAILED');
   expect(failed.body).not.toContain('/private');
 });
+
+it('queues only owned, confirmed objective/criteria work and returns durable task identity on retry', async () => {
+  const payload = {
+    requestId: 'aaaaaaaa-1111-4111-8111-111111111111',
+    objective: 'Repair the settings form',
+    completionCriteria: 'Tests pass and owner review is requested.',
+  };
+  const queue = (body: unknown = payload) =>
+    h.app.inject({ method: 'POST', url: base() + '/automation/owner-work', payload: body });
+  expect((await queue({ ...payload, completionCriteria: '' })).statusCode).toBe(400);
+  expect((await queue({ ...payload, arbitraryInput: 'unsafe' })).statusCode).toBe(400);
+  const first = await queue();
+  expect(first.statusCode).toBe(200);
+  expect(first.json().data.tasks).toHaveLength(1);
+  expect(dispatch).not.toHaveBeenCalled();
+  expect((await queue()).json().data.tasks).toHaveLength(1);
+  expect((await queue({ ...payload, objective: 'Changed request' })).statusCode).toBe(400);
+  Object.assign(h.ctx._session, { owner: 'bob' });
+  expect((await queue()).statusCode).toBe(404);
+});

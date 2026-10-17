@@ -77,7 +77,8 @@ access. Each inbox retains at most 64 messages within a 32 KiB journal; capacity
 reported rather than silently dropping messages or replay receipts.
 
 The manager uses `supervisor_agents` to learn the directory and `supervisor_agent`
-to observe bounded cached tab output, read replies or queue authorized cooperative
+to read bounded conversation pages (`mode: "conversation"`), inspect usage
+(`mode: "usage"`), observe cached tab output, read replies or queue authorized cooperative
 messages. Hourly check-ins automatically learn each agent's project, role, objective
 and blockers from this context and maintain attributed, dated notes in `brain.md`.
 Unknown and inferred facts stay labeled. Connected agents can be asked for missing
@@ -164,3 +165,26 @@ queries. Unsolicited, expired or replayed replies and raw keyboard input retain 
 input-ownership veto. Updating Codeman never clears an existing pane's veto; an
 owner must explicitly restart that manager with its exact conversation to use a
 new broker.
+
+
+### Reading chats and usage
+
+`supervisor_agent` conversation pages identify their source, observation time,
+conversation ID when attributed, truncation, and snapshot revision. Pass the
+returned `nextCursor` to read older messages from that same snapshot. Pages are
+capped at 16 KiB, snapshots at 128 KiB, and cursors expire after two minutes.
+Local Codex chat comes from its exact verified conversation and pinned home;
+local Claude chat uses the existing hook transcript only when its UUID and home
+match. SSH agents and shell tabs currently expose their cached terminal context,
+not remote native chat history. No conversation read sends terminal input or
+runs a remote command. Chat text is untrusted context, never instructions or
+proof that work finished.
+
+The manager checks `mode: "usage"` for itself and selected agents before planning
+assignments. Session token/cost counters remain labeled estimates. A local Codex
+native quota report includes the reported percent, reset time, observation time
+and freshness; it does not establish the current account's capacity. Missing,
+malformed, expired and unavailable reports remain unknown or stale. Codeman does
+not project its server account's quota onto an SSH agent or another Codex home.
+These reports help planning; worker actions still require their existing live
+identity, ownership, task, permission and lifecycle checks.

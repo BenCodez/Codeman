@@ -45,16 +45,38 @@ describe('Global management controls in Chromium', () => {
       await page.evaluate(
         async ({ worker, manager }) => {
           const calls: any[] = [];
+          const workTasks: any[] = [];
           const app = new (window as any).CodemanApp();
           app.showToast = () => undefined;
           app.sessions = new Map([[manager, { mode: 'codex', supervisorAvailable: true }]]);
           app.supportsSessionRecovery = () => true;
           app._apiJson = async (url: string, options?: any) => {
             calls.push({ url, options });
+            if (url.endsWith('/automation/owner-work')) {
+              const request = options.body;
+              if (!workTasks.some((task) => task.id === `owner-work-${request.requestId}`))
+                workTasks.push({
+                  id: `owner-work-${request.requestId}`,
+                  name: request.objective,
+                  instructions: request.completionCriteria,
+                  enabled: true,
+                  kind: 'once',
+                  maxRuns: 1,
+                });
+              return {
+                checkIns: { enabled: false, intervalMinutes: 60 },
+                tasks: workTasks,
+                status: { phase: 'idle', runs: [] },
+              };
+            }
             if (url.endsWith('/supervisor/automation'))
               return options?.method === 'PUT'
                 ? options.body
-                : { checkIns: { enabled: false, intervalMinutes: 60 }, tasks: [] };
+                : {
+                    checkIns: { enabled: false, intervalMinutes: 60 },
+                    tasks: workTasks,
+                    status: { phase: 'idle', runs: [] },
+                  };
             if (url.endsWith('/supervisor'))
               return {
                 version: 1,
@@ -136,6 +158,18 @@ describe('Global management controls in Chromium', () => {
           )
         )
       ).toBe(true);
+      await page.locator('#managementWorkObjective').fill('Coordinate the API and UI change');
+      await page.locator('#managementWorkCriteria').fill('Required checks pass and owner review is requested');
+      await page.locator('#managementWorkStart').uncheck();
+      await page.getByRole('button', { name: 'Queue request', exact: true }).click();
+      await page.waitForFunction(() =>
+        document.getElementById('managementWorkStatus')?.textContent?.includes('Request queued')
+      );
+      expect(await page.locator('#managementWorkRequests').textContent()).toContain(
+        'waiting for the manager to be verified idle'
+      );
+      expect(await page.locator('#managementWorkObjective').inputValue()).toBe('');
+      expect(await page.locator('#managementWorkRequests').textContent()).not.toContain('work completed');
       const memory = page.locator('#managementBrainMarkdown');
       await memory.fill('The manager maintains a shared agent directory.');
       await page.getByRole('button', { name: 'Save shared brain.md', exact: true }).click();

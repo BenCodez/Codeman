@@ -2556,11 +2556,75 @@ Object.assign(CodemanApp.prototype, {
     this.showToast(ok ? 'Path copied' : 'Copy failed', ok ? 'success' : 'error');
   },
 
+  async previewSshCodexConversion() {
+    const id = this.editingSessionId, button = document.getElementById('sshCodexConversionPreview');
+    const status = document.getElementById('sshCodexConversionStatus'), details = document.getElementById('sshCodexConversionDetails');
+    if (!id || !button || !status || !details) return;
+    button.disabled = true; details.replaceChildren(); details.hidden = true; this._sshCodexConversionPlan = null;
+    status.textContent = 'Inspecting the owned shell and existing conversations. This does not change the pane.';
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(id)}/codex-conversion/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error || 'Could not preview conversion');
+      if (this.editingSessionId !== id) return;
+      const plan = result.data;
+      this._sshCodexConversionPlan = { ...plan, sessionId: id };
+      const summary = document.createElement('p'); summary.className = 'set-group-hint';
+      summary.textContent = `${plan.hostLabel} · ${plan.workingDir} · ${plan.launcher} · Codex home: ${plan.codexHome}`;
+      const label = document.createElement('label'); label.className = 'set-row-label'; label.textContent = 'Conversation to resume';
+      const select = document.createElement('select'); select.id = 'sshCodexConversionConversation'; select.className = 'set-select'; select.setAttribute('aria-label', 'Existing Codex conversation');
+      for (const [index, conversation] of (plan.conversations || []).entries()) {
+        const option = document.createElement('option'); option.value = conversation.id;
+        option.textContent = `${index === 0 ? 'Most recent · ' : ''}${new Date(conversation.modifiedAt).toLocaleString()} · ${conversation.id}${conversation.unavailableReason ? ' · unavailable' : ''}`;
+        option.disabled = !conversation.config || !!conversation.unavailableReason; select.appendChild(option);
+      }
+      // Never silently choose an older conversation when the newest cannot be verified.
+      if (select.options.length) select.selectedIndex = 0;
+      const settings = document.createElement('p'); settings.className = 'set-group-hint';
+      const consent = document.createElement('label'); consent.className = 'set-check';
+      const checkbox = document.createElement('input'); checkbox.type = 'checkbox'; checkbox.id = 'sshCodexConversionConsent';
+      const consentText = document.createElement('span'); consentText.textContent = `Preserve the idle shell as ${plan.retainedSessionName} and resume only this selected conversation in this tab. The configured launcher must forward Codex arguments and preserve CODEX_HOME.`;
+      consent.append(checkbox,consentText);
+      const confirm = document.createElement('button'); confirm.type = 'button'; confirm.className = 'btn-toolbar'; confirm.textContent = 'Confirm conversion'; confirm.id = 'sshCodexConversionConfirm'; confirm.disabled = true;
+      const refresh = () => { const conversation = plan.conversations.find(item => item.id === select.value); settings.textContent = conversation?.unavailableReason || (conversation?.config ? `Model: ${conversation.config.model} · sandbox: ${conversation.config.sandbox} · approvals: ${conversation.config.approvalPolicy}. Exact UUID, home and working directory are pinned; recovery remains opt-in.` : 'No supported existing conversation was found.'); confirm.disabled = !checkbox.checked || !conversation?.config || !!conversation.unavailableReason; };
+      select.addEventListener('change', () => { checkbox.checked = false; refresh(); }); checkbox.addEventListener('change', refresh);
+      confirm.addEventListener('click', () => void this.confirmSshCodexConversion(select.value));
+      details.append(summary,label,select,settings,consent,confirm); details.hidden = false; refresh();
+      status.textContent = plan.conversations.length ? plan.notice : 'No existing conversation was found for this exact home and working directory. Start or resume Codex normally first; nothing was changed.';
+    } catch(error) { if (this.editingSessionId === id) status.textContent = error.message; }
+    finally { if (this.editingSessionId === id) button.disabled = false; }
+  },
+
+  async confirmSshCodexConversion(conversationId) {
+    const plan = this._sshCodexConversionPlan, checkbox = document.getElementById('sshCodexConversionConsent');
+    const button = document.getElementById('sshCodexConversionConfirm'), status = document.getElementById('sshCodexConversionStatus');
+    if (!plan || plan.sessionId !== this.editingSessionId || !checkbox?.checked || !button || button.disabled) return;
+    button.disabled = true; checkbox.disabled = true; document.getElementById('sshCodexConversionPreview').disabled = true;
+    this._sshCodexConversionPlan = null; status.textContent = 'Preserving the shell and preparing the selected Codex conversation…';
+    try {
+      const response = await fetch(`/api/sessions/${encodeURIComponent(plan.sessionId)}/codex-conversion/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmationToken: plan.confirmationToken, conversationId, confirmPreserveShell: true }) });
+      const result = await response.json();
+      if (!result.success) throw new Error(result.error || 'Conversion needs inspection; do not retry automatically.');
+      status.textContent = `Converted. Retained shell: ${result.data.retainedSessionName}. ${result.data.retainedShellCommand}`;
+      this.showToast('SSH tab converted to the selected Codex conversation. Recovery is opt-in.', 'success');
+      this._renderSessionTabsImmediate?.();
+    } catch(error) { status.textContent = error.message; this.showToast(error.message,'error'); }
+  },
+
   openSessionOptions(sessionId) {
     const session = this.sessions.get(sessionId);
     if (!session) return;
 
     this.editingSessionId = sessionId;
+    this._sshCodexConversionPlan = null;
+    const conversionSection = document.getElementById('sshCodexConversionSection');
+    if (conversionSection) conversionSection.style.display = session.mode === 'shell' && session.remote && session.remote.owned !== false && !session.docker ? '' : 'none';
+    const conversionDetails = document.getElementById('sshCodexConversionDetails');
+    if (conversionDetails) { conversionDetails.replaceChildren(); conversionDetails.hidden = true; }
+    const conversionStatus = document.getElementById('sshCodexConversionStatus');
+    if (conversionStatus) conversionStatus.textContent = '';
+    const conversionPreview = document.getElementById('sshCodexConversionPreview');
+    if (conversionPreview) conversionPreview.disabled = false;
 
     // Per-tab pop-out override state (see _tabDetachOverrides above).
     const detachToggle = document.getElementById('sessionOptShowTabDetach');

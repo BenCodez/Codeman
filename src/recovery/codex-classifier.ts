@@ -406,6 +406,47 @@ export function hasCodexComposerText(screen: string, expected?: string): boolean
   );
 }
 
+/** Owner-triggered setup may supersede a validated native settings change only.
+ * This is eligibility for one fixed setup prompt, never recovery authority.
+ */
+export function permitsCodexManagerSetup(
+  tail: string,
+  context: CodexClassificationContext,
+  launchStartedAt: number
+): boolean {
+  if (
+    context.tailTruncated !== false ||
+    !Number.isFinite(launchStartedAt) ||
+    launchStartedAt <= 0 ||
+    launchStartedAt > context.now
+  )
+    return false;
+  const original = classifyCodexTail(tail, context);
+  if (original.activity !== 'paused' || original.reason !== 'approval-required') return false;
+  let currentSettings = false;
+  const retained: string[] = [];
+  try {
+    for (const line of tail.split('\n')) {
+      if (!line) continue;
+      const row = object(JSON.parse(line));
+      const payload = row && object(row.payload);
+      if (row?.type === 'event_msg' && payload?.type === 'thread_settings_applied') {
+        if (!validThreadSettings(payload, context.conversationId)) return false;
+        const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
+        if (!Number.isFinite(at) || at > context.now) return false;
+        if (at >= launchStartedAt) currentSettings = true;
+        continue;
+      }
+      retained.push(line);
+    }
+  } catch {
+    return false;
+  }
+  if (!currentSettings) return false;
+  const prior = classifyCodexTail(retained.length ? retained.join('\n') + '\n' : '', context);
+  return ['idle', 'completed'].includes(prior.activity);
+}
+
 export function classifyCodexTail(tail: string, context: CodexClassificationContext): RecoveryObservation {
   const unknown: RecoveryObservation = {
     activity: 'unknown',

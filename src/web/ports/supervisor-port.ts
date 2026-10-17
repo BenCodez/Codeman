@@ -1,7 +1,13 @@
 import type { Session } from '../../session.js';
 import type { SupervisorController } from '../../supervisor/controller.js';
 import type { SupervisorAutomationController } from '../../supervisor/automation.js';
+import type { ManagerSetupReceipt } from '../../supervisor/manager-setup.js';
 export interface SupervisorPort {
+  setupAndStartSupervisorManager?(
+    session: Session,
+    requestId: string,
+    isCurrent: () => boolean
+  ): Promise<ManagerSetupReceipt>;
   prepareSupervisorManager?(session: Session, isCurrent: () => boolean): Promise<boolean | { inspectionOnly: true }>;
   getSupervisorController(session: Session): SupervisorController | undefined;
   getSupervisorAutomation?(session: Session): SupervisorAutomationController | undefined;

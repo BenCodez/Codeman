@@ -9,6 +9,7 @@ import { PromptTextSchema } from '../../supervision/schema.js';
 import {
   SupervisorAutomationConfigSchema,
   SupervisorAutomationRequestSchema,
+  SupervisorOwnerWorkSchema,
 } from '../../supervisor/automation-schema.js';
 import { SupervisorAutomationError } from '../../supervisor/automation.js';
 import { BrainStoreError } from '../../supervisor/brain.js';
@@ -113,6 +114,26 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
     }
   });
 
+  app.post('/api/sessions/:id/supervisor/setup-manager', async (req, reply) => {
+    const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req);
+    const body = parseBody(
+      SupervisorRequestSchema.extend({ confirmRestrictedManager: z.literal(true) }).strict(),
+      req.body
+    );
+    const current = ownerCurrent(req, reply, session);
+    try {
+      if (!ctx.setupAndStartSupervisorManager) throw new SupervisorValidationError('Manager setup is unavailable');
+      const receipt = await ctx.setupAndStartSupervisorManager(session, body.requestId, current);
+      return { success: true, data: receipt };
+    } catch (error) {
+      return operationFailure(
+        reply,
+        error,
+        'Manager setup requires a current idle conversation. Retain the request ID; inspect unresolved setup before retrying.'
+      );
+    }
+  });
+
   app.get('/api/sessions/:id/supervisor', async (req) => {
     const scoped = controller(req).result;
     return {
@@ -145,6 +166,23 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
       );
     }
   });
+  app.post('/api/sessions/:id/supervisor/automation/owner-work', async (req, reply) => {
+    const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req);
+    const current = ownerCurrent(req, reply, session);
+    const body = parseBody(SupervisorOwnerWorkSchema, req.body, 'Enter an objective and completion criteria');
+    try {
+      const scoped = ctx.getSupervisorAutomation?.(session);
+      if (!scoped) throw new SupervisorAutomationError('Management scheduling is unavailable');
+      return { success: true, data: await scoped.queueOwnerWork(body, current) };
+    } catch (error) {
+      return operationFailure(
+        reply,
+        error,
+        'Work was not confirmed. Retain the request ID; check manager delivery, the 12-task limit and 128-run capacity before retrying.'
+      );
+    }
+  });
+
   app.post('/api/sessions/:id/supervisor/automation/tasks/:taskId/run', async (req, reply) => {
     const { id, taskId } = req.params as { id: string; taskId: string },
       session = findSessionOrFail(ctx, id, req),

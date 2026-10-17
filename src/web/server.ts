@@ -176,6 +176,10 @@ import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
 import { haveDistinctSupervisorHomes } from '../supervisor/home-identity.js';
 import { ManagerCredentialRegistry } from '../supervisor/manager-credentials.js';
+import { ManagerSetupJournal, MANAGER_SETUP_PROMPT, type ManagerSetupPhase } from '../supervisor/manager-setup.js';
+import { hasEmptyCodexComposer, permitsCodexManagerSetup } from '../recovery/codex-classifier.js';
+import { hasAcknowledgedCodexComposerCapture } from '../recovery/codex-composer-capture.js';
+import { queueInputDispatch } from './input-dispatch-queue.js';
 import { MAX_CODEX_ROLLOUT_BYTES } from '../recovery/codex-evidence-limits.js';
 import { drainSupervisorManagerRetirements } from '../supervisor/manager-launch.js';
 import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
@@ -187,6 +191,7 @@ import { BrainStore } from '../supervisor/brain.js';
 import { ManagementService } from '../management/store.js';
 import { GitLabService } from '../management/gitlab.js';
 import { observeManagementAgent } from '../management/observation.js';
+import { ManagementAgentReader } from '../management/agent-reader.js';
 import { registerManagementGitLabRoutes } from './routes/management-gitlab-routes.js';
 import { registerManagementRoutes } from './routes/management-routes.js';
 import { registerManagementAgentAuth } from './middleware/management-agent-auth.js';
@@ -364,6 +369,10 @@ export class WebServer extends EventEmitter {
   private supervisorBrainStore = new BrainStore();
   private managementBrainStore = new BrainStore(dataPath('management-brains'));
   private managementGitLab = new GitLabService();
+  private managementAgentReader = new ManagementAgentReader({
+    lookup: (id) => this.sessions.get(id),
+    claudeTranscriptPath: (id) => this.transcriptWatchers.get(id)?.getPath() ?? null,
+  });
   private managementService = new ManagementService({
     sessions: () =>
       [...this.sessions.values()].map((session) => ({
@@ -864,6 +873,7 @@ export class WebServer extends EventEmitter {
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
       dropSupervisorManagementState: this.dropSupervisorManagementState.bind(this),
+      replaceConvertedSession: this.replaceConvertedSession.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
       persistSessionState: this.persistSessionState.bind(this),
       persistSessionStateNow: this._persistSessionStateNow.bind(this),
@@ -875,6 +885,7 @@ export class WebServer extends EventEmitter {
       getTaskController: this.getTaskController.bind(this),
       getSupervisorController: this.getSupervisorController.bind(this),
       prepareSupervisorManager: this.prepareSupervisorManager.bind(this),
+      setupAndStartSupervisorManager: this.setupAndStartSupervisorManager.bind(this),
       getSupervisorAutomation: this.getSupervisorAutomation.bind(this),
       supervisorBrain: {
         read: (session: Session, current: () => boolean) =>
@@ -1350,6 +1361,16 @@ export class WebServer extends EventEmitter {
           const owner = scope.owner ?? 'admin';
           const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
           return observeManagementAgent(agentId, scope.sessionId, owner, (id) => this.sessions.get(id), authority);
+        },
+        conversation: async (scope, agentId, options, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          return this.managementAgentReader.conversation(agentId, scope.sessionId, owner, options, authority);
+        },
+        usage: async (scope, agentId, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          return this.managementAgentReader.usage(agentId, scope.sessionId, owner, authority);
         },
         thread: async (scope, agentId, current) => {
           const authority = await this.managementService.captureManager(
@@ -2241,6 +2262,108 @@ export class WebServer extends EventEmitter {
     });
   }
 
+  /** Commit the exact converted worker before exposing input or attaching its new transport. */
+  private async replaceConvertedSession(
+    previous: Session,
+    replacement: Session,
+    isCurrent: (expected?: Session) => boolean
+  ): Promise<void> {
+    const id = previous.id;
+    const owner = previous.owner;
+    const remote = JSON.stringify(previous.remote);
+    const configuration = JSON.stringify([replacement.codexConfig, replacement.getEnvOverridesForPersist()]);
+    let grantsCurrent = () => true;
+    const shape = () =>
+      previous !== replacement &&
+      previous.mode === 'shell' &&
+      replacement.mode === 'codex' &&
+      replacement.id === id &&
+      previous.owner === owner &&
+      replacement.owner === owner &&
+      !!previous.remote &&
+      previous.remote.owned !== false &&
+      JSON.stringify(previous.remote) === remote &&
+      JSON.stringify(replacement.remote) === remote &&
+      JSON.stringify([replacement.codexConfig, replacement.getEnvOverridesForPersist()]) === configuration &&
+      grantsCurrent() &&
+      previous.workingDir === replacement.workingDir &&
+      !previous.docker &&
+      !replacement.docker;
+    const current = (expected: Session) =>
+      !this.recoveryStopping &&
+      !this.cleaningUp.has(id) &&
+      this.sessions.get(id) === expected &&
+      shape() &&
+      isCurrent(expected) === true;
+    if (
+      !current(previous) ||
+      this.controllerHasRecoveryFlight(id) ||
+      this.controllerHasTaskFlight(id) ||
+      this.supervisorLeaseHolder(id, id) ||
+      this.supervisorStore.get(id).enabled
+    )
+      throw new Error('Converted session registration is no longer current');
+    const grant = await clampRecoveryLaunchForOwner(
+      owner,
+      { codexConfig: replacement.codexConfig },
+      replacement.getEnvOverridesForPersist()
+    );
+    grantsCurrent = grant.isCurrent;
+    if (
+      !current(previous) ||
+      JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(replacement.codexConfig) ||
+      JSON.stringify(grant.env) !== JSON.stringify(replacement.getEnvOverridesForPersist())
+    )
+      throw new Error('Converted worker launch grants changed before publication');
+    this.persistDeb.cancelKey(id);
+    if (!(await replacement.ensureRecoveryIdentityFence()) || !current(previous))
+      throw new Error('Converted identity fence was not acknowledged');
+    await this.mux.flushSessionsDurably(() => current(previous));
+    await this.store.persistSessionDurably(
+      id,
+      () => this.buildPersistedSessionState(replacement),
+      () => current(previous)
+    );
+    if (!current(previous)) throw new Error('Converted session publication was cancelled');
+    const listeners = this.sessionListenerRefs.get(id);
+    if (listeners) detachSessionListeners(previous, listeners);
+    this.sessionListenerRefs.delete(id);
+    this.stopTranscriptWatcher(id);
+    imageWatcher.unwatchSession(id);
+    previous.ralphTracker.stopWatchingFixPlan();
+    const summary = this.runSummaryTrackers.get(id);
+    summary?.stop();
+    this.runSummaryTrackers.delete(id);
+    const respawn = this.respawnControllers.get(id);
+    respawn?.stop();
+    respawn?.removeAllListeners();
+    this.respawnControllers.delete(id);
+    const timer = this.respawnTimers.get(id);
+    if (timer) clearTimeout(timer.timer);
+    this.respawnTimers.delete(id);
+    const pending = this.pendingRespawnStarts.get(id);
+    if (pending) clearTimeout(pending);
+    this.pendingRespawnStarts.delete(id);
+    this.sessions.set(id, replacement);
+    // Publication is irreversible here. A failed acknowledgement retains the new
+    // registration for inspection; the durable pending marker keeps input sealed.
+    if (!(await replacement.commitOwnedRemoteShellConversion(() => current(replacement))))
+      throw new Error('Converted worker publication requires inspection');
+    await previous.stop(false);
+    if (!current(replacement)) throw new Error('Converted session attachment was cancelled');
+    await this.setupSessionListeners(replacement);
+    if (!current(replacement)) throw new Error('Converted session attachment was cancelled');
+    await replacement.startInteractive();
+    if (!current(replacement)) throw new Error('Converted session attachment was cancelled');
+    await this.mux.flushSessionsDurably(() => current(replacement));
+    await this.store.persistSessionDurably(
+      id,
+      () => this.buildPersistedSessionState(replacement),
+      () => current(replacement)
+    );
+    this.broadcast(SseEvent.SessionUpdated, { session: this.getSessionStateWithRespawn(replacement) });
+  }
+
   private async setupSessionListeners(session: Session): Promise<void> {
     this.getRecoveryController(session);
     this.getTaskController(session);
@@ -2891,8 +3014,11 @@ export class WebServer extends EventEmitter {
         )
       );
     const capturedTask = taskBinding();
+    let preparedTaskOwner: (() => boolean) | undefined;
     const taskCurrent = () =>
-      this.managerTaskAllowsPreparation(session, () => retainedManager && taskBinding() === capturedTask);
+      this.managerTaskAllowsPreparation(session, () =>
+        preparedTaskOwner ? preparedTaskOwner() === true : retainedManager && taskBinding() === capturedTask
+      );
     // Serialize owner preparation/rechecks before their first asynchronous proof.
     const pending = Object.assign(async () => false, { canOperate: () => false });
     this.supervisorManagerPreparationChecks.set(session, pending);
@@ -3130,7 +3256,13 @@ export class WebServer extends EventEmitter {
             files,
             isCurrent: () => (converting ? current() : scopeCurrent()) && grant.isCurrent(),
           })) === true;
-        if (acknowledged) launchAuthority = session.captureSupervisorManagerLaunchAuthority();
+        if (acknowledged) {
+          launchAuthority = session.captureSupervisorManagerLaunchAuthority();
+          // Admission starts with an ordinary disabled task. After conversion,
+          // only this exact restricted launch may retain the role's derived
+          // task through owner Start/Pause/teaching; unrelated tasks still veto.
+          preparedTaskOwner = () => launchAuthority?.() === true;
+        }
         converting = false;
         return await checkReadiness(callerCurrent);
       } catch {
@@ -3140,6 +3272,211 @@ export class WebServer extends EventEmitter {
       if (this.supervisorManagerPreparationChecks.get(session) === pending)
         this.supervisorManagerPreparationChecks.delete(session);
     }
+  }
+
+  private managerSetupJournal?: ManagerSetupJournal;
+
+  /** One explicit owner action; no background retries, arbitrary prompts or worker input. */
+  private async setupAndStartSupervisorManager(session: Session, requestId: string, callerCurrent: () => boolean) {
+    const configuration = () =>
+      JSON.stringify([
+        session.id,
+        session.owner,
+        session.mode,
+        session.workingDir,
+        session.codexConfig,
+        session.getEnvOverridesForPersist(),
+        session.remote,
+        session.docker,
+      ]);
+    const captured = configuration();
+    const scope = createHash('sha256').update(captured).digest('hex');
+    const role = this.getSupervisorController(session);
+    if (!role) throw new SupervisorValidationError('Manager setup is unavailable');
+    const roleConfiguration = () => {
+      const state = role.getStatus();
+      return JSON.stringify([
+        state.objective,
+        state.enabled,
+        state.workers.map((worker) => [
+          worker.sessionId,
+          worker.task,
+          worker.criteria,
+          worker.maxAssignments,
+          worker.maxRuntimeMs,
+          worker.allowMessages,
+          worker.maxMessages,
+        ]),
+      ]);
+    };
+    const capturedRole = roleConfiguration();
+    const roleIntent = JSON.stringify([role.getStatus().phase, role.getStatus().reason, role.getStatus().history]);
+    let starting = false;
+    const current = () =>
+      callerCurrent() === true &&
+      (starting ||
+        roleIntent === JSON.stringify([role.getStatus().phase, role.getStatus().reason, role.getStatus().history])) &&
+      !this.recoveryStopping &&
+      !this.cleaningUp.has(session.id) &&
+      this.sessions.get(session.id) === session &&
+      configuration() === captured &&
+      this.supervisorManagerIsEligible(session) &&
+      capturedRole === roleConfiguration();
+    this.managerSetupJournal ??= new ManagerSetupJournal();
+    return this.managerSetupJournal.run(session.id, requestId, scope, {
+      current,
+      prepare: () => this.prepareSupervisorManager(session, current),
+      setupTurn: (reserve) => this.sendManagerSetupTurn(session, requestId, current, reserve),
+      start: async () => {
+        if (!current()) return false;
+        starting = true;
+        return (await role.start()).phase === 'active' && current();
+      },
+    });
+  }
+
+  private async sendManagerSetupTurn(
+    session: Session,
+    requestId: string,
+    callerCurrent: () => boolean,
+    reserve: (phase: ManagerSetupPhase) => Promise<void>
+  ): Promise<boolean> {
+    let generation = session.getRecoveryContext().generation;
+    let writing = false;
+    const conversationId = session.codexConfig?.resumeSessionId;
+    const launch = session.captureSupervisorManagerLaunchAuthority();
+    const ownerFrame = session.captureSupervisorManagerOwnerInputAuthority();
+    const paneStartedAt = session.paneStartedAt;
+    const current = () =>
+      callerCurrent() === true &&
+      ownerFrame?.() === true &&
+      (session.getRecoveryContext().generation === generation ||
+        (writing && [generation + 1, generation + 2].includes(session.getRecoveryContext().generation))) &&
+      session.paneStartedAt === paneStartedAt &&
+      session.codexConfig?.resumeSessionId === conversationId &&
+      !session.paneExit &&
+      !session.recoveryInputReserved &&
+      session.inputDispatchAllowed &&
+      !this.controllerHasTaskFlight(session.id) &&
+      !this.controllerHasRecoveryFlight(session.id) &&
+      !this.supervisorStore.loadFailed &&
+      !this.supervisorStore.get(session.id).inFlight &&
+      this.supervisorControllers.get(session.id)?.getStatus().phase !== 'active' &&
+      this.managerTaskAllowsPreparation(session, () => ownerFrame?.() === true);
+    if (!conversationId || !launch || !ownerFrame || session.paneLifecycleInFlight || !current()) return false;
+    const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+    const clientId = 'manager-setup-' + createHash('sha256').update(requestId).digest('hex');
+    let submittedAt = 0;
+    const submitted = await queueInputDispatch(session, MANAGER_SETUP_PROMPT.length + 1, async () => {
+      if (!current() || session.isBusy() || session.watching || !(await ownerFrame.confirm()) || !current())
+        return false;
+      const observation = await adapter.observe();
+      const tail = adapter.getVerifiedTail(conversationId);
+      const source = adapter.getLocalEvidenceSource(conversationId, generation);
+      const pane = await session.inspectRecoveryPane();
+      if (
+        !current() ||
+        !pane ||
+        pane.dead ||
+        !pane.paneId ||
+        !pane.panePid ||
+        !source ||
+        source.identity.tailTruncated !== false ||
+        !tail ||
+        pane.panePid !== source.inputBroker?.proof.brokerPid ||
+        !hasEmptyCodexComposer(pane.screen ?? '') ||
+        observation.conversationId !== conversationId ||
+        source.inputBroker?.proof.closed !== false ||
+        !source.inputBroker.proof.childPid ||
+        !permitsCodexManagerSetup(
+          tail,
+          {
+            conversationId,
+            now: Date.now(),
+            screen: pane.screen,
+            busy: false,
+            watching: false,
+            tailTruncated: source.identity.tailTruncated,
+            lastIntentionalStopAt: session.getRecoveryContext().intentionalStopAt,
+          },
+          paneStartedAt
+        ) ||
+        !(await adapter.confirmLocalEvidence(conversationId, generation)) ||
+        !current()
+      )
+        return false;
+      const paneId = pane.paneId,
+        panePid = pane.panePid;
+      const samePane = async (expected?: string) => {
+        const fresh = await session.inspectRecoveryPane();
+        return (
+          current() &&
+          !session.isBusy() &&
+          !session.watching &&
+          fresh?.dead === false &&
+          fresh.paneId === paneId &&
+          fresh.panePid === panePid &&
+          (expected === undefined
+            ? hasEmptyCodexComposer(fresh.screen ?? '')
+            : hasAcknowledgedCodexComposerCapture(fresh.screen ?? '', expected, pane.screen ?? ''))
+        );
+      };
+      const write = async (input: string, seq: number) => {
+        if (!current() || !session.deferInputSeq(clientId, seq) || !session.shouldApplyInput(clientId, seq))
+          return false;
+        writing = true;
+        try {
+          const result = await session.writeAsync(input, {
+            fromUser: true,
+            inputSeq: { clientId, seq },
+            isCurrent: current,
+          });
+          if (session.getRecoveryContext().generation !== generation + 2) throw Error('Setup input generation changed');
+          generation += 2;
+          return result;
+        } finally {
+          writing = false;
+          // Committed/partially dispatched identities remain sealed by Session.
+          session.forgetInputSeq(clientId, seq);
+        }
+      };
+      await reserve('literal-reserved');
+      if (!(await samePane()) || !(await ownerFrame.confirm()) || !current()) return false;
+      if (!(await write(MANAGER_SETUP_PROMPT, 1))) return false;
+      await reserve('literal-sent');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (!(await samePane(MANAGER_SETUP_PROMPT)) || !(await ownerFrame.confirm()) || !current()) return false;
+      await reserve('enter-reserved');
+      if (!(await samePane(MANAGER_SETUP_PROMPT)) || !current()) return false;
+      submittedAt = Date.now();
+      if (!(await write('\r', 2))) return false;
+      await reserve('submitted');
+      return true;
+    });
+    if (!submitted || !current()) return false;
+    const hash = createHash('sha256').update(MANAGER_SETUP_PROMPT).digest('hex');
+    const deadline = performance.now() + 40_000;
+    while (current() && performance.now() < deadline) {
+      const observation = await adapter.observe();
+      const submission = session.getRecoveryContext().submission;
+      if (
+        current() &&
+        observation.activity === 'completed' &&
+        observation.conversationId === conversationId &&
+        observation.submissionHash === hash &&
+        submission?.hash === hash &&
+        submission.at >= submittedAt &&
+        hasFreshProcessReady(observation, paneStartedAt, Date.now()) &&
+        (await adapter.confirmLocalEvidence(conversationId, generation)) &&
+        current()
+      ) {
+        await reserve('turn-completed');
+        return true;
+      }
+      if (!['unknown', 'paused', 'working', 'completed', 'idle'].includes(observation.activity)) return false;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return false;
   }
 
   /** Only these numeric binds guarantee the bridge's IPv4 loopback endpoint. */

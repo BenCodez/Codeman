@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { describe, expect, it } from 'vitest';
 import {
   classifyCodexTail,
+  permitsCodexManagerSetup,
   hasEmptyCodexComposer,
   hasCodexComposerText,
   type CodexClassificationContext,
@@ -628,6 +629,25 @@ describe('native thread settings ownership boundary', () => {
       disabled_plugin_ids: [],
     },
   });
+  it('permits only a current native settings pause above a completed, otherwise clean conversation', () => {
+    const completed = tail(start(), complete(), settings());
+    expect(permitsCodexManagerSetup(completed, context(), NOW - 9000)).toBe(true);
+    expect(permitsCodexManagerSetup(completed, context({ tailTruncated: true }), NOW - 9000)).toBe(false);
+    expect(permitsCodexManagerSetup(completed, context(), NOW - 1000)).toBe(false);
+    expect(permitsCodexManagerSetup(tail(start(), settings()), context(), NOW - 10000)).toBe(false);
+    expect(permitsCodexManagerSetup(completed.slice(0, -1), context(), NOW - 10000)).toBe(false);
+  });
+  it.each([
+    { type: 'error', message: 'Authentication failed', codex_error_info: 'Unauthorized' },
+    { type: 'error', message: 'Usage limit', codex_error_info: 'UsageLimitExceeded' },
+    { type: 'error', message: 'failed to load workspace requirements', codex_error_info: 'Other' },
+    { type: 'turn_aborted', turn_id: TURN, reason: 'interrupted' },
+    { type: 'request_permissions', turn_id: TURN },
+    { type: 'collab_agent_spawn_end', new_thread_id: AGENT, status: 'running' },
+  ])('never removes another veto during settings setup: %j', (veto) => {
+    expect(permitsCodexManagerSetup(tail(start(), complete(), veto, settings()), context(), NOW - 10000)).toBe(false);
+  });
+
   it('requires a subsequent owner message and fresh lifecycle after applied settings', () => {
     expect(classifyCodexTail(failed(settings()), context())).toMatchObject({ activity: 'paused', safeToAct: false });
     const input = { type: 'user_message', message: 'Owner confirmed next turn', local_images: [] };

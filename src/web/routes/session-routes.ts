@@ -1,3 +1,5 @@
+import { registerSshCodexConversionRoutes } from './ssh-codex-conversion-routes.js';
+import { remoteCodexLauncher } from '../../recovery/remote-codex-launcher.js';
 /**
  * @fileoverview Session management routes.
  * Covers session CRUD, input/output, terminal buffer, quick-start, quick-run,
@@ -981,6 +983,7 @@ export function registerSessionRoutes(
   /** Test seam: inject a registry with fake IO instead of the real TCP/WoL probes. */
   options: { remoteWake?: RemoteWakeRegistry } = {}
 ): RemoteWakeRegistry {
+  registerSshCodexConversionRoutes(app, ctx);
   let stopBrokerCleanup: (() => Promise<void>) | undefined;
   app.addHook('onReady', async () => {
     stopBrokerCleanup = ownedRemoteBrokerCache.startFinalCleanupRetries((id) => ({
@@ -4202,10 +4205,10 @@ export function registerSessionRoutes(
           'Remote cases only accept Codex launch config and an absolute CODEX_HOME override; effort, advisorModel, modelOverride, other environment/config fields, and custom model endpoints do not cross ssh.'
         );
       }
-      if (remoteRecoveryCapable && host.commands?.[mode] && hasRemoteCodexLaunchConfig) {
+      if (remoteRecoveryCapable && host.commands?.[mode] && !remoteCodexLauncher(host) && hasRemoteCodexLaunchConfig) {
         return createErrorResponse(
           ApiErrorCode.INVALID_INPUT,
-          'A remote Codex host command override cannot be combined with per-session codexConfig or CODEX_HOME.'
+          'A remote Codex shell command cannot be combined with per-session codexConfig or CODEX_HOME. Set the host Codex command to an argv-forwarding executable such as codex-workspace.'
         );
       }
 

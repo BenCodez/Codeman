@@ -523,6 +523,29 @@ export interface ClaudeMessage {
  * @fires Session#autoClear - Token threshold reached, clearing context
  * @fires Session#autoCompact - Token threshold reached, compacting context
  */
+export interface OwnedRemoteShellConversionOptions {
+  retainedSessionName: string;
+  codexConfig: CodexConfig;
+  codexHome: string;
+  /** Durably reserve this exact attempt before any remote mutation. */
+  prepare(): Promise<boolean>;
+  isCurrent(): boolean;
+  dispatch(
+    remote: SessionRemote,
+    isCurrent: () => boolean
+  ): Promise<
+    | {
+        status: 'converted';
+        retainedSessionName: string;
+        replacementPane: import('./recovery/remote-input-broker.js').RemoteBrokerDeadPane;
+      }
+    | { status: 'not-sent' | 'unknown' }
+  >;
+}
+export type OwnedRemoteShellConversionResult =
+  | { status: 'converted'; replacement: Session; retainedSessionName: string }
+  | { status: 'not-sent' | 'unknown' };
+
 export class Session extends EventEmitter {
   readonly id: string;
   readonly workingDir: string;
@@ -1047,6 +1070,10 @@ export class Session extends EventEmitter {
       Object.hasOwn(this._muxSession, 'restoreUncertain') &&
       this._muxSession.restoreUncertain !== false;
     this._preserveExitedPane = (config.preserveExitedPane ?? false) || this._codexRestoreWorkerMayExist;
+    if (this._muxSession?.remoteShellConversion && this._muxSession.remoteShellConversion.phase !== 'converted') {
+      this._preserveExitedPane = true;
+      this._remoteWakeAttachmentReady = false;
+    }
     this._recoveryCodexHome = normalizedCodexHome(config.recoveryCodexHome);
     // Construction never performs private disk I/O. Unknown private evidence
     // remains pending until bounded asynchronous initialization completes.
@@ -2241,6 +2268,7 @@ export class Session extends EventEmitter {
       throw new Error('An uncertain reboot worker requires owner inspection of its existing pane');
     const preserveExitedPane =
       this._preserveExitedPane ||
+      (!!this._muxSession?.remoteShellConversion && this._muxSession.remoteShellConversion.phase !== 'converted') ||
       this._codexRestoreWorkerMayExist ||
       this._restoreLaunchMayExist ||
       this._discoveredMuxSession ||
@@ -2385,6 +2413,240 @@ export class Session extends EventEmitter {
   }
 
   /**
+   * Owner-confirmed conversion retains the original remote shell and replaces only
+   * its local SSH attachment. An uncertain attempt stays sealed against input/retry.
+   * The server must durably publish the replacement before retiring this object.
+   */
+  async convertOwnedRemoteShell(options: OwnedRemoteShellConversionOptions): Promise<OwnedRemoteShellConversionResult> {
+    const mux = this._mux,
+      record = this._muxSession,
+      remote = this._remote;
+    const home = normalizedCodexHome(options.codexHome);
+    if (
+      this.mode !== 'shell' ||
+      !remote ||
+      remote.owned === false ||
+      this._docker ||
+      !this._useMux ||
+      !mux?.convertOwnedRemoteShell ||
+      !record ||
+      record.mode !== 'shell' ||
+      record.sessionId !== this.id ||
+      record.owner !== this.owner ||
+      JSON.stringify(record.remote) !== JSON.stringify(remote) ||
+      this._discoveredMuxSession ||
+      this._closing ||
+      this._isStopped ||
+      this.paneLifecycleInFlight ||
+      this.isBusy() ||
+      this._isWorking ||
+      this.watching ||
+      this._currentTaskId !== null ||
+      this._childAgentIds.length > 0 ||
+      this._remoteWakeAttachmentReady === false ||
+      record.remoteShellConversion !== undefined ||
+      !/^codeman-retained-[a-f0-9-]{8,64}$/.test(options.retainedSessionName) ||
+      !home ||
+      options.codexConfig.noDaemon !== true ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(options.codexConfig.resumeSessionId ?? '') ||
+      (this._envOverrides?.CODEX_HOME !== undefined && normalizedCodexHome(this._envOverrides.CODEX_HOME) !== home)
+    )
+      return { status: 'not-sent' };
+    const config = structuredClone(options.codexConfig);
+    const env = { ...this._envOverrides, CODEX_HOME: home };
+    const retainedSessionName = options.retainedSessionName;
+    let scope = JSON.stringify([this.owner, remote, this._envOverrides, this._codexConfig, record]);
+    const current = () => {
+      try {
+        return (
+          options.isCurrent() === true &&
+          !this._closing &&
+          !this._isStopped &&
+          this._mux === mux &&
+          this._muxSession === record &&
+          this._remote === remote &&
+          JSON.stringify([this.owner, remote, this._envOverrides, this._codexConfig, record]) === scope &&
+          JSON.stringify(options.codexConfig) === JSON.stringify(config) &&
+          options.codexHome === home &&
+          options.retainedSessionName === retainedSessionName &&
+          !this._isWorking &&
+          !this.isBusy() &&
+          !this.watching &&
+          this._currentTaskId === null &&
+          this._childAgentIds.length === 0
+        );
+      } catch {
+        return false;
+      }
+    };
+    const authorized = async () => {
+      if (!current()) return false;
+      const [allowed, allowedEnv] = await Promise.all([
+        clampExternalCliConfigsForOwner(this.owner, { codexConfig: config }),
+        clampEnvOverridesForOwner(this.owner, env),
+      ]);
+      return (
+        current() &&
+        JSON.stringify(allowed.codexConfig) === JSON.stringify(config) &&
+        JSON.stringify(allowedEnv) === JSON.stringify(env)
+      );
+    };
+    let attempted = false;
+    try {
+      return await this._withPaneLifecycle(async () => {
+        if (!(await authorized()) || !(await options.prepare()) || !(await authorized())) return { status: 'not-sent' };
+        record.remoteShellConversion = {
+          retainedSessionName,
+          conversationId: config.resumeSessionId!,
+          codexHome: home,
+          phase: 'pending',
+        };
+        scope = JSON.stringify([this.owner, remote, this._envOverrides, this._codexConfig, record]);
+        attempted = true;
+        this._remoteWakeAttachmentReady = false;
+        await mux.flushSessionsDurably(current);
+        if (!(await authorized())) return { status: 'unknown' };
+        const result = await options.dispatch(remote, current);
+        if (result.status === 'not-sent') {
+          delete record.remoteShellConversion;
+          scope = JSON.stringify([this.owner, remote, this._envOverrides, this._codexConfig, record]);
+          try {
+            await mux.flushSessionsDurably(current);
+          } catch {
+            record.remoteShellConversion = {
+              retainedSessionName,
+              conversationId: config.resumeSessionId!,
+              codexHome: home,
+              phase: 'pending',
+            };
+            return { status: 'unknown' };
+          }
+          this._remoteWakeAttachmentReady = undefined;
+          return { status: 'not-sent' };
+        }
+        if (
+          result.status !== 'converted' ||
+          result.retainedSessionName !== retainedSessionName ||
+          !(await authorized())
+        )
+          return { status: 'unknown' };
+        const converted = await mux.convertOwnedRemoteShell!(
+          {
+            sessionId: this.id,
+            workingDir: this.workingDir,
+            mode: 'codex',
+            name: this._name,
+            owner: this.owner,
+            remote,
+            codexConfig: config,
+            recoveryCodexHome: home,
+            envOverrides: env,
+            niceConfig: this._niceConfig,
+            historyLimit: this._tmuxHistoryLimit,
+            remoteLaunchCurrent: current,
+            remoteLaunchPrepare: authorized,
+          },
+          result.replacementPane,
+          record
+        );
+        if (
+          !(await authorized()) ||
+          converted.mode !== 'codex' ||
+          converted.owner !== this.owner ||
+          converted.codexRestoreUncertain !== false ||
+          converted.recoveryInputBrokerPending !== undefined ||
+          !converted.recoveryInputBroker ||
+          converted.recoveryCodexHome !== home ||
+          JSON.stringify(converted.codexRestoreConfig) !== JSON.stringify(config) ||
+          JSON.stringify(converted.remote) !== JSON.stringify(remote)
+        )
+          return { status: 'unknown' };
+        const replacement = new Session({
+          id: this.id,
+          createdAt: this.createdAt,
+          workingDir: this.workingDir,
+          mode: 'codex',
+          name: this._name,
+          nameSource: this._nameSource,
+          owner: this.owner,
+          remote: structuredClone(remote),
+          mux,
+          useMux: true,
+          muxSession: converted,
+          codexConfig: config,
+          envOverrides: env,
+          recoveryCodexHome: home,
+          niceConfig: { ...this._niceConfig },
+          tmuxHistoryLimit: this._tmuxHistoryLimit,
+          parentSessionId: this._parentSessionId,
+          attachmentHistory: structuredClone(this._attachmentHistory),
+          lastActivityAt: this._wireActivityAt,
+        });
+        replacement.restorePin(this._pinned, this._pinnedAt ?? undefined);
+        replacement.setColor(this._color);
+        replacement.flickerFilterEnabled = this._flickerFilterEnabled;
+        return { status: 'converted', replacement, retainedSessionName: result.retainedSessionName };
+      });
+    } catch {
+      if (attempted) this._remoteWakeAttachmentReady = false;
+      return { status: attempted ? 'unknown' : 'not-sent' };
+    }
+  }
+
+  /** Release a pending conversion only after the server durably published this replacement. */
+  async commitOwnedRemoteShellConversion(isCurrent: () => boolean): Promise<boolean> {
+    const record = this._muxSession,
+      mux = this._mux,
+      marker = record?.remoteShellConversion;
+    if (
+      this.mode !== 'codex' ||
+      !this._remote ||
+      this._remote.owned === false ||
+      !mux ||
+      !record ||
+      !marker ||
+      marker.phase !== 'pending' ||
+      marker.conversationId !== this._codexConfig?.resumeSessionId ||
+      marker.codexHome !== normalizedCodexHome(this._recoveryCodexHome) ||
+      !record.recoveryInputBroker ||
+      record.recoveryInputBrokerPending !== undefined ||
+      record.codexRestoreUncertain !== false
+    )
+      return false;
+    const scope = JSON.stringify([this.owner, this._remote, this._codexConfig, this._envOverrides]);
+    const current = () => {
+      try {
+        return (
+          isCurrent() === true &&
+          !this._closing &&
+          !this._isStopped &&
+          this._mux === mux &&
+          this._muxSession === record &&
+          mux.getSession(this.id) === record &&
+          record.remoteShellConversion === marker &&
+          JSON.stringify([this.owner, this._remote, this._codexConfig, this._envOverrides]) === scope
+        );
+      } catch {
+        return false;
+      }
+    };
+    if (!current()) return false;
+    marker.phase = 'converted';
+    try {
+      await mux.flushSessionsDurably(current);
+      if (!current()) throw new Error('SSH shell conversion publication changed');
+      this._preserveExitedPane = false;
+      this._remoteWakeAttachmentReady = undefined;
+      return true;
+    } catch {
+      marker.phase = 'pending';
+      this._preserveExitedPane = true;
+      this._remoteWakeAttachmentReady = false;
+      return false;
+    }
+  }
+
+  /**
    * COD-108 — re-establish a dropped REMOTE session. Triggered by the
    * `TmuxManager` remote-reconnect watcher (via `remoteSessionDropped`): the
    * watcher detects a dead remote pane, the session owner reassembles the SAME
@@ -2400,7 +2662,13 @@ export class Session extends EventEmitter {
    * @returns true if the pane was respawned (reattach issued), false otherwise.
    */
   async reattachRemote(): Promise<boolean> {
-    if (this.paneLifecycleInFlight || this._closing || this._isStopped) return false;
+    if (
+      this.paneLifecycleInFlight ||
+      this._closing ||
+      this._isStopped ||
+      (this._muxSession?.remoteShellConversion && this._muxSession.remoteShellConversion.phase !== 'converted')
+    )
+      return false;
     if (!this._remote || !this._useMux || !this._mux || !this._muxSession) return false;
     return this._withPaneLifecycle(() => this._doReattachRemote());
   }
@@ -2537,6 +2805,33 @@ export class Session extends EventEmitter {
             this._supervisorManagerProfile === profile ? this.revokeSupervisorManagerLaunch() : Promise.resolve(),
         })
       : undefined;
+  }
+
+  /** Exact restricted-profile continuity while a queued owner frame publishes its input fence.
+   * This grants no automatic action and deliberately does not certify an idle pane.
+   */
+  captureSupervisorManagerOwnerInputAuthority(): ((() => boolean) & { confirm(): Promise<boolean> }) | undefined {
+    const profile = this._supervisorManagerProfile;
+    if (!profile || this.paneLifecycleInFlight || !this.isSupervisorManagerLaunchCurrent()) return undefined;
+    const current = () => {
+      const context = this.getRecoveryContext();
+      return (
+        this._supervisorManagerProfile === profile &&
+        profile.isCurrent() === true &&
+        !this._closing &&
+        !this._isStopped &&
+        this._paneLifecycleOps === 0 &&
+        this.mode === 'codex' &&
+        !this._remote &&
+        !this._docker &&
+        context.managed &&
+        context.noDaemon &&
+        !context.untrackedInput &&
+        !context.inputBrokerPending &&
+        this._mux?.isSupervisorManagerLaunchCurrent?.(this.id, profile) === true
+      );
+    };
+    return Object.assign(current, { confirm: async () => current() && (await profile.confirm(true)) && current() });
   }
 
   /** Explicit owner conversion of a separately verified idle pane; no create or fallback path. */
@@ -6133,6 +6428,8 @@ export class Session extends EventEmitter {
    * ```
    */
   async startShell(): Promise<void> {
+    if (this._muxSession?.remoteShellConversion && this._muxSession.remoteShellConversion.phase !== 'converted')
+      throw new Error('SSH shell conversion requires owner inspection');
     if (this._inputDeliveryInFlight) throw new Error('Session recovery is in progress');
     if (this.ptyProcess) {
       throw new Error('Session already has a running process');

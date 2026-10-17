@@ -460,6 +460,7 @@ describe('transport canonical task prompts', () => {
       name: 'accepts both real kickoff and continuation bytes and processes subsequent structured progress',
       kind: 'recorded-pipe',
     },
+    { name: 'accepts native blank separator through initial and final task input checks', kind: 'native-spacing' },
     { name: 'refuses canonical task delivery without an explicit private pipe fixture', kind: 'missing-pipe' },
     { name: 'refuses controlled owner input without an injected native pane reader', kind: 'missing-owner-pane' },
     { name: 'refuses controlled owner input with an invalid injected native pane reader', kind: 'invalid-owner-pane' },
@@ -499,7 +500,8 @@ describe('transport canonical task prompts', () => {
     vi.spyOn(broker, 'receipt').mockResolvedValue('sent');
     const delivered: string[] = [];
     let enters = 0;
-    const screen = '›\n  example-model high · /tmp\n';
+    const separator = kind === 'native-spacing' ? '\n' : '';
+    const screen = `›\n${separator}  example-model high · /tmp\n`;
     let joinedScreen = screen;
     const captured: string[] = [];
     const commands: string[] = [];
@@ -550,8 +552,12 @@ describe('transport canonical task prompts', () => {
             joinedScreen = screen;
             return { stdout: '' };
           }
-          delivered.push(bytes);
-          joinedScreen = `› ${delivered.at(-1)}\n  example-model high · /tmp\n`;
+          // The native TUI consumes bracketed-paste delimiters; its composer
+          // and history expose the enclosed text, never the terminal protocol.
+          expect(bytes.startsWith('\x1b[200~')).toBe(true);
+          expect(bytes.endsWith('\x1b[201~')).toBe(true);
+          delivered.push(bytes.slice(6, -6));
+          joinedScreen = `› ${delivered.at(-1)}\n${separator}  example-model high · /tmp\n`;
         }
         return { stdout: '' };
       },
@@ -770,15 +776,15 @@ describe('transport canonical task prompts', () => {
       screen,
       screen,
       screen,
-      `› ${delivered[0]}\n  example-model high · /tmp\n`,
-      `› ${delivered[0]}\n  example-model high · /tmp\n`,
-      `› ${delivered[0]}\n  example-model high · /tmp\n`,
+      `› ${delivered[0]}\n${separator}  example-model high · /tmp\n`,
+      `› ${delivered[0]}\n${separator}  example-model high · /tmp\n`,
+      `› ${delivered[0]}\n${separator}  example-model high · /tmp\n`,
       screen,
       screen,
       screen,
-      `› ${delivered[1]}\n  example-model high · /tmp\n`,
-      `› ${delivered[1]}\n  example-model high · /tmp\n`,
-      `› ${delivered[1]}\n  example-model high · /tmp\n`,
+      `› ${delivered[1]}\n${separator}  example-model high · /tmp\n`,
+      `› ${delivered[1]}\n${separator}  example-model high · /tmp\n`,
+      `› ${delivered[1]}\n${separator}  example-model high · /tmp\n`,
     ]);
     expect(loadedFrames).toHaveLength(4);
     expect(buffers.size).toBe(0);

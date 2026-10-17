@@ -124,8 +124,11 @@ Key points:
 - **Owned Codex** has its own exact command builder. Quick-start accepts
   `codexConfig` plus an absolute `CODEX_HOME` override and renders the model,
   reasoning, isolation, approval, display and resume options inside the remote
-  login shell. A per-host `commands.codex` override cannot be combined with
-  these fields because Codeman could not prove what it launched.
+  login shell. A per-host `commands.codex` value naming a single executable (for example,
+  `codex-workspace` or `/opt/bin/codex-workspace`) receives the same exact argv.
+  That launcher must forward its arguments and preserve the supplied environment.
+  Full shell command overrides cannot be combined with these fields because
+  Codeman cannot render an exact controlled launch for them.
 - The **whole tmux invocation is a single shell-quoted ssh argument**, and the
   pane command is independently quoted, so a `remotePath` with spaces is safe.
 - Connection options come from the **same `buildSshConnectionArgs(remote)`** as
@@ -283,7 +286,9 @@ recovery-isolated session, and a second observation matches its pane id, pid,
 status, signal and exact conversation. The guarded remote command checks those
 values again and uses `respawn-pane` without `-k`, so it cannot kill a pane that
 became live. Status zero is a clean exit and is never restarted. Discovered
-`owned:false` sessions and host command overrides are never mutated.
+`owned:false` sessions and full shell command overrides are never mutated. A
+configured launcher executable follows the normal controlled launch path; its name
+alone does not establish healthy process or recovery evidence.
 
 If a host reboot removed the owned private tmux session, automatic recovery
 stops at `remote-session-missing`. The owner can use **Restore remote worker**;
@@ -684,3 +689,38 @@ session-create flow, or via the per-host **"Discover existing sessions"** button
   Key Pattern.
 - `docs/security-architecture.md` — overall network/auth model.
 - COD-104 (tmux prereq + durable launch), COD-105 (discover + attach, detach-not-kill ownership), COD-107 (shell-safe connection args).
+
+
+## Convert an existing SSH shell tab to a Codex chat
+
+Open **Session Options → Session → Convert to Codex chat…** on an owned SSH shell.
+The preview checks the actual remote pane, shell process and working directory,
+then lists existing conversations under that shell's effective Codex home. It uses
+the case's saved host Codex launcher, including a single executable such as
+`codex-workspace`; there is no second launcher setting to maintain.
+
+Select the conversation to resume and confirm preservation of the shell. The
+most recent conversation appears first. An unavailable newest conversation never
+silently selects an older one. Codeman resumes the selected UUID with its verified
+model, approval and sandbox settings, pins its home and working directory, and
+keeps the same browser tab. Recovery and task automation remain opt-in.
+
+The source shell and its scrollback remain alive under the retained remote tmux
+session name shown in the result. The result also gives the remote attachment
+command. Conversion does not kill that shell or send a prompt to it. The local SSH
+transport is replaced to attach the managed Codex pane.
+
+An existing Codex program running inside a shell tab stays open. Return to an idle
+shell before conversion; Codeman refuses child work, a foreground program, another
+Codex process using the same home, changed native pane identities, or uncertain
+conversation evidence. It does not adopt an untracked running Codex process or
+start a fresh conversation as a fallback.
+
+Discovery is deliberately bounded: 2,000 entries, four nested levels, 32 matching
+conversations, and complete rollout evidence up to 512 KiB per conversation within
+a shared response budget. Unsupported permission profiles, incomplete records,
+pending work and oversized evidence are shown as unavailable. Use the normal
+native Codex resume interface for those conversations. The preview expires after
+two minutes; source changes require a new preview. A transport failure after an
+effect seals the conversion for inspection, preserving the retained/staging names
+instead of retrying or guessing a rollback.

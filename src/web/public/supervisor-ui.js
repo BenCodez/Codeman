@@ -500,7 +500,72 @@ Object.assign(CodemanApp.prototype, {
     await this.loadSupervisorStatus();
   },
   async setupAndStartSupervisorManager() {
-    await this.prepareSupervisorManager(true);
+    const view = this._supervisorView;
+    if (!view?.state || view.busy || view.state.phase === 'active' || view.state.inFlight) return;
+    if (
+      !window.confirm(
+        supervisorUiTranslate(
+          'Set up and start this manager? Codeman retains the exact conversation, connects restricted tools and, only for a verified settings change at an empty prompt, sends a harmless setup turn. Then it starts the saved objective and schedules. Uncertain delivery is never retried.'
+        )
+      ) ||
+      this._supervisorView !== view
+    )
+      return;
+    let requestId;
+    const key = `codeman:managerSetup:${view.sessionId}`;
+    try {
+      requestId = sessionStorage.getItem(key);
+      if (requestId && !/^[A-Za-z0-9_:.-]{8,120}$/.test(requestId)) throw new Error('Invalid retained setup request');
+      if (!requestId) {
+        requestId = `manager-setup-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+        sessionStorage.setItem(key, requestId);
+        if (sessionStorage.getItem(key) !== requestId) throw new Error('Setup request storage failed');
+      }
+    } catch {
+      this.showToast(
+        supervisorUiTranslate('Manager setup requires durable request storage. No setup was started.'),
+        'error'
+      );
+      return;
+    }
+    view.busy = true;
+    this._renderSupervisorStatus();
+    let result;
+    try {
+      result = await this._apiJson(`/api/sessions/${encodeURIComponent(view.sessionId)}/supervisor/setup-manager`, {
+        method: 'POST',
+        body: { requestId, confirmRestrictedManager: true },
+      });
+    } catch {
+      result = null;
+    } finally {
+      view.busy = false;
+    }
+    if (this._supervisorView !== view) return;
+    if (
+      result?.sessionId === view.sessionId &&
+      result?.requestId === requestId &&
+      ['started', 'refused'].includes(result.phase)
+    ) {
+      try {
+        sessionStorage.removeItem(key);
+      } catch {
+        /* A retained completed request cannot replay setup. */
+      }
+    }
+    if (result?.sessionId === view.sessionId && result?.requestId === requestId && result.phase === 'started')
+      this.showToast(
+        supervisorUiTranslate('Manager is active. Setup completed using the existing conversation.'),
+        'success'
+      );
+    else
+      this.showToast(
+        supervisorUiTranslate(
+          'Manager setup stopped or remains uncertain. The request is retained; inspect the manager before trying again. No setup input will be replayed.'
+        ),
+        'error'
+      );
+    await this.loadSupervisorStatus();
   },
   async supervisorAction(action) {
     if (!['start', 'pause', 'reset'].includes(action)) return;

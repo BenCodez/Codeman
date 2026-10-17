@@ -53,6 +53,18 @@ export const SupervisorAutomationConfigSchema = DurableConfigSchema.refine(
   (config) => remainingAutomationRuns(config) <= MAX_SUPERVISOR_AUTOMATION_RECEIPTS,
   'Management schedules share 128 lifetime receipt slots; enabled check-ins allocate 100, once tasks 1, and recurring tasks maxRuns (including disabled custom tasks).'
 );
+export const SupervisorOwnerWorkSchema = z
+  .object({
+    requestId: z.string().uuid(),
+    objective: PromptTextSchema.min(1)
+      .max(2000)
+      .refine((text) => !!text.trim()),
+    completionCriteria: PromptTextSchema.min(1)
+      .max(1000)
+      .refine((text) => !!text.trim()),
+  })
+  .strict();
+
 export const SupervisorAutomationRequestSchema = z.object({ requestId: z.string().regex(/^[\w:.-]{8,120}$/) }).strict();
 const Run = z
   .object({

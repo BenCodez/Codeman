@@ -341,23 +341,33 @@ describe('Codex supervisor UI', () => {
     expect(read('index.html')).toMatch(/--no-daemon.*verified Codex identity/s);
   });
 
-  it.each([true, false, undefined])(
-    'one-action Start requires confirmed preparation with literal readiness: %s',
-    async (ready) => {
+  it.each(['started', 'uncertain', 'refused', undefined])(
+    'retains setup request identity until a settled result: %s',
+    async (phase) => {
       const h = harness();
       h.app.openSupervisorOptions(SID);
       await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
       vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
       h.app._apiJson.mockClear();
-      h.app._apiJson.mockImplementation(async (url: string) =>
-        url.endsWith('/prepare-manager') ? { managerReady: ready, managerInspectionOnly: ready === false } : state()
+      h.app._apiJson.mockImplementation(async (url: string, options: any) =>
+        url.endsWith('/setup-manager') ? { sessionId: SID, requestId: options.body.requestId, phase } : state()
       );
       await h.app.setupAndStartSupervisorManager();
-      expect(h.app._apiJson.mock.calls[0]).toEqual([
-        `/api/sessions/${SID}/supervisor/prepare-manager`,
-        { method: 'POST', body: { confirmRestrictedManager: true } },
-      ]);
-      expect(h.app._apiJson.mock.calls.some(([url]: [string]) => url.endsWith('/start'))).toBe(ready === true);
+      const [url, options] = h.app._apiJson.mock.calls[0];
+      expect(url).toBe(`/api/sessions/${SID}/supervisor/setup-manager`);
+      expect(options).toMatchObject({
+        method: 'POST',
+        body: { confirmRestrictedManager: true, requestId: expect.stringMatching(/^manager-setup-/) },
+      });
+      const retained = h.dom.window.sessionStorage.getItem(`codeman:managerSetup:${SID}`);
+      expect(retained).toBe(['started', 'refused'].includes(phase ?? '') ? null : options.body.requestId);
+      expect(h.app._apiJson.mock.calls.some(([path]: [string]) => path.endsWith('/start'))).toBe(false);
+      if (retained) {
+        await h.app.setupAndStartSupervisorManager();
+        expect(
+          h.app._apiJson.mock.calls.findLast(([path]: [string]) => path.endsWith('/setup-manager'))[1].body.requestId
+        ).toBe(retained);
+      }
     }
   );
 

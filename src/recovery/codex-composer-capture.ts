@@ -1,6 +1,6 @@
 /** Preserve the distinction between a native dim placeholder and an owner draft. */
 import { stripAnsi } from '../utils/regex-patterns.js';
-import { hasEmptyCodexComposer } from './codex-classifier.js';
+import { hasCodexComposerText, hasEmptyCodexComposer } from './codex-classifier.js';
 
 export function normalizeCodexComposerCapture(ansi: string, cursor: { row: number; column: number }): string {
   const plain = stripAnsi(ansi);
@@ -33,4 +33,41 @@ export function normalizeCodexComposerCapture(ansi: string, cursor: { row: numbe
   // The cursor, exact styling and known native footer must all agree. A model
   // quotation, multiline draft, approval screen or plain placeholder stays inert.
   return hasEmptyCodexComposer(candidate) ? candidate : plain;
+}
+
+/** Exact acknowledgement of our own text using the admitted native empty footer.
+ * The normal parser stays strict: only a footer captured before this write may
+ * account for native separator rows. Added draft rows or changed chrome refuse.
+ */
+export function hasAcknowledgedCodexComposerCapture(screen: string, expected: string, emptyBaseline: string): boolean {
+  if (
+    Buffer.byteLength(screen) > 65536 ||
+    Buffer.byteLength(emptyBaseline) > 65536 ||
+    !expected ||
+    /[\r\n]/.test(expected)
+  )
+    return false;
+  if (!hasEmptyCodexComposer(emptyBaseline)) return false;
+  if (hasCodexComposerText(screen, expected)) return true;
+  const parts = (capture: string) => {
+    const rows = capture.split('\n');
+    while (rows.length && !rows[rows.length - 1].trim()) rows.pop();
+    let index = -1;
+    for (let i = rows.length - 1; i >= 0; i--)
+      if (/^\s*›(?:\s|$)/u.test(rows[i])) {
+        index = i;
+        break;
+      }
+    return index < 0 ? undefined : { text: rows[index].replace(/^\s*› ?/u, ''), footer: rows.slice(index + 1) };
+  };
+  const baseline = parts(emptyBaseline),
+    actual = parts(screen);
+  return (
+    !!baseline &&
+    !!actual &&
+    baseline.text.trim() === '' &&
+    actual.text === expected &&
+    baseline.footer.length > 0 &&
+    JSON.stringify(actual.footer) === JSON.stringify(baseline.footer)
+  );
 }

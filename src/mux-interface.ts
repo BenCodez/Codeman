@@ -35,6 +35,13 @@ import type {
  * Multiplexer session metadata.
  */
 export interface MuxSession {
+  /** Crash-safe owner conversion fence; a pending attempt must never reconnect or relaunch. */
+  remoteShellConversion?: {
+    retainedSessionName: string;
+    conversationId: string;
+    codexHome: string;
+    phase: 'pending' | 'converted';
+  };
   /** An uncommitted local custom-profile launch is inspection-only across server restarts. */
   restoreUncertain?: boolean;
   /** A guarded reboot launch may have started; preserve this exact pane until owner inspection. */
@@ -366,6 +373,12 @@ export interface TerminalMultiplexer extends EventEmitter {
     sessionId: string,
     profile: import('./supervisor/manager-launch.js').SupervisorManagerLaunch
   ): boolean;
+  /** Owner-confirmed SSH shell conversion, scoped to a newly certified inert remote pane. */
+  convertOwnedRemoteShell?(
+    options: CreateSessionOptions,
+    expectedPane: import('./recovery/remote-input-broker.js').RemoteBrokerDeadPane,
+    source: MuxSession
+  ): Promise<MuxSession>;
   /** Optional private reference provider: unknown snapshots disable broker retirement. */
   setBrokerCleanupReferenceProvider?(
     provider: import('./recovery/codex-broker-cleanup.js').BrokerCleanupReferenceProvider

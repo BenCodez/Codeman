@@ -32,6 +32,7 @@ import {
   type OwnedRemoteBrokerDescriptor,
 } from './recovery/remote-input-broker-cache.js';
 import { provisionRemoteInputBroker } from './recovery/remote-input-broker.js';
+import { remoteCodexLauncher } from './recovery/remote-codex-launcher.js';
 import { observeOwnedRemoteBroker } from './recovery/remote-broker-launch.js';
 import type { PrivateFileWitness } from './recovery/private-file-witness.js';
 import { collectDescendants } from './proc-tree.js';
@@ -47,8 +48,11 @@ import { writeFile, rename, mkdir, open, unlink, lstat, link } from 'node:fs/pro
 import { dirname, join, isAbsolute, posix } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
-import { hasCodexComposerText, hasEmptyCodexComposer } from './recovery/codex-classifier.js';
-import { normalizeCodexComposerCapture } from './recovery/codex-composer-capture.js';
+import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
+import {
+  normalizeCodexComposerCapture,
+  hasAcknowledgedCodexComposerCapture,
+} from './recovery/codex-composer-capture.js';
 import {
   dataPath,
   getDataDirPath,
@@ -1179,11 +1183,25 @@ function buildRemoteRecoveryLoginCommand(options: {
   sessionId: string;
   codexConfig?: CodexConfig;
   codexHome?: string;
+  launcher?: string;
 }): string {
   if (options.entry.capabilities.recovery !== 'codex-rollout') {
     throw new Error(`Remote recovery launch is not supported for ${options.mode}`);
   }
-  const codexCmd = buildSpawnCommandFromRegistry(options.entry, {
+  const codexEntry = options.launcher
+    ? {
+        ...options.entry,
+        launch: {
+          ...options.entry.launch,
+          variants: options.entry.launch.variants.map((variant) => {
+            if (variant.args[0] && 'lit' in variant.args[0] && variant.args[0].lit === 'codex')
+              return { ...variant, args: [{ lit: shellescape(options.launcher!) }, ...variant.args.slice(1)] };
+            throw new Error('Remote Codex launcher requires the native Codex argv template');
+          }),
+        },
+      }
+    : options.entry;
+  const codexCmd = buildSpawnCommandFromRegistry(codexEntry, {
     mode: options.mode,
     sessionId: options.sessionId,
     codexConfig: options.codexConfig,
@@ -1202,13 +1220,18 @@ export function buildRemoteCodexPaneCommand(options: {
   sessionId: string;
   codexConfig?: CodexConfig;
   codexHome?: string;
+  remote?: Pick<SessionRemote, 'commands'>;
 }): string {
+  const launcher = remoteCodexLauncher(options.remote ?? {});
+  if (!launcher)
+    throw new Error('Managed Codex requires a launcher executable that forwards argv, not a shell command');
   const entry = getCli('codex');
   if (!entry) throw new Error('Cannot resolve the Codex CLI registry entry');
   return `cd ${shellescape(options.remotePath)} && ${buildRemoteRecoveryLoginCommand({
     ...options,
     entry,
     mode: 'codex',
+    launcher,
   })}`;
 }
 
@@ -1279,7 +1302,7 @@ export function buildRemoteLaunchCommand(options: {
   // only an interactive login shell resolves (see that function's comment).
   const override = remote.commands?.[mode];
   let modeCommand: string;
-  if (override) {
+  if (override && !(mode === 'codex' && remoteCodexLauncher(remote))) {
     modeCommand = override;
   } else if (mode === 'claude') {
     // Deterministic conversation pinning for SSH-remote claude (mirrors the
@@ -1348,6 +1371,7 @@ export function buildRemoteLaunchCommand(options: {
       sessionId,
       codexConfig,
       codexHome: envOverrides?.CODEX_HOME,
+      launcher: mode === 'codex' ? remoteCodexLauncher(remote) : undefined,
     });
   } else {
     modeCommand = defaultRemoteCommandForMode(mode);
@@ -2218,6 +2242,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         createHash('sha256')
           .update(
             buildRemoteCodexPaneCommand({
+              remote: scope.remote,
               sessionId,
               remotePath: scope.remote.remotePath,
               codexHome: scope.codexHome,
@@ -2280,7 +2305,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
   /** PID 0 with an incarnation records a possible dispatch whose native receipt was lost. */
   private uncertainBrokerRegistration(session: MuxSession | undefined): boolean {
-    return !!session?.recoveryInputBroker && session.pid === 0;
+    return (
+      (!!session?.remoteShellConversion && session.remoteShellConversion.phase !== 'converted') ||
+      (!!session?.recoveryInputBroker && session.pid === 0)
+    );
   }
 
   canDeliverCodexOwnerInput(sessionId: string): boolean {
@@ -2595,7 +2623,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     return `exec python3 ${shellescape(`${broker.directory}/broker.py`)} ${shellescape(broker.directory)} ${shellescape(broker.configurationDigest)}`;
   }
 
-  private async prepareOwnedRemoteLaunch(options: CreateSessionOptions, codexHome: string) {
+  private async prepareOwnedRemoteLaunch(
+    options: CreateSessionOptions,
+    codexHome: string,
+    conversion?: { record: MuxSession; expectedPane: import('./recovery/remote-input-broker.js').RemoteBrokerDeadPane }
+  ) {
     const remote = options.remote!;
     let before = this.sessions.get(options.sessionId);
     const retainedBinding = before && JSON.stringify(before);
@@ -2631,6 +2663,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       isCurrent: current,
     };
     const command = buildRemoteCodexPaneCommand({
+      remote,
       remotePath: remote.remotePath,
       sessionId: options.sessionId,
       codexConfig: options.codexConfig,
@@ -2646,7 +2679,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         configJson: JSON.stringify(material.config),
       },
       authority,
-      { planOnly: true }
+      { planOnly: true, ...(conversion ? { expectedPane: conversion.expectedPane } : {}) }
     );
     if (!current()) throw new Error('Owned SSH launch authority changed');
     if (planned.status === 'existing') {
@@ -2686,6 +2719,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           createHash('sha256')
             .update(
               buildRemoteCodexPaneCommand({
+                remote,
                 remotePath: remote.remotePath,
                 sessionId: options.sessionId,
                 codexConfig: options.codexConfig,
@@ -2733,7 +2767,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       codexHome,
       owner: options.owner,
     };
-    if (before) throw new Error('Owned SSH launch already has a local registration');
+    if (before && (!conversion || before !== conversion.record || before.mode !== 'shell'))
+      throw new Error('Owned SSH launch already has a local registration');
     const descriptor = await ownedRemoteBrokerCache.prepare(scope, material, planned.directory);
     let reservationAttempted = false;
     try {
@@ -2743,8 +2778,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const reservation: MuxSession = {
         sessionId: options.sessionId,
         muxName: `codeman-${options.sessionId.slice(0, 8)}`,
-        pid: 0,
-        createdAt: Date.now(),
+        pid: conversion?.record.pid ?? 0,
+        createdAt: conversion?.record.createdAt ?? Date.now(),
         workingDir: options.workingDir,
         mode: options.mode,
         attached: false,
@@ -2753,6 +2788,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         recoveryCodexHome: codexHome,
         recoveryIsolated: true,
         codexRestoreConfig: options.codexConfig && structuredClone(options.codexConfig),
+        ...(conversion
+          ? {
+              codexRestoreUncertain: true,
+              remoteShellConversion:
+                conversion.record.remoteShellConversion && structuredClone(conversion.record.remoteShellConversion),
+            }
+          : {}),
       };
       this.sessions.set(options.sessionId, reservation);
       before = reservation;
@@ -2773,7 +2815,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           configJson: JSON.stringify(material.config),
         },
         authority,
-        { root: posix.dirname(posix.dirname(planned.directory)), ownerInitialLaunch: true }
+        {
+          root: posix.dirname(posix.dirname(planned.directory)),
+          ownerInitialLaunch: !conversion,
+          ...(conversion ? { expectedPane: conversion.expectedPane } : {}),
+        }
       );
       if (provisioned.status !== 'provisioned' || provisioned.directory !== descriptor.directory || !current())
         throw new Error('Owned SSH launch provisioning needs owner inspection');
@@ -2808,6 +2854,69 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         await ownedRemoteBrokerCache.discardUnreservedPreparation(scope, descriptor);
     }
   }
+  private remoteConversionAttachPermits?: WeakSet<RespawnPaneOptions>;
+
+  /** Explicit shell conversion: launch into only the newly certified inert remote pane. */
+  async convertOwnedRemoteShell(
+    options: CreateSessionOptions,
+    expectedPane: import('./recovery/remote-input-broker.js').RemoteBrokerDeadPane,
+    source: MuxSession
+  ): Promise<MuxSession> {
+    const remote = options.remote;
+    const home = normalizedCodexHome(options.recoveryCodexHome);
+    if (
+      !remote ||
+      remote.owned === false ||
+      options.mode !== 'codex' ||
+      options.codexConfig?.noDaemon !== true ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(options.codexConfig.resumeSessionId ?? '') ||
+      !home ||
+      this.sessions.get(options.sessionId) !== source ||
+      source.mode !== 'shell' ||
+      source.owner !== options.owner ||
+      source.workingDir !== options.workingDir ||
+      JSON.stringify(source.remote) !== JSON.stringify(remote) ||
+      source.recoveryInputBroker !== undefined ||
+      source.recoveryInputBrokerPending !== undefined ||
+      source.codexRestoreUncertain !== undefined ||
+      source.remoteShellConversion?.phase !== 'pending' ||
+      source.remoteShellConversion.conversationId !== options.codexConfig.resumeSessionId ||
+      source.remoteShellConversion.codexHome !== home ||
+      !options.remoteLaunchCurrent ||
+      !options.remoteLaunchPrepare
+    )
+      throw new Error('SSH shell conversion authority is unavailable');
+    const prepared = await this.prepareOwnedRemoteLaunch(options, home, { record: source, expectedPane });
+    if (!prepared?.incarnation || !prepared.isCurrent()) throw new Error('SSH shell conversion broker is unavailable');
+    const record = this.sessions.get(options.sessionId);
+    if (!record || record === source || record.recoveryInputBroker !== prepared.incarnation)
+      throw new Error('SSH shell conversion registration is uncertain');
+    const attachOptions: RespawnPaneOptions = {
+      ...options,
+      remoteAttachOnly: true,
+      ownerLaunchIsCurrent: prepared.isCurrent,
+    };
+    const permits = (this.remoteConversionAttachPermits ??= new WeakSet());
+    permits.add(attachOptions);
+    let pid: number | null;
+    try {
+      pid = await this.respawnPane(attachOptions);
+    } finally {
+      permits.delete(attachOptions);
+    }
+    if (!pid || !prepared.isCurrent()) throw new Error('SSH shell conversion attachment is uncertain');
+    record.codexRestoreUncertain = false;
+    try {
+      await this.flushSessionsDurably(prepared.isCurrent);
+    } catch (error) {
+      record.codexRestoreUncertain = true;
+      record.remoteShellConversion!.phase = 'pending';
+      throw error;
+    }
+    if (!prepared.isCurrent()) throw new Error('SSH shell conversion commit is uncertain');
+    return record;
+  }
+
   private optionalBrokerDispatchReceipt(
     output: unknown
   ): { sessionNativeId: string; paneId: string; brokerPid: number; serverPid: number } | undefined {
@@ -3617,6 +3726,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
     } = options;
     const muxName = `codeman-${sessionId.slice(0, 8)}`;
     const priorRegistration = this.sessions.get(sessionId);
+    if (priorRegistration?.remoteShellConversion && priorRegistration.remoteShellConversion.phase !== 'converted')
+      throw new Error('SSH shell conversion requires owner inspection');
     if (this.uncertainBrokerRegistration(priorRegistration))
       throw new Error('An uncertain Codex launch cannot create another worker');
     const launchSnapshot = JSON.stringify(options);
@@ -3635,7 +3746,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       !!remote &&
       remote.owned !== false &&
       !docker &&
-      !remote.commands?.[mode] &&
+      (mode === 'codex' ? !!remoteCodexLauncher(remote) : !remote.commands?.[mode]) &&
       getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
       codexConfig?.noDaemon === true;
     const launchEnvCodexHome = envOverrides?.CODEX_HOME === '' ? undefined : envOverrides?.CODEX_HOME;
@@ -4142,7 +4253,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         ...(ownedRemoteLaunch?.incarnation ? { codexRestoreConfig: structuredClone(codexConfig) } : {}),
         recoveryIsolated:
           !docker &&
-          (!remote || (remote.owned !== false && !remote.commands?.[mode])) &&
+          (!remote ||
+            (remote.owned !== false &&
+              (mode === 'codex' ? !!remoteCodexLauncher(remote) : !remote.commands?.[mode]))) &&
           getCli(mode)?.capabilities.recovery === 'codex-rollout' &&
           /(?:^|\s)--no-daemon(?:\s|$)/.test(baseCmd),
         createdAt: Date.now(),
@@ -4416,7 +4529,17 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       remoteAttachOnly,
     } = options;
     const session = this.sessions.get(sessionId);
-    if (!session || this.uncertainBrokerRegistration(session) || session.recoveryInputBrokerPending !== undefined)
+    if (
+      session?.remoteShellConversion &&
+      session.remoteShellConversion.phase !== 'converted' &&
+      !this.remoteConversionAttachPermits?.has(options)
+    )
+      return null;
+    if (
+      !session ||
+      (this.uncertainBrokerRegistration(session) && !this.remoteConversionAttachPermits?.has(options)) ||
+      session.recoveryInputBrokerPending !== undefined
+    )
       return null;
     const muxName = session.muxName;
     const localCodex = !remote && !docker && getCli(mode)?.capabilities.recovery === 'codex-rollout';
@@ -4661,7 +4784,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       if (recoveryCodexHome) this.pinCodexLaunchHome(muxName, recoveryCodexHome);
 
       if (!canDispatch()) return null;
-      if (inputBroker || session.codexRestoreStateBinding !== undefined || session.codexRestoreConfig !== undefined) {
+      if (
+        (!remote || !remoteAttachOnly) &&
+        (inputBroker || session.codexRestoreStateBinding !== undefined || session.codexRestoreConfig !== undefined)
+      ) {
         // A later owner/recovery launch must not inherit an earlier reboot's
         // configuration binding, even if the new effect loses its receipt.
         if (this.sessions.get(sessionId) !== session) return null;
@@ -6695,6 +6821,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         if (receipt === 'sent') recoveryGuard?.noteBrokerSent?.();
         return receipt === 'sent';
       };
+      let admittedEmptyComposer: string | undefined;
       const composerCurrent = (expected?: string): boolean => {
         if (!recoveryGuard) return true;
         // This synchronous read follows queued/async preparation. -J joins native
@@ -6736,8 +6863,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           accepted =
             !/esc to interrupt|reconnecting|would you like|approve this|sign in|log in|authentication failed|usage limit|limit reached/i.test(
               chrome
-            ) && (expected === undefined ? hasCodexComposerText(screen, '') : hasCodexComposerText(screen, expected));
-          if (accepted) composerScreen = screen;
+            ) &&
+            (expected === undefined
+              ? hasEmptyCodexComposer(screen)
+              : admittedEmptyComposer !== undefined &&
+                hasAcknowledgedCodexComposerCapture(screen, expected, admittedEmptyComposer));
+          if (accepted) {
+            composerScreen = screen;
+            if (expected === undefined) admittedEmptyComposer = screen;
+          }
         } catch {
           // No native input has been attempted by this read.
         }

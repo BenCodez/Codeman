@@ -1459,6 +1459,16 @@
               </div>
               <p class="set-section-blurb">What this tab is called, how its context window is kept from filling up, and what it watches.</p>
 
+              <div class="set-group" id="sshCodexConversionSection" style="display: none;">
+                <div class="set-group-head"><h4>Convert this SSH tab to Codex</h4></div>
+                <p class="set-group-hint">Get Codex recovery and task controls in this tab. Return to an idle shell first; running agents stay untouched. The existing shell and scrollback are kept in a retained remote session. Choose an existing conversation explicitly; a new chat is never substituted.</p>
+                <div class="set-group-body">
+                  <div class="set-row"><div class="set-row-text"><span class="set-row-label">Codex chat in place</span><span class="set-row-desc">Uses this case’s existing host launcher, including custom Codex executables.</span></div><div class="set-row-actions"><button type="button" class="btn-toolbar btn-sm" id="sshCodexConversionPreview" onclick="app.previewSshCodexConversion()">Convert to Codex chat…</button></div></div>
+                  <div id="sshCodexConversionDetails" hidden></div>
+                  <p class="set-group-hint" id="sshCodexConversionStatus" role="status"></p>
+                </div>
+              </div>
+
               <div class="set-group">
                 <div class="set-group-head"><h4>Identity</h4></div>
                 <div class="set-group-body">
@@ -1719,7 +1729,7 @@
               <div class="set-section-head"><h2>Codex supervisor</h2></div>
               <p class="set-section-blurb">Assign this local isolated Codex session to manage selected owned Codex workers through guarded task and recovery controllers. The role is off by default and requires server authentication. The manager and local workers need distinct authorized <code>CODEX_HOME</code> directories. Submit an ordinary prompt through Codeman in each current isolated <code>--no-daemon</code> conversation to establish its verified Codex identity, then wait for the manager to become idle. A launch or resume seed alone cannot authorize automatic input.</p>
               <p id="supervisorError" role="alert" hidden>Supervisor is unavailable for this session. Local managed Codex, isolation, owner access, and verified identity are required.</p>
-              <div class="set-group"><h4>Codex process isolation</h4><p class="set-group-hint">To create an isolated conversation, set the <code>--no-daemon</code> and <code>--no-alt-screen</code> launch defaults under App Settings → Codex, then create a new local session and submit its first prompt. Select Prepare restricted manager to explicitly resume the verified manager conversation with restricted supervisor tools and a scoped credential. Preparation refuses active work, pending child work, unknown identity and uncertain delivery. Start requires a verified restricted launch; an ordinary Codex process cannot adopt the role.</p></div>
+              <div class="set-group"><h4>Codex process isolation</h4><p class="set-group-hint">To create an isolated conversation, set the <code>--no-daemon</code> and <code>--no-alt-screen</code> launch defaults under App Settings → Codex, then create a new local session and submit its first prompt. Start manager prepares the verified conversation, connects restricted supervisor tools and starts the saved objective in one confirmed action. When only a verified native settings change needs acknowledgement at an empty prompt, Codeman sends a fixed harmless setup turn and waits for its exact completion. Active work, pending children, permission or authentication limits and uncertain delivery stop setup. Prepare restricted manager remains available for inspection without starting work.</p></div>
               <div class="set-group"><h4>Supervisor status</h4><dl class="task-status-grid"><dt>Phase</dt><dd id="supervisorPhase">Loading</dd><dt>Reason</dt><dd id="supervisorReason">—</dd><dt>Usage</dt><dd id="supervisorUsage">Unknown</dd></dl>
                 <div class="task-actions"><button class="btn-toolbar" id="supervisorPrepareBtn" onclick="app.prepareSupervisorManager()">Prepare restricted manager</button><button class="btn-toolbar" id="supervisorStartBtn" onclick="app.setupAndStartSupervisorManager()">Start manager</button><button class="btn-toolbar" id="supervisorPauseBtn" onclick="app.supervisorAction('pause')">Pause</button><button class="btn-toolbar" id="supervisorResetBtn" onclick="app.supervisorAction('reset')">Reset</button><button class="btn-toolbar" onclick="app.loadSupervisorStatus()">Refresh</button></div>
               </div>
@@ -3427,6 +3437,18 @@
                 <div class="task-actions"><button type="button" class="btn-toolbar" onclick="app.saveManagementSettings()">Save management settings</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration()">Manager objectives and controls</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration('automation')">Manager schedules and custom tasks</button></div>
                 <div id="managementAgents"></div>
               </fieldset>
+              <fieldset class="set-group task-form" id="managementWorkSettings" disabled>
+                <legend>Give manager work</legend>
+                <p class="set-group-hint">Describe the outcome and how it should be checked. Work waits for the manager to be safely idle; accepted delivery does not mean the work is complete.</p>
+                <label for="managementWorkObjective">What should the manager get done?</label>
+                <textarea class="set-textarea" id="managementWorkObjective" rows="4" maxlength="2000" placeholder="For example: have the API and UI agents implement the settings page, verify it, and report what needs my review."></textarea>
+                <label for="managementWorkCriteria">What must be true when it is done?</label>
+                <textarea class="set-textarea" id="managementWorkCriteria" rows="3" maxlength="1000" placeholder="List required checks, expected behavior, and anything that needs your approval."></textarea>
+                <label><input type="checkbox" id="managementWorkStart" checked> Start the configured manager if paused</label>
+                <div class="task-actions"><button type="button" class="btn-toolbar" id="managementWorkSubmit" onclick="app.queueManagementWork()">Queue request</button><button type="button" class="btn-toolbar" onclick="app.loadManagementWork()">Refresh work status</button><button type="button" class="btn-toolbar" onclick="app.openManagementConversation()">Open manager conversation</button></div>
+                <p id="managementWorkStatus" role="status" aria-live="polite">Select and save a manager to queue work.</p>
+                <div id="managementWorkRequests"></div>
+              </fieldset>
               <div class="set-group"><h4>Management Codex controls and schedules</h4><p id="managementControlsStatus" role="status">Select and save an eligible local manager to configure it here.</p><div id="managementManagerControls"></div></div>
               <fieldset class="set-group task-form" id="managementBrainSettings" disabled>
                 <legend>Shared brain.md</legend>
@@ -3795,8 +3817,8 @@
             </div>
             <div class="form-row">
               <label>Codex Command Override</label>
-              <input type="text" id="remoteHostCodexCommand" placeholder="exec codx personal" autocomplete="off" autocapitalize="off" spellcheck="false">
-              <span class="form-hint">Optional. Leave blank to use exec codex on the remote host.</span>
+              <input type="text" id="remoteHostCodexCommand" placeholder="codex-workspace" autocomplete="off" autocapitalize="off" spellcheck="false">
+              <span class="form-hint">Optional. A single executable such as codex-workspace receives the exact Codex arguments and home. It must forward them. Full shell commands stay manual-only. Leave blank for native codex.</span>
             </div>
             <details class="advanced-options">
               <summary><svg class="set-adv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span>Advanced SSH</span></summary>

@@ -86,6 +86,19 @@ async function fixture(
     scope.sessionId === SID && scope.owner === (multiuser ? 'alice' : undefined) ? controller : undefined
   );
   const management = {
+    conversation: vi.fn(async (_scope, _id, options: { cursor?: string; limit?: number }, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return {
+        messages: [{ role: 'assistant', text: 'Project chat' }],
+        nextCursor: options.cursor ?? null,
+        trust: 'untrusted-context',
+        authority: 'none',
+      };
+    }),
+    usage: vi.fn(async (_scope, _id, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { counters: { source: 'codeman-session-counter-estimate' }, providerQuota: { status: 'unavailable' } };
+    }),
     observe: vi.fn(async (_scope, _id, current: () => boolean) => {
       if (!current()) throw Error('cancelled');
       return { output: 'Project API', trust: 'untrusted-context', identityVerified: false };
@@ -789,4 +802,59 @@ it('records discovery only after valid authenticated initialization and tools li
   expect(f.registry.hasToolsDiscovery(SID)).toBe(true);
   f.revoke();
   expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+});
+
+it('exposes bounded chat pagination and honest usage only through prepared manager authority', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  const listed = (await f.rpc('tools/list')).json().result.tools;
+  const schema = listed.find((tool: { name: string }) => tool.name === 'supervisor_agent').inputSchema;
+  const validate = new Ajv().compile(schema);
+  const cursor = 'a'.repeat(48);
+  for (const args of [
+    { mode: 'conversation', agentId: WORKER },
+    { mode: 'conversation', agentId: WORKER, cursor, limit: 3 },
+    { mode: 'usage', agentId: WORKER },
+  ]) {
+    expect(validate(args)).toBe(true);
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: args })).json().error).toBeUndefined();
+  }
+  expect(f.management.conversation).toHaveBeenCalledTimes(2);
+  expect(f.management.conversation).toHaveBeenLastCalledWith(
+    expect.objectContaining({ sessionId: SID }),
+    WORKER,
+    { cursor, limit: 3 },
+    expect.any(Function)
+  );
+  expect(f.management.usage).toHaveBeenCalledOnce();
+  for (const args of [
+    { mode: 'conversation', agentId: WORKER, path: '/fixture/private' },
+    { mode: 'conversation', agentId: WORKER, cursor: '../outside' },
+    { mode: 'conversation', agentId: WORKER, limit: 41 },
+    { mode: 'conversation', agentId: WORKER, message: 'run a command' },
+    { mode: 'usage', agentId: WORKER, limit: 2 },
+    { mode: 'usage', agentId: WORKER, cursor },
+    { mode: 'observe', agentId: WORKER, cursor },
+  ]) {
+    expect(validate(args)).toBe(false);
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: args })).json().error.code).toBe(-32602);
+  }
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode: 'conversation', agentId: SID } })).json()
+      .error.code
+  ).toBe(-32602);
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode: 'usage', agentId: SID } })).json().error
+  ).toBeUndefined();
+  for (const mode of ['conversation', 'usage']) {
+    f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+    expect(
+      (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode, agentId: WORKER } })).json().error.code
+    ).toBe(-32001);
+  }
+  expect(f.management.conversation).toHaveBeenCalledTimes(2);
+  expect(f.management.usage).toHaveBeenCalledTimes(2);
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.retry).not.toHaveBeenCalled();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.generic).not.toHaveBeenCalled();
 });

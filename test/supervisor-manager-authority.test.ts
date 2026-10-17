@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFile, writeFile, mkdtemp, rm, rename } from 'node:fs/promises';
 import fs from 'node:fs/promises';
-import { lstatSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { lstatSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -23,7 +23,11 @@ import { TaskStore } from '../src/supervision/store.js';
 import { latestProgressMarker } from '../src/supervision/evidence.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
-import { classifyCodexTail, hasEmptyCodexComposer } from '../src/recovery/codex-classifier.js';
+import {
+  classifyCodexTail,
+  hasEmptyCodexComposer,
+  permitsCodexManagerSetup,
+} from '../src/recovery/codex-classifier.js';
 import type { RecoveryActionAuthority, RecoveryEvidenceSource, RecoveryObservation } from '../src/recovery/types.js';
 import { RecoveryController, type RecoveryDependencies } from '../src/recovery/controller.js';
 import { SupervisorController, type SupervisorDependencies } from '../src/supervisor/controller.js';
@@ -611,6 +615,174 @@ describe('manager authority at the real server boundary', () => {
       expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(verified);
       expect(observe).toHaveBeenCalled();
       expect(prepare).toHaveBeenCalledTimes(verified ? 1 : 0);
+    }
+  );
+
+  it.each(['completed', 'draft-changed', 'owner-cancelled'] as const)(
+    'uses real tagged owner writes for the bounded setup turn: %s',
+    async (kind) => {
+      await manager.pause();
+      const at = Date.now();
+      Reflect.set(managerSession, '_paneStartedAt', at - 1000);
+      const setting = {
+        type: 'thread_settings_applied',
+        thread_id: MANAGER_THREAD,
+        thread_settings: {
+          model: 'fixture',
+          model_provider_id: 'fixture',
+          approval_policy: 'on-request',
+          approvals_reviewer: 'user',
+          permission_profile: {
+            type: 'managed',
+            file_system: { type: 'restricted', entries: [] },
+            network: 'restricted',
+          },
+          cwd: '/fixture',
+          runtime_workspace_roots: ['/fixture'],
+          collaboration_mode: { mode: 'default', settings: { model: 'fixture' } },
+          disabled_plugin_ids: [],
+        },
+      };
+      const nativeLine = (payload: unknown) =>
+        JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+      await writeFile(
+        rolloutPath,
+        nativeLine({ type: 'user_message', message: 'Prior owner prompt' }) +
+          nativeLine({ type: 'task_started', turn_id: 'prior-turn' }) +
+          nativeLine({ type: 'task_complete', turn_id: 'prior-turn' }) +
+          nativeLine(setting)
+      );
+      observation = { ...observation, activity: 'paused', reason: 'approval-required', processReady: true };
+      vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+      const profile = { isCurrent: () => true, confirm: async () => true, revoke: vi.fn(async () => {}) };
+      Reflect.set(managerSession, '_supervisorManagerProfile', profile);
+      const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
+      Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', () => true);
+      let draft = '',
+        current = true;
+      Reflect.set(mux, 'inspectPaneForRecovery', async () => ({
+        dead: false,
+        paneId: '%7',
+        panePid: 99999,
+        screen: `› ${draft}\n\n  fixture default · /fixture\n  ? for shortcuts\n`,
+      }));
+      const writes: string[] = [];
+      const previousPty = managerSession.ptyProcess;
+      Reflect.set(managerSession, 'ptyProcess', {
+        write: (input: string) => {
+          writes.push(input);
+          if (input !== '\r') {
+            draft = kind === 'draft-changed' ? 'Different owner draft' : input;
+            if (kind === 'owner-cancelled') current = false;
+          } else {
+            draft = '';
+            const text = writes[0];
+            appendFileSync(
+              rolloutPath,
+              nativeLine({ type: 'user_message', message: text }) +
+                nativeLine({ type: 'task_started', turn_id: 'setup-turn' }) +
+                nativeLine({ type: 'task_complete', turn_id: 'setup-turn' })
+            );
+            observation = {
+              ...observation,
+              activity: 'completed',
+              reason: 'turn-completed',
+              submissionHash: createHash('sha256').update(text).digest('hex'),
+            };
+          }
+        },
+      });
+      const phases: string[] = [];
+      try {
+        expect(managerSession.captureSupervisorManagerOwnerInputAuthority()?.()).toBe(true);
+        expect(Reflect.get(server, 'managerTaskAllowsPreparation').call(server, managerSession)).toBe(true);
+        const preflight = new CodexRecoveryAdapter(managerSession);
+        const observed = await preflight.observe();
+        const source = preflight.getLocalEvidenceSource(MANAGER_THREAD, managerSession.getRecoveryContext().generation);
+        expect(observed.activity).toBe('paused');
+        expect(source).toBeDefined();
+        expect(
+          permitsCodexManagerSetup(
+            readFileSync(rolloutPath, 'utf8'),
+            {
+              conversationId: MANAGER_THREAD,
+              now: at,
+              screen: '› ',
+              busy: false,
+              watching: false,
+              tailTruncated: false,
+            },
+            at - 1000
+          )
+        ).toBe(true);
+        expect(
+          await preflight.confirmLocalEvidence(MANAGER_THREAD, managerSession.getRecoveryContext().generation)
+        ).toBe(true);
+        const result = await Reflect.get(server, 'sendManagerSetupTurn').call(
+          server,
+          managerSession,
+          'owner-setup-test',
+          () => current,
+          async (phase: string) => {
+            phases.push(phase);
+          }
+        );
+        expect(result).toBe(kind === 'completed');
+        expect(writes).toEqual(kind === 'completed' ? ['Reply READY only.', '\r'] : ['Reply READY only.']);
+        expect(phases).toContain('literal-reserved');
+        if (kind === 'completed') expect(phases.at(-1)).toBe('turn-completed');
+      } finally {
+        Reflect.set(managerSession, 'ptyProcess', previousPty);
+      }
+    }
+  );
+
+  it.each([false, true])(
+    'retains exact newly prepared task ownership through start, pause and teaching (unrelated task: %s)',
+    async (unrelated) => {
+      await manager.reset();
+      await manager.configure(config);
+      vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+      expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(false);
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      const revoke = vi.fn(async () => {});
+      vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        Reflect.set(managerSession, '_supervisorManagerProfile', { isCurrent: options.isCurrent, revoke });
+        Reflect.set(Reflect.get(managerSession, '_mux'), 'isSupervisorManagerLaunchCurrent', () => true);
+        return options.isCurrent();
+      });
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 1000);
+      expect((await manager.start()).phase).toBe('active');
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10);
+      // Settle the known kickoff before the owner pauses and teaches the manager.
+      const kickoff = managerTask.getStatus().inFlight!;
+      const userLine = JSON.stringify({
+        timestamp: new Date(Date.now()).toISOString(),
+        type: 'event_msg',
+        payload: { type: 'user_message', message: taskAct.mock.calls[0][2] },
+      });
+      await writeFile(rolloutPath, userLine + '\n');
+      observation = {
+        ...observation,
+        submissionKey: createHash('sha256').update(userLine).digest('hex'),
+        submissionHash: kickoff.promptHash,
+      };
+      await managerTask.refresh();
+      expect(managerTask.getStatus().inFlight).toBeUndefined();
+      await manager.pause();
+      managerSession.emit('recoveryUserInput');
+      await managerTask.drain();
+      if (unrelated) await managerTask.update({ objective: 'An unrelated owner task' });
+      const result = await internals.prepareSupervisorManager(managerSession, () => true);
+      if (unrelated) expect(result).not.toBe(true);
+      else {
+        expect(result).toBe(true);
+        expect((await manager.start()).phase).toBe('active');
+      }
+      expect(revoke).not.toHaveBeenCalled();
     }
   );
 

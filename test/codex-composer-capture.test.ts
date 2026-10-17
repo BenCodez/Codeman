@@ -63,3 +63,19 @@ sys.stdout.write(marker + '|%42|12345|2|1\\n')
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+it('acknowledges exact submitted text against admitted native footer spacing only', async () => {
+  const { hasAcknowledgedCodexComposerCapture: ack } = await import('../src/recovery/codex-composer-capture.js');
+  const baseline = '› \n\n  example-model high · /tmp\n';
+  expect(ack('› Known task\n\n  example-model high · /tmp\n', 'Known task', baseline)).toBe(true);
+  for (const screen of [
+    '› Known task\n\n\n  example-model high · /tmp\n',
+    '› Known task\n changed draft\n\n  example-model high · /tmp\n',
+    '› Different task\n\n  example-model high · /tmp\n',
+    '› Known task\n\n  example-model low · /tmp\n',
+  ])
+    expect(ack(screen, 'Known task', baseline)).toBe(false);
+  expect(
+    ack('› Known task\n\n  example-model high · /tmp\n', 'Known task', baseline.replace('› ', '› Existing draft'))
+  ).toBe(false);
+});

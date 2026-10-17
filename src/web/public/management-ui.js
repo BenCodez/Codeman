@@ -19,6 +19,31 @@ function managementSnapshot(value) {
     supervisorBrainSnapshot(value.brain)
   );
 }
+function managementWorkSnapshot(value) {
+  return (
+    value &&
+    Array.isArray(value.tasks) &&
+    value.tasks.length <= 12 &&
+    value.tasks.every(
+      (task) =>
+        task &&
+        typeof task.id === 'string' &&
+        /^[A-Za-z0-9_-]{1,64}$/.test(task.id) &&
+        typeof task.name === 'string' &&
+        task.name.length <= 100 &&
+        typeof task.instructions === 'string' &&
+        task.instructions.length <= 4000 &&
+        typeof task.enabled === 'boolean'
+    ) &&
+    value.status &&
+    ['idle', 'running', 'blocked'].includes(value.status.phase) &&
+    Array.isArray(value.status.runs) &&
+    value.status.runs.length <= 128 &&
+    value.status.runs.every(
+      (run) => typeof run.taskId === 'string' && Number.isInteger(run.attempts) && run.attempts >= 0
+    )
+  );
+}
 function managementRequestId() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
   const bytes = new Uint8Array(16);
@@ -41,12 +66,217 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('managementEnrollmentInstructions').value = '';
     document.getElementById('managementMessageDraft').value = '';
     document.getElementById('managementMessageThread').textContent = '';
+    document.getElementById('managementWorkObjective').value = '';
+    document.getElementById('managementWorkCriteria').value = '';
+    document.getElementById('managementWorkRequests').textContent = '';
     document.getElementById('managementAgentTools').hidden = true;
   },
   _renderManagementBusy(view) {
     document.getElementById('managementSettings').disabled = !view?.snapshot || !!view.busy || !!view.brainBusy;
     document.getElementById('managementBrainSettings').disabled = !view?.brain || !!view.brainBusy || !!view.busy;
     this.renderManagementCreation();
+    this._renderManagementWork();
+  },
+  _renderManagementWork() {
+    const view = this._managementView;
+    const manager = view?.snapshot?.managerSessionId;
+    document.getElementById('managementWorkSettings').disabled = !manager || !!view.busy || !!view.work?.busy;
+    const status = document.getElementById('managementWorkStatus');
+    if (!manager) {
+      status.textContent = 'Select and save a manager to queue work.';
+      return;
+    }
+    const work = view.work;
+    status.textContent =
+      work?.notice ||
+      (work?.busy
+        ? 'Saving or refreshing work…'
+        : 'Work uses the saved manager and its current grants. Refresh to see delivery status. Required checks and owner acceptance remain separate.');
+    const list = document.getElementById('managementWorkRequests');
+    list.replaceChildren();
+    const automation = work?.automation;
+    for (const task of automation?.tasks || []) {
+      if (!task.id.startsWith('owner-work-')) continue;
+      const run = automation.status?.runs?.find((value) => value.taskId === task.id);
+      const flight = automation.status?.inFlight;
+      const last = automation.status?.lastRun;
+      let detail = 'Queued — waiting for the manager to be verified idle.';
+      if (!task.enabled && !run?.attempts) detail = 'Paused in schedule settings.';
+      if (run?.attempts) detail = 'Attempt recorded — check the manager conversation. Completion is unverified.';
+      if (last?.taskId === task.id && last.phase === 'accepted')
+        detail = 'Accepted by manager — completion and required owner review are unverified.';
+      if (last?.taskId === task.id && last.phase === 'refused')
+        detail = 'Delivery refused — inspect the manager before requesting another run.';
+      if (flight?.taskId === task.id) detail = 'Delivery pending or uncertain — do not resend.';
+      const card = managementElement('div');
+      card.className = 'set-group';
+      card.append(managementElement('h4', task.name), managementElement('p', detail));
+      list.append(card);
+    }
+    if (automation) {
+      const hint = managementElement(
+        'p',
+        `${automation.tasks.length} of 12 custom task slots used. Manager schedules share 128 lifetime delivery receipts. Use schedules to inspect retained tasks; nothing is removed automatically.`
+      );
+      hint.className = 'set-group-hint';
+      list.append(hint);
+    }
+  },
+  async loadManagementWork() {
+    const view = this._managementView;
+    const sessionId = view?.snapshot?.managerSessionId;
+    if (!sessionId || view.work?.busy) return;
+    const work = (view.work = { ...view.work, busy: true });
+    this._renderManagementWork();
+    let automation, role;
+    try {
+      [automation, role] = await Promise.all([
+        this._apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/supervisor/automation`),
+        this._apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/supervisor`),
+      ]);
+    } catch {
+      automation = null;
+    }
+    if (this._managementView !== view || view.snapshot.managerSessionId !== sessionId || view.work !== work) return;
+    work.busy = false;
+    work.role = role;
+    work.automation = managementWorkSnapshot(automation) ? automation : null;
+    work.notice = work.automation ? null : 'Work status unavailable. Your draft is retained; refresh before sending.';
+    if (work.automation) {
+      try {
+        const key = `codeman:managerWorkRequest:${sessionId}`;
+        const pending = sessionStorage.getItem(key);
+        if (pending && work.automation.tasks.some((task) => task.id === `owner-work-${pending}`)) {
+          sessionStorage.removeItem(key);
+          const draft = work.pendingDraft;
+          if (
+            draft &&
+            document.getElementById('managementWorkObjective').value.trim() === draft.objective &&
+            document.getElementById('managementWorkCriteria').value.trim() === draft.completionCriteria
+          ) {
+            document.getElementById('managementWorkObjective').value = '';
+            document.getElementById('managementWorkCriteria').value = '';
+          }
+          delete work.pendingDraft;
+          work.notice = 'The earlier request is confirmed saved below. Enter new work when needed.';
+        }
+      } catch {
+        /* A retained request cannot be replayed as different work. */
+      }
+    }
+    this._renderManagementWork();
+  },
+  async queueManagementWork() {
+    const view = this._managementView;
+    const sessionId = view?.snapshot?.managerSessionId;
+    if (!sessionId || view.busy || view.work?.busy) return;
+    const objective = document.getElementById('managementWorkObjective').value.trim();
+    const completionCriteria = document.getElementById('managementWorkCriteria').value.trim();
+    if (
+      !objective ||
+      !completionCriteria ||
+      objective.length > 2000 ||
+      completionCriteria.length > 1000 ||
+      /[\x00-\x09\x0b\x0c\x0e-\x1f\x7f-\x9f]/.test(objective + completionCriteria)
+    ) {
+      this.showToast('Enter the objective and completion criteria as plain text.', 'warning');
+      return;
+    }
+    const start = document.getElementById('managementWorkStart').checked;
+    if (
+      start &&
+      !window.confirm(
+        'Queue this request and start the configured manager if paused? Its saved objective, schedules, current worker grants and budgets apply. Setup preserves the exact conversation and refuses uncertain or active work.'
+      )
+    )
+      return;
+    const key = `codeman:managerWorkRequest:${sessionId}`;
+    let requestId;
+    try {
+      requestId = sessionStorage.getItem(key) || managementRequestId();
+      if (!/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(requestId)) throw Error('Invalid work request');
+      sessionStorage.setItem(key, requestId);
+      if (sessionStorage.getItem(key) !== requestId) throw Error('Work request storage failed');
+    } catch {
+      this.showToast('Request storage is unavailable. No work was sent.', 'error');
+      return;
+    }
+    const work = (view.work = {
+      ...view.work,
+      busy: true,
+      pendingDraft: { objective, completionCriteria },
+      notice: 'Saving one durable work request…',
+    });
+    this._renderManagementWork();
+    let result;
+    try {
+      result = await this._apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/supervisor/automation/owner-work`, {
+        method: 'POST',
+        body: { requestId, objective, completionCriteria },
+      });
+    } catch {
+      result = null;
+    }
+    if (this._managementView !== view || view.snapshot.managerSessionId !== sessionId || view.work !== work) return;
+    const saved = managementWorkSnapshot(result) && result.tasks.some((task) => task.id === `owner-work-${requestId}`);
+    if (!saved) {
+      work.busy = false;
+      work.notice =
+        'Save was not confirmed. Your draft and request ID are retained. Refresh before retrying; changing the text cannot reuse this request ID.';
+      this._renderManagementWork();
+      return;
+    }
+    work.automation = result;
+    work.notice = 'Request queued. It waits for verified idle delivery; acceptance does not mean the work is complete.';
+    try {
+      sessionStorage.removeItem(key);
+    } catch {
+      /* Retain the settled request safely. */
+    }
+    document.getElementById('managementWorkObjective').value = '';
+    document.getElementById('managementWorkCriteria').value = '';
+    if (start) {
+      try {
+        const role = await this._apiJson(`/api/sessions/${encodeURIComponent(sessionId)}/supervisor`);
+        if (this._managementView !== view || view.work !== work || view.snapshot.managerSessionId !== sessionId) return;
+        work.role = role;
+        if (role?.phase !== 'active') {
+          if (role?.enabled !== true || !role.objective?.trim())
+            work.notice += ' Configure and enable the manager objective under controls before Start.';
+          else {
+            const setupKey = `codeman:managerSetup:${sessionId}`;
+            const setupId = sessionStorage.getItem(setupKey) || `owner-work-start-${requestId}`;
+            if (!/^[A-Za-z0-9_:.-]{8,120}$/.test(setupId)) throw Error('Invalid retained setup request');
+            sessionStorage.setItem(setupKey, setupId);
+            if (sessionStorage.getItem(setupKey) !== setupId) throw Error('Setup request storage failed');
+            const setup = await this._apiJson(
+              `/api/sessions/${encodeURIComponent(sessionId)}/supervisor/setup-manager`,
+              {
+                method: 'POST',
+                body: { requestId: setupId, confirmRestrictedManager: true },
+              }
+            );
+            if (setup?.sessionId === sessionId && setup.requestId === setupId && setup.phase === 'started') {
+              sessionStorage.removeItem(setupKey);
+              work.notice += ' Manager started.';
+            } else
+              work.notice +=
+                ' Manager Start was not confirmed; inspect its retained setup request. The work remains queued.';
+          }
+        }
+      } catch {
+        work.notice += ' Manager status or Start was not confirmed. The work remains queued.';
+      }
+    }
+    if (this._managementView !== view || view.work !== work) return;
+    work.busy = false;
+    this._renderManagementWork();
+  },
+  async openManagementConversation() {
+    const sessionId = this._managementView?.snapshot?.managerSessionId;
+    if (!sessionId) return;
+    this.closeAppSettings();
+    await this.selectSession(sessionId);
   },
   renderManagementCreation() {
     const creation = this._managementCreation;
@@ -318,6 +548,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('managementManagerControls').append(section);
     status.textContent =
       'These controls apply to your selected global management Codex. Preparing, starting and scheduling require your explicit actions.';
+    void this.loadManagementWork();
     return true;
   },
   openGlobalManagerConfiguration(target) {

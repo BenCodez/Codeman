@@ -203,7 +203,11 @@ describe('Global management settings', () => {
     expect(get('supervisorBrainPanel').hidden).toBe(true);
     expect(get('supervisorAutomationPanel').open).toBe(true);
     expect(app.loadSupervisorAutomation).toHaveBeenCalledTimes(1);
-    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    expect(app._apiJson.mock.calls.map(([path]: [string]) => path)).toEqual([
+      '/api/management',
+      `/api/sessions/${manager}/supervisor/automation`,
+      `/api/sessions/${manager}/supervisor`,
+    ]);
     app.closeManagementSettings();
     expect(get('supervisor-tab').parentNode).toBe(originalParent);
     expect(get('supervisor-tab').classList.contains('set-section')).toBe(true);
@@ -351,4 +355,86 @@ describe('Global management settings', () => {
     expect(get('managementMessageThread').textContent).toContain('Manager thread');
     expect(get('managementMessageThread').textContent).not.toContain('Private worker');
   });
+});
+
+function ownerWorkState(requestId = 'aaaaaaaa-1111-4111-8111-111111111111', phase?: string) {
+  const taskId = `owner-work-${requestId}`;
+  return {
+    checkIns: { enabled: true, intervalMinutes: 60 },
+    tasks: [
+      { id: taskId, name: '<b>Owner work</b>', instructions: 'Owner work', enabled: true, kind: 'once', maxRuns: 1 },
+    ],
+    status: {
+      phase: 'idle',
+      reason: 'configured',
+      runs: phase ? [{ taskId, attempts: 1 }] : [],
+      ...(phase ? { lastRun: { taskId, phase } } : {}),
+    },
+  };
+}
+it('queues objective and criteria through a durable owner task without terminal input', async () => {
+  const { app, get, dom } = harness();
+  await app.loadManagementSettings();
+  get('managementWorkObjective').value = 'Have the API worker implement the change';
+  get('managementWorkCriteria').value = 'Tests pass; owner reviews it';
+  get('managementWorkStart').checked = false;
+  app._apiJson.mockImplementation(async (url: string, options: any) =>
+    url.endsWith('/owner-work') ? ownerWorkState(options.body.requestId) : snapshot()
+  );
+  await app.queueManagementWork();
+  const [url, options] = app._apiJson.mock.calls.at(-1);
+  expect(url).toBe(`/api/sessions/${manager}/supervisor/automation/owner-work`);
+  expect(options.body).toMatchObject({
+    objective: 'Have the API worker implement the change',
+    completionCriteria: 'Tests pass; owner reviews it',
+  });
+  expect(dom.window.sessionStorage.getItem(`codeman:managerWorkRequest:${manager}`)).toBeNull();
+  expect(get('managementWorkStatus').textContent).toContain('queued');
+  expect(get('managementWorkRequests').querySelector('b')).toBeNull();
+  expect(get('managementWorkObjective').value).toBe('');
+  expect(app._apiJson.mock.calls.every(([path]: [string]) => !path.includes('/input'))).toBe(true);
+});
+it('retains the same request and draft after uncertain save, without automatically starting or retrying', async () => {
+  const { app, get, dom } = harness();
+  await app.loadManagementSettings();
+  get('managementWorkObjective').value = 'Inspect project changes';
+  get('managementWorkCriteria').value = 'Report evidence';
+  get('managementWorkStart').checked = false;
+  app._apiJson.mockResolvedValue(null);
+  await app.queueManagementWork();
+  const first = app._apiJson.mock.calls.at(-1)[1].body.requestId;
+  expect(dom.window.sessionStorage.getItem(`codeman:managerWorkRequest:${manager}`)).toBe(first);
+  expect(get('managementWorkObjective').value).toBe('Inspect project changes');
+  await app.queueManagementWork();
+  expect(app._apiJson.mock.calls.at(-1)[1].body.requestId).toBe(first);
+  expect(get('managementWorkStatus').textContent).toContain('not confirmed');
+});
+it.each(['accepted', 'refused', 'unknown'])('does not equate %s delivery with completion', async (phase) => {
+  const { app, get } = harness();
+  await app.loadManagementSettings();
+  app._managementView.work = { automation: ownerWorkState(undefined, phase) };
+  app._renderManagementWork();
+  expect(get('managementWorkRequests').textContent).not.toMatch(/work completed/i);
+  if (phase === 'accepted')
+    expect(get('managementWorkRequests').textContent).toContain('completion and required owner review are unverified');
+});
+it('starts a paused configured manager only after explicit work-and-start confirmation', async () => {
+  const { app, get, dom } = harness();
+  await app.loadManagementSettings();
+  get('managementWorkObjective').value = 'Coordinate implementation';
+  get('managementWorkCriteria').value = 'Required tests pass';
+  dom.window.confirm = vi.fn(() => false);
+  const before = app._apiJson.mock.calls.length;
+  await app.queueManagementWork();
+  expect(app._apiJson.mock.calls).toHaveLength(before);
+  dom.window.confirm = vi.fn(() => true);
+  app._apiJson.mockImplementation(async (url: string, options: any) => {
+    if (url.endsWith('/owner-work')) return ownerWorkState(options.body.requestId);
+    if (url.endsWith('/setup-manager'))
+      return { sessionId: manager, requestId: options.body.requestId, phase: 'started' };
+    return { phase: 'paused', enabled: true, objective: 'Manage owner work' };
+  });
+  await app.queueManagementWork();
+  expect(app._apiJson.mock.calls.some(([url]: [string]) => url.endsWith('/setup-manager'))).toBe(true);
+  expect(get('managementWorkStatus').textContent).toContain('Manager started');
 });

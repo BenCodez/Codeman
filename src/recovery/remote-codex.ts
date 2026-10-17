@@ -985,6 +985,7 @@ async function rotateRemoteCodexBroker(
     assertExactRemoteResume(request);
     if ((await authority.check()) !== true || !currentRemoteAuthority(authority)) return 'not-sent';
     const command = buildRemoteCodexPaneCommand({
+      remote,
       remotePath: remote.remotePath,
       sessionId: request.sessionId,
       codexConfig: request.codexConfig,
@@ -1097,6 +1098,7 @@ export function buildRemoteCodexRestoreCommand(
 ): RemoteCodexCommand {
   assertExactRemoteResume(request);
   const command = buildRemoteCodexPaneCommand({
+    remote,
     remotePath: remote.remotePath,
     sessionId: request.sessionId,
     codexConfig: request.codexConfig,
@@ -1135,6 +1137,7 @@ export function buildRemoteCodexRestartCommand(
 ): RemoteCodexCommand {
   assertExactRemoteResume(request);
   const paneCommand = buildRemoteCodexPaneCommand({
+    remote,
     remotePath: remote.remotePath,
     sessionId: request.sessionId,
     codexConfig: request.codexConfig,
