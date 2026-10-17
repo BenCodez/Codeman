@@ -37,7 +37,7 @@ import type { PrivateFileWitness } from './recovery/private-file-witness.js';
 import { collectDescendants } from './proc-tree.js';
 import { prepareRebootWorkspaceLaunch, type RebootWorkspaceLaunch } from './recovery/reboot-workspace-launch.js';
 import { isMultiUserMode } from './config/multiuser.js';
-import { execSync, exec, execFile } from 'node:child_process';
+import { execSync, execFileSync, exec, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const execAsync = promisify(exec);
@@ -48,6 +48,7 @@ import { dirname, join, isAbsolute, posix } from 'node:path';
 import { homedir } from 'node:os';
 import { matchesNativePaneSignal, parseNativePaneSignal } from './recovery/native-pane-signal.js';
 import { hasCodexComposerText, hasEmptyCodexComposer } from './recovery/codex-classifier.js';
+import { normalizeCodexComposerCapture } from './recovery/codex-composer-capture.js';
 import {
   dataPath,
   getDataDirPath,
@@ -6715,11 +6716,13 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           }
           const screen = IS_TEST_MODE
             ? this.inputComposerReader?.(muxName)
-            : execSync(`${this.tmux()} capture-pane -p -J -t ${shellescape(livePane!.paneId)}`, {
-                encoding: 'utf-8',
-                timeout: EXEC_TIMEOUT_MS,
-                maxBuffer: 64 * 1024,
-              });
+            : expected === undefined
+              ? this.captureRecoveryComposer(livePane!.paneId, livePane!.panePid)
+              : execSync(`${this.tmux()} capture-pane -p -J -t ${shellescape(livePane!.paneId)}`, {
+                  encoding: 'utf-8',
+                  timeout: EXEC_TIMEOUT_MS,
+                  maxBuffer: 64 * 1024,
+                });
           if (typeof screen !== 'string') throw new Error('Native input composer is unavailable');
           // Our own literal task text may mention a veto phrase. Only its exact
           // composer row is excluded; changed drafts and surrounding UI still veto.
@@ -7008,6 +7011,49 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
    * terminal. Returns null in tests (no tmux) so callers fall back to their
    * stream heuristics rather than reading an empty screen as "not working".
    */
+  private captureRecoveryComposer(paneId: string, panePid: number): string {
+    const marker = 'CODEMAN_COMPOSER_' + randomUUID();
+    // One tmux command queue supplies styling and cursor metadata from the same
+    // exact pane. The random delimiter is not inferred from worker output.
+    const captured = execFileSync(
+      'tmux',
+      [
+        '-L',
+        this.tmuxSocket,
+        'capture-pane',
+        '-p',
+        '-e',
+        '-t',
+        paneId,
+        ';',
+        'display-message',
+        '-p',
+        '-t',
+        paneId,
+        marker + '|#{pane_id}|#{pane_pid}|#{cursor_x}|#{cursor_y}',
+      ],
+      {
+        encoding: 'utf8',
+        timeout: EXEC_TIMEOUT_MS,
+        maxBuffer: 64 * 1024,
+      }
+    );
+    const boundary = captured.lastIndexOf('\n' + marker + '|');
+    if (boundary < 0 || !captured.endsWith('\n')) throw new Error('Native composer metadata unavailable');
+    const fields = captured.slice(boundary + marker.length + 2, -1).split('|');
+    if (
+      fields.length !== 4 ||
+      fields[0] !== paneId ||
+      fields[1] !== String(panePid) ||
+      !fields.slice(2).every((value) => /^(?:0|[1-9]\d{0,4})$/.test(value))
+    )
+      throw new Error('Native composer pane changed');
+    return normalizeCodexComposerCapture(captured.slice(0, boundary + 1), {
+      column: Number(fields[2]),
+      row: Number(fields[3]),
+    });
+  }
+
   async inspectPaneForRecovery(muxName: string): Promise<{
     dead: boolean;
     paneId?: string;
@@ -7042,11 +7088,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const number = (s: string): number | undefined => (s === '' ? undefined : Number(s));
       let screen: string | null = null;
       if (dead === '0') {
-        const capture = await execAsync(`${this.tmux()} capture-pane -p -t ${shellescape(paneId)}`, {
-          timeout: EXEC_TIMEOUT_MS,
-          maxBuffer: 64 * 1024,
-        });
-        screen = capture.stdout;
+        screen = this.captureRecoveryComposer(paneId, Number(rawPid));
       }
       const session = [...this.sessions.values()].find((candidate) => candidate.muxName === muxName);
       const inputProvenance = session && (await this.inspectCodexInputProvenance(session.sessionId, Number(rawPid)));
