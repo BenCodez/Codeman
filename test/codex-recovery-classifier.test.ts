@@ -1023,3 +1023,61 @@ it('closes only exact Codeman bridge invalid-argument failures without clearing 
     safeToAct: false,
   });
 });
+
+it('requires later owner intent after the exact scoped manager authority refusal', () => {
+  const message =
+    'tool call error: tool call failed for `codeman_supervisor/supervisor_agent`\n\nCaused by:\n    Mcp error: -32001: Current prepared manager authority is required';
+  const row = (text = message, server = 'codeman_supervisor'): Payload => ({
+    type: 'item_completed',
+    thread_id: THREAD,
+    turn_id: TURN,
+    started_at_ms: NOW - 9000,
+    completed_at_ms: NOW - 8000,
+    item: {
+      type: 'McpToolCall',
+      id: 'manager-authority-refusal',
+      server,
+      tool: 'supervisor_agent',
+      arguments: { mode: 'usage', agentId: THREAD },
+      status: 'failed',
+      error: { message: text },
+      duration: { secs: 0, nanos: 0 },
+    },
+  });
+  expect(classifyCodexTail(tail(start(), row(), complete()), context())).toMatchObject({
+    activity: 'paused',
+    reason: 'approval-required',
+    safeToAct: false,
+  });
+  expect(
+    classifyCodexTail(
+      tail(
+        start(),
+        row(),
+        complete(),
+        { type: 'user_message', message: 'Owner repaired manager scope; continue.' },
+        start('new-owner-turn'),
+        complete(undefined, 'new-owner-turn')
+      ),
+      context()
+    ).activity
+  ).toBe('completed');
+  for (const bad of [
+    row(message + '\nAuthentication failed'),
+    row(message.replace('Current prepared manager authority is required', 'Manager authentication changed')),
+    row(message, 'untrusted_server'),
+  ])
+    expect(
+      classifyCodexTail(
+        tail(
+          start(),
+          bad,
+          complete(),
+          { type: 'user_message', message: 'Try again' },
+          start('new-owner-turn'),
+          complete(undefined, 'new-owner-turn')
+        ),
+        context()
+      )
+    ).toMatchObject({ activity: 'blocked', safeToAct: false });
+});

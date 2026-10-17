@@ -19,6 +19,7 @@ import { RecoveryStore } from '../src/recovery/store.js';
 import { createDeferred, safeRmHomeTree } from './mocks/index.js';
 import type { RecoverySubmission } from '../src/recovery/remote-clock.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
+import { MAX_CODEX_ROLLOUT_BYTES } from '../src/recovery/codex-evidence-limits.js';
 import { commandHash } from '../src/supervision/evidence.js';
 const clockAt = (at = Date.now()) => ({ localBefore: at, localAfter: at, remoteBefore: at, remoteAfter: at });
 import { fakeInputProvenance, updateFakeInputProvenance } from './helpers/codex-input-provenance.js';
@@ -495,7 +496,7 @@ function hiddenLiveChildTail(): string {
   return (
     event(CHILD_SPAWN, NOW - 20_000) +
     '\n' +
-    JSON.stringify({ type: 'response_item', payload: { message: 'x'.repeat(300 * 1024) } }) +
+    JSON.stringify({ type: 'response_item', payload: { message: 'x'.repeat(MAX_CODEX_ROLLOUT_BYTES + 64 * 1024) } }) +
     '\n' +
     failedTail()
   );
@@ -844,9 +845,9 @@ describe('bounded real rollout lifecycle evidence', () => {
     });
   });
 
-  it('keeps a hidden live child non-actionable after the 256KiB tail window loses its spawn', async () => {
+  it('keeps a hidden live child non-actionable after the bounded tail window loses its spawn', async () => {
     const body = hiddenLiveChildTail();
-    expect(Buffer.byteLength(body)).toBeGreaterThan(256 * 1024);
+    expect(Buffer.byteLength(body)).toBeGreaterThan(MAX_CODEX_ROLLOUT_BYTES);
     await withRollout(body, async (f) => {
       const identity = await resolveCodexIdentity({
         sessionId: SESSION,
@@ -2870,4 +2871,42 @@ describe('malformed error variants cannot spend an existing recovery reservation
     expect(await f.adapter.act(reserved)).toBe('not-sent');
     expect(f.session.deliverRecovery).not.toHaveBeenCalled();
   });
+});
+
+it('keeps scoped live-pane proof independent from an idle composer, but bound to fresh exact process and scope', async () => {
+  const f = fixture();
+  f.identity.tail = activeTail();
+  const directory = await fs.mkdtemp(join(tmpdir(), 'scoped-live-pane-'));
+  f.identity.path = join(directory, 'rollout.jsonl');
+  await fs.writeFile(f.identity.path, f.identity.tail);
+  const stat = await fs.stat(f.identity.path);
+  f.identity.witness = {
+    paths: [
+      {
+        path: f.identity.path,
+        kind: 'file',
+        dev: stat.dev,
+        ino: stat.ino,
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        ctimeMs: stat.ctimeMs,
+      },
+    ],
+  };
+  try {
+    f.pane!.screen = 'Working (esc to interrupt)\n› draft\n  fixture-model default · /fixture/workspace\n';
+    expect(await f.adapter.observe()).toMatchObject({ activity: 'working', processReady: false });
+    expect(f.adapter.hasFreshOwnedLocalPane(THREAD, f.context.generation)).toBe(true);
+    expect(f.adapter.hasFreshOwnedLocalPane(OTHER, f.context.generation)).toBe(false);
+    expect(f.adapter.hasFreshOwnedLocalPane(THREAD, f.context.generation + 1)).toBe(false);
+    expect(f.adapter.hasFreshOwnedLocalPane(THREAD, f.context.generation, NOW + 30_001)).toBe(false);
+    f.context.switchPending = true;
+    expect(f.adapter.hasFreshOwnedLocalPane(THREAD, f.context.generation)).toBe(false);
+    f.context.switchPending = false;
+    f.pane!.dead = true;
+    await f.adapter.observe();
+    expect(f.adapter.hasFreshOwnedLocalPane(THREAD, f.context.generation)).toBe(false);
+  } finally {
+    await fs.rm(directory, { recursive: true, force: true });
+  }
 });

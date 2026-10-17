@@ -188,9 +188,16 @@ export class SupervisorAutomationController {
     if (existing) {
       if (JSON.stringify(existing) !== JSON.stringify(task))
         return Promise.reject(new SupervisorAutomationError('Owner request ID is bound to different work'));
-      if (!this.current(callerCurrent) || this.stopped || this.failed)
-        return Promise.reject(new SupervisorAutomationError('Owner request is unavailable'));
-      return Promise.resolve(this.getStatus());
+      // configure installs its tentative state before awaiting persistence. A
+      // duplicate must wait for that save and any cancellation save to settle.
+      return this.enqueue(async () => {
+        if (!this.current(callerCurrent) || this.stopped || this.failed)
+          throw new SupervisorAutomationError('Owner request is unavailable');
+        const committed = this.state.tasks.find((value) => value.id === task.id);
+        if (!committed?.enabled || JSON.stringify(committed) !== JSON.stringify(task))
+          throw new SupervisorAutomationError('Owner request is no longer configured');
+        return this.getStatus();
+      });
     }
     // Reconfiguration during a pending send would revoke that send's authority.
     if (this.state.inFlight)

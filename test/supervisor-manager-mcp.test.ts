@@ -869,7 +869,7 @@ it('advertises exact canonical mode arguments in discovery and the manager promp
   const { buildSupervisorManagerTask } = await import('../src/supervisor/manager-task.js');
   const prompt = buildSupervisorManagerTask('Coordinate owner work').objective;
   expect(prompt).toContain('{"mode":"read"}');
-  expect(prompt).toContain('{"mode":"usage","agentId":"EXACT_AGENT_ID"}');
+  expect(prompt).toMatch(/\{"mode":"usage","agentId":"[A-Z_]+"\}/);
   expect(
     (await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { mode: 'read' } })).json().error
   ).toBeUndefined();

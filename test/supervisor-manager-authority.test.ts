@@ -325,6 +325,13 @@ describe('manager authority at the real server boundary', () => {
         config: JSON.stringify(session.codexConfig),
         env: JSON.stringify(session.getEnvOverridesForPersist()),
       });
+      Reflect.set(this, 'livePaneProof', {
+        paneId: '%7',
+        panePid: inputProofs.get(session)!.brokerPid,
+        at: Date.now(),
+        conversationId: observation.conversationId,
+        scope: Reflect.get(this, 'liveProofScope').call(this),
+      });
       return { ...observation, processReadyAt: observation.processReadyAt ?? Date.now() };
     });
     effects = vi.fn();
@@ -421,6 +428,46 @@ describe('manager authority at the real server boundary', () => {
       }) + '\n'
     );
   }
+
+  it.each([
+    'healthy',
+    'stale',
+    'dead',
+    'unverified',
+    'owner-input',
+    'caller-grant',
+    'pending-child',
+    'blocked',
+    'paused',
+  ] as const)(
+    'allows scoped memory authority during a nonidle manager tool call only with current live proof: %s',
+    async (kind) => {
+      observation = { ...observation, activity: 'working', reason: 'turn-running', processReady: false };
+      if (kind === 'pending-child') observation = { ...observation, activity: 'watching', reason: 'background-work' };
+      if (kind === 'blocked') observation = { ...observation, activity: 'blocked', reason: 'authentication-required' };
+      if (kind === 'paused') observation = { ...observation, activity: 'paused', reason: 'approval-required' };
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const original = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        const result = await original.call(this);
+        if (kind === 'stale') Reflect.get(this, 'livePaneProof').at -= 30_001;
+        if (kind === 'unverified') Reflect.set(this, 'livePaneProof', undefined);
+        if (kind === 'dead')
+          Reflect.get(this, 'verifiedTail').inputProof = { ...inputProofs.get(managerSession), closed: true };
+        return result;
+      });
+      if (kind === 'owner-input') Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+      const authority = await manager.captureBrainAuthority(() => kind !== 'caller-grant');
+      expect(!!authority?.()).toBe(kind === 'healthy');
+      expect(observation.processReady).toBe(false);
+      if (kind === 'healthy') {
+        const brain = Reflect.get(server, 'supervisorBrainStore') as import('../src/supervisor/brain.js').BrainStore;
+        expect((await brain.read(MANAGER, authority!)).revision).toMatch(/^[a-f0-9]{64}$/);
+        Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+        expect(authority!()).toBe(false);
+      }
+    }
+  );
 
   it.each(['objective', 'worker-task', 'worker-criteria', 'worker-grants', 'owner-pause'] as const)(
     'binds durable owner setup replay to unchanged role work and current active state: %s',

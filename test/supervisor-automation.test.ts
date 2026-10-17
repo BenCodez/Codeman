@@ -792,3 +792,107 @@ it('refuses owner work at the task limit without removing retained tasks or rece
   expect(f.controller.getStatus()).toEqual(before);
   expect(f.dispatch).not.toHaveBeenCalled();
 });
+
+it('waits for the first owner-work save before acknowledging an identical retry', async () => {
+  const f = await fixture();
+  const release = heldRelease();
+  const entered = createDeferred<void>();
+  f.persist.mockImplementationOnce(async (record) => {
+    entered.resolve();
+    await release.promise;
+    await f.store.save(ID, record);
+  });
+  const first = f.controller.queueOwnerWork(ownerWork(), () => true);
+  await entered.promise;
+  let settled = false;
+  const duplicate = f.controller.queueOwnerWork(ownerWork(), () => true);
+  void duplicate.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    }
+  );
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  expect(settled).toBe(false);
+  expect(f.dispatch).not.toHaveBeenCalled();
+  release.resolve();
+  expect(await duplicate).toEqual(await first);
+  expect(f.persist).toHaveBeenCalledOnce();
+  expect(f.reload().getStatus().tasks).toEqual(f.controller.getStatus().tasks);
+  await f.controller.tick();
+  await f.controller.tick();
+  expect(f.dispatch).toHaveBeenCalledOnce();
+});
+
+it('refuses an identical owner-work retry when the outstanding save fails', async () => {
+  const f = await fixture();
+  const release = heldRelease();
+  const entered = createDeferred<void>();
+  f.persist.mockImplementationOnce(async () => {
+    entered.resolve();
+    await release.promise;
+    throw new Error('Fixture persistence failure');
+  });
+  const first = f.controller.queueOwnerWork(ownerWork(), () => true);
+  const firstRejected = expect(first).rejects.toThrow('Fixture persistence failure');
+  await entered.promise;
+  const duplicate = f.controller.queueOwnerWork(ownerWork(), () => true);
+  const duplicateRejected = expect(duplicate).rejects.toThrow('unavailable');
+  release.resolve();
+  await Promise.all([firstRejected, duplicateRejected]);
+  expect(f.persist).toHaveBeenCalledOnce();
+  expect(f.controller.getStatus().status.phase).toBe('blocked');
+  await f.controller.tick();
+  expect(f.dispatch).not.toHaveBeenCalled();
+  expect(f.reload().getStatus().tasks).toEqual([]);
+});
+
+it('does not acknowledge or re-enable duplicate owner work canceled during its first save', async () => {
+  const f = await fixture();
+  const release = heldRelease();
+  const entered = createDeferred<void>();
+  let firstCurrent = true;
+  f.persist.mockImplementationOnce(async (record) => {
+    entered.resolve();
+    await release.promise;
+    await f.store.save(ID, record);
+  });
+  const first = f.controller.queueOwnerWork(ownerWork(), () => firstCurrent);
+  const firstRejected = expect(first).rejects.toThrow('cancelled');
+  await entered.promise;
+  const duplicate = f.controller.queueOwnerWork(ownerWork(), () => true);
+  const duplicateRejected = expect(duplicate).rejects.toThrow('no longer configured');
+  firstCurrent = false;
+  release.resolve();
+  await Promise.all([firstRejected, duplicateRejected]);
+  expect(f.persist).toHaveBeenCalledTimes(2);
+  expect(f.reload().getStatus().tasks).toEqual([expect.objectContaining({ enabled: false })]);
+  await expect(f.controller.queueOwnerWork(ownerWork(), () => true)).rejects.toThrow('bound');
+  await f.controller.tick();
+  expect(f.dispatch).not.toHaveBeenCalled();
+});
+
+it('checks the retry caller again after waiting without canceling the original owner work', async () => {
+  const f = await fixture();
+  const release = heldRelease();
+  const entered = createDeferred<void>();
+  let duplicateCurrent = true;
+  f.persist.mockImplementationOnce(async (record) => {
+    entered.resolve();
+    await release.promise;
+    await f.store.save(ID, record);
+  });
+  const first = f.controller.queueOwnerWork(ownerWork(), () => true);
+  await entered.promise;
+  const duplicate = f.controller.queueOwnerWork(ownerWork(), () => duplicateCurrent);
+  const duplicateRejected = expect(duplicate).rejects.toThrow('unavailable');
+  duplicateCurrent = false;
+  release.resolve();
+  await first;
+  await duplicateRejected;
+  expect(f.persist).toHaveBeenCalledOnce();
+  expect(f.reload().getStatus().tasks[0].enabled).toBe(true);
+  expect(f.dispatch).not.toHaveBeenCalled();
+});

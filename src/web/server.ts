@@ -3934,14 +3934,17 @@ export class WebServer extends EventEmitter {
             context.untrackedInput ||
             context.inputBrokerPending ||
             observation.conversationId !== config?.resumeSessionId ||
-            !hasFreshProcessReady(observation, 0, Date.now()) ||
-            ['unknown', 'blocked', 'paused', 'crashed', 'exited'].includes(observation.activity) ||
+            !['working', 'idle', 'completed'].includes(observation.activity) ||
+            !managerAdapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation) ||
             !(await managerAdapter.confirmLocalEvidence(observation.conversationId!, context.generation)) ||
             !current() ||
             !grant.isCurrent()
           )
             return undefined;
-          return () => current() && grant.isCurrent();
+          return () =>
+            current() &&
+            grant.isCurrent() &&
+            managerAdapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation);
         },
         getInputIssuer: () => {
           const evidence = managerEvidence;
