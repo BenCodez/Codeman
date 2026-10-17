@@ -2012,6 +2012,7 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M9 13h6"/></svg>
                 <span>Shortcuts</span>
               </button>
+              <button type="button" class="set-rail-item" data-section="settings-management"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="M12 8v4M5 15v-3h14v3"/></svg><span>Management</span></button>
               <button type="button" class="set-rail-item" data-section="settings-system">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.26.6.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.65 0-1.25.4-1.51 1z"/></svg>
                 <span>System</span>
@@ -3397,7 +3398,43 @@
             </section>
 
 
-            <!-- ══ System ═══════════════════════════════════════════════════ -->
+            <!-- ══ Management ═══════════════════════════════════════════════ -->
+            <section class="set-section" id="settings-management" data-label="Management">
+              <div class="set-section-head"><h2>Management</h2></div>
+              <p class="set-group-hint">Shared across this Codeman server and all your browser devices. Choose one local manager to coordinate your agents, including Codex running inside SSH shell sessions.</p>
+              <p id="managementStatus" role="status" aria-live="polite">Loading management settings…</p>
+              <button type="button" class="btn-toolbar" onclick="app.loadManagementSettings(true)">Refresh management settings</button>
+              <fieldset class="set-group task-form" id="managementSettings" disabled>
+                <legend>Global manager and agent directory</legend>
+                <label for="managementManager">Local management Codex</label>
+                <select class="set-select" id="managementManager" onchange="app.mountGlobalManagerControls()"><option value="">No manager selected</option></select>
+                <p class="set-group-hint">Selecting a manager saves your preference; preparation and starting remain explicit actions. Agent roles, notes and messaging permissions below are shared server settings.</p>
+                <div class="task-actions"><button type="button" class="btn-toolbar" onclick="app.saveManagementSettings()">Save management settings</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration()">Manager objectives and controls</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration('automation')">Manager schedules and custom tasks</button></div>
+                <div id="managementAgents"></div>
+              </fieldset>
+              <div class="set-group"><h4>Management Codex controls and schedules</h4><p id="managementControlsStatus" role="status">Select and save an eligible local manager to configure it here.</p><div id="managementManagerControls"></div></div>
+              <fieldset class="set-group task-form" id="managementBrainSettings" disabled>
+                <legend>Shared brain.md</legend>
+                <p class="set-group-hint">Teach your manager what each agent does and how you want work coordinated. The management Codex can read and update this shared memory through its scoped tools. Agent observations remain attributed notes until the manager incorporates them.</p>
+                <label for="managementBrainMarkdown">Manager memory (Markdown, up to 32 KiB)</label>
+                <textarea class="set-textarea" id="managementBrainMarkdown" rows="12" spellcheck="false"></textarea>
+                <button type="button" class="btn-toolbar" onclick="app.saveManagementBrain()">Save shared brain.md</button>
+                <p id="managementBrainStatus" role="status" aria-live="polite"></p>
+              </fieldset>
+              <div class="set-group task-form" id="managementAgentTools" hidden>
+                <h4 id="managementAgentToolsTitle">Agent connection</h4>
+                <p id="managementAgentToolsStatus" role="status" aria-live="polite"></p>
+                <label for="managementEnrollmentInstructions">Private enrollment instructions</label>
+                <textarea class="set-textarea" id="managementEnrollmentInstructions" rows="6" readonly spellcheck="false"></textarea>
+                <button type="button" class="btn-toolbar" onclick="app.copyManagementEnrollment()">Copy instructions</button>
+                <p class="set-group-hint">Copy these private instructions into the intended agent yourself. The agent must cooperate to read its inbox and send replies; messages are queued, never typed into a shell automatically.</p>
+                <pre id="managementMessageThread" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:18rem;overflow:auto"></pre>
+                <label for="managementMessageDraft">Message to this agent</label>
+                <textarea class="set-textarea" id="managementMessageDraft" rows="3" maxlength="2000"></textarea>
+                <div class="task-actions"><button type="button" class="btn-toolbar" id="managementSendMessage" onclick="app.sendManagementMessage()">Queue message</button><button type="button" class="btn-toolbar" onclick="app.refreshManagementMessages()">Refresh replies</button></div>
+              </div>
+            </section>
+
             <section class="set-section" id="settings-system" data-label="System">
               <div class="set-section-head">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.26.6.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.65 0-1.25.4-1.51 1z"/></svg>
@@ -4470,6 +4507,7 @@
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>
   <script defer src="settings-ui.js"></script>
+  <script defer src="management-ui.js"></script>
   <script defer src="panels-ui.js"></script>
   <script defer src="readmymind-ui.js"></script>
   <script defer src="ultracode-panel.js"></script>

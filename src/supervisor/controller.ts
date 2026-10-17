@@ -315,7 +315,7 @@ export class SupervisorController {
     return this.enqueue(() =>
       this.deps.withLeases(async () => {
         if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
-        if (!this.state.enabled || !this.state.objective.trim() || !this.state.workers.length)
+        if (!this.state.enabled || !this.state.objective.trim())
           throw new SupervisorValidationError('Supervisor is not configured');
         if (this.state.phase === 'active') throw new SupervisorValidationError('Supervisor is already active');
         if (this.state.inFlight)

@@ -466,10 +466,30 @@ export class BrainStore {
     ifMatch: string,
     authority: BrainAuthority
   ): Promise<BrainSnapshot & { duplicate: boolean }> {
+    return this.edit(id, requestId, note, ifMatch, authority, 'append');
+  }
+  /** Manager rewrites require an exact revision and retain durable request receipts. */
+  replaceManaged(
+    id: string,
+    requestId: string,
+    markdown: string,
+    ifMatch: string,
+    authority: BrainAuthority
+  ): Promise<BrainSnapshot & { duplicate: boolean }> {
+    return this.edit(id, requestId, markdown, ifMatch, authority, 'replace');
+  }
+  private edit(
+    id: string,
+    requestId: string,
+    note: string,
+    ifMatch: string,
+    authority: BrainAuthority,
+    mode: 'append' | 'replace'
+  ): Promise<BrainSnapshot & { duplicate: boolean }> {
     if (
       typeof requestId !== 'string' ||
       !REQUEST_ID.test(requestId) ||
-      !isValidBrainNote(note) ||
+      !(mode === 'append' ? isValidBrainNote(note) : validText(note, MAX_BRAIN_BYTES)) ||
       typeof ifMatch !== 'string' ||
       !HASH.test(ifMatch)
     )
@@ -477,9 +497,10 @@ export class BrainStore {
     return this.run(id, authority, async (path) => {
       const dirs = (await this.directories(id, true, authority))!;
       const before = this.readLeaf(path, dirs, authority);
+      const payloadHash = hash(mode === 'append' ? note : JSON.stringify(['replace', note]));
       const receipt = before.record.receipts.find((receipt) => receipt.requestId === requestId);
       if (receipt) {
-        if (receipt.hash !== hash(note)) throw new BrainStoreError('conflict');
+        if (receipt.hash !== payloadHash) throw new BrainStoreError('conflict');
         // A prior publication may have lost its ACK. Re-confirm durability of
         // the exact receipt without appending or rewriting any bytes.
         const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -499,13 +520,14 @@ export class BrainStore {
       }
       if (snapshot(before).revision !== ifMatch) throw new BrainStoreError('conflict');
       if (before.record.receipts.length >= MAX_BRAIN_NOTES) throw new BrainStoreError('capacity');
-      const markdown = `${before.record.markdown}${before.record.markdown ? '\n\n' : ''}${note}`;
+      const markdown =
+        mode === 'replace' ? note : `${before.record.markdown}${before.record.markdown ? '\n\n' : ''}${note}`;
       if (!validText(markdown, MAX_BRAIN_BYTES)) throw new BrainStoreError('capacity');
       const saved = await this.write(
         path,
         dirs,
         before,
-        { markdown, receipts: [...before.record.receipts, { requestId, hash: hash(note) }] },
+        { markdown, receipts: [...before.record.receipts, { requestId, hash: payloadHash }] },
         authority
       );
       return { ...saved, duplicate: false };

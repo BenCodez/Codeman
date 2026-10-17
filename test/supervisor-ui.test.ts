@@ -60,6 +60,19 @@ afterEach(() => {
 });
 
 describe('Codex supervisor UI', () => {
+  it('allows an enabled manager with an objective and no guarded worker plans to start', async () => {
+    const { app, get } = harness();
+    app._apiJson.mockResolvedValueOnce({
+      ...state(),
+      enabled: true,
+      objective: 'Coordinate enrolled SSH inbox agents',
+    });
+    expect(app.openSupervisorOptions(SID)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(get('supervisorStartBtn').disabled).toBe(false);
+    expect(get('supervisorWorkerStatus').children.length).toBe(0);
+  });
+
   it.each([
     {
       label: 'local manager',

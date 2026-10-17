@@ -375,6 +375,8 @@ export async function prepareSupervisorManagerLaunch(options: {
               'supervisor_retry',
               'supervisor_message',
               'supervisor_brain',
+              'supervisor_agents',
+              'supervisor_agent',
             ],
             required: true,
           },

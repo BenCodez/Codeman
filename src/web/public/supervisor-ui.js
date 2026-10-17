@@ -290,12 +290,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('supervisorPrepareBtn').disabled =
       !available || state.phase === 'active' || !!state.inFlight;
     document.getElementById('supervisorStartBtn').disabled =
-      !available ||
-      !state.enabled ||
-      !state.objective ||
-      !state.workers.length ||
-      state.phase === 'active' ||
-      !!state.inFlight;
+      !available || !state.enabled || !state.objective || state.phase === 'active' || !!state.inFlight;
     document.getElementById('supervisorPauseBtn').disabled = !available || state.phase !== 'active';
     document.getElementById('supervisorResetBtn').disabled = !available;
     if (force && state) {

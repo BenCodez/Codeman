@@ -53,7 +53,7 @@ async function fixture(authenticated = true, multiUser = false) {
 }
 
 describe('actual server restricted manager credential', () => {
-  it('authenticates only six scoped tools without relying on session attribution', async () => {
+  it('authenticates only scoped worker and global management tools without relying on session attribution', async () => {
     const h = await fixture();
     const result = await h.rpc('tools/list');
     expect(result.statusCode).toBe(200);
@@ -64,6 +64,8 @@ describe('actual server restricted manager credential', () => {
       'supervisor_retry',
       'supervisor_message',
       'supervisor_brain',
+      'supervisor_agents',
+      'supervisor_agent',
     ]);
     const arbitrary = await h.rpc('tools/call', { name: 'send_input', arguments: { input: 'unsafe' } });
     expect(arbitrary.json()).toMatchObject({ error: { code: -32602 } });

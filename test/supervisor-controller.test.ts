@@ -2420,3 +2420,12 @@ describe('shared lifetime supervisor request allocation', () => {
     }
   );
 });
+
+it('starts a bounded directory-and-inbox manager without granting native worker assignments', async () => {
+  const h = harness();
+  await h.controller.configure({ ...config, workers: [] });
+  expect((await h.controller.start()).phase).toBe('active');
+  expect(h.deps.startManager).toHaveBeenCalled();
+  await expect(h.controller.assign(WORKER, 'not-granted-worker')).rejects.toBeInstanceOf(SupervisorValidationError);
+  expect(h.worker.task.resume).not.toHaveBeenCalled();
+});

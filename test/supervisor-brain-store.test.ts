@@ -321,3 +321,28 @@ it.each(['a'.repeat(2001), '🙂'.repeat(2001)])(
     expect(await fs.readdir(root)).toEqual([]);
   }
 );
+
+it('binds manager rewrites to exact content and revisions without replaying over later owner edits', async () => {
+  const first = await seeded('# Owner goals');
+  const next = '# Owner goals\n\n## Agent roles\nAPI worker owns backend.';
+  const saved = await store.replaceManaged(ID, 'manager-rewrite', next, first.revision, current);
+  expect(saved.markdown).toBe(next);
+  const replay = await new BrainStore(base).replaceManaged(ID, 'manager-rewrite', next, first.revision, current);
+  expect(replay.duplicate).toBe(true);
+  await expect(store.replaceManaged(ID, 'manager-rewrite', 'different', saved.revision, current)).rejects.toMatchObject(
+    { code: 'conflict' }
+  );
+  await expect(store.append(ID, 'manager-rewrite', next, saved.revision, current)).rejects.toMatchObject({
+    code: 'conflict',
+  });
+  const ownerEdit = await store.replace(ID, 'Owner changed direction', saved.revision, current);
+  expect((await store.replaceManaged(ID, 'manager-rewrite', next, first.revision, current)).markdown).toBe(
+    ownerEdit.markdown
+  );
+  await expect(store.replaceManaged(ID, 'other-rewrite', next, first.revision, current)).rejects.toMatchObject({
+    code: 'conflict',
+  });
+  await expect(
+    store.replaceManaged(ID, 'canceled-rewrite', next, ownerEdit.revision, () => false)
+  ).rejects.toMatchObject({ code: 'forbidden' });
+});

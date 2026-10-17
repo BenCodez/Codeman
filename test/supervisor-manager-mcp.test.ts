@@ -30,7 +30,8 @@ async function fixture(
   password = 'owner-password',
   multiuser = false,
   initiallyAborted = false,
-  initiallyReady = true
+  initiallyReady = true,
+  withManagement = false
 ) {
   vi.stubEnv('CODEMAN_MULTIUSER', multiuser ? '1' : '0');
   vi.stubEnv('CODEMAN_PASSWORD', password);
@@ -82,7 +83,25 @@ async function fixture(
   const resolve = vi.fn((scope) =>
     scope.sessionId === SID && scope.owner === (multiuser ? 'alice' : undefined) ? controller : undefined
   );
+  const management = {
+    directory: vi.fn(async (_scope, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { agents: [{ sessionId: WORKER, mode: 'shell', remote: true }] };
+    }),
+    thread: vi.fn(async (_scope, _id, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { messages: [{ direction: 'agent', message: 'I maintain the API' }] };
+    }),
+    message: vi.fn(async (_scope, _id, _request, _message, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { queued: true };
+    }),
+  };
   const brain = {
+    replace: vi.fn(async (_scope, _id, _markdown, _revision, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { revision: 'c'.repeat(64) };
+    }),
     read: vi.fn(async (_scope, current: () => boolean) => {
       if (!current()) throw Error('cancelled');
       return { content: 'Owner teaching', revision: REVISION };
@@ -92,7 +111,12 @@ async function fixture(
       return { revision: 'b'.repeat(64) };
     }),
   };
-  registerSupervisorMcpRoutes(app, { credentials: registry, resolveController: resolve, brain } as never);
+  registerSupervisorMcpRoutes(app, {
+    credentials: registry,
+    resolveController: resolve,
+    brain,
+    ...(withManagement ? { management } : {}),
+  } as never);
   const generic = vi.fn(async () => ({ success: true }));
   for (const path of [
     '/api/sessions',
@@ -121,6 +145,7 @@ async function fixture(
     issued,
     controller,
     brain,
+    management,
     resolve,
     generic,
     rpc,
@@ -161,7 +186,7 @@ it('initializes and lists exactly six scoped tools, then invokes exact owner-sel
     required: ['mode'],
     additionalProperties: false,
     properties: {
-      mode: { enum: ['read', 'append'] },
+      mode: { enum: ['read', 'append', 'replace'] },
       note: { maxLength: 2000 },
       ifMatch: { pattern: '^[a-f0-9]{64}$' },
     },
@@ -574,4 +599,59 @@ it('advertises the same non-whitespace message constraint that runtime admission
     expect(f.controller.message).toHaveBeenLastCalledWith(WORKER, REQUEST, message, expect.any(Function));
   }
   expect(f.controller.message).toHaveBeenCalledTimes(3);
+});
+
+it('exposes global agent discovery and cooperative messages without calling native worker handlers', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  expect((await f.rpc('tools/list')).json().result.tools.map((t: { name: string }) => t.name)).toEqual([
+    ...TOOLS,
+    'supervisor_agents',
+    'supervisor_agent',
+  ]);
+  const directory = (await f.rpc('tools/call', { name: 'supervisor_agents', arguments: {} })).json();
+  expect(directory.error).toBeUndefined();
+  expect(f.management.directory).toHaveBeenCalledOnce();
+  for (const args of [
+    { mode: 'read', agentId: WORKER },
+    { mode: 'message', agentId: WORKER, requestId: REQUEST, message: 'Tell me your project and current role.' },
+  ]) {
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: args })).json().error).toBeUndefined();
+  }
+  expect(f.management.thread).toHaveBeenCalledOnce();
+  expect(f.management.message).toHaveBeenCalledOnce();
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.generic).not.toHaveBeenCalled();
+  f.setReady(false);
+  expect(
+    (
+      await f.rpc('tools/call', {
+        name: 'supervisor_agent',
+        arguments: { mode: 'message', agentId: WORKER, requestId: REQUEST, message: 'Wait' },
+      })
+    ).json().error.code
+  ).toBe(-32001);
+});
+
+it('allows revision-checked brain rewrites only with fresh prepared-manager authority', async () => {
+  const f = await fixture();
+  const args = {
+    mode: 'replace',
+    requestId: REQUEST,
+    markdown: '# Goals\nPreserve owner limits.\n## Agents\nAPI worker: backend.',
+    ifMatch: REVISION,
+  };
+  const schema = (await f.rpc('tools/list'))
+    .json()
+    .result.tools.find((t: { name: string }) => t.name === 'supervisor_brain').inputSchema;
+  expect(new Ajv().compile(schema)(args)).toBe(true);
+  expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toBeUndefined();
+  expect(f.brain.replace).toHaveBeenCalledOnce();
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+  expect(
+    (
+      await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { ...args, requestId: 'rewrite-second' } })
+    ).json().error.code
+  ).toBe(-32001);
+  expect(f.brain.replace).toHaveBeenCalledOnce();
 });

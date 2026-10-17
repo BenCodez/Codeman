@@ -1,5 +1,6 @@
 /** Bearer credentials authorize only the dedicated manager tool endpoint. */
 import type { FastifyInstance, FastifyRequest } from 'fastify';
+import { isManagementAgentRequest } from './management-agent-auth.js';
 import { isMultiUserMode } from '../../config/multiuser.js';
 import { findUser } from '../../user-store.js';
 import type { AuthUser } from '../../types.js';
@@ -24,6 +25,7 @@ export function isSupervisorManagerRequest(req: FastifyRequest): boolean {
 
 export function registerSupervisorManagerAuth(app: FastifyInstance, credentials?: ManagerCredentialRegistry): void {
   app.addHook('onRequest', async (req, reply) => {
+    if (isManagementAgentRequest(req)) return;
     const header = req.headers.authorization;
     if (typeof header !== 'string' || !/^Bearer(?:\s|$)/i.test(header)) return;
     const token = /^Bearer ([^\s]+)$/i.exec(header)?.[1];

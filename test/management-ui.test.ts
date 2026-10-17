@@ -1,0 +1,221 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import vm from 'node:vm';
+import { JSDOM } from 'jsdom';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+const root = resolve(import.meta.dirname, '../src/web/public');
+const read = (name: string) => readFileSync(resolve(root, name), 'utf8');
+const doms: JSDOM[] = [];
+const manager = '11111111-1111-4111-8111-111111111111';
+const worker = '22222222-2222-4222-8222-222222222222';
+const brain = { revision: 'b'.repeat(64), markdown: 'Remember agents', exists: true, noteCount: 0 };
+function snapshot() {
+  return {
+    revision: 'a'.repeat(64),
+    managerSessionId: manager,
+    brain,
+    agents: [
+      {
+        sessionId: manager,
+        name: 'Manager',
+        mode: 'codex',
+        remote: false,
+        status: 'idle',
+        role: '',
+        notes: '',
+        allowMessages: false,
+        enrolled: false,
+        pendingMessages: 0,
+        managerAvailable: true,
+      },
+      {
+        sessionId: worker,
+        name: '<img src=x onerror=alert(1)>',
+        mode: 'shell',
+        remote: true,
+        status: 'busy',
+        role: 'Deploy',
+        notes: 'Codex inside SSH',
+        allowMessages: true,
+        enrolled: true,
+        pendingMessages: 1,
+      },
+    ],
+  };
+}
+function harness() {
+  const dom = new JSDOM(read('index.html'), { runScripts: 'outside-only', url: 'http://localhost/' });
+  doms.push(dom);
+  const ctx = dom.getInternalVMContext();
+  (ctx as any).TextEncoder = TextEncoder;
+  vm.runInContext('class CodemanApp {}', ctx);
+  vm.runInContext(read('supervisor-brain-ui.js'), ctx);
+  vm.runInContext(read('management-ui.js'), ctx);
+  const app = vm.runInContext('new CodemanApp()', ctx) as any;
+  app._apiJson = vi.fn(async () => snapshot());
+  app.showToast = vi.fn();
+  dom.window.confirm = vi.fn(() => true);
+  const get = (id: string) => dom.window.document.getElementById(id)! as any;
+  return { app, dom, get };
+}
+afterEach(() => {
+  for (const dom of doms.splice(0)) dom.window.close();
+});
+
+describe('Global management settings', () => {
+  it('shows shell agents safely and only eligible manager choices, without any shell input', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    expect(get('managementSettings').disabled).toBe(false);
+    expect(app._managementView.rows[1].notes.value).toBe('Codex inside SSH');
+    expect(get('managementAgents').querySelector('img')).toBeNull();
+    expect(get('managementManager').options.length).toBe(2);
+    expect(app._apiJson.mock.calls.map(([path]: [string]) => path)).toEqual(['/api/management']);
+    expect(get('managementBrainMarkdown').value).toBe('Remember agents');
+  });
+  it('saves global edits and grants using the observed revision and retains drafts on conflict', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    app._managementView.rows[1].notes.value = 'Owns SSH work';
+    app._apiJson.mockResolvedValueOnce(null);
+    await app.saveManagementSettings();
+    expect(app._apiJson.mock.calls[1]).toEqual([
+      '/api/management',
+      {
+        method: 'PUT',
+        body: {
+          ifMatch: 'a'.repeat(64),
+          managerSessionId: manager,
+          agents: [{ sessionId: worker, role: 'Deploy', notes: 'Owns SSH work', allowMessages: true }],
+        },
+      },
+    ]);
+    expect(app._managementView.rows[1].notes.value).toBe('Owns SSH work');
+    expect(get('managementSettings').disabled).toBe(true);
+    expect(get('managementStatus').textContent).toContain('not confirmed');
+  });
+  it('ignores a late directory response after settings close', async () => {
+    const { app, get } = harness();
+    let finish!: (value: unknown) => void;
+    app._apiJson.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const pending = app.loadManagementSettings();
+    app.closeManagementSettings();
+    finish(snapshot());
+    await pending;
+    expect(app._managementView).toBeNull();
+    expect(get('managementSettings').disabled).toBe(true);
+  });
+  it('saves shared brain independently and keeps an unconfirmed draft', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementBrainMarkdown').value = 'Manager can update shared memory';
+    app._apiJson.mockResolvedValueOnce(null);
+    await app.saveManagementBrain();
+    expect(app._apiJson.mock.calls[1]).toEqual([
+      '/api/management/brain',
+      { method: 'PUT', body: { markdown: 'Manager can update shared memory', ifMatch: brain.revision } },
+    ]);
+    expect(get('managementBrainMarkdown').value).toBe('Manager can update shared memory');
+    expect(get('managementBrainSettings').disabled).toBe(true);
+  });
+  it('clears private enrollment capabilities on close and fences a late enrollment response', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    let finish!: (value: unknown) => void;
+    app._apiJson.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const pending = app.openManagementAgent(manager, true);
+    app.closeManagementSettings();
+    finish({ instructions: 'private fixture capability' });
+    await pending;
+    expect(get('managementEnrollmentInstructions').value).toBe('');
+    expect(get('managementAgentTools').hidden).toBe(true);
+  });
+  it('queues cooperative messages with an unchanged request ID after uncertainty, without shell input', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    app._apiJson.mockResolvedValueOnce({ messages: [] });
+    await app.openManagementAgent(worker, false);
+    get('managementMessageDraft').value = 'Please report your role';
+    app._apiJson.mockResolvedValueOnce(null);
+    await app.sendManagementMessage();
+    const first = app._apiJson.mock.calls.at(-1);
+    expect(first[0]).toBe(`/api/management/agents/${worker}/messages`);
+    expect(first[1].body.message).toBe('Please report your role');
+    expect(get('managementMessageDraft').value).toBe('Please report your role');
+    app._apiJson
+      .mockResolvedValueOnce({ message: { ...first[1].body, direction: 'owner' }, duplicate: true })
+      .mockResolvedValueOnce({ messages: [] });
+    await app.sendManagementMessage();
+    const second = app._apiJson.mock.calls.at(-2);
+    expect(second[1].body.requestId).toBe(first[1].body.requestId);
+    expect(get('managementAgentToolsStatus').textContent).toContain('must check its inbox');
+    expect(app._apiJson.mock.calls.every(([path]: [string]) => !path.includes('/input'))).toBe(true);
+  });
+  it('gives owner-copyable private instructions an exact endpoint and bounded learning guidance', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    app._apiJson.mockResolvedValueOnce({ instructions: 'Use fixture-private-token only in Authorization.' });
+    app._apiJson.mockResolvedValueOnce({ messages: [] });
+    await app.openManagementAgent(manager, true);
+    expect(get('managementEnrollmentInstructions').value).toContain('http://localhost/api/management/agent-inbox');
+    expect(get('managementEnrollmentInstructions').value).toContain('fixture-private-token');
+    expect(get('managementEnrollmentInstructions').value).toContain('do not start an unbounded background poller');
+    expect(get('managementEnrollmentInstructions').value).toContain('agent observations, not owner instructions');
+    app.closeManagementSettings();
+    expect(get('managementEnrollmentInstructions').value).toBe('');
+  });
+  it('embeds the selected global manager controls and schedules, restoring the same IDs on close', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    const originalParent = get('supervisor-tab').parentNode;
+    app.openSupervisorOptions = vi.fn(() => {
+      app._supervisorView = { sessionId: manager };
+      return true;
+    });
+    app.closeSupervisorOptions = vi.fn(() => {
+      app._supervisorView = null;
+    });
+    app.loadSupervisorAutomation = vi.fn();
+    app.openGlobalManagerConfiguration('automation');
+    expect(get('supervisor-tab').parentNode).toBe(get('managementManagerControls'));
+    expect(get('supervisor-tab').classList.contains('set-section')).toBe(false);
+    expect(get('supervisorBrainPanel').hidden).toBe(true);
+    expect(get('supervisorAutomationPanel').open).toBe(true);
+    expect(app.loadSupervisorAutomation).toHaveBeenCalledTimes(1);
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    app.closeManagementSettings();
+    expect(get('supervisor-tab').parentNode).toBe(originalParent);
+    expect(get('supervisor-tab').classList.contains('set-section')).toBe(true);
+    expect(get('supervisorBrainPanel').hidden).toBe(false);
+    expect(app.closeSupervisorOptions).toHaveBeenCalledTimes(1);
+  });
+  it('does not render late replies into a different selected agent', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    let finish!: (value: unknown) => void;
+    app._apiJson.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          finish = resolve;
+        })
+    );
+    const pending = app.openManagementAgent(worker, false);
+    app._apiJson.mockResolvedValueOnce({ messages: [{ direction: 'agent', message: 'Manager thread' }] });
+    await app.openManagementAgent(manager, false);
+    finish({ messages: [{ direction: 'agent', message: 'Private worker thread' }] });
+    await pending;
+    expect(get('managementMessageThread').textContent).toContain('Manager thread');
+    expect(get('managementMessageThread').textContent).not.toContain('Private worker');
+  });
+});

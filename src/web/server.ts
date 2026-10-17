@@ -183,6 +183,9 @@ import { SupervisorStore } from '../supervisor/store.js';
 import { SupervisorAutomationController } from '../supervisor/automation.js';
 import { SupervisorAutomationStore } from '../supervisor/automation-store.js';
 import { BrainStore } from '../supervisor/brain.js';
+import { ManagementService } from '../management/store.js';
+import { registerManagementRoutes } from './routes/management-routes.js';
+import { registerManagementAgentAuth } from './middleware/management-agent-auth.js';
 import type { SupervisorUsage } from '../types/supervisor.js';
 import { SupervisorStateSchema } from '../supervisor/schema.js';
 import { RecoveryController } from '../recovery/controller.js';
@@ -355,6 +358,24 @@ export class WebServer extends EventEmitter {
   private supervisorAutomationStore = new SupervisorAutomationStore();
   private supervisorAutomations = new Map<string, SupervisorAutomationController>();
   private supervisorBrainStore = new BrainStore();
+  private managementBrainStore = new BrainStore(dataPath('management-brains'));
+  private managementService = new ManagementService({
+    sessions: () =>
+      [...this.sessions.values()].map((session) => ({
+        id: session.id,
+        owner: session.owner ?? 'admin',
+        name: session.name,
+        mode: session.mode,
+        remote: !!session.remote,
+        status: session.status,
+        managerAvailable: this.supervisorManagerIsEligible(session),
+        managerActive: this.supervisorControllers.get(session.id)?.getStatus().phase === 'active',
+      })),
+    ownerCurrent: () => !this.recoveryStopping && this.supervisorManagerAuthenticationAvailable(),
+  });
+  private managementBrainId(owner: string): string {
+    return 'management-owner-' + createHash('sha256').update(owner).digest('hex');
+  }
   private supervisorLeaseQueue: Promise<unknown> = Promise.resolve();
   private recoveryControllers = new Map<string, RecoveryController>();
   private recoveryInputListeners = new Map<string, () => void>();
@@ -835,9 +856,15 @@ export class WebServer extends EventEmitter {
       prepareSupervisorManager: this.prepareSupervisorManager.bind(this),
       getSupervisorAutomation: this.getSupervisorAutomation.bind(this),
       supervisorBrain: {
-        read: (session: Session, current: () => boolean) => this.supervisorBrainStore.read(session.id, current),
+        read: (session: Session, current: () => boolean) =>
+          this.managementBrainStore.read(this.managementBrainId(session.owner ?? 'admin'), current),
         replace: (session: Session, markdown: string, ifMatch: string, current: () => boolean) =>
-          this.supervisorBrainStore.replace(session.id, markdown, ifMatch, current),
+          this.managementBrainStore.replace(
+            this.managementBrainId(session.owner ?? 'admin'),
+            markdown,
+            ifMatch,
+            current
+          ),
       },
       // EventPort
       broadcast: this.broadcast.bind(this),
@@ -963,6 +990,8 @@ export class WebServer extends EventEmitter {
     // on the default no-password install. See docs/reports/security-review-2026-06-09.md.
     registerHostGuard(this.app, () => this.getHostPolicy(), this.basePath);
 
+    // Inbox capabilities grant only cooperative message access, never terminal input.
+    registerManagementAgentAuth(this.app, this.managementService);
     // Auth middleware (Basic Auth + session cookies + rate limiting)
     const authState = registerAuthMiddleware(this.app, this.https, this.basePath, this.supervisorManagerCredentials);
     this.supervisorManagerAuthReady = authState.authSessions !== null;
@@ -1248,6 +1277,15 @@ export class WebServer extends EventEmitter {
     registerRecoveryRoutes(this.app, ctx);
     registerTaskRoutes(this.app, ctx);
     registerSupervisorRoutes(this.app, ctx);
+    registerManagementRoutes(this.app, {
+      service: this.managementService,
+      globalBrain: {
+        read: (owner, current) => this.managementBrainStore.read(this.managementBrainId(owner), current),
+        replace: (owner, markdown, ifMatch, current) =>
+          this.managementBrainStore.replace(this.managementBrainId(owner), markdown, ifMatch, current),
+      },
+      ownerCurrent: (req) => !this.recoveryStopping && !req.raw.aborted,
+    });
     registerSupervisorMcpRoutes(this.app, {
       credentials: this.supervisorManagerCredentials,
       resolveController: (scope) => {
@@ -1259,32 +1297,67 @@ export class WebServer extends EventEmitter {
           ? this.getSupervisorController(session)
           : undefined;
       },
-      brain: {
-        read: (scope, current) => {
-          const session = this.sessions.get(scope.sessionId);
-          return this.supervisorBrainStore.read(
+      management: {
+        directory: async (scope, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
             scope.sessionId,
-            () =>
-              current() &&
-              !!session &&
-              this.sessions.get(scope.sessionId) === session &&
-              session.owner === scope.owner &&
-              session.isSupervisorManagerLaunchCurrent()
+            current
           );
+          return this.managementService.directory(scope.owner ?? 'admin', authority);
         },
-        append: (scope, requestId, note, ifMatch, current) => {
-          const session = this.sessions.get(scope.sessionId);
-          return this.supervisorBrainStore.append(
+        thread: async (scope, agentId, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
             scope.sessionId,
+            current
+          );
+          return this.managementService.messages(scope.owner ?? 'admin', agentId, authority);
+        },
+        message: async (scope, agentId, requestId, message, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
+            scope.sessionId,
+            current
+          );
+          return this.managementService.send(scope.owner ?? 'admin', agentId, message, requestId, authority);
+        },
+      },
+      brain: {
+        read: async (scope, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
+            scope.sessionId,
+            current
+          );
+          return this.managementBrainStore.read(this.managementBrainId(scope.owner ?? 'admin'), authority);
+        },
+        append: async (scope, requestId, note, ifMatch, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
+            scope.sessionId,
+            current
+          );
+          return this.managementBrainStore.append(
+            this.managementBrainId(scope.owner ?? 'admin'),
             requestId,
             note,
             ifMatch,
-            () =>
-              current() &&
-              !!session &&
-              this.sessions.get(scope.sessionId) === session &&
-              session.owner === scope.owner &&
-              session.isSupervisorManagerLaunchCurrent()
+            authority
+          );
+        },
+        replace: async (scope, requestId, markdown, ifMatch, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
+            scope.sessionId,
+            current
+          );
+          return this.managementBrainStore.replaceManaged(
+            this.managementBrainId(scope.owner ?? 'admin'),
+            requestId,
+            markdown,
+            ifMatch,
+            authority
           );
         },
       },

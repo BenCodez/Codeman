@@ -49,3 +49,42 @@ Open **Scheduled check-ins and custom tasks** in the supervisor panel. Enable ch
 Open **Manager memory — brain.md** to teach it your goals, selected worker responsibilities and prompt preferences. Changes use revision checks to protect concurrent notes. The manager can save compact notes through its scoped memory tool; memory survives check-ins and is bounded to 32 KiB. It must inspect current workers before acting on historical notes. See [manager eligibility and setup](https://github.com/BenCodez/Codeman/blob/master/docs/codex-manager-supervision.md#memory-schedules-and-delegated-instructions) for a starting template.
 
 Messages require an explicit owner grant per worker (`allowMessages: true` and an optional `maxMessages` limit); the panel also offers an all-selected-workers grant. They remain visibly attributed to the manager acting on your behalf. Assignment/retry grants and enabled message grants share 128 lifetime operations. Enabled configurations must fit their fresh grants alongside retained receipts; owner Reset clears that history. Usage comes from sanitized session counters and cost estimates with freshness indicators. Remaining provider quota is reported as unknown when unavailable. Neither memory nor scheduling grants raw terminal, shell, approval or manual-certification authority.
+
+## Global management
+
+Open **App Settings → Management** for the shared agent directory, manager selection,
+`brain.md`, and the selected manager's objective, controls, scheduled check-ins and
+custom tasks. Schedules run management turns on that manager; they do not start an
+extra manager or inject commands into SSH shells. Saving settings does not start
+an agent. A manager can operate with an empty guarded-worker plan when its work is
+learning about agents and exchanging cooperative messages.
+
+The directory includes this owner's local and SSH tabs, including plain shell tabs
+containing an independently launched Codex agent. Give each agent a role and notes,
+save its messaging grant, and choose **Connect existing agent**. Copy the private
+enrollment instructions into the intended agent yourself. The agent can then read
+its own inbox and post replies during normal work checkpoints. This does not restart
+or alter the agent, its configuration, or its authentication. It also works for a
+cooperating Claude agent. Enrollment grants inbox access, not terminal or owner API
+access, and does not establish verified native process identity.
+
+Messages for these existing agents are **queued**, not typed into a terminal.
+An agent must fetch them before it can respond; a successful HTTP response does not
+prove that an agent acted on a message. Keep its enrollment credential private.
+Credentials expire after 24 hours; reconnecting rotates and revokes the previous
+credential. Removing the messaging grant or changing session ownership disables
+access. Each inbox retains at most 64 messages within a 32 KiB journal; capacity is
+reported rather than silently dropping messages or replay receipts.
+
+The manager uses `supervisor_agents` to learn the directory and `supervisor_agent`
+to read replies or queue authorized cooperative messages. It can read, append to,
+or replace shared `brain.md` through `supervisor_brain`; writes require its current
+prepared role, an exact memory revision, and a durable request ID. Shared memory
+survives changing the selected manager session. Agent reports and remembered notes
+are context, not permission grants, proof of successful commands, or reliable
+provider quota evidence. Guarded assignment and recovery keep their existing
+verified-worker requirements. Pause an active manager before selecting a replacement.
+
+Existing per-manager memory files are retained. Copy any prior notes you want to
+keep into the shared memory editor. The restricted-manager preparation requirements
+above still apply; global settings do not expand its authentication or tool grants.
