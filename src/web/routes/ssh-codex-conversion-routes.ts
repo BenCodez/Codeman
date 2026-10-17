@@ -249,10 +249,13 @@ export function registerSshCodexConversionRoutes(
       if (result.status === 'not-sent') {
         if (persisted && (await readFile(journalPath(session.id), 'utf8')) === text)
           await unlink(journalPath(session.id));
-        return createErrorResponse(
-          ApiErrorCode.OPERATION_FAILED,
-          'Conversion was refused before a worker launch. The original shell remains available. Preview again.'
-        );
+        return {
+          ...createErrorResponse(
+            ApiErrorCode.OPERATION_FAILED,
+            'Conversion was refused before a worker launch. The original shell remains available. Preview again.'
+          ),
+          canPreviewAgain: true,
+        };
       }
       if (result.status !== 'converted')
         return createErrorResponse(

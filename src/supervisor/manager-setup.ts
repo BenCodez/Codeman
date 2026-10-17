@@ -1,8 +1,8 @@
 /** Durable owner-only setup receipts. Reserved or uncertain phases are never replayed. */
 import { lstatSync, readFileSync } from 'node:fs';
-import { mkdir, open, rename, unlink } from 'node:fs/promises';
+import { mkdir, open, rename, unlink, link } from 'node:fs/promises';
 import { dirname } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { z } from 'zod';
 import { dataPath } from '../config/instance.js';
 
@@ -65,11 +65,85 @@ export class ManagerSetupJournal {
       this.failed = true;
     }
   }
+  private archivePath(sessionId: string, requestId: string): string {
+    const key = createHash('sha256')
+      .update(JSON.stringify([sessionId, requestId]))
+      .digest('hex');
+    return this.path + '.archive/' + key + '.json';
+  }
+  private archived(sessionId: string, requestId: string): ManagerSetupReceipt | undefined {
+    const path = this.archivePath(sessionId, requestId);
+    let info;
+    try {
+      info = lstatSync(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      throw error;
+    }
+    if (!info.isFile() || info.isSymbolicLink() || info.size > 1024) throw Error('Invalid setup archive');
+    const receipt = Receipt.parse(JSON.parse(readFileSync(path, 'utf8')));
+    if (
+      receipt.sessionId !== sessionId ||
+      receipt.requestId !== requestId ||
+      !['started', 'refused'].includes(receipt.phase)
+    )
+      throw Error('Invalid setup archive binding');
+    return receipt;
+  }
+  private async archive(receipt: ManagerSetupReceipt): Promise<void> {
+    const target = this.archivePath(receipt.sessionId, receipt.requestId);
+    const existing = this.archived(receipt.sessionId, receipt.requestId);
+    if (existing && JSON.stringify(existing) !== JSON.stringify(receipt)) throw Error('Setup archive changed');
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    const temp = target + '.' + randomUUID() + '.tmp';
+    try {
+      if (!existing) {
+        const file = await open(temp, 'wx', 0o600);
+        try {
+          await file.writeFile(JSON.stringify(receipt));
+          await file.sync();
+        } finally {
+          await file.close();
+        }
+        // Immutable publication: an existing replay fence can never be replaced.
+        try {
+          await link(temp, target);
+        } catch (error) {
+          if (
+            (error as NodeJS.ErrnoException).code !== 'EEXIST' ||
+            JSON.stringify(this.archived(receipt.sessionId, receipt.requestId)) !== JSON.stringify(receipt)
+          )
+            throw error;
+        }
+      }
+      const dir = await open(dirname(target), 'r');
+      try {
+        await dir.sync();
+      } finally {
+        await dir.close();
+      }
+      // Persist the archive directory entry before dropping anything from primary.
+      const parent = await open(dirname(this.path), 'r');
+      try {
+        await parent.sync();
+      } finally {
+        await parent.close();
+      }
+    } finally {
+      await unlink(temp).catch(() => {});
+    }
+  }
   private save(receipt: ManagerSetupReceipt): Promise<void> {
     const result = this.writes.then(async () => {
       if (this.failed) throw Error('Manager setup journal is unavailable');
       const next = this.records.filter((r) => r.sessionId !== receipt.sessionId || r.requestId !== receipt.requestId);
       next.push(Receipt.parse(receipt));
+      while (next.length > 128) {
+        const index = next.findIndex((r) => ['started', 'refused'].includes(r.phase));
+        if (index < 0) throw Error('Manager setup journal is full of unresolved requests');
+        await this.archive(next[index]);
+        next.splice(index, 1);
+      }
       const serialized = JSON.stringify(Journal.parse({ version: 1, receipts: next }));
       if (Buffer.byteLength(serialized) > MAX_BYTES) throw Error('Manager setup journal is full');
       await mkdir(dirname(this.path), { recursive: true, mode: 0o700 });
@@ -108,7 +182,9 @@ export class ManagerSetupJournal {
     scope: string,
     deps: ManagerSetupDependencies
   ): Promise<ManagerSetupReceipt> {
-    const existing = this.records.find((r) => r.sessionId === sessionId && r.requestId === requestId);
+    const existing =
+      this.records.find((r) => r.sessionId === sessionId && r.requestId === requestId) ??
+      this.archived(sessionId, requestId);
     if (existing) {
       if (existing.scope !== scope) throw Error('Manager setup request scope changed');
       return structuredClone(existing);

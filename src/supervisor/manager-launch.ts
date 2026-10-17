@@ -370,6 +370,10 @@ export async function prepareSupervisorManagerLaunch(options: {
           codeman_supervisor: {
             command: options.bridgeCommand,
             args: [...options.bridgeArgs, '--credential-file', credentialFile],
+            // Owner preparation authorizes only this allowlisted, server-scoped
+            // bridge. Never-mode cannot answer a native MCP approval prompt;
+            // the bridge still enforces live grants on every operation.
+            default_tools_approval_mode: 'approve',
             enabled_tools: [
               'supervisor_status',
               'supervisor_workers',

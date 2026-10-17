@@ -567,6 +567,7 @@ export class Session extends EventEmitter {
   private readonly _recoveryInputProofTracker = new CodexInputProofTracker();
   private readonly _acceptsPrompts: boolean;
   private ptyProcess: pty.IPty | null = null;
+  private _shellPtyDisposables: Array<{ dispose(): void }> = [];
   private _pid: number | null = null;
   private _status: SessionStatus = 'idle';
   private _currentTaskId: string | null = null;
@@ -6534,34 +6535,41 @@ export class Session extends EventEmitter {
     this._pid = this.ptyProcess.pid;
     console.log('[Session] Shell PTY spawned with PID:', this._pid);
 
-    this.ptyProcess.onData((rawData: string) => {
-      // Filter out focus escape sequences
-      const data = rawData.replace(FOCUS_ESCAPE_FILTER, '');
-      if (!data) return; // Skip if only focus sequences
+    const shellPty = this.ptyProcess;
+    this._shellPtyDisposables.push(
+      shellPty.onData((rawData: string) => {
+        if (this._isStopped || this.ptyProcess !== shellPty) return;
+        // Filter out focus escape sequences
+        const data = rawData.replace(FOCUS_ESCAPE_FILTER, '');
+        if (!data) return; // Skip if only focus sequences
 
-      this._handleTerminalOutput(data);
-    });
+        this._handleTerminalOutput(data);
+      })
+    );
 
-    this.ptyProcess.onExit(({ exitCode }) => {
-      console.log('[Session] Shell PTY exited with code:', exitCode);
-      this.ptyProcess = null;
-      this._pid = null;
-      this._status = 'idle';
-      // Clear timers to prevent memory leaks
-      if (this._shellIdleTimer) {
-        clearTimeout(this._shellIdleTimer);
-        this._shellIdleTimer = null;
-      }
-      if (this.activityTimeout) {
-        clearTimeout(this.activityTimeout);
-        this.activityTimeout = null;
-      }
-      // If using mux, mark the session as detached but don't kill it
-      if (this._muxSession && this._mux) {
-        this._mux.setAttached(this.id, false);
-      }
-      this.emit('exit', exitCode);
-    });
+    this._shellPtyDisposables.push(
+      shellPty.onExit(({ exitCode }) => {
+        if (this._isStopped || this.ptyProcess !== shellPty) return;
+        console.log('[Session] Shell PTY exited with code:', exitCode);
+        this.ptyProcess = null;
+        this._pid = null;
+        this._status = 'idle';
+        // Clear timers to prevent memory leaks
+        if (this._shellIdleTimer) {
+          clearTimeout(this._shellIdleTimer);
+          this._shellIdleTimer = null;
+        }
+        if (this.activityTimeout) {
+          clearTimeout(this.activityTimeout);
+          this.activityTimeout = null;
+        }
+        // If using mux, mark the session as detached but don't kill it
+        if (this._muxSession && this._mux) {
+          this._mux.setAttached(this.id, false);
+        }
+        this.emit('exit', exitCode);
+      })
+    );
 
     // Mark as idle after a short delay (shell is ready)
     this._shellIdleTimer = setTimeout(() => {
@@ -7996,9 +8004,44 @@ export class Session extends EventEmitter {
    * await session.stop(false);
    * ```
    */
+  /** Retire only the superseded local tmux attach client after exact conversion publication. */
+  async retireConvertedShellTransport(replacement: Session): Promise<void> {
+    const source = this._muxSession,
+      next = replacement._muxSession,
+      mux = this._mux;
+    if (
+      replacement === this ||
+      this.mode !== 'shell' ||
+      replacement.mode !== 'codex' ||
+      replacement.id !== this.id ||
+      replacement.owner !== this.owner ||
+      !this._remote ||
+      this._remote.owned === false ||
+      JSON.stringify(this._remote) !== JSON.stringify(replacement._remote) ||
+      !this._useMux ||
+      !replacement._useMux ||
+      !mux ||
+      replacement._mux !== mux ||
+      !source ||
+      !next ||
+      source === next ||
+      source.muxName !== next.muxName ||
+      mux.getSession(this.id) !== next ||
+      next.remoteShellConversion?.phase !== 'converted'
+    )
+      throw new Error('Converted shell attachment is not the published replacement');
+    const attach = this.ptyProcess;
+    // Dispose callbacks before signalling: a late old exit must not mark the
+    // replacement detached, and old output must not retain the retired Session.
+    for (const disposable of this._shellPtyDisposables.splice(0)) disposable.dispose();
+    attach?.kill('SIGHUP');
+    await this.stop(false);
+  }
+
   async stop(killMux: boolean = true): Promise<void> {
     // Set stopped flag first to prevent new timers from being created
     this._isStopped = true;
+    for (const disposable of this._shellPtyDisposables.splice(0)) disposable.dispose();
     const managerRetirement = this.revokeSupervisorManagerLaunch();
     this._namedKeyAbort?.abort();
     // A pane that is gone is watching nothing. Nothing probes a stopped session, so

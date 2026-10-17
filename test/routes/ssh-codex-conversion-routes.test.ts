@@ -197,6 +197,20 @@ describe('SSH Codex conversion owner controls', () => {
     expect((await preview()).json().success).toBe(false);
     expect(run).not.toHaveBeenCalled();
   });
+  it('allows a new owner preview after a certified refusal without automatically retrying', async () => {
+    const p = (await preview()).json().data;
+    run.mockImplementationOnce(async () => frame({ status: 'refused' }));
+    const result = await h.app.inject({
+      method: 'POST',
+      url: `/api/sessions/${SID}/codex-conversion/confirm`,
+      payload: { confirmationToken: p.confirmationToken, conversationId: CID, confirmPreserveShell: true },
+    });
+    expect(result.json()).toMatchObject({ success: false, canPreviewAgain: true });
+    expect(run).toHaveBeenCalledTimes(2);
+    expect((await preview()).json().success).toBe(true);
+    expect(run).toHaveBeenCalledTimes(3);
+    expect(replace).not.toHaveBeenCalled();
+  });
   it('keeps uncertain journals sealed and never retries the remote effect', async () => {
     const p = (await preview()).json().data;
     run.mockImplementationOnce(async () => frame({ status: 'unknown' }));

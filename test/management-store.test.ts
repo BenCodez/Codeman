@@ -274,6 +274,67 @@ describe('owner-global management and cooperative inbox', () => {
     expect(authority()).toBe(false);
     await expect(service.captureManager('alice', 'manager-one')).rejects.toMatchObject({ code: 'forbidden' });
   });
+  it('keeps the existing credential usable when a concurrent reply defeats rotation', async () => {
+    await enable();
+    const first = await service.enroll('alice', 'session-one');
+    const scope = (await service.authenticate(first.token))!;
+    const inboxId = createHash('sha256').update('alice\0session-one').digest('hex');
+    const tokenKey = inboxId.slice(0, 32);
+    // Existing installations have generation fields in the routing record.
+    const routing = new BrainStore(join(root, 'management-tokens'));
+    const initial = await routing.read(tokenKey, () => true);
+    await routing.replace(
+      tokenKey,
+      JSON.stringify({
+        owner: 'alice',
+        sessionId: 'session-one',
+        expiresAt: first.expiresAt,
+        tokenHash: scope.tokenHash,
+      }),
+      initial.revision,
+      () => true
+    );
+    const before = await routing.read(tokenKey, () => true);
+    const original = BrainStore.prototype.replace;
+    let release!: () => void;
+    let entered!: () => void;
+    let held = false;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(BrainStore.prototype, 'replace').mockImplementation(async function (
+      this: BrainStore,
+      ...args: Parameters<BrainStore['replace']>
+    ) {
+      if (!held && args[0] === inboxId && JSON.parse(args[1]).tokenHash !== scope.tokenHash) {
+        held = true;
+        entered();
+        await gate;
+      }
+      return original.apply(this, args);
+    });
+    const rotation = service.enroll('alice', 'session-one');
+    const rejected = expect(rotation).rejects.toMatchObject({ code: 'conflict' });
+    await waiting;
+    // A replacement that has not committed must not revoke the old credential.
+    expect(await service.authenticate(first.token)).toBeDefined();
+    await service.reply(scope, 'Concurrent owner-visible update', 'reply-during-rotation');
+    release();
+    await rejected;
+    expect((await routing.read(tokenKey, () => true)).markdown).toBe(before.markdown);
+    const restarted = new ManagementService({ root, sessions: () => sessions });
+    expect(await restarted.authenticate(first.token)).toBeDefined();
+    expect((await restarted.messages('alice', 'session-one')).messages).toEqual([
+      expect.objectContaining({ requestId: 'reply-during-rotation' }),
+    ]);
+    const next = await restarted.enroll('alice', 'session-one');
+    expect(await restarted.authenticate(first.token)).toBeUndefined();
+    expect(await restarted.authenticate(next.token)).toBeDefined();
+    expect((await routing.read(tokenKey, () => true)).markdown).toBe(before.markdown);
+  });
   it('cannot commit an old credential reply across enrollment rotation', async () => {
     await enable();
     const first = await service.enroll('alice', 'session-one');

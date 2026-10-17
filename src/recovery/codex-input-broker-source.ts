@@ -414,7 +414,7 @@ def run():
     # protocol reply to a recently observed query; all other raw bytes still taint.
     terminal_queries = []
     terminal_tail = b''
-    query_pattern = re.compile(rb'\x1b(?:\[(?:[>?]?c|[56]n|\?u|\?(?:2026|2004|1004)\$p)|\](?:10|11|12);\?(?:\x07|\x1b\\))')
+    query_pattern = re.compile(rb'\x1b(?:\[(?:(?:[>?]?|0)c|[56]n|\?u|\?(?:2026|2004|1004)\$p)|\](?:10|11|12);\?(?:\x07|\x1b\\))')
     def track_terminal_queries(output):
         nonlocal terminal_tail
         now = time.monotonic()
@@ -445,7 +445,7 @@ def run():
         reply = data[:end]
         for index, (query, _) in enumerate(terminal_queries):
             pattern = None
-            if query == b'\x1b[c': pattern = rb'\x1b\[\?[0-9;]{1,48}c'
+            if query in (b'\x1b[c', b'\x1b[0c'): pattern = rb'\x1b\[\?[0-9;]{1,48}c'
             elif query == b'\x1b[>c': pattern = rb'\x1b\[>[0-9;]{1,48}c'
             elif query == b'\x1b[6n': pattern = rb'\x1b\[[1-9][0-9]{0,4};[1-9][0-9]{0,4}R'
             elif query == b'\x1b[5n': pattern = rb'\x1b\[0n'

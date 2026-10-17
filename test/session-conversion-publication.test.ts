@@ -78,8 +78,8 @@ async function fixture(failure?: string) {
     order.push('commit');
     return failure !== 'commit';
   });
-  const stop = vi.spyOn(previous, 'stop').mockImplementation(async (kill) => {
-    expect(kill).toBe(false);
+  const stop = vi.spyOn(previous, 'retireConvertedShellTransport').mockImplementation(async (published) => {
+    expect(published).toBe(replacement);
     order.push('detach');
   });
   const attach = vi.spyOn(replacement, 'startInteractive').mockImplementation(async () => {

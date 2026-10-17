@@ -2342,7 +2342,7 @@ export class WebServer extends EventEmitter {
     // registration for inspection; the durable pending marker keeps input sealed.
     if (!(await replacement.commitOwnedRemoteShellConversion(() => current(replacement))))
       throw new Error('Converted worker publication requires inspection');
-    await previous.stop(false);
+    await previous.retireConvertedShellTransport(replacement);
     if (!current(replacement)) throw new Error('Converted session attachment was cancelled');
     await this.setupSessionListeners(replacement);
     if (!current(replacement)) throw new Error('Converted session attachment was cancelled');

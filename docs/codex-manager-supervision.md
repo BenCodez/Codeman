@@ -2,10 +2,9 @@
 
 Choose an owned local managed Codex session with an isolated `--no-daemon` conversation. The manager uses the Codex executable that Codeman resolves on its local host, in a separate managed session with an owner-selected home. It does not adopt an unrelated running Codex process. Before starting the manager, submit at least one ordinary prompt through Codeman in its current thread and each selected worker's current thread. Codeman must match that exact tracked submission to complete current history. A new or resumed pane with only a launch seed requires this owner step before automatic manager or worker input.
 
-
 **Start manager** performs preparation and Start as one confirmed owner action. It preserves the exact conversation and connects restricted tools. If the newly restricted native process is paused only by a validated settings event at a verified empty composer, Codeman sends the fixed `Reply READY only.` setup prompt as separate tracked text and Enter frames, waits for exact native completion and rechecks tool discovery before starting. Other approvals, authentication or usage limits, unknown history and pending children still stop setup. Preparation does not recover an exited process or create a fresh chat.
 
-Setup keeps a durable request receipt before each input phase and before Start. A lost response, partial write or interrupted process never authorizes replay. The browser retains that request ID; repeating it returns its receipt. Unresolved setup requires owner inspection before another request. The private setup journal is bounded to 128 retained requests; it is not silently pruned. **Prepare restricted manager** remains an inspection and preparation control without starting the saved objective.
+Setup keeps a durable request receipt before each input phase and before Start. A lost response, partial write or interrupted process never authorizes replay. The browser retains that request ID; repeating it returns its receipt. Unresolved setup requires owner inspection before another request. The private setup journal retains at most 128 current receipts. Finalized started/refused receipts move to immutable private archive files before leaving that journal; replaying their request IDs returns the original receipt. Preparing and uncertain receipts are never archived or pruned. Archive storage grows with completed requests to preserve exact replay fences. **Prepare restricted manager** remains an inspection and preparation control without starting the saved objective.
 
 The manager bridge requires Codeman to listen on numeric IPv4 loopback (`127.0.0.1`) or the IPv4 wildcard (`0.0.0.0`). Specific LAN/VPN addresses, IPv6-only binds and ambiguous hostnames cannot offer a new manager. Existing roles remain available for inspection and reset. This restriction does not change the server's binding or start another listener.
 
@@ -39,19 +38,23 @@ Useful initial memory:
 
 ```markdown
 # Goals
+
 Deliver small, verified changes. Ask me when priorities conflict.
 
 ## Worker roles
+
 - API worker: backend implementation and backend tests.
 - UI worker: frontend implementation and browser tests.
-Use the actual selected worker IDs from supervisor_workers.
+  Use the actual selected worker IDs from supervisor_workers.
 
 ## Prompt conventions
+
 Give one clear objective, necessary context, constraints and acceptance criteria.
 Read the latest checkpoint before sending another instruction.
 Keep prompts concise; do not repeat entire histories.
 
 ## Usage
+
 Inspect usage and current health before assigning work.
 Distinguish estimates from verified limits; report unknown quota honestly.
 ```

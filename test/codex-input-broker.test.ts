@@ -1395,6 +1395,27 @@ it.each(['\x1b[12;4R', '/resume unsafe\r', '\x1b[?1;2c/resume unsafe\r'])(
   }
 );
 
+it.each(['', '0'])('accepts a single primary device reply for CSI %s c only once', async (parameter) => {
+  const { broker, child, bytes } = await fixture(0, undefined, (source) =>
+    source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", `os.write(1, b'\\x1b[${parameter}cFAKE_CHILD_READY\\n')`)
+  );
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await bytes()).toString() === '\x1b[?1;2c');
+  expect(await broker.prove(child.pid!)).toMatchObject({ rawGeneration: 0 });
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});
+
+it('does not authorize a primary device reply for an unsupported parameter', async () => {
+  const { broker, child } = await fixture(0, undefined, (source) =>
+    source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[1cFAKE_CHILD_READY\\n')")
+  );
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});
+
 it('does not accept a terminal reply after its query expires', async () => {
   const { broker, child } = await fixture(
     0,

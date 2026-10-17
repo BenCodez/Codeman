@@ -2604,7 +2604,11 @@ Object.assign(CodemanApp.prototype, {
     try {
       const response = await fetch(`/api/sessions/${encodeURIComponent(plan.sessionId)}/codex-conversion/confirm`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirmationToken: plan.confirmationToken, conversationId, confirmPreserveShell: true }) });
       const result = await response.json();
-      if (!result.success) throw new Error(result.error || 'Conversion needs inspection; do not retry automatically.');
+      if (!result.success) {
+        if (result.canPreviewAgain === true && this.editingSessionId === plan.sessionId)
+          document.getElementById('sshCodexConversionPreview').disabled = false;
+        throw new Error(result.error || 'Conversion needs inspection; do not retry automatically.');
+      }
       status.textContent = `Converted. Retained shell: ${result.data.retainedSessionName}. ${result.data.retainedShellCommand}`;
       this.showToast('SSH tab converted to the selected Codex conversation. Recovery is opt-in.', 'success');
       this._renderSessionTabsImmediate?.();

@@ -159,7 +159,8 @@ async function run(
   remote: SessionRemote,
   request: unknown,
   current: () => boolean,
-  transport?: RemoteBrokerTransport
+  transport?: RemoteBrokerTransport,
+  onDispatch?: () => void
 ): Promise<unknown> {
   const snapshot = JSON.stringify(remote),
     deadline = performance.now() + 12_000;
@@ -171,8 +172,10 @@ async function run(
       if (!admitted()) throw new Error('Conversion ownership changed');
       const input = JSON.stringify(request);
       if (Buffer.byteLength(input) > 131072) throw new Error('Conversion request too large');
-      const response = await (transport?.run(command(remote), input) ??
-        runRemoteBrokerStdin(command(remote), input, { inputBytes: 131072, outputBytes: MAX_WIRE, deadline }, retain));
+      const remoteCommand = command(remote);
+      onDispatch?.();
+      const response = await (transport?.run(remoteCommand, input) ??
+        runRemoteBrokerStdin(remoteCommand, input, { inputBytes: 131072, outputBytes: MAX_WIRE, deadline }, retain));
       return parsed(response.stdout);
     },
     { deadline, isCurrent: admitted }
@@ -283,14 +286,6 @@ export async function applySshCodexConversion(
     return { status: 'not-sent' };
   let submitted = false;
   try {
-    const transport: RemoteBrokerTransport | undefined = options.transport && {
-      run: (cmd, input) => {
-        submitted = true;
-        return options.transport!.run(cmd, input);
-      },
-    };
-    // Crossing the transport boundary can leave a staging or retained pane. Never retry uncertainty.
-    submitted = true;
     const result = (await run(
       remote,
       {
@@ -303,7 +298,10 @@ export async function applySshCodexConversion(
         retainedSessionName,
       },
       isCurrent,
-      transport
+      options.transport,
+      () => {
+        submitted = true;
+      }
     )) as { status?: string; retainedSessionName?: string; replacementPane?: RemoteBrokerDeadPane };
     if (result.status === 'refused') return { status: 'not-sent' };
     if (

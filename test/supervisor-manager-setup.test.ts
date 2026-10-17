@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm, writeFile, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile, symlink, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -148,4 +148,94 @@ it('coalesces a repeated pending request and excludes a simultaneous replacement
   release();
   expect((await operation).phase).toBe('started');
   expect(f.deps.prepare).toHaveBeenCalledOnce();
+});
+
+it('continues beyond 128 finalized requests and preserves archived replay and scope fences after reload', async () => {
+  const f = await fixture();
+  const saved = [];
+  for (let i = 0; i < 140; i++) {
+    vi.mocked(f.deps.prepare).mockResolvedValue(i % 2 === 0);
+    saved.push(await f.journal.run(SID, `owner-bounded-${i}`, SCOPE, f.deps));
+  }
+  expect(JSON.parse(await readFile(f.path, 'utf8')).receipts).toHaveLength(128);
+  expect(await readdir(f.path + '.archive')).toHaveLength(12);
+  expect(f.deps.prepare).toHaveBeenCalledTimes(140);
+  expect(f.deps.start).toHaveBeenCalledTimes(70);
+  const reloaded = new ManagerSetupJournal(f.path);
+  for (let i = 0; i < saved.length; i++)
+    expect(await reloaded.run(SID, `owner-bounded-${i}`, SCOPE, f.deps)).toEqual(saved[i]);
+  await expect(reloaded.run(SID, 'owner-bounded-0', 'b'.repeat(64), f.deps)).rejects.toThrow('scope');
+  expect(f.deps.prepare).toHaveBeenCalledTimes(140);
+  expect(f.deps.start).toHaveBeenCalledTimes(70);
+  vi.mocked(f.deps.prepare).mockResolvedValue(true);
+  expect((await reloaded.run(SID, 'owner-bounded-140', SCOPE, f.deps)).phase).toBe('started');
+});
+
+it('never archives preparing or uncertain requests when finalized receipts rotate', async () => {
+  const f = await fixture();
+  const preparing = {
+    sessionId: '22222222-2222-4222-8222-222222222222',
+    requestId: 'pending-preparing',
+    scope: SCOPE,
+    phase: 'preparing',
+    at: 1,
+  };
+  const uncertain = {
+    ...preparing,
+    sessionId: '33333333-3333-4333-8333-333333333333',
+    requestId: 'pending-uncertain',
+    phase: 'uncertain',
+  };
+  await writeFile(f.path, JSON.stringify({ version: 1, receipts: [preparing, uncertain] }));
+  const journal = new ManagerSetupJournal(f.path);
+  for (let i = 0; i < 130; i++) await journal.run(SID, `owner-rotation-${i}`, SCOPE, f.deps);
+  const receipts = JSON.parse(await readFile(f.path, 'utf8')).receipts;
+  expect(receipts).toHaveLength(128);
+  expect(receipts).toContainEqual(preparing);
+  expect(receipts).toContainEqual(uncertain);
+  const reloaded = new ManagerSetupJournal(f.path);
+  for (const receipt of [preparing, uncertain]) {
+    expect(await reloaded.run(receipt.sessionId, receipt.requestId, SCOPE, f.deps)).toEqual(receipt);
+    await expect(reloaded.run(receipt.sessionId, 'owner-new-request', SCOPE, f.deps)).rejects.toThrow('inspection');
+  }
+  expect(f.deps.prepare).toHaveBeenCalledTimes(130);
+});
+
+it('fails closed on a corrupted archived fence without overwriting or replaying it', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 129; i++) await f.journal.run(SID, `owner-archive-${i}`, SCOPE, f.deps);
+  const [file] = await readdir(f.path + '.archive');
+  const archivedPath = join(f.path + '.archive', file);
+  await writeFile(archivedPath, '{broken');
+  await expect(new ManagerSetupJournal(f.path).run(SID, 'owner-archive-0', SCOPE, f.deps)).rejects.toThrow();
+  expect(await readFile(archivedPath, 'utf8')).toBe('{broken');
+  expect(f.deps.prepare).toHaveBeenCalledTimes(129);
+});
+
+it('preserves a full unresolved journal instead of pruning reservations to admit effects', async () => {
+  const f = await fixture();
+  const receipts = Array.from({ length: 128 }, (_, index) => ({
+    sessionId: `44444444-4444-4444-8444-${String(index).padStart(12, '0')}`,
+    requestId: 'pending-owner-request',
+    scope: SCOPE,
+    phase: index % 2 ? 'uncertain' : 'preparing',
+    at: 1,
+  }));
+  const original = JSON.stringify({ version: 1, receipts });
+  await writeFile(f.path, original);
+  await new ManagerSetupJournal(f.path).run(SID, 'owner-over-capacity', SCOPE, f.deps);
+  expect(await readFile(f.path, 'utf8')).toBe(original);
+  expect(f.deps.prepare).not.toHaveBeenCalled();
+  expect(f.deps.start).not.toHaveBeenCalled();
+});
+
+it('keeps primary replay fences when the archive cannot be durably published', async () => {
+  const f = await fixture();
+  for (let i = 0; i < 128; i++) await f.journal.run(SID, `owner-publish-${i}`, SCOPE, f.deps);
+  const original = await readFile(f.path, 'utf8');
+  await writeFile(f.path + '.archive', 'archive unavailable');
+  await expect(f.journal.run(SID, 'owner-publish-128', SCOPE, f.deps)).rejects.toThrow();
+  expect(await readFile(f.path, 'utf8')).toBe(original);
+  expect((await f.journal.run(SID, 'owner-publish-0', SCOPE, f.deps)).phase).toBe('started');
+  expect(f.deps.prepare).toHaveBeenCalledTimes(128);
 });

@@ -309,8 +309,14 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
   const text = await fs.readFile(prepared!.file, 'utf8');
   expect(text).not.toContain(TOKEN);
   const parsed = parse(text),
-    servers = parsed.mcp_servers as Record<string, { command: string; args: string[]; enabled_tools: string[] }>;
+    servers = parsed.mcp_servers as Record<
+      string,
+      { command: string; args: string[]; enabled_tools: string[]; default_tools_approval_mode: string }
+    >;
   expect(Object.keys(servers)).toEqual(['codeman_supervisor']);
+  expect(servers.codeman_supervisor.default_tools_approval_mode).toBe('approve');
+  expect(parsed).not.toHaveProperty('default_tools_approval_mode');
+  expect(parsed.apps).toBeUndefined();
   expect(servers.codeman_supervisor.enabled_tools).toEqual([
     'supervisor_status',
     'supervisor_workers',

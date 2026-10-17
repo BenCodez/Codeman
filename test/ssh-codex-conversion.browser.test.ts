@@ -20,6 +20,87 @@ describe('in-place SSH Codex conversion controls', () => {
   afterAll(async () => {
     await browser?.close();
   });
+  for (const recoverable of [true, false])
+    it(`only enables another preview after a certified refusal: ${recoverable}`, async () => {
+      const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+      let previews = 0,
+        confirmations = 0;
+      await page.route('**/*', async (route) => {
+        if (route.request().isNavigationRequest()) {
+          await route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: `<!doctype html><html><head><style>${styles}</style></head><body>${markup}</body></html>`,
+          });
+          return;
+        }
+        const url = route.request().url();
+        if (!url.includes('/api/')) {
+          await route.fulfill({ status: 204, body: '' });
+          return;
+        }
+        let result;
+        if (url.endsWith('/preview')) {
+          previews++;
+          result = {
+            success: true,
+            data: {
+              confirmationToken: 'a'.repeat(64),
+              hostLabel: 'Fixture',
+              workingDir: '/fixture/project',
+              codexHome: '/fixture/home',
+              launcher: 'codex-workspace',
+              retainedSessionName: 'codeman-retained-aaaaaaaa-abcdef012345',
+              conversations: [
+                {
+                  id: CID,
+                  modifiedAt: Date.now(),
+                  config: { model: 'fixture-model', sandbox: 'read-only', approvalPolicy: 'on-request' },
+                },
+              ],
+            },
+          };
+        } else {
+          confirmations++;
+          result = {
+            success: false,
+            error: 'Fixture conversion refused',
+            ...(recoverable ? { canPreviewAgain: true } : {}),
+          };
+        }
+        await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(result) });
+      });
+      await page.goto('http://codeman-conversion.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp=CodemanApp;' });
+      await page.addScriptTag({ content: controller });
+      await page.evaluate(
+        ({ id }) => {
+          const app = new (window as any).CodemanApp();
+          app.editingSessionId = id;
+          app.showToast = () => {};
+          (window as any).app = app;
+          document.getElementById('sshCodexConversionSection')!.style.display = '';
+        },
+        { id: SID }
+      );
+      await page.locator('#sshCodexConversionPreview').click();
+      await page.locator('#sshCodexConversionConsent').check();
+      await page.locator('#sshCodexConversionConfirm').click();
+      await page.waitForFunction(() =>
+        document.getElementById('sshCodexConversionStatus')!.textContent!.includes('Fixture conversion refused')
+      );
+      expect(await page.locator('#sshCodexConversionPreview').isEnabled()).toBe(recoverable);
+      expect(await page.locator('#sshCodexConversionConfirm').isEnabled()).toBe(false);
+      if (recoverable) {
+        await page.locator('#sshCodexConversionPreview').click();
+        await page.waitForFunction(
+          () => !(document.getElementById('sshCodexConversionPreview') as HTMLButtonElement).disabled
+        );
+        expect(previews).toBe(2);
+      }
+      expect(confirmations).toBe(1);
+      await page.close();
+    });
   it('keeps an unavailable newest conversation selected until the owner explicitly chooses another', async () => {
     const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
     const older = '99999999-2222-4333-8444-555555555555';

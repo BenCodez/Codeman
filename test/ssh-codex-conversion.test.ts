@@ -1,10 +1,11 @@
 /** Actual fixed remote helper against disposable proc/tmux fixtures. Never SSH or real panes. */
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { spawn } from 'node:child_process';
 import { mkdtemp, mkdir, writeFile, readFile, symlink, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { SessionRemote } from '../src/types.js';
+import { getRemoteSshLimit, getQueuedRemoteSshCount, runWithRemoteSshLimit } from '../src/remote-ssh-limiter.js';
 import {
   inspectSshCodexConversion,
   applySshCodexConversion,
@@ -119,6 +120,47 @@ default:throw Error('Unexpected native command '+a[0]);}
   };
 }
 describe('owned SSH shell conversion', () => {
+  it('releases conversion after queued SSH admission cancellation but seals transport uncertainty', async () => {
+    const f = await fixture(),
+      inspection = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });
+    if (inspection.status !== 'ready') throw Error(inspection.reason);
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let started = 0;
+    const blockers = Array.from({ length: getRemoteSshLimit() }, () =>
+      runWithRemoteSshLimit(async () => {
+        started++;
+        await held;
+      })
+    );
+    await vi.waitFor(() => expect(started).toBe(getRemoteSshLimit()));
+    const transport = {
+      run: vi.fn(async () => {
+        throw Error('Lost SSH ACK');
+      }),
+    };
+    let current = true;
+    try {
+      const pending = applySshCodexConversion(f.remote, SID, inspection.preview, CID, retained, () => current, {
+        transport,
+      });
+      await vi.waitFor(() => expect(getQueuedRemoteSshCount()).toBe(1));
+      current = false;
+      expect(await pending).toEqual({ status: 'not-sent' });
+      expect(transport.run).not.toHaveBeenCalled();
+      expect((await f.effects()).effects).toEqual([]);
+    } finally {
+      release();
+      await Promise.all(blockers);
+    }
+    expect(
+      await applySshCodexConversion(f.remote, SID, inspection.preview, CID, retained, () => true, { transport })
+    ).toEqual({ status: 'unknown' });
+    expect(transport.run).toHaveBeenCalledOnce();
+  });
+
   it('previews without effects and resumes an explicitly selected existing conversation while preserving the source', async () => {
     const f = await fixture(),
       preview = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });

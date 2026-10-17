@@ -34,14 +34,13 @@ const Inbox = z
     messages: z.array(Message).max(64),
   })
   .strict();
-const Token = z
-  .object({
-    owner: z.string().min(1).max(200),
-    sessionId: Id,
-    expiresAt: z.number().finite(),
-    tokenHash: z.string().regex(/^[a-f0-9]{64}$/),
-  })
-  .strict();
+const TokenBinding = z.object({ owner: z.string().min(1).max(200), sessionId: Id }).strict();
+// Old index records also carry a generation. Accept their format for upgrades,
+// but only the atomically published inbox determines the current credential.
+const Token = z.union([
+  TokenBinding,
+  TokenBinding.extend({ expiresAt: z.number().finite(), tokenHash: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
+]);
 export type ManagementConfig = z.infer<typeof Config>;
 export interface ManagementSession {
   id: string;
@@ -224,13 +223,12 @@ export class ManagementService {
     const token = `codeman-agent-v1.${tokenKey}${randomBytes(16).toString('hex')}`;
     const tokenHash = digest(token);
     const expiresAt = Date.now() + 24 * 60 * 60 * 1000;
-    const record = await this.tokens.read(tokenKey, current);
-    await this.tokens.replace(
-      tokenKey,
-      JSON.stringify({ owner, sessionId, expiresAt, tokenHash }),
-      record.revision,
-      current
-    );
+    const record = await this.load(this.tokens, tokenKey, Token, () => ({ owner, sessionId }), current);
+    if (record.value.owner !== owner || record.value.sessionId !== sessionId) throw new BrainStoreError('unavailable');
+    // Routing is immutable. Publishing a replacement index before the inbox CAS
+    // would revoke the old credential even when a concurrent reply wins that CAS.
+    if (!record.exists)
+      await this.tokens.replace(tokenKey, JSON.stringify({ owner, sessionId }), record.revision, current);
     await this.inboxes.replace(
       this.inboxId(owner, sessionId),
       JSON.stringify({ ...inbox.value, tokenHash, expiresAt }),
@@ -300,8 +298,21 @@ export class ManagementService {
         },
         () => true
       );
-      if (record.value.tokenHash !== tokenHash) return undefined;
-      const scope = { ...record.value, tokenHash };
+      const { owner, sessionId } = record.value;
+      if (
+        token.slice('codeman-agent-v1.'.length, 'codeman-agent-v1.'.length + 32) !==
+        this.inboxId(owner, sessionId).slice(0, 32)
+      )
+        return undefined;
+      const inbox = await this.load(
+        this.inboxes,
+        this.inboxId(owner, sessionId),
+        Inbox,
+        emptyInbox,
+        this.authority(owner, sessionId)
+      );
+      if (inbox.value.tokenHash !== tokenHash) return undefined;
+      const scope = { owner, sessionId, tokenHash, expiresAt: inbox.value.expiresAt };
       await this.receive(scope);
       return scope;
     } catch {
