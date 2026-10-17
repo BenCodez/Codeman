@@ -198,6 +198,16 @@ describe('sendInput wiring', () => {
     expect(commands[0]).toContain(submit ? 'set-buffer' : 'send-keys');
   });
 
+  it('preserves an already bracketed payload without adding another paste envelope', async () => {
+    const { manager, record, commands } = fixture();
+    const input = '\x1b[200~already pasted owner text\x1b[201~';
+    expect(await manager.sendInput(record.sessionId, input + '\r')).toBe(true);
+    expect(commands).toHaveLength(2);
+    expect(argvOf(commands[0].replace(/^tmux -L \S+/, FAKE_TMUX)).at(-1)).toBe(input);
+    expect(commands[0]).not.toContain('paste-buffer');
+    expect(commands[1]).toMatch(/ Enter$/);
+  });
+
   it('refuses a replacement session after buffer setup and cleans only its own buffer', async () => {
     const { manager, record, commands } = fixture(async (command, active, old) => {
       if (command.includes('set-buffer')) active.registerSession({ ...old, pid: 456 });

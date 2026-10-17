@@ -6557,9 +6557,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           recoveryGuard?.noteRefusal?.();
           return false;
         }
+        const alreadyBracketed = data.startsWith('\x1b[200~') && data.endsWith('\x1b[201~');
+        // The broker forwards its authenticated payload verbatim. Mark the child
+        // bytes inside that payload, so its HMAC, size budget and receipt hash
+        // describe exactly one paste; never paste-wrap the outer broker packet.
+        const brokerData = bracketedPaste && !alreadyBracketed ? `\x1b[200~${data}\x1b[201~` : data;
         const frame = inputBroker?.frame(
           recoveryGuard ? 'auto' : 'owner-mux',
-          data,
+          brokerData,
           recoveryGuard?.conversationId,
           recoveryGuard?.inputIssuer,
           recoveryGuard?.privateFiles,
@@ -6573,7 +6578,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           return false;
         }
         if (!frame || !inputBroker) {
-          if (bracketedPaste) {
+          if (bracketedPaste && !alreadyBracketed) {
             const commands = buildPasteTextCommands(this.tmux(), muxName, data);
             await pasteText(async (command) => {
               // Buffer preparation adds an await: recheck before delivering its
