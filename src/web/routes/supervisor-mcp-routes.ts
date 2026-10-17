@@ -65,7 +65,12 @@ export interface SupervisorMcpContext {
     ): Promise<unknown>;
   };
 }
-const Empty = z.object({}).strict();
+// MCP request metadata is protocol context, never tool arguments or authority.
+const Meta = z.record(z.string().max(200), z.unknown()).refine((value) => JSON.stringify(value).length <= 4096);
+const Empty = z.object({ _meta: Meta.optional() }).strict();
+// The native client serializes an absent first-page cursor as null. This
+// bounded catalog has one page; a nonempty cursor is never accepted.
+const Discovery = Empty.extend({ cursor: z.union([z.null(), z.literal('')]).optional() });
 const Operation = z
   .object({
     workerId: z.string().regex(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i),
@@ -264,6 +269,7 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
             protocolVersion: z.string().max(80),
             capabilities: z.object({}).passthrough(),
             clientInfo: z.object({ name: z.string().max(200), version: z.string().max(80) }).passthrough(),
+            _meta: Meta.optional(),
           })
           .strict()
           .safeParse(params);
@@ -285,7 +291,7 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
       // independently of enabled_tools. This bridge exposes no resources: keep
       // discovery inert, and never interpret a URI as a path or API request.
       if (method === 'resources/list' || method === 'resources/templates/list') {
-        if (params !== undefined && !Empty.safeParse(params).success)
+        if (params !== undefined && !Discovery.safeParse(params).success)
           return fail(id, -32602, 'Invalid resource discovery request');
         return send({
           jsonrpc: '2.0',
@@ -296,7 +302,7 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
       if (method === 'resources/read') {
         if (
           !z
-            .object({ uri: z.string().min(1).max(2048) })
+            .object({ uri: z.string().min(1).max(2048), _meta: Meta.optional() })
             .strict()
             .safeParse(params).success
         )
@@ -304,7 +310,8 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
         return fail(id, -32002, 'The supervisor bridge exposes no resources; use the supervisor tools');
       }
       if (method === 'tools/list') {
-        if (params !== undefined && !Empty.safeParse(params).success) return fail(id, -32602, 'Invalid tools request');
+        if (params !== undefined && !Discovery.safeParse(params).success)
+          return fail(id, -32602, 'Invalid tools request');
         return send({
           jsonrpc: '2.0',
           id,
@@ -322,6 +329,7 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
         .object({
           name: z.enum(toolNames),
           arguments: z.unknown().optional(),
+          _meta: Meta.optional(),
         })
         .strict()
         .safeParse(params);

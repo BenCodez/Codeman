@@ -733,3 +733,39 @@ it('requires current prepared authority for observation and rejects wider observ
   ).toBe(-32001);
   expect(f.management.observe).not.toHaveBeenCalled();
 });
+
+it('accepts native first-page discovery and MCP metadata without expanding tool authority', async () => {
+  const f = await fixture();
+  for (const method of ['tools/list', 'resources/list', 'resources/templates/list']) {
+    for (const params of [
+      { cursor: null },
+      { cursor: '' },
+      { _meta: { progressToken: 7 } },
+      { cursor: null, _meta: { progressToken: 'list' } },
+    ]) {
+      const response = (await f.rpc(method, params)).json();
+      expect(response.error).toBeUndefined();
+      if (method === 'tools/list')
+        expect(response.result.tools.map((tool: { name: string }) => tool.name)).toEqual(TOOLS);
+    }
+    for (const params of [
+      { cursor: 'foreign' },
+      { cursor: 1 },
+      { _meta: null },
+      { _meta: { note: 'x'.repeat(4097) } },
+      { arbitrary: true },
+    ])
+      expect((await f.rpc(method, params)).json().error.code).toBe(-32602);
+  }
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_status', arguments: {}, _meta: { progressToken: 1 } })).json().error
+  ).toBeUndefined();
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_status', arguments: { rawInput: 'forbidden' }, _meta: {} })).json()
+      .error
+  ).toBeDefined();
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.retry).not.toHaveBeenCalled();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.generic).not.toHaveBeenCalled();
+});
