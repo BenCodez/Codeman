@@ -14,7 +14,7 @@
  * Listings contain non-hidden subfolders and files whose type the preview supports
  * (`isSupportedAttachmentExtension`), newest first, capped at
  * {@link MAX_FOLDER_ENTRIES}. Local folders are read with `fs`; a remote (SSH) case's
- * folder is listed on its host in one ssh round trip (`remoteListFolder`).
+ * folder is listed on its host through bounded SSH calls (`remoteListFolder`).
  */
 
 import { randomUUID } from 'node:crypto';
@@ -28,7 +28,13 @@ import {
 } from './attachment-registry.js';
 import { isBlockedAttachmentPath, isUnderTree, loadAttachmentGuardConfig } from './config/attachment-guard.js';
 import { isMultiUserMode, userSpacePath } from './config/multiuser.js';
-import { remoteListFolder, RemoteFileAccessError, type RemoteFolderEntry } from './remote-files.js';
+import {
+  remoteListFolder,
+  remoteProbePaths,
+  RemoteFileAccessError,
+  type RemoteFolderEntry,
+  type RemoteProbe,
+} from './remote-files.js';
 import type { AttachmentDetectedType, AuthUser } from './types.js';
 import type { SessionRemote } from './types/session.js';
 import { describeUnknownPath, probePathKind } from './utils/bounded-path-probe.js';
@@ -157,6 +163,19 @@ export function folderAllowedForUser(
   );
 }
 
+/** Only a bounded, canonical directory proof can define a remote workspace boundary. */
+export function canonicalRemoteWorkspaceRoot(probe: RemoteProbe | null | undefined): string | undefined {
+  const path = probe?.realPath;
+  return probe?.kind === 'directory' &&
+    typeof path === 'string' &&
+    posix.isAbsolute(path) &&
+    !path.includes('\0') &&
+    Buffer.byteLength(path, 'utf8') <= 4096 &&
+    posix.normalize(path) === path
+    ? path
+    : undefined;
+}
+
 /**
  * Resolve, guard, list and grant a folder for `sessionId`.
  *
@@ -179,7 +198,7 @@ export async function listFolder(
   }
 
   const guard = await loadAttachmentGuardConfig();
-  const workingDir = options.sessionWorkingDir;
+  let workingDir = options.sessionWorkingDir;
   const assertAllowed = (dir: string): void => {
     const confined = !guard.confineToWorkspace
       ? true
@@ -199,16 +218,27 @@ export async function listFolder(
   let truncated = false;
   if (options.remote) {
     const remotePath = requestedPath === '~' ? '~/' : requestedPath;
+    const needsWorkspaceRoot = guard.confineToWorkspace || (isMultiUserMode() && options.user?.role !== 'admin');
+    if (needsWorkspaceRoot && !workingDir) throw new FolderListingError('Remote workspace could not be resolved', 403);
     let listing;
+    let rootProbes: Array<RemoteProbe | null> | undefined = undefined;
     try {
-      listing = await remoteListFolder(options.remote, remotePath, supportedAttachmentExtensions(), MAX_FOLDER_ENTRIES);
+      [listing, rootProbes] = await Promise.all([
+        remoteListFolder(options.remote, remotePath, supportedAttachmentExtensions(), MAX_FOLDER_ENTRIES),
+        needsWorkspaceRoot ? remoteProbePaths(options.remote, [workingDir!]) : undefined,
+      ]);
     } catch (err) {
       throw new FolderListingError(err instanceof RemoteFileAccessError ? err.message : 'remote host unreachable', 502);
     }
     if (!listing) throw new FolderListingError('Folder not found', 404);
     if (listing === 'not-a-folder') throw new FolderListingError('Not a folder');
+    if (needsWorkspaceRoot) {
+      const root = rootProbes?.length === 1 ? canonicalRemoteWorkspaceRoot(rootProbes[0]) : undefined;
+      if (!root) throw new FolderListingError('Remote workspace could not be resolved', 403);
+      workingDir = root;
+    }
     ({ dir, entries, truncated } = listing);
-    // One ssh call lists and resolves together, so the guard can only run after it;
+    // The listing and workspace proof resolve on the remote host before either guard;
     // nothing of a refused listing leaves this function.
     assertAllowed(dir);
   } else {

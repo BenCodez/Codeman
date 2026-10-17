@@ -43,6 +43,7 @@ import {
   folderFilePath,
   folderGrants,
   folderAllowedForUser,
+  canonicalRemoteWorkspaceRoot,
   listFolder,
   validFolderFileName,
 } from '../../folder-listing.js';
@@ -336,6 +337,8 @@ function getAttachmentOr404(
 interface ServableAttachment {
   path: string;
   probe?: RemoteProbe;
+  /** Fresh canonical remote workspace used by folder authorization too. */
+  workspaceRoot?: string;
 }
 
 /**
@@ -427,18 +430,18 @@ async function resolveServableRemoteAttachment(
   }
 
   const guard = await loadAttachmentGuardConfig();
-  const root = rootProbe?.realPath ?? scope.workingDir;
+  const root = canonicalRemoteWorkspaceRoot(rootProbe);
   const blocked =
     isBlockedAttachmentPath(probe.realPath, guard.blockedTrees) ||
     isBlockedAttachmentPath(record.filePath, guard.blockedTrees) ||
-    (guard.confineToWorkspace && !isPathWithinRoot(root, probe.realPath));
+    (guard.confineToWorkspace && (!root || !isPathWithinRoot(root, probe.realPath)));
 
   if (blocked) {
     reply.code(403).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Access to this file is blocked'));
     return null;
   }
 
-  return { path: probe.realPath, probe };
+  return { path: probe.realPath, probe, workspaceRoot: root };
 }
 
 /**
@@ -2513,7 +2516,8 @@ export function registerFileRoutes(app: FastifyInstance, ctx: SessionPort & Even
       reply.code(400).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'Attachment path is not a file'));
       return null;
     }
-    if (!folderAllowedForUser(servable.path, getAuthUser(req), scope)) {
+    const userScope = scope.remote ? { ...scope, workingDir: servable.workspaceRoot } : scope;
+    if (!folderAllowedForUser(servable.path, getAuthUser(req), userScope)) {
       reply.code(403).send(createErrorResponse(ApiErrorCode.INVALID_INPUT, 'File is outside your space'));
       return null;
     }

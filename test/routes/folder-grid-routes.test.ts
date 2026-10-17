@@ -47,6 +47,9 @@ vi.mock('../../src/utils/bounded-path-probe.js', async (importOriginal) => {
 import { probePathKind } from '../../src/utils/bounded-path-probe.js';
 import {
   buildRemoteFolderListCommand,
+  buildRemoteProbeCommand,
+  parseRemoteProbeOutput,
+  RemoteFileAccessError,
   parseRemoteFolderListOutput,
   remoteCreateReadStream,
   remoteListFolder,
@@ -415,6 +418,7 @@ describe('folder grid routes — remote (SSH) case', () => {
     await harness.app.close();
     folderGrants.clearSession(sessionId);
     vi.clearAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it('lists the folder on the remote host and serves its files over ssh', async () => {
@@ -484,6 +488,137 @@ describe('folder grid routes — remote (SSH) case', () => {
       expect(res.statusCode).toBe(400);
       expect(mockedCreateReadStream).not.toHaveBeenCalled();
     });
+  });
+
+  describe('canonical remote workspace authority', () => {
+    async function asOwner() {
+      await harness.app.close();
+      harness = await createRouteTestHarness(registerFileRoutes, { authUser: { username: 'alice', role: 'user' } });
+      sessionId = harness.ctx._sessionId;
+      harness.ctx._session.owner = 'alice';
+      harness.ctx._session.workingDir = REMOTE_DIR;
+      harness.ctx._session.remote = { ...remote };
+      vi.stubEnv('CODEMAN_MULTIUSER', '1');
+    }
+    const grantRemote = (path: string) =>
+      harness.app.inject({
+        method: 'POST',
+        url: `/api/sessions/${sessionId}/folders`,
+        payload: { path },
+      });
+    const rawRemote = (id: string) =>
+      harness.app.inject({
+        method: 'GET',
+        url: `/api/sessions/${sessionId}/folders/${id}/files/a.png/raw`,
+      });
+
+    it.each(['confined', 'non-admin', 'both'] as const)(
+      'grants and serves an actual symlink-root workspace with %s checks enabled',
+      async (policy) => {
+        if (policy !== 'confined') await asOwner();
+        if (policy !== 'non-admin') vi.stubEnv('CODEMAN_ATTACHMENT_CONFINE', '1');
+        const temp = mkdtempSync(join(tmpdir(), 'remote-folder-root-'));
+        try {
+          const canonical = join(temp, 'canonical'),
+            alias = join(temp, 'workspace-link');
+          mkdirSync(canonical);
+          mkdirSync(join(canonical, 'renders'));
+          writeFileSync(join(canonical, 'renders', 'a.png'), 'abc');
+          symlinkSync(canonical, alias);
+          harness.ctx._session.workingDir = alias;
+          harness.ctx._session.remote = { ...remote, remotePath: alias };
+          // Execute only the actual generated read-only scripts against this
+          // disposable tree. No SSH, native pane or production path is touched.
+          mockedListFolder.mockImplementation(async (_remote, path, extensions, max) =>
+            parseRemoteFolderListOutput(
+              execFileSync('sh', ['-c', buildRemoteFolderListCommand(path, extensions, max)], { encoding: 'utf8' })
+            )
+          );
+          mockedProbePaths.mockImplementation(async (_remote, paths) =>
+            parseRemoteProbeOutput(
+              execFileSync('sh', ['-c', buildRemoteProbeCommand(paths)], { encoding: 'utf8' }),
+              paths
+            )
+          );
+          const granted = await grantRemote(join(alias, 'renders'));
+          expect(granted.statusCode).toBe(200);
+          const data = granted.json().data;
+          expect(data.path).toBe(join(canonical, 'renders'));
+          expect(mockedProbePaths).toHaveBeenCalledWith(expect.anything(), [alias]);
+          expect((await rawRemote(data.folderId)).statusCode).toBe(200);
+          expect(mockedProbePaths).toHaveBeenLastCalledWith(expect.anything(), [
+            join(canonical, 'renders', 'a.png'),
+            alias,
+          ]);
+          // A child symlink escaping the canonical workspace must never grant.
+          const outside = join(temp, 'outside');
+          mkdirSync(outside);
+          writeFileSync(join(outside, 'a.png'), 'outside-secret');
+          symlinkSync(outside, join(canonical, 'renders', 'escape'));
+          expect((await grantRemote(join(alias, 'renders', 'escape'))).statusCode).toBe(403);
+          expect(mockedCreateReadStream).toHaveBeenCalledOnce();
+        } finally {
+          rmSync(temp, { recursive: true, force: true });
+        }
+      }
+    );
+
+    it.each(['missing', 'not-directory', 'relative', 'dot-segments', 'oversized', 'unreachable'] as const)(
+      'refuses an %s workspace proof without granting or serving a folder',
+      async (kind) => {
+        await asOwner();
+        vi.stubEnv('CODEMAN_ATTACHMENT_CONFINE', '1');
+        mockedListFolder.mockResolvedValue({ dir: '/canonical/work/renders', entries: [], truncated: false });
+        if (kind === 'unreachable')
+          mockedProbePaths.mockRejectedValueOnce(new RemoteFileAccessError('Fixture root probe unavailable'));
+        else
+          mockedProbePaths.mockResolvedValue([
+            kind === 'missing'
+              ? null
+              : {
+                  realPath:
+                    kind === 'relative'
+                      ? 'relative/work'
+                      : kind === 'dot-segments'
+                        ? '/canonical/elsewhere/../work'
+                        : kind === 'oversized'
+                          ? '/' + 'x'.repeat(4096)
+                          : '/canonical/work',
+                  kind: kind === 'not-directory' ? 'file' : 'directory',
+                  size: 0,
+                  mtimeMs: 0,
+                },
+          ]);
+        const res = await grantRemote(REMOTE_DIR + '/renders');
+        expect(res.statusCode).toBe(kind === 'unreachable' ? 502 : 403);
+        expect(res.json().data?.folderId).toBeUndefined();
+        expect(mockedCreateReadStream).not.toHaveBeenCalled();
+      }
+    );
+
+    it.each(['outside', 'missing-root', 'non-directory-root'] as const)(
+      'refuses %s after a previously authorized non-admin folder grant',
+      async (kind) => {
+        await asOwner();
+        mockedListFolder.mockResolvedValue({ dir: '/canonical/work/renders', entries: [], truncated: false });
+        const root = { realPath: '/canonical/work', kind: 'directory' as const, size: 0, mtimeMs: 0 };
+        mockedProbePaths.mockResolvedValueOnce([root]);
+        const grant = await grantRemote(REMOTE_DIR + '/renders');
+        expect(grant.statusCode).toBe(200);
+        mockedProbePaths.mockResolvedValue([
+          {
+            realPath: kind === 'outside' ? '/canonical/other/a.png' : '/canonical/work/renders/a.png',
+            kind: 'file',
+            size: 3,
+            mtimeMs: 1000,
+          },
+          kind === 'missing-root' ? null : { ...root, kind: kind === 'non-directory-root' ? 'file' : 'directory' },
+        ]);
+        const response = await rawRemote(grant.json().data.folderId);
+        expect(response.statusCode).toBe(403);
+        expect(mockedCreateReadStream).not.toHaveBeenCalled();
+      }
+    );
   });
 
   it('answers 400 "Not a folder" for a remote file, so the client falls back to the preview', async () => {

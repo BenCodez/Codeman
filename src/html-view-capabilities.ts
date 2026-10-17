@@ -65,7 +65,17 @@ export class HtmlViewCapabilityStore {
     if (existing && this.capabilities.get(existing)) return existing;
     if (existing) this.byRoot.delete(key);
 
-    if (this.capabilities.size >= MAX_WEBVIEW_CAPABILITIES) this.capabilities.cleanup();
+    if (this.capabilities.size >= MAX_WEBVIEW_CAPABILITIES) {
+      this.capabilities.cleanup();
+      // Expiry alone need not release space: active capabilities have a rolling
+      // TTL. Drop the oldest mints, as the shared capability limit specifies.
+      for (const [oldToken, record] of this.capabilities) {
+        if (this.capabilities.size < MAX_WEBVIEW_CAPABILITIES) break;
+        this.capabilities.delete(oldToken);
+        const oldKey = rootKey(record.rootDir, record.owner, record.outsideWorkspace);
+        if (this.byRoot.get(oldKey) === oldToken) this.byRoot.delete(oldKey);
+      }
+    }
 
     const token = randomBytes(24).toString('base64url');
     this.capabilities.set(token, { rootDir, owner, outsideWorkspace, createdAt: Date.now() });

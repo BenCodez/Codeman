@@ -973,6 +973,7 @@
     'Write your prompt…': '请输入提示词…',
     'Use terminal keyboard': '使用终端键盘',
     'Uploading…': '上传中…',
+    'max {limit} videos per batch ({skipped} skipped)': '每批最多 {limit} 个视频（已跳过 {skipped} 个）',
 
     // Mobile overview (phone home screen)
     'Needs you': '需要你',

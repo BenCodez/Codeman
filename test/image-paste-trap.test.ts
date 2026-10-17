@@ -17,6 +17,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import vm from 'node:vm';
+import { JSDOM } from 'jsdom';
 import { describe, expect, it, vi } from 'vitest';
 
 const imageInputSource = readFileSync(resolve(import.meta.dirname, '../src/web/public/image-input.js'), 'utf8');
@@ -311,5 +312,118 @@ describe('image upload insertion policy', () => {
     await app._uploadAndInsertImages([{ path: '/tmp/shot.png' }]);
 
     expect(app.showToast).toHaveBeenCalledWith(`1 failed: ${reason}`, 'error');
+  });
+});
+
+describe('per-kind upload batch admission', () => {
+  const file = (name: string, type = '') => ({ name, type, path: '/uploads/' + name });
+  it('drops the fourth video before normalization or upload and reports the exact skipped count', async () => {
+    const app = loadImageInputApp(),
+      files = [1, 2, 3, 4].map((n) => file(`clip-${n}.mp4`, 'video/mp4'));
+    const paths = await app._uploadAndInsertImages(files);
+    expect(Array.from(paths)).toEqual(files.slice(0, 3).map((row) => row.path));
+    expect(app._normalizeImageForUpload.mock.calls.map(([row]) => row)).toEqual(files.slice(0, 3));
+    expect(app._uploadPasteImage.mock.calls.map(([, row]) => row)).toEqual(files.slice(0, 3));
+    expect(app.showToast).toHaveBeenLastCalledWith('3 files ready · max 3 videos per batch (1 skipped)', 'info');
+    expect(app._sendInputAsync).toHaveBeenCalledWith(
+      'session-1',
+      files
+        .slice(0, 3)
+        .map((row) => row.path)
+        .join(' '),
+      { useMux: true }
+    );
+  });
+  it('accepts exactly three videos without a cap warning, even with MIME-free extension classification', async () => {
+    const app = loadImageInputApp(),
+      files = [file('one.mov', 'video/quicktime'), file('two.webm', 'video/webm'), file('three.mp4')];
+    expect(Array.from(await app._uploadAndInsertImages(files, { insert: false }))).toEqual(
+      files.map((row) => row.path)
+    );
+    expect(app._uploadPasteImage).toHaveBeenCalledTimes(3);
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    expect(app.showToast).toHaveBeenLastCalledWith('3 files ready', 'success');
+  });
+  it('retains mixed image/document selection order and does not spend their slots on excess videos', async () => {
+    const app = loadImageInputApp(),
+      files = [
+        file('one.mp4'),
+        file('photo.png', 'image/png'),
+        file('two.mov'),
+        file('notes.pdf'),
+        file('three.webm'),
+        file('skipped.mp4'),
+        file('after.md'),
+      ];
+    const expected = [files[0], files[1], files[2], files[3], files[4], files[6]];
+    expect(Array.from(await app._uploadAndInsertImages(files, { insert: false }))).toEqual(
+      expected.map((row) => row.path)
+    );
+    expect(app._uploadPasteImage.mock.calls.map(([, row]) => row)).toEqual(expected);
+    expect(app.showToast).toHaveBeenLastCalledWith('6 files ready · max 3 videos per batch (1 skipped)', 'info');
+  });
+  it('retains the overall twenty-file bound as well as the three-video bound for a large mixed batch', async () => {
+    const app = loadImageInputApp(),
+      videos = [1, 2, 3, 4].map((n) => file(`clip-${n}.mp4`)),
+      documents = Array.from({ length: 21 }, (_, n) => file(`doc-${n}.pdf`));
+    const expected = [...videos.slice(0, 3), ...documents.slice(0, 17)];
+    expect(Array.from(await app._uploadAndInsertImages([...videos, ...documents], { insert: false }))).toEqual(
+      expected.map((row) => row.path)
+    );
+    expect(app._uploadPasteImage).toHaveBeenCalledTimes(20);
+    expect(app.showToast).toHaveBeenLastCalledWith(
+      '20 files ready · max 20 per batch · max 3 videos per batch (1 skipped)',
+      'info'
+    );
+  });
+  it.each(['image/png', 'application/pdf'])(
+    'keeps the original twenty-file image/document cap for %s',
+    async (type) => {
+      const app = loadImageInputApp(),
+        files = Array.from({ length: 21 }, (_, n) => file(`file-${n}.${type === 'image/png' ? 'png' : 'pdf'}`, type));
+      expect(Array.from(await app._uploadAndInsertImages(files, { insert: false }))).toEqual(
+        files.slice(0, 20).map((row) => row.path)
+      );
+      expect(app.showToast).toHaveBeenLastCalledWith('20 files ready · max 20 per batch', 'info');
+    }
+  );
+  it('keeps selected-session insertion and FIFO ordering when three admitted video uploads finish out of order after a tab switch', async () => {
+    const app = loadImageInputApp(),
+      files = [1, 2, 3, 4].map((n) => file(`clip-${n}.mp4`));
+    const finish: Array<() => void> = [];
+    app._uploadPasteImage = vi.fn((_sid, row) => new Promise((resolve) => finish.push(() => resolve(row.path))));
+    const uploading = app._uploadAndInsertImages(files, { sessionId: 'session-b' });
+    await vi.waitFor(() => expect(finish).toHaveLength(3));
+    app.activeSessionId = 'session-2';
+    finish[2]();
+    finish[0]();
+    finish[1]();
+    expect(Array.from(await uploading)).toEqual(files.slice(0, 3).map((row) => row.path));
+    expect(app._uploadPasteImage.mock.calls.map(([sid]) => sid)).toEqual(['session-b', 'session-b', 'session-b']);
+    expect(app._sendInputAsync).toHaveBeenCalledExactlyOnceWith(
+      'session-b',
+      files
+        .slice(0, 3)
+        .map((row) => row.path)
+        .join(' '),
+      { useMux: true }
+    );
+    expect(app.sendInput).not.toHaveBeenCalled();
+  });
+  it('translates the exact video-cap feedback with the real localization helper', () => {
+    const dom = new JSDOM('<!doctype html><html><body></body></html>', { runScripts: 'outside-only' });
+    try {
+      vm.runInContext(
+        readFileSync(resolve(import.meta.dirname, '../src/web/public/i18n.js'), 'utf8'),
+        dom.getInternalVMContext()
+      );
+      const i18n = Reflect.get(dom.window, 'CodemanI18n');
+      i18n.configure({ language: 'zh-CN' });
+      expect(i18n.t('max {limit} videos per batch ({skipped} skipped)', { limit: 3, skipped: 1 })).toBe(
+        '每批最多 3 个视频（已跳过 1 个）'
+      );
+    } finally {
+      dom.window.close();
+    }
   });
 });

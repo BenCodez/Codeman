@@ -316,10 +316,10 @@ Object.assign(CodemanApp.prototype, {
     return null;
   },
 
-  // Max images accepted in one batch (paste / drop / mobile picker). Each is
-  // uploaded as its own request, so 20 stays under the server's 30 uploads/min
-  // rate limit while covering "select a bunch of photos at once".
+  // Overall batch bound (paste / drop / mobile picker). Images/documents share
+  // the server's 30/min bucket; videos have a separate three-token bucket.
   _maxBatchImages: 20,
+  _maxBatchVideos: 3,
   // How many uploads to run concurrently. Small enough that decoding several
   // large images through <canvas> at once won't OOM a phone, large enough that
   // 20 photos don't crawl through serially.
@@ -337,12 +337,29 @@ Object.assign(CodemanApp.prototype, {
     let files = Array.from(fileList || []);
     if (files.length === 0) return [];
 
-    // Cap the batch and tell the user what got dropped (no silent truncation).
+    // Admit in selection order before any normalization/upload. An excess video
+    // must not spend a general batch slot or reach the server's 429 after its
+    // body has started. Keep the existing overall image/document batch bound.
     let capped = false;
-    if (files.length > this._maxBatchImages) {
-      files = files.slice(0, this._maxBatchImages);
-      capped = true;
-    }
+    let videos = 0;
+    let skippedVideos = 0;
+    let admitted = 0;
+    files = files.filter((file) => {
+      const isVideo = this._promptAttachKind({ type: file.type || '', name: file.name || '' }) === 'video';
+      if (isVideo && videos >= this._maxBatchVideos) {
+        skippedVideos++;
+        return false;
+      }
+      // Count accepted entries, not the original index: skipped videos leave
+      // room for later images and documents within the same total bound.
+      if (admitted >= this._maxBatchImages) {
+        capped = true;
+        return false;
+      }
+      admitted++;
+      if (isVideo) videos++;
+      return true;
+    });
 
     const total = files.length;
     let done = 0;
@@ -397,7 +414,13 @@ Object.assign(CodemanApp.prototype, {
     if (paths.length > 0) parts.push(`${paths.length} file${paths.length > 1 ? 's' : ''} ready`);
     if (failed > 0) parts.push(failReason ? `${failed} failed: ${failReason}` : `${failed} failed`);
     if (capped) parts.push(`max ${this._maxBatchImages} per batch`);
-    const tone = paths.length > 0 ? (failed > 0 || capped ? 'info' : 'success') : 'error';
+    if (skippedVideos > 0) {
+      const message = `max ${this._maxBatchVideos} videos per batch (${skippedVideos} skipped)`;
+      parts.push(window.CodemanI18n?.t?.('max {limit} videos per batch ({skipped} skipped)', {
+        limit: this._maxBatchVideos, skipped: skippedVideos,
+      }) || message);
+    }
+    const tone = paths.length > 0 ? (failed > 0 || capped || skippedVideos > 0 ? 'info' : 'success') : 'error';
     this.showToast(parts.join(' · ') || 'No files uploaded', tone);
     return paths;
   },
