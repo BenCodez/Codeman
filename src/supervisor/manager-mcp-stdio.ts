@@ -12,6 +12,7 @@ import { isValidBasePath } from '../config/base-path.js';
 const MAX_REQUEST = 800 * 1024;
 const MAX_RESPONSE = 2_097_152;
 const TOKEN = /^codeman-manager-v1\.[a-f0-9]{64}$/;
+class ManagerBridgeTransportError extends Error {}
 export interface ManagerBridgeCredential {
   readonly version: 1;
   readonly url: string;
@@ -121,6 +122,9 @@ export async function postManagerRpc(config: ManagerBridgeCredential, body: Buff
         port: url.port,
         path: url.pathname,
         method: 'POST',
+        // Each request is bounded and independent; do not reuse an idle pooled
+        // loopback socket after a later owner turn. Never retry a failed write.
+        agent: false,
         rejectUnauthorized: false,
         headers: {
           Authorization: `Bearer ${config.token}`,
@@ -140,12 +144,14 @@ export async function postManagerRpc(config: ManagerBridgeCredential, body: Buff
             request.destroy();
           } else chunks.push(chunk);
         });
-        response.on('error', () => finish(new Error('Manager bridge response failed')));
-        response.on('aborted', () => finish(new Error('Manager bridge response was interrupted')));
+        response.on('error', () => finish(new ManagerBridgeTransportError('Manager bridge response failed')));
+        response.on('aborted', () =>
+          finish(new ManagerBridgeTransportError('Manager bridge response was interrupted'))
+        );
         response.on('end', () => {
           if (response.statusCode === 202 || response.statusCode === 204) return finish();
           if (response.statusCode !== 200)
-            return finish(new Error('Manager bridge request refused or acceptance is uncertain'));
+            return finish(new ManagerBridgeTransportError('Manager bridge request refused or acceptance is uncertain'));
           const bytes = Buffer.concat(chunks);
           try {
             const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
@@ -164,15 +170,17 @@ export async function postManagerRpc(config: ManagerBridgeCredential, body: Buff
       }
     );
     const timer = setTimeout(() => {
-      finish(new Error('Manager bridge deadline expired; acceptance may be uncertain'));
+      finish(new ManagerBridgeTransportError('Manager bridge deadline expired; acceptance may be uncertain'));
       request.destroy();
     }, 30_000);
     timer.unref?.();
-    request.on('error', () => finish(new Error('Manager bridge transport failed; acceptance may be uncertain')));
+    request.on('error', () =>
+      finish(new ManagerBridgeTransportError('Manager bridge transport failed; acceptance may be uncertain'))
+    );
     try {
       request.end(body);
     } catch {
-      finish(new Error('Manager bridge transport failed; acceptance may be uncertain'));
+      finish(new ManagerBridgeTransportError('Manager bridge transport failed; acceptance may be uncertain'));
       request.destroy();
     }
   });
@@ -201,16 +209,51 @@ export async function runSupervisorManagerMcp(
         pending = pending.subarray(newline + 1);
         if (!line.length) continue;
         if (line.length > MAX_REQUEST) throw new Error('Manager RPC request exceeded its limit');
+        let request: { jsonrpc: string; method: string; id?: string | number };
         try {
-          JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line));
+          const value = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(line));
+          if (
+            !value ||
+            typeof value !== 'object' ||
+            Array.isArray(value) ||
+            value.jsonrpc !== '2.0' ||
+            typeof value.method !== 'string' ||
+            !value.method ||
+            (Object.hasOwn(value, 'id') &&
+              !(
+                (typeof value.id === 'string' && value.id.length <= 120) ||
+                (typeof value.id === 'number' && Number.isFinite(value.id))
+              ))
+          )
+            throw Error();
+          request = value;
         } catch {
           throw new Error('Invalid manager RPC input');
         }
         // Never automatically replay a request after a lost response. The caller
         // retains its operation requestId and inspects the durable manager status.
         if (outputFailed) throw new Error('Manager RPC output failed');
-        const response = await postManagerRpc(config, line);
-        if (response)
+        let response: Buffer | undefined;
+        try {
+          response = await postManagerRpc(config, line);
+        } catch (error) {
+          if (!(error instanceof ManagerBridgeTransportError)) throw error;
+        }
+        if (!response && Object.hasOwn(request, 'id'))
+          response = Buffer.from(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: request.id,
+              error: {
+                code: -32002,
+                message:
+                  'Manager bridge request failed; acceptance may be uncertain. Retain requestId and inspect durable status before retrying.',
+              },
+            })
+          );
+        // Notifications never receive responses, including HTTP refusals. A
+        // request failure does not close the transport or authorize any replay.
+        if (response && Object.hasOwn(request, 'id'))
           await new Promise<void>((resolve, reject) =>
             output.write(Buffer.concat([response, Buffer.from('\n')]), (error) =>
               error ? reject(new Error('Manager RPC output failed')) : resolve()

@@ -285,3 +285,130 @@ it('carries a maximum escaped GitLab file and keeps subsequent manager tools ava
   );
   expect(received).toEqual([request, subsequent]);
 });
+
+it.each(['refused', 'timeout', 'accepted-no-response'])(
+  'keeps stdio alive after %s requests and notifications without replaying uncertain effects',
+  async (fault) => {
+    const originalTimeout = setTimeout;
+    vi.spyOn(globalThis, 'setTimeout').mockImplementation(((callback, ms, ...args) =>
+      originalTimeout(callback, ms === 30_000 ? 30 : ms, ...args)) as typeof setTimeout);
+    const received: unknown[] = [];
+    const connections: Array<string | undefined> = [];
+    let effects = 0;
+    const server = http.createServer(async (req, res) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of req) chunks.push(chunk);
+      const body = JSON.parse(Buffer.concat(chunks).toString());
+      received.push(body);
+      connections.push(req.headers.connection);
+      if (body.id === 'write-request') {
+        effects++;
+        if (fault === 'timeout') return;
+        if (fault === 'accepted-no-response') {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        res.writeHead(503);
+        res.end(TOKEN + ' private upstream details');
+        return;
+      }
+      if (!Object.hasOwn(body, 'id')) {
+        res.writeHead(401);
+        res.end(TOKEN);
+        return;
+      }
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: { readable: true } }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = (server.address() as { port: number }).port;
+    const f = await credential(`http://127.0.0.1:${port}/api/supervisor-mcp`);
+    const messages = [
+      {
+        jsonrpc: '2.0',
+        id: 'write-request',
+        method: 'tools/call',
+        params: { name: 'supervisor_brain', arguments: { mode: 'append', requestId: 'retained-write-id' } },
+      },
+      { jsonrpc: '2.0', method: 'notifications/initialized' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/call', params: { name: 'supervisor_status', arguments: {} } },
+    ];
+    let output = '';
+    await runSupervisorManagerMcp(
+      f.file,
+      Readable.from([messages.map((value) => JSON.stringify(value) + '\n').join('')]),
+      new Writable({
+        write(chunk, _encoding, done) {
+          output += chunk.toString();
+          done();
+        },
+      })
+    );
+    const responses = output
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(responses).toHaveLength(2);
+    expect(responses[0]).toMatchObject({ jsonrpc: '2.0', id: 'write-request', error: { code: -32002 } });
+    expect(responses[0].error.message).toContain('acceptance may be uncertain');
+    expect(responses[1]).toEqual({ jsonrpc: '2.0', id: 2, result: { readable: true } });
+    expect(received).toEqual(messages);
+    expect(connections).toEqual(['close', 'close', 'close']);
+    expect(effects).toBe(1);
+    expect(output).not.toContain(TOKEN);
+    expect(output).not.toContain('upstream');
+    expect(output).not.toContain(String(port));
+  }
+);
+
+it.each(['null', '[]', '{"jsonrpc":"2.0","method":"tools/list","id":null}'])(
+  'keeps malformed request envelopes fatal: %s',
+  async (line) => {
+    const f = await credential();
+    await expect(
+      runSupervisorManagerMcp(
+        f.file,
+        Readable.from([line + '\n']),
+        new Writable({
+          write(_chunk, _encoding, done) {
+            done();
+          },
+        })
+      )
+    ).rejects.toThrow('Invalid manager RPC input');
+  }
+);
+
+it.each(['malformed', 'oversize'])(
+  'keeps %s HTTP responses fatal instead of hiding protocol corruption',
+  async (fault) => {
+    let requests = 0;
+    const server = http.createServer(async (req, res) => {
+      for await (const _chunk of req) {
+        /* Drain the one bounded request. */
+      }
+      requests++;
+      res.end(fault === 'malformed' ? '{broken' : 'x'.repeat(2_097_153));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const f = await credential(`http://127.0.0.1:${(server.address() as { port: number }).port}/api/supervisor-mcp`);
+    const input = [1, 2].map((id) => JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list' }) + '\n').join('');
+    let output = '';
+    await expect(
+      runSupervisorManagerMcp(
+        f.file,
+        Readable.from([input]),
+        new Writable({
+          write(chunk, _encoding, done) {
+            output += chunk.toString();
+            done();
+          },
+        })
+      )
+    ).rejects.toThrow(fault === 'malformed' ? 'Invalid manager bridge response' : 'exceeded its limit');
+    expect(requests).toBe(1);
+    expect(output).toBe('');
+  }
+);

@@ -120,6 +120,26 @@ default:throw Error('Unexpected native command '+a[0]);}
   };
 }
 describe('owned SSH shell conversion', () => {
+  it.each(['foreground-program', 'codex-pane', 'child-work'])(
+    'explains why an idle chat is not a free shell: %s',
+    async (kind) => {
+      const f = await fixture();
+      if (kind === 'foreground-program') {
+        const stat = await readFile(join(f.proc, '101', 'stat'), 'utf8');
+        await writeFile(join(f.proc, '101', 'stat'), stat.replace('S 1 101 101 0 101 ', 'S 1 101 101 0 202 '));
+      } else if (kind === 'codex-pane') {
+        await writeFile(join(f.proc, '101', 'cmdline'), '/synthetic/codex\0--no-daemon\0');
+      } else {
+        await writeFile(join(f.proc, '101', 'task', '101', 'children'), '202');
+      }
+      const result = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });
+      expect(result.status).toBe('refused');
+      if (result.status !== 'refused') throw Error('Expected explicit refusal');
+      expect(result.reason).toMatch(/chat.*(?:idle|awaiting input)|idle chat/);
+      expect(result.reason).toMatch(/shell/);
+      expect((await f.effects()).effects).toEqual([]);
+    }
+  );
   it('releases conversion after queued SSH admission cancellation but seals transport uncertainty', async () => {
     const f = await fixture(),
       inspection = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });
