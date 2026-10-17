@@ -473,6 +473,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
   const pendingAgents = new Set<string>();
   const childActivityAt = new Map<string, number>();
   const commands = new Map<string, { startedAt: number; signature: string; open: boolean }>();
+  const mcpCalls = new Map<string, { startedAt: number; signature: string; open: boolean }>();
   const updateChild = (
     rawId: unknown,
     status: unknown,
@@ -606,10 +607,24 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
         if (!message.trim() || submittedAt <= latestVetoAt) return unknown;
       }
       submissionHash = createHash('sha256').update(message.trim()).digest('hex');
-      // A new prompt can precede task_started in the journal. It already supersedes the old failure.
-      turnId = undefined;
-      hasTurnStart = false;
-      turnStartedAt = 0;
+      // Native paginated history can persist task_started before its own
+      // completed UserMessage. Preserve only that exact still-running turn;
+      // legacy/new-turn input continues to invalidate older failure authority.
+      const retainsStartedTurn =
+        p.type === 'item_completed' &&
+        p.turn_id === turnId &&
+        hasTurnStart &&
+        result.activity === 'working' &&
+        result.reason === 'turn-running' &&
+        Number.isSafeInteger(p.started_at_ms) &&
+        Number(p.started_at_ms) > 0 &&
+        Number(p.started_at_ms) >= turnStartedAt - 2000 &&
+        Number(p.completed_at_ms) >= turnStartedAt;
+      if (!retainsStartedTurn) {
+        turnId = undefined;
+        hasTurnStart = false;
+        turnStartedAt = 0;
+      }
       pendingApproval = false;
       terminalError = undefined;
       update('working', 'turn-running');
@@ -848,6 +863,89 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
         Buffer.from(p.chunk, 'base64').toString('base64') !== p.chunk
       )
         return unknown;
+    } else if ((p.type === 'item_started' || p.type === 'item_completed') && object(p.item)?.type === 'McpToolCall') {
+      // rust-v0.162.1 protocol/items.rs: native rollouts may persist only the
+      // completed item, carrying its own paired begin/end timestamps.
+      const item = object(p.item)!;
+      const id = token(item.id);
+      const startedAt = p.started_at_ms;
+      const completedAt = p.completed_at_ms;
+      const duration = item.duration == null ? undefined : object(item.duration);
+      const error = item.error == null ? undefined : object(item.error);
+      const response = item.result == null ? undefined : object(item.result);
+      if (
+        !id ||
+        p.thread_id !== context.conversationId ||
+        !turnId ||
+        p.turn_id !== turnId ||
+        !token(item.server) ||
+        !token(item.tool) ||
+        item.arguments === undefined ||
+        !Number.isSafeInteger(startedAt) ||
+        Number(startedAt) <= 0 ||
+        Number(startedAt) < turnStartedAt - 2000 ||
+        Number(startedAt) > Math.min(context.now + 2000, at + 2000) ||
+        (item.duration != null &&
+          (!duration ||
+            !Number.isSafeInteger(duration.secs) ||
+            Number(duration.secs) < 0 ||
+            !Number.isInteger(duration.nanos) ||
+            Number(duration.nanos) < 0 ||
+            Number(duration.nanos) >= 1_000_000_000))
+      )
+        return unknown;
+      const signature = JSON.stringify([p.turn_id, item.server, item.tool, item.arguments]);
+      const previous = mcpCalls.get(id);
+      if (p.type === 'item_started') {
+        if (
+          previous ||
+          item.status !== 'inProgress' ||
+          item.error != null ||
+          item.result != null ||
+          item.duration != null
+        )
+          return unknown;
+        mcpCalls.set(id, { startedAt: Number(startedAt), signature, open: true });
+        terminalError = undefined;
+        update('working', 'turn-running');
+      } else {
+        if (
+          !Number.isSafeInteger(completedAt) ||
+          Number(completedAt) < Number(startedAt) ||
+          Number(completedAt) > Math.min(context.now + 2000, at + 2000) ||
+          (previous && (!previous.open || previous.signature !== signature || previous.startedAt !== startedAt)) ||
+          !['completed', 'failed'].includes(String(item.status))
+        )
+          return unknown;
+        if (item.status === 'failed') {
+          if (
+            !error ||
+            Object.keys(error).length !== 1 ||
+            typeof error.message !== 'string' ||
+            !error.message.trim() ||
+            item.result != null
+          )
+            return unknown;
+          if (error.message === 'MCP tool call requires approval, but approval policy is never') {
+            update('paused', 'approval-required');
+            latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else {
+            const failure = classifyError(error);
+            update(failure.activity, failure.reason);
+          }
+        } else {
+          if (
+            item.error != null ||
+            !response ||
+            !Array.isArray(response.content) ||
+            !response.content.every((block) => !!object(block)) ||
+            (response.isError !== undefined && typeof response.isError !== 'boolean')
+          )
+            return unknown;
+          if (response.isError === true) update('blocked', 'observing');
+        }
+        mcpCalls.set(id, { startedAt: Number(startedAt), signature, open: false });
+      }
     } else if ((p.type === 'item_started' || p.type === 'item_completed') && object(p.item)) {
       const item = object(p.item)!;
       const itemAt = p.type === 'item_started' ? p.started_at_ms : p.completed_at_ms;
@@ -894,7 +992,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     return { ...result, activity: 'paused', reason: ownerVetoReason, safeToAct: false };
   }
   if (
-    [...commands.values()].some((command) => command.open) &&
+    ([...commands.values()].some((command) => command.open) || [...mcpCalls.values()].some((call) => call.open)) &&
     !['unknown', 'blocked', 'paused'].includes(result.activity)
   ) {
     return { ...result, activity: 'watching', reason: 'background-work', safeToAct: false };

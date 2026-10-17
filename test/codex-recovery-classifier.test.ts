@@ -779,3 +779,156 @@ it('retains early child and approval vetoes across a complete larger conversatio
   }
   expect(classifyCodexTail(full, context({ tailTruncated: true }))).toMatchObject({ safeToAct: false });
 });
+
+describe('native MCP item lifecycle', () => {
+  const approval = 'MCP tool call requires approval, but approval policy is never';
+  const item = (patch: Payload = {}): Payload => ({
+    type: 'McpToolCall',
+    id: 'mcp-call-fixture',
+    server: 'codeman',
+    tool: 'codeman_list_agents',
+    arguments: {},
+    status: 'completed',
+    result: { content: [] },
+    duration: { secs: 0, nanos: 0 },
+    ...patch,
+  });
+  const event = (patch: Payload = {}, payload: Payload = {}): Payload => ({
+    type: 'item_completed',
+    thread_id: THREAD,
+    turn_id: TURN,
+    started_at_ms: NOW - 9000,
+    completed_at_ms: NOW - 8000,
+    item: item(patch),
+    ...payload,
+  });
+  const failedCall = (message = approval) => event({ status: 'failed', result: undefined, error: { message } });
+  it('retains an exact native task start persisted before its own completed owner input', () => {
+    const owner = {
+      type: 'item_completed',
+      thread_id: THREAD,
+      turn_id: TURN,
+      started_at_ms: NOW - 9984,
+      completed_at_ms: NOW - 9984,
+      item: { type: 'UserMessage', id: 'owner-input', content: [{ type: 'text', text: 'Run scoped tool' }] },
+    };
+    expect(classifyCodexTail(tail(start(), owner, event(), complete()), context()).activity).toBe('completed');
+    for (const change of [
+      { turn_id: 'other-turn' },
+      { started_at_ms: undefined },
+      { started_at_ms: NOW - 15000, completed_at_ms: NOW - 15000 },
+    ])
+      expect(classifyCodexTail(tail(start(), { ...owner, ...change }, event(), complete()), context()).activity).toBe(
+        'unknown'
+      );
+    expect(
+      classifyCodexTail(tail(start(), complete(INTERRUPTED), owner, event(), complete()), context()).activity
+    ).toBe('unknown');
+    expect(
+      classifyCodexTail(
+        tail(start(), { type: 'user_message', message: 'Unbound owner input' }, event(), complete()),
+        context()
+      ).activity
+    ).toBe('unknown');
+  });
+  it('accepts native completed-only timestamps and a later tracked owner turn after an approval refusal', () => {
+    expect(classifyCodexTail(tail(start(), event(), complete()), context()).activity).toBe('completed');
+    expect(classifyCodexTail(tail(start(), failedCall(), complete()), context())).toMatchObject({
+      activity: 'paused',
+      reason: 'approval-required',
+      safeToAct: false,
+    });
+    expect(
+      classifyCodexTail(
+        tail(
+          start(),
+          failedCall(),
+          complete(),
+          { type: 'user_message', message: 'Owner repaired approval; reply READY.' },
+          start('owner-turn'),
+          complete(undefined, 'owner-turn')
+        ),
+        context()
+      ).activity
+    ).toBe('completed');
+  });
+  it('requires explicit starts to pair exactly, and keeps uncompleted MCP calls pending across owner turns', () => {
+    const begin = event(
+      { status: 'inProgress', result: undefined, duration: undefined },
+      { type: 'item_started', completed_at_ms: undefined }
+    );
+    expect(classifyCodexTail(tail(start(), begin, event(), complete()), context()).activity).toBe('completed');
+    expect(
+      classifyCodexTail(
+        tail(
+          start(),
+          begin,
+          complete(),
+          { type: 'user_message', message: 'Another owner turn' },
+          start('owner-turn'),
+          complete(undefined, 'owner-turn')
+        ),
+        context()
+      )
+    ).toMatchObject({ activity: 'watching', reason: 'background-work', safeToAct: false });
+    expect(
+      classifyCodexTail(tail(start(), begin, event({ tool: 'another_tool' }), complete()), context()).activity
+    ).toBe('unknown');
+  });
+  it.each([
+    event({}, { started_at_ms: undefined }),
+    event({}, { started_at_ms: NOW - 7000 }),
+    event({}, { completed_at_ms: NOW + 3000 }),
+    event({}, { thread_id: AGENT }),
+    event({}, { turn_id: 'other-turn' }),
+    event({ status: 'inProgress' }),
+    event({ status: 'failed', result: undefined }),
+    event({
+      status: 'failed',
+      result: undefined,
+      error: { message: 'Unknown error', codex_error_info: 'Unauthorized' },
+    }),
+    event({ error: { message: approval } }),
+    event({ result: { content: 'malformed' } }),
+    event({ duration: { secs: 0, nanos: -1 } }),
+    event({ arguments: undefined }),
+    event({ status: 'unknown' }),
+  ])('vetoes malformed or unsupported MCP evidence %#', (row) => {
+    expect(classifyCodexTail(tail(start(), row, complete()), context())).toMatchObject({
+      activity: 'unknown',
+      safeToAct: false,
+    });
+  });
+  it('retains unknown/authentication/permission error and result-error vetoes despite later completion and owner prompts', () => {
+    for (const row of [
+      failedCall('Authentication required'),
+      failedCall('Permission denied'),
+      failedCall('Unknown tool failure'),
+      event({ result: { content: [], isError: true } }),
+    ])
+      expect(
+        classifyCodexTail(
+          tail(
+            start(),
+            row,
+            complete(),
+            { type: 'user_message', message: 'Try again' },
+            start('owner-turn'),
+            complete(undefined, 'owner-turn')
+          ),
+          context()
+        )
+      ).toMatchObject({ activity: 'blocked', safeToAct: false });
+  });
+  it('refuses repeated terminal IDs and a missing start cannot erase another pending call', () => {
+    expect(classifyCodexTail(tail(start(), event(), event(), complete()), context()).activity).toBe('unknown');
+    const begin = event(
+      { id: 'other-call', status: 'inProgress', result: undefined, duration: undefined },
+      { type: 'item_started', completed_at_ms: undefined }
+    );
+    expect(classifyCodexTail(tail(start(), begin, event(), complete()), context())).toMatchObject({
+      activity: 'watching',
+      safeToAct: false,
+    });
+  });
+});
