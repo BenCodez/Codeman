@@ -215,7 +215,10 @@ export class ManagementService {
     return { revision: config.revision, managerSessionId: config.managerSessionId, agents };
   }
   async enroll(owner: string, sessionId: string, extraCurrent = () => true) {
-    const current = this.authority(owner, sessionId, extraCurrent);
+    const configuration = await this.captureConfiguration(owner, extraCurrent);
+    if (!configuration.config.agents.some((agent) => agent.sessionId === sessionId && agent.allowMessages))
+      throw new BrainStoreError('forbidden');
+    const current = this.authority(owner, sessionId, configuration.current);
     const inbox = await this.load(this.inboxes, this.inboxId(owner, sessionId), Inbox, emptyInbox, current);
     const tokenKey = this.inboxId(owner, sessionId).slice(0, 32);
     const token = `codeman-agent-v1.${tokenKey}${randomBytes(16).toString('hex')}`;

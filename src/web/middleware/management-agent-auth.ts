@@ -18,7 +18,7 @@ export function registerManagementAgentAuth(app: FastifyInstance, service: Manag
     reply.header('Cache-Control', 'no-store');
     if ((req.method !== 'GET' && req.method !== 'POST') || req.url !== MANAGEMENT_AGENT_PATH)
       return reply.code(403).send({ success: false, error: 'Agent credential is restricted to its inbox' });
-    const token = /^Bearer (codeman-agent-v1\.[a-f0-9]{64})$/.exec(header)?.[1];
+    const token = /^Bearer\s+(codeman-agent-v1\.[a-f0-9]{64})$/i.exec(header)?.[1];
     const scope = token ? await service.authenticate(token) : undefined;
     if (!scope) return reply.code(401).send({ success: false, error: 'Invalid agent credential' });
     if (isMultiUserMode()) {

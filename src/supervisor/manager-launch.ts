@@ -49,6 +49,9 @@ export interface SupervisorManagerLaunch {
   readonly files: readonly PrivateFileWitness[];
   readonly missing: readonly string[];
   isCurrent(): boolean;
+  /** Exact owner-frame continuity only; never grants automatic worker authority. */
+  isOwnerInputCurrent?(): boolean;
+  confirmOwnerInput?(): Promise<boolean>;
   /** Runtime rechecks omit the one-time pre-conversion rollout witnesses. */
   confirm(runtime?: boolean): Promise<boolean>;
   /** Revoke immediately, then remove only this invocation's verified private artifacts. */
@@ -119,6 +122,7 @@ export async function prepareSupervisorManagerLaunch(options: {
   bridgeCommand: string;
   bridgeArgs: readonly string[];
   isCurrent(): boolean;
+  ownerInputIsCurrent?(): boolean;
 }): Promise<SupervisorManagerLaunch | undefined> {
   const { home, workingDir, conversationId } = options;
   if (
@@ -420,7 +424,78 @@ export async function prepareSupervisorManagerLaunch(options: {
         return undefined;
       let revoked = false;
       let retirement: Promise<boolean> | undefined;
-      const permanentCurrent = () => !revoked && options.isCurrent() === true;
+      const permanentCurrent = (ownerInput = false) =>
+        !revoked && (ownerInput ? options.ownerInputIsCurrent?.() === true : options.isCurrent() === true);
+      const confirm = async (runtime = false, ownerInput = false): Promise<boolean> => {
+        if (
+          !permanentCurrent(ownerInput) ||
+          pending.has(home) ||
+          retirements.has(home) ||
+          pending.size + retirements.size >= 2
+        )
+          return false;
+        const limit = performance.now() + 2_000;
+        pending.add(home);
+        const verify = (async () => {
+          try {
+            const refreshed = personalIdentity
+              ? await readPersonalManagerAuth(
+                  authPath,
+                  personalIdentity,
+                  () => permanentCurrent(ownerInput) && performance.now() < limit
+                )
+              : undefined;
+            if (personalIdentity && !refreshed) return false;
+            const snapshot = [...(runtime ? files.slice(startupFileCount) : files), ...(refreshed ? [refreshed] : [])];
+            if (!(await checkPrivateFileWitnesses(snapshot, limit))) return false;
+            for (const path of missing) {
+              try {
+                await fs.lstat(path);
+                return false;
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+              }
+              if (!permanentCurrent(ownerInput) || performance.now() >= limit) return false;
+            }
+            if (
+              !permanentCurrent(ownerInput) ||
+              !(await checkPrivateFileWitnesses(snapshot, limit)) ||
+              !permanentCurrent(ownerInput)
+            )
+              return false;
+            if (refreshed) authWitness = refreshed;
+            return true;
+          } catch {
+            return false;
+          } finally {
+            pending.delete(home);
+          }
+        })();
+        pendingWork.set(home, verify);
+        void verify.finally(() => {
+          if (pendingWork.get(home) === verify) pendingWork.delete(home);
+        });
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const verified = await Promise.race([
+            verify,
+            new Promise<false>((resolve) => {
+              timeout = setTimeout(
+                () => {
+                  revoked = true;
+                  resolve(false);
+                },
+                Math.max(0, limit - performance.now())
+              );
+            }),
+          ]);
+          const accepted = verified && performance.now() < limit && permanentCurrent(ownerInput);
+          if (!accepted) void result.revoke();
+          return accepted;
+        } finally {
+          if (timeout) clearTimeout(timeout);
+        }
+      };
       const result: SupervisorManagerLaunch = Object.freeze({
         expectedPane: Object.freeze({ ...options.expectedPane }),
         conversationId,
@@ -500,70 +575,9 @@ export async function prepareSupervisorManagerLaunch(options: {
           })();
           return retirement;
         },
-        confirm: async (runtime = false) => {
-          if (!permanentCurrent() || pending.has(home) || retirements.has(home) || pending.size + retirements.size >= 2)
-            return false;
-          const limit = performance.now() + 2_000;
-          pending.add(home);
-          const verify = (async () => {
-            try {
-              const refreshed = personalIdentity
-                ? await readPersonalManagerAuth(
-                    authPath,
-                    personalIdentity,
-                    () => permanentCurrent() && performance.now() < limit
-                  )
-                : undefined;
-              if (personalIdentity && !refreshed) return false;
-              const snapshot = [
-                ...(runtime ? files.slice(startupFileCount) : files),
-                ...(refreshed ? [refreshed] : []),
-              ];
-              if (!(await checkPrivateFileWitnesses(snapshot, limit))) return false;
-              for (const path of missing) {
-                try {
-                  await fs.lstat(path);
-                  return false;
-                } catch (error) {
-                  if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
-                }
-                if (!permanentCurrent() || performance.now() >= limit) return false;
-              }
-              if (!permanentCurrent() || !(await checkPrivateFileWitnesses(snapshot, limit)) || !permanentCurrent())
-                return false;
-              if (refreshed) authWitness = refreshed;
-              return true;
-            } catch {
-              return false;
-            } finally {
-              pending.delete(home);
-            }
-          })();
-          pendingWork.set(home, verify);
-          void verify.finally(() => {
-            if (pendingWork.get(home) === verify) pendingWork.delete(home);
-          });
-          let timeout: ReturnType<typeof setTimeout> | undefined;
-          try {
-            const verified = await Promise.race([
-              verify,
-              new Promise<false>((resolve) => {
-                timeout = setTimeout(
-                  () => {
-                    revoked = true;
-                    resolve(false);
-                  },
-                  Math.max(0, limit - performance.now())
-                );
-              }),
-            ]);
-            const accepted = verified && performance.now() < limit && permanentCurrent();
-            if (!accepted) void result.revoke();
-            return accepted;
-          } finally {
-            if (timeout) clearTimeout(timeout);
-          }
-        },
+        confirm: (runtime = false) => confirm(runtime),
+        isOwnerInputCurrent: () => permanentCurrent(true),
+        confirmOwnerInput: () => confirm(true, true),
       });
       if (!current()) return undefined;
       issued.add(result);

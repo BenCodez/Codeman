@@ -98,6 +98,9 @@ including its durable note receipts. An existing shared brain, even an intention
 empty one, is never overwritten. Legacy manager memory files remain as private
 migration sources and are not removed by session cleanup. The restricted-manager preparation requirements
 above still apply; global settings do not expand its authentication or tool grants.
+Supervisors that are not selected globally keep their separate per-session memory,
+including scoped MCP reads and revision-checked writes. Selecting a different global
+manager does not grant it access to another supervisor's memory.
 
 ### Direct GitLab access
 
@@ -188,3 +191,21 @@ malformed, expired and unavailable reports remain unknown or stale. Codeman does
 not project its server account's quota onto an SSH agent or another Codex home.
 These reports help planning; worker actions still require their existing live
 identity, ownership, task, permission and lifecycle checks.
+
+
+GitLab project listings stop after page 100. A `capacityReached` result with
+`truncated: true` and `nextPage: null` means additional projects exist beyond the
+supported listing budget; it is not a complete inventory. Narrow the saved project
+selection when that boundary is reached.
+
+Changing the saved GitLab origin without supplying a new token clears the saved
+credential and write grant. A blank token retains credentials only when the
+normalized origin stays the same; explicitly clearing the credential still works.
+Pasted token edges are trimmed and internal whitespace is rejected before saving.
+
+When GitLab's 128 active write receipts fill, use **Archive finished write
+receipts** in Management settings. This owner-only operation archives only
+confirmed succeeded/rejected receipts. Uncertain operations stay active. Durable
+per-request replay fences remain in the private archive, so reusing an archived
+request ID cannot issue the write again. Archival sends no GitLab requests and
+never deletes uncertain records or automatically retires archives.

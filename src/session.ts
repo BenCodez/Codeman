@@ -2817,7 +2817,7 @@ export class Session extends EventEmitter {
       const context = this.getRecoveryContext();
       return (
         this._supervisorManagerProfile === profile &&
-        profile.isCurrent() === true &&
+        profile.isOwnerInputCurrent?.() === true &&
         !this._closing &&
         !this._isStopped &&
         this._paneLifecycleOps === 0 &&
@@ -2831,7 +2831,9 @@ export class Session extends EventEmitter {
         this._mux?.isSupervisorManagerLaunchCurrent?.(this.id, profile) === true
       );
     };
-    return Object.assign(current, { confirm: async () => current() && (await profile.confirm(true)) && current() });
+    return Object.assign(current, {
+      confirm: async () => current() && (await profile.confirmOwnerInput?.()) === true && current(),
+    });
   }
 
   /** Explicit owner conversion of a separately verified idle pane; no create or fallback path. */
@@ -2888,7 +2890,8 @@ export class Session extends EventEmitter {
       ]);
     const snapshot = scope();
     let profile: SupervisorManagerLaunch | undefined = undefined;
-    const current = () => {
+    let acknowledged = false;
+    const current = (ownerInput = false) => {
       try {
         return (
           options.isCurrent() === true &&
@@ -2900,7 +2903,7 @@ export class Session extends EventEmitter {
           this._muxSession === record &&
           scope() === snapshot &&
           !this._recoveryUntrackedInput &&
-          !this._recoverySwitchPending &&
+          (!this._recoverySwitchPending || (ownerInput && acknowledged)) &&
           (!profile || this._supervisorManagerProfile === profile)
         );
       } catch {
@@ -2921,6 +2924,7 @@ export class Session extends EventEmitter {
       bridgeCommand: bridge.command,
       bridgeArgs: bridge.args,
       isCurrent: current,
+      ownerInputIsCurrent: () => acknowledged && current(true),
     });
     if (!profile) return false;
     this._supervisorManagerProfile = profile;
@@ -2944,6 +2948,7 @@ export class Session extends EventEmitter {
     } finally {
       if (!ready && this._supervisorManagerProfile === profile) await this.revokeSupervisorManagerLaunch();
     }
+    acknowledged = ready;
     return ready && this.isSupervisorManagerLaunchCurrent();
   }
 

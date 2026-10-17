@@ -117,6 +117,45 @@ describe('owner-global management and cooperative inbox', () => {
       service.configure('alice', { ifMatch: data.revision, managerSessionId: 'other-owner', agents: [] })
     ).rejects.toMatchObject({ code: 'forbidden' });
   });
+  it('requires a saved messaging grant before issuing or rotating inbox credentials', async () => {
+    await expect(service.enroll('alice', 'session-one')).rejects.toMatchObject({ code: 'forbidden' });
+    await enable();
+    const first = await service.enroll('alice', 'session-one');
+    const key = createHash('sha256').update('alice\0session-one').digest('hex');
+    const tokenPath = join(root, 'management-tokens', key.slice(0, 32), 'brain.md');
+    const inboxPath = join(root, 'management-inboxes', key, 'brain.md');
+    const before = await Promise.all([fs.readFile(tokenPath, 'utf8'), fs.readFile(inboxPath, 'utf8')]);
+    const config = await service.read('alice');
+    await service.configure('alice', {
+      ...config,
+      ifMatch: config.revision,
+      agents: [{ ...config.agents[0], allowMessages: false }],
+    });
+    await expect(service.enroll('alice', 'session-one')).rejects.toMatchObject({ code: 'forbidden' });
+    expect(await Promise.all([fs.readFile(tokenPath, 'utf8'), fs.readFile(inboxPath, 'utf8')])).toEqual(before);
+    expect(await service.authenticate(first.token)).toBeUndefined();
+    await enable();
+    const next = await service.enroll('alice', 'session-one');
+    expect(await service.authenticate(first.token)).toBeUndefined();
+    expect(await service.authenticate(next.token)).toBeDefined();
+  });
+  it('rechecks the captured grant after asynchronous configuration loading', async () => {
+    await enable();
+    const capture = service.captureConfiguration.bind(service);
+    vi.spyOn(service, 'captureConfiguration').mockImplementationOnce(async (owner, current) => {
+      const captured = await capture(owner, current);
+      await service.configure(owner, {
+        ifMatch: captured.config.revision,
+        managerSessionId: 'manager-one',
+        agents: [{ sessionId: 'session-one', role: '', notes: '', allowMessages: false }],
+      });
+      return captured;
+    });
+    await expect(service.enroll('alice', 'session-one')).rejects.toMatchObject({ code: 'forbidden' });
+    expect((await service.directory('alice')).agents.find((agent) => agent.sessionId === 'session-one')?.enrolled).toBe(
+      false
+    );
+  });
   it('queues idempotent explicit messages, polls and replies without terminal effects', async () => {
     await enable();
     const enrollment = await service.enroll('alice', 'session-one');
@@ -354,6 +393,19 @@ describe('owner-global management and cooperative inbox', () => {
     registerManagementRoutes(app, { service, globalBrain: { read: async () => ({}), replace: async () => ({}) } });
     const headers = { authorization: `Bearer ${token}` };
     expect((await app.inject({ method: 'GET', url: '/api/management/agent-inbox', headers })).statusCode).toBe(200);
+    for (const authorization of [`bearer ${token}`, `bEaReR    ${token}`, `BEARER\t${token}`]) {
+      expect(
+        (await app.inject({ method: 'GET', url: '/api/management/agent-inbox', headers: { authorization } })).statusCode
+      ).toBe(200);
+      expect((await app.inject({ method: 'GET', url: '/api/management', headers: { authorization } })).statusCode).toBe(
+        403
+      );
+    }
+    for (const authorization of [`Bearer ${token} trailing`, `bearer    ${token.slice(0, -1)}x`])
+      expect(
+        (await app.inject({ method: 'GET', url: '/api/management/agent-inbox', headers: { authorization } })).statusCode
+      ).toBe(401);
+
     expect((await app.inject({ method: 'GET', url: '/api/management', headers })).statusCode).toBe(403);
     expect(
       (await app.inject({ method: 'GET', url: '/api/management/agent-inbox?token=anything', headers })).statusCode

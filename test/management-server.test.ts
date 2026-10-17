@@ -359,3 +359,75 @@ it('imports the selected manager memory and its receipts on the first global con
   ).toBe(noted.markdown);
   for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
 });
+
+it('keeps unselected supervisor MCP memory private and writable without global selection', async () => {
+  const h = await fixture();
+  const legacy = Reflect.get(h.server, 'supervisorBrainStore') as import('../src/supervisor/brain.js').BrainStore;
+  const missing = await legacy.read(MANAGER, () => true);
+  const taught = await legacy.replace(MANAGER, 'Legacy manager context', missing.revision, () => true);
+  vi.spyOn(h.manager, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
+  vi.spyOn(h.server as never, 'getSupervisorController' as never).mockReturnValue({
+    confirmManagerLaunch: async () => true,
+    captureBrainAuthority: async (current: () => boolean) => current,
+  } as never);
+  const credentials = Reflect.get(
+    h.server,
+    'supervisorManagerCredentials'
+  ) as import('../src/supervisor/manager-credentials.js').ManagerCredentialRegistry;
+  const issued = credentials.issue({ sessionId: MANAGER, isCurrent: () => true, canOperate: () => true });
+  const call = async (args: Record<string, unknown>) => {
+    const response = await h.app.inject({
+      method: 'POST',
+      url: '/api/supervisor-mcp',
+      headers: { host: '127.0.0.1', authorization: 'Bearer ' + issued.token },
+      payload: { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'supervisor_brain', arguments: args } },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json().error).toBeUndefined();
+    return JSON.parse(response.json().result.content[0].text);
+  };
+  expect(await call({ mode: 'read' })).toMatchObject({ markdown: taught.markdown });
+  const appended = await call({
+    mode: 'append',
+    requestId: 'legacy-note-one',
+    note: 'Keep the worker context.',
+    ifMatch: taught.revision,
+  });
+  const replaced = await call({
+    mode: 'replace',
+    requestId: 'legacy-replace-one',
+    markdown: 'Owner-compatible legacy context',
+    ifMatch: appended.revision,
+  });
+  expect((await legacy.read(MANAGER, () => true)).revision).toBe(replaced.revision);
+  const global = await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders });
+  expect(global.json().data.managerSessionId).toBeNull();
+  expect(global.json().data.brain.exists).toBe(false);
+  expect((await legacy.read(OTHER, () => true)).exists).toBe(false);
+});
+
+it('invalidates captured supervisor brain writes when the global selection or owner changes', async () => {
+  const h = await fixture();
+  const capture = () =>
+    Reflect.get(h.server, 'captureSupervisorBrain').call(h.server, h.manager, () => true) as Promise<{
+      store: import('../src/supervisor/brain.js').BrainStore;
+      id: string;
+      current: () => boolean;
+    }>;
+  const before = await capture();
+  const empty = await before.store.read(before.id, before.current);
+  const config = (await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders })).json().data;
+  const saved = await h.app.inject({
+    method: 'PUT',
+    url: '/api/management',
+    headers: ownerHeaders,
+    payload: { ifMatch: config.revision, managerSessionId: MANAGER, agents: [] },
+  });
+  expect(saved.statusCode).toBe(200);
+  expect(before.current()).toBe(false);
+  await expect(before.store.replace(before.id, 'Stale write', empty.revision, before.current)).rejects.toThrow();
+  const selected = await capture();
+  expect(selected.id).not.toBe(MANAGER);
+  Object.assign(h.manager, { owner: 'bob' });
+  expect(selected.current()).toBe(false);
+});

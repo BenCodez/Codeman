@@ -110,6 +110,49 @@ describe('private direct GitLab connection', () => {
     expect(cleared.credentialConfigured).toBe(false);
     await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
   });
+  it('never forwards a saved credential to a changed origin without an explicitly supplied new token', async () => {
+    const first = await configure();
+    const changed = await service.configure('alice', {
+      ifMatch: first.revision,
+      url: 'https://other-gitlab.example.invalid',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(changed).toMatchObject({ credentialConfigured: false, allowWrite: false });
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    expect(transport).not.toHaveBeenCalled();
+    const explicit = await service.configure('alice', {
+      ifMatch: changed.revision,
+      url: 'https://other-gitlab.example.invalid/',
+      token: 'new-synthetic-token',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(explicit).toMatchObject({ credentialConfigured: true, allowWrite: true });
+    const same = await service.configure('alice', {
+      ifMatch: explicit.revision,
+      url: 'https://other-gitlab.example.invalid',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(same.credentialConfigured).toBe(true);
+    const blank = await service.configure('alice', {
+      ifMatch: same.revision,
+      url: 'https://third-gitlab.example.invalid',
+      token: '',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(blank).toMatchObject({ credentialConfigured: false, allowWrite: false });
+  });
   it('requires explicit fake transport under VITEST and never falls back to real networking', async () => {
     await configure();
     const isolated = new GitLabService({ root });
@@ -133,6 +176,27 @@ describe('private direct GitLab connection', () => {
       nextPage: 2,
     });
     expect(transport.mock.calls.some(([url]) => url.endsWith('/projects?per_page=50&page=1'))).toBe(true);
+  });
+  it('terminates all-project pagination explicitly at the supported page boundary', async () => {
+    await configure({ projectIds: [], allowAllProjects: true });
+    transport.mockResolvedValueOnce(
+      json([{ id: 7, name: 'Seven', path_with_namespace: 'group/seven', default_branch: 'main' }], 200, {
+        'x-next-page': '101',
+      })
+    );
+    expect(await service.operate('alice', { operation: 'projects', page: 100 })).toMatchObject({
+      projects: [{ id: 7 }],
+      truncated: true,
+      nextPage: null,
+      capacityReached: true,
+    });
+    expect(GitLabOperationSchema.safeParse({ operation: 'projects', page: 101 }).success).toBe(false);
+    transport.mockResolvedValueOnce(json([], 200, { 'x-next-page': '' }));
+    expect(await service.operate('alice', { operation: 'projects', page: 100 })).toMatchObject({
+      truncated: false,
+      nextPage: null,
+      capacityReached: false,
+    });
   });
   it('checks actual selected project access and the all-project endpoint', async () => {
     await configure();
@@ -434,6 +498,81 @@ describe('private direct GitLab connection', () => {
     });
     expect(transport).toHaveBeenCalledTimes(count);
   });
+  it('archives finalized receipts to free capacity while preserving uncertain and archived replay fences', async () => {
+    await configure();
+    await service.operate('alice', branchOperation);
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      init.method === 'POST' ? json({ message: 'not allowed' }, 403) : original(url, init)
+    );
+    const rejected = { ...branchOperation, requestId: 'branch-rejected-request' };
+    await service.operate('alice', rejected);
+    transport.mockImplementation(original);
+    const store = new BrainStore(join(root, 'management-gitlab'));
+    const before = await store.read(digest('alice'), () => true);
+    const saved = JSON.parse(before.markdown);
+    saved.receipts.push(
+      ...Array.from({ length: 126 }, (_, i) => ({
+        requestId: `uncertain-${i}`,
+        hash: digest(`uncertain-${i}`),
+        status: 'uncertain',
+      }))
+    );
+    await store.replace(digest('alice'), JSON.stringify(saved), before.revision, () => true);
+    const full = await service.read('alice');
+    expect(full.writeReceipts).toEqual({ active: 128, capacity: 128, finalized: 2, uncertain: 126 });
+    const calls = transport.mock.calls.length;
+    const archived = await service.archiveFinalized('alice', { ifMatch: full.revision, confirmArchiveFinalized: true });
+    expect(archived).toMatchObject({
+      archived: 2,
+      config: { writeReceipts: { active: 126, finalized: 0, uncertain: 126 } },
+    });
+    expect(transport).toHaveBeenCalledTimes(calls);
+    // Reconstructing the service still finds immutable tombstones; old IDs cannot become fresh writes.
+    const restarted = new GitLabService({ root, transport });
+    expect(await restarted.operate('alice', branchOperation)).toEqual({
+      status: 'succeeded',
+      requestId: branchOperation.requestId,
+      duplicate: true,
+    });
+    expect(await restarted.operate('alice', rejected)).toEqual({
+      status: 'rejected',
+      requestId: rejected.requestId,
+      duplicate: true,
+    });
+    await expect(restarted.operate('alice', { ...branchOperation, branch: 'codeman/changed' })).rejects.toMatchObject({
+      code: 'conflict',
+    });
+    await expect(restarted.operate('alice', { ...branchOperation, requestId: 'uncertain-0' })).rejects.toMatchObject({
+      code: 'conflict',
+    });
+    expect(transport).toHaveBeenCalledTimes(calls);
+    expect(await restarted.operate('alice', { ...branchOperation, requestId: 'fresh-after-archive' })).toMatchObject({
+      status: 'succeeded',
+      duplicate: false,
+    });
+    await expect(
+      restarted.archiveFinalized('alice', { ifMatch: full.revision, confirmArchiveFinalized: true })
+    ).rejects.toMatchObject({ code: 'conflict' });
+  });
+  it('retains active finalized receipts when an archive write is uncertain', async () => {
+    await configure();
+    await service.operate('alice', branchOperation);
+    const current = await service.read('alice');
+    const archives = Reflect.get(service, 'archives') as BrainStore;
+    const archiveWrite = archives.replace.bind(archives);
+    vi.spyOn(archives, 'replace').mockImplementationOnce(async (...args) => {
+      await archiveWrite(...args);
+      throw Error('lost archive ACK after durable write');
+    });
+    await expect(
+      service.archiveFinalized('alice', { ifMatch: current.revision, confirmArchiveFinalized: true })
+    ).rejects.toThrow();
+    expect((await service.read('alice')).writeReceipts).toMatchObject({ active: 1, finalized: 1 });
+    const calls = transport.mock.calls.length;
+    expect(await service.operate('alice', branchOperation)).toMatchObject({ status: 'succeeded', duplicate: true });
+    expect(transport).toHaveBeenCalledTimes(calls);
+  });
   it('exposes redacted owner routes and rejects malformed config without echoing credentials', async () => {
     const app = Fastify();
     app.addHook('onRequest', async (req) => {
@@ -460,11 +599,26 @@ describe('private direct GitLab connection', () => {
     const checked = await app.inject({ method: 'POST', url: '/api/management/gitlab/check', payload: {} });
     expect(checked.statusCode).toBe(200);
     expect(checked.body).not.toContain(secret);
+    const archived = await app.inject({
+      method: 'POST',
+      url: '/api/management/gitlab/receipts/archive',
+      payload: { ifMatch: saved.json().data.revision, confirmArchiveFinalized: true },
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json().data.archived).toBe(0);
+    expect(archived.headers['cache-control']).toBe('no-store');
+    expect(archived.body).not.toContain(secret);
+    const unconfirmed = await app.inject({
+      method: 'POST',
+      url: '/api/management/gitlab/receipts/archive',
+      payload: { ifMatch: archived.json().data.config.revision, confirmArchiveFinalized: false },
+    });
+    expect(unconfirmed.statusCode).toBe(400);
     const invalid = await app.inject({
       method: 'PUT',
       url: '/api/management/gitlab',
       payload: {
-        ifMatch: saved.json().data.revision,
+        ifMatch: archived.json().data.config.revision,
         url: 'http://gitlab.example.invalid',
         token: secret,
         projectIds: [],

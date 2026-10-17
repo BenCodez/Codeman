@@ -37,6 +37,8 @@ describe('Global management controls in Chromium', () => {
         else await route.fulfill({ status: 204, body: '' });
       });
       await page.goto('http://codeman-management.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({ content: "window.__CODEMAN_BASE__ = '/codeman';" });
+      await page.addScriptTag({ content: read('constants.js') });
       await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp = CodemanApp;' });
       await page.addScriptTag({ content: read('supervisor-ui.js') });
       await page.addScriptTag({ content: read('supervisor-automation-ui.js') });
@@ -90,6 +92,7 @@ describe('Global management controls in Chromium', () => {
                 handledRequestBindings: [],
                 history: [],
               };
+            if (url.endsWith('/enroll')) return { instructions: 'Private fixture enrollment capability' };
             if (url.endsWith('/brain'))
               return { markdown: options.body.markdown, revision: 'c'.repeat(64), exists: true, noteCount: 0 };
             if (url.endsWith('/messages'))
@@ -174,6 +177,7 @@ describe('Global management controls in Chromium', () => {
       await memory.fill('The manager maintains a shared agent directory.');
       await page.getByRole('button', { name: 'Save shared brain.md', exact: true }).click();
       expect(await page.locator('#managementBrainStatus').textContent()).toContain('saved');
+      expect(await page.getByRole('button', { name: 'Connect existing agent', exact: true }).isEnabled()).toBe(false);
       await page.getByRole('button', { name: 'Open agent inbox and replies', exact: true }).click();
       expect(await page.locator('#managementMessageThread').textContent()).toContain('remote builds');
       await page.locator('#managementMessageDraft').fill('Please report build usage.');
@@ -183,6 +187,22 @@ describe('Global management controls in Chromium', () => {
       );
       expect(await page.locator('#managementAgentToolsStatus').textContent()).toContain('must check its inbox');
       expect(await page.locator('#managementMessageDraft').inputValue()).toBe('');
+      page.once('dialog', (dialog) => void dialog.accept());
+      await page.getByRole('button', { name: 'Rotate connection instructions', exact: true }).click();
+      await page.waitForFunction(() =>
+        (document.getElementById('managementEnrollmentInstructions') as HTMLTextAreaElement).value.includes(
+          'Private fixture enrollment capability'
+        )
+      );
+      expect(await page.locator('#managementEnrollmentInstructions').inputValue()).toContain(
+        'http://codeman-management.test/codeman/api/management/agent-inbox'
+      );
+      expect(
+        await page.evaluate(
+          () => (window as any).managementCalls.filter((call: any) => call.url.endsWith('/enroll')).length
+        )
+      ).toBe(1);
+
       expect(
         await page.evaluate(() => (window as any).managementCalls.every((call: any) => !call.url.includes('/input')))
       ).toBe(true);

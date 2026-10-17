@@ -100,6 +100,45 @@ describe('Owner-global GitLab connection UI', () => {
     expect(get('managementGitlabToken').value).toBe('');
     expect(get('managementGitlabStatus').textContent).toContain('No repository write');
   });
+  it('trims pasted token edges and rejects internal whitespace before sending settings', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementGitlabToken').value = '  pasted-token  ';
+    await app.saveManagementGitlab();
+    expect(app._apiJson.mock.calls[1][1].body.token).toBe('pasted-token');
+    const count = app._apiJson.mock.calls.length;
+    get('managementGitlabToken').value = 'token with space';
+    await app.saveManagementGitlab();
+    expect(app._apiJson).toHaveBeenCalledTimes(count);
+    expect(app.showToast).toHaveBeenCalledWith(expect.any(String), 'warning');
+  });
+  it('archives only on an explicit owner click with the displayed revision, without discarding drafts', async () => {
+    const { app, get, dom } = harness();
+    app._apiJson.mockResolvedValueOnce({
+      ...config(),
+      writeReceipts: { active: 128, capacity: 128, finalized: 3, uncertain: 125 },
+    });
+    await app.loadManagementSettings();
+    expect(get('managementGitlabArchive').disabled).toBe(false);
+    get('managementGitlabToken').value = 'private-unsaved-draft';
+    app._apiJson.mockResolvedValueOnce({
+      archived: 3,
+      config: {
+        ...config(),
+        revision: 'b'.repeat(64),
+        writeReceipts: { active: 125, capacity: 128, finalized: 0, uncertain: 125 },
+      },
+    });
+    await app.archiveManagementGitlabReceipts();
+    expect(dom.window.confirm).toHaveBeenCalledWith(expect.stringContaining('Archive 3 finished'));
+    expect(app._apiJson.mock.calls.at(-1)).toEqual([
+      '/api/management/gitlab/receipts/archive',
+      { method: 'POST', body: { ifMatch: 'a'.repeat(64), confirmArchiveFinalized: true } },
+    ]);
+    expect(get('managementGitlabToken').value).toBe('private-unsaved-draft');
+    expect(get('managementGitlabArchive').disabled).toBe(true);
+    expect(get('managementGitlabStatus').textContent).toContain('No GitLab request');
+  });
   it('requires explicit HTTP consent and preserves it in saved configuration', async () => {
     const { app, get } = harness();
     await app.loadManagementSettings();

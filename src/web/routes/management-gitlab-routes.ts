@@ -53,6 +53,9 @@ export function registerManagementGitLabRoutes(app: FastifyInstance, context: Ma
   app.put('/api/management/gitlab', async (req, reply) =>
     run(req, reply, (owner, current) => context.service.configure(owner, req.body, current))
   );
+  app.post('/api/management/gitlab/receipts/archive', async (req, reply) =>
+    run(req, reply, (owner, current) => context.service.archiveFinalized(owner, req.body, current))
+  );
   app.post('/api/management/gitlab/check', async (req, reply) =>
     run(req, reply, async (owner, current) => {
       z.object({}).strict().parse(req.body);

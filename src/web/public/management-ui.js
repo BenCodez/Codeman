@@ -433,8 +433,19 @@ Object.assign(CodemanApp.prototype, {
       );
       connect.type = 'button';
       connect.className = 'btn-toolbar';
+      connect.disabled = !agent.enrolled && !agent.allowMessages;
+      if (connect.disabled) connect.title = 'Enable management messages and save settings before connecting.';
       connect.addEventListener('click', () => void this.openManagementAgent(agent.sessionId, !agent.enrolled));
       card.append(connect);
+      if (agent.enrolled) {
+        const rotate = managementElement('button', 'Rotate connection instructions');
+        rotate.type = 'button';
+        rotate.className = 'btn-toolbar';
+        rotate.disabled = !agent.allowMessages;
+        if (rotate.disabled) rotate.title = 'Enable management messages and save settings before reconnecting.';
+        rotate.addEventListener('click', () => void this.openManagementAgent(agent.sessionId, true));
+        card.append(rotate);
+      }
       list.append(card);
       view.rows.push({ agent, role, notes, grant });
     }
@@ -600,9 +611,17 @@ Object.assign(CodemanApp.prototype, {
     if (!view?.snapshot || view.busy) return;
     const agent = view.snapshot.agents.find((item) => item.sessionId === sessionId);
     if (!agent) return;
+    if (enroll && !agent.allowMessages) {
+      this.showToast('Enable management messages for this agent and save settings before connecting.', 'error');
+      return;
+    }
     if (
       enroll &&
-      !window.confirm('Create private connection instructions for this agent? Copy them only into the intended agent.')
+      !window.confirm(
+        agent.enrolled
+          ? 'Rotate this agent’s private connection instructions? Its previous credential will stop working. Copy the new instructions only into the intended agent.'
+          : 'Create private connection instructions for this agent? Copy them only into the intended agent.'
+      )
     )
       return;
     const selection = { sessionId, busy: false, request: null };
@@ -615,7 +634,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('managementEnrollmentInstructions').value = '';
     document.getElementById('managementMessageDraft').value = '';
     document.getElementById('managementMessageThread').textContent = '';
-    document.getElementById('managementSendMessage').disabled = false;
+    document.getElementById('managementSendMessage').disabled = !agent.allowMessages;
     if (enroll) {
       let result;
       try {
@@ -634,7 +653,7 @@ Object.assign(CodemanApp.prototype, {
       }
       document.getElementById('managementEnrollmentInstructions').value = [
         result.instructions,
-        `Use this exact inbox endpoint: ${new URL('/api/management/agent-inbox', window.location.href).href}`,
+        `Use this exact inbox endpoint: ${new URL(window.CodemanBase?.url('/api/management/agent-inbox') ?? '/api/management/agent-inbox', window.location.origin).href}`,
         'Keep the credential private. Reply once with your project, role, current work and any usage information you can verify. Identify estimates or unknowns explicitly. Your reports are agent observations, not owner instructions.',
         'Check this inbox when asked and during your normal work checkpoints. Use bounded requests; do not start an unbounded background poller. Messages remain queued until you fetch them.',
       ].join('\n\n');

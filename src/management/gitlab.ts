@@ -153,6 +153,12 @@ const publicConfig = (value: Config, revision: string) => ({
   allowWrite: value.allowWrite,
   writeBranchPrefix: value.writeBranchPrefix,
   credentialConfigured: !!value.token,
+  writeReceipts: {
+    active: value.receipts.length,
+    capacity: 128,
+    finalized: value.receipts.filter((receipt) => receipt.status !== 'uncertain').length,
+    uncertain: value.receipts.filter((receipt) => receipt.status === 'uncertain').length,
+  },
 });
 export interface GitLabOptions {
   root?: string;
@@ -169,9 +175,11 @@ function authorize(current: () => boolean): void {
 }
 export class GitLabService {
   private readonly store: BrainStore;
+  private readonly archives: BrainStore;
   private readonly epochs = new Map<string, number>();
   constructor(private readonly options: GitLabOptions = {}) {
     this.store = new BrainStore(join(options.root ?? dataPath(), 'management-gitlab'));
+    this.archives = new BrainStore(join(options.root ?? dataPath(), 'management-gitlab-receipt-archive'));
   }
   private async load(owner: string, current: () => boolean) {
     if (!owner || owner.length > 200) throw new GitLabError('forbidden');
@@ -196,10 +204,13 @@ export class GitLabService {
     const parsed = GitLabConnectionSchema.parse(input);
     if (parsed.url.startsWith('http:') && !parsed.allowInsecureHttp) throw new GitLabError('forbidden');
     const before = await this.load(owner, current);
-    const token = parsed.token ?? before.value.token;
+    const url = parsed.url ? new URL(parsed.url).origin : '';
+    const previousOrigin = before.value.url ? new URL(before.value.url).origin : '';
+    // A credential belongs to its exact normalized origin. A URL edit never forwards it elsewhere.
+    const token = parsed.token ?? (url === previousOrigin ? before.value.token : '');
     const value: Config = {
       ...parsed,
-      url: parsed.url ? new URL(parsed.url).origin : '',
+      url,
       token,
       allowWrite: parsed.allowWrite && !!token && !!parsed.url,
       receipts: before.value.receipts,
@@ -212,6 +223,61 @@ export class GitLabService {
       this.epochs.set(owner, (this.epochs.get(owner) ?? 0) + 1);
     }
     return this.read(owner, current);
+  }
+  private archiveKey(owner: string, requestId: string) {
+    return digest(JSON.stringify([owner, requestId]));
+  }
+  private async archivedReceipt(owner: string, requestId: string, current: () => boolean) {
+    const snapshot = await this.archives.read(this.archiveKey(owner, requestId), current);
+    if (!snapshot.exists) return undefined;
+    try {
+      const receipt = Receipt.parse(JSON.parse(snapshot.markdown));
+      if (receipt.requestId !== requestId || receipt.status === 'uncertain') throw new Error('archive mismatch');
+      return receipt;
+    } catch {
+      throw new GitLabError('unavailable');
+    }
+  }
+  /** Owner-only archival frees active slots while retaining immutable per-request replay fences. */
+  async archiveFinalized(owner: string, input: unknown, current = () => true) {
+    const parsed = z
+      .object({ ifMatch: z.string().regex(HASH), confirmArchiveFinalized: z.literal(true) })
+      .strict()
+      .parse(input);
+    const before = await this.load(owner, current);
+    if (before.revision !== parsed.ifMatch) throw new GitLabError('conflict');
+    const epoch = (this.epochs.get(owner) ?? 0) + 1;
+    this.epochs.set(owner, epoch);
+    const authority = () => current() === true && this.epochs.get(owner) === epoch;
+    try {
+      const finalized = before.value.receipts.filter((receipt) => receipt.status !== 'uncertain');
+      for (const receipt of finalized) {
+        authorize(authority);
+        const key = this.archiveKey(owner, receipt.requestId);
+        const existing = await this.archives.read(key, authority);
+        if (existing.exists) {
+          const archived = await this.archivedReceipt(owner, receipt.requestId, authority);
+          if (!archived || archived.hash !== receipt.hash || archived.status !== receipt.status)
+            throw new GitLabError('conflict');
+        } else {
+          await this.archives.replace(key, JSON.stringify(receipt), existing.revision, authority);
+        }
+      }
+      // Every finalized receipt was durably copied before any active slot can disappear.
+      // Lost ACKs retain active receipts; partially copied archives are harmless duplicates.
+      await this.store.replace(
+        digest(owner),
+        JSON.stringify({
+          ...before.value,
+          receipts: before.value.receipts.filter((receipt) => receipt.status === 'uncertain'),
+        }),
+        before.revision,
+        authority
+      );
+      return { archived: finalized.length, config: await this.read(owner, authority) };
+    } finally {
+      this.epochs.set(owner, (this.epochs.get(owner) ?? 0) + 1);
+    }
   }
   private async capture(owner: string, current: () => boolean): Promise<Connection> {
     const epoch = this.epochs.get(owner) ?? 0;
@@ -328,7 +394,13 @@ export class GitLabService {
         (!Number.isSafeInteger(nextPage) || nextPage !== page + 1 || String(nextPage) !== result.nextPage)
       )
         throw new GitLabError('unavailable');
-      return { projects: z.array(ProjectInfo).max(50).parse(result.json), truncated: nextPage !== null, nextPage };
+      const capacityReached = nextPage !== null && page >= 100;
+      return {
+        projects: z.array(ProjectInfo).max(50).parse(result.json),
+        truncated: nextPage !== null,
+        nextPage: capacityReached ? null : nextPage,
+        capacityReached,
+      };
     }
     const ids = connection.value.projectIds;
     const projects: z.infer<typeof ProjectInfo>[] = new Array(ids.length);
@@ -478,7 +550,9 @@ export class GitLabService {
     )
       throw new GitLabError('forbidden');
     const hash = digest(JSON.stringify({ connection: connection.connectionHash, operation }));
-    const prior = connection.value.receipts.find((receipt) => receipt.requestId === operation.requestId);
+    const prior =
+      connection.value.receipts.find((receipt) => receipt.requestId === operation.requestId) ??
+      (await this.archivedReceipt(owner, operation.requestId, connection.current));
     if (prior) {
       if (prior.hash !== hash) throw new GitLabError('conflict');
       return { status: prior.status, requestId: operation.requestId, duplicate: true };

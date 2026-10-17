@@ -44,11 +44,16 @@ function snapshot() {
     ],
   };
 }
-function harness() {
-  const dom = new JSDOM(read('index.html'), { runScripts: 'outside-only', url: 'http://localhost/' });
+function harness(base = '') {
+  const dom = new JSDOM(read('index.html'), {
+    runScripts: 'outside-only',
+    url: `http://localhost${base}/?owner=view#management`,
+  });
   doms.push(dom);
   const ctx = dom.getInternalVMContext();
   (ctx as any).TextEncoder = TextEncoder;
+  (dom.window as any).__CODEMAN_BASE__ = base;
+  vm.runInContext(read('constants.js'), ctx);
   vm.runInContext('class CodemanApp {}', ctx);
   vm.runInContext(read('supervisor-brain-ui.js'), ctx);
   vm.runInContext(read('management-ui.js'), ctx);
@@ -134,6 +139,52 @@ describe('Global management settings', () => {
     expect(get('managementBrainMarkdown').value).toBe('Manager can update shared memory');
     expect(get('managementBrainSettings').disabled).toBe(true);
   });
+  it('requires a saved grant even if its checkbox has unsaved changes', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    const connect = [...get('managementAgents').querySelectorAll('button')].find(
+      (button: any) => button.textContent === 'Connect existing agent'
+    ) as any;
+    expect(connect.disabled).toBe(true);
+    app._managementView.rows[0].grant.checked = true;
+    await app.openManagementAgent(manager, true);
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    expect(get('managementEnrollmentInstructions').value).toBe('');
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('save settings'), 'error');
+  });
+  it.each(['', '/codeman'])(
+    'offers explicit credential rotation and copies the mounted inbox endpoint at %s',
+    async (base) => {
+      const { app, get, dom } = harness(base);
+      await app.loadManagementSettings();
+      app._apiJson
+        .mockResolvedValueOnce({ instructions: 'Private fixture instructions' })
+        .mockResolvedValueOnce({ messages: [] });
+      const rotate = [...get('managementAgents').querySelectorAll('button')].find(
+        (button: any) => button.textContent === 'Rotate connection instructions'
+      ) as any;
+      expect(rotate.disabled).toBe(false);
+      rotate.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(dom.window.confirm).toHaveBeenCalledWith(expect.stringContaining('previous credential will stop working'));
+      expect(app._apiJson.mock.calls[1]).toEqual([
+        `/api/management/agents/${worker}/enroll`,
+        { method: 'POST', body: {} },
+      ]);
+      expect(get('managementEnrollmentInstructions').value).toContain(
+        `http://localhost${base}/api/management/agent-inbox`
+      );
+      expect(get('managementEnrollmentInstructions').value).not.toContain('owner=view');
+      expect(get('managementEnrollmentInstructions').value).not.toContain('#management');
+    }
+  );
+  it('does not rotate an existing credential if the owner dismisses confirmation', async () => {
+    const { app, dom } = harness();
+    await app.loadManagementSettings();
+    dom.window.confirm = vi.fn(() => false);
+    await app.openManagementAgent(worker, true);
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+  });
   it('clears private enrollment capabilities on close and fences a late enrollment response', async () => {
     const { app, get } = harness();
     await app.loadManagementSettings();
@@ -144,7 +195,7 @@ describe('Global management settings', () => {
           finish = resolve;
         })
     );
-    const pending = app.openManagementAgent(manager, true);
+    const pending = app.openManagementAgent(worker, true);
     app.closeManagementSettings();
     finish({ instructions: 'private fixture capability' });
     await pending;
@@ -177,7 +228,7 @@ describe('Global management settings', () => {
     await app.loadManagementSettings();
     app._apiJson.mockResolvedValueOnce({ instructions: 'Use fixture-private-token only in Authorization.' });
     app._apiJson.mockResolvedValueOnce({ messages: [] });
-    await app.openManagementAgent(manager, true);
+    await app.openManagementAgent(worker, true);
     expect(get('managementEnrollmentInstructions').value).toContain('http://localhost/api/management/agent-inbox');
     expect(get('managementEnrollmentInstructions').value).toContain('fixture-private-token');
     expect(get('managementEnrollmentInstructions').value).toContain('do not start an unbounded background poller');

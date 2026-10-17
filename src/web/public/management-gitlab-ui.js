@@ -101,7 +101,7 @@ Object.assign(CodemanApp.prototype, {
     );
     const token = input(
       'managementGitlabToken',
-      'Private GitLab access token (leave blank to keep the saved credential)',
+      'Private GitLab access token (blank keeps it only for the same origin)',
       'password',
       4096
     );
@@ -131,6 +131,12 @@ Object.assign(CodemanApp.prototype, {
       'managementGitlabCheck'
     );
     button('Refresh GitLab connection', () => this.loadManagementGitlab(true), actions);
+    button(
+      'Archive finished write receipts',
+      () => this.archiveManagementGitlabReceipts(),
+      actions,
+      'managementGitlabArchive'
+    );
     panel.append(actions);
     document.getElementById('settings-management').append(panel);
   },
@@ -144,8 +150,12 @@ Object.assign(CodemanApp.prototype, {
     if (fields) fields.disabled = true;
     const check = document.getElementById('managementGitlabCheck');
     if (check) check.disabled = true;
+    const archive = document.getElementById('managementGitlabArchive');
+    if (archive) archive.disabled = true;
   },
   _renderManagementGitlabBusy(view) {
+    const archive = document.getElementById('managementGitlabArchive');
+    if (archive) archive.disabled = !view?.config || !!view.busy || !(view.config.writeReceipts?.finalized > 0);
     document.getElementById('managementGitlabSettings').disabled = !view?.config || !!view.busy;
     document.getElementById('managementGitlabCheck').disabled = !view?.config?.credentialConfigured || !!view.busy;
   },
@@ -205,8 +215,8 @@ Object.assign(CodemanApp.prototype, {
     const projectIds = managementGitlabProjectIds(document.getElementById('managementGitlabProjects').value);
     const allowAllProjects = document.getElementById('managementGitlabAllProjects').checked;
     const allowWrite = document.getElementById('managementGitlabAllowWrite').checked;
-    const token = document.getElementById('managementGitlabToken').value;
-    if (token.length > 4096 || /[^\x20-\x7e]/.test(token)) throw new Error('invalid-token');
+    const token = document.getElementById('managementGitlabToken').value.trim();
+    if (token.length > 4096 || /[^\x21-\x7e]/.test(token)) throw new Error('invalid-token');
     const clear = document.getElementById('managementGitlabClearToken').checked;
     return {
       url,
@@ -217,6 +227,41 @@ Object.assign(CodemanApp.prototype, {
       writeBranchPrefix: 'codeman/',
       ...(clear ? { token: '' } : token ? { token } : {}),
     };
+  },
+  async archiveManagementGitlabReceipts() {
+    const view = this._managementGitlabView;
+    if (!view?.config || view.busy || this._managementView !== view.ownerView) return;
+    const count = view.config.writeReceipts?.finalized;
+    if (!Number.isSafeInteger(count) || count <= 0) return;
+    if (
+      !window.confirm(
+        `Archive ${count} finished GitLab write receipts to free active slots? Uncertain receipts stay active. Archived request IDs remain sealed against replay. No GitLab request will be sent.`
+      )
+    )
+      return;
+    view.busy = true;
+    this._renderManagementGitlabBusy(view);
+    let result;
+    try {
+      result = await this._apiJson('/api/management/gitlab/receipts/archive', {
+        method: 'POST',
+        body: { ifMatch: view.config.revision, confirmArchiveFinalized: true },
+      });
+    } catch {
+      result = null;
+    }
+    if (this._managementGitlabView !== view || this._managementView !== view.ownerView) return;
+    view.busy = false;
+    if (!managementGitlabSnapshot(result?.config)) {
+      view.config = null;
+      document.getElementById('managementGitlabStatus').textContent =
+        'Archive was not confirmed. Refresh and reconcile before trying again; replay fences were retained.';
+    } else {
+      view.config = result.config;
+      document.getElementById('managementGitlabStatus').textContent =
+        `Archived ${result.archived} finished receipts. Uncertain operations and archived request IDs remain sealed. No GitLab request was sent.`;
+    }
+    this._renderManagementGitlabBusy(view);
   },
   async saveManagementGitlab() {
     const view = this._managementGitlabView;

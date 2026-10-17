@@ -655,7 +655,13 @@ describe('manager authority at the real server boundary', () => {
       observation = { ...observation, activity: 'paused', reason: 'approval-required', processReady: true };
       vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
       vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
-      const profile = { isCurrent: () => true, confirm: async () => true, revoke: vi.fn(async () => {}) };
+      const profile = {
+        isCurrent: () => true,
+        isOwnerInputCurrent: () => true,
+        confirmOwnerInput: async () => true,
+        confirm: async () => true,
+        revoke: vi.fn(async () => {}),
+      };
       Reflect.set(managerSession, '_supervisorManagerProfile', profile);
       const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
       Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', () => true);

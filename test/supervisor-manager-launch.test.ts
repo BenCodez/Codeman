@@ -1025,3 +1025,60 @@ it('allows new manager rollout bytes at runtime while retaining static restricti
   expect(await prepared!.confirm(true)).toBe(false);
   await prepared!.revoke();
 });
+
+it('keeps automatic launch authority fenced while real-profile owner setup writes publish their durable fence', async () => {
+  const f = await fixture();
+  expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+  const profile = Reflect.get(f.session, '_supervisorManagerProfile') as SupervisorManagerLaunch;
+  const ownerFrame = f.session.captureSupervisorManagerOwnerInputAuthority()!;
+  expect(ownerFrame()).toBe(true);
+  const previousPty = f.session.ptyProcess;
+  const write = vi.fn(() => {
+    expect(profile.isCurrent()).toBe(false);
+    expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
+    expect(ownerFrame()).toBe(true);
+  });
+  Reflect.set(f.session, 'ptyProcess', { write });
+  const clientId = 'real-manager-setup-owner';
+  try {
+    expect(f.session.shouldApplyInput(clientId, 1)).toBe(true);
+    expect(
+      await f.session.writeAsync('Reply READY only.', {
+        fromUser: true,
+        inputSeq: { clientId, seq: 1 },
+        isCurrent: ownerFrame,
+      })
+    ).toBe(true);
+    expect(f.session.getRecoveryContext().switchPending).toBe(true);
+    expect(profile.isCurrent()).toBe(false);
+    expect(await ownerFrame.confirm()).toBe(true);
+    expect(f.session.shouldApplyInput(clientId, 2)).toBe(true);
+    expect(
+      await f.session.writeAsync('\r', { fromUser: true, inputSeq: { clientId, seq: 2 }, isCurrent: ownerFrame })
+    ).toBe(true);
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(f.session.getRecoveryContext().switchPending).toBe(false);
+    expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(true);
+  } finally {
+    Reflect.set(f.session, 'ptyProcess', previousPty);
+  }
+});
+
+it.each(['untracked', 'home', 'replacement'] as const)(
+  'owner setup continuity cannot cross %s changes in a real prepared profile',
+  async (kind) => {
+    const f = await fixture();
+    expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+    const original = Reflect.get(f.session, '_supervisorManagerProfile');
+    const ownerFrame = f.session.captureSupervisorManagerOwnerInputAuthority()!;
+    expect(ownerFrame()).toBe(true);
+    Reflect.set(f.session, '_recoverySwitchPending', true);
+    if (kind === 'untracked') Reflect.set(f.session, '_recoveryUntrackedInput', true);
+    if (kind === 'home') Reflect.set(f.session, '_envOverrides', { CODEX_HOME: f.home + '-other' });
+    if (kind === 'replacement') Reflect.set(f.session, '_supervisorManagerProfile', Object.create(original));
+    expect(ownerFrame()).toBe(false);
+    expect(await ownerFrame.confirm()).toBe(false);
+    expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
+    Reflect.set(f.session, '_supervisorManagerProfile', original);
+  }
+);

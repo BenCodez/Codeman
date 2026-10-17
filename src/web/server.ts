@@ -390,6 +390,19 @@ export class WebServer extends EventEmitter {
   private managementBrainId(owner: string): string {
     return 'management-owner-' + createHash('sha256').update(owner).digest('hex');
   }
+  /** Global selection shares one brain; other supervisors retain their own memory. */
+  private async captureSupervisorBrain(session: Session, current: () => boolean) {
+    const owner = session.owner ?? 'admin';
+    const captured = await this.managementService.captureConfiguration(owner, current);
+    const authority = () =>
+      captured.current() && this.sessions.get(session.id) === session && (session.owner ?? 'admin') === owner;
+    if (!authority()) throw Error('Supervisor memory owner changed');
+    if (captured.config.managerSessionId === session.id) {
+      await this.readManagementBrain(owner, authority, session);
+      return { store: this.managementBrainStore, id: this.managementBrainId(owner), current: authority };
+    }
+    return { store: this.supervisorBrainStore, id: session.id, current: authority };
+  }
   /** Only an owner-selected (or explicitly requested legacy) manager may seed shared memory. */
   private async readManagementBrain(owner: string, current: () => boolean, requested?: Session) {
     const captured = await this.managementService.captureConfiguration(owner, current);
@@ -888,16 +901,13 @@ export class WebServer extends EventEmitter {
       setupAndStartSupervisorManager: this.setupAndStartSupervisorManager.bind(this),
       getSupervisorAutomation: this.getSupervisorAutomation.bind(this),
       supervisorBrain: {
-        read: (session: Session, current: () => boolean) =>
-          this.readManagementBrain(session.owner ?? 'admin', current, session),
+        read: async (session: Session, current: () => boolean) => {
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.read(brain.id, brain.current);
+        },
         replace: async (session: Session, markdown: string, ifMatch: string, current: () => boolean) => {
-          await this.readManagementBrain(session.owner ?? 'admin', current, session);
-          return this.managementBrainStore.replace(
-            this.managementBrainId(session.owner ?? 'admin'),
-            markdown,
-            ifMatch,
-            current
-          );
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.replace(brain.id, markdown, ifMatch, brain.current);
         },
       },
       // EventPort
@@ -1391,42 +1401,25 @@ export class WebServer extends EventEmitter {
       },
       brain: {
         read: async (scope, current) => {
-          const authority = await this.managementService.captureManager(
-            scope.owner ?? 'admin',
-            scope.sessionId,
-            current
-          );
-          return this.readManagementBrain(scope.owner ?? 'admin', authority, this.sessions.get(scope.sessionId));
+          const session = this.sessions.get(scope.sessionId);
+          if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
+            throw Error('Supervisor memory owner changed');
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.read(brain.id, brain.current);
         },
         append: async (scope, requestId, note, ifMatch, current) => {
-          const authority = await this.managementService.captureManager(
-            scope.owner ?? 'admin',
-            scope.sessionId,
-            current
-          );
-          await this.readManagementBrain(scope.owner ?? 'admin', authority, this.sessions.get(scope.sessionId));
-          return this.managementBrainStore.append(
-            this.managementBrainId(scope.owner ?? 'admin'),
-            requestId,
-            note,
-            ifMatch,
-            authority
-          );
+          const session = this.sessions.get(scope.sessionId);
+          if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
+            throw Error('Supervisor memory owner changed');
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.append(brain.id, requestId, note, ifMatch, brain.current);
         },
         replace: async (scope, requestId, markdown, ifMatch, current) => {
-          const authority = await this.managementService.captureManager(
-            scope.owner ?? 'admin',
-            scope.sessionId,
-            current
-          );
-          await this.readManagementBrain(scope.owner ?? 'admin', authority, this.sessions.get(scope.sessionId));
-          return this.managementBrainStore.replaceManaged(
-            this.managementBrainId(scope.owner ?? 'admin'),
-            requestId,
-            markdown,
-            ifMatch,
-            authority
-          );
+          const session = this.sessions.get(scope.sessionId);
+          if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
+            throw Error('Supervisor memory owner changed');
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.replaceManaged(brain.id, requestId, markdown, ifMatch, brain.current);
         },
       },
     });
