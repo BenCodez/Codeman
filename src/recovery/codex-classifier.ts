@@ -931,6 +931,22 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
             latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
           } else if (
             item.server === 'codeman_supervisor' &&
+            item.tool === 'supervisor_gitlab' &&
+            ['projects', 'tree', 'file', 'merge_requests', 'merge_request'].includes(
+              String(object(item.arguments)?.operation)
+            ) &&
+            Object.keys(object(item.arguments)!).every((key) =>
+              ['operation', 'projectId', 'branch', 'path', 'state', 'page', 'iid'].includes(key)
+            ) &&
+            error.message ===
+              'tool call error: tool call failed for `codeman_supervisor/supervisor_gitlab`\n\nCaused by:\n    Mcp error: -32000: Supervisor operation refused or acceptance is uncertain; inspect status and retain the same requestId'
+          ) {
+            // These exact legacy bridge requests only read GitLab. Retain the
+            // failure as an owner-intent fence; no automatic retry or write is authorized.
+            update('paused', 'approval-required');
+            latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else if (
+            item.server === 'codeman_supervisor' &&
             item.tool === 'supervisor_brain' &&
             object(item.arguments)?.mode === 'read' &&
             Object.keys(object(item.arguments)!).length === 1 &&

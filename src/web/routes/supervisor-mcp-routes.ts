@@ -1,10 +1,15 @@
 /** Scoped manager tools; authenticated launch scope supplies the manager identity. */
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { GitLabOperationSchema } from '../../management/gitlab.js';
+import { GitLabError, GitLabOperationSchema } from '../../management/gitlab.js';
 import { BrainSyncPublishSchema } from '../../management/brain-gitlab-sync.js';
 import { PromptTextSchema } from '../../supervision/schema.js';
-import { isValidBrainNote, MAX_BRAIN_NOTE_CHARACTERS, MAX_BRAIN_BYTES } from '../../supervisor/brain.js';
+import {
+  BrainStoreError,
+  isValidBrainNote,
+  MAX_BRAIN_NOTE_CHARACTERS,
+  MAX_BRAIN_BYTES,
+} from '../../supervisor/brain.js';
 import type { SupervisorController } from '../../supervisor/controller.js';
 import { ManagerCredentialRegistry, type SupervisorManagerScope } from '../../supervisor/manager-credentials.js';
 import { getSupervisorManagerScope, SUPERVISOR_MCP_PATH } from '../middleware/supervisor-manager-auth.js';
@@ -453,7 +458,24 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
         const selected = GitLabOperationSchema.parse(args.data);
         const authority = await controller.captureBrainAuthority?.(current);
         if (!authority || !authority()) return fail(id, -32001, 'Current prepared manager authority is required');
-        result = await ctx.gitlab.operate(scope, selected, () => current() && authority());
+        const readOnly = ['projects', 'tree', 'file', 'merge_requests', 'merge_request'].includes(selected.operation);
+        try {
+          result = await ctx.gitlab.operate(scope, selected, () => current() && authority());
+        } catch (error) {
+          if (!current()) return reply.code(401).send({ success: false, error: 'Manager credential was revoked' });
+          if (!authority()) return fail(id, -32001, 'Current prepared manager authority is required');
+          if (
+            !readOnly ||
+            !(error instanceof GitLabError || error instanceof BrainStoreError) ||
+            !['unavailable', 'invalid', 'conflict', 'capacity'].includes(error.code)
+          )
+            throw error;
+          // A refused read has no worker effect and supplies no usable repository
+          // evidence. Keep the tool session available without retrying the read.
+          result = { available: false, readOnly: true, authority: 'none', reason: 'gitlab-read-unavailable' };
+        }
+        if (!current()) return reply.code(401).send({ success: false, error: 'Manager credential was revoked' });
+        if (!authority()) return fail(id, -32001, 'Current prepared manager authority is required');
       } else if (call.data.name === 'supervisor_agents') {
         if (!ctx.management) return fail(id, -32001, 'Global management is unavailable');
         result = await ctx.management.directory(scope, current);

@@ -1206,3 +1206,77 @@ it('classifies complete history beyond2MiB without losing malformed, truncated o
     safeToAct: false,
   });
 });
+
+it('requires later owner intent for legacy failed GitLab reads while preserving write and auth vetoes', () => {
+  const message =
+    'tool call error: tool call failed for `codeman_supervisor/supervisor_gitlab`\n\nCaused by:\n    Mcp error: -32000: Supervisor operation refused or acceptance is uncertain; inspect status and retain the same requestId';
+  const call = (arguments_: Payload, patch: Payload = {}): Payload => ({
+    type: 'item_completed',
+    thread_id: THREAD,
+    turn_id: TURN,
+    started_at_ms: NOW - 9000,
+    completed_at_ms: NOW - 8000,
+    item: {
+      type: 'McpToolCall',
+      id: 'failed-gitlab-read',
+      server: 'codeman_supervisor',
+      tool: 'supervisor_gitlab',
+      arguments: arguments_,
+      status: 'failed',
+      error: { message },
+      duration: { secs: 0, nanos: 0 },
+      ...patch,
+    },
+  });
+  const later = [
+    { type: 'user_message', message: 'Owner asks to continue reading other permitted project context.' },
+    start('owner-turn'),
+    complete(undefined, 'owner-turn'),
+  ];
+  for (const operation of ['projects', 'tree', 'file', 'merge_requests', 'merge_request']) {
+    const read = call({ operation, projectId: 42, branch: 'main', path: 'README.md', iid: 1 });
+    expect(classifyCodexTail(tail(start(), read, complete()), context())).toMatchObject({
+      activity: 'paused',
+      safeToAct: false,
+    });
+    expect(classifyCodexTail(tail(start(), read, complete(), ...later), context()).activity).toBe('completed');
+    expect(
+      classifyCodexTail(tail(start(), read, complete(), ...later), context({ tailTruncated: true })).safeToAct
+    ).toBe(false);
+  }
+  for (const blocked of [
+    call({ operation: 'update_file', requestId: 'uncertain-write' }),
+    call({ operation: 'create_file' }),
+    call({ operation: 'create_branch' }),
+    call({ operation: 'file', requestId: 'unexpected-key' }),
+    call({ action: 'file' }),
+    call({ operation: 'file' }, { server: 'other_server' }),
+    call({ operation: 'file' }, { error: { message: message + '\nAuthentication required' } }),
+  ])
+    expect(classifyCodexTail(tail(start(), blocked, complete(), ...later), context()).activity).not.toBe('completed');
+  for (const codex_error_info of ['Unauthorized', 'UsageLimitExceeded'])
+    expect(
+      classifyCodexTail(
+        tail(
+          start(),
+          { type: 'error', message: 'Existing native veto', codex_error_info },
+          call({ operation: 'projects' }),
+          complete(),
+          ...later
+        ),
+        context()
+      )
+    ).toMatchObject({ activity: 'blocked', safeToAct: false });
+  expect(
+    classifyCodexTail(
+      tail(
+        start(),
+        { type: 'collab_agent_spawn_end', new_thread_id: AGENT, status: 'running' },
+        call({ operation: 'projects' }),
+        complete(),
+        ...later
+      ),
+      context()
+    )
+  ).toMatchObject({ activity: 'watching', safeToAct: false });
+});

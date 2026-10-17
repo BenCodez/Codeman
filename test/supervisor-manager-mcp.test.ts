@@ -6,6 +6,11 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { ManagerCredentialRegistry } from '../src/supervisor/manager-credentials.js';
 import { registerAuthMiddleware, registerHostGuard } from '../src/web/middleware/auth.js';
 import { registerSupervisorMcpRoutes } from '../src/web/routes/supervisor-mcp-routes.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { GitLabService, GitLabError } from '../src/management/gitlab.js';
+import { BrainStoreError } from '../src/supervisor/brain.js';
 import { createDeferred } from './mocks/index.js';
 import { findUser } from '../src/user-store.js';
 
@@ -920,4 +925,122 @@ it('does not expose owner-only GitLab brain configuration or import through mana
       -32602
     );
   expect(f.brain.sync).not.toHaveBeenCalled();
+});
+
+it.each([
+  { operation: 'projects' },
+  { operation: 'tree', projectId: 1, branch: 'main' },
+  { operation: 'file', projectId: 1, branch: 'main', path: 'README.md' },
+  { operation: 'merge_requests', projectId: 1 },
+  { operation: 'merge_request', projectId: 1, iid: 1 },
+])('reports refused GitLab read $operation without poisoning later tools or replaying', async (args) => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  f.gitlab.operate.mockRejectedValueOnce(new GitLabError('unavailable'));
+  const response = (await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: args })).json();
+  expect(response.error).toBeUndefined();
+  expect(JSON.parse(response.result.content[0].text)).toEqual({
+    available: false,
+    readOnly: true,
+    authority: 'none',
+    reason: 'gitlab-read-unavailable',
+  });
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  expect((await f.rpc('tools/call', { name: 'supervisor_status', arguments: {} })).json().error).toBeUndefined();
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } })).json().error
+  ).toBeUndefined();
+  expect(f.gitlab.operate).toHaveBeenCalledTimes(2);
+});
+it('keeps writes, permission loss, uncertainty and unknown GitLab errors strict', async () => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  const call = (args: unknown) => f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: args });
+  const write = {
+    operation: 'create_branch',
+    projectId: 1,
+    branch: 'codeman/fix',
+    startCommit: 'a'.repeat(40),
+    requestId: 'safe-request',
+  };
+  for (const error of [new GitLabError('unavailable'), new BrainStoreError('uncertain')]) {
+    f.gitlab.operate.mockRejectedValueOnce(error);
+    expect((await call(write)).json().error.code).toBe(-32000);
+  }
+  for (const error of [
+    new GitLabError('forbidden'),
+    new BrainStoreError('uncertain'),
+    new Error('private malformed error'),
+  ]) {
+    f.gitlab.operate.mockRejectedValueOnce(error);
+    const response = (await call({ operation: 'projects' })).json();
+    expect(response.error.code).toBe(-32000);
+    expect(JSON.stringify(response)).not.toContain('private malformed');
+  }
+  f.gitlab.operate.mockRejectedValueOnce(new BrainStoreError('unavailable'));
+  expect((await call({ operation: 'projects' })).json().error).toBeUndefined();
+});
+it('does not soften GitLab read refusals after caller or captured prepared authority is revoked', async () => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(() => false);
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } })).json().error.code
+  ).toBe(-32001);
+  f.gitlab.operate.mockImplementationOnce(async () => {
+    f.revoke();
+    throw new GitLabError('unavailable');
+  });
+  const response = await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } });
+  expect(response.statusCode).toBe(401);
+  expect(response.json().result).toBeUndefined();
+});
+
+it('turns an actual GitLab MR HTTP 403 into unavailable read context while later scoped tools remain usable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gitlab-mcp-read-'));
+  try {
+    const transport = vi.fn(
+      async () => new Response(JSON.stringify({ message: 'synthetic private denial' }), { status: 403 })
+    );
+    const service = new GitLabService({ root, transport });
+    const config = await service.read('fixture-owner');
+    await service.configure('fixture-owner', {
+      ifMatch: config.revision,
+      url: 'https://gitlab.example.invalid',
+      token: 'synthetic-token',
+      projectIds: [1],
+      allowWrite: false,
+    });
+    const f = await fixture('owner-password', false, false, true, false, true);
+    f.gitlab.operate.mockImplementation(
+      async (_scope, args, current) => service.operate('fixture-owner', args, current) as never
+    );
+    const response = (
+      await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'merge_requests', projectId: 1 } })
+    ).json();
+    expect(response.error).toBeUndefined();
+    expect(JSON.parse(response.result.content[0].text)).toMatchObject({
+      available: false,
+      readOnly: true,
+      authority: 'none',
+    });
+    expect(JSON.stringify(response)).not.toContain('synthetic private denial');
+    expect(transport).toHaveBeenCalledOnce();
+    expect((await f.rpc('tools/call', { name: 'supervisor_workers', arguments: {} })).json().error).toBeUndefined();
+    expect(transport).toHaveBeenCalledOnce();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+it.each([true, false])('retains a prepared authority veto revoked during a GitLab read (throws=%s)', async (throws) => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  let live = true;
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(() => live);
+  f.gitlab.operate.mockImplementationOnce(async () => {
+    live = false;
+    if (throws) throw new GitLabError('unavailable');
+    return { projects: [] };
+  });
+  const response = (
+    await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } })
+  ).json();
+  expect(response.error.code).toBe(-32001);
+  expect(response.result).toBeUndefined();
 });
