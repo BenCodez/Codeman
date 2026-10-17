@@ -199,6 +199,24 @@ fs.readSync=function(fd,...args){const result=originalRead.call(fs,fd,...args);i
     }
   );
 
+  it.each([
+    ['/usr/bin/python3\0/usr/local/libexec/codex-usage-api.py\0', false],
+    ['/usr/bin/node\0/usr/local/libexec/codex-usage-api.js\0', false],
+    ['/usr/bin/codex\0app-server\0', true],
+    ['/opt/codex-vp-control\0resume\0', true],
+    ['/usr/bin/node\0/opt/codex/bin/codex.js\0', true],
+    ['/usr/bin/nodejs\0/opt/codex/bin/codex.mjs\0', true],
+  ] as const)('distinguishes native Codex from unrelated usage helpers: %s', async (command, blocked) => {
+    const f = await fixture();
+    await mkdir(join(f.proc, '303'));
+    await writeFile(join(f.proc, '303', 'cmdline'), command);
+    await writeFile(join(f.proc, '303', 'environ'), `HOME=${f.home}\0CODEX_HOME=${f.home}\0`);
+    const result = await inspectSshCodexConversion(f.remote, SID, { transport: f.transport });
+    expect(result.status).toBe(blocked ? 'refused' : 'ready');
+    if (blocked && result.status === 'refused') expect(result.reason).toContain('already uses this home');
+    expect((await f.effects()).effects).toEqual([]);
+  });
+
   it.each(['foreground-program', 'codex-pane', 'child-work'])(
     'explains why an idle chat is not a free shell: %s',
     async (kind) => {
