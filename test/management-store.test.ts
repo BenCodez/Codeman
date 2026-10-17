@@ -80,6 +80,33 @@ describe('owner-global management and cooperative inbox', () => {
       (await service.configure('alice', { ifMatch: before.revision, managerSessionId: null, agents: valid })).agents
     ).toHaveLength(100);
   });
+  it.each(['owner', 'agent'])(
+    'reports inbox byte capacity for %s while preserving messages and replay receipts',
+    async (direction) => {
+      await enable();
+      const enrollment = await service.enroll('alice', 'session-one');
+      const scope = (await service.authenticate(enrollment.token))!;
+      const send = (message: string, id: string) =>
+        direction === 'owner' ? service.send('alice', 'session-one', message, id) : service.reply(scope, message, id);
+      const text = '界'.repeat(2000);
+      await send(text, 'capacity-initial');
+      let capacity = false;
+      for (let i = 0; i < 64; i++) {
+        const before = await service.messages('alice', 'session-one');
+        try {
+          await send(text, 'capacity-next-' + i);
+        } catch (error) {
+          expect(error).toMatchObject({ code: 'capacity' });
+          expect(await service.messages('alice', 'session-one')).toEqual(before);
+          expect(before.messages.length).toBeLessThan(64);
+          capacity = true;
+          break;
+        }
+      }
+      expect(capacity).toBe(true);
+      expect((await send(text, 'capacity-initial')).duplicate).toBe(true);
+    }
+  );
   it('persists global selection and isolates even an administrative owner from other sessions', async () => {
     const data = await enable();
     expect(data.agents.map((a) => a.sessionId)).toEqual(['session-one', 'manager-one']);

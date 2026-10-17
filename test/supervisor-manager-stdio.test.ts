@@ -223,7 +223,7 @@ it.each(['incomplete', 'oversize', 'malformed-utf8'])('refuses %s stdio without 
     fault === 'incomplete'
       ? Buffer.from('{}')
       : fault === 'oversize'
-        ? Buffer.from('x'.repeat(65537) + '\n')
+        ? Buffer.from('x'.repeat(800 * 1024 + 1) + '\n')
         : Buffer.from([0xc3, 10]);
   await expect(
     runSupervisorManagerMcp(
@@ -237,4 +237,51 @@ it.each(['incomplete', 'oversize', 'malformed-utf8'])('refuses %s stdio without 
     )
   ).rejects.toThrow();
   expect(request).not.toHaveBeenCalled();
+});
+
+it('carries a maximum escaped GitLab file and keeps subsequent manager tools available', async () => {
+  const received: unknown[] = [];
+  const server = http.createServer(async (req, res) => {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const body = JSON.parse(Buffer.concat(chunks).toString());
+    received.push(body);
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ jsonrpc: '2.0', id: body.id, result: {} }));
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = (server.address() as { port: number }).port;
+  const f = await credential(`http://127.0.0.1:${port}/api/supervisor-mcp`);
+  const request = {
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'tools/call',
+    params: {
+      name: 'supervisor_gitlab',
+      arguments: {
+        operation: 'create_file',
+        projectId: 1,
+        branch: 'codeman/fix',
+        path: 'file.txt',
+        content: '\u0001'.repeat(128 * 1024),
+        commitMessage: 'Owner-authorized edit',
+        requestId: 'maximum-file-request',
+      },
+    },
+  };
+  const subsequent = { jsonrpc: '2.0', id: 2, method: 'tools/list' };
+  const line = JSON.stringify(request) + '\n';
+  expect(Buffer.byteLength(line)).toBeGreaterThan(65536);
+  const chunks = Array.from({ length: Math.ceil(line.length / 8192) }, (_, i) => line.slice(i * 8192, (i + 1) * 8192));
+  await runSupervisorManagerMcp(
+    f.file,
+    Readable.from([...chunks, JSON.stringify(subsequent) + '\n']),
+    new Writable({
+      write(_chunk, _encoding, done) {
+        done();
+      },
+    })
+  );
+  expect(received).toEqual([request, subsequent]);
 });

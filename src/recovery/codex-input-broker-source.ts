@@ -366,6 +366,7 @@ def run():
     if original is not None:
         tty.setraw(0, termios.TCSANOW)
     def resize(_signal=None, _frame=None):
+        if master < 0: return
         try:
             size = fcntl.ioctl(0, termios.TIOCGWINSZ, b'\0' * 8)
             fcntl.ioctl(master, termios.TIOCSWINSZ, size)

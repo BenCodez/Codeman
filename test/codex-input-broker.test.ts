@@ -5,6 +5,7 @@ import fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import * as nodePty from 'node-pty';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   CodexInputBroker,
@@ -1304,4 +1305,60 @@ it('keeps output alive and disables later input after one lock-close failure', a
   expect((await bytes()).toString()).toBe('First owner bytes');
   expect(output().length).toBeGreaterThan(before);
   expect(child.exitCode).toBeNull();
+});
+
+it('starts under a real outer terminal and sizes the child after its PTY exists', async () => {
+  const root = await fs.mkdtemp(join(homedir(), 'broker-real-tty-'));
+  let terminal: nodePty.IPty | undefined;
+  let exited = false;
+  try {
+    const childPath = join(root, 'fake-terminal-child.py');
+    await fs.writeFile(
+      childPath,
+      `import fcntl, os, struct, termios, time
+end = time.monotonic() + 2
+while time.monotonic() < end:
+    rows, cols, _, _ = struct.unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\0' * 8))
+    if (rows, cols) == (30, 100): break
+    time.sleep(.01)
+os.write(1, ('FAKE_TTY_READY:%s:%s\\n' % (rows, cols)).encode())
+`
+    );
+    const broker = await CodexInputBroker.create(join(root, 'control'), SID, `exec python3 ${quote(childPath)}`, root);
+    terminal = nodePty.spawn(
+      'python3',
+      [join(broker.directory, 'broker.py'), broker.directory, broker.configurationDigest],
+      {
+        name: 'xterm-256color',
+        cols: 100,
+        rows: 30,
+        cwd: root,
+        env: { ...process.env, CODEX_HOME: root },
+      }
+    );
+    let output = '';
+    terminal.onData((data) => {
+      output += data;
+    });
+    const done = new Promise<number>((resolve) =>
+      terminal!.onExit(({ exitCode }) => {
+        exited = true;
+        resolve(exitCode);
+      })
+    );
+    const exitCode = await Promise.race([
+      done,
+      new Promise<never>((_, reject) => setTimeout(() => reject(Error('Fake terminal child timed out')), 4000)),
+    ]);
+    expect(output).toContain('FAKE_TTY_READY:30:100');
+    expect(output).not.toContain('input reliability guard unavailable');
+    expect(exitCode).toBe(0);
+    const state = await broker.readState();
+    expect(state?.startup.status).toBe('started');
+    expect(state?.closed).toBe(true);
+    expect(state?.exitStatus).toBe(0);
+  } finally {
+    if (terminal && !exited) terminal.kill(); // Disposable fake child only.
+    await fs.rm(root, { recursive: true, force: true });
+  }
 });

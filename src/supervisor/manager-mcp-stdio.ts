@@ -8,7 +8,8 @@ import type { Readable, Writable } from 'node:stream';
 import { TextDecoder } from 'node:util';
 import { isValidBasePath } from '../config/base-path.js';
 
-const MAX_REQUEST = 65_536;
+// Match the scoped HTTP route, including escaped 128 KiB GitLab content and JSON overhead.
+const MAX_REQUEST = 800 * 1024;
 const MAX_RESPONSE = 2_097_152;
 const TOKEN = /^codeman-manager-v1\.[a-f0-9]{64}$/;
 export interface ManagerBridgeCredential {

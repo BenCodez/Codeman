@@ -66,6 +66,11 @@ export interface ManagementOptions {
 }
 const emptyConfig = (): ManagementConfig => ({ managerSessionId: null, agents: [] });
 const emptyInbox = (): z.infer<typeof Inbox> => ({ tokenHash: null, expiresAt: 0, messages: [] });
+const serializeInbox = (value: z.infer<typeof Inbox>): string => {
+  const serialized = JSON.stringify(value);
+  if (Buffer.byteLength(serialized) > MAX_BRAIN_BYTES) throw new BrainStoreError('capacity');
+  return serialized;
+};
 export class ManagementService {
   private readonly config: BrainStore;
   private readonly inboxes: BrainStore;
@@ -262,7 +267,7 @@ export class ManagementService {
     if (duplicate) {
       if (duplicate.message !== message) throw new BrainStoreError('conflict');
       // Re-confirm the receipt's durability after a possibly lost publication ACK.
-      await this.inboxes.replace(this.inboxId(owner, sessionId), JSON.stringify(inbox.value), inbox.revision, current);
+      await this.inboxes.replace(this.inboxId(owner, sessionId), serializeInbox(inbox.value), inbox.revision, current);
       return { message: duplicate, duplicate: true };
     }
     if (inbox.value.messages.length >= 64) throw new BrainStoreError('capacity');
@@ -271,7 +276,7 @@ export class ManagementService {
     if (latest.revision !== config.revision) throw new BrainStoreError('conflict');
     await this.inboxes.replace(
       this.inboxId(owner, sessionId),
-      JSON.stringify({ ...inbox.value, messages: [...inbox.value.messages, parsed] }),
+      serializeInbox({ ...inbox.value, messages: [...inbox.value.messages, parsed] }),
       inbox.revision,
       current
     );
@@ -339,7 +344,7 @@ export class ManagementService {
       if (duplicate.message !== message || duplicate.replyTo !== replyTo) throw new BrainStoreError('conflict');
       await this.inboxes.replace(
         this.inboxId(scope.owner, scope.sessionId),
-        JSON.stringify(inbox.value),
+        serializeInbox(inbox.value),
         inbox.revision,
         current
       );
@@ -350,7 +355,7 @@ export class ManagementService {
     if (inbox.value.messages.length >= 64) throw new BrainStoreError('capacity');
     await this.inboxes.replace(
       this.inboxId(scope.owner, scope.sessionId),
-      JSON.stringify({ ...inbox.value, messages: [...inbox.value.messages, parsed] }),
+      serializeInbox({ ...inbox.value, messages: [...inbox.value.messages, parsed] }),
       inbox.revision,
       current
     );
