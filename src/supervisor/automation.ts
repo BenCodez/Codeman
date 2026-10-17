@@ -246,6 +246,7 @@ export class SupervisorAutomationController {
         await this.save();
         return this.getStatus();
       }
+      const priorRun = { ...run };
       if (!this.state.runs.includes(run)) this.state.runs.push(run);
       run.attempts++;
       run.nextRunAt = plan.interval === undefined ? undefined : this.now() + plan.interval;
@@ -269,6 +270,23 @@ export class SupervisorAutomationController {
         flight.phase = 'unknown';
         this.state.reason = 'instruction-uncertain';
         await this.save();
+        return this.getStatus();
+      }
+      if (automatic && result === 'not-sent') {
+        // Certified zero-byte automatic refusals are retryable. Release the exact
+        // durable reservation before reusing its ID; do not consume a receipt slot.
+        const reservedRun = { ...run };
+        Object.assign(run, priorRun);
+        if (priorRun.nextRunAt === undefined) delete run.nextRunAt;
+        delete this.state.inFlight;
+        this.state.reason = 'instruction-retryable';
+        try {
+          await this.save();
+        } catch (error) {
+          Object.assign(run, reservedRun);
+          this.state.inFlight = { ...flight, phase: 'unknown' };
+          throw error;
+        }
         return this.getStatus();
       }
       flight.phase = result === 'sent' ? 'accepted' : 'refused';
@@ -316,7 +334,7 @@ export class SupervisorAutomationController {
             createHash('sha256').update(`${requestId}:retry:${this.state.handled.length}`).digest('hex');
         }
         const revision = this.revision;
-        await this.runInstruction(
+        const result = await this.runInstruction(
           run.taskId,
           requestId,
           () =>
@@ -325,6 +343,9 @@ export class SupervisorAutomationController {
             this.plan(run.taskId)?.hash === plan.hash,
           true
         );
+        // A certified unsent first task must not starve other due instructions.
+        // Still stop after any accepted/unknown dispatch; the due list is bounded.
+        if (result.status.reason === 'instruction-retryable' && this.available()) continue;
         break;
       }
     } finally {

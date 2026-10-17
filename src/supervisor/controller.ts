@@ -10,6 +10,9 @@ import { SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from './manager-task.js';
 import { formatTaskPrompt } from '../supervision/prompt.js';
 import {
   SupervisorConfigSchema,
+  remainingSupervisorRequests,
+  MAX_SUPERVISOR_REQUEST_RECEIPTS,
+  DEFAULT_SUPERVISOR_MESSAGES,
   SupervisorRequestSchema,
   initialSupervisorState,
   type SupervisorConfig,
@@ -263,6 +266,16 @@ export class SupervisorController {
           if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
           if (this.state.inFlight)
             throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
+          // Reconfiguration grants fresh worker counters, but accepted request
+          // bindings remain durable until explicit owner reset.
+          if (
+            config.enabled &&
+            this.state.handledRequestIds.length + remainingSupervisorRequests(config.workers) >
+              MAX_SUPERVISOR_REQUEST_RECEIPTS
+          )
+            throw new SupervisorValidationError(
+              'Worker grants exceed remaining lifetime request receipts; reduce grants or reset the supervisor'
+            );
           if (config.enabled) {
             if (!this.managerIsEligible())
               throw new SupervisorValidationError('Supervisor manager is no longer eligible');
@@ -307,6 +320,15 @@ export class SupervisorController {
         if (this.state.phase === 'active') throw new SupervisorValidationError('Supervisor is already active');
         if (this.state.inFlight)
           throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
+        // Older overallocated journals remain inspectable/resettable. They may
+        // resume only after every remaining grant fits the retained receipts.
+        if (
+          this.state.handledRequestIds.length + remainingSupervisorRequests(this.state.workers, this.state.workers) >
+          MAX_SUPERVISOR_REQUEST_RECEIPTS
+        )
+          throw new SupervisorValidationError(
+            'Worker grants exceed remaining lifetime request receipts; reduce grants or reset the supervisor'
+          );
         await this.deps.validateWorkers(this.state.workers.map((w) => w.sessionId));
         if (this.stopped || this.revision !== revision)
           throw new SupervisorValidationError('Supervisor action was superseded');
@@ -803,7 +825,7 @@ export class SupervisorController {
       }
       if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
       if (this.state.phase !== 'active') throw new SupervisorValidationError('Supervisor is not active');
-      if (this.state.handledRequestIds.length >= 128)
+      if (this.state.handledRequestIds.length >= MAX_SUPERVISOR_REQUEST_RECEIPTS)
         throw new SupervisorValidationError('Supervisor request journal is full');
       if (this.state.inFlight)
         throw new SupervisorValidationError('Unresolved supervisor operation requires owner reset');
@@ -817,7 +839,8 @@ export class SupervisorController {
       const runtimeStartedAt = configured.startedAt ?? this.now();
       const hasBudget = () =>
         (action === 'message'
-          ? configured.allowMessages === true && (configured.messages ?? 0) < (configured.maxMessages ?? 20)
+          ? configured.allowMessages === true &&
+            (configured.messages ?? 0) < (configured.maxMessages ?? DEFAULT_SUPERVISOR_MESSAGES)
           : configured.assignments < configured.maxAssignments) &&
         this.hasRuntimeBudget(runtimeStartedAt, configured.maxRuntimeMs) &&
         this.hasRuntimeBudget(this.state.startedAt, SUPERVISOR_MANAGER_MAX_RUNTIME_MS);

@@ -9,6 +9,25 @@ import type {
 
 const SessionId = z.string().regex(/^[\w-]{8,100}$/);
 const RequestId = z.string().regex(/^[\w:.-]{8,120}$/);
+export const MAX_SUPERVISOR_REQUEST_RECEIPTS = 128;
+export const DEFAULT_SUPERVISOR_MESSAGES = 20;
+
+/** Assignments and recovery retries share one grant; messages require separate owner delegation. */
+export function remainingSupervisorRequests(
+  workers: readonly PublicSupervisorConfig['workers'][number][],
+  spent: readonly PublicSupervisorState['workers'][number][] = []
+): number {
+  return workers.reduce((total, worker) => {
+    const prior = spent.find((entry) => entry.sessionId === worker.sessionId);
+    return (
+      total +
+      Math.max(0, worker.maxAssignments - (prior?.assignments ?? 0)) +
+      (worker.allowMessages === true
+        ? Math.max(0, (worker.maxMessages ?? DEFAULT_SUPERVISOR_MESSAGES) - (prior?.messages ?? 0))
+        : 0)
+    );
+  }, 0);
+}
 
 export const SupervisorWorkerSchema = z
   .object({
@@ -41,6 +60,10 @@ export const SupervisorConfigSchema = z
   })
   .strict()
   .refine((v) => new Set(v.workers.map((w) => w.sessionId)).size === v.workers.length, 'Duplicate worker')
+  .refine(
+    (config) => !config.enabled || remainingSupervisorRequests(config.workers) <= MAX_SUPERVISOR_REQUEST_RECEIPTS,
+    'Assignments (including retries) and delegated message grants share 128 lifetime request receipts'
+  )
   .refine(
     (config) =>
       config.workers.every((worker) =>
@@ -80,7 +103,7 @@ export const SupervisorStateSchema = z
       })
       .strict()
       .optional(),
-    handledRequestIds: z.array(RequestId).max(128),
+    handledRequestIds: z.array(RequestId).max(MAX_SUPERVISOR_REQUEST_RECEIPTS),
     handledRequestBindings: z
       .array(
         z
@@ -95,7 +118,7 @@ export const SupervisorStateSchema = z
           })
           .strict()
       )
-      .max(128),
+      .max(MAX_SUPERVISOR_REQUEST_RECEIPTS),
     history: z
       .array(
         z.object({ at: z.number(), reason: z.string().regex(/^[\w-]{1,80}$/), workerId: SessionId.optional() }).strict()

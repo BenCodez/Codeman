@@ -11,7 +11,7 @@ import { TaskController, type TaskObservation } from '../src/supervision/control
 import { RecoveryController } from '../src/recovery/controller.js';
 import { initialRecoveryState, type RecoveryObservation } from '../src/recovery/types.js';
 import { buildSupervisorManagerTask, SUPERVISOR_MANAGER_MAX_RUNTIME_MS } from '../src/supervisor/manager-task.js';
-import { SupervisorConfigSchema, initialSupervisorState } from '../src/supervisor/schema.js';
+import { SupervisorConfigSchema, SupervisorStateSchema, initialSupervisorState } from '../src/supervisor/schema.js';
 import { formatTaskPrompt } from '../src/supervision/prompt.js';
 import { SupervisorStore } from '../src/supervisor/store.js';
 import { dataPath } from '../src/config/instance.js';
@@ -1493,6 +1493,14 @@ describe('SupervisorController', () => {
     await h.controller.start();
     const restored = h.controller.getStatus();
     restored.handledRequestIds = Array.from({ length: 128 }, (_, i) => `request-${String(i).padStart(4, '0')}`);
+    restored.handledRequestBindings = restored.handledRequestIds.map((requestId) => ({
+      requestId,
+      workerId: WORKER,
+      action: 'assign' as const,
+    }));
+    // This completed plan has no unused grants; old accepted IDs still occupy
+    // every receipt and cannot be evicted to admit another effect.
+    restored.workers[0].assignments = restored.workers[0].maxAssignments;
     const full = new SupervisorController(h.deps, SUPERVISOR, restored);
     await full.start();
     await expect(full.assign(WORKER, 'request-new1')).rejects.toThrow(/journal is full/);
@@ -2261,4 +2269,154 @@ describe('SupervisorController', () => {
     expect(h.worker.recovery.inspect).not.toHaveBeenCalled();
     expect(h.controller.getStatus().inFlight).toBeUndefined();
   });
+});
+
+describe('shared lifetime supervisor request allocation', () => {
+  function plan(messages = 8) {
+    return {
+      ...config,
+      workers: Array.from({ length: 12 }, (_, index) => ({
+        ...config.workers[0],
+        sessionId: index === 0 ? WORKER : `worker-${String(index).padStart(4, '0')}`,
+        maxAssignments: 10,
+        allowMessages: index === 0,
+        maxMessages: index === 0 ? messages : 100,
+      })),
+    };
+  }
+  function receipts(state: ReturnType<typeof initialSupervisorState>, count: number) {
+    state.handledRequestIds = Array.from({ length: count }, (_, index) => `retained-${String(index).padStart(4, '0')}`);
+    state.handledRequestBindings = state.handledRequestIds.map((requestId) => ({
+      requestId,
+      workerId: WORKER,
+      action: 'assign' as const,
+    }));
+    return state;
+  }
+
+  it.each([128, 129])('validates the aggregate assignment/retry and message allocation at %s slots', async (slots) => {
+    const candidate = plan(slots - 120);
+    expect(SupervisorConfigSchema.safeParse(candidate).success).toBe(slots === 128);
+    const h = harness();
+    if (slots === 128) {
+      await expect(h.controller.configure(candidate)).resolves.toMatchObject({ phase: 'ready' });
+      expect(h.controller.getStatus().workers).toHaveLength(12);
+    } else {
+      expect(() => h.controller.configure(candidate)).toThrow(/128 lifetime/);
+      expect(h.deps.persist).not.toHaveBeenCalled();
+      expect(h.worker.task.update).not.toHaveBeenCalled();
+    }
+  });
+
+  it('counts the default 20 messages only when the owner enabled messaging', () => {
+    const disabled = plan(100);
+    disabled.workers[0].allowMessages = false;
+    expect(SupervisorConfigSchema.safeParse(disabled).success).toBe(true);
+    const defaultMessages = {
+      ...config,
+      workers: Array.from({ length: 6 }, (_, index) => ({
+        ...config.workers[0],
+        sessionId: `worker-${String(index).padStart(4, '0')}`,
+        maxAssignments: 1,
+        allowMessages: true,
+      })),
+    };
+    expect(SupervisorConfigSchema.safeParse(defaultMessages).success).toBe(true); // 6 × 21 =126
+    defaultMessages.workers.push({ ...defaultMessages.workers[0], sessionId: 'worker-extra' });
+    expect(SupervisorConfigSchema.safeParse(defaultMessages).success).toBe(false);
+  });
+
+  it('allocates fresh reconfiguration grants after retained history, including removed workers, and preserves duplicate bindings', async () => {
+    const h = harness();
+    await h.controller.configure(config);
+    await h.controller.start();
+    await h.controller.assign(WORKER, 'spent-before-edit');
+    const before = h.controller.getStatus();
+    const changed = plan();
+    changed.workers[0].sessionId = 'replacement-worker';
+    await expect(h.controller.configure(changed)).rejects.toThrow(/remaining lifetime request receipts/);
+    expect(h.controller.getStatus().workers).toEqual(before.workers);
+    expect(h.controller.getStatus().handledRequestBindings).toEqual(before.handledRequestBindings);
+    expect(h.controller.getStatus().phase).toBe('paused');
+    const repaired = await h.controller.configure(plan(7)); // 1 retained +127 fresh grants
+    expect(repaired.handledRequestIds).toEqual(['spent-before-edit']);
+    expect(repaired.workers.every((worker) => worker.assignments === 0)).toBe(true);
+    const effects = vi.mocked(h.worker.task.resume).mock.calls.length;
+    await h.controller.assign(WORKER, 'spent-before-edit');
+    expect(h.worker.task.resume).toHaveBeenCalledTimes(effects);
+    await h.controller.reset();
+    await expect(h.controller.configure(plan())).resolves.toMatchObject({ handledRequestIds: [], phase: 'ready' });
+  });
+
+  it('allows a resumed normally spent boundary plan without allocating fresh counters', async () => {
+    const h = harness();
+    await h.controller.configure(plan());
+    await h.controller.start();
+    await h.controller.assign(WORKER, 'boundary-assignment');
+    const restored = h.controller.getStatus();
+    const reloaded = new SupervisorController(h.deps, SUPERVISOR, restored);
+    await expect(reloaded.start()).resolves.toMatchObject({
+      phase: 'active',
+      handledRequestIds: ['boundary-assignment'],
+    });
+    expect(reloaded.getStatus().workers[0].assignments).toBe(1);
+    await expect(reloaded.configure(plan())).rejects.toThrow(/remaining lifetime request receipts/);
+    expect(reloaded.getStatus().handledRequestIds).toEqual(['boundary-assignment']);
+  });
+
+  it('spends the final shared receipt once and retains all 128 exact bindings', async () => {
+    const h = harness();
+    await h.controller.configure({ ...config, workers: [{ ...config.workers[0], maxAssignments: 1 }] });
+    const restored = receipts(h.controller.getStatus(), 127);
+    expect(SupervisorStateSchema.safeParse(restored).success).toBe(true);
+    const reloaded = new SupervisorController(h.deps, SUPERVISOR, restored);
+    await reloaded.start();
+    const accepted = await reloaded.assign(WORKER, 'last-shared-slot');
+    expect(accepted.handledRequestIds).toHaveLength(128);
+    expect(accepted.handledRequestBindings.at(-1)).toEqual({
+      requestId: 'last-shared-slot',
+      workerId: WORKER,
+      action: 'assign',
+    });
+    await reloaded.assign(WORKER, 'last-shared-slot');
+    await expect(reloaded.assign(WORKER, 'after-shared-cap')).rejects.toThrow(/journal is full/);
+    expect(h.worker.task.resume).toHaveBeenCalledOnce();
+  });
+
+  it.each(['legacy-overallocated', 'unknown-flight'] as const)(
+    'keeps %s durable state inspectable and resettable without dispatch',
+    async (kind) => {
+      const h = harness();
+      await h.controller.configure(config);
+      const restored = receipts(h.controller.getStatus(), 1);
+      if (kind === 'legacy-overallocated')
+        restored.workers = plan(100).workers.map((worker) => ({ ...worker, assignments: 0 }));
+      else restored.inFlight = { requestId: 'unknown-request', workerId: WORKER, action: 'retry', reservedAt: 10_000 };
+      expect(SupervisorStateSchema.safeParse(restored).success).toBe(true);
+      const reloaded = new SupervisorController(h.deps, SUPERVISOR, restored);
+      await expect(reloaded.start()).rejects.toThrow(kind === 'unknown-flight' ? /Unresolved/ : /remaining lifetime/);
+      expect(h.deps.startManager).not.toHaveBeenCalled();
+      expect(reloaded.getStatus().handledRequestIds).toEqual(restored.handledRequestIds);
+      expect(reloaded.getStatus().workers).toEqual(restored.workers);
+      if (kind === 'unknown-flight') {
+        await expect(reloaded.configure(config)).rejects.toThrow(/Unresolved/);
+        expect(reloaded.getStatus().inFlight).toEqual(restored.inFlight);
+      } else {
+        vi.mocked(h.deps.validateWorkers)
+          .mockClear()
+          .mockImplementation(() => {
+            throw new SupervisorValidationError('Worker is no longer eligible');
+          });
+        await expect(reloaded.configure({ ...plan(100), enabled: false })).resolves.toMatchObject({
+          phase: 'disabled',
+          enabled: false,
+        });
+        expect(h.deps.validateWorkers).not.toHaveBeenCalled();
+        await expect(reloaded.configure(plan(7))).rejects.toThrow(/no longer eligible/);
+        vi.mocked(h.deps.validateWorkers).mockImplementation(() => {});
+        await expect(reloaded.configure(plan(7))).resolves.toMatchObject({ phase: 'ready' });
+      }
+      await expect(reloaded.reset()).resolves.toMatchObject({ workers: [], handledRequestIds: [] });
+    }
+  );
 });

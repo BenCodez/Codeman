@@ -590,3 +590,139 @@ it('retains manual readiness refusals and post-reservation unknown seals while a
   expect(f.dispatch).toHaveBeenCalledOnce();
   expect(f.store.get(ID)).toEqual(saved);
 });
+
+it('refunds an automatic once reservation after authority is withdrawn during its durable ACK, then retries after reload', async () => {
+  const f = await fixture();
+  await f.controller.configure(config());
+  const original = f.persist.getMockImplementation()!;
+  const entered = createDeferred<void>(),
+    release = heldRelease();
+  f.persist.mockImplementationOnce(async (record) => {
+    await original(record);
+    entered.resolve();
+    await release.promise;
+  });
+  const ticking = f.controller.tick();
+  await entered.promise;
+  expect(new SupervisorAutomationStore(f.path).get(ID).inFlight?.phase).toBe('reserved');
+  f.setAvailable(false);
+  release.resolve();
+  await ticking;
+  expect(f.dispatch).not.toHaveBeenCalled();
+  expect(f.store.get(ID)).toMatchObject({ handled: [], runs: [{ taskId: 'owner-task', attempts: 0, nextRunAt: NOW }] });
+  expect(f.store.get(ID).inFlight).toBeUndefined();
+  f.setAvailable(true);
+  await f.reload().tick();
+  expect(f.dispatch).toHaveBeenCalledOnce();
+  expect(f.store.get(ID).runs[0].attempts).toBe(1);
+});
+
+it('refunds a queued automatic certified refusal without losing any of the fully allocated 128 receipt slots', async () => {
+  const f = await fixture(),
+    cfg = config('recurring');
+  cfg.tasks[0].maxRuns = 100;
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', maxRuns: 28 });
+  await f.controller.configure(cfg);
+  f.setTime(NOW + HOUR);
+  const entered = createDeferred<void>(),
+    release = heldRelease();
+  f.dispatch.mockImplementationOnce(async (_instructions, current) => {
+    entered.resolve();
+    await release.promise;
+    expect(current()).toBe(false);
+    return 'not-sent';
+  });
+  const ticking = f.controller.tick();
+  await entered.promise;
+  f.setAvailable(false);
+  release.resolve();
+  await ticking;
+  expect(f.store.get(ID).handled).toEqual([]);
+  expect(f.store.get(ID).inFlight).toBeUndefined();
+  expect(f.store.get(ID).runs).toEqual(
+    cfg.tasks.map((task) => ({ taskId: task.id, attempts: 0, nextRunAt: NOW + HOUR }))
+  );
+  f.setAvailable(true);
+  const reloaded = f.reload();
+  await reloaded.tick();
+  await reloaded.tick();
+  expect(f.dispatch).toHaveBeenCalledTimes(3);
+  expect(f.store.get(ID).handled).toHaveLength(2);
+  expect(f.store.get(ID).runs.every((run) => run.attempts === 1)).toBe(true);
+});
+
+it('lets a later due task run after an earlier certified automatic refusal and retries only the unsent task on the next tick', async () => {
+  const f = await fixture(),
+    cfg = config();
+  cfg.tasks.push({ ...cfg.tasks[0], id: 'later-task', instructions: 'Later due work' });
+  await f.controller.configure(cfg);
+  f.dispatch.mockResolvedValueOnce('not-sent');
+  await f.controller.tick();
+  expect(f.dispatch.mock.calls.map((call) => call[0])).toEqual(cfg.tasks.map((task) => task.instructions));
+  expect(f.store.get(ID).handled).toHaveLength(1);
+  expect(f.store.get(ID).handled[0].taskId).toBe('later-task');
+  expect(f.store.get(ID).runs.find((run) => run.taskId === 'owner-task')?.attempts).toBe(0);
+  await f.controller.tick();
+  expect(f.dispatch).toHaveBeenCalledTimes(3);
+  expect(f.store.get(ID).handled).toHaveLength(2);
+  expect(f.store.get(ID).runs.every((run) => run.attempts === 1)).toBe(true);
+});
+
+it.each(['unknown', 'throw'] as const)(
+  'never refunds or replays an automatic %s delivery after reservation',
+  async (outcome) => {
+    const f = await fixture();
+    await f.controller.configure(config());
+    if (outcome === 'throw') f.dispatch.mockRejectedValueOnce(Error('possible effect'));
+    else f.dispatch.mockResolvedValueOnce('unknown');
+    await f.controller.tick();
+    const saved = f.store.get(ID);
+    expect(saved.inFlight?.phase).toBe('unknown');
+    expect(saved.runs[0].attempts).toBe(1);
+    await f.controller.tick();
+    await f.reload().tick();
+    expect(f.dispatch).toHaveBeenCalledOnce();
+    expect(f.store.get(ID)).toEqual(saved);
+  }
+);
+
+it.each(['reservation', 'release'] as const)(
+  'retains the automatic reservation seal when the %s durability ACK fails',
+  async (stage) => {
+    const f = await fixture();
+    await f.controller.configure(config());
+    const original = f.persist.getMockImplementation()!;
+    f.dispatch.mockResolvedValueOnce('not-sent');
+    f.persist.mockImplementation(async (record) => {
+      if (
+        (stage === 'reservation' && record.inFlight) ||
+        (stage === 'release' && record.reason === 'instruction-retryable')
+      )
+        throw Error('lost ACK');
+      await original(record);
+    });
+    await expect(f.controller.tick()).rejects.toThrow(/lost ACK/);
+    expect(f.controller.getStatus().status.phase).toBe('blocked');
+    expect(f.controller.getStatus().status.inFlight).toBeDefined();
+    expect(f.controller.getStatus().status.runs[0].attempts).toBe(1);
+    await f.controller.tick();
+    expect(f.dispatch).toHaveBeenCalledTimes(stage === 'reservation' ? 0 : 1);
+    if (stage === 'release') {
+      const saved = f.store.get(ID);
+      expect(saved.inFlight?.phase).toBe('reserved');
+      await f.reload().tick();
+      expect(f.dispatch).toHaveBeenCalledOnce();
+    }
+  }
+);
+
+it('preserves the explicit manual known-unsent receipt and spent attempt instead of refunding its request', async () => {
+  const f = await fixture();
+  await f.controller.configure(config());
+  f.dispatch.mockResolvedValueOnce('not-sent');
+  await f.controller.runTask('owner-task', 'manual-certified-unsent');
+  expect(f.store.get(ID).handled[0]).toMatchObject({ requestId: 'manual-certified-unsent', phase: 'refused' });
+  expect(f.store.get(ID).runs[0].attempts).toBe(1);
+  await f.reload().runTask('owner-task', 'manual-certified-unsent');
+  expect(f.dispatch).toHaveBeenCalledOnce();
+});

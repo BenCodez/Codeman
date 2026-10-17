@@ -204,12 +204,20 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
   });
   app.put('/api/sessions/:id/supervisor', async (req, reply) => {
     const scoped = controller(req).result;
-    const config = parseBody(SupervisorConfigSchema, req.body, 'Invalid supervisor configuration');
+    const config = parseBody(
+      SupervisorConfigSchema,
+      req.body,
+      'Invalid supervisor configuration; assignment/retry and enabled message grants must fit 128 operations'
+    );
     try {
       const data = await scoped.configure(config);
       return { success: true, data };
     } catch (error) {
-      return operationFailure(reply, error, 'Supervisor configuration is invalid or a worker lease is unavailable');
+      return operationFailure(
+        reply,
+        error,
+        'Supervisor configuration is invalid or a worker lease is unavailable; assignment/retry and enabled message grants plus retained receipts must fit 128 operations'
+      );
     }
   });
   for (const action of ['start', 'pause', 'reset'] as const) {
