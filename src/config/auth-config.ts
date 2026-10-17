@@ -27,6 +27,11 @@ export const AUTH_FAILURE_MAX = 10;
 /** Failed auth attempt tracking window (ms) */
 export const AUTH_FAILURE_WINDOW_MS = 15 * 60 * 1000;
 
+/** Password guesses allowed before progressive login backoff starts. */
+export const LOGIN_FAILURE_GRACE = 5;
+/** Maximum login backoff; the failure history still decays after 15 minutes. */
+export const LOGIN_BACKOFF_MAX_MS = 60 * 1000;
+
 // ============================================================================
 // Hooks
 // ============================================================================
