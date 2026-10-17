@@ -63,6 +63,7 @@ export function createMockRouteContext(options?: {
       reconcileAfterRestoration: vi.fn(async () => {}),
     },
     cleanupSession: vi.fn(async () => {}),
+    dropSupervisorManagementState: vi.fn(async () => {}),
     setupSessionListeners: vi.fn(async () => {}),
     persistSessionState: vi.fn(),
     persistSessionStateNow: vi.fn(),
@@ -75,6 +76,9 @@ export function createMockRouteContext(options?: {
     getSessionStateWithRespawn: vi.fn((s: MockSession) => s.toState()),
     getTaskController: vi.fn(() => undefined),
     getSupervisorController: vi.fn(() => undefined),
+    prepareSupervisorManager: vi.fn(async () => false),
+    getSupervisorAutomation: vi.fn(() => undefined),
+    supervisorBrain: undefined,
 
     // -- EventPort --
     broadcast: vi.fn(),

@@ -5,11 +5,13 @@ import { ApiErrorCode, createErrorResponse } from '../../types.js';
 import { SupervisorActionSchema, SupervisorConfigSchema, SupervisorRequestSchema } from '../../supervisor/schema.js';
 import { SupervisorValidationError } from '../../supervisor/controller.js';
 import { TaskValidationError } from '../../supervision/controller.js';
+import { PromptTextSchema } from '../../supervision/schema.js';
 import {
   SupervisorAutomationConfigSchema,
   SupervisorAutomationRequestSchema,
 } from '../../supervisor/automation-schema.js';
 import { SupervisorAutomationError } from '../../supervisor/automation.js';
+import { BrainStoreError } from '../../supervisor/brain.js';
 import { canAccessOwned, getAuthUser, findSessionOrFail, parseBody } from '../route-helpers.js';
 import type { SessionPort, SupervisorPort } from '../ports/index.js';
 
@@ -23,6 +25,7 @@ function operationFailure(reply: FastifyReply, error: unknown, validationMessage
     error instanceof SupervisorValidationError ||
     error instanceof TaskValidationError ||
     error instanceof SupervisorAutomationError ||
+    (error instanceof BrainStoreError && error.code === 'invalid') ||
     error instanceof ZodError;
   return reply
     .code(validation ? 400 : 500)
@@ -172,7 +175,18 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
     const session = findSessionOrFail(ctx, (req.params as { id: string }).id, req),
       current = ownerCurrent(req, reply, session);
     const body = parseBody(
-      z.object({ markdown: z.string().max(32768), ifMatch: z.string().regex(/^[a-f0-9]{64}$/) }).strict(),
+      z
+        .object({
+          markdown: z
+            .string()
+            .max(32768)
+            .refine(
+              (text) => Buffer.byteLength(text, 'utf8') <= 32768 && Buffer.from(text, 'utf8').toString('utf8') === text,
+              'Memory must contain at most 32 KiB of valid UTF-8'
+            ),
+          ifMatch: z.string().regex(/^[a-f0-9]{64}$/),
+        })
+        .strict(),
       req.body,
       'Invalid brain update'
     );
@@ -231,4 +245,24 @@ export function registerSupervisorRoutes(app: FastifyInstance, ctx: SessionPort 
       }
     });
   }
+  app.post('/api/sessions/:id/supervisor/workers/:workerId/message', async (req, reply) => {
+    const { id, workerId } = req.params as { id: string; workerId: string };
+    const session = findSessionOrFail(ctx, id, req),
+      current = ownerCurrent(req, reply, session),
+      scoped = manager(req);
+    const body = parseBody(
+      SupervisorRequestSchema.extend({
+        message: PromptTextSchema.min(1)
+          .max(4000)
+          .refine((text) => !!text.trim()),
+      }),
+      req.body,
+      'Invalid supervisor message'
+    );
+    try {
+      return { success: true, data: await scoped.message(workerId, body.requestId, body.message, current) };
+    } catch (error) {
+      return operationFailure(reply, error, 'Supervisor message was refused or remains unresolved; retain requestId');
+    }
+  });
 }

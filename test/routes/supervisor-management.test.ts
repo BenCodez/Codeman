@@ -199,3 +199,60 @@ it('does not ACK or dispatch a schedule when the exact owner/session is replaced
   expect(dispatch).not.toHaveBeenCalled();
   expect(automation.getStatus().tasks[0].enabled).toBe(false);
 });
+
+it.each(['é'.repeat(16385), '🙂'.repeat(8193), '\ud800'])(
+  'rejects over-byte-budget or malformed UTF-8 memory as invalid input before store access',
+  async (markdown) => {
+    const replace = vi.spyOn(brain, 'replace');
+    const response = await h.app.inject({
+      method: 'PUT',
+      url: base() + '/brain',
+      payload: { markdown, ifMatch: 'a'.repeat(64) },
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json()).toMatchObject({ success: false, errorCode: 'INVALID_INPUT' });
+    expect(replace).not.toHaveBeenCalled();
+    expect(await fs.readdir(root)).toEqual([]);
+  }
+);
+
+it('accepts exactly 32 KiB of multibyte memory through the real store and preserves revision conflicts', async () => {
+  const initial = (await h.app.inject(base() + '/brain')).json().data;
+  const markdown = 'é'.repeat(16384);
+  expect(Buffer.byteLength(markdown, 'utf8')).toBe(32768);
+  const saved = await h.app.inject({
+    method: 'PUT',
+    url: base() + '/brain',
+    payload: { markdown, ifMatch: initial.revision },
+  });
+  expect(saved.statusCode).toBe(200);
+  expect(saved.json().data.markdown).toBe(markdown);
+  const conflict = await h.app.inject({
+    method: 'PUT',
+    url: base() + '/brain',
+    payload: { markdown: 'Valid update', ifMatch: initial.revision },
+  });
+  expect(conflict.statusCode).toBe(409);
+  expect((await h.app.inject(base() + '/brain')).json().data).toEqual(saved.json().data);
+});
+
+it('classifies invalid store input as 400 while keeping real persistence failures sanitized 500s', async () => {
+  const initial = (await h.app.inject(base() + '/brain')).json().data;
+  const invalid = await h.app.inject({
+    method: 'PUT',
+    url: base() + '/brain',
+    payload: { markdown: 'invalid\u0000text', ifMatch: initial.revision },
+  });
+  expect(invalid.statusCode).toBe(400);
+  expect(invalid.json().errorCode).toBe('INVALID_INPUT');
+  expect((await h.app.inject(base() + '/brain')).json().data).toEqual(initial);
+  vi.spyOn(brain, 'replace').mockRejectedValueOnce(new Error('/private/brain-store is read-only'));
+  const failed = await h.app.inject({
+    method: 'PUT',
+    url: base() + '/brain',
+    payload: { markdown: 'Valid text', ifMatch: initial.revision },
+  });
+  expect(failed.statusCode).toBe(500);
+  expect(failed.json().errorCode).toBe('OPERATION_FAILED');
+  expect(failed.body).not.toContain('/private');
+});

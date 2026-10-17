@@ -1512,7 +1512,7 @@ export function registerSessionRoutes(
         ctx.store.getSession(id) === before &&
         JSON.stringify(before) === beforeText;
       const ownedRemote = killMux && before.remote && before.remote.owned !== false;
-      const native = ownedRemote ? ctx.mux.getSession(id) : undefined;
+      const native = ctx.mux.getSession(id);
       const nativeText = JSON.stringify(native);
       const nativeCurrent = () =>
         !!native &&
@@ -1548,18 +1548,28 @@ export function registerSessionRoutes(
             throw Error('Owned remote session teardown was not acknowledged');
         }
       }
+      const retiredOwner = before.owner;
+      const expectedRetiredText = JSON.stringify(
+        before.pinned ? { ...before, status: 'stopped', pid: null } : undefined
+      );
       ctx.store.demoteOrRemoveSession(id);
       if (killMux) {
         const retiredState = ctx.store.getSessions()[id];
         const retiredStateText = JSON.stringify(retiredState);
-        await ownedRemoteBrokerCache.finishFinalCleanup(
-          id,
-          () =>
-            !ctx.sessions.has(id) &&
-            ctx.store.getSessions()[id] === retiredState &&
-            JSON.stringify(retiredState) === retiredStateText,
-          retiredState
-        );
+        const retiredCurrent = () =>
+          !req.raw.aborted &&
+          !reply.raw.destroyed &&
+          before.owner === retiredOwner &&
+          canAccessOwned(getAuthUser(req), retiredOwner) &&
+          !ctx.sessions.has(id) &&
+          ctx.store.getSessions()[id] === retiredState &&
+          JSON.stringify(retiredState) === retiredStateText &&
+          retiredStateText === expectedRetiredText &&
+          (ownedRemote
+            ? !ctx.mux.getSession(id)
+            : ctx.mux.getSession(id) === native && JSON.stringify(native) === nativeText);
+        await ctx.dropSupervisorManagementState(id, retiredCurrent);
+        await ownedRemoteBrokerCache.finishFinalCleanup(id, retiredCurrent, retiredState);
       }
       // Mirrors the broadcast at the tail of the live-session cleanup path
       // (_doCleanupSession in server.ts) — without it, other open tabs keep

@@ -798,6 +798,7 @@ export class WebServer extends EventEmitter {
       persistRebootRestoreDurably: this.persistRebootRestoreDurably.bind(this),
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
+      dropSupervisorManagementState: this.dropSupervisorManagementState.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
       persistSessionState: this.persistSessionState.bind(this),
       persistSessionStateNow: this._persistSessionStateNow.bind(this),

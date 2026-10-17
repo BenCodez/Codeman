@@ -4,6 +4,11 @@ import fsSync from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import Fastify from 'fastify';
+import { registerSessionRoutes } from '../src/web/routes/session-routes.js';
+import { installRouteErrorHandler } from '../src/web/route-error-handler.js';
+import { createMockRouteContext } from './mocks/index.js';
+import type { MuxSession } from '../src/mux-interface.js';
 import { BrainStore } from '../src/supervisor/brain.js';
 import { SupervisorAutomationStore } from '../src/supervisor/automation-store.js';
 import { initialSupervisorAutomationRecord } from '../src/supervisor/automation-schema.js';
@@ -27,6 +32,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await fs.rm(root, { recursive: true, force: true });
 });
 async function memory(id = ID, store = new BrainStore(join(root, 'brains'))) {
@@ -173,6 +179,7 @@ type Internal = {
   supervisorBrainStore: BrainStore;
   _doCleanupSession(id: string, kill: boolean, reason: string, layouts: boolean): Promise<void>;
   cleanupStaleSessions(): Promise<number>;
+  dropSupervisorManagementState(id: string, current: () => boolean): Promise<void>;
 };
 async function serverFixture(
   check: (f: {
@@ -275,3 +282,129 @@ it('startup stale cleanup prunes settled orphan metadata and preserves current h
     expect((await internal.supervisorBrainStore.read(OTHER, current)).exists).toBe(false);
     expect((await internal.supervisorBrainStore.read(UNKNOWN, current)).exists).toBe(true);
   }));
+
+it.each([
+  'delete',
+  'pinned',
+  'detach',
+  'state-failure',
+  'foreign-owner',
+  'remote-failure',
+  'remote-delete',
+  'replacement-row',
+  'replacement-pane',
+  'changed-owner',
+] as const)('persisted-only %s retires management data only after acknowledged current deletion', async (kind) =>
+  serverFixture(async ({ internal, session }) => {
+    internal.sessions.delete(ID);
+    const remote = {
+      host: 'worker.invalid',
+      user: 'fixture',
+      port: 22,
+      remotePath: '/fixture/work',
+      owned: true,
+    };
+    const isRemote = kind.startsWith('remote-') || kind === 'replacement-pane';
+    internal.store.setSession(ID, {
+      ...session.toState(),
+      ...(kind === 'pinned' ? { pinned: true } : {}),
+      ...(isRemote ? { remote } : {}),
+    });
+    let native: MuxSession | undefined = isRemote
+      ? ({
+          sessionId: ID,
+          muxName: 'fixture-pane',
+          pid: 700,
+          createdAt: 1000,
+          workingDir: root,
+          mode: 'codex',
+          owner: session.owner,
+          remote,
+          attached: false,
+        } as MuxSession)
+      : undefined;
+    const context = createMockRouteContext();
+    const kill = vi.fn(async () => {
+      if (kind === 'remote-failure') return false;
+      native = undefined;
+      return true;
+    });
+    Object.assign(context, {
+      sessions: internal.sessions,
+      store: internal.store,
+      mux: { ...context.mux, getSession: vi.fn(() => native), killPersistedOwnedRemoteSession: kill },
+      dropSupervisorManagementState: internal.dropSupervisorManagementState.bind(internal),
+    });
+    if (kind === 'state-failure')
+      vi.spyOn(internal.store, 'demoteOrRemoveSession').mockImplementation(() => {
+        throw Error('State retirement failed');
+      });
+    if (['replacement-row', 'replacement-pane', 'changed-owner'].includes(kind)) {
+      const drop = internal.supervisorAutomationStore.drop.bind(internal.supervisorAutomationStore);
+      vi.spyOn(internal.supervisorAutomationStore, 'drop').mockImplementation(async (...args) => {
+        if (kind === 'replacement-row')
+          internal.store.setSession(ID, { ...session.toState(), owner: 'replacement-owner' });
+        if (kind === 'replacement-pane')
+          native = {
+            sessionId: ID,
+            muxName: 'replacement-pane',
+            pid: 701,
+            createdAt: 2000,
+            workingDir: root,
+            mode: 'codex',
+            owner: session.owner,
+            remote,
+            attached: false,
+          } as MuxSession;
+        return drop(...args);
+      });
+      // The retired object remains the captured historical ownership witness.
+      if (kind === 'changed-owner') {
+        const before = internal.store.getSession(ID)!;
+        vi.mocked(internal.supervisorAutomationStore.drop).mockImplementation(async (...args) => {
+          before.owner = 'replacement-owner';
+          return drop(...args);
+        });
+      }
+    }
+    const app = Fastify();
+    installRouteErrorHandler(app);
+    vi.stubEnv('CODEMAN_MULTIUSER', '1');
+    app.addHook('preHandler', async (req) => {
+      req.authUser = {
+        username: kind === 'foreign-owner' ? 'other-owner' : 'fixture-owner',
+        role: 'user',
+      } as NonNullable<typeof req.authUser>;
+    });
+    const wake = registerSessionRoutes(app, context);
+    try {
+      const result = await app.inject({
+        method: 'DELETE',
+        url: '/api/sessions/' + ID + (kind === 'detach' ? '?killMux=false' : ''),
+      });
+      expect(result.statusCode).toBe(
+        kind === 'foreign-owner' ? 404 : ['state-failure', 'remote-failure'].includes(kind) ? 500 : 200
+      );
+      const removed = ['delete', 'pinned', 'remote-delete'].includes(kind);
+      expect(internal.supervisorAutomationStore.ids().includes(ID)).toBe(!removed);
+      expect(new SupervisorAutomationStore(join(root, 'automation.json')).ids().includes(ID)).toBe(!removed);
+      expect((await internal.supervisorBrainStore.read(ID, current)).exists).toBe(!removed);
+      if (kind === 'pinned')
+        expect(internal.store.getSession(ID)).toMatchObject({
+          pinned: true,
+          status: 'stopped',
+          pid: null,
+          owner: 'fixture-owner',
+        });
+      if (['state-failure', 'remote-failure', 'foreign-owner'].includes(kind))
+        expect(internal.store.getSession(ID)).not.toBeNull();
+      if (kind === 'remote-delete') expect(kill).toHaveBeenCalledTimes(1);
+      if (kind === 'replacement-pane') expect(native?.muxName).toBe('replacement-pane');
+      if (kind === 'replacement-row') expect(internal.store.getSession(ID)?.owner).toBe('replacement-owner');
+      expect(context.cleanupSession).not.toHaveBeenCalled();
+    } finally {
+      wake.stop();
+      await app.close();
+    }
+  })
+);
