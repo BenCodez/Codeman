@@ -152,7 +152,7 @@ describe('trustDialogNextKey', () => {
   });
 });
 
-describe('Session trust-dialog auto-accept', () => {
+describe('Session trust-dialog auto-accept', async () => {
   afterEach(() => vi.useRealTimers());
 
   /** A session whose pane renders `screen`, recording everything written to it. */
@@ -177,90 +177,99 @@ describe('Session trust-dialog auto-accept', () => {
       _interactiveStartedAt: number;
     };
     internals._interactiveStartedAt = Date.now();
-    return { session, writes, tick: () => internals._maybeAcceptTrustDialog() };
+    return {
+      session,
+      writes,
+      tick: async () => {
+        internals._maybeAcceptTrustDialog();
+        // Session input uses its real FIFO; settle its queued write without
+        // advancing the retry window or bypassing lifecycle/ownership guards.
+        await vi.advanceTimersByTimeAsync(0);
+      },
+    };
   }
 
-  it('presses Enter when the dialog is on screen', () => {
+  it('presses Enter when the dialog is on screen', async () => {
     vi.useFakeTimers();
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG);
-    tick();
+    await tick();
     expect(writes).toEqual(['\r']);
   });
 
-  it('walks the 2.1.252 dialog onto the trust option before it confirms', () => {
+  it('walks the 2.1.252 dialog onto the trust option before it confirms', async () => {
     vi.useFakeTimers();
     // The whole point: no Enter goes out while "No, exit" is highlighted.
     let screen = RENDERED_DIALOG_2_1_252;
     const { writes, tick } = sessionShowing(() => screen);
-    tick();
+    await tick();
     expect(writes).toEqual([TRUST_KEY_DOWN]);
 
     screen = RENDERED_DIALOG_2_1_252_ON_YES;
-    vi.advanceTimersByTime(2000);
-    tick();
+    await vi.advanceTimersByTimeAsync(2000);
+    await tick();
     expect(writes).toEqual([TRUST_KEY_DOWN, TRUST_KEY_CONFIRM]);
   });
 
-  it('never presses Enter while the cursor sits on "No, exit"', () => {
+  it('never presses Enter while the cursor sits on "No, exit"', async () => {
     vi.useFakeTimers();
     // A dialog that never moves (a dropped arrow, a wedged pane) must run out of
     // attempts pressing arrows, not answer *exit* on the way.
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG_2_1_252);
     for (let i = 0; i < 20; i++) {
-      tick();
-      vi.advanceTimersByTime(2000);
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
     }
     expect(writes).toEqual(Array(TRUST_DIALOG_MAX_ATTEMPTS).fill(TRUST_KEY_DOWN));
   });
 
-  it('retries a dropped keystroke, then gives up rather than typing forever', () => {
+  it('retries a dropped keystroke, then gives up rather than typing forever', async () => {
     vi.useFakeTimers();
     // Ink can drop a keystroke while it is still mounting the widget, so one
     // press is not always enough; a stuck dialog must not become an Enter loop.
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG);
     for (let i = 0; i < 20; i++) {
-      tick();
-      vi.advanceTimersByTime(2000);
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
     }
     expect(writes.length).toBe(TRUST_DIALOG_MAX_ATTEMPTS);
   });
 
-  it('stops once the dialog is answered', () => {
+  it('stops once the dialog is answered', async () => {
     vi.useFakeTimers();
     let screen = RENDERED_DIALOG;
     const { writes, tick } = sessionShowing(() => screen);
-    tick();
+    await tick();
     expect(writes).toEqual(['\r']);
 
     screen = RENDERED_MAIN_UI;
     for (let i = 0; i < 5; i++) {
-      vi.advanceTimersByTime(2000);
-      tick();
+      await vi.advanceTimersByTimeAsync(2000);
+      await tick();
     }
     expect(writes).toEqual(['\r']);
   });
 
-  it('never answers a dialog-looking screen outside the startup window', () => {
+  it('never answers a dialog-looking screen outside the startup window', async () => {
     vi.useFakeTimers();
     // A live agent can print this text hours in; only a launching pane can be
     // showing the real widget.
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG);
-    vi.advanceTimersByTime(10 * 60_000);
-    tick();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await tick();
     expect(writes).toEqual([]);
   });
 
-  it('reads the dialog that painted inside the throttle of the read before it', () => {
+  it('reads the dialog that painted inside the throttle of the read before it', async () => {
     vi.useFakeTimers();
     // Measured on 2.1.294: one read at +156 ms saw a blank pane, the dialog painted
     // within the throttle, and a quiet dialog sends no further output to read on.
     let screen = '';
     const { writes, tick } = sessionShowing(() => screen);
-    tick();
-    vi.advanceTimersByTime(500);
+    await tick();
+    await vi.advanceTimersByTimeAsync(500);
     screen = RENDERED_DIALOG_2_1_252;
-    tick(); // the dialog's own paint: throttled, and the last output the pane produces
-    vi.advanceTimersByTime(5000);
+    await tick(); // the dialog's own paint: throttled, and the last output the pane produces
+    await vi.advanceTimersByTimeAsync(5000);
     expect(writes[0]).toBe(TRUST_KEY_DOWN);
   });
 
@@ -269,10 +278,10 @@ describe('Session trust-dialog auto-accept', () => {
     // DELETE goes through stop(), and a read deferred just before it must not outlive it.
     let screen = '';
     const { session, tick } = sessionShowing(() => screen);
-    tick();
+    await tick();
     screen = RENDERED_DIALOG_2_1_252;
     const before = vi.getTimerCount();
-    tick(); // throttled, so a read is deferred
+    await tick(); // throttled, so a read is deferred
     expect(vi.getTimerCount()).toBe(before + 1);
     await session.stop(false);
     expect(vi.getTimerCount()).toBe(0);
@@ -285,19 +294,32 @@ describe('Session trust-dialog auto-accept', () => {
     const { session, tick } = sessionShowing(() => RENDERED_DIALOG_2_1_252);
     await session.stop(false);
     const log = vi.spyOn(console, 'log').mockImplementation(() => {});
-    tick();
-    tick(); // inside the throttle of the first
+    await tick();
+    await tick(); // inside the throttle of the first
     expect(vi.getTimerCount()).toBe(0);
     expect(log.mock.calls.some(([line]) => String(line).includes('trust dialog'))).toBe(false);
     log.mockRestore();
   });
 
-  it('does not press Enter on a normal screen', () => {
+  it('keeps a pending pane lifecycle veto before queuing a trust-dialog answer', async () => {
+    vi.useFakeTimers();
+    const { session, writes, tick } = sessionShowing(() => RENDERED_DIALOG);
+    Reflect.set(session, '_paneLifecycleOps', 1);
+    await tick();
+    expect(writes).toEqual([]);
+    Reflect.set(session, '_paneLifecycleOps', 0);
+    await vi.advanceTimersByTimeAsync(2000);
+    await tick();
+    expect(writes).toEqual([TRUST_KEY_CONFIRM]);
+    await session.stop(false);
+  });
+
+  it('does not press Enter on a normal screen', async () => {
     vi.useFakeTimers();
     const { writes, tick } = sessionShowing(() => RENDERED_MAIN_UI);
     for (let i = 0; i < 5; i++) {
-      tick();
-      vi.advanceTimersByTime(2000);
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
     }
     expect(writes).toEqual([]);
   });

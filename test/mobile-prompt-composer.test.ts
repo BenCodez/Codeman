@@ -127,7 +127,7 @@ describe('mobile prompt composer', () => {
     expect((document.querySelector('.prompt-composer-textarea') as HTMLTextAreaElement).value).toBe(input.value);
   });
 
-  it('pins shell paste and its delayed Enter to the original session across a tab switch', () => {
+  it('pins bracketed shell paste to the original session across a tab switch without submitting it', () => {
     const { app, bar, document, runTimers } = loadComposer();
     app.sessions.set('session-1', { mode: 'shell' });
     bar.pasteFromClipboard();
@@ -135,15 +135,16 @@ describe('mobile prompt composer', () => {
     app.activeSessionId = 'session-2';
     (document.querySelector('.paste-send') as HTMLButtonElement).click();
     runTimers();
-    expect(app._sendInputAsync.mock.calls).toEqual([
-      ['session-1', 'fixture command'],
-      ['session-1', '\r', { useMux: true }],
-    ]);
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', '\x1b[200~fixture command\x1b[201~']]);
   });
 
-  it.each(['  first line\nsecond line  \t', ' \t\n\n \t', 'λ🙂\n尾 \t'])(
-    'preserves shell paste %j through HTTP fallback, durable reload and a separate Enter',
-    async (text) => {
+  it.each([
+    ['  first line\nsecond line  \t', '\x1b[200~  first line\rsecond line  \t\x1b[201~'],
+    [' \t\n\n \t', '\x1b[200~ \t\r\r \t\x1b[201~'],
+    ['λ🙂\n尾 \t', '\x1b[200~λ🙂\r尾 \t\x1b[201~'],
+  ])(
+    'preserves shell paste %j through HTTP fallback and reload; only explicit owner Enter submits',
+    async (text, framed) => {
       const journal = browserInputJournal();
       const browser = journal.open(); // No WebSocket: actual POST fallback.
       const { app, bar, document, runTimers } = loadComposer();
@@ -156,18 +157,24 @@ describe('mobile prompt composer', () => {
       (document.querySelector('.paste-send') as HTMLButtonElement).click();
       await settleInput(browser.app);
       expect(browser.fetches.map(({ body }) => body)).toEqual([
-        { clientId: browser.app._clientId, seq: 1, input: text },
+        { clientId: browser.app._clientId, seq: 1, input: framed },
       ]);
       expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
-        { data: text, useMux: false },
+        { data: framed, useMux: false },
       ]);
-      // A failed prefix remains durable; the delayed Enter cannot overtake it.
+      // A failed paste stays durable. Timers and a tab switch cannot submit it.
       app.activeSessionId = 'session-2';
       runTimers();
       await settleInput(browser.app);
+      expect(journal.records()).toHaveLength(1);
+      expect(app._sendInputAsync).toHaveBeenCalledOnce();
+      // The owner returns to the original shell and explicitly presses Enter.
+      app.activeSessionId = 'session-1';
+      app._sendInputAsync(app.activeSessionId, '\r', { useMux: true });
+      await settleInput(browser.app);
       const records = journal.records().map(({ value }) => value);
       expect(records.map(({ data, useMux }) => ({ data, useMux }))).toEqual([
-        { data: text, useMux: false },
+        { data: framed, useMux: false },
         { data: '\r', useMux: true },
       ]);
       expect(records[1].after).toEqual({ cid: records[0].cid, seq: records[0].seq });
@@ -176,7 +183,7 @@ describe('mobile prompt composer', () => {
       reloaded.app._drainSession('session-1');
       await settleInput(reloaded.app);
       expect(reloaded.fetches).toEqual([
-        { sid: 'session-1', body: { clientId: records[0].cid, seq: records[0].seq, input: text } },
+        { sid: 'session-1', body: { clientId: records[0].cid, seq: records[0].seq, input: framed } },
         { sid: 'session-1', body: { clientId: records[1].cid, seq: records[1].seq, input: '\r', useMux: true } },
       ]);
       expect(journal.records()).toEqual([]);
@@ -184,22 +191,25 @@ describe('mobile prompt composer', () => {
     }
   );
 
-  it('keeps connected shell paste byte-exact while Enter remains a separate durable occurrence', () => {
+  it('keeps connected bracketed shell paste byte-exact and waits for a separate manual Enter', () => {
     const journal = browserInputJournal();
     const browser = journal.open();
     browser.socket('session-1');
     const { app, bar, document, runTimers } = loadComposer();
     app.sessions.set('session-1', { mode: 'shell' });
     app._sendInputAsync.mockImplementation((...args) => Reflect.apply(browser.app._sendInputAsync, browser.app, args));
-    const text = '  first\nlast \t';
+    const text = '  first\nlast \t',
+      framed = '\x1b[200~  first\rlast \t\x1b[201~';
     bar.pasteFromClipboard();
     (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = text;
     (document.querySelector('.paste-send') as HTMLButtonElement).click();
-    expect(browser.frames.map(({ d }) => d)).toEqual([text]);
+    expect(browser.frames.map(({ d }) => d)).toEqual([framed]);
     runTimers();
-    expect(browser.frames.map(({ d }) => d)).toEqual([text, '\r']);
+    expect(browser.frames.map(({ d }) => d)).toEqual([framed]);
+    app._sendInputAsync('session-1', '\r', { useMux: true });
+    expect(browser.frames.map(({ d }) => d)).toEqual([framed, '\r']);
     expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
-      { data: text, useMux: false },
+      { data: framed, useMux: false },
       { data: '\r', useMux: true },
     ]);
     expect(browser.fetches).toEqual([]);
@@ -702,8 +712,9 @@ describe('mobile prompt composer', () => {
     const script = new document.defaultView!.File(['#!/bin/sh'], 'run.sh', { type: 'text/x-shellscript' });
     Object.defineProperty(fileInput, 'files', { configurable: true, value: [video, pdf, script] });
 
+    app.activeSessionId = 'session-2';
     fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
-    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([video, pdf], { insert: false });
+    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([video, pdf], { sessionId: 'session-1', insert: false });
     await vi.waitFor(() => expect(textarea(document).value).toContain('/tmp/image-one.png'));
   });
 
@@ -737,9 +748,10 @@ describe('mobile prompt composer', () => {
         ],
       },
     });
+    app.activeSessionId = 'session-2';
     input.dispatchEvent(event);
     expect(event.defaultPrevented).toBe(true);
-    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([video], { insert: false });
+    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([video], { sessionId: 'session-1', insert: false });
   });
 });
 

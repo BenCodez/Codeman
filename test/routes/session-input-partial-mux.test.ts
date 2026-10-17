@@ -28,99 +28,135 @@ vi.mock('node:child_process', async () => {
   };
 });
 
-it.each([
-  [true, true, false],
-  [true, true, true],
-  [false, true, false],
-  [false, true, true],
-  [false, undefined, false],
-  [false, undefined, true],
-] as const)('never repeats actual partial mux input (tagged=%s,useMux=%s,wait=%s)', async (tagged, useMux, wait) => {
-  // Disable only TmuxManager's module-level no-op guard, behind mocked process
-  // APIs. Session and route imports retain runtime test mode; HOME is isolated.
-  const originalVitest = process.env.VITEST;
-  vi.resetModules();
-  let TmuxManager: typeof import('../../src/tmux-manager.js').TmuxManager;
-  try {
-    delete process.env.VITEST;
-    ({ TmuxManager } = await import('../../src/tmux-manager.js'));
-  } finally {
-    if (originalVitest === undefined) delete process.env.VITEST;
-    else process.env.VITEST = originalVitest;
-  }
-  const commands: string[] = [];
-  vi.mocked(exec).mockImplementation((...args: unknown[]) => {
-    const command = String(args[0]);
-    commands.push(command);
-    const callback = args.at(-1) as (err: Error | null, stdout: string, stderr: string) => void;
-    queueMicrotask(() => callback(command.endsWith(' Enter') ? new Error('Enter dispatch failed') : null, '', ''));
-    return { on: vi.fn(), kill: vi.fn(), pid: 12345 } as never;
-  });
-
-  const mux = new TmuxManager();
-  const app = Fastify({ logger: false });
-  try {
-    const muxSession = {
-      sessionId: 'test-session-1',
-      muxName: 'codeman-12345678',
-      pid: 12345,
-      createdAt: Date.now(),
-      workingDir: '/tmp',
-      mode: 'claude' as const,
-      attached: true,
-    };
-    mux.registerSession(muxSession);
-    const session = new Session({
-      id: muxSession.sessionId,
-      workingDir: '/tmp',
-      mode: 'claude',
-      mux,
-      muxSession,
-      useMux: true,
+it.each(
+  (
+    [
+      [true, true, false],
+      [true, true, true],
+      [false, true, false],
+      [false, true, true],
+      [false, undefined, false],
+      [false, undefined, true],
+    ] as const
+  ).flatMap((settings) => (['paste', 'enter'] as const).map((failure) => [...settings, failure] as const))
+)(
+  'never repeats actual partial mux input (tagged=%s,useMux=%s,wait=%s,failure=%s)',
+  async (tagged, useMux, wait, failure) => {
+    // Disable only TmuxManager's module-level no-op guard, behind mocked process
+    // APIs. Session and route imports retain runtime test mode; HOME is isolated.
+    const originalVitest = process.env.VITEST;
+    vi.resetModules();
+    let TmuxManager: typeof import('../../src/tmux-manager.js').TmuxManager;
+    try {
+      delete process.env.VITEST;
+      ({ TmuxManager } = await import('../../src/tmux-manager.js'));
+    } finally {
+      if (originalVitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = originalVitest;
+    }
+    const commands: string[] = [];
+    const deliveries: string[] = [];
+    const buffers = new Map<string, string>();
+    const effects: string[] = [];
+    vi.mocked(exec).mockImplementation((...args: unknown[]) => {
+      const command = String(args[0]);
+      commands.push(command);
+      const callback = args.at(-1) as (err: Error | null, stdout: string, stderr: string) => void;
+      let failed = false;
+      if (command.includes(' set-buffer ')) {
+        effects.push('set');
+        const buffer = /set-buffer -b (\S+) -- 'keep this literal'$/.exec(command);
+        expect(buffer).not.toBeNull();
+        buffers.set(buffer![1], 'keep this literal');
+      } else if (command.includes(' paste-buffer ')) {
+        effects.push('paste');
+        const name = /-b (\S+)/.exec(command)![1];
+        expect(command).toContain('paste-buffer -p -d');
+        expect(buffers.get(name)).toBe('keep this literal');
+        deliveries.push(buffers.get(name)!);
+        if (failure === 'paste')
+          failed = true; // bytes landed; acknowledgement did not
+        else buffers.delete(name);
+      } else if (command.includes(' delete-buffer ')) {
+        effects.push('discard');
+        buffers.delete(/-b (\S+)/.exec(command)![1]);
+      } else if (command.endsWith(' Enter')) {
+        effects.push('enter');
+        deliveries.push('\r');
+        failed = true; // submission may also have landed before the reply was lost
+      }
+      queueMicrotask(() => callback(failed ? new Error('Native input acknowledgement lost') : null, '', ''));
+      return { on: vi.fn(), kill: vi.fn(), pid: 12345 } as never;
     });
-    const directWrite = vi.fn();
-    (session as unknown as { ptyProcess: unknown }).ptyProcess = { write: directWrite };
-    const ctx = createMockRouteContext();
-    (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
-    await app.register(fastifyCookie);
-    registerSessionRoutes(app, ctx as never);
-    installRouteErrorHandler(app);
-    await app.ready();
-    const payload = {
-      input: 'keep this literal\r',
-      ...(useMux === undefined ? {} : { useMux }),
-      ...(tagged ? { clientId: 'browser', seq: 7 } : {}),
-      ...(wait ? { wait } : {}),
-    };
-    const send = () => app.inject({ method: 'POST', url: `/api/sessions/${session.id}/input`, payload });
 
-    const first = await send();
-    expect(first.statusCode).toBe(tagged || wait || useMux === undefined ? 500 : 200);
-    await vi.waitFor(() => expect(commands).toHaveLength(2));
-    expect(first.json()).not.toMatchObject({ retryable: true, notSent: true });
-    expect(commands).toHaveLength(2);
-    expect(commands[0]).toContain('-l');
-    expect(commands[0]).toContain('keep this literal');
-    expect(commands[1]).toMatch(/ Enter$/);
-    expect(session.lastInputSeq('browser')).toBe(tagged ? 7 : 0);
-    expect(directWrite).not.toHaveBeenCalled();
-    expect(sessionWaits.signalWaiterCount(session.id)).toBe(0);
+    const mux = new TmuxManager();
+    const app = Fastify({ logger: false });
+    try {
+      const muxSession = {
+        sessionId: 'test-session-1',
+        muxName: 'codeman-12345678',
+        pid: 12345,
+        createdAt: Date.now(),
+        workingDir: '/tmp',
+        mode: 'claude' as const,
+        attached: true,
+      };
+      mux.registerSession(muxSession);
+      const session = new Session({
+        id: muxSession.sessionId,
+        workingDir: '/tmp',
+        mode: 'claude',
+        mux,
+        muxSession,
+        useMux: true,
+      });
+      const directWrite = vi.fn();
+      (session as unknown as { ptyProcess: unknown }).ptyProcess = { write: directWrite };
+      const ctx = createMockRouteContext();
+      (ctx.sessions as unknown as Map<string, Session>).set(session.id, session);
+      await app.register(fastifyCookie);
+      registerSessionRoutes(app, ctx as never);
+      installRouteErrorHandler(app);
+      await app.ready();
+      const payload = {
+        input: 'keep this literal\r',
+        ...(useMux === undefined ? {} : { useMux }),
+        ...(tagged ? { clientId: 'browser', seq: 7 } : {}),
+        ...(wait ? { wait } : {}),
+      };
+      const send = () => app.inject({ method: 'POST', url: `/api/sessions/${session.id}/input`, payload });
 
-    if (!tagged) return;
-    const retry = await app.inject({
-      method: 'POST',
-      url: `/api/sessions/${session.id}/input`,
-      payload: { ...payload, wait: false },
-    });
-    expect(retry.statusCode).toBe(200);
-    expect(JSON.parse(String(retry.headers['x-codeman-input-ack']))).toEqual({ seq: 7, dup: true, last: 7 });
-    expect(commands).toHaveLength(2);
-    expect(directWrite).not.toHaveBeenCalled();
-  } finally {
-    await app.close();
-    mux.destroy();
+      const first = await send();
+      expect(first.statusCode).toBe(tagged || wait || useMux === undefined ? 500 : 200);
+      await vi.waitFor(() =>
+        expect(effects).toEqual(failure === 'paste' ? ['set', 'paste', 'discard'] : ['set', 'paste', 'enter'])
+      );
+      expect(first.json()).not.toMatchObject({ retryable: true, notSent: true });
+      expect(deliveries).toEqual(failure === 'paste' ? ['keep this literal'] : ['keep this literal', '\r']);
+      expect(buffers.size).toBe(0);
+      const originalEffects = [...effects],
+        originalDeliveries = [...deliveries];
+      expect(session.lastInputSeq('browser')).toBe(tagged ? 7 : 0);
+      expect(directWrite).not.toHaveBeenCalled();
+      expect(sessionWaits.signalWaiterCount(session.id)).toBe(0);
+
+      if (!tagged) return;
+      const retry = await app.inject({
+        method: 'POST',
+        url: `/api/sessions/${session.id}/input`,
+        payload: { ...payload, wait: false },
+      });
+      expect(retry.statusCode).toBe(200);
+      expect(JSON.parse(String(retry.headers['x-codeman-input-ack']))).toEqual({ seq: 7, dup: true, last: 7 });
+      expect(effects).toEqual(originalEffects);
+      expect(deliveries).toEqual(originalDeliveries);
+      expect(directWrite).not.toHaveBeenCalled();
+    } finally {
+      await app.close();
+      mux.destroy();
+    }
   }
-});
+);
 
 it('never repeats an untagged PTY fallback that throws after bytes land', async () => {
   const app = Fastify({ logger: false });

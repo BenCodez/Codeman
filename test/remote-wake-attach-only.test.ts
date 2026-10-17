@@ -1,4 +1,4 @@
-/** Actual wake/reconnect command generation may not create a missing owned Codex worker. */
+/** @fileoverview Actual wake/reconnect command generation may not create a missing owned Codex worker. */
 import { afterEach, beforeAll, expect, it, vi } from 'vitest';
 import type { MuxSession } from '../src/mux-interface.js';
 import type { Session as SessionType } from '../src/session.js';
@@ -162,16 +162,22 @@ it.each([
   'flushes ordinary %s owned=%s buffered input without controlled-worker identity requirements',
   async (mode, owned) => {
     const f = fixture(mode, owned, false);
-    const delivered = vi.spyOn(f.worker, 'writeViaMux').mockResolvedValue(true);
+    const delivered = vi.spyOn(f.worker, 'writeViaMux').mockImplementation(async (_data, options) => {
+      expect(options?.isCurrent?.()).toBe(true);
+      return true;
+    });
     expect(await f.registry.handleInput(f.worker, 'queued')).toBe('buffered');
     expect(await f.registry.wake(f.worker)).toBe(true);
-    expect(delivered).toHaveBeenCalledWith('queued', { fromUser: true });
+    expect(delivered).toHaveBeenCalledWith('queued', { fromUser: true, isCurrent: expect.any(Function) });
+    const authority = delivered.mock.calls[0][1]!.isCurrent!;
+    f.worker.remote!.host = 'replacement.invalid';
+    expect(authority()).toBe(false);
     expect(f.registry.pendingBytes(f.worker.id)).toBe(0);
   }
 );
 
 it.each(['completed', 'uncertain'] as const)(
-  'reattach cannot replace a pane between literal text and Enter (%s)',
+  'reattach cannot replace a pane between bracketed paste and Enter (%s)',
   async (outcome) => {
     const f = fixture('claude', true);
     let entering!: () => void, release!: () => void;
@@ -183,8 +189,12 @@ it.each(['completed', 'uncertain'] as const)(
     });
     const bytes: string[] = [];
     effects.exec.mockImplementation(async (command: string) => {
-      if (command.includes('send-keys') && command.includes(' -l ')) bytes.push('literal');
-      else if (command.includes('send-keys') && command.includes('Enter')) {
+      if (command.includes('set-buffer')) {
+        expect(command).toContain('literal');
+      } else if (command.includes('paste-buffer')) {
+        expect(command).toContain('paste-buffer -p -d');
+        bytes.push('paste');
+      } else if (command.includes('send-keys') && command.includes('Enter')) {
         entering();
         await pending;
         if (outcome === 'uncertain') throw new Error('Fixture lost Enter ACK');
@@ -201,7 +211,7 @@ it.each(['completed', 'uncertain'] as const)(
     );
     await entered;
     try {
-      expect(bytes).toEqual(['literal']);
+      expect(bytes).toEqual(['paste']);
       expect(f.worker.paneLifecycleInFlight).toBe(true);
       expect(await f.worker.reattachRemote()).toBe(false);
       expect(await f.registry.ensureAwake(f.worker)).toBe(false);
@@ -217,7 +227,7 @@ it.each(['completed', 'uncertain'] as const)(
     expect(f.command()).toContain('new-session -A');
     // A successful reconnect must never reopen a delivered or uncertain identity.
     expect(f.worker.shouldApplyInput(identity.clientId, identity.seq)).toBe(false);
-    expect(bytes).toEqual(outcome === 'completed' ? ['literal', 'Enter'] : ['literal']);
+    expect(bytes).toEqual(outcome === 'completed' ? ['paste', 'Enter'] : ['paste']);
   }
 );
 

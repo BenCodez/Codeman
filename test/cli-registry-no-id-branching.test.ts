@@ -97,13 +97,30 @@ const ALLOWED_BRANCHES: Record<string, Allowance> = {
   "web/routes/session-routes.ts::mode === 'grok'": allow(2, 'legacy <Mode>Config plumbing'),
   "web/routes/session-routes.ts::mode === 'deepseek'": allow(2, 'legacy <Mode>Config plumbing'),
   "web/server.ts::mode === 'opencode'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
-  "web/server.ts::mode === 'codex'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
   "web/server.ts::mode === 'gemini'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
   "web/server.ts::mode === 'antigravity'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
   "web/server.ts::mode === 'pi'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
   "web/server.ts::mode === 'grok'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
   "web/server.ts::mode === 'deepseek'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
   "web/server.ts::mode === 'omp'": allow(1, 'legacy <Mode>Config plumbing (session recovery)'),
+
+  // --- Exact Codex authority boundaries (not a general registry capability) ---
+  "session.ts::mode !== 'codex'": allow(
+    1,
+    'owner conversion installs a restricted Codex-only manager profile, bound to codexConfig and its exact conversation UUID'
+  ),
+  "session.ts::mode === 'codex'": allow(
+    1,
+    'owned SSH Codex reattachment must attach the existing exact worker; only explicit journaled recovery may recreate it'
+  ),
+  "tmux-manager.ts::mode !== 'codex'": allow(
+    1,
+    'cached owned SSH broker admission requires the original canonical Codex registration and configuration, not a new CLI grant'
+  ),
+  "web/server.ts::mode !== 'codex'": allow(
+    1,
+    'restricted supervisor preparation requires the canonical Codex manager profile and exact Codex identity, rather than a capability-based privilege grant'
+  ),
 
   // --- Claude's remote/docker command construction ---
   "tmux-manager.ts::mode === 'claude'": allow(
@@ -164,7 +181,6 @@ const ALLOWED_BRANCHES: Record<string, Allowance> = {
     'TUI resume builds a claude --resume; claude-transcript-only by construction'
   ),
   "tui/tui-render.ts::mode !== 'claude'": allow(1, 'cosmetic: suppress the mode badge for the default mode'),
-
 
   // Legacy <Mode>Config plumbing, same category as the `===` entries above.
   "web/routes/session-routes.ts::mode !== 'omp'": allow(

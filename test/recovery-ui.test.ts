@@ -39,7 +39,8 @@ function harness(initial = initialRecoveryState(), settings = false) {
   });
   browser.fetch = fetchMock;
   for (const file of [
-    ...(settings ? ['constants.js', 'settings-ui.js'] : []),
+    'constants.js',
+    ...(settings ? ['settings-ui.js'] : []),
     'api-client.js',
     'recovery-ui.js',
     'respawn-ui.js',
@@ -204,6 +205,7 @@ describe('Recovery Session Options', () => {
     h.app.openSessionOptions('session-a');
     await vi.waitFor(() => expect(h.app._recoveryView?.loading).toBe(false));
     expect(h.get('sessionOptionsModal').classList.contains('active')).toBe(true);
+    expect(h.get('promptCacheStatus').textContent).toMatch(/^Not reported yet\./);
     expect(h.get('recovery-tab').classList.contains('hidden')).toBe(false);
     expect(h.get('context-tab').classList.contains('hidden')).toBe(true);
     expect(h.doc.querySelector<HTMLElement>('[data-tab="recovery"]')!.style.display).toBe('');
