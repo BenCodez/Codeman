@@ -4124,6 +4124,24 @@ export class WebServer extends EventEmitter {
             if (!current() || !grant.isCurrent()) return refuse('scope', attempt);
             const observation = await adapter.observe(),
               context = session.getRecoveryContext();
+            // An append racing the native identity read supplies no authority.
+            // Retry only that missing-identity observation, within this same
+            // bounded scope; a different identity or any intent veto is final.
+            if (
+              attempt < 3 &&
+              current() &&
+              grant.isCurrent() &&
+              context.managed &&
+              !context.switchPending &&
+              !context.untrackedInput &&
+              !context.inputBrokerPending &&
+              !observation.conversationId &&
+              observation.activity === 'unknown' &&
+              observation.reason === 'identity-unverified'
+            ) {
+              await new Promise((resolve) => setTimeout(resolve, 25));
+              continue;
+            }
             if (
               !current() ||
               !grant.isCurrent() ||

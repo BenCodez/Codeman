@@ -469,6 +469,33 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it.each(['fresh', 'still-missing', 'different', 'owner-input', 'caller-revoked', 'blocked'] as const)(
+    'bounds missing scoped identity reads before requiring fresh authority: %s',
+    async (kind) => {
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const original = observe.getMockImplementation()!;
+      let attempts = 0;
+      let callerCurrent = true;
+      observe.mockImplementation(async function () {
+        attempts++;
+        const result = await original.call(this);
+        if (attempts === 1 || kind === 'still-missing') {
+          if (kind === 'owner-input') Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+          if (kind === 'caller-revoked') callerCurrent = false;
+          return { ...result, conversationId: undefined, activity: 'unknown', reason: 'identity-unverified' };
+        }
+        if (kind === 'different') return { ...result, conversationId: OTHER_THREAD };
+        if (kind === 'blocked') return { ...result, activity: 'blocked', reason: 'authentication-required' };
+        return result;
+      });
+      const authority = await manager.captureBrainAuthority(() => callerCurrent);
+      expect(!!authority?.()).toBe(kind === 'fresh');
+      expect(attempts).toBe(kind === 'still-missing' ? 3 : ['owner-input', 'caller-revoked'].includes(kind) ? 1 : 2);
+      expect(taskAct).not.toHaveBeenCalled();
+      expect(recoveryAct).not.toHaveBeenCalled();
+    }
+  );
+
   it('retains the manager task pause and runtime veto for global worker wake authority', async () => {
     const service = Reflect.get(server, 'managementService') as import('../src/management/store.js').ManagementService;
     const saved = await service.read('alice');
