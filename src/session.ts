@@ -1028,9 +1028,9 @@ export class Session extends EventEmitter {
     if (restoredConversation) this._claudeSessionId = restoredConversation;
     this._mux = config.mux || null;
     this._useMux = config.useMux ?? (this._mux !== null && this._mux.isAvailable());
-    this.on('recoveryUserInput', () => {
-      void this.revokeSupervisorManagerLaunch();
-    });
+    // Tracked owner teaching pauses task/recovery authority through their input
+    // listeners. Keep the exact restricted launch files: native Codex reloads
+    // them on each turn. Scope changes, raw input and explicit reset still revoke.
     this._muxSession = config.muxSession || null;
     if (
       this._muxSession?.recoveryInputBroker !== undefined ||

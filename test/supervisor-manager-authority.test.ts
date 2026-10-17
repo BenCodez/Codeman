@@ -549,7 +549,10 @@ describe('manager authority at the real server boundary', () => {
       vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
       vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
       expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(true);
-      managerTask.noteUserInput();
+      managerSession.emit('recoveryUserInput');
+      await managerTask.drain();
+      expect(managerSession.hasSupervisorManagerLaunch()).toBe(true);
+      expect(revoke).not.toHaveBeenCalled();
       // Hold the tracked input publication boundary. It grants no manager
       // operations while pending and must not destroy the exact profile.
       Reflect.set(managerSession, '_recoverySwitchPending', true);

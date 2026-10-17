@@ -705,3 +705,32 @@ describe('native thread settings ownership boundary', () => {
     }
   );
 });
+
+it('requires a new owner turn after the native workspace reload failure', () => {
+  const error = { message: 'failed to load workspace requirements', codex_error_info: 'other' };
+  const failure = [start(), complete(error)];
+  expect(classifyCodexTail(tail(...failure, start('later'), complete(undefined, 'later')), context())).toMatchObject({
+    activity: 'paused',
+    safeToAct: false,
+  });
+  const retry = [
+    { type: 'user_message', message: 'Retry after repairing configuration' },
+    start('later'),
+    complete(undefined, 'later'),
+  ];
+  expect(classifyCodexTail(tail(...failure, ...retry), context())).toMatchObject({
+    activity: 'completed',
+    reason: 'turn-completed',
+  });
+  for (const codex_error_info of ['unauthorized', 'usage_limit_exceeded', 'unrecognized_failure']) {
+    expect(
+      classifyCodexTail(tail(start(), complete({ ...error, codex_error_info }), ...retry), context())
+    ).toMatchObject({ activity: 'blocked', safeToAct: false });
+  }
+  expect(
+    classifyCodexTail(
+      tail(...failure, { type: 'request_permissions' }, start('later'), complete(undefined, 'later')),
+      context()
+    )
+  ).toMatchObject({ activity: 'paused', safeToAct: false });
+});

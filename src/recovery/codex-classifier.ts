@@ -328,6 +328,13 @@ function classifyError(error: JsonObject): { activity: RecoveryActivity; reason:
     return { activity: 'blocked', reason: 'usage-limit' };
   }
   if (kind === 'unauthorized') return { activity: 'blocked', reason: 'authentication-required' };
+  // Native Codex uses this exact terminal error when its per-turn config reload
+  // fails. An explicit new owner prompt may retry after the configuration is
+  // repaired; completion alone cannot clear the pause. Unknown errors and
+  // explicit auth/quota/permission events retain their independent vetoes.
+  if (kind === 'other' && message === 'failed to load workspace requirements')
+    return { activity: 'paused', reason: 'approval-required' };
+
   if (kind === 'activeturnnotsteerable' || kind === 'threadrollbackfailed') {
     return { activity: 'unknown', reason: 'observing' };
   }
