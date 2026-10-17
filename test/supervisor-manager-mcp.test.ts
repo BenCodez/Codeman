@@ -858,3 +858,30 @@ it('exposes bounded chat pagination and honest usage only through prepared manag
   expect(f.controller.message).not.toHaveBeenCalled();
   expect(f.generic).not.toHaveBeenCalled();
 });
+
+it('advertises exact canonical mode arguments in discovery and the manager prompt, without accepting aliases', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  const tools = (await f.rpc('tools/list')).json().result.tools;
+  expect(tools.find((t: { name: string }) => t.name === 'supervisor_brain').description).toContain('{"mode":"read"}');
+  expect(tools.find((t: { name: string }) => t.name === 'supervisor_agent').description).toContain(
+    '{"mode":"usage","agentId":"EXACT_AGENT_ID"}'
+  );
+  const { buildSupervisorManagerTask } = await import('../src/supervisor/manager-task.js');
+  const prompt = buildSupervisorManagerTask('Coordinate owner work').objective;
+  expect(prompt).toContain('{"mode":"read"}');
+  expect(prompt).toContain('{"mode":"usage","agentId":"EXACT_AGENT_ID"}');
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { mode: 'read' } })).json().error
+  ).toBeUndefined();
+  for (const [name, args] of [
+    ['supervisor_brain', { operation: 'read' }],
+    ['supervisor_brain', { action: 'read' }],
+    ['supervisor_agent', { action: 'usage', agentId: SID }],
+  ])
+    expect((await f.rpc('tools/call', { name, arguments: args })).json().error).toEqual({
+      code: -32602,
+      message: 'Invalid manager tool arguments',
+    });
+  expect(f.brain.read).toHaveBeenCalledOnce();
+  expect(f.management.usage).not.toHaveBeenCalled();
+});

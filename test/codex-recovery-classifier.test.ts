@@ -958,3 +958,68 @@ it('does not mistake plural usage-policy prose for a native singular limit notic
     )
   ).toMatchObject({ activity: 'blocked', reason: 'usage-limit', safeToAct: false });
 });
+
+it('closes only exact Codeman bridge invalid-argument failures without clearing other vetoes', () => {
+  const wrapper = (tool = 'supervisor_brain') =>
+    `tool call error: tool call failed for \`codeman_supervisor/${tool}\`\n\nCaused by:\n    Mcp error: -32602: Invalid manager tool arguments`;
+  const row = (message = wrapper(), patch: Payload = {}): Payload => ({
+    type: 'item_completed',
+    thread_id: THREAD,
+    turn_id: TURN,
+    started_at_ms: NOW - 9000,
+    completed_at_ms: NOW - 8000,
+    item: {
+      type: 'McpToolCall',
+      id: 'validation-call',
+      server: 'codeman_supervisor',
+      tool: 'supervisor_brain',
+      arguments: { action: 'read' },
+      status: 'failed',
+      error: { message },
+      duration: { secs: 0, nanos: 0 },
+      ...patch,
+    },
+  });
+  for (const tool of ['supervisor_brain', 'supervisor_agent'])
+    expect(classifyCodexTail(tail(start(), row(wrapper(tool), { tool }), complete()), context()).activity).toBe(
+      'completed'
+    );
+  for (const bad of [
+    row(wrapper().replace('-32602', '-32001')),
+    row(wrapper() + '\nAuthentication required'),
+    row(wrapper().replace('Invalid manager tool arguments', 'Permission denied')),
+    row(wrapper(), { server: 'other_server' }),
+    row(wrapper(), { tool: 'supervisor_agent' }),
+    row(wrapper('unknown_tool'), { tool: 'unknown_tool' }),
+  ])
+    expect(classifyCodexTail(tail(start(), bad, complete()), context())).toMatchObject({
+      activity: 'blocked',
+      safeToAct: false,
+    });
+  for (const veto of [
+    { type: 'exec_approval_request' },
+    { type: 'error', message: 'Unauthorized', codex_error_info: 'Unauthorized' },
+    { type: 'error', message: 'Limit exceeded', codex_error_info: 'UsageLimitExceeded' },
+  ])
+    expect(['paused', 'blocked']).toContain(
+      classifyCodexTail(tail(start(), veto, row(), complete()), context()).activity
+    );
+  const begin = {
+    ...row(),
+    type: 'item_started',
+    completed_at_ms: undefined,
+    item: {
+      type: 'McpToolCall',
+      id: 'pending-other',
+      server: 'codeman_supervisor',
+      tool: 'supervisor_status',
+      arguments: {},
+      status: 'inProgress',
+    },
+  };
+  expect(classifyCodexTail(tail(start(), begin, row(), complete()), context())).toMatchObject({
+    activity: 'watching',
+    reason: 'background-work',
+    safeToAct: false,
+  });
+});

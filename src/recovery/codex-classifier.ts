@@ -929,6 +929,16 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
           if (error.message === 'MCP tool call requires approval, but approval policy is never') {
             update('paused', 'approval-required');
             latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else if (
+            item.server === 'codeman_supervisor' &&
+            /^supervisor_(?:status|workers|assign|retry|message|brain|agents|agent|gitlab)$/.test(String(item.tool)) &&
+            error.message ===
+              'tool call error: tool call failed for `codeman_supervisor/' +
+                item.tool +
+                '`\n\nCaused by:\n    Mcp error: -32602: Invalid manager tool arguments'
+          ) {
+            // This exact bridge validation response precedes every tool effect.
+            // Close only this call; retain all other pending/control vetoes.
           } else {
             const failure = classifyError(error);
             update(failure.activity, failure.reason);
