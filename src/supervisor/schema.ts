@@ -55,7 +55,6 @@ export const SupervisorConfigSchema = z
     enabled: z.boolean(),
     workers: z
       .array(SupervisorWorkerSchema.omit({ assignments: true, startedAt: true, lastRequestId: true, messages: true }))
-      .min(1)
       .max(12),
   })
   .strict()

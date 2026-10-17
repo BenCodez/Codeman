@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from '../src/recovery/codex-evidence-limits.js';
 /**
  * @fileoverview Sanitized fixture tests for recovery's strict Codex identity reader.
  * No Codex process, tmux or SSH is started. Every store lives below the isolated HOME.
@@ -458,13 +459,26 @@ describe('corrupt and over-budget stores', () => {
     expect(await resolveCodexIdentity(request())).toEqual({ reason: 'unverified' });
   });
 
+  it('verifies the entire larger conversation and its byte witness, never a suffix', async () => {
+    const body = (JSON.stringify({ type: 'response_item', payload: { text: 'x'.repeat(1024) } }) + '\n').repeat(2500);
+    expect(Buffer.byteLength(body)).toBeGreaterThan(2_097_152);
+    const path = await rollout(A, {}, CREATED, store, body);
+    const result = await resolveCodexIdentity(request());
+    expect(result.tailTruncated).toBe(false);
+    expect(result.tail).toBe(await fs.readFile(path, 'utf8'));
+    const { checkCodexIdentityWitness } = await import('../src/recovery/codex-witness-check.js');
+    expect(await checkCodexIdentityWitness(result)).toBe(true);
+    await fs.appendFile(path, '{"partial":');
+    expect(await checkCodexIdentityWitness(result)).toBe(false);
+  });
+
   it('bounds the selected tail and drops its leading partial line', async () => {
     await rollout(
       A,
       {},
       CREATED,
       store,
-      JSON.stringify({ payload: 'x'.repeat(300 * 1024) }) + '\n' + '{"last":true}\n'
+      JSON.stringify({ payload: 'x'.repeat(MAX_CODEX_ROLLOUT_BYTES + 4096) }) + '\n' + '{"last":true}\n'
     );
     const result = await resolveCodexIdentity(request());
     expect(result).toMatchObject({
@@ -473,7 +487,7 @@ describe('corrupt and over-budget stores', () => {
       tail: '{"last":true}\n',
       tailTruncated: true,
     });
-    expect(Buffer.byteLength(result.tail!)).toBeLessThanOrEqual(256 * 1024);
+    expect(Buffer.byteLength(result.tail!)).toBeLessThanOrEqual(MAX_CODEX_ROLLOUT_BYTES);
   });
 
   it('refuses an incomplete selected tail', async () => {

@@ -6,6 +6,11 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { ManagerCredentialRegistry } from '../src/supervisor/manager-credentials.js';
 import { registerAuthMiddleware, registerHostGuard } from '../src/web/middleware/auth.js';
 import { registerSupervisorMcpRoutes } from '../src/web/routes/supervisor-mcp-routes.js';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { GitLabService, GitLabError } from '../src/management/gitlab.js';
+import { BrainStoreError } from '../src/supervisor/brain.js';
 import { createDeferred } from './mocks/index.js';
 import { findUser } from '../src/user-store.js';
 
@@ -30,7 +35,9 @@ async function fixture(
   password = 'owner-password',
   multiuser = false,
   initiallyAborted = false,
-  initiallyReady = true
+  initiallyReady = true,
+  withManagement = false,
+  withGitLab = false
 ) {
   vi.stubEnv('CODEMAN_MULTIUSER', multiuser ? '1' : '0');
   vi.stubEnv('CODEMAN_PASSWORD', password);
@@ -77,12 +84,52 @@ async function fixture(
       if (!isCurrent?.()) throw Error('cancelled');
       return state;
     }),
+    confirmManagerLaunch: vi.fn(async () => true),
     captureBrainAuthority: vi.fn(async (isCurrent: () => boolean) => (isCurrent() ? isCurrent : undefined)),
   };
   const resolve = vi.fn((scope) =>
     scope.sessionId === SID && scope.owner === (multiuser ? 'alice' : undefined) ? controller : undefined
   );
+  const management = {
+    conversation: vi.fn(async (_scope, _id, options: { cursor?: string; limit?: number }, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return {
+        messages: [{ role: 'assistant', text: 'Project chat' }],
+        nextCursor: options.cursor ?? null,
+        trust: 'untrusted-context',
+        authority: 'none',
+      };
+    }),
+    usage: vi.fn(async (_scope, _id, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { counters: { source: 'codeman-session-counter-estimate' }, providerQuota: { status: 'unavailable' } };
+    }),
+    observe: vi.fn(async (_scope, _id, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { output: 'Project API', trust: 'untrusted-context', identityVerified: false };
+    }),
+    directory: vi.fn(async (_scope, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { agents: [{ sessionId: WORKER, mode: 'shell', remote: true }] };
+    }),
+    thread: vi.fn(async (_scope, _id, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { messages: [{ direction: 'agent', message: 'I maintain the API' }] };
+    }),
+    message: vi.fn(async (_scope, _id, _request, _message, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { queued: true };
+    }),
+  };
   const brain = {
+    sync: vi.fn(async (_scope, _input, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { status: 'pending' };
+    }),
+    replace: vi.fn(async (_scope, _id, _markdown, _revision, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { revision: 'c'.repeat(64) };
+    }),
     read: vi.fn(async (_scope, current: () => boolean) => {
       if (!current()) throw Error('cancelled');
       return { content: 'Owner teaching', revision: REVISION };
@@ -92,7 +139,19 @@ async function fixture(
       return { revision: 'b'.repeat(64) };
     }),
   };
-  registerSupervisorMcpRoutes(app, { credentials: registry, resolveController: resolve, brain } as never);
+  const gitlab = {
+    operate: vi.fn(async (_scope, _input, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { projects: [] };
+    }),
+  };
+  registerSupervisorMcpRoutes(app, {
+    credentials: registry,
+    resolveController: resolve,
+    brain,
+    ...(withManagement ? { management } : {}),
+    ...(withGitLab ? { gitlab } : {}),
+  } as never);
   const generic = vi.fn(async () => ({ success: true }));
   for (const path of [
     '/api/sessions',
@@ -121,6 +180,8 @@ async function fixture(
     issued,
     controller,
     brain,
+    gitlab,
+    management,
     resolve,
     generic,
     rpc,
@@ -161,7 +222,7 @@ it('initializes and lists exactly six scoped tools, then invokes exact owner-sel
     required: ['mode'],
     additionalProperties: false,
     properties: {
-      mode: { enum: ['read', 'append'] },
+      mode: { enum: ['read', 'append', 'replace', 'sync_status', 'sync_preview', 'sync_publish'] },
       note: { maxLength: 2000 },
       ifMatch: { pattern: '^[a-f0-9]{64}$' },
     },
@@ -574,4 +635,412 @@ it('advertises the same non-whitespace message constraint that runtime admission
     expect(f.controller.message).toHaveBeenLastCalledWith(WORKER, REQUEST, message, expect.any(Function));
   }
   expect(f.controller.message).toHaveBeenCalledTimes(3);
+});
+
+it('exposes global agent discovery and cooperative messages without calling native worker handlers', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  expect((await f.rpc('tools/list')).json().result.tools.map((t: { name: string }) => t.name)).toEqual([
+    ...TOOLS,
+    'supervisor_agents',
+    'supervisor_agent',
+  ]);
+  const directory = (await f.rpc('tools/call', { name: 'supervisor_agents', arguments: {} })).json();
+  expect(directory.error).toBeUndefined();
+  expect(f.management.directory).toHaveBeenCalledOnce();
+  for (const args of [
+    { mode: 'read', agentId: WORKER },
+    { mode: 'observe', agentId: WORKER },
+    { mode: 'message', agentId: WORKER, requestId: REQUEST, message: 'Tell me your project and current role.' },
+  ]) {
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: args })).json().error).toBeUndefined();
+  }
+  expect(f.management.observe).toHaveBeenCalledOnce();
+  expect(f.management.thread).toHaveBeenCalledOnce();
+  expect(f.management.message).toHaveBeenCalledOnce();
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.generic).not.toHaveBeenCalled();
+  f.setReady(false);
+  expect(
+    (
+      await f.rpc('tools/call', {
+        name: 'supervisor_agent',
+        arguments: { mode: 'message', agentId: WORKER, requestId: REQUEST, message: 'Wait' },
+      })
+    ).json().error.code
+  ).toBe(-32001);
+});
+
+it('allows revision-checked brain rewrites only with fresh prepared-manager authority', async () => {
+  const f = await fixture();
+  const args = {
+    mode: 'replace',
+    requestId: REQUEST,
+    markdown: '# Goals\nPreserve owner limits.\n## Agents\nAPI worker: backend.',
+    ifMatch: REVISION,
+  };
+  const schema = (await f.rpc('tools/list'))
+    .json()
+    .result.tools.find((t: { name: string }) => t.name === 'supervisor_brain').inputSchema;
+  expect(new Ajv().compile(schema)(args)).toBe(true);
+  expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toBeUndefined();
+  expect(f.brain.replace).toHaveBeenCalledOnce();
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+  expect(
+    (
+      await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { ...args, requestId: 'rewrite-second' } })
+    ).json().error.code
+  ).toBe(-32001);
+  expect(f.brain.replace).toHaveBeenCalledOnce();
+});
+
+it('gates GitLab reads and writes on current prepared manager authority and strict inputs', async () => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  const listed = (await f.rpc('tools/list')).json().result.tools;
+  expect(listed.map((tool: { name: string }) => tool.name)).toEqual([...TOOLS, 'supervisor_gitlab']);
+  const call = (args: unknown) => f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: args });
+  expect((await call({ operation: 'projects' })).json().error).toBeUndefined();
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  f.setReady(false);
+  expect((await call({ operation: 'projects' })).json().error.code).toBe(-32001);
+  f.setReady(true);
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+  expect((await call({ operation: 'projects' })).json().error.code).toBe(-32001);
+  for (const args of [
+    { operation: 'projects', token: 'synthetic' },
+    { operation: 'merge', projectId: 1 },
+    { operation: 'update_file', projectId: 1, branch: 'codeman/fix', path: '../unsafe' },
+  ])
+    expect((await call(args)).json().error.code).toBe(-32602);
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  f.controller.captureBrainAuthority.mockImplementationOnce(async (current) => {
+    f.revoke();
+    return current;
+  });
+  expect((await call({ operation: 'projects' })).json().error.code).toBe(-32001);
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  expect(f.generic).not.toHaveBeenCalled();
+});
+
+it('blocks manager tools after current native authentication proof is lost', async () => {
+  const f = await fixture('owner-password', false, false, true, true, true);
+  f.controller.confirmManagerLaunch.mockResolvedValue(false);
+  for (const [name, args] of [
+    ['supervisor_status', {}],
+    ['supervisor_brain', { mode: 'read' }],
+    ['supervisor_agents', {}],
+    ['supervisor_gitlab', { operation: 'projects' }],
+    ['supervisor_assign', { workerId: WORKER, requestId: REQUEST }],
+  ] as const)
+    expect((await f.rpc('tools/call', { name, arguments: args })).json().error.code).toBe(-32001);
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.brain.read).not.toHaveBeenCalled();
+  expect(f.management.directory).not.toHaveBeenCalled();
+  expect(f.gitlab.operate).not.toHaveBeenCalled();
+});
+
+it('requires current prepared authority for observation and rejects wider observation requests', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  for (const arguments_ of [
+    { mode: 'observe', agentId: SID },
+    { mode: 'observe', agentId: WORKER, command: 'capture-pane' },
+  ]) {
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: arguments_ })).json().error).toBeDefined();
+  }
+  expect(f.management.observe).not.toHaveBeenCalled();
+  f.setReady(false);
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode: 'observe', agentId: WORKER } })).json()
+      .error.code
+  ).toBe(-32001);
+  expect(f.management.observe).not.toHaveBeenCalled();
+});
+
+it('accepts native first-page discovery and MCP metadata without expanding tool authority', async () => {
+  const f = await fixture();
+  for (const method of ['tools/list', 'resources/list', 'resources/templates/list']) {
+    for (const params of [
+      { cursor: null },
+      { cursor: '' },
+      { _meta: { progressToken: 7 } },
+      { cursor: null, _meta: { progressToken: 'list' } },
+    ]) {
+      const response = (await f.rpc(method, params)).json();
+      expect(response.error).toBeUndefined();
+      if (method === 'tools/list')
+        expect(response.result.tools.map((tool: { name: string }) => tool.name)).toEqual(TOOLS);
+    }
+    for (const params of [
+      { cursor: 'foreign' },
+      { cursor: 1 },
+      { _meta: null },
+      { _meta: { note: 'x'.repeat(4097) } },
+      { arbitrary: true },
+    ])
+      expect((await f.rpc(method, params)).json().error.code).toBe(-32602);
+  }
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_status', arguments: {}, _meta: { progressToken: 1 } })).json().error
+  ).toBeUndefined();
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_status', arguments: { rawInput: 'forbidden' }, _meta: {} })).json()
+      .error
+  ).toBeDefined();
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.retry).not.toHaveBeenCalled();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.generic).not.toHaveBeenCalled();
+});
+
+it('records discovery only after valid authenticated initialization and tools listing', async () => {
+  const f = await fixture();
+  await f.rpc('tools/list');
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('initialize', { protocolVersion: '2025-03-26' });
+  await f.rpc('tools/list');
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'native-fixture', version: '1' },
+  });
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('tools/list', { cursor: 12 });
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('tools/list', { _meta: {}, cursor: undefined });
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(true);
+  f.revoke();
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+});
+
+it('exposes bounded chat pagination and honest usage only through prepared manager authority', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  const listed = (await f.rpc('tools/list')).json().result.tools;
+  const schema = listed.find((tool: { name: string }) => tool.name === 'supervisor_agent').inputSchema;
+  const validate = new Ajv().compile(schema);
+  const cursor = 'a'.repeat(48);
+  for (const args of [
+    { mode: 'conversation', agentId: WORKER },
+    { mode: 'conversation', agentId: WORKER, cursor, limit: 3 },
+    { mode: 'usage', agentId: WORKER },
+  ]) {
+    expect(validate(args)).toBe(true);
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: args })).json().error).toBeUndefined();
+  }
+  expect(f.management.conversation).toHaveBeenCalledTimes(2);
+  expect(f.management.conversation).toHaveBeenLastCalledWith(
+    expect.objectContaining({ sessionId: SID }),
+    WORKER,
+    { cursor, limit: 3 },
+    expect.any(Function)
+  );
+  expect(f.management.usage).toHaveBeenCalledOnce();
+  for (const args of [
+    { mode: 'conversation', agentId: WORKER, path: '/fixture/private' },
+    { mode: 'conversation', agentId: WORKER, cursor: '../outside' },
+    { mode: 'conversation', agentId: WORKER, limit: 41 },
+    { mode: 'conversation', agentId: WORKER, message: 'run a command' },
+    { mode: 'usage', agentId: WORKER, limit: 2 },
+    { mode: 'usage', agentId: WORKER, cursor },
+    { mode: 'observe', agentId: WORKER, cursor },
+  ]) {
+    expect(validate(args)).toBe(false);
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: args })).json().error.code).toBe(-32602);
+  }
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode: 'conversation', agentId: SID } })).json()
+      .error.code
+  ).toBe(-32602);
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode: 'usage', agentId: SID } })).json().error
+  ).toBeUndefined();
+  for (const mode of ['conversation', 'usage']) {
+    f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+    expect(
+      (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode, agentId: WORKER } })).json().error.code
+    ).toBe(-32001);
+  }
+  expect(f.management.conversation).toHaveBeenCalledTimes(2);
+  expect(f.management.usage).toHaveBeenCalledTimes(2);
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.controller.retry).not.toHaveBeenCalled();
+  expect(f.controller.message).not.toHaveBeenCalled();
+  expect(f.generic).not.toHaveBeenCalled();
+});
+
+it('advertises exact canonical mode arguments in discovery and the manager prompt, without accepting aliases', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  const tools = (await f.rpc('tools/list')).json().result.tools;
+  expect(tools.find((t: { name: string }) => t.name === 'supervisor_brain').description).toContain('{"mode":"read"}');
+  expect(tools.find((t: { name: string }) => t.name === 'supervisor_agent').description).toContain(
+    '{"mode":"usage","agentId":"EXACT_AGENT_ID"}'
+  );
+  const { buildSupervisorManagerTask } = await import('../src/supervisor/manager-task.js');
+  const prompt = buildSupervisorManagerTask('Coordinate owner work').objective;
+  expect(prompt).toContain('{"mode":"read"}');
+  expect(prompt).toMatch(/\{"mode":"usage","agentId":"[A-Z_]+"\}/);
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { mode: 'read' } })).json().error
+  ).toBeUndefined();
+  for (const [name, args] of [
+    ['supervisor_brain', { operation: 'read' }],
+    ['supervisor_brain', { action: 'read' }],
+    ['supervisor_agent', { action: 'usage', agentId: SID }],
+  ])
+    expect((await f.rpc('tools/call', { name, arguments: args })).json().error).toEqual({
+      code: -32602,
+      message: 'Invalid manager tool arguments',
+    });
+  expect(f.brain.read).toHaveBeenCalledOnce();
+  expect(f.management.usage).not.toHaveBeenCalled();
+});
+
+it.each(['sync_status', 'sync_preview', 'sync_publish'] as const)(
+  'binds GitLab memory %s to prepared manager evidence',
+  async (mode) => {
+    const f = await fixture();
+    const args = {
+      mode,
+      ...(mode === 'sync_publish'
+        ? {
+            requestId: REQUEST,
+            localRevision: REVISION,
+            remoteLastCommitId: 'a'.repeat(40),
+            remoteHash: 'b'.repeat(64),
+          }
+        : {}),
+    };
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error).toBeUndefined();
+    expect(f.brain.sync).toHaveBeenCalledWith(f.registry.resolve(f.issued.token), args, expect.any(Function));
+    f.brain.sync.mockClear();
+    f.controller.captureBrainAuthority.mockResolvedValueOnce(undefined as never);
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: args })).json().error.code).toBe(-32001);
+    expect(f.brain.sync).not.toHaveBeenCalled();
+  }
+);
+it('does not expose owner-only GitLab brain configuration or import through manager tools', async () => {
+  const f = await fixture();
+  for (const mode of ['sync_configure', 'sync_pull'])
+    expect((await f.rpc('tools/call', { name: 'supervisor_brain', arguments: { mode } })).json().error.code).toBe(
+      -32602
+    );
+  expect(f.brain.sync).not.toHaveBeenCalled();
+});
+
+it.each([
+  { operation: 'projects' },
+  { operation: 'tree', projectId: 1, branch: 'main' },
+  { operation: 'file', projectId: 1, branch: 'main', path: 'README.md' },
+  { operation: 'merge_requests', projectId: 1 },
+  { operation: 'merge_request', projectId: 1, iid: 1 },
+])('reports refused GitLab read $operation without poisoning later tools or replaying', async (args) => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  f.gitlab.operate.mockRejectedValueOnce(new GitLabError('unavailable'));
+  const response = (await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: args })).json();
+  expect(response.error).toBeUndefined();
+  expect(JSON.parse(response.result.content[0].text)).toEqual({
+    available: false,
+    readOnly: true,
+    authority: 'none',
+    reason: 'gitlab-read-unavailable',
+  });
+  expect(f.gitlab.operate).toHaveBeenCalledOnce();
+  expect((await f.rpc('tools/call', { name: 'supervisor_status', arguments: {} })).json().error).toBeUndefined();
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } })).json().error
+  ).toBeUndefined();
+  expect(f.gitlab.operate).toHaveBeenCalledTimes(2);
+});
+it('keeps writes, permission loss, uncertainty and unknown GitLab errors strict', async () => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  const call = (args: unknown) => f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: args });
+  const write = {
+    operation: 'create_branch',
+    projectId: 1,
+    branch: 'codeman/fix',
+    startCommit: 'a'.repeat(40),
+    requestId: 'safe-request',
+  };
+  for (const error of [new GitLabError('unavailable'), new BrainStoreError('uncertain')]) {
+    f.gitlab.operate.mockRejectedValueOnce(error);
+    expect((await call(write)).json().error.code).toBe(-32000);
+  }
+  for (const error of [
+    new GitLabError('forbidden'),
+    new BrainStoreError('uncertain'),
+    new Error('private malformed error'),
+  ]) {
+    f.gitlab.operate.mockRejectedValueOnce(error);
+    const response = (await call({ operation: 'projects' })).json();
+    expect(response.error.code).toBe(-32000);
+    expect(JSON.stringify(response)).not.toContain('private malformed');
+  }
+  f.gitlab.operate.mockRejectedValueOnce(new BrainStoreError('unavailable'));
+  expect((await call({ operation: 'projects' })).json().error).toBeUndefined();
+});
+it('does not soften GitLab read refusals after caller or captured prepared authority is revoked', async () => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(() => false);
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } })).json().error.code
+  ).toBe(-32001);
+  f.gitlab.operate.mockImplementationOnce(async () => {
+    f.revoke();
+    throw new GitLabError('unavailable');
+  });
+  const response = await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } });
+  expect(response.statusCode).toBe(401);
+  expect(response.json().result).toBeUndefined();
+});
+
+it('turns an actual GitLab MR HTTP 403 into unavailable read context while later scoped tools remain usable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'gitlab-mcp-read-'));
+  try {
+    const transport = vi.fn(
+      async () => new Response(JSON.stringify({ message: 'synthetic private denial' }), { status: 403 })
+    );
+    const service = new GitLabService({ root, transport });
+    const config = await service.read('fixture-owner');
+    await service.configure('fixture-owner', {
+      ifMatch: config.revision,
+      url: 'https://gitlab.example.invalid',
+      token: 'synthetic-token',
+      projectIds: [1],
+      allowWrite: false,
+    });
+    const f = await fixture('owner-password', false, false, true, false, true);
+    f.gitlab.operate.mockImplementation(
+      async (_scope, args, current) => service.operate('fixture-owner', args, current) as never
+    );
+    const response = (
+      await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'merge_requests', projectId: 1 } })
+    ).json();
+    expect(response.error).toBeUndefined();
+    expect(JSON.parse(response.result.content[0].text)).toMatchObject({
+      available: false,
+      readOnly: true,
+      authority: 'none',
+    });
+    expect(JSON.stringify(response)).not.toContain('synthetic private denial');
+    expect(transport).toHaveBeenCalledOnce();
+    expect((await f.rpc('tools/call', { name: 'supervisor_workers', arguments: {} })).json().error).toBeUndefined();
+    expect(transport).toHaveBeenCalledOnce();
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+it.each([true, false])('retains a prepared authority veto revoked during a GitLab read (throws=%s)', async (throws) => {
+  const f = await fixture('owner-password', false, false, true, false, true);
+  let live = true;
+  f.controller.captureBrainAuthority.mockResolvedValueOnce(() => live);
+  f.gitlab.operate.mockImplementationOnce(async () => {
+    live = false;
+    if (throws) throw new GitLabError('unavailable');
+    return { projects: [] };
+  });
+  const response = (
+    await f.rpc('tools/call', { name: 'supervisor_gitlab', arguments: { operation: 'projects' } })
+  ).json();
+  expect(response.error.code).toBe(-32001);
+  expect(response.result).toBeUndefined();
 });

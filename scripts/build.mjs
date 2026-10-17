@@ -124,6 +124,9 @@ run('minify terminal-ui.js', 'npx esbuild dist/web/public/terminal-ui.js --minif
 run('minify respawn-ui.js', 'npx esbuild dist/web/public/respawn-ui.js --minify --outfile=dist/web/public/respawn-ui.js --allow-overwrite');
 run('minify supervisor-ui.js', 'npx esbuild dist/web/public/supervisor-ui.js --minify --outfile=dist/web/public/supervisor-ui.js --allow-overwrite');
 run('minify ralph-panel.js', 'npx esbuild dist/web/public/ralph-panel.js --minify --outfile=dist/web/public/ralph-panel.js --allow-overwrite');
+run('minify management-brain-sync-ui.js', 'npx esbuild dist/web/public/management-brain-sync-ui.js --minify --outfile=dist/web/public/management-brain-sync-ui.js --allow-overwrite');
+run('minify management-gitlab-ui.js', 'npx esbuild dist/web/public/management-gitlab-ui.js --minify --outfile=dist/web/public/management-gitlab-ui.js --allow-overwrite');
+run('minify management-ui.js', 'npx esbuild dist/web/public/management-ui.js --minify --outfile=dist/web/public/management-ui.js --allow-overwrite');
 run('minify settings-ui.js', 'npx esbuild dist/web/public/settings-ui.js --minify --outfile=dist/web/public/settings-ui.js --allow-overwrite');
 run('minify panels-ui.js', 'npx esbuild dist/web/public/panels-ui.js --minify --outfile=dist/web/public/panels-ui.js --allow-overwrite');
 run('minify session-ui.js', 'npx esbuild dist/web/public/session-ui.js --minify --outfile=dist/web/public/session-ui.js --allow-overwrite');
@@ -155,6 +158,9 @@ console.log('\n[build] content-hash cache busting');
     'supervisor-ui.js',
     'ralph-panel.js',
     'settings-ui.js',
+    'management-ui.js',
+    'management-gitlab-ui.js',
+    'management-brain-sync-ui.js',
     'panels-ui.js',
     'session-ui.js',
     'ralph-wizard.js',

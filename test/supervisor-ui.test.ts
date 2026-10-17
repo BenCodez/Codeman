@@ -60,6 +60,19 @@ afterEach(() => {
 });
 
 describe('Codex supervisor UI', () => {
+  it('allows an enabled manager with an objective and no guarded worker plans to start', async () => {
+    const { app, get } = harness();
+    app._apiJson.mockResolvedValueOnce({
+      ...state(),
+      enabled: true,
+      objective: 'Coordinate enrolled SSH inbox agents',
+    });
+    expect(app.openSupervisorOptions(SID)).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(get('supervisorStartBtn').disabled).toBe(false);
+    expect(get('supervisorWorkerStatus').children.length).toBe(0);
+  });
+
   it.each([
     {
       label: 'local manager',
@@ -326,6 +339,46 @@ describe('Codex supervisor UI', () => {
     await h.app.supervisorAction('start');
     expect(h.app._apiJson.mock.calls[1][0]).toBe(`/api/sessions/${SID}/supervisor/start`);
     expect(read('index.html')).toMatch(/--no-daemon.*verified Codex identity/s);
+  });
+
+  it.each(['started', 'uncertain', 'refused', undefined])(
+    'retains setup request identity until a settled result: %s',
+    async (phase) => {
+      const h = harness();
+      h.app.openSupervisorOptions(SID);
+      await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+      vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
+      h.app._apiJson.mockClear();
+      h.app._apiJson.mockImplementation(async (url: string, options: any) =>
+        url.endsWith('/setup-manager') ? { sessionId: SID, requestId: options.body.requestId, phase } : state()
+      );
+      await h.app.setupAndStartSupervisorManager();
+      const [url, options] = h.app._apiJson.mock.calls[0];
+      expect(url).toBe(`/api/sessions/${SID}/supervisor/setup-manager`);
+      expect(options).toMatchObject({
+        method: 'POST',
+        body: { confirmRestrictedManager: true, requestId: expect.stringMatching(/^manager-setup-/) },
+      });
+      const retained = h.dom.window.sessionStorage.getItem(`codeman:managerSetup:${SID}`);
+      expect(retained).toBe(['started', 'refused'].includes(phase ?? '') ? null : options.body.requestId);
+      expect(h.app._apiJson.mock.calls.some(([path]: [string]) => path.endsWith('/start'))).toBe(false);
+      if (retained) {
+        await h.app.setupAndStartSupervisorManager();
+        expect(
+          h.app._apiJson.mock.calls.findLast(([path]: [string]) => path.endsWith('/setup-manager'))[1].body.requestId
+        ).toBe(retained);
+      }
+    }
+  );
+
+  it('does not prepare or start after cancelling the combined confirmation', async () => {
+    const h = harness();
+    h.app.openSupervisorOptions(SID);
+    await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+    vi.spyOn(h.dom.window, 'confirm').mockReturnValue(false);
+    h.app._apiJson.mockClear();
+    await h.app.setupAndStartSupervisorManager();
+    expect(h.app._apiJson).not.toHaveBeenCalled();
   });
 
   it('requires separate owner confirmation to prepare the exact manager without starting it', async () => {

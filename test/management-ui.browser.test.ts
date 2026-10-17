@@ -1,0 +1,481 @@
+/** Actual browser controls; intercepted requests and synthetic agents only. */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { chromium, type Browser } from 'playwright';
+
+const root = resolve(import.meta.dirname, '../src/web/public');
+const read = (name: string) => readFileSync(resolve(root, name), 'utf8');
+const html = read('index.html');
+const supervisorStart = html.indexOf('<section class="set-section hidden" id="supervisor-tab"');
+const supervisorMarkup = html.slice(supervisorStart, html.indexOf('</section>', supervisorStart) + '</section>'.length);
+const start = html.indexOf('<div class="modal" id="appSettingsModal">');
+const end = html.indexOf('<!-- Shortcut Overlay Modal -->', start);
+const worker = '22222222-2222-4222-8222-222222222222';
+const manager = '11111111-1111-4111-8111-111111111111';
+
+describe('Global management controls in Chromium', () => {
+  let browser: Browser;
+  beforeAll(async () => {
+    browser = await chromium.launch({
+      headless: true,
+      ...(process.env.CHROMIUM_EXECUTABLE_PATH ? { executablePath: process.env.CHROMIUM_EXECUTABLE_PATH } : {}),
+      args: ['--no-sandbox'],
+    });
+  });
+  afterAll(async () => browser?.close());
+  it.each([390, 1280])('saves global memory and queues cooperative SSH messages at %ipx', async (width) => {
+    const page = await browser.newPage({ viewport: { width, height: 900 } });
+    try {
+      await page.route('**/*', async (route) => {
+        if (route.request().isNavigationRequest())
+          await route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: `<!doctype html><html><head><style>${read('styles.css')}</style><style>${read('mobile.css')}</style></head><body>${html.slice(start, end)}<div id="sessionOptionsModal"><div id="sessionOptionsDoc">${supervisorMarkup}</div></div></body></html>`,
+          });
+        else await route.fulfill({ status: 204, body: '' });
+      });
+      await page.goto('http://codeman-management.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({ content: "window.__CODEMAN_BASE__ = '/codeman';" });
+      await page.addScriptTag({ content: read('constants.js') });
+      await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp = CodemanApp;' });
+      await page.addScriptTag({ content: read('supervisor-ui.js') });
+      await page.addScriptTag({ content: read('supervisor-automation-ui.js') });
+      await page.addScriptTag({ content: read('supervisor-brain-ui.js') });
+      await page.addScriptTag({ content: read('management-ui.js') });
+      await page.evaluate(
+        async ({ worker, manager }) => {
+          const calls: any[] = [];
+          const workTasks: any[] = [];
+          const app = new (window as any).CodemanApp();
+          app.showToast = () => undefined;
+          app.sessions = new Map([[manager, { mode: 'codex', supervisorAvailable: true }]]);
+          app.supportsSessionRecovery = () => true;
+          app._apiJson = async (url: string, options?: any) => {
+            calls.push({ url, options });
+            if (url.endsWith('/automation/owner-work')) {
+              const request = options.body;
+              if (!workTasks.some((task) => task.id === `owner-work-${request.requestId}`))
+                workTasks.push({
+                  id: `owner-work-${request.requestId}`,
+                  name: request.objective,
+                  instructions: request.completionCriteria,
+                  enabled: true,
+                  kind: 'once',
+                  maxRuns: 1,
+                });
+              return {
+                checkIns: { enabled: false, intervalMinutes: 60 },
+                tasks: workTasks,
+                status: { phase: 'idle', runs: [] },
+              };
+            }
+            if (url.endsWith('/supervisor/automation'))
+              return options?.method === 'PUT'
+                ? options.body
+                : {
+                    checkIns: { enabled: false, intervalMinutes: 60 },
+                    tasks: workTasks,
+                    status: { phase: 'idle', runs: [] },
+                  };
+            if (url.endsWith('/supervisor'))
+              return {
+                version: 1,
+                supervisorSessionId: manager,
+                objective: 'Manage SSH agents',
+                enabled: false,
+                phase: 'disabled',
+                reason: 'disabled',
+                workers: [],
+                handledRequestIds: [],
+                handledRequestBindings: [],
+                history: [],
+              };
+            if (url.endsWith('/enroll')) return { instructions: 'Private fixture enrollment capability' };
+            if (url.endsWith('/brain'))
+              return { markdown: options.body.markdown, revision: 'c'.repeat(64), exists: true, noteCount: 0 };
+            if (url.endsWith('/messages'))
+              return options?.method === 'POST'
+                ? { message: { ...options.body, direction: 'owner' }, duplicate: false }
+                : { messages: [{ direction: 'agent', message: 'I maintain remote builds.' }] };
+            return {
+              revision: 'a'.repeat(64),
+              managerSessionId: manager,
+              inboxEndpoint: 'http://codeman-management.test/codeman/api/management/agent-inbox',
+              brain: { markdown: '', revision: 'b'.repeat(64), exists: false, noteCount: 0 },
+              agents: [
+                {
+                  sessionId: manager,
+                  name: 'Local manager',
+                  mode: 'codex',
+                  remote: false,
+                  status: 'idle',
+                  role: '',
+                  notes: '',
+                  allowMessages: false,
+                  enrolled: false,
+                  pendingMessages: 0,
+                  managerAvailable: true,
+                },
+                {
+                  sessionId: worker,
+                  name: 'SSH Codex',
+                  mode: 'shell',
+                  remote: true,
+                  status: 'idle',
+                  role: 'Builds',
+                  notes: 'Existing shell agent',
+                  allowMessages: true,
+                  enrolled: true,
+                  pendingMessages: 0,
+                  managerAvailable: false,
+                },
+              ],
+            };
+          };
+          (window as any).app = app;
+          (window as any).managementCalls = calls;
+          document.getElementById('appSettingsModal')!.classList.add('active');
+          await app.loadManagementSettings();
+          document.getElementById('settings-management')!.scrollIntoView();
+        },
+        { worker, manager }
+      );
+      expect(await page.locator('#managementManagerControls #supervisor-tab').count()).toBe(1);
+      await page.getByRole('button', { name: 'Manager schedules and custom tasks', exact: true }).click();
+      await page.waitForFunction(
+        () => !(document.getElementById('supervisorAutomationSettings') as HTMLFieldSetElement)?.disabled
+      );
+      expect(await page.locator('#supervisorCheckInMinutes').inputValue()).toBe('60');
+      await page.locator('#supervisorCheckInMinutes').fill('90');
+      await page.locator('#supervisorCheckInsEnabled').check();
+      await page.getByRole('button', { name: 'Save schedules', exact: true }).click();
+      expect(
+        await page.evaluate(() =>
+          (window as any).managementCalls.some(
+            (call: any) =>
+              call.url.endsWith('/supervisor/automation') &&
+              call.options?.method === 'PUT' &&
+              call.options.body.checkIns.intervalMinutes === 90 &&
+              call.options.body.checkIns.enabled
+          )
+        )
+      ).toBe(true);
+      await page.locator('#managementWorkObjective').fill('Coordinate the API and UI change');
+      await page.locator('#managementWorkCriteria').fill('Required checks pass and owner review is requested');
+      await page.locator('#managementWorkStart').uncheck();
+      await page.getByRole('button', { name: 'Queue request', exact: true }).click();
+      await page.waitForFunction(() =>
+        document.getElementById('managementWorkStatus')?.textContent?.includes('Request queued')
+      );
+      expect(await page.locator('#managementWorkRequests').textContent()).toContain(
+        'waiting for the manager to be verified idle'
+      );
+      expect(await page.locator('#managementWorkObjective').inputValue()).toBe('');
+      expect(await page.locator('#managementWorkRequests').textContent()).not.toContain('work completed');
+      const memory = page.locator('#managementBrainMarkdown');
+      await memory.fill('The manager maintains a shared agent directory.');
+      await page.getByRole('button', { name: 'Save shared brain.md', exact: true }).click();
+      expect(await page.locator('#managementBrainStatus').textContent()).toContain('saved');
+      expect(await page.getByRole('button', { name: 'Connect existing agent', exact: true }).isEnabled()).toBe(false);
+      await page.getByRole('button', { name: 'Open agent inbox and replies', exact: true }).click();
+      await page.waitForFunction(() => {
+        const title = document.getElementById('managementAgentToolsTitle');
+        const rect = title?.getBoundingClientRect();
+        return !!rect && rect.top >= 0 && rect.bottom <= innerHeight && document.activeElement === title;
+      });
+      expect(await page.locator('#managementMessageThread').textContent()).toContain('remote builds');
+      await page.locator('#managementMessageDraft').fill('Please report build usage.');
+      await page.getByRole('button', { name: 'Queue message', exact: true }).click();
+      await page.waitForFunction(() =>
+        document.getElementById('managementAgentToolsStatus')?.textContent?.includes('must check its inbox')
+      );
+      expect(await page.locator('#managementAgentToolsStatus').textContent()).toContain('must check its inbox');
+      expect(await page.locator('#managementMessageDraft').inputValue()).toBe('');
+      page.once('dialog', (dialog) => void dialog.accept());
+      await page.getByRole('button', { name: 'Rotate connection instructions', exact: true }).click();
+      await page.waitForFunction(() => {
+        const rect = document.getElementById('managementAgentToolsTitle')?.getBoundingClientRect();
+        return !!rect && rect.top >= 0 && rect.bottom <= innerHeight;
+      });
+      await page.waitForFunction(() =>
+        (document.getElementById('managementEnrollmentInstructions') as HTMLTextAreaElement).value.includes(
+          'Private fixture enrollment capability'
+        )
+      );
+      expect(await page.locator('#managementEnrollmentInstructions').inputValue()).toContain(
+        'http://codeman-management.test/codeman/api/management/agent-inbox'
+      );
+      expect(
+        await page.evaluate(
+          () => (window as any).managementCalls.filter((call: any) => call.url.endsWith('/enroll')).length
+        )
+      ).toBe(1);
+
+      expect(
+        await page.evaluate(() => (window as any).managementCalls.every((call: any) => !call.url.includes('/input')))
+      ).toBe(true);
+      expect(
+        await page.locator('#settings-management').evaluate((node) => node.scrollWidth <= node.clientWidth + 1)
+      ).toBe(true);
+    } finally {
+      await page.close();
+    }
+  });
+  it('offers an empty manager picker a safe explicit local-session setup flow', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+    try {
+      await page.route('**/*', async (route) => {
+        if (route.request().isNavigationRequest())
+          await route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: `<!doctype html><html><head><style>${read('styles.css')}</style><style>${read('mobile.css')}</style></head><body>${html.slice(start, end)}</body></html>`,
+          });
+        else await route.fulfill({ status: 204, body: '' });
+      });
+      await page.goto('http://codeman-management.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp = CodemanApp;' });
+      await page.addScriptTag({ content: read('supervisor-brain-ui.js') });
+      await page.addScriptTag({ content: read('management-ui.js') });
+      await page.evaluate(
+        async ({ worker, manager }) => {
+          const calls: any[] = [];
+          const app = new (window as any).CodemanApp();
+          app.showToast = () => undefined;
+          app._ensureCreatedSessionVisible = async (id: string) => calls.push({ upsert: id });
+          app.selectSession = async (id: string) => calls.push({ opened: id });
+          app.closeAppSettings = () => document.getElementById('appSettingsModal')!.classList.remove('active');
+          app._apiJson = async (url: string, options?: any) => {
+            calls.push({ url, options });
+            if (url === '/api/sessions')
+              return { session: { id: manager, mode: 'codex', name: 'Management Codex', pid: null } };
+            return {
+              revision: 'a'.repeat(64),
+              managerSessionId: null,
+              brain: { markdown: '', revision: 'b'.repeat(64), exists: false, noteCount: 0 },
+              agents: [
+                {
+                  sessionId: worker,
+                  name: 'Existing SSH shell',
+                  mode: 'shell',
+                  remote: true,
+                  status: 'idle',
+                  role: '',
+                  notes: '',
+                  allowMessages: false,
+                  enrolled: false,
+                  pendingMessages: 0,
+                  managerAvailable: false,
+                },
+              ],
+            };
+          };
+          (window as any).app = app;
+          (window as any).managementCalls = calls;
+          document.getElementById('appSettingsModal')!.classList.add('active');
+          await app.loadManagementSettings();
+          document.getElementById('settings-management')!.scrollIntoView();
+        },
+        { worker, manager }
+      );
+      expect(await page.locator('#managementManager option').count()).toBe(1);
+      expect(await page.locator('#managementCreateStatus').textContent()).toContain('existing directory');
+      await page.locator('#managementCreateWorkingDir').fill('/tmp/owner-project');
+      await page.locator('#managementCreateCodexHome').fill('/synthetic/subscription-manager');
+      await page.getByRole('button', { name: 'Create local management Codex', exact: true }).click();
+      await page.waitForFunction(() => !document.getElementById('managementOpenCreatedSession')!.hidden);
+      expect(
+        await page.evaluate(() =>
+          (window as any).managementCalls
+            .filter((call: any) => call.url === '/api/sessions')
+            .map((call: any) => call.options.body)
+        )
+      ).toEqual([
+        {
+          name: 'Management Codex',
+          workingDir: '/tmp/owner-project',
+          mode: 'codex',
+          envOverrides: { CODEX_HOME: '/synthetic/subscription-manager' },
+          codexConfig: { noDaemon: true, noAltScreen: true, dangerouslyBypassApprovals: false },
+        },
+      ]);
+      expect(await page.evaluate(() => (window as any).managementCalls.some((call: any) => call.opened))).toBe(false);
+      expect(await page.locator('#managementCreateStatus').textContent()).toContain('one normal turn');
+      await page.getByRole('button', { name: 'Open new manager session', exact: true }).click();
+      expect(
+        await page.evaluate(() =>
+          (window as any).managementCalls.filter((call: any) => call.opened).map((call: any) => call.opened)
+        )
+      ).toEqual([manager]);
+      expect(
+        await page.evaluate(() =>
+          (window as any).managementCalls.some(
+            (call: any) => call.url?.includes('/supervisor/start') || call.url?.includes('/prepare-manager')
+          )
+        )
+      ).toBe(false);
+    } finally {
+      await page.close();
+    }
+  });
+  it.each(['submitted', 'blocked', 'unknown'] as const)(
+    'shows automatic enrollment and wake outcomes truthfully: %s',
+    async (status) => {
+      const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+      try {
+        await page.route('**/*', async (route) =>
+          route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: `<!doctype html><html><head><style>${read('styles.css')}</style><style>${read('mobile.css')}</style></head><body>${html.slice(start, end)}</body></html>`,
+          })
+        );
+        await page.goto('http://codeman-management.test', { waitUntil: 'domcontentloaded' });
+        await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp = CodemanApp;' });
+        await page.addScriptTag({ content: read('supervisor-brain-ui.js') });
+        await page.addScriptTag({ content: read('management-ui.js') });
+        await page.evaluate(
+          async ({ worker, status }) => {
+            const app = new (window as any).CodemanApp();
+            const calls: any[] = [];
+            const delivery = { status, ...(status === 'blocked' ? { needsConversion: true } : {}) };
+            app.showToast = () => undefined;
+            app._apiJson = async (url: string, options?: any) => {
+              calls.push({ url, options });
+              if (url.endsWith('/enroll')) return { instructions: 'Synthetic private enrollment', delivery };
+              if (url.endsWith('/messages'))
+                return options?.method === 'POST'
+                  ? { message: { ...options.body, direction: 'owner' }, duplicate: false, delivery }
+                  : { messages: [] };
+              return {
+                revision: 'a'.repeat(64),
+                managerSessionId: null,
+                inboxEndpoint: 'http://codeman-management.test/api/management/agent-inbox',
+                brain: { markdown: '', revision: 'b'.repeat(64), exists: false, noteCount: 0 },
+                agents: [
+                  {
+                    sessionId: worker,
+                    name: 'Backend Codex',
+                    mode: 'codex',
+                    remote: true,
+                    status: 'idle',
+                    role: 'Builds',
+                    notes: '',
+                    allowMessages: true,
+                    enrolled: false,
+                  },
+                ],
+              };
+            };
+            (window as any).app = app;
+            (window as any).managementCalls = calls;
+            document.getElementById('appSettingsModal')!.classList.add('active');
+            await app.loadManagementSettings();
+          },
+          { worker, status }
+        );
+        page.once('dialog', (dialog) => void dialog.accept());
+        await page.getByRole('button', { name: 'Connect existing agent', exact: true }).click();
+        const expected =
+          status === 'submitted'
+            ? 'Enrollment prompt submitted'
+            : status === 'blocked'
+              ? 'Convert this SSH shell'
+              : 'outcome is uncertain';
+        await page.waitForFunction(
+          (expected) => document.getElementById('managementAgentToolsStatus')?.textContent?.includes(expected),
+          expected
+        );
+        expect(await page.locator('#managementEnrollmentInstructions').inputValue()).toContain(
+          'Synthetic private enrollment'
+        );
+        await page.locator('#managementMessageDraft').fill('Report current PR ownership');
+        await page.getByRole('button', { name: 'Queue message', exact: true }).click();
+        expect(await page.locator('#managementAgentToolsStatus').textContent()).toContain(
+          status === 'submitted' ? 'Wake-up prompt submitted' : expected
+        );
+        const calls = await page.evaluate(() => (window as any).managementCalls);
+        expect(calls.find((call: any) => call.url.endsWith('/enroll')).options.body).toMatchObject({
+          autoSend: true,
+          requestId: expect.any(String),
+        });
+        expect(calls.every((call: any) => !call.url.includes('/input'))).toBe(true);
+      } finally {
+        await page.close();
+      }
+    }
+  );
+  it('previews GitLab suggestions and confirms an exact memory publication from the mobile UI', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+    try {
+      await page.route('**/*', async (route) =>
+        route.fulfill({
+          status: 200,
+          contentType: 'text/html',
+          body: `<!doctype html><html><head><style>${read('styles.css')}</style><style>${read('mobile.css')}</style></head><body>${html.slice(start, end)}</body></html>`,
+        })
+      );
+      await page.goto('https://codeman-management.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({
+        content:
+          'class CodemanApp {}; window.CodemanApp = CodemanApp; CodemanApp.prototype.loadManagementSettings = async function() {}; CodemanApp.prototype.closeManagementSettings = function() {}; function managementRequestId() { return "11111111-1111-4111-8111-111111111111"; }',
+      });
+      await page.addScriptTag({ content: read('management-brain-sync-ui.js') });
+      await page.evaluate(async () => {
+        const app = new (window as any).CodemanApp();
+        const calls: any[] = [];
+        app._managementView = { snapshot: {} };
+        app.showToast = () => undefined;
+        app._apiJson = async (url: string, options?: any) => {
+          calls.push({ url, options });
+          if (url.endsWith('/publish')) return { status: 'synced' };
+          if (url.endsWith('/preview'))
+            return {
+              status: 'different',
+              local: { revision: 'b'.repeat(64), markdown: 'Agent A owns MR 12; verified yesterday.' },
+              remote: {
+                lastCommitId: 'c'.repeat(40),
+                hash: 'd'.repeat(64),
+                markdown: '<img src=x onerror=alert(1)> Agent suggests a handoff.',
+              },
+              target: { projectId: 42, branch: 'codeman/brain', path: 'brain.md' },
+            };
+          return {
+            revision: 'a'.repeat(64),
+            enabled: true,
+            autoPublish: false,
+            projectId: 42,
+            branch: 'codeman/brain',
+            path: 'brain.md',
+            status: 'pending',
+            baseline: null,
+          };
+        };
+        (window as any).app = app;
+        (window as any).brainSyncCalls = calls;
+        document.getElementById('appSettingsModal')!.classList.add('active');
+        await app.loadManagementBrainSync();
+      });
+      expect(await page.locator('#managementBrainSyncPublish').isDisabled()).toBe(true);
+      await page.getByRole('button', { name: 'Preview memory sync', exact: true }).click();
+      expect(await page.locator('#managementBrainSyncContent').textContent()).toContain('untrusted suggestions');
+      expect(await page.locator('#managementBrainSyncContent img').count()).toBe(0);
+      page.once('dialog', (dialog) => void dialog.dismiss());
+      await page.getByRole('button', { name: 'Publish local memory', exact: true }).click();
+      expect(await page.evaluate(() => (window as any).brainSyncCalls.length)).toBe(2);
+      page.once('dialog', (dialog) => void dialog.accept());
+      await page.getByRole('button', { name: 'Publish local memory', exact: true }).click();
+      expect(await page.locator('#managementBrainSyncStatus').textContent()).toContain('synced and verified');
+      const calls = await page.evaluate(() => (window as any).brainSyncCalls);
+      expect(calls[2].options.body).toMatchObject({
+        localRevision: 'b'.repeat(64),
+        remoteLastCommitId: 'c'.repeat(40),
+        remoteHash: 'd'.repeat(64),
+      });
+    } finally {
+      await page.close();
+    }
+  });
+});

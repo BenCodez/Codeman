@@ -36,6 +36,7 @@ import {
 } from '../webview-proxy.js';
 import { ApiErrorCode, createErrorResponse, type AuthUser } from '../../types.js';
 import type { ManagerCredentialRegistry } from '../../supervisor/manager-credentials.js';
+import { isManagementAgentRequest } from './management-agent-auth.js';
 import { isSupervisorManagerRequest, registerSupervisorManagerAuth } from './supervisor-manager-auth.js';
 
 // Request-scoped identity (multi-user). Single-user leaves it undefined and the
@@ -401,7 +402,7 @@ export function registerAuthMiddleware(
   const expectedHeader = 'Basic ' + Buffer.from(`${authUsername}:${authPassword}`).toString('base64');
 
   app.addHook('onRequest', (req, reply, done) => {
-    if (isSupervisorManagerRequest(req)) {
+    if (isSupervisorManagerRequest(req) || isManagementAgentRequest(req)) {
       done();
       return;
     }
@@ -563,7 +564,7 @@ function registerMultiUserAuthHook(
   };
 
   app.addHook('onRequest', async (req, reply) => {
-    if (isSupervisorManagerRequest(req)) return;
+    if (isSupervisorManagerRequest(req) || isManagementAgentRequest(req)) return;
     const bypass = checkHookSecretBypass(req, reply, hookSecretFailures);
     if (bypass === 'bypass' || bypass === 'rejected') return;
 

@@ -98,6 +98,7 @@ export interface SupervisorDependencies {
     instructions: string,
     authority: RecoveryActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'>;
+  confirmManagerLaunch?(): Promise<boolean>;
   captureBrainAuthority?(caller: () => boolean): Promise<(() => boolean) | undefined>;
   changed(state: SupervisorState): void;
   now?: () => number;
@@ -140,6 +141,9 @@ export class SupervisorController {
 
   getManagerUsage(): SupervisorUsage | undefined {
     return this.deps.managerUsage?.();
+  }
+  confirmManagerLaunch(): Promise<boolean> {
+    return this.stopped ? Promise.resolve(false) : (this.deps.confirmManagerLaunch?.() ?? Promise.resolve(false));
   }
   captureBrainAuthority(caller: () => boolean): Promise<(() => boolean) | undefined> {
     return this.stopped || caller() !== true
@@ -315,7 +319,7 @@ export class SupervisorController {
     return this.enqueue(() =>
       this.deps.withLeases(async () => {
         if (this.revision !== revision) throw new SupervisorValidationError('Supervisor action was superseded');
-        if (!this.state.enabled || !this.state.objective.trim() || !this.state.workers.length)
+        if (!this.state.enabled || !this.state.objective.trim())
           throw new SupervisorValidationError('Supervisor is not configured');
         if (this.state.phase === 'active') throw new SupervisorValidationError('Supervisor is already active');
         if (this.state.inFlight)

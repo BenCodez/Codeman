@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { appendFile, writeFile, mkdtemp, rm, rename } from 'node:fs/promises';
 import fs from 'node:fs/promises';
-import { lstatSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { lstatSync, readFileSync, writeFileSync, renameSync, appendFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -11,10 +11,12 @@ import { clampRecoveryLaunchForOwner } from '../src/session-env-clamp.js';
 import { dataPath } from '../src/config/instance.js';
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 import { WebServer } from '../src/web/server.js';
+import { ManagerCredentialRegistry } from '../src/supervisor/manager-credentials.js';
 import { registerSupervisorRoutes } from '../src/web/routes/supervisor-routes.js';
 import { createRouteTestHarness } from './routes/_route-test-utils.js';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
+import * as ManagerCatalog from '../src/supervisor/manager-catalog.js';
 import type { MuxSession, RecoveryMuxDispatchGuard, TerminalMultiplexer } from '../src/mux-interface.js';
 import { TaskController, type TaskDependencies } from '../src/supervision/controller.js';
 import type { TaskState } from '../src/supervision/schema.js';
@@ -22,7 +24,11 @@ import { TaskStore } from '../src/supervision/store.js';
 import { latestProgressMarker } from '../src/supervision/evidence.js';
 import { CodexTaskAdapter } from '../src/supervision/adapter.js';
 import { CodexRecoveryAdapter } from '../src/recovery/codex-adapter.js';
-import { classifyCodexTail, hasEmptyCodexComposer } from '../src/recovery/codex-classifier.js';
+import {
+  classifyCodexTail,
+  hasEmptyCodexComposer,
+  permitsCodexManagerSetup,
+} from '../src/recovery/codex-classifier.js';
 import type { RecoveryActionAuthority, RecoveryEvidenceSource, RecoveryObservation } from '../src/recovery/types.js';
 import { RecoveryController, type RecoveryDependencies } from '../src/recovery/controller.js';
 import { SupervisorController, type SupervisorDependencies } from '../src/supervisor/controller.js';
@@ -123,6 +129,9 @@ async function fakeSession(id: string, conversationId: string): Promise<Session>
   });
   // This suite isolates Task/native issuer authority after the separate restricted launch boundary.
   vi.spyOn(session, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
+  vi.spyOn(session, 'confirmSupervisorManagerLaunch').mockImplementation(async () =>
+    session.isSupervisorManagerLaunchCurrent()
+  );
   vi.spyOn(session, 'captureSupervisorManagerLaunchAuthority').mockImplementation(() =>
     Object.assign(() => session.isSupervisorManagerLaunchCurrent(), {
       revoke: () => session.revokeSupervisorManagerLaunch(),
@@ -200,7 +209,18 @@ describe('manager authority at the real server boundary', () => {
   let previousMode: string | undefined;
   let previousPassword: string | undefined;
 
+  // Positive mocked launches model the owner's subsequent completed setup turn.
+  // The full WebServer tests below exercise the real bootstrap and stale-startup race.
+  const completeFixtureSetupTurn = () => {
+    const hash = observation.submissionHash ?? managerSession.getRecoveryContext().submission?.hash;
+    if (!hash) throw Error('Fixture setup requires a tracked submission');
+    Reflect.set(managerSession, '_recoverySubmission', { hash, at: Date.now() });
+    observation = { ...observation, submissionHash: hash };
+  };
+
   beforeEach(async () => {
+    // Native MCP transport is separately exercised through the real route suite.
+    vi.spyOn(ManagerCredentialRegistry.prototype, 'hasToolsDiscovery').mockReturnValue(true);
     previousData = process.env.CODEMAN_DATA_DIR;
     previousMode = process.env.CODEMAN_MULTIUSER;
     previousPassword = process.env.CODEMAN_PASSWORD;
@@ -305,6 +325,13 @@ describe('manager authority at the real server boundary', () => {
         config: JSON.stringify(session.codexConfig),
         env: JSON.stringify(session.getEnvOverridesForPersist()),
       });
+      Reflect.set(this, 'livePaneProof', {
+        paneId: '%7',
+        panePid: inputProofs.get(session)!.brokerPid,
+        at: Date.now(),
+        conversationId: observation.conversationId,
+        scope: Reflect.get(this, 'liveProofScope').call(this),
+      });
       return { ...observation, processReadyAt: observation.processReadyAt ?? Date.now() };
     });
     effects = vi.fn();
@@ -402,6 +429,181 @@ describe('manager authority at the real server boundary', () => {
     );
   }
 
+  it.each([
+    'healthy',
+    'stale',
+    'dead',
+    'unverified',
+    'owner-input',
+    'caller-grant',
+    'pending-child',
+    'blocked',
+    'paused',
+  ] as const)(
+    'allows scoped memory authority during a nonidle manager tool call only with current live proof: %s',
+    async (kind) => {
+      observation = { ...observation, activity: 'working', reason: 'turn-running', processReady: false };
+      if (kind === 'pending-child') observation = { ...observation, activity: 'watching', reason: 'background-work' };
+      if (kind === 'blocked') observation = { ...observation, activity: 'blocked', reason: 'authentication-required' };
+      if (kind === 'paused') observation = { ...observation, activity: 'paused', reason: 'approval-required' };
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const original = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        const result = await original.call(this);
+        if (kind === 'stale') Reflect.get(this, 'livePaneProof').at -= 30_001;
+        if (kind === 'unverified') Reflect.set(this, 'livePaneProof', undefined);
+        if (kind === 'dead')
+          Reflect.get(this, 'verifiedTail').inputProof = { ...inputProofs.get(managerSession), closed: true };
+        return result;
+      });
+      if (kind === 'owner-input') Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+      const authority = await manager.captureBrainAuthority(() => kind !== 'caller-grant');
+      expect(!!authority?.()).toBe(kind === 'healthy');
+      expect(observation.processReady).toBe(false);
+      if (kind === 'healthy') {
+        const brain = Reflect.get(server, 'supervisorBrainStore') as import('../src/supervisor/brain.js').BrainStore;
+        expect((await brain.read(MANAGER, authority!)).revision).toMatch(/^[a-f0-9]{64}$/);
+        Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+        expect(authority!()).toBe(false);
+      }
+    }
+  );
+
+  it('retains the manager task pause and runtime veto for global worker wake authority', async () => {
+    const service = Reflect.get(server, 'managementService') as import('../src/management/store.js').ManagementService;
+    const saved = await service.read('alice');
+    await service.configure('alice', {
+      ifMatch: saved.revision,
+      managerSessionId: MANAGER,
+      agents: [{ sessionId: WORKER, role: 'Backend', notes: '', allowMessages: true }],
+    });
+    const capture = () =>
+      Reflect.get(server, 'captureManagementDeliveryAuthority').call(server, {
+        owner: 'alice',
+        sessionId: WORKER,
+        kind: 'message',
+        requestId: 'owner-inbox-wake',
+        prompt: '',
+        current: () => true,
+      }) as Promise<RecoveryActionAuthority | undefined>;
+    const authority = await capture();
+    expect(authority?.()).toBe(true);
+    await managerTask.pause();
+    expect(authority?.()).toBe(false);
+    expect(await capture()).toBeUndefined();
+    expect(taskAct).not.toHaveBeenCalled();
+  });
+
+  it('carries fresh scoped manager issuer proof into a coupled worker delivery barrier', async () => {
+    observation = { ...observation, activity: 'working', reason: 'turn-running', processReady: false };
+    const authority = (await manager.captureBrainAuthority(() => true)) as RecoveryActionAuthority;
+    expect(authority()).toBe(true);
+    expect(authority.getInputIssuer?.()?.sessionId).toBe(MANAGER);
+    const workerSource = privateEvidenceSource(internals.sessions.get(WORKER)!, workerRolloutPath, WORKER_THREAD);
+    expect(await authority.prepareEvidence?.(workerSource)).toBe(true);
+    // A worker transcript edit after observation revokes the coupled barrier.
+    await appendFile(
+      workerRolloutPath,
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }) + '\n'
+    );
+    expect(await authority.prepareEvidence?.(workerSource)).toBe(false);
+    Reflect.set(managerSession, '_recoveryUntrackedInput', true);
+    expect(authority.getInputIssuer?.()).toBeUndefined();
+  });
+
+  it.each([
+    'native-progress',
+    'continuous-progress',
+    'new-veto',
+    'owner-input',
+    'caller-grant',
+    'broker-counter',
+  ] as const)('bounds scoped-tool read-only evidence refresh while retaining original authority: %s', async (kind) => {
+    observation = { ...observation, activity: 'working', reason: 'turn-running', processReady: false };
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const actual = CodexRecoveryAdapter.prototype.confirmLocalEvidence;
+    const confirm = vi.spyOn(CodexRecoveryAdapter.prototype, 'confirmLocalEvidence');
+    let attempts = 0,
+      callerCurrent = true;
+    confirm.mockImplementation(async function (...args) {
+      attempts++;
+      if (attempts === 1 || kind === 'continuous-progress') {
+        await appendFile(
+          rolloutPath,
+          JSON.stringify({
+            timestamp: new Date(Date.now()).toISOString(),
+            type: 'event_msg',
+            payload: { type: 'agent_message', message: 'Synthetic native progress' },
+          }) + '\n'
+        );
+        if (kind === 'new-veto')
+          observation = { ...observation, activity: 'blocked', reason: 'authentication-required' };
+        if (kind === 'owner-input') {
+          managerSession.trackUserInput('New explicit owner instruction\r');
+          await Reflect.get(managerSession, '_recoveryFencePublication');
+        }
+        if (kind === 'caller-grant') callerCurrent = false;
+        if (kind === 'broker-counter') {
+          const proof = inputProofs.get(managerSession)!;
+          updateFakeInputProvenance(proof, {
+            ownerCounters: { ...proof.ownerCounters, 'owner-pty': proof.ownerCounters['owner-pty'] + 1 },
+          });
+        }
+      }
+      return actual.apply(this, args);
+    });
+    const authority = await manager.captureBrainAuthority(() => callerCurrent);
+    expect(!!authority?.()).toBe(kind === 'native-progress');
+    expect(attempts).toBe(kind === 'native-progress' ? 2 : kind === 'continuous-progress' ? 3 : 1);
+    expect(taskAct).not.toHaveBeenCalled();
+    expect(recoveryAct).not.toHaveBeenCalled();
+    const diagnostics = JSON.stringify(warning.mock.calls);
+    expect(diagnostics).toContain('stage');
+    expect(diagnostics).not.toContain(MANAGER);
+    expect(diagnostics).not.toContain(MANAGER_THREAD);
+    expect(diagnostics).not.toContain(rolloutPath);
+    expect(diagnostics).not.toContain('Synthetic native progress');
+  });
+
+  it.each(['objective', 'worker-task', 'worker-criteria', 'worker-grants', 'owner-pause'] as const)(
+    'binds durable owner setup replay to unchanged role work and current active state: %s',
+    async (change) => {
+      let status = {
+        ...manager.getStatus(),
+        phase: 'paused' as import('../src/types/supervisor.js').SupervisorState['phase'],
+        reason: 'owner-paused',
+      };
+      vi.spyOn(manager, 'getStatus').mockImplementation(() => structuredClone(status));
+      const start = vi.spyOn(manager, 'start').mockImplementation(async () => {
+        status = {
+          ...status,
+          phase: 'active',
+          reason: 'manager-started',
+          history: [...status.history, { at: Date.now(), reason: 'manager-started' }],
+        };
+        return structuredClone(status);
+      });
+      const prepare = vi.spyOn(server as unknown as Internals, 'prepareSupervisorManager').mockResolvedValue(true);
+      const setup = Reflect.get(server, 'setupAndStartSupervisorManager').bind(server);
+      const requestId = 'owner-role-bound-start';
+      const first = await setup(managerSession, requestId, () => true);
+      expect(first.phase).toBe('started');
+      // Start's own phase/history changes must not invalidate a normal retry.
+      expect(await setup(managerSession, requestId, () => true)).toEqual(first);
+      expect(start).toHaveBeenCalledOnce();
+      if (change === 'objective') status.objective = 'Owner replacement objective';
+      if (change === 'worker-task') status.workers[0].task = 'Owner replacement task';
+      if (change === 'worker-criteria') status.workers[0].criteria[0].description = 'Owner replacement criterion';
+      if (change === 'worker-grants') status.workers[0].maxAssignments++;
+      if (change === 'owner-pause') status = { ...status, phase: 'paused', reason: 'owner-paused' };
+      await expect(setup(managerSession, requestId, () => true)).rejects.toThrow(
+        change === 'owner-pause' ? 'no longer active' : 'scope changed'
+      );
+      expect(start).toHaveBeenCalledOnce();
+      expect(prepare).toHaveBeenCalledOnce();
+    }
+  );
+
   it('owner reset revokes the manager credential and launch artifacts before awaiting its journal', async () => {
     const registry = Reflect.get(
       server,
@@ -457,6 +659,7 @@ describe('manager authority at the real server boundary', () => {
     const beforeLive = managerTask.getStatus(),
       beforeDurable = internals.taskStore.get(MANAGER);
     const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      completeFixtureSetupTurn();
       if (kind === 'late-task') Reflect.set(managerTask, 'state', changed);
       return options.isCurrent();
     });
@@ -485,6 +688,7 @@ describe('manager authority at the real server boundary', () => {
           workers: [{ ...config.workers[0], sessionId: MANAGER, assignments: 0 }],
         });
       const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         if (kind === 'late') await lease();
         return options.isCurrent();
       });
@@ -529,6 +733,7 @@ describe('manager authority at the real server boundary', () => {
       observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
       const revoke = vi.fn(async () => {});
       vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         // Native launch is a fixture; retain the REAL server preparation scope
         // and exercise Session's real profile lifecycle after acknowledgment.
         Reflect.set(managerSession, '_supervisorManagerProfile', {
@@ -546,7 +751,10 @@ describe('manager authority at the real server boundary', () => {
       vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
       vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
       expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(true);
-      managerTask.noteUserInput();
+      managerSession.emit('recoveryUserInput');
+      await managerTask.drain();
+      expect(managerSession.hasSupervisorManagerLaunch()).toBe(true);
+      expect(revoke).not.toHaveBeenCalled();
       // Hold the tracked input publication boundary. It grants no manager
       // operations while pending and must not destroy the exact profile.
       Reflect.set(managerSession, '_recoverySwitchPending', true);
@@ -583,6 +791,375 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it.each([true, false])(
+    'establishes an uninspected manager identity only through adapter proof: %s',
+    async (verified) => {
+      await manager.pause();
+      await managerTask.update({ config: { enabled: false } });
+      process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';
+      Reflect.set(server, 'supervisorManagerAuthReady', true);
+      Reflect.set(managerSession, '_codexConfig', { ...managerSession.codexConfig, resumeSessionId: undefined });
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const original = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        if (verified) managerSession.pinRecoveryConversation(MANAGER_THREAD);
+        return original.call(this);
+      });
+      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async () => {
+        completeFixtureSetupTurn();
+        return true;
+      });
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(verified);
+      expect(observe).toHaveBeenCalled();
+      expect(prepare).toHaveBeenCalledTimes(verified ? 1 : 0);
+    }
+  );
+
+  it.each(['settings-written', 'settings-delayed'] as const)(
+    'prepares and starts through the real WebServer, Session, profile and tmux continuity predicates (%s)',
+    async (timing) => {
+      await manager.pause();
+      await managerTask.update({ config: { enabled: false } });
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      await appendFile(
+        rolloutPath,
+        JSON.stringify({
+          timestamp: new Date(Date.now()).toISOString(),
+          type: 'event_msg',
+          payload: { type: 'task_complete', turn_id: 'manager-turn' },
+        }) + '\n'
+      );
+      vi.spyOn(ManagerCatalog, 'readSupervisorManagerCatalog').mockResolvedValue(
+        JSON.stringify({
+          models: [{ slug: 'owner-model', description: 'fixture', apply_patch_tool_type: null, tool_mode: 'direct' }],
+        })
+      );
+      vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+      vi.mocked(managerSession.confirmSupervisorManagerLaunch).mockRestore();
+      const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
+      const record = Reflect.get(managerSession, '_muxSession') as MuxSession;
+      Reflect.set(managerSession, 'workingDir', fixtureData);
+      record.workingDir = fixtureData;
+      const preparing = vi.spyOn(managerSession, 'prepareSupervisorManager');
+      const native = Object.create(TmuxManager.prototype) as TmuxManager;
+      const launches = new Map();
+      Reflect.set(native, 'supervisorManagerLaunches', launches);
+      Reflect.set(native, 'sessions', new Map([[MANAGER, record]]));
+      Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', native.isSupervisorManagerLaunchCurrent.bind(native));
+      Reflect.set(
+        mux,
+        'isSupervisorManagerOwnerInputCurrent',
+        native.isSupervisorManagerOwnerInputCurrent.bind(native)
+      );
+      let draft = '';
+      const line = (payload: unknown) =>
+        JSON.stringify({ timestamp: new Date(Date.now()).toISOString(), type: 'event_msg', payload }) + '\n';
+      Reflect.set(mux, 'inspectPaneForRecovery', async () => ({
+        dead: false,
+        paneId: '%7',
+        panePid: record.pid,
+        screen: `› ${draft}\n\n  fixture default · /fixture\n  ? for shortcuts\n`,
+      }));
+      let restricted = false;
+      let postLaunchProbes = 0;
+      let publishSettings: (() => Promise<void>) | undefined;
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const originalObserve = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        if (timing === 'settings-delayed' && restricted && ++postLaunchProbes === 2 && publishSettings)
+          await publishSettings();
+        return originalObserve.call(this);
+      });
+      Reflect.set(mux, 'respawnPane', async (options: import('../src/mux-interface.js').RespawnPaneOptions) => {
+        expect(options.ownerLaunchIsCurrent?.()).toBe(true);
+        expect(await options.supervisorManager?.confirm()).toBe(true);
+        record.recoveryInputBroker = inputProofs.get(managerSession)!.incarnation;
+        launches.set(MANAGER, {
+          profile: options.supervisorManager,
+          record,
+          pid: record.pid,
+          incarnation: record.recoveryInputBroker,
+        });
+        publishSettings = async () => {
+          await appendFile(
+            rolloutPath,
+            line({
+              type: 'thread_settings_applied',
+              thread_id: MANAGER_THREAD,
+              thread_settings: {
+                model: 'owner-model',
+                model_provider_id: 'fixture',
+                approval_policy: 'on-request',
+                approvals_reviewer: 'user',
+                permission_profile: {
+                  type: 'managed',
+                  file_system: { type: 'restricted', entries: [] },
+                  network: 'restricted',
+                },
+                cwd: '/fixture',
+                runtime_workspace_roots: ['/fixture'],
+                collaboration_mode: { mode: 'default', settings: { model: 'owner-model' } },
+                disabled_plugin_ids: [],
+              },
+            })
+          );
+          observation = { ...observation, activity: 'paused', reason: 'approval-required' };
+        };
+        restricted = true;
+        if (timing === 'settings-written') await publishSettings();
+        return record.pid;
+      });
+      const writes: string[] = [];
+      const previousPty = managerSession.ptyProcess;
+      Reflect.set(managerSession, 'ptyProcess', {
+        write: (input: string) => {
+          writes.push(input);
+          if (input !== '\r') draft = input;
+          else {
+            draft = '';
+            appendFileSync(
+              rolloutPath,
+              line({ type: 'user_message', message: writes[0] }) +
+                line({ type: 'task_started', turn_id: 'setup-turn' }) +
+                line({ type: 'task_complete', turn_id: 'setup-turn' })
+            );
+            observation = {
+              ...observation,
+              activity: 'completed',
+              reason: 'turn-completed',
+              submissionHash: createHash('sha256').update(writes[0]).digest('hex'),
+            };
+          }
+        },
+      });
+      try {
+        const result = await Reflect.get(server, 'setupAndStartSupervisorManager').call(
+          server,
+          managerSession,
+          'full-manager-setup-regression',
+          () => true
+        );
+        expect(preparing).toHaveBeenCalledOnce();
+        expect(await preparing.mock.results[0].value).toBe(true);
+        expect(result.phase).toBe('started');
+        expect(writes).toEqual(['Reply READY only.', '\r']);
+        expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(true);
+        expect(manager.getStatus().phase).toBe('active');
+      } finally {
+        Reflect.set(managerSession, 'ptyProcess', previousPty);
+      }
+    }
+  );
+
+  it.each(['completed', 'draft-changed', 'owner-cancelled'] as const)(
+    'uses real tagged owner writes for the bounded setup turn: %s',
+    async (kind) => {
+      await manager.pause();
+      const at = Date.now();
+      Reflect.set(managerSession, '_paneStartedAt', at - 1000);
+      const setting = {
+        type: 'thread_settings_applied',
+        thread_id: MANAGER_THREAD,
+        thread_settings: {
+          model: 'fixture',
+          model_provider_id: 'fixture',
+          approval_policy: 'on-request',
+          approvals_reviewer: 'user',
+          permission_profile: {
+            type: 'managed',
+            file_system: { type: 'restricted', entries: [] },
+            network: 'restricted',
+          },
+          cwd: '/fixture',
+          runtime_workspace_roots: ['/fixture'],
+          collaboration_mode: { mode: 'default', settings: { model: 'fixture' } },
+          disabled_plugin_ids: [],
+        },
+      };
+      const nativeLine = (payload: unknown) =>
+        JSON.stringify({ timestamp: new Date(at).toISOString(), type: 'event_msg', payload }) + '\n';
+      await writeFile(
+        rolloutPath,
+        nativeLine({ type: 'user_message', message: 'Prior owner prompt' }) +
+          nativeLine({ type: 'task_started', turn_id: 'prior-turn' }) +
+          nativeLine({ type: 'task_complete', turn_id: 'prior-turn' }) +
+          nativeLine(setting)
+      );
+      observation = { ...observation, activity: 'paused', reason: 'approval-required', processReady: true };
+      vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+      const profile = {
+        isCurrent: () => true,
+        isOwnerInputCurrent: () => true,
+        confirmOwnerInput: async () => true,
+        confirm: async () => true,
+        revoke: vi.fn(async () => {}),
+      };
+      Reflect.set(managerSession, '_supervisorManagerProfile', profile);
+      const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
+      Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', () => true);
+      Reflect.set(mux, 'isSupervisorManagerOwnerInputCurrent', () => true);
+      let draft = '',
+        current = true;
+      Reflect.set(mux, 'inspectPaneForRecovery', async () => ({
+        dead: false,
+        paneId: '%7',
+        panePid: 99999,
+        screen: `› ${draft}\n\n  fixture default · /fixture\n  ? for shortcuts\n`,
+      }));
+      const writes: string[] = [];
+      const previousPty = managerSession.ptyProcess;
+      Reflect.set(managerSession, 'ptyProcess', {
+        write: (input: string) => {
+          writes.push(input);
+          if (input !== '\r') {
+            draft = kind === 'draft-changed' ? 'Different owner draft' : input;
+            if (kind === 'owner-cancelled') current = false;
+          } else {
+            draft = '';
+            const text = writes[0];
+            appendFileSync(
+              rolloutPath,
+              nativeLine({ type: 'user_message', message: text }) +
+                nativeLine({ type: 'task_started', turn_id: 'setup-turn' }) +
+                nativeLine({ type: 'task_complete', turn_id: 'setup-turn' })
+            );
+            observation = {
+              ...observation,
+              activity: 'completed',
+              reason: 'turn-completed',
+              submissionHash: createHash('sha256').update(text).digest('hex'),
+            };
+          }
+        },
+      });
+      const phases: string[] = [];
+      try {
+        expect(managerSession.captureSupervisorManagerOwnerInputAuthority()?.()).toBe(true);
+        expect(Reflect.get(server, 'managerTaskAllowsPreparation').call(server, managerSession)).toBe(true);
+        const preflight = new CodexRecoveryAdapter(managerSession);
+        const observed = await preflight.observe();
+        const source = preflight.getLocalEvidenceSource(MANAGER_THREAD, managerSession.getRecoveryContext().generation);
+        expect(observed.activity).toBe('paused');
+        expect(source).toBeDefined();
+        expect(
+          permitsCodexManagerSetup(
+            readFileSync(rolloutPath, 'utf8'),
+            {
+              conversationId: MANAGER_THREAD,
+              now: at,
+              screen: '› ',
+              busy: false,
+              watching: false,
+              tailTruncated: false,
+            },
+            at - 1000
+          )
+        ).toBe(true);
+        expect(
+          await preflight.confirmLocalEvidence(MANAGER_THREAD, managerSession.getRecoveryContext().generation)
+        ).toBe(true);
+        const result = await Reflect.get(server, 'sendManagerSetupTurn').call(
+          server,
+          managerSession,
+          'owner-setup-test',
+          () => current,
+          async (phase: string) => {
+            phases.push(phase);
+          }
+        );
+        expect(result).toBe(kind === 'completed');
+        expect(writes).toEqual(kind === 'completed' ? ['Reply READY only.', '\r'] : ['Reply READY only.']);
+        expect(phases).toContain('literal-reserved');
+        if (kind === 'completed') expect(phases.at(-1)).toBe('turn-completed');
+      } finally {
+        Reflect.set(managerSession, 'ptyProcess', previousPty);
+      }
+    }
+  );
+
+  it.each([false, true])(
+    'retains exact newly prepared task ownership through start, pause and teaching (unrelated task: %s)',
+    async (unrelated) => {
+      await manager.reset();
+      await manager.configure(config);
+      vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+      vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+      expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(false);
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      const revoke = vi.fn(async () => {});
+      vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
+        Reflect.set(managerSession, '_supervisorManagerProfile', { isCurrent: options.isCurrent, revoke });
+        Reflect.set(Reflect.get(managerSession, '_mux'), 'isSupervisorManagerLaunchCurrent', () => true);
+        return options.isCurrent();
+      });
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 1000);
+      expect((await manager.start()).phase).toBe('active');
+      vi.spyOn(Date, 'now').mockReturnValue(Date.now() + 10);
+      // Settle the known kickoff before the owner pauses and teaches the manager.
+      const kickoff = managerTask.getStatus().inFlight!;
+      const userLine = JSON.stringify({
+        timestamp: new Date(Date.now()).toISOString(),
+        type: 'event_msg',
+        payload: { type: 'user_message', message: taskAct.mock.calls[0][2] },
+      });
+      await writeFile(rolloutPath, userLine + '\n');
+      observation = {
+        ...observation,
+        submissionKey: createHash('sha256').update(userLine).digest('hex'),
+        submissionHash: kickoff.promptHash,
+      };
+      await managerTask.refresh();
+      expect(managerTask.getStatus().inFlight).toBeUndefined();
+      await manager.pause();
+      managerSession.emit('recoveryUserInput');
+      await managerTask.drain();
+      if (unrelated) await managerTask.update({ objective: 'An unrelated owner task' });
+      const result = await internals.prepareSupervisorManager(managerSession, () => true);
+      if (unrelated) expect(result).not.toBe(true);
+      else {
+        expect(result).toBe(true);
+        expect((await manager.start()).phase).toBe('active');
+      }
+      expect(revoke).not.toHaveBeenCalled();
+    }
+  );
+
+  it('requires native tool discovery and refreshes idle evidence after an earlier ready result', async () => {
+    await manager.pause();
+    observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+    vi.mocked(ManagerCredentialRegistry.prototype.hasToolsDiscovery).mockReturnValue(false);
+    let launched = false;
+    let offset = 0;
+    const now = performance.now();
+    vi.spyOn(performance, 'now').mockImplementation(() => now + offset);
+    const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+    const original = observe.getMockImplementation()!;
+    observe.mockImplementation(async function () {
+      const result = await original.call(this);
+      if (launched) offset += 5_001;
+      return result;
+    });
+    const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async () => {
+      completeFixtureSetupTurn();
+      launched = true;
+      return true;
+    });
+    expect(await internals.prepareSupervisorManager(managerSession, () => true)).toEqual({ inspectionOnly: true });
+    await expect(manager.start()).rejects.toThrow(/restricted manager/);
+    vi.mocked(ManagerCredentialRegistry.prototype.hasToolsDiscovery).mockReturnValue(true);
+    expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+    observation = { ...observation, activity: 'working', processReady: true };
+    expect(await internals.prepareSupervisorManager(managerSession, () => true)).toEqual({ inspectionOnly: true });
+    expect(prepare).toHaveBeenCalledOnce();
+    await expect(manager.start()).rejects.toThrow(/restricted manager/);
+    expect(effects).not.toHaveBeenCalled();
+  });
+
   it('prepares only a verified idle manager with explicit request scope, retaining UUID and private startup evidence', async () => {
     await manager.pause();
     process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';
@@ -590,6 +1167,7 @@ describe('manager authority at the real server boundary', () => {
     Reflect.set(server, 'supervisorManagerAuthReady', true);
     observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
     const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      completeFixtureSetupTurn();
       expect(options.isCurrent()).toBe(true);
       expect(options.token).toMatch(/^codeman-manager-v1\.[a-f0-9]{64}$/);
       expect(options.files?.some((file) => file.path === rolloutPath)).toBe(true);
@@ -624,6 +1202,7 @@ describe('manager authority at the real server boundary', () => {
       );
       const profiles: Array<{ isCurrent(): boolean; revoke: ReturnType<typeof vi.fn> }> = [];
       const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         expect(options.isCurrent()).toBe(true);
         const profile = { isCurrent: () => true, revoke: vi.fn(async () => true) };
         profiles.push(profile);
@@ -753,6 +1332,7 @@ describe('manager authority at the real server boundary', () => {
       });
       const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
       const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         token = options.token;
         launched = true;
         return true;
@@ -792,6 +1372,7 @@ describe('manager authority at the real server boundary', () => {
         token = '';
       const revoke = vi.spyOn(managerSession, 'revokeSupervisorManagerLaunch');
       vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+        completeFixtureSetupTurn();
         token = options.token;
         if (kind === 'owner') managerSession.owner = 'changed-owner';
         if (kind === 'config')
@@ -838,6 +1419,7 @@ describe('manager authority at the real server boundary', () => {
       release = createDeferred();
     let current = true;
     vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async (options) => {
+      completeFixtureSetupTurn();
       expect(options.isCurrent()).toBe(true);
       entered.resolve();
       await release.promise;

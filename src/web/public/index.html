@@ -1459,6 +1459,16 @@
               </div>
               <p class="set-section-blurb">What this tab is called, how its context window is kept from filling up, and what it watches.</p>
 
+              <div class="set-group" id="sshCodexConversionSection" style="display: none;">
+                <div class="set-group-head"><h4>Convert this SSH tab to Codex</h4></div>
+                <p class="set-group-hint">Get Codex recovery and task controls in this tab. Return to an idle shell first; running agents stay untouched. The existing shell and scrollback are kept in a retained remote session. Choose an existing conversation explicitly; a new chat is never substituted.</p>
+                <div class="set-group-body">
+                  <div class="set-row"><div class="set-row-text"><span class="set-row-label">Codex chat in place</span><span class="set-row-desc">Uses this case’s existing host launcher, including custom Codex executables.</span></div><div class="set-row-actions"><button type="button" class="btn-toolbar btn-sm" id="sshCodexConversionPreview" onclick="app.previewSshCodexConversion()">Convert to Codex chat…</button></div></div>
+                  <div id="sshCodexConversionDetails" hidden></div>
+                  <p class="set-group-hint" id="sshCodexConversionStatus" role="status"></p>
+                </div>
+              </div>
+
               <div class="set-group">
                 <div class="set-group-head"><h4>Identity</h4></div>
                 <div class="set-group-body">
@@ -1719,9 +1729,9 @@
               <div class="set-section-head"><h2>Codex supervisor</h2></div>
               <p class="set-section-blurb">Assign this local isolated Codex session to manage selected owned Codex workers through guarded task and recovery controllers. The role is off by default and requires server authentication. The manager and local workers need distinct authorized <code>CODEX_HOME</code> directories. Submit an ordinary prompt through Codeman in each current isolated <code>--no-daemon</code> conversation to establish its verified Codex identity, then wait for the manager to become idle. A launch or resume seed alone cannot authorize automatic input.</p>
               <p id="supervisorError" role="alert" hidden>Supervisor is unavailable for this session. Local managed Codex, isolation, owner access, and verified identity are required.</p>
-              <div class="set-group"><h4>Codex process isolation</h4><p class="set-group-hint">To create an isolated conversation, set the <code>--no-daemon</code> and <code>--no-alt-screen</code> launch defaults under App Settings → Codex, then create a new local session and submit its first prompt. Select Prepare restricted manager to explicitly resume the verified manager conversation with restricted supervisor tools and a scoped credential. Preparation refuses active work, pending child work, unknown identity and uncertain delivery. Start requires a verified restricted launch; an ordinary Codex process cannot adopt the role.</p></div>
+              <div class="set-group"><h4>Codex process isolation</h4><p class="set-group-hint">To create an isolated conversation, set the <code>--no-daemon</code> and <code>--no-alt-screen</code> launch defaults under App Settings → Codex, then create a new local session and submit its first prompt. Start manager prepares the verified conversation, connects restricted supervisor tools and starts the saved objective in one confirmed action. When only a verified native settings change needs acknowledgement at an empty prompt, Codeman sends a fixed harmless setup turn and waits for its exact completion. Active work, pending children, permission or authentication limits and uncertain delivery stop setup. Prepare restricted manager remains available for inspection without starting work.</p></div>
               <div class="set-group"><h4>Supervisor status</h4><dl class="task-status-grid"><dt>Phase</dt><dd id="supervisorPhase">Loading</dd><dt>Reason</dt><dd id="supervisorReason">—</dd><dt>Usage</dt><dd id="supervisorUsage">Unknown</dd></dl>
-                <div class="task-actions"><button class="btn-toolbar" id="supervisorPrepareBtn" onclick="app.prepareSupervisorManager()">Prepare restricted manager</button><button class="btn-toolbar" id="supervisorStartBtn" onclick="app.supervisorAction('start')">Start manager</button><button class="btn-toolbar" id="supervisorPauseBtn" onclick="app.supervisorAction('pause')">Pause</button><button class="btn-toolbar" id="supervisorResetBtn" onclick="app.supervisorAction('reset')">Reset</button><button class="btn-toolbar" onclick="app.loadSupervisorStatus()">Refresh</button></div>
+                <div class="task-actions"><button class="btn-toolbar" id="supervisorPrepareBtn" onclick="app.prepareSupervisorManager()">Prepare restricted manager</button><button class="btn-toolbar" id="supervisorStartBtn" onclick="app.setupAndStartSupervisorManager()">Start manager</button><button class="btn-toolbar" id="supervisorPauseBtn" onclick="app.supervisorAction('pause')">Pause</button><button class="btn-toolbar" id="supervisorResetBtn" onclick="app.supervisorAction('reset')">Reset</button><button class="btn-toolbar" onclick="app.loadSupervisorStatus()">Refresh</button></div>
               </div>
               <fieldset class="set-group task-form" id="supervisorSettings" disabled><legend>Owner configuration</legend>
                 <label for="supervisorObjective">Manager objective</label><textarea class="set-textarea" id="supervisorObjective" maxlength="3000" rows="3"></textarea>
@@ -2012,6 +2022,7 @@
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M6 9h.01M10 9h.01M14 9h.01M18 9h.01M6 13h.01M18 13h.01M9 13h6"/></svg>
                 <span>Shortcuts</span>
               </button>
+              <button type="button" class="set-rail-item" data-section="settings-management"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="12" cy="5" r="3"/><circle cx="5" cy="18" r="3"/><circle cx="19" cy="18" r="3"/><path d="M12 8v4M5 15v-3h14v3"/></svg><span>Management</span></button>
               <button type="button" class="set-rail-item" data-section="settings-system">
                 <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.26.6.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.65 0-1.25.4-1.51 1z"/></svg>
                 <span>System</span>
@@ -3397,7 +3408,89 @@
             </section>
 
 
-            <!-- ══ System ═══════════════════════════════════════════════════ -->
+            <!-- ══ Management ═══════════════════════════════════════════════ -->
+            <section class="set-section" id="settings-management" data-label="Management">
+              <div class="set-section-head"><h2>Management</h2></div>
+              <p class="set-group-hint">Shared across this Codeman server and all your browser devices. Choose one local manager to coordinate your agents, including Codex running inside SSH shell sessions.</p>
+              <p id="managementStatus" role="status" aria-live="polite">Loading management settings…</p>
+              <button type="button" class="btn-toolbar" onclick="app.loadManagementSettings(true)">Refresh management settings</button>
+              <div class="set-group task-form">
+                <h4>Set up a local management Codex</h4>
+                <p class="set-group-hint">Existing SSH shell sessions are workers. The manager is a separate local Codex on this Codeman server. Create it here without changing your SSH sessions or starting manager automation.</p>
+                <fieldset class="task-form" id="managementCreateSettings" disabled>
+                  <label for="managementCreateWorkingDir">Manager working directory on this server (absolute path)</label>
+                  <input class="set-input" id="managementCreateWorkingDir" type="text" maxlength="4096" placeholder="Enter an existing local working directory" autocomplete="off" spellcheck="false">
+                  <label for="managementCreateCodexHome">Dedicated Codex home (absolute path, optional)</label>
+                  <input class="set-input" id="managementCreateCodexHome" type="text" maxlength="4096" placeholder="Separate home authenticated with your Codex subscription" autocomplete="off" spellcheck="false">
+                  <p class="set-group-hint">Use a separate Codex home for the manager. Sign in there with device code before preparing it. Your other Codex logins stay unchanged. Personal Plus and Pro subscriptions are supported; workspace-managed authentication requires additional compatibility checks.</p>
+                  <button type="button" class="btn-toolbar" onclick="app.createGlobalManagementSession()">Create local management Codex</button>
+                </fieldset>
+                <p id="managementCreateStatus" role="status" aria-live="polite">Use an existing directory where this owner may work.</p>
+                <button type="button" class="btn-toolbar" id="managementOpenCreatedSession" hidden onclick="app.openCreatedManagementSession()">Open new manager session</button>
+                <p class="set-group-hint">Creation uses an ordinary Codex session with --no-daemon and --no-alt-screen and keeps approval bypass off. Open it, finish one normal conversation turn, and let it become idle. Then return here, refresh, select and save it, and explicitly prepare and start the restricted manager.</p>
+              </div>
+              <fieldset class="set-group task-form" id="managementSettings" disabled>
+                <legend>Global manager and agent directory</legend>
+                <label for="managementManager">Local management Codex</label>
+                <select class="set-select" id="managementManager" onchange="app.mountGlobalManagerControls()"><option value="">No manager selected</option></select>
+                <p class="set-group-hint">Selecting a manager saves your preference; preparation and starting remain explicit actions. Agent roles, notes and messaging permissions below are shared server settings.</p>
+                <label for="managementInboxEndpoint">Agent inbox endpoint</label>
+                <input type="url" class="set-input" id="managementInboxEndpoint" maxlength="1000" placeholder="https://codeman.example/api/management/agent-inbox">
+                <p class="set-group-hint">Use the Codeman URL reachable from your agents, including any base path. Connect saves this page’s server URL if unset. No credentials, query or fragment belong in this field.</p>
+                <div class="task-actions"><button type="button" class="btn-toolbar" onclick="app.saveManagementSettings()">Save management settings</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration()">Manager objectives and controls</button><button type="button" class="btn-toolbar" onclick="app.openGlobalManagerConfiguration('automation')">Manager schedules and custom tasks</button></div>
+                <div id="managementAgents"></div>
+              </fieldset>
+              <fieldset class="set-group task-form" id="managementWorkSettings" disabled>
+                <legend>Give manager work</legend>
+                <p class="set-group-hint">Describe the outcome and how it should be checked. Work waits for the manager to be safely idle; accepted delivery does not mean the work is complete.</p>
+                <label for="managementWorkObjective">What should the manager get done?</label>
+                <textarea class="set-textarea" id="managementWorkObjective" rows="4" maxlength="2000" placeholder="For example: have the API and UI agents implement the settings page, verify it, and report what needs my review."></textarea>
+                <label for="managementWorkCriteria">What must be true when it is done?</label>
+                <textarea class="set-textarea" id="managementWorkCriteria" rows="3" maxlength="1000" placeholder="List required checks, expected behavior, and anything that needs your approval."></textarea>
+                <label><input type="checkbox" id="managementWorkStart" checked> Start the configured manager if paused</label>
+                <div class="task-actions"><button type="button" class="btn-toolbar" id="managementWorkSubmit" onclick="app.queueManagementWork()">Queue request</button><button type="button" class="btn-toolbar" onclick="app.loadManagementWork()">Refresh work status</button><button type="button" class="btn-toolbar" onclick="app.openManagementConversation()">Open manager conversation</button></div>
+                <p id="managementWorkStatus" role="status" aria-live="polite">Select and save a manager to queue work.</p>
+                <div id="managementWorkRequests"></div>
+              </fieldset>
+              <div class="set-group"><h4>Management Codex controls and schedules</h4><p id="managementControlsStatus" role="status">Select and save an eligible local manager to configure it here.</p><div id="managementManagerControls"></div></div>
+              <fieldset class="set-group task-form" id="managementBrainSettings" disabled>
+                <legend>Shared brain.md</legend>
+                <p class="set-group-hint">Teach your manager what each agent does and how you want work coordinated. The management Codex can read and update this shared memory through its scoped tools. Agent observations remain attributed notes until the manager incorporates them.</p>
+                <label for="managementBrainMarkdown">Manager memory (Markdown, up to 32 KiB)</label>
+                <textarea class="set-textarea" id="managementBrainMarkdown" rows="12" spellcheck="false"></textarea>
+                <button type="button" class="btn-toolbar" onclick="app.saveManagementBrain()">Save shared brain.md</button>
+                <p id="managementBrainStatus" role="status" aria-live="polite"></p>
+              </fieldset>
+              <div class="set-group task-form" id="managementBrainSyncPanel">
+                <h4>Shared brain.md on GitLab</h4>
+                <p class="set-group-hint">Keep a shared memory file where backend agents can propose updates. Choose an existing file in the intended project. Publishing obeys your GitLab write branch prefix; remote changes pause automatic export until reviewed. Agent and MR ownership claims need attributed evidence.</p>
+                <fieldset class="task-form" id="managementBrainSyncSettings" disabled>
+                  <legend>Owner-approved GitLab memory destination</legend>
+                  <label><input type="checkbox" id="managementBrainSyncEnabled"> Enable GitLab brain sync</label>
+                  <label for="managementBrainSyncProject">GitLab project ID</label><input class="set-input" type="number" min="1" step="1" id="managementBrainSyncProject">
+                  <label for="managementBrainSyncBranch">Existing branch</label><input class="set-input" maxlength="200" id="managementBrainSyncBranch" placeholder="codeman/manager-brain">
+                  <label for="managementBrainSyncPath">Existing memory file</label><input class="set-input" maxlength="1024" id="managementBrainSyncPath" placeholder="brain.md">
+                  <label><input type="checkbox" id="managementBrainSyncAutomatic"> Export local memory changes automatically after initial sync</label>
+                  <button class="btn-toolbar" type="button" onclick="app.saveManagementBrainSync()">Save brain destination</button>
+                </fieldset>
+                <p id="managementBrainSyncStatus" role="status" aria-live="polite">GitLab brain sync is disabled until configured.</p>
+                <div class="task-actions"><button class="btn-toolbar" type="button" onclick="app.loadManagementBrainSync()">Refresh brain sync</button><button class="btn-toolbar" type="button" id="managementBrainSyncPreview" disabled onclick="app.previewManagementBrainSync()">Preview memory sync</button><button class="btn-toolbar" type="button" id="managementBrainSyncPublish" disabled onclick="app.applyManagementBrainSync('publish')">Publish local memory</button><button class="btn-toolbar" type="button" id="managementBrainSyncPull" disabled onclick="app.applyManagementBrainSync('pull')">Import reviewed GitLab memory</button></div>
+                <pre id="managementBrainSyncContent" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:24rem;overflow:auto"></pre>
+              </div>
+              <div class="set-group task-form" id="managementAgentTools" hidden>
+                <h4 id="managementAgentToolsTitle">Agent connection</h4>
+                <p id="managementAgentToolsStatus" role="status" aria-live="polite"></p>
+                <label for="managementEnrollmentInstructions">Private enrollment instructions</label>
+                <textarea class="set-textarea" id="managementEnrollmentInstructions" rows="6" readonly spellcheck="false"></textarea>
+                <button type="button" class="btn-toolbar" onclick="app.copyManagementEnrollment()">Copy instructions</button>
+                <p class="set-group-hint">Connect attempts automatic enrollment only into a verified idle Codex chat. Messages queue in the private inbox and submit a fixed wake-up prompt when safe. SSH shells need conversion first. Delivery is separate from an agent reply; private instructions remain available for manual enrollment.</p>
+                <pre id="managementMessageThread" style="white-space:pre-wrap;overflow-wrap:anywhere;max-height:18rem;overflow:auto"></pre>
+                <label for="managementMessageDraft">Message to this agent</label>
+                <textarea class="set-textarea" id="managementMessageDraft" rows="3" maxlength="2000"></textarea>
+                <div class="task-actions"><button type="button" class="btn-toolbar" id="managementSendMessage" onclick="app.sendManagementMessage()">Queue message</button><button type="button" class="btn-toolbar" onclick="app.refreshManagementMessages()">Refresh replies</button></div>
+              </div>
+            </section>
+
             <section class="set-section" id="settings-system" data-label="System">
               <div class="set-section-head">
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.26.6.86 1 1.51 1H21a2 2 0 0 1 0 4h-.09c-.65 0-1.25.4-1.51 1z"/></svg>
@@ -3743,8 +3836,8 @@
             </div>
             <div class="form-row">
               <label>Codex Command Override</label>
-              <input type="text" id="remoteHostCodexCommand" placeholder="exec codx personal" autocomplete="off" autocapitalize="off" spellcheck="false">
-              <span class="form-hint">Optional. Leave blank to use exec codex on the remote host.</span>
+              <input type="text" id="remoteHostCodexCommand" placeholder="codex-workspace" autocomplete="off" autocapitalize="off" spellcheck="false">
+              <span class="form-hint">Optional. A single executable such as codex-workspace receives the exact Codex arguments and home. It must forward them. Full shell commands stay manual-only. Leave blank for native codex.</span>
             </div>
             <details class="advanced-options">
               <summary><svg class="set-adv-chev" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg><span>Advanced SSH</span></summary>
@@ -4470,6 +4563,9 @@
   <script defer src="orchestrator-panel.js"></script>
   <script defer src="cron-ui.js"></script>
   <script defer src="settings-ui.js"></script>
+  <script defer src="management-ui.js"></script>
+  <script defer src="management-gitlab-ui.js"></script>
+  <script defer src="management-brain-sync-ui.js"></script>
   <script defer src="panels-ui.js"></script>
   <script defer src="readmymind-ui.js"></script>
   <script defer src="ultracode-panel.js"></script>

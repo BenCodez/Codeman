@@ -449,6 +449,38 @@ export class BrainStore {
       return snapshot(dirs ? this.readLeaf(path, dirs, authority) : absent());
     });
   }
+  /** Import one explicitly selected legacy brain only while both private files remain current.
+   * Existing global memory, including an intentionally empty file, always wins.
+   * Copy receipts too, so pre-upgrade note requests cannot replay after import.
+   */
+  importIfAbsent(id: string, source: BrainStore, sourceId: string, authority: BrainAuthority): Promise<BrainSnapshot> {
+    if (this.root === source.root) return Promise.reject(new BrainStoreError('invalid'));
+    return this.run(id, authority, async (path) => {
+      let dirs = await this.directories(id, false, authority);
+      const existing = dirs ? this.readLeaf(path, dirs, authority) : absent();
+      if (existing.info) return snapshot(existing);
+      return source.run(sourceId, authority, async (sourcePath) => {
+        const sourceDirs = await source.directories(sourceId, false, authority);
+        if (!sourceDirs) return snapshot(existing);
+        const before = source.readLeaf(sourcePath, sourceDirs, authority);
+        if (!before.info) return snapshot(existing);
+        const unchanged = () => {
+          try {
+            authorize(authority);
+            const latest = source.readLeaf(sourcePath, sourceDirs, authority);
+            return !!latest.info && !!before.info && same(latest.info, before.info) && latest.text === before.text;
+          } catch {
+            return false;
+          }
+        };
+        dirs = await this.directories(id, true, unchanged);
+        if (!dirs) throw new BrainStoreError('unavailable');
+        const latest = this.readLeaf(path, dirs, unchanged);
+        if (latest.info) return snapshot(latest);
+        return this.write(path, dirs, latest, before.record, unchanged);
+      });
+    });
+  }
   replace(id: string, markdown: string, ifMatch: string, authority: BrainAuthority): Promise<BrainSnapshot> {
     if (!validText(markdown, MAX_BRAIN_BYTES) || typeof ifMatch !== 'string' || !HASH.test(ifMatch))
       return Promise.reject(new BrainStoreError('invalid'));
@@ -466,10 +498,30 @@ export class BrainStore {
     ifMatch: string,
     authority: BrainAuthority
   ): Promise<BrainSnapshot & { duplicate: boolean }> {
+    return this.edit(id, requestId, note, ifMatch, authority, 'append');
+  }
+  /** Manager rewrites require an exact revision and retain durable request receipts. */
+  replaceManaged(
+    id: string,
+    requestId: string,
+    markdown: string,
+    ifMatch: string,
+    authority: BrainAuthority
+  ): Promise<BrainSnapshot & { duplicate: boolean }> {
+    return this.edit(id, requestId, markdown, ifMatch, authority, 'replace');
+  }
+  private edit(
+    id: string,
+    requestId: string,
+    note: string,
+    ifMatch: string,
+    authority: BrainAuthority,
+    mode: 'append' | 'replace'
+  ): Promise<BrainSnapshot & { duplicate: boolean }> {
     if (
       typeof requestId !== 'string' ||
       !REQUEST_ID.test(requestId) ||
-      !isValidBrainNote(note) ||
+      !(mode === 'append' ? isValidBrainNote(note) : validText(note, MAX_BRAIN_BYTES)) ||
       typeof ifMatch !== 'string' ||
       !HASH.test(ifMatch)
     )
@@ -477,9 +529,10 @@ export class BrainStore {
     return this.run(id, authority, async (path) => {
       const dirs = (await this.directories(id, true, authority))!;
       const before = this.readLeaf(path, dirs, authority);
+      const payloadHash = hash(mode === 'append' ? note : JSON.stringify(['replace', note]));
       const receipt = before.record.receipts.find((receipt) => receipt.requestId === requestId);
       if (receipt) {
-        if (receipt.hash !== hash(note)) throw new BrainStoreError('conflict');
+        if (receipt.hash !== payloadHash) throw new BrainStoreError('conflict');
         // A prior publication may have lost its ACK. Re-confirm durability of
         // the exact receipt without appending or rewriting any bytes.
         const handle = await fs.open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -499,13 +552,14 @@ export class BrainStore {
       }
       if (snapshot(before).revision !== ifMatch) throw new BrainStoreError('conflict');
       if (before.record.receipts.length >= MAX_BRAIN_NOTES) throw new BrainStoreError('capacity');
-      const markdown = `${before.record.markdown}${before.record.markdown ? '\n\n' : ''}${note}`;
+      const markdown =
+        mode === 'replace' ? note : `${before.record.markdown}${before.record.markdown ? '\n\n' : ''}${note}`;
       if (!validText(markdown, MAX_BRAIN_BYTES)) throw new BrainStoreError('capacity');
       const saved = await this.write(
         path,
         dirs,
         before,
-        { markdown, receipts: [...before.record.receipts, { requestId, hash: hash(note) }] },
+        { markdown, receipts: [...before.record.receipts, { requestId, hash: payloadHash }] },
         authority
       );
       return { ...saved, duplicate: false };

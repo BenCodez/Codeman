@@ -1,6 +1,6 @@
 /**
  * Exact recovery evidence is separate from the deliberately lossy auto-name draft.
- * Only append-only text, LF newlines and bracketed LF paste are modeled. Cursor
+ * Append-only text, ASCII Backspace, LF newlines and bracketed LF paste are modeled. Cursor
  * edits, history, completion and oversized drafts supply no submission evidence.
  */
 export interface CodexInputProof {
@@ -67,6 +67,18 @@ export class CodexInputProofTracker {
         this.bytes = 0;
         this.tainted = false;
         continue;
+      }
+      if ((ch === '\x7f' || ch === '\b') && !this.inPaste && !this.tainted) {
+        // Native Backspace deletes one ASCII character at the end of a known
+        // single-line draft. Unicode graphemes, cursor movement, unknown drafts
+        // and paste controls remain unmodeled. History must still match exactly.
+        if (/^[\x20-\x7e]*$/.test(this.draft)) {
+          if (this.draft.length) {
+            this.draft = this.draft.slice(0, -1);
+            this.bytes--;
+          }
+          continue;
+        }
       }
       const point = ch.codePointAt(0) ?? 0;
       if ((point >= 0xd800 && point <= 0xdfff) || (ch !== '\n' && (point < 0x20 || point === 0x7f))) {

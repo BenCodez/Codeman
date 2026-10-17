@@ -290,12 +290,7 @@ Object.assign(CodemanApp.prototype, {
     document.getElementById('supervisorPrepareBtn').disabled =
       !available || state.phase === 'active' || !!state.inFlight;
     document.getElementById('supervisorStartBtn').disabled =
-      !available ||
-      !state.enabled ||
-      !state.objective ||
-      !state.workers.length ||
-      state.phase === 'active' ||
-      !!state.inFlight;
+      !available || !state.enabled || !state.objective || state.phase === 'active' || !!state.inFlight;
     document.getElementById('supervisorPauseBtn').disabled = !available || state.phase !== 'active';
     document.getElementById('supervisorResetBtn').disabled = !available;
     if (force && state) {
@@ -454,13 +449,15 @@ Object.assign(CodemanApp.prototype, {
       workers,
     });
   },
-  async prepareSupervisorManager() {
+  async prepareSupervisorManager(startAfter = false) {
     const view = this._supervisorView;
     if (!view?.state || view.busy || view.state.phase === 'active' || view.state.inFlight) return;
     if (
       !window.confirm(
         supervisorUiTranslate(
-          'Prepare this session as a restricted manager? This restarts the manager session in place using its verified conversation and restricted supervisor tools. Active work or uncertain delivery will refuse preparation.'
+          startAfter
+            ? 'Prepare and start this manager? The verified conversation is retained. Preparation may restart only this manager to connect restricted tools; Start runs the saved objective and enabled schedules. Active work or uncertain delivery will refuse setup.'
+            : 'Prepare this session as a restricted manager? This restarts the manager session in place using its verified conversation and restricted supervisor tools. Active work or uncertain delivery will refuse preparation.'
         )
       ) ||
       this._supervisorView !== view
@@ -480,6 +477,10 @@ Object.assign(CodemanApp.prototype, {
       view.busy = false;
     }
     if (this._supervisorView !== view) return;
+    if (prepared?.managerReady === true && startAfter) {
+      await this._performSupervisorRequest('/start', 'POST');
+      return;
+    }
     if (prepared?.managerReady === true)
       this.showToast(supervisorUiTranslate('Restricted manager prepared. Select Start manager to begin.'), 'success');
     else if (prepared?.managerReady === false && prepared?.managerInspectionOnly === true)
@@ -493,6 +494,74 @@ Object.assign(CodemanApp.prototype, {
       this.showToast(
         supervisorUiTranslate(
           'Manager preparation was refused or is uncertain. Inspect the pane and verify authentication, exact conversation, settings and idle state before trying again. If the pane exited, use owner Restart after inspection; automatic recovery remains fenced.'
+        ),
+        'error'
+      );
+    await this.loadSupervisorStatus();
+  },
+  async setupAndStartSupervisorManager() {
+    const view = this._supervisorView;
+    if (!view?.state || view.busy || view.state.phase === 'active' || view.state.inFlight) return;
+    if (
+      !window.confirm(
+        supervisorUiTranslate(
+          'Set up and start this manager? Codeman retains the exact conversation, connects restricted tools and, only for a verified settings change at an empty prompt, sends a harmless setup turn. Then it starts the saved objective and schedules. Uncertain delivery is never retried.'
+        )
+      ) ||
+      this._supervisorView !== view
+    )
+      return;
+    let requestId;
+    const key = `codeman:managerSetup:${view.sessionId}`;
+    try {
+      requestId = sessionStorage.getItem(key);
+      if (requestId && !/^[A-Za-z0-9_:.-]{8,120}$/.test(requestId)) throw new Error('Invalid retained setup request');
+      if (!requestId) {
+        requestId = `manager-setup-${globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
+        sessionStorage.setItem(key, requestId);
+        if (sessionStorage.getItem(key) !== requestId) throw new Error('Setup request storage failed');
+      }
+    } catch {
+      this.showToast(
+        supervisorUiTranslate('Manager setup requires durable request storage. No setup was started.'),
+        'error'
+      );
+      return;
+    }
+    view.busy = true;
+    this._renderSupervisorStatus();
+    let result;
+    try {
+      result = await this._apiJson(`/api/sessions/${encodeURIComponent(view.sessionId)}/supervisor/setup-manager`, {
+        method: 'POST',
+        body: { requestId, confirmRestrictedManager: true },
+      });
+    } catch {
+      result = null;
+    } finally {
+      view.busy = false;
+    }
+    if (this._supervisorView !== view) return;
+    if (
+      result?.sessionId === view.sessionId &&
+      result?.requestId === requestId &&
+      ['started', 'refused'].includes(result.phase)
+    ) {
+      try {
+        sessionStorage.removeItem(key);
+      } catch {
+        /* A retained completed request cannot replay setup. */
+      }
+    }
+    if (result?.sessionId === view.sessionId && result?.requestId === requestId && result.phase === 'started')
+      this.showToast(
+        supervisorUiTranslate('Manager is active. Setup completed using the existing conversation.'),
+        'success'
+      );
+    else
+      this.showToast(
+        supervisorUiTranslate(
+          'Manager setup stopped or remains uncertain. The request is retained; inspect the manager before trying again. No setup input will be replayed.'
         ),
         'error'
       );

@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** @fileoverview Codex-specific recovery authority for verified local and owned SSH panes. */
 import { createHash } from 'node:crypto';
 import type { Session } from '../session.js';
@@ -113,6 +114,36 @@ export class CodexRecoveryAdapter {
       context.codexHome,
       this.session.remote,
     ]);
+  }
+
+  /** Scoped manager tools need a fresh owned live process, not an idle composer.
+   * This never authorizes worker input, recovery, or task continuation.
+   */
+  hasFreshOwnedLocalPane(conversationId: string, generation: number, now = Date.now()): boolean {
+    const live = this.livePaneProof;
+    const input = this.verifiedTail?.inputProof;
+    const context = this.session.getRecoveryContext();
+    return (
+      !this.session.remote &&
+      !!live &&
+      !!input &&
+      !input.closed &&
+      input.rawGeneration === 0 &&
+      context.managed &&
+      !context.switchPending &&
+      !context.untrackedInput &&
+      !context.inputBrokerPending &&
+      context.generation === generation &&
+      this.verifiedTail?.conversationId === conversationId &&
+      this.verifiedTail.tailTruncated === false &&
+      live.conversationId === conversationId &&
+      live.panePid === input.brokerPid &&
+      live.scope === this.liveProofScope() &&
+      Number.isFinite(now) &&
+      now >= live.at &&
+      now - live.at <= 30_000 &&
+      !!this.getLocalEvidenceSource(conversationId, generation)
+    );
   }
 
   /** Live evidence is private, process-specific, short-lived and never restored from disk. */
@@ -1016,7 +1047,7 @@ export class CodexRecoveryAdapter {
         mtimeMs: leaf.mtimeMs,
         ctimeMs: leaf.ctimeMs,
         hash: createHash('sha256').update(expected.tail).digest('hex'),
-        maxBytes: 262_144,
+        maxBytes: MAX_CODEX_ROLLOUT_BYTES,
       },
     ];
     authority.paths = expected.witness.paths.map((path) => ({ ...path }));

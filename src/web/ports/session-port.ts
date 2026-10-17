@@ -20,6 +20,12 @@ export interface SessionPort {
   cleanupSession(sessionId: string, killMux?: boolean, reason?: string): Promise<void>;
   /** Retire optional manager data only while final session retirement remains current. */
   dropSupervisorManagementState(sessionId: string, current: () => boolean): Promise<void>;
+  /** Publish an explicitly confirmed SSH shell conversion without retiring its preserved remote shell. */
+  replaceConvertedSession?(
+    previous: Session,
+    replacement: Session,
+    isCurrent: (expected?: Session) => boolean
+  ): Promise<void>;
   setupSessionListeners(session: Session): Promise<void>;
   persistSessionState(session: Session): void;
   persistSessionStateNow(session: Session): void;

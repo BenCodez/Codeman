@@ -1,0 +1,844 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import Fastify from 'fastify';
+import { BrainStore } from '../src/supervisor/brain.js';
+import { GitLabService, GitLabOperationSchema } from '../src/management/gitlab.js';
+import { registerManagementGitLabRoutes } from '../src/web/routes/management-gitlab-routes.js';
+const sha = 'a'.repeat(40);
+const secret = 'synthetic-private-token';
+const content = 'Owner scoped source text\n';
+const digest = (s: string) => createHash('sha256').update(s).digest('hex');
+const json = (value: unknown, status = 200, headers: Record<string, string> = {}) =>
+  new Response(JSON.stringify(value), { status, headers });
+const branchOperation = {
+  operation: 'create_branch',
+  projectId: 1,
+  branch: 'codeman/fix',
+  startCommit: sha,
+  requestId: 'branch-request-one',
+};
+const fileOperation = {
+  operation: 'update_file',
+  projectId: 1,
+  branch: 'codeman/fix',
+  path: 'src/file.ts',
+  content: 'New text',
+  commitMessage: 'fix: keep normal validation',
+  lastCommitId: sha,
+  requestId: 'file-request-one',
+};
+describe('private direct GitLab connection', () => {
+  let root: string;
+  let transport: ReturnType<typeof vi.fn>;
+  let service: GitLabService;
+  const configure = async (overrides: Record<string, unknown> = {}) => {
+    const current = await service.read('alice');
+    return service.configure('alice', {
+      ifMatch: current.revision,
+      url: 'https://gitlab.example.invalid',
+      token: secret,
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+      ...overrides,
+    });
+  };
+  beforeEach(async () => {
+    root = await mkdtemp(join(tmpdir(), 'codeman-gitlab-'));
+    transport = vi.fn(async (url: string, init: RequestInit) => {
+      const path = new URL(url).pathname;
+      if (path === '/api/v4/user')
+        return json({ id: 1, username: 'fixture', name: 'Fixture user', private_token: secret });
+      if (path === '/api/v4/projects')
+        return json([{ id: 7, name: 'Seven', path_with_namespace: 'group/seven', default_branch: 'main' }], 200, {
+          'x-next-page': '2',
+        });
+      if (path === '/api/v4/projects/1')
+        return json({ id: 1, name: 'One', path_with_namespace: 'group/one', default_branch: 'main' });
+      if (path.endsWith('/repository/tree'))
+        return json([{ id: sha, name: 'file.ts', path: 'src/file.ts', type: 'blob', mode: '100644' }]);
+      if (path.endsWith('/repository/branches') && init.method === 'POST')
+        return json({ name: 'codeman/fix', default: false, protected: false, commit: { id: sha } }, 201);
+      if (path.includes('/repository/branches/'))
+        return json({ name: 'codeman/fix', default: false, protected: false });
+      if (path.includes('/repository/files/')) {
+        if (init.method === 'PUT' || init.method === 'POST')
+          return json({ file_path: 'src/file.ts', branch: 'codeman/fix' }, init.method === 'POST' ? 201 : 200);
+        return json({
+          file_path: 'src/file.ts',
+          encoding: 'base64',
+          content: Buffer.from(content).toString('base64'),
+          size: Buffer.byteLength(content),
+          last_commit_id: sha,
+          blob_id: sha,
+          content_sha256: digest(content),
+        });
+      }
+      throw new Error('unexpected fake route');
+    });
+    service = new GitLabService({ root, transport });
+  });
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+    await rm(root, { recursive: true, force: true });
+  });
+  const mr = (patch: Record<string, unknown> = {}) => ({
+    id: 101,
+    iid: 7,
+    project_id: 1,
+    title: 'Fix owner parser',
+    description: 'Untrusted agent handoff text',
+    author: { id: 9, username: 'agent-bot', name: 'Agent Bot', private_token: secret },
+    source_branch: 'codeman/parser',
+    target_branch: 'main',
+    source_project_id: 1,
+    target_project_id: 1,
+    state: 'opened',
+    draft: false,
+    detailed_merge_status: 'checking',
+    web_url: 'https://gitlab.example.invalid/group/one/-/merge_requests/7',
+    sha,
+    updated_at: '2026-10-17T12:00:00Z',
+    ...patch,
+  });
+  it('pins multi-step authority without network and revokes it on owner or connection changes', async () => {
+    await configure();
+    transport.mockClear();
+    let current = true;
+    const authority = await service.captureAuthority('alice', () => current);
+    expect(authority()).toBe(true);
+    expect(transport).not.toHaveBeenCalled();
+    current = false;
+    expect(authority()).toBe(false);
+    await expect(service.captureAuthority('alice', () => current)).rejects.toMatchObject({ code: 'forbidden' });
+    current = true;
+    const beforeConfigChange = await service.captureAuthority('alice', () => current);
+    await configure({ projectIds: [2] });
+    expect(beforeConfigChange()).toBe(false);
+    expect(transport).not.toHaveBeenCalled();
+    await configure({ token: '' });
+    await expect(service.captureAuthority('alice')).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it('reads scoped merge requests and details without writing grants or attributing GitLab authors to agents', async () => {
+    await configure({ allowWrite: false });
+    transport.mockImplementation(async (url: string, init: RequestInit) => {
+      expect(init.method).toBe('GET');
+      const u = new URL(url);
+      if (u.pathname.endsWith('/merge_requests/7')) return json(mr());
+      expect(u.pathname).toBe('/api/v4/projects/1/merge_requests');
+      expect(Object.fromEntries(u.searchParams)).toEqual({ scope: 'all', state: 'opened', per_page: '50', page: '1' });
+      return json([mr()], 200, { 'x-next-page': '2' });
+    });
+    expect(await service.operate('alice', { operation: 'merge_requests', projectId: 1 })).toMatchObject({
+      mergeRequests: [
+        {
+          iid: 7,
+          projectId: 1,
+          author: { username: 'agent-bot' },
+          sourceBranch: 'codeman/parser',
+          targetBranch: 'main',
+          state: 'opened',
+          mergeStatus: 'checking',
+          sha,
+          untrusted: true,
+          agentAttribution: 'unverified',
+        },
+      ],
+      truncated: true,
+      nextPage: 2,
+      capacityReached: false,
+      untrusted: true,
+    });
+    const detail = await service.operate('alice', { operation: 'merge_request', projectId: 1, iid: 7 });
+    expect(detail).toMatchObject({
+      mergeRequest: { id: 101, iid: 7, description: 'Untrusted agent handoff text', webUrl: mr().web_url },
+      untrusted: true,
+    });
+    expect(JSON.stringify(detail)).not.toContain(secret);
+    expect(JSON.stringify(detail)).not.toContain('private_token');
+    expect(transport).toHaveBeenCalledTimes(2);
+  });
+  it('applies explicit all-project grants and bounded merge-request pagination', async () => {
+    await configure({ projectIds: [], allowAllProjects: true, allowWrite: false });
+    transport.mockResolvedValue(
+      json([mr({ project_id: 2, target_project_id: 2, state: 'merged' })], 200, { 'x-next-page': '101' })
+    );
+    expect(
+      await service.operate('alice', { operation: 'merge_requests', projectId: 2, state: 'merged', page: 100 })
+    ).toMatchObject({ truncated: true, nextPage: null, capacityReached: true });
+    expect(String(transport.mock.calls[0][0])).toContain(
+      '/projects/2/merge_requests?scope=all&state=merged&per_page=50&page=100'
+    );
+    await configure({ projectIds: [1], allowAllProjects: false });
+    transport.mockClear();
+    await expect(service.operate('alice', { operation: 'merge_request', projectId: 2, iid: 7 })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+    expect(transport).not.toHaveBeenCalled();
+  });
+  it('bounds UTF-8 descriptions and rejects mismatched, malformed, foreign or secret-bearing MR output', async () => {
+    await configure();
+    transport.mockResolvedValue(json(mr({ description: '😀'.repeat(5000) })));
+    const result = (await service.operate('alice', { operation: 'merge_request', projectId: 1, iid: 7 })) as {
+      mergeRequest: { description: string; descriptionTruncated: boolean };
+    };
+    expect(Buffer.byteLength(result.mergeRequest.description)).toBeLessThanOrEqual(8192);
+    expect(result.mergeRequest.description).not.toContain('�');
+    expect(result.mergeRequest.descriptionTruncated).toBe(true);
+    for (const patch of [
+      { project_id: 2 },
+      { target_project_id: 2 },
+      { iid: 8 },
+      { sha: 'unknown' },
+      { author: { username: 'unverified' } },
+      { web_url: 'https://foreign.invalid/group/one/-/merge_requests/7' },
+      { web_url: 'https://gitlab.example.invalid/group/one/-/merge_requests/7?token=secret' },
+      { web_url: 'https://secret@gitlab.example.invalid/group/one/-/merge_requests/7' },
+      { description: secret },
+    ]) {
+      transport.mockResolvedValue(json(mr(patch)));
+      await expect(
+        service.operate('alice', { operation: 'merge_request', projectId: 1, iid: 7 })
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    }
+  });
+  it('rejects malformed MR pagination, oversized lists and changed owner authority without extra requests', async () => {
+    await configure();
+    for (const cursor of ['1', '02', '3', '-1', 'https://foreign.invalid']) {
+      transport.mockResolvedValue(json([mr()], 200, { 'x-next-page': cursor }));
+      await expect(service.operate('alice', { operation: 'merge_requests', projectId: 1 })).rejects.toMatchObject({
+        code: 'unavailable',
+      });
+    }
+    transport.mockResolvedValue(json(Array.from({ length: 51 }, () => mr())));
+    await expect(service.operate('alice', { operation: 'merge_requests', projectId: 1 })).rejects.toMatchObject({
+      code: 'unavailable',
+    });
+    let current = true;
+    transport.mockImplementation(async () => {
+      current = false;
+      return json([mr()]);
+    });
+    await expect(
+      service.operate('alice', { operation: 'merge_requests', projectId: 1 }, () => current)
+    ).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it.each([
+    { operation: 'merge_requests', projectId: 1, state: 'arbitrary' },
+    { operation: 'merge_requests', projectId: 1, page: 101 },
+    { operation: 'merge_request', projectId: 1, id: 101 },
+    { operation: 'merge_request', projectId: 1, iid: '../7' },
+    { operation: 'merge_request', projectId: 1, iid: 7, url: 'https://foreign.invalid' },
+  ])('rejects arbitrary MR selectors/routes %#', (operation) => {
+    expect(GitLabOperationSchema.safeParse(operation).success).toBe(false);
+  });
+  it('keeps tokens private, retains omitted credentials, clears explicitly and scopes owners', async () => {
+    const result = await configure();
+    expect(result.credentialConfigured).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(secret);
+    const retained = await service.configure('alice', {
+      ifMatch: result.revision,
+      url: result.url,
+      projectIds: result.projectIds,
+      allowAllProjects: result.allowAllProjects,
+      allowWrite: result.allowWrite,
+      writeBranchPrefix: result.writeBranchPrefix,
+    });
+    expect(retained.credentialConfigured).toBe(true);
+    expect((await service.read('bob')).credentialConfigured).toBe(false);
+    expect(await service.check('alice')).toMatchObject({
+      available: true,
+      user: { id: 1, username: 'fixture', name: 'Fixture user' },
+    });
+    const cleared = await configure({ token: '' });
+    expect(cleared.allowWrite).toBe(false);
+    expect(cleared.credentialConfigured).toBe(false);
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it('never forwards a saved credential to a changed origin without an explicitly supplied new token', async () => {
+    const first = await configure();
+    const changed = await service.configure('alice', {
+      ifMatch: first.revision,
+      url: 'https://other-gitlab.example.invalid',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(changed).toMatchObject({ credentialConfigured: false, allowWrite: false });
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    expect(transport).not.toHaveBeenCalled();
+    const explicit = await service.configure('alice', {
+      ifMatch: changed.revision,
+      url: 'https://other-gitlab.example.invalid/',
+      token: 'new-synthetic-token',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(explicit).toMatchObject({ credentialConfigured: true, allowWrite: true });
+    const same = await service.configure('alice', {
+      ifMatch: explicit.revision,
+      url: 'https://other-gitlab.example.invalid',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(same.credentialConfigured).toBe(true);
+    const blank = await service.configure('alice', {
+      ifMatch: same.revision,
+      url: 'https://third-gitlab.example.invalid',
+      token: '',
+      projectIds: [1],
+      allowAllProjects: false,
+      allowWrite: true,
+      writeBranchPrefix: 'codeman/',
+    });
+    expect(blank).toMatchObject({ credentialConfigured: false, allowWrite: false });
+  });
+  it('requires explicit fake transport under VITEST and never falls back to real networking', async () => {
+    await configure();
+    const isolated = new GitLabService({ root });
+    const fetch = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('should not be called'));
+    await expect(isolated.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    expect(fetch).not.toHaveBeenCalled();
+  });
+  it('reads only configured project IDs and supports explicitly enabled all-project pagination', async () => {
+    await configure();
+    expect(await service.operate('alice', { operation: 'projects' })).toMatchObject({
+      projects: [{ id: 1 }],
+      truncated: false,
+    });
+    await expect(
+      service.operate('alice', { operation: 'file', projectId: 9, branch: 'main', path: 'src/file.ts' })
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    await configure({ projectIds: [], allowAllProjects: true });
+    expect(await service.operate('alice', { operation: 'projects', page: 1 })).toMatchObject({
+      projects: [{ id: 7 }],
+      truncated: true,
+      nextPage: 2,
+    });
+    expect(transport.mock.calls.some(([url]) => url.endsWith('/projects?per_page=50&page=1'))).toBe(true);
+  });
+  it('terminates all-project pagination explicitly at the supported page boundary', async () => {
+    await configure({ projectIds: [], allowAllProjects: true });
+    transport.mockResolvedValueOnce(
+      json([{ id: 7, name: 'Seven', path_with_namespace: 'group/seven', default_branch: 'main' }], 200, {
+        'x-next-page': '101',
+      })
+    );
+    expect(await service.operate('alice', { operation: 'projects', page: 100 })).toMatchObject({
+      projects: [{ id: 7 }],
+      truncated: true,
+      nextPage: null,
+      capacityReached: true,
+    });
+    expect(GitLabOperationSchema.safeParse({ operation: 'projects', page: 101 }).success).toBe(false);
+    transport.mockResolvedValueOnce(json([], 200, { 'x-next-page': '' }));
+    expect(await service.operate('alice', { operation: 'projects', page: 100 })).toMatchObject({
+      truncated: false,
+      nextPage: null,
+      capacityReached: false,
+    });
+  });
+  it('returns the final supported tree page with an explicit capacity boundary', async () => {
+    await configure();
+    const entries = [{ id: sha, name: 'file.ts', path: 'src/file.ts', type: 'blob', mode: '100644' }];
+    transport.mockResolvedValueOnce(json(entries, 200, { 'x-next-page': '101' }));
+    expect(
+      await service.operate('alice', { operation: 'tree', projectId: 1, branch: 'main', path: 'src', page: 100 })
+    ).toEqual({ entries, truncated: true, nextPage: null, capacityReached: true });
+    expect(
+      GitLabOperationSchema.safeParse({ operation: 'tree', projectId: 1, branch: 'main', page: 101 }).success
+    ).toBe(false);
+    transport.mockResolvedValueOnce(json(entries, 200, { 'x-next-page': '' }));
+    expect(
+      await service.operate('alice', { operation: 'tree', projectId: 1, branch: 'main', path: 'src', page: 100 })
+    ).toEqual({ entries, truncated: false, nextPage: null, capacityReached: false });
+    for (const cursor of ['102', '0101', 'NaN']) {
+      transport.mockResolvedValueOnce(json(entries, 200, { 'x-next-page': cursor }));
+      await expect(
+        service.operate('alice', { operation: 'tree', projectId: 1, branch: 'main', page: 100 })
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    }
+  });
+  it.each(['release@2026', 'feature+test', '发布/版本+test'])(
+    'accepts valid GitLab default ref %s in listing, connection checks and write preflight',
+    async (defaultBranch) => {
+      await configure();
+      const original = transport.getMockImplementation()!;
+      const project = { id: 1, name: 'One', path_with_namespace: 'group/one', default_branch: defaultBranch };
+      transport.mockImplementation(async (url: string, init: RequestInit) => {
+        const path = new URL(url).pathname;
+        if (path === '/api/v4/projects/1') return json(project);
+        if (path === '/api/v4/projects') return json([project]);
+        return original(url, init);
+      });
+      expect(await service.operate('alice', { operation: 'projects' })).toMatchObject({ projects: [project] });
+      expect(await service.check('alice')).toMatchObject({ available: true, projectCount: 1 });
+      expect(await service.operate('alice', branchOperation)).toMatchObject({ status: 'succeeded' });
+      expect(await service.operate('alice', fileOperation)).toMatchObject({ status: 'succeeded' });
+      await configure({ projectIds: [], allowAllProjects: true });
+      expect(await service.operate('alice', { operation: 'projects' })).toMatchObject({ projects: [project] });
+      expect(GitLabOperationSchema.safeParse({ ...fileOperation, branch: defaultBranch }).success).toBe(false);
+    }
+  );
+  it('still rejects malformed default refs and refuses writes to the actual default branch', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    let defaultBranch = '';
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      new URL(url).pathname === '/api/v4/projects/1'
+        ? json({ id: 1, name: 'One', path_with_namespace: 'group/one', default_branch: defaultBranch })
+        : original(url, init)
+    );
+    for (const invalid of ['', 'feature test', 'refs/../main', 'feature@{1}', 'release.lock/main', 'x'.repeat(1025)]) {
+      defaultBranch = invalid;
+      await expect(service.operate('alice', { operation: 'projects' })).rejects.toMatchObject({ code: 'unavailable' });
+      await expect(service.check('alice')).rejects.toThrow();
+      await expect(service.operate('alice', branchOperation)).rejects.toMatchObject({ code: 'unavailable' });
+    }
+    defaultBranch = 'codeman/fix';
+    await expect(service.operate('alice', branchOperation)).rejects.toMatchObject({ code: 'forbidden' });
+    await expect(service.operate('alice', fileOperation)).rejects.toMatchObject({ code: 'forbidden' });
+    expect(transport.mock.calls.some(([, init]) => init.method === 'POST' || init.method === 'PUT')).toBe(false);
+  });
+  it('checks actual selected project access and the all-project endpoint', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      new URL(url).pathname === '/api/v4/projects/1' ? json({ message: 'forbidden' }, 403) : original(url, init)
+    );
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    await configure({ projectIds: [], allowAllProjects: true });
+    expect(await service.check('alice')).toMatchObject({ available: true, projectCount: 1, projectsTruncated: true });
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      new URL(url).pathname === '/api/v4/projects' ? json({}, 403) : original(url, init)
+    );
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it('uses bounded parallel project reads and retains configured ordering', async () => {
+    await configure({ projectIds: Array.from({ length: 100 }, (_, i) => i + 1) });
+    let active = 0,
+      peak = 0;
+    transport.mockImplementation(async (url: string) => {
+      const id = Number(new URL(url).pathname.split('/').at(-1));
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      active--;
+      return json({ id, name: String(id), path_with_namespace: `group/${id}`, default_branch: 'main' });
+    });
+    const result = (await service.operate('alice', { operation: 'projects' })) as { projects: { id: number }[] };
+    expect(result.projects.map((p) => p.id)).toEqual(Array.from({ length: 100 }, (_, i) => i + 1));
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(5);
+  });
+  it('requires explicit consent for plaintext HTTP and retains the warning', async () => {
+    await expect(configure({ url: 'http://gitlab.example.invalid' })).rejects.toMatchObject({ code: 'forbidden' });
+    const saved = await configure({ url: 'http://gitlab.example.invalid', allowInsecureHttp: true });
+    expect(saved).toMatchObject({ allowInsecureHttp: true, credentialTransportPlaintext: true });
+    expect(await service.check('alice')).toMatchObject({ available: true });
+    expect(transport.mock.calls.every(([url]) => url.startsWith('http://gitlab.example.invalid/'))).toBe(true);
+    await expect(configure({ url: 'http://gitlab.example.invalid', allowInsecureHttp: false })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+  });
+  it('finds a regular file on a later tree page for reads and guarded updates', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) => {
+      const u = new URL(url);
+      if (u.pathname.endsWith('/repository/tree') && u.searchParams.get('page') === '1')
+        return json([{ id: sha, name: 'other.ts', path: 'src/other.ts', type: 'blob', mode: '100644' }], 200, {
+          'x-next-page': '2',
+        });
+      return original(url, init);
+    });
+    expect(
+      await service.operate('alice', { operation: 'file', projectId: 1, branch: 'main', path: 'src/file.ts' })
+    ).toMatchObject({ content });
+    expect(await service.operate('alice', fileOperation)).toMatchObject({ status: 'succeeded' });
+    expect(
+      transport.mock.calls.filter(
+        ([url]) => url.includes('/repository/tree') && new URL(url).searchParams.get('page') === '2'
+      )
+    ).toHaveLength(2);
+  });
+  it('bounds directory pagination and refuses malformed cursors without a file write', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    for (const cursor of ['NaN', '1', '3', '101', '02']) {
+      transport.mockImplementation(async (url: string, init: RequestInit) =>
+        url.includes('/repository/tree') ? json([], 200, { 'x-next-page': cursor }) : original(url, init)
+      );
+      await expect(
+        service.operate('alice', { operation: 'file', projectId: 1, branch: 'main', path: 'src/file.ts' })
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    }
+    transport.mockClear();
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      url.includes('/repository/tree')
+        ? json([], 200, { 'x-next-page': String(Number(new URL(url).searchParams.get('page')) + 1) })
+        : original(url, init)
+    );
+    await expect(service.operate('alice', fileOperation)).rejects.toMatchObject({ code: 'capacity' });
+    expect(transport.mock.calls.filter(([url]) => url.includes('/repository/tree'))).toHaveLength(10);
+    expect(transport.mock.calls.some(([, init]) => init.method === 'PUT')).toBe(false);
+  });
+  it('validates UTF-8 blob content and rejects symlinks, stale blob metadata and unsafe paths', async () => {
+    await configure();
+    expect(
+      await service.operate('alice', { operation: 'file', projectId: 1, branch: 'main', path: 'src/file.ts' })
+    ).toMatchObject({ content, lastCommitId: sha });
+    for (const path of ['../secret', '/root/file', 'src/../file', 'src\\file', 'src/\0file'])
+      expect(GitLabOperationSchema.safeParse({ operation: 'file', projectId: 1, branch: 'main', path }).success).toBe(
+        false
+      );
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      url.includes('/repository/tree')
+        ? json([{ id: sha, name: 'file.ts', path: 'src/file.ts', type: 'blob', mode: '120000' }])
+        : original(url, init)
+    );
+    await expect(
+      service.operate('alice', { operation: 'file', projectId: 1, branch: 'main', path: 'src/file.ts' })
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      url.includes('/repository/tree')
+        ? json([{ id: 'b'.repeat(40), name: 'file.ts', path: 'src/file.ts', type: 'blob', mode: '100644' }])
+        : original(url, init)
+    );
+    await expect(
+      service.operate('alice', { operation: 'file', projectId: 1, branch: 'main', path: 'src/file.ts' })
+    ).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it('uses fixed HTTPS routes with private headers, redirect refusal and exact file CAS/commit message', async () => {
+    await configure();
+    expect(await service.operate('alice', fileOperation)).toMatchObject({ status: 'succeeded', duplicate: false });
+    const [url, request] = transport.mock.calls.find(([, init]) => init.method === 'PUT')!;
+    expect(url).toBe('https://gitlab.example.invalid/api/v4/projects/1/repository/files/src%2Ffile.ts');
+    expect(request.redirect).toBe('error');
+    expect(request.headers).toMatchObject({ 'PRIVATE-TOKEN': secret });
+    expect(JSON.parse(request.body as string)).toEqual({
+      branch: 'codeman/fix',
+      content: 'New text',
+      commit_message: 'fix: keep normal validation',
+      last_commit_id: sha,
+    });
+    expect(await service.operate('alice', fileOperation)).toMatchObject({ status: 'succeeded', duplicate: true });
+    expect(transport.mock.calls.filter(([, init]) => init.method === 'PUT')).toHaveLength(1);
+    await expect(service.operate('alice', { ...fileOperation, content: 'different' })).rejects.toMatchObject({
+      code: 'conflict',
+    });
+  });
+  it('seals lost acknowledgements across restart and never retries an uncertain write', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') throw new Error(`private diagnostic ${secret}`);
+      return original(url, init);
+    });
+    expect(await service.operate('alice', branchOperation)).toEqual({
+      status: 'uncertain',
+      requestId: branchOperation.requestId,
+      duplicate: false,
+    });
+    const restarted = new GitLabService({ root, transport });
+    expect(await restarted.operate('alice', branchOperation)).toEqual({
+      status: 'uncertain',
+      requestId: branchOperation.requestId,
+      duplicate: true,
+    });
+    expect(transport.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
+  });
+  it('refuses writes without grants, outside prefix, on default/protected branches and with stale file commits', async () => {
+    await configure({ allowWrite: false });
+    await expect(service.operate('alice', branchOperation)).rejects.toMatchObject({ code: 'forbidden' });
+    await configure();
+    await expect(service.operate('alice', { ...branchOperation, branch: 'main' })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+    await expect(service.operate('alice', { ...fileOperation, lastCommitId: 'b'.repeat(40) })).rejects.toMatchObject({
+      code: 'conflict',
+    });
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      url.includes('/repository/branches/')
+        ? json({ name: 'codeman/fix', default: false, protected: true })
+        : original(url, init)
+    );
+    await expect(service.operate('alice', fileOperation)).rejects.toMatchObject({ code: 'forbidden' });
+    expect(transport.mock.calls.filter(([, init]) => init.method === 'PUT' || init.method === 'POST')).toHaveLength(0);
+  });
+  it('fences cancellation and connection edits while reads are in flight', async () => {
+    await configure();
+    let release!: (response: Response) => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>((r) => {
+      entered = r;
+    });
+    transport.mockImplementation(() => {
+      entered();
+      return new Promise<Response>((r) => {
+        release = r;
+      });
+    });
+    const pending = service.check('alice');
+    const checked = expect(pending).rejects.toMatchObject({ code: 'unavailable' });
+    await waiting;
+    await configure({ allowWrite: false });
+    release(json({ id: 1, username: 'fixture', name: 'Fixture' }));
+    await checked;
+    await expect(service.operate('alice', branchOperation, () => false)).rejects.toMatchObject({ code: 'forbidden' });
+  });
+  it('returns uncertainty if grants are revoked after a write may have landed', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    let release!: (response: Response) => void;
+    let entered!: () => void;
+    const waiting = new Promise<void>((r) => {
+      entered = r;
+    });
+    transport.mockImplementation((url: string, init: RequestInit) => {
+      if (init.method === 'POST') {
+        entered();
+        return new Promise<Response>((r) => {
+          release = r;
+        });
+      }
+      return original(url, init);
+    });
+    const pending = service.operate('alice', branchOperation);
+    await waiting;
+    await configure({ allowWrite: false });
+    release(json({ name: 'codeman/fix', default: false, protected: false, commit: { id: sha } }, 201));
+    expect(await pending).toMatchObject({ status: 'uncertain' });
+    await configure();
+    expect(await service.operate('alice', branchOperation)).toMatchObject({ status: 'uncertain', duplicate: true });
+    expect(transport.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(1);
+  });
+  it('rejects redirects, oversized or malformed responses and preserves corrupt private files', async () => {
+    await configure();
+    transport.mockResolvedValue(
+      new Response(null, { status: 302, headers: { location: 'https://other.example.invalid' } })
+    );
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    transport.mockResolvedValue(new Response('x'.repeat(512 * 1024 + 1)));
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    const path = join(root, 'management-gitlab', digest('alice'), 'brain.md');
+    await writeFile(path, 'broken', { mode: 0o600 });
+    await expect(service.read('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    expect(await readFile(path, 'utf8')).toBe('broken');
+  });
+  it('rechecks grants in the final transport admission gap after the awaited verification', async () => {
+    await configure();
+    const store = new BrainStore(join(root, 'management-gitlab'));
+    const internal = service as unknown as { verify(owner: string, connection: unknown): Promise<void> };
+    const verify = internal.verify.bind(service);
+    let revoked = false;
+    vi.spyOn(internal, 'verify').mockImplementation(async (owner, connection) => {
+      await verify(owner, connection);
+      const persisted = await store.read(digest('alice'), () => true);
+      if (
+        !revoked &&
+        JSON.parse(persisted.markdown).receipts.some(
+          (receipt: { requestId: string }) => receipt.requestId === branchOperation.requestId
+        )
+      ) {
+        revoked = true;
+        await configure({ allowWrite: false });
+      }
+    });
+    expect(await service.operate('alice', branchOperation)).toMatchObject({ status: 'uncertain' });
+    expect(revoked).toBe(true);
+    expect(transport.mock.calls.filter(([, init]) => init.method === 'POST')).toHaveLength(0);
+  });
+  it('expires a stalled request after ten seconds without any retry', async () => {
+    await configure();
+    let entered!: () => void;
+    const waiting = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let signal: AbortSignal | null | undefined;
+    transport.mockImplementation((_url: string, init: RequestInit) => {
+      signal = init.signal;
+      entered();
+      return new Promise<Response>(() => {});
+    });
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    const pending = service.check('alice');
+    const checked = expect(pending).rejects.toMatchObject({ code: 'unavailable' });
+    await waiting;
+    await vi.advanceTimersByTimeAsync(10_001);
+    await checked;
+    expect(signal?.aborted).toBe(true);
+    expect(transport).toHaveBeenCalledOnce();
+  });
+  it('reserves writes durably before transport and refuses new operations at receipt capacity', async () => {
+    await configure();
+    const store = new BrainStore(join(root, 'management-gitlab'));
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) => {
+      if (init.method === 'POST') {
+        const persisted = await store.read(digest('alice'), () => true);
+        expect(JSON.parse(persisted.markdown).receipts).toContainEqual(
+          expect.objectContaining({ requestId: branchOperation.requestId, status: 'uncertain' })
+        );
+      }
+      return original(url, init);
+    });
+    expect(await service.operate('alice', branchOperation)).toMatchObject({ status: 'succeeded' });
+    const before = await store.read(digest('alice'), () => true);
+    const config = JSON.parse(before.markdown);
+    config.receipts = Array.from({ length: 128 }, (_, index) => ({
+      requestId: `capacity-${index}`,
+      hash: 'a'.repeat(64),
+      status: 'uncertain',
+    }));
+    await store.replace(digest('alice'), JSON.stringify(config), before.revision, () => true);
+    const count = transport.mock.calls.length;
+    await expect(service.operate('alice', { ...branchOperation, requestId: 'capacity-new' })).rejects.toMatchObject({
+      code: 'capacity',
+    });
+    expect(transport).toHaveBeenCalledTimes(count);
+  });
+  it('archives finalized receipts to free capacity while preserving uncertain and archived replay fences', async () => {
+    await configure();
+    await service.operate('alice', branchOperation);
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      init.method === 'POST' ? json({ message: 'not allowed' }, 403) : original(url, init)
+    );
+    const rejected = { ...branchOperation, requestId: 'branch-rejected-request' };
+    await service.operate('alice', rejected);
+    transport.mockImplementation(original);
+    const store = new BrainStore(join(root, 'management-gitlab'));
+    const before = await store.read(digest('alice'), () => true);
+    const saved = JSON.parse(before.markdown);
+    saved.receipts.push(
+      ...Array.from({ length: 126 }, (_, i) => ({
+        requestId: `uncertain-${i}`,
+        hash: digest(`uncertain-${i}`),
+        status: 'uncertain',
+      }))
+    );
+    await store.replace(digest('alice'), JSON.stringify(saved), before.revision, () => true);
+    const full = await service.read('alice');
+    expect(full.writeReceipts).toEqual({ active: 128, capacity: 128, finalized: 2, uncertain: 126 });
+    const calls = transport.mock.calls.length;
+    const archived = await service.archiveFinalized('alice', { ifMatch: full.revision, confirmArchiveFinalized: true });
+    expect(archived).toMatchObject({
+      archived: 2,
+      config: { writeReceipts: { active: 126, finalized: 0, uncertain: 126 } },
+    });
+    expect(transport).toHaveBeenCalledTimes(calls);
+    // Reconstructing the service still finds immutable tombstones; old IDs cannot become fresh writes.
+    const restarted = new GitLabService({ root, transport });
+    expect(await restarted.operate('alice', branchOperation)).toEqual({
+      status: 'succeeded',
+      requestId: branchOperation.requestId,
+      duplicate: true,
+    });
+    expect(await restarted.operate('alice', rejected)).toEqual({
+      status: 'rejected',
+      requestId: rejected.requestId,
+      duplicate: true,
+    });
+    await expect(restarted.operate('alice', { ...branchOperation, branch: 'codeman/changed' })).rejects.toMatchObject({
+      code: 'conflict',
+    });
+    await expect(restarted.operate('alice', { ...branchOperation, requestId: 'uncertain-0' })).rejects.toMatchObject({
+      code: 'conflict',
+    });
+    expect(transport).toHaveBeenCalledTimes(calls);
+    expect(await restarted.operate('alice', { ...branchOperation, requestId: 'fresh-after-archive' })).toMatchObject({
+      status: 'succeeded',
+      duplicate: false,
+    });
+    await expect(
+      restarted.archiveFinalized('alice', { ifMatch: full.revision, confirmArchiveFinalized: true })
+    ).rejects.toMatchObject({ code: 'conflict' });
+  });
+  it('retains active finalized receipts when an archive write is uncertain', async () => {
+    await configure();
+    await service.operate('alice', branchOperation);
+    const current = await service.read('alice');
+    const archives = Reflect.get(service, 'archives') as BrainStore;
+    const archiveWrite = archives.replace.bind(archives);
+    vi.spyOn(archives, 'replace').mockImplementationOnce(async (...args) => {
+      await archiveWrite(...args);
+      throw Error('lost archive ACK after durable write');
+    });
+    await expect(
+      service.archiveFinalized('alice', { ifMatch: current.revision, confirmArchiveFinalized: true })
+    ).rejects.toThrow();
+    expect((await service.read('alice')).writeReceipts).toMatchObject({ active: 1, finalized: 1 });
+    const calls = transport.mock.calls.length;
+    expect(await service.operate('alice', branchOperation)).toMatchObject({ status: 'succeeded', duplicate: true });
+    expect(transport).toHaveBeenCalledTimes(calls);
+  });
+  it('exposes redacted owner routes and rejects malformed config without echoing credentials', async () => {
+    const app = Fastify();
+    app.addHook('onRequest', async (req) => {
+      req.authUser = { username: 'alice', role: 'admin' };
+    });
+    registerManagementGitLabRoutes(app, { service });
+    const initial = (await app.inject('/api/management/gitlab')).json().data;
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/api/management/gitlab',
+      payload: {
+        ifMatch: initial.revision,
+        url: 'https://gitlab.example.invalid',
+        token: secret,
+        projectIds: [],
+        allowAllProjects: true,
+        allowWrite: true,
+        writeBranchPrefix: 'codeman/',
+      },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.body).not.toContain(secret);
+    expect(saved.headers['cache-control']).toBe('no-store');
+    const checked = await app.inject({ method: 'POST', url: '/api/management/gitlab/check', payload: {} });
+    expect(checked.statusCode).toBe(200);
+    expect(checked.body).not.toContain(secret);
+    const archived = await app.inject({
+      method: 'POST',
+      url: '/api/management/gitlab/receipts/archive',
+      payload: { ifMatch: saved.json().data.revision, confirmArchiveFinalized: true },
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json().data.archived).toBe(0);
+    expect(archived.headers['cache-control']).toBe('no-store');
+    expect(archived.body).not.toContain(secret);
+    const unconfirmed = await app.inject({
+      method: 'POST',
+      url: '/api/management/gitlab/receipts/archive',
+      payload: { ifMatch: archived.json().data.config.revision, confirmArchiveFinalized: false },
+    });
+    expect(unconfirmed.statusCode).toBe(400);
+    const invalid = await app.inject({
+      method: 'PUT',
+      url: '/api/management/gitlab',
+      payload: {
+        ifMatch: archived.json().data.config.revision,
+        url: 'http://gitlab.example.invalid',
+        token: secret,
+        projectIds: [],
+        allowWrite: true,
+      },
+    });
+    expect(invalid.statusCode).toBe(403);
+    expect(invalid.body).not.toContain(secret);
+    await app.close();
+  });
+});

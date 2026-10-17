@@ -22802,3 +22802,35 @@ html[data-header-stats='tiles'] .header-plan-usage:not(:has(.pu-row)) {
   }
   #task-tab .task-criterion { min-height: 44px; align-items: center; }
 }
+
+/* Global manager directory: forms fit both the settings document and phone width. */
+#settings-management .task-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+#settings-management fieldset {
+  border: 0;
+  margin-inline: 0;
+}
+#settings-management .task-form > label {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+#settings-management .task-form > label > :is(input[type="text"], textarea),
+#settings-management .set-select,
+#settings-management .set-textarea {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+}
+#settings-management .task-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+#settings-management [hidden] { display: none !important; }

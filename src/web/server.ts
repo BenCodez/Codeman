@@ -176,6 +176,11 @@ import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
 import { haveDistinctSupervisorHomes } from '../supervisor/home-identity.js';
 import { ManagerCredentialRegistry } from '../supervisor/manager-credentials.js';
+import { ManagerSetupJournal, MANAGER_SETUP_PROMPT, type ManagerSetupPhase } from '../supervisor/manager-setup.js';
+import { hasEmptyCodexComposer, permitsCodexManagerSetup } from '../recovery/codex-classifier.js';
+import { hasAcknowledgedCodexComposerCapture } from '../recovery/codex-composer-capture.js';
+import { queueInputDispatch } from './input-dispatch-queue.js';
+import { MAX_CODEX_ROLLOUT_BYTES } from '../recovery/codex-evidence-limits.js';
 import { drainSupervisorManagerRetirements } from '../supervisor/manager-launch.js';
 import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
 import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
@@ -183,6 +188,16 @@ import { SupervisorStore } from '../supervisor/store.js';
 import { SupervisorAutomationController } from '../supervisor/automation.js';
 import { SupervisorAutomationStore } from '../supervisor/automation-store.js';
 import { BrainStore } from '../supervisor/brain.js';
+import { ManagementService } from '../management/store.js';
+import { BrainGitLabSyncService } from '../management/brain-gitlab-sync.js';
+import { registerManagementBrainSyncRoutes } from './routes/management-brain-sync-routes.js';
+import { ManagementAgentDeliveryKernel, type ManagementAgentDeliveryRequest } from '../management/agent-delivery.js';
+import { GitLabService } from '../management/gitlab.js';
+import { observeManagementAgent } from '../management/observation.js';
+import { ManagementAgentReader } from '../management/agent-reader.js';
+import { registerManagementGitLabRoutes } from './routes/management-gitlab-routes.js';
+import { registerManagementRoutes } from './routes/management-routes.js';
+import { registerManagementAgentAuth } from './middleware/management-agent-auth.js';
 import type { SupervisorUsage } from '../types/supervisor.js';
 import { SupervisorStateSchema } from '../supervisor/schema.js';
 import { RecoveryController } from '../recovery/controller.js';
@@ -355,6 +370,184 @@ export class WebServer extends EventEmitter {
   private supervisorAutomationStore = new SupervisorAutomationStore();
   private supervisorAutomations = new Map<string, SupervisorAutomationController>();
   private supervisorBrainStore = new BrainStore();
+  private managementBrainStore = new BrainStore(dataPath('management-brains'));
+  private managementGitLab = new GitLabService();
+  private managementBrainSync = new BrainGitLabSyncService({
+    gitlab: this.managementGitLab,
+    brain: {
+      read: (owner, current) => this.readManagementBrain(owner, current),
+      replace: (owner, markdown, ifMatch, current) =>
+        this.managementBrainStore.replace(this.managementBrainId(owner), markdown, ifMatch, current),
+    },
+  });
+  private managementAgentReader = new ManagementAgentReader({
+    lookup: (id) => this.sessions.get(id),
+    claudeTranscriptPath: (id) => this.transcriptWatchers.get(id)?.getPath() ?? null,
+  });
+  private managementDelivery = new ManagementAgentDeliveryKernel({
+    worker: (owner, id) => {
+      const session = this.sessions.get(id);
+      if (!session || (session.owner ?? 'admin') !== owner) return undefined;
+      return {
+        session,
+        isCurrent: () =>
+          !this.recoveryStopping &&
+          !this.cleaningUp.has(id) &&
+          this.sessions.get(id) === session &&
+          (session.owner ?? 'admin') === owner,
+        journalsReadable: () =>
+          !this.taskStore.loadFailed &&
+          !this.recoveryStore.loadFailed &&
+          !!this.supervisorStore.getBrokerCleanupState() &&
+          !this.actionReservationStore.loadFailed,
+        taskStates: () => [this.taskControllers.get(id)?.getStatus() ?? this.taskStore.get(id), this.taskStore.get(id)],
+        recoveryStates: () => [
+          this.recoveryControllers.get(id)?.getStatus() ?? this.recoveryStore.get(id),
+          this.recoveryStore.get(id),
+        ],
+        task: this.taskControllers.get(id),
+      };
+    },
+    arbiter: (id) => this.getActionArbiter(id),
+    persistSession: (session) => this._persistSessionStateNow(session),
+    canDispatch: (request, worker) =>
+      request.current() &&
+      worker.isCurrent() &&
+      !worker.session.hasSupervisorManagerLaunch() &&
+      !this.supervisorControllers.get(worker.session.id)?.getStatus().enabled &&
+      !this.supervisorStore.get(worker.session.id).enabled &&
+      !this.supervisorLeaseHolder(worker.session.id, '__management_delivery__'),
+    authority: (request) => this.captureManagementDeliveryAuthority(request),
+  });
+  private managementService = new ManagementService({
+    sessions: () =>
+      [...this.sessions.values()].map((session) => ({
+        id: session.id,
+        owner: session.owner ?? 'admin',
+        name: session.name,
+        mode: session.mode,
+        remote: !!session.remote,
+        status: session.status,
+        managerAvailable: this.supervisorManagerIsEligible(session),
+        managerActive: this.supervisorControllers.get(session.id)?.getStatus().phase === 'active',
+      })),
+    ownerCurrent: () => !this.recoveryStopping && this.supervisorManagerAuthenticationAvailable(),
+    deliver: (request) => this.managementDelivery.deliver(request),
+  });
+  /** Pin the owner request while obtaining the selected manager's native input issuer.
+   * A fresh evidence read never rebinds the original message/configuration grant. */
+  private async captureManagementDeliveryAuthority(
+    request: ManagementAgentDeliveryRequest
+  ): Promise<import('../recovery/types.js').RecoveryActionAuthority | undefined> {
+    const captured = await this.managementService.captureConfiguration(request.owner, request.current);
+    const managerId = captured.config.managerSessionId;
+    const manager = managerId ? this.sessions.get(managerId) : undefined;
+    const worker = this.sessions.get(request.sessionId);
+    if (!manager || !worker || manager === worker) return undefined;
+    const managerTask = this.taskControllers.get(manager.id);
+    if (!managerTask) return undefined;
+    const managerIntent = managerTask.captureActionAuthority();
+    const managerWorkCurrent = () => {
+      if (!managerIntent() || this.taskControllers.get(manager.id) !== managerTask) return false;
+      const live = managerTask.getStatus(),
+        durable = this.taskStore.get(manager.id);
+      return (
+        [live, durable].every(
+          (state) =>
+            state.config.enabled &&
+            state.phase === 'watching' &&
+            !state.inFlight &&
+            !state.agentProgressVeto &&
+            state.outcome !== 'blocked' &&
+            state.outcome !== 'completed' &&
+            state.conversationId === manager.codexConfig?.resumeSessionId
+        ) &&
+        JSON.stringify(live.config) === JSON.stringify(durable.config) &&
+        live.objective === durable.objective
+      );
+    };
+    const workerBinding = () =>
+      JSON.stringify([
+        worker.owner,
+        worker.mode,
+        worker.workingDir,
+        worker.codexConfig,
+        worker.getEnvOverridesForPersist(),
+        worker.remote,
+        worker.getRecoveryContext().codexHome,
+      ]);
+    const expectedWorker = workerBinding();
+    const current = () =>
+      request.current() &&
+      captured.current() &&
+      managerWorkCurrent() &&
+      !this.recoveryStopping &&
+      !this.cleaningUp.has(manager.id) &&
+      !this.cleaningUp.has(worker.id) &&
+      this.sessions.get(manager.id) === manager &&
+      this.sessions.get(worker.id) === worker &&
+      (manager.owner ?? 'admin') === request.owner &&
+      (worker.owner ?? 'admin') === request.owner &&
+      workerBinding() === expectedWorker &&
+      this.supervisorManagerIsEligible(manager) &&
+      this.supervisorControllers.get(manager.id)?.getStatus().phase === 'active';
+    if (!current()) return undefined;
+    if (
+      !worker.remote &&
+      !(await haveDistinctSupervisorHomes(
+        manager.getRecoveryContext().codexHome,
+        worker.getRecoveryContext().codexHome,
+        current,
+        performance.now() + 2000
+      ))
+    )
+      return undefined;
+    const authority = (await this.supervisorControllers.get(manager.id)?.captureBrainAuthority(current)) as
+      | import('../recovery/types.js').RecoveryActionAuthority
+      | undefined;
+    return current() && authority?.() && authority.getInputIssuer?.() ? authority : undefined;
+  }
+  /** A remote failure must not turn a successful local memory write into a failed write. */
+  private async afterManagementBrainWrite<T>(owner: string, saved: T, current: () => boolean): Promise<T> {
+    try {
+      await this.managementBrainSync.publishChanged(owner, current);
+    } catch {
+      // The sync service retains pending/conflict/uncertain state separately.
+    }
+    return saved;
+  }
+  private managementBrainId(owner: string): string {
+    return 'management-owner-' + createHash('sha256').update(owner).digest('hex');
+  }
+  /** Global selection shares one brain; other supervisors retain their own memory. */
+  private async captureSupervisorBrain(session: Session, current: () => boolean) {
+    const owner = session.owner ?? 'admin';
+    const captured = await this.managementService.captureConfiguration(owner, current);
+    const authority = () =>
+      captured.current() && this.sessions.get(session.id) === session && (session.owner ?? 'admin') === owner;
+    if (!authority()) throw Error('Supervisor memory owner changed');
+    if (captured.config.managerSessionId === session.id) {
+      await this.readManagementBrain(owner, authority, session);
+      return { store: this.managementBrainStore, id: this.managementBrainId(owner), current: authority };
+    }
+    return { store: this.supervisorBrainStore, id: session.id, current: authority };
+  }
+  /** Only an owner-selected (or explicitly requested legacy) manager may seed shared memory. */
+  private async readManagementBrain(owner: string, current: () => boolean, requested?: Session) {
+    const captured = await this.managementService.captureConfiguration(owner, current);
+    const config = captured.config;
+    const source = config.managerSessionId ? this.sessions.get(config.managerSessionId) : requested;
+    if (!source) return this.managementBrainStore.read(this.managementBrainId(owner), captured.current);
+    const sameOwner = () =>
+      captured.current() && this.sessions.get(source.id) === source && (source.owner ?? 'admin') === owner;
+    if (!sameOwner()) throw Error('Management memory source is no longer current');
+    return this.managementBrainStore.importIfAbsent(
+      this.managementBrainId(owner),
+      this.supervisorBrainStore,
+      source.id,
+      sameOwner
+    );
+  }
   private supervisorLeaseQueue: Promise<unknown> = Promise.resolve();
   private recoveryControllers = new Map<string, RecoveryController>();
   private recoveryInputListeners = new Map<string, () => void>();
@@ -822,6 +1015,7 @@ export class WebServer extends EventEmitter {
       tabLayouts: this.tabLayouts,
       cleanupSession: this.cleanupSession.bind(this),
       dropSupervisorManagementState: this.dropSupervisorManagementState.bind(this),
+      replaceConvertedSession: this.replaceConvertedSession.bind(this),
       setupSessionListeners: this.setupSessionListeners.bind(this),
       persistSessionState: this.persistSessionState.bind(this),
       persistSessionStateNow: this._persistSessionStateNow.bind(this),
@@ -833,11 +1027,17 @@ export class WebServer extends EventEmitter {
       getTaskController: this.getTaskController.bind(this),
       getSupervisorController: this.getSupervisorController.bind(this),
       prepareSupervisorManager: this.prepareSupervisorManager.bind(this),
+      setupAndStartSupervisorManager: this.setupAndStartSupervisorManager.bind(this),
       getSupervisorAutomation: this.getSupervisorAutomation.bind(this),
       supervisorBrain: {
-        read: (session: Session, current: () => boolean) => this.supervisorBrainStore.read(session.id, current),
-        replace: (session: Session, markdown: string, ifMatch: string, current: () => boolean) =>
-          this.supervisorBrainStore.replace(session.id, markdown, ifMatch, current),
+        read: async (session: Session, current: () => boolean) => {
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.read(brain.id, brain.current);
+        },
+        replace: async (session: Session, markdown: string, ifMatch: string, current: () => boolean) => {
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.replace(brain.id, markdown, ifMatch, brain.current);
+        },
       },
       // EventPort
       broadcast: this.broadcast.bind(this),
@@ -963,6 +1163,8 @@ export class WebServer extends EventEmitter {
     // on the default no-password install. See docs/reports/security-review-2026-06-09.md.
     registerHostGuard(this.app, () => this.getHostPolicy(), this.basePath);
 
+    // Inbox capabilities grant only cooperative message access, never terminal input.
+    registerManagementAgentAuth(this.app, this.managementService);
     // Auth middleware (Basic Auth + session cookies + rate limiting)
     const authState = registerAuthMiddleware(this.app, this.https, this.basePath, this.supervisorManagerCredentials);
     this.supervisorManagerAuthReady = authState.authSessions !== null;
@@ -1248,6 +1450,33 @@ export class WebServer extends EventEmitter {
     registerRecoveryRoutes(this.app, ctx);
     registerTaskRoutes(this.app, ctx);
     registerSupervisorRoutes(this.app, ctx);
+    registerManagementRoutes(this.app, {
+      service: this.managementService,
+      globalBrain: {
+        read: (owner, current) => this.readManagementBrain(owner, current),
+        replace: async (owner, markdown, ifMatch, current) => {
+          await this.readManagementBrain(owner, current);
+          const saved = await this.managementBrainStore.replace(
+            this.managementBrainId(owner),
+            markdown,
+            ifMatch,
+            current
+          );
+          return this.afterManagementBrainWrite(owner, saved, current);
+        },
+      },
+      ownerCurrent: (req) => !this.recoveryStopping && !req.raw.aborted,
+    });
+    registerManagementBrainSyncRoutes(this.app, {
+      service: this.managementBrainSync,
+      ownerCurrent: (req) =>
+        !this.recoveryStopping && !req.raw.aborted && this.supervisorManagerAuthenticationAvailable(),
+    });
+    registerManagementGitLabRoutes(this.app, {
+      service: this.managementGitLab,
+      ownerCurrent: (req) =>
+        !this.recoveryStopping && !req.raw.aborted && this.supervisorManagerAuthenticationAvailable(),
+    });
     registerSupervisorMcpRoutes(this.app, {
       credentials: this.supervisorManagerCredentials,
       resolveController: (scope) => {
@@ -1259,33 +1488,108 @@ export class WebServer extends EventEmitter {
           ? this.getSupervisorController(session)
           : undefined;
       },
-      brain: {
-        read: (scope, current) => {
-          const session = this.sessions.get(scope.sessionId);
-          return this.supervisorBrainStore.read(
+      gitlab: {
+        operate: async (scope, input, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
             scope.sessionId,
-            () =>
-              current() &&
-              !!session &&
-              this.sessions.get(scope.sessionId) === session &&
-              session.owner === scope.owner &&
-              session.isSupervisorManagerLaunchCurrent()
+            current
+          );
+          return this.managementGitLab.operate(scope.owner ?? 'admin', input, authority);
+        },
+      },
+      management: {
+        directory: async (scope, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
+            scope.sessionId,
+            current
+          );
+          return this.managementService.directory(scope.owner ?? 'admin', authority);
+        },
+        observe: async (scope, agentId, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          return observeManagementAgent(
+            agentId,
+            scope.sessionId,
+            owner,
+            (id) => this.sessions.get(id),
+            authority,
+            (candidate) => {
+              const pane = this.mux.getSession(candidate.id);
+              if (!pane || !authority()) return null;
+              const output = this.mux.captureActivePaneBuffer?.(pane.muxName, {
+                fullHistory: true,
+                historyLimitLines: 200,
+                maxCaptureBytes: 64 * 1024,
+              });
+              return this.mux.getSession(candidate.id) === pane && authority() ? (output ?? null) : null;
+            }
           );
         },
-        append: (scope, requestId, note, ifMatch, current) => {
-          const session = this.sessions.get(scope.sessionId);
-          return this.supervisorBrainStore.append(
+        conversation: async (scope, agentId, options, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          return this.managementAgentReader.conversation(agentId, scope.sessionId, owner, options, authority);
+        },
+        usage: async (scope, agentId, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          return this.managementAgentReader.usage(agentId, scope.sessionId, owner, authority);
+        },
+        thread: async (scope, agentId, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
             scope.sessionId,
-            requestId,
-            note,
-            ifMatch,
-            () =>
-              current() &&
-              !!session &&
-              this.sessions.get(scope.sessionId) === session &&
-              session.owner === scope.owner &&
-              session.isSupervisorManagerLaunchCurrent()
+            current
           );
+          return this.managementService.grantedMessages(scope.owner ?? 'admin', agentId, authority);
+        },
+        message: async (scope, agentId, requestId, message, current) => {
+          const authority = await this.managementService.captureManager(
+            scope.owner ?? 'admin',
+            scope.sessionId,
+            current
+          );
+          return this.managementService.send(scope.owner ?? 'admin', agentId, message, requestId, authority);
+        },
+      },
+      brain: {
+        sync: async (scope, input, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          if (input.mode === 'sync_status') return this.managementBrainSync.read(owner, authority);
+          if (input.mode === 'sync_preview') return this.managementBrainSync.preview(owner, authority);
+          const { mode: _mode, ...request } = input;
+          return this.managementBrainSync.publish(owner, request, authority);
+        },
+        read: async (scope, current) => {
+          const session = this.sessions.get(scope.sessionId);
+          if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
+            throw Error('Supervisor memory owner changed');
+          const brain = await this.captureSupervisorBrain(session, current);
+          return brain.store.read(brain.id, brain.current);
+        },
+        append: async (scope, requestId, note, ifMatch, current) => {
+          const session = this.sessions.get(scope.sessionId);
+          if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
+            throw Error('Supervisor memory owner changed');
+          const brain = await this.captureSupervisorBrain(session, current);
+          const saved = await brain.store.append(brain.id, requestId, note, ifMatch, brain.current);
+          return brain.store === this.managementBrainStore
+            ? this.afterManagementBrainWrite(scope.owner ?? 'admin', saved, brain.current)
+            : saved;
+        },
+        replace: async (scope, requestId, markdown, ifMatch, current) => {
+          const session = this.sessions.get(scope.sessionId);
+          if (!session || (session.owner ?? 'admin') !== (scope.owner ?? 'admin'))
+            throw Error('Supervisor memory owner changed');
+          const brain = await this.captureSupervisorBrain(session, current);
+          const saved = await brain.store.replaceManaged(brain.id, requestId, markdown, ifMatch, brain.current);
+          return brain.store === this.managementBrainStore
+            ? this.afterManagementBrainWrite(scope.owner ?? 'admin', saved, brain.current)
+            : saved;
         },
       },
     });
@@ -2121,6 +2425,108 @@ export class WebServer extends EventEmitter {
     });
   }
 
+  /** Commit the exact converted worker before exposing input or attaching its new transport. */
+  private async replaceConvertedSession(
+    previous: Session,
+    replacement: Session,
+    isCurrent: (expected?: Session) => boolean
+  ): Promise<void> {
+    const id = previous.id;
+    const owner = previous.owner;
+    const remote = JSON.stringify(previous.remote);
+    const configuration = JSON.stringify([replacement.codexConfig, replacement.getEnvOverridesForPersist()]);
+    let grantsCurrent = () => true;
+    const shape = () =>
+      previous !== replacement &&
+      previous.mode === 'shell' &&
+      replacement.mode === 'codex' &&
+      replacement.id === id &&
+      previous.owner === owner &&
+      replacement.owner === owner &&
+      !!previous.remote &&
+      previous.remote.owned !== false &&
+      JSON.stringify(previous.remote) === remote &&
+      JSON.stringify(replacement.remote) === remote &&
+      JSON.stringify([replacement.codexConfig, replacement.getEnvOverridesForPersist()]) === configuration &&
+      grantsCurrent() &&
+      previous.workingDir === replacement.workingDir &&
+      !previous.docker &&
+      !replacement.docker;
+    const current = (expected: Session) =>
+      !this.recoveryStopping &&
+      !this.cleaningUp.has(id) &&
+      this.sessions.get(id) === expected &&
+      shape() &&
+      isCurrent(expected) === true;
+    if (
+      !current(previous) ||
+      this.controllerHasRecoveryFlight(id) ||
+      this.controllerHasTaskFlight(id) ||
+      this.supervisorLeaseHolder(id, id) ||
+      this.supervisorStore.get(id).enabled
+    )
+      throw new Error('Converted session registration is no longer current');
+    const grant = await clampRecoveryLaunchForOwner(
+      owner,
+      { codexConfig: replacement.codexConfig },
+      replacement.getEnvOverridesForPersist()
+    );
+    grantsCurrent = grant.isCurrent;
+    if (
+      !current(previous) ||
+      JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(replacement.codexConfig) ||
+      JSON.stringify(grant.env) !== JSON.stringify(replacement.getEnvOverridesForPersist())
+    )
+      throw new Error('Converted worker launch grants changed before publication');
+    this.persistDeb.cancelKey(id);
+    if (!(await replacement.ensureRecoveryIdentityFence()) || !current(previous))
+      throw new Error('Converted identity fence was not acknowledged');
+    await this.mux.flushSessionsDurably(() => current(previous));
+    await this.store.persistSessionDurably(
+      id,
+      () => this.buildPersistedSessionState(replacement),
+      () => current(previous)
+    );
+    if (!current(previous)) throw new Error('Converted session publication was cancelled');
+    const listeners = this.sessionListenerRefs.get(id);
+    if (listeners) detachSessionListeners(previous, listeners);
+    this.sessionListenerRefs.delete(id);
+    this.stopTranscriptWatcher(id);
+    imageWatcher.unwatchSession(id);
+    previous.ralphTracker.stopWatchingFixPlan();
+    const summary = this.runSummaryTrackers.get(id);
+    summary?.stop();
+    this.runSummaryTrackers.delete(id);
+    const respawn = this.respawnControllers.get(id);
+    respawn?.stop();
+    respawn?.removeAllListeners();
+    this.respawnControllers.delete(id);
+    const timer = this.respawnTimers.get(id);
+    if (timer) clearTimeout(timer.timer);
+    this.respawnTimers.delete(id);
+    const pending = this.pendingRespawnStarts.get(id);
+    if (pending) clearTimeout(pending);
+    this.pendingRespawnStarts.delete(id);
+    this.sessions.set(id, replacement);
+    // Publication is irreversible here. A failed acknowledgement retains the new
+    // registration for inspection; the durable pending marker keeps input sealed.
+    if (!(await replacement.commitOwnedRemoteShellConversion(() => current(replacement))))
+      throw new Error('Converted worker publication requires inspection');
+    await previous.retireConvertedShellTransport(replacement);
+    if (!current(replacement)) throw new Error('Converted session attachment was cancelled');
+    await this.setupSessionListeners(replacement);
+    if (!current(replacement)) throw new Error('Converted session attachment was cancelled');
+    await replacement.startInteractive();
+    if (!current(replacement)) throw new Error('Converted session attachment was cancelled');
+    await this.mux.flushSessionsDurably(() => current(replacement));
+    await this.store.persistSessionDurably(
+      id,
+      () => this.buildPersistedSessionState(replacement),
+      () => current(replacement)
+    );
+    this.broadcast(SseEvent.SessionUpdated, { session: this.getSessionStateWithRespawn(replacement) });
+  }
+
   private async setupSessionListeners(session: Session): Promise<void> {
     this.getRecoveryController(session);
     this.getTaskController(session);
@@ -2771,13 +3177,24 @@ export class WebServer extends EventEmitter {
         )
       );
     const capturedTask = taskBinding();
+    let preparedTaskOwner: (() => boolean) | undefined;
     const taskCurrent = () =>
-      this.managerTaskAllowsPreparation(session, () => retainedManager && taskBinding() === capturedTask);
+      this.managerTaskAllowsPreparation(session, () =>
+        preparedTaskOwner ? preparedTaskOwner() === true : retainedManager && taskBinding() === capturedTask
+      );
     // Serialize owner preparation/rechecks before their first asynchronous proof.
     const pending = Object.assign(async () => false, { canOperate: () => false });
     this.supervisorManagerPreparationChecks.set(session, pending);
     try {
       if (!(await session.ensureRecoveryIdentityFence())) return false;
+      // The first ordinary prompt may not have been inspected while recovery is
+      // disabled. Let the normal adapter pin only its fully verified identity
+      // before capturing launch settings; all final preparation proofs still run.
+      if (!session.codexConfig?.resumeSessionId) {
+        if (!callerCurrent()) return false;
+        await new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session)).observe();
+        if (!callerCurrent() || !session.codexConfig?.resumeSessionId) return false;
+      }
       const owner = session.owner;
       const configuration = () =>
         JSON.stringify([
@@ -2897,7 +3314,7 @@ export class WebServer extends EventEmitter {
           mtimeMs: leaf.mtimeMs,
           ctimeMs: leaf.ctimeMs,
           hash: createHash('sha256').update(source.identity.tail).digest('hex'),
-          maxBytes: 262_144,
+          maxBytes: MAX_CODEX_ROLLOUT_BYTES,
         },
       ];
       const grantFile = grant.getFileWitness?.() ?? grant.fileWitness;
@@ -2939,7 +3356,7 @@ export class WebServer extends EventEmitter {
         checking = false;
       const checkReadiness = async (requestCurrent: () => boolean): Promise<boolean | { inspectionOnly: true }> => {
         if (requestCurrent() !== true) return scopeCurrent() ? false : refuse();
-        if (operationReady) return launchIsCurrent() ? true : refuse();
+        if (!launchIsCurrent()) return refuse();
         if (checking) return launchIsCurrent() ? { inspectionOnly: true } : false;
         checking = true;
         try {
@@ -2955,12 +3372,19 @@ export class WebServer extends EventEmitter {
               performance.now() < readyDeadline
             ) {
               const observed = await adapter.observe();
+              const submission = session.getRecoveryContext().submission;
               if (
                 requestCurrent() === true &&
                 current() &&
                 grant.isCurrent() &&
+                this.supervisorManagerCredentials.hasToolsDiscovery(session.id) &&
+                !session.isBusy() &&
+                !session.watching &&
                 observed.conversationId === session.codexConfig?.resumeSessionId &&
-                ['idle', 'completed'].includes(observed.activity) &&
+                observed.activity === 'completed' &&
+                !!submission &&
+                submission.at >= launchStartedAt &&
+                observed.submissionHash === submission.hash &&
                 hasFreshProcessReady(observed, launchStartedAt, Date.now())
               ) {
                 ready = true;
@@ -2980,6 +3404,7 @@ export class WebServer extends EventEmitter {
           } catch {
             /* A failed observation never certifies readiness. */
           }
+          operationReady = false;
           // A cancelled recheck grants nothing and leaves the previous read-only proof intact.
           if (requestCurrent() !== true && scopeCurrent()) return false;
           return refuse();
@@ -2998,7 +3423,13 @@ export class WebServer extends EventEmitter {
             files,
             isCurrent: () => (converting ? current() : scopeCurrent()) && grant.isCurrent(),
           })) === true;
-        if (acknowledged) launchAuthority = session.captureSupervisorManagerLaunchAuthority();
+        if (acknowledged) {
+          launchAuthority = session.captureSupervisorManagerLaunchAuthority();
+          // Admission starts with an ordinary disabled task. After conversion,
+          // only this exact restricted launch may retain the role's derived
+          // task through owner Start/Pause/teaching; unrelated tasks still veto.
+          preparedTaskOwner = () => launchAuthority?.() === true;
+        }
         converting = false;
         return await checkReadiness(callerCurrent);
       } catch {
@@ -3008,6 +3439,221 @@ export class WebServer extends EventEmitter {
       if (this.supervisorManagerPreparationChecks.get(session) === pending)
         this.supervisorManagerPreparationChecks.delete(session);
     }
+  }
+
+  private managerSetupJournal?: ManagerSetupJournal;
+
+  /** One explicit owner action; no background retries, arbitrary prompts or worker input. */
+  private async setupAndStartSupervisorManager(session: Session, requestId: string, callerCurrent: () => boolean) {
+    const configuration = () =>
+      JSON.stringify([
+        session.id,
+        session.owner,
+        session.mode,
+        session.workingDir,
+        session.codexConfig,
+        session.getEnvOverridesForPersist(),
+        session.remote,
+        session.docker,
+      ]);
+    const captured = configuration();
+    const role = this.getSupervisorController(session);
+    if (!role) throw new SupervisorValidationError('Manager setup is unavailable');
+    const roleConfiguration = () => {
+      const state = role.getStatus();
+      return JSON.stringify([
+        state.objective,
+        state.enabled,
+        state.workers.map((worker) => [
+          worker.sessionId,
+          worker.task,
+          worker.criteria,
+          worker.maxAssignments,
+          worker.maxRuntimeMs,
+          worker.allowMessages,
+          worker.maxMessages,
+        ]),
+      ]);
+    };
+    const capturedRole = roleConfiguration();
+    const scope = createHash('sha256')
+      .update(JSON.stringify([captured, capturedRole]))
+      .digest('hex');
+    const roleIntent = JSON.stringify([role.getStatus().phase, role.getStatus().reason, role.getStatus().history]);
+    let starting = false;
+    const current = () =>
+      callerCurrent() === true &&
+      (starting ||
+        roleIntent === JSON.stringify([role.getStatus().phase, role.getStatus().reason, role.getStatus().history])) &&
+      !this.recoveryStopping &&
+      !this.cleaningUp.has(session.id) &&
+      this.sessions.get(session.id) === session &&
+      configuration() === captured &&
+      this.supervisorManagerIsEligible(session) &&
+      capturedRole === roleConfiguration();
+    this.managerSetupJournal ??= new ManagerSetupJournal();
+    const receipt = await this.managerSetupJournal.run(session.id, requestId, scope, {
+      current,
+      prepare: () => this.prepareSupervisorManager(session, current),
+      setupTurn: (reserve) => this.sendManagerSetupTurn(session, requestId, current, reserve),
+      start: async () => {
+        if (!current()) return false;
+        starting = true;
+        return (await role.start()).phase === 'active' && current();
+      },
+    });
+    // Own Start changes phase/history, so those do not belong in the durable
+    // request scope. A later owner pause must still prevent stale confirmation.
+    if (
+      receipt.phase === 'started' &&
+      (role.getStatus().phase !== 'active' || capturedRole !== roleConfiguration() || captured !== configuration())
+    )
+      throw new SupervisorValidationError('Previous manager start is no longer active; use a new owner request');
+    return receipt;
+  }
+
+  private async sendManagerSetupTurn(
+    session: Session,
+    requestId: string,
+    callerCurrent: () => boolean,
+    reserve: (phase: ManagerSetupPhase) => Promise<void>
+  ): Promise<boolean> {
+    let generation = session.getRecoveryContext().generation;
+    let writing = false;
+    const conversationId = session.codexConfig?.resumeSessionId;
+    const launch = session.captureSupervisorManagerLaunchAuthority();
+    const ownerFrame = session.captureSupervisorManagerOwnerInputAuthority();
+    const paneStartedAt = session.paneStartedAt;
+    const current = () =>
+      callerCurrent() === true &&
+      ownerFrame?.() === true &&
+      (session.getRecoveryContext().generation === generation ||
+        (writing && [generation + 1, generation + 2].includes(session.getRecoveryContext().generation))) &&
+      session.paneStartedAt === paneStartedAt &&
+      session.codexConfig?.resumeSessionId === conversationId &&
+      !session.paneExit &&
+      !session.recoveryInputReserved &&
+      session.inputDispatchAllowed &&
+      !this.controllerHasTaskFlight(session.id) &&
+      !this.controllerHasRecoveryFlight(session.id) &&
+      !this.supervisorStore.loadFailed &&
+      !this.supervisorStore.get(session.id).inFlight &&
+      this.supervisorControllers.get(session.id)?.getStatus().phase !== 'active' &&
+      this.managerTaskAllowsPreparation(session, () => ownerFrame?.() === true);
+    if (!conversationId || !launch || !ownerFrame || session.paneLifecycleInFlight || !current()) return false;
+    const adapter = new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session));
+    const clientId = 'manager-setup-' + createHash('sha256').update(requestId).digest('hex');
+    let submittedAt = 0;
+    const submitted = await queueInputDispatch(session, MANAGER_SETUP_PROMPT.length + 1, async () => {
+      if (!current() || session.isBusy() || session.watching || !(await ownerFrame.confirm()) || !current())
+        return false;
+      const observation = await adapter.observe();
+      const tail = adapter.getVerifiedTail(conversationId);
+      const source = adapter.getLocalEvidenceSource(conversationId, generation);
+      const pane = await session.inspectRecoveryPane();
+      if (
+        !current() ||
+        !pane ||
+        pane.dead ||
+        !pane.paneId ||
+        !pane.panePid ||
+        !source ||
+        source.identity.tailTruncated !== false ||
+        !tail ||
+        pane.panePid !== source.inputBroker?.proof.brokerPid ||
+        !hasEmptyCodexComposer(pane.screen ?? '') ||
+        observation.conversationId !== conversationId ||
+        source.inputBroker?.proof.closed !== false ||
+        !source.inputBroker.proof.childPid ||
+        !permitsCodexManagerSetup(
+          tail,
+          {
+            conversationId,
+            now: Date.now(),
+            screen: pane.screen,
+            busy: false,
+            watching: false,
+            tailTruncated: source.identity.tailTruncated,
+            lastIntentionalStopAt: session.getRecoveryContext().intentionalStopAt,
+          },
+          paneStartedAt
+        ) ||
+        !(await adapter.confirmLocalEvidence(conversationId, generation)) ||
+        !current()
+      )
+        return false;
+      const paneId = pane.paneId,
+        panePid = pane.panePid;
+      const samePane = async (expected?: string) => {
+        const fresh = await session.inspectRecoveryPane();
+        return (
+          current() &&
+          !session.isBusy() &&
+          !session.watching &&
+          fresh?.dead === false &&
+          fresh.paneId === paneId &&
+          fresh.panePid === panePid &&
+          (expected === undefined
+            ? hasEmptyCodexComposer(fresh.screen ?? '')
+            : hasAcknowledgedCodexComposerCapture(fresh.screen ?? '', expected, pane.screen ?? ''))
+        );
+      };
+      const write = async (input: string, seq: number) => {
+        if (!current() || !session.deferInputSeq(clientId, seq) || !session.shouldApplyInput(clientId, seq))
+          return false;
+        writing = true;
+        try {
+          const result = await session.writeAsync(input, {
+            fromUser: true,
+            inputSeq: { clientId, seq },
+            isCurrent: current,
+          });
+          if (session.getRecoveryContext().generation !== generation + 2) throw Error('Setup input generation changed');
+          generation += 2;
+          return result;
+        } finally {
+          writing = false;
+          // Committed/partially dispatched identities remain sealed by Session.
+          session.forgetInputSeq(clientId, seq);
+        }
+      };
+      await reserve('literal-reserved');
+      if (!(await samePane()) || !(await ownerFrame.confirm()) || !current()) return false;
+      if (!(await write(MANAGER_SETUP_PROMPT, 1))) return false;
+      await reserve('literal-sent');
+      await new Promise((resolve) => setTimeout(resolve, 250));
+      if (!(await samePane(MANAGER_SETUP_PROMPT)) || !(await ownerFrame.confirm()) || !current()) return false;
+      await reserve('enter-reserved');
+      if (!(await samePane(MANAGER_SETUP_PROMPT)) || !current()) return false;
+      submittedAt = Date.now();
+      if (!(await write('\r', 2))) return false;
+      await reserve('submitted');
+      return true;
+    });
+    if (!submitted || !current()) return false;
+    const hash = createHash('sha256').update(MANAGER_SETUP_PROMPT).digest('hex');
+    const deadline = performance.now() + 40_000;
+    while (current() && performance.now() < deadline) {
+      const observation = await adapter.observe();
+      const submission = session.getRecoveryContext().submission;
+      if (
+        current() &&
+        observation.activity === 'completed' &&
+        observation.conversationId === conversationId &&
+        observation.submissionHash === hash &&
+        submission?.hash === hash &&
+        submission.at >= submittedAt &&
+        hasFreshProcessReady(observation, paneStartedAt, Date.now()) &&
+        (await adapter.confirmLocalEvidence(conversationId, generation)) &&
+        current()
+      ) {
+        await reserve('turn-completed');
+        return true;
+      }
+      if (!['unknown', 'paused', 'working', 'completed', 'idle'].includes(observation.activity)) return false;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    return false;
   }
 
   /** Only these numeric binds guarantee the bridge's IPv4 loopback endpoint. */
@@ -3186,7 +3832,13 @@ export class WebServer extends EventEmitter {
       source?: import('../recovery/types.js').RecoveryEvidenceSource
     ): Promise<boolean> => {
       const expected = managerEvidence;
-      if (!expected || !hasManagerAuthority()) return false;
+      if (
+        !expected ||
+        !hasManagerAuthority() ||
+        !(await session.confirmSupervisorManagerLaunch()) ||
+        !hasManagerAuthority()
+      )
+        return false;
       let verified = false;
       try {
         const managerSource = managerAdapter.getLocalEvidenceSource(expected.conversationId, expected.generation);
@@ -3196,7 +3848,11 @@ export class WebServer extends EventEmitter {
           // A fresh ordered manager probe changes its own journal bytes.
           // confirmLocalEvidence supplies that refreshed manager file witness;
           // only a separate worker source keeps its previously captured files.
-          files: [...(source?.files ?? []), ...(expected.grantFile ? [expected.grantFile] : [])],
+          files: [
+            ...(source?.files ?? []),
+            ...(expected.grantFile ? [expected.grantFile] : []),
+            ...(session.getSupervisorManagerAuthWitness() ? [session.getSupervisorManagerAuthWitness()!] : []),
+          ],
         };
         verified =
           !!managerSource?.inputBroker &&
@@ -3409,8 +4065,10 @@ export class WebServer extends EventEmitter {
             };
           return result;
         },
+        confirmManagerLaunch: () => session.confirmSupervisorManagerLaunch(),
         captureBrainAuthority: async (caller) => {
           const launch = session.captureSupervisorManagerLaunchAuthority();
+          const intent = JSON.stringify(session.getRecoveryContext());
           const configuration = JSON.stringify([
             session.owner,
             session.workingDir,
@@ -3424,6 +4082,7 @@ export class WebServer extends EventEmitter {
             !this.cleaningUp.has(session.id) &&
             this.sessions.get(session.id) === session &&
             managerIsEligible() &&
+            intent === JSON.stringify(session.getRecoveryContext()) &&
             configuration ===
               JSON.stringify([
                 session.owner,
@@ -3431,30 +4090,113 @@ export class WebServer extends EventEmitter {
                 session.codexConfig,
                 session.getEnvOverridesForPersist(),
               ]);
-          if (!current()) return undefined;
+          const refuse = (
+            stage: string,
+            attempt = 0,
+            observation?: RecoveryObservation,
+            checks?: Record<string, boolean>
+          ) => {
+            console.warn('[Supervisor] Scoped manager authority evidence', {
+              stage,
+              attempt,
+              current: current(),
+              ...(observation ? { activity: observation.activity, reason: observation.reason } : {}),
+              ...(checks ? { checks } : {}),
+            });
+            return undefined;
+          };
+          if (!current() || !(await session.confirmSupervisorManagerLaunch()) || !current()) return refuse('launch');
           const config = session.codexConfig,
             env = session.getEnvOverridesForPersist();
           const grant = await clampRecoveryLaunchForOwner(session.owner, { codexConfig: config }, env);
-          const observation = await managerAdapter.observe(),
-            context = session.getRecoveryContext();
           if (
             !current() ||
             !grant.isCurrent() ||
             JSON.stringify(grant.configs.codexConfig) !== JSON.stringify(config) ||
-            JSON.stringify(grant.env) !== JSON.stringify(env) ||
-            !context.managed ||
-            context.switchPending ||
-            context.untrackedInput ||
-            context.inputBrokerPending ||
-            observation.conversationId !== config?.resumeSessionId ||
-            !hasFreshProcessReady(observation, 0, Date.now()) ||
-            ['unknown', 'blocked', 'paused', 'crashed', 'exited'].includes(observation.activity) ||
-            !(await managerAdapter.confirmLocalEvidence(observation.conversationId!, context.generation)) ||
-            !current() ||
-            !grant.isCurrent()
+            JSON.stringify(grant.env) !== JSON.stringify(env)
           )
-            return undefined;
-          return () => current() && grant.isCurrent();
+            return refuse('grant');
+          // A scoped tool gets its own observation state. Background worker/task
+          // validation must not replace its verifiedTail during the final barrier.
+          const adapter = new CodexRecoveryAdapter(session, () => {});
+          let brokerBinding: string | undefined;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            if (!current() || !grant.isCurrent()) return refuse('scope', attempt);
+            const observation = await adapter.observe(),
+              context = session.getRecoveryContext();
+            if (
+              !current() ||
+              !grant.isCurrent() ||
+              !context.managed ||
+              context.switchPending ||
+              context.untrackedInput ||
+              context.inputBrokerPending ||
+              observation.conversationId !== config?.resumeSessionId ||
+              !['working', 'idle', 'completed'].includes(observation.activity) ||
+              !adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation)
+            )
+              return refuse('observation', attempt, observation, {
+                grant: grant.isCurrent(),
+                managed: context.managed,
+                switchPending: context.switchPending,
+                untrackedInput: context.untrackedInput,
+                inputBrokerPending: context.inputBrokerPending,
+                identityMatches: observation.conversationId === config?.resumeSessionId,
+                activityAllowed: ['working', 'idle', 'completed'].includes(observation.activity),
+                liveProof: adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation),
+              });
+            const source = adapter.getLocalEvidenceSource(observation.conversationId!, context.generation);
+            if (!source?.inputBroker || !source.isCurrent()) return refuse('source', attempt, observation);
+            const { fileWitness: _witness, ...proof } = source.inputBroker.proof;
+            const binding = JSON.stringify(proof);
+            if (brokerBinding !== undefined && brokerBinding !== binding)
+              return refuse('broker-binding', attempt, observation);
+            brokerBinding = binding;
+            const confirmed = await adapter.confirmLocalEvidence(observation.conversationId!, context.generation);
+            if (
+              !current() ||
+              !grant.isCurrent() ||
+              !source.isCurrent() ||
+              !adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation)
+            )
+              return refuse('final-scope', attempt, observation);
+            if (confirmed) {
+              const authority: import('../recovery/types.js').RecoveryActionAuthority = () =>
+                current() &&
+                grant.isCurrent() &&
+                adapter.hasFreshOwnedLocalPane(observation.conversationId!, context.generation);
+              const permissionFiles = () => {
+                const permission = grant.getFileWitness?.() ?? grant.fileWitness;
+                const authentication = session.getSupervisorManagerAuthWitness();
+                return [...(permission ? [permission] : []), ...(authentication ? [authentication] : [])];
+              };
+              authority.getInputIssuer = () => {
+                if (!authority()) return undefined;
+                const issuer = adapter.getLocalEvidenceSource(
+                  observation.conversationId!,
+                  context.generation
+                )?.inputBroker;
+                return issuer && { ...issuer, files: [...(issuer.files ?? []), ...permissionFiles()] };
+              };
+              authority.prepareEvidence = async (workerSource) => {
+                if (!authority() || !(await session.confirmSupervisorManagerLaunch()) || !authority()) return false;
+                const managerSource = adapter.getLocalEvidenceSource(observation.conversationId!, context.generation);
+                const joint = workerSource ?? managerSource;
+                if (!joint || !managerSource?.inputBroker) return false;
+                const accepted = await adapter.confirmLocalEvidence(observation.conversationId!, context.generation, {
+                  ...joint,
+                  files: [...(workerSource?.files ?? []), ...permissionFiles()],
+                });
+                return accepted && authority();
+              };
+              return authority;
+            }
+            // Only evidence reads repeat. Fresh native progress may replace the
+            // rollout inode; every new observation retains the original owner,
+            // launch, grant and broker/counter binding and reclassifies all vetoes.
+            refuse('final-evidence-changed', attempt, observation);
+          }
+          return undefined;
         },
         getInputIssuer: () => {
           const evidence = managerEvidence;
@@ -3466,13 +4208,22 @@ export class WebServer extends EventEmitter {
           return (
             issuer && {
               ...issuer,
-              files: [...(issuer.files ?? []), ...(evidence.grantFile ? [evidence.grantFile] : [])],
+              files: [
+                ...(issuer.files ?? []),
+                ...(evidence.grantFile ? [evidence.grantFile] : []),
+                ...(session.getSupervisorManagerAuthWitness() ? [session.getSupervisorManagerAuthWitness()!] : []),
+              ],
             }
           );
         },
         validateManagerAuthority: async () => {
           managerEvidence = undefined;
-          if (!hasManagerTaskAuthority()) return false;
+          if (
+            !hasManagerTaskAuthority() ||
+            !(await session.confirmSupervisorManagerLaunch()) ||
+            !hasManagerTaskAuthority()
+          )
+            return false;
           const scope = managerScope();
           const managerConfig = session.codexConfig;
           const context = session.getRecoveryContext();
@@ -3796,10 +4547,7 @@ export class WebServer extends EventEmitter {
 
   /** Optional manager data is retired only after the native session/state deletion succeeded. */
   private async dropSupervisorManagementState(id: string, current: () => boolean): Promise<void> {
-    for (const [name, journal] of [
-      ['Management schedule', this.supervisorAutomationStore],
-      ['Manager memory', this.supervisorBrainStore],
-    ] as const) {
+    for (const [name, journal] of [['Management schedule', this.supervisorAutomationStore]] as const) {
       try {
         await journal.drop(id, current);
       } catch (err) {
@@ -3877,10 +4625,7 @@ export class WebServer extends EventEmitter {
     }
     // Reuse the authoritative startup cleanup rather than inferring absence
     // from a missing live controller. Detach, restore and uncertain work veto it.
-    for (const [name, journal] of [
-      ['Management schedule', this.supervisorAutomationStore],
-      ['Manager memory', this.supervisorBrainStore],
-    ] as const) {
+    for (const [name, journal] of [['Management schedule', this.supervisorAutomationStore]] as const) {
       try {
         await journal.pruneOrphans((id) => this.supervisorManagementHasOwner(id));
       } catch (err) {

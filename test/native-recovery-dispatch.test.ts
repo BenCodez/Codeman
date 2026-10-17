@@ -10,10 +10,10 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { parseNativePaneSignal } from '../src/recovery/native-pane-signal.js';
 import { join } from 'node:path';
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MuxSession } from '../src/mux-interface.js';
 import type { Session as SessionType } from '../src/session.js';
 import type { TmuxManager as ManagerType } from '../src/tmux-manager.js';
@@ -57,16 +57,28 @@ let previousMode: string | undefined;
 const workers: SessionType[] = [];
 const acceptedPackets = new Map<string, 'sent' | 'not-sent'>();
 const loadedFrames = new Map<string, string>();
+let moduleDataDirectory: string;
+const managers: ManagerType[] = [];
 beforeAll(async () => {
   // Enable the real command branches only after every child API is mocked.
   const vitest = process.env.VITEST;
+  const previousModuleData = process.env.CODEMAN_DATA_DIR;
+  // Mux metadata paths are captured at module evaluation, before beforeEach.
+  // Protect durable flushes even when this file is run without the CI config.
+  moduleDataDirectory = mkdtempSync(join(tmpdir(), 'native-recovery-module-data-'));
+  process.env.CODEMAN_DATA_DIR = moduleDataDirectory;
   delete process.env.VITEST;
   try {
     ({ TmuxManager } = await import('../src/tmux-manager.js'));
     ({ Session } = await import('../src/session.js'));
   } finally {
     if (vitest !== undefined) process.env.VITEST = vitest;
+    if (previousModuleData === undefined) delete process.env.CODEMAN_DATA_DIR;
+    else process.env.CODEMAN_DATA_DIR = previousModuleData;
   }
+});
+afterAll(() => {
+  if (moduleDataDirectory) rmSync(moduleDataDirectory, { recursive: true, force: true });
 });
 beforeEach(() => {
   acceptedPackets.clear();
@@ -82,6 +94,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   for (const worker of workers.splice(0)) await worker.stop(false);
+  for (const manager of managers.splice(0)) await manager.drainSessionSaves();
   if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
   else process.env.CODEMAN_DATA_DIR = previousData;
   if (previousMode === undefined) delete process.env.CODEMAN_MULTIUSER;
@@ -99,6 +112,7 @@ function setGrant(granted: boolean) {
 }
 function bareManager(): ManagerType {
   const manager = Object.create(TmuxManager.prototype) as ManagerType;
+  managers.push(manager);
   for (const name of ['sessions', 'inputBrokers', 'inputBrokerLoads', 'inputQueues'])
     Reflect.set(manager, name, new Map());
   Reflect.set(manager, 'sessionSaves', Promise.resolve());
@@ -235,6 +249,11 @@ async function fixture(
       pane.screen = `› ${prompt.replace(/\r/g, '').replace(/\n/g, '').trimEnd()}\n  fixture-model high · /tmp\n`;
     return { stdout: '', stderr: '' };
   });
+  // Native styled capture is a single OS boundary; keep it synthetic alongside
+  // the existing command/cursor fixtures and never invoke execFileSync here.
+  vi.spyOn(manager as unknown as { captureRecoveryComposer(): string }, 'captureRecoveryComposer').mockImplementation(
+    () => effects.sync('capture-pane -p -e -t %7')
+  );
   // These would read server credential env/bin locations; the effect boundary under test needs neither.
   vi.spyOn(manager as unknown as { _configureCliEnv(): void }, '_configureCliEnv').mockImplementation(() => {});
   vi.spyOn(
@@ -401,6 +420,14 @@ function commands() {
 }
 
 describe('native recovery pane frame validation', () => {
+  it('confines actual durable mux writes to the pre-import temporary module directory', async () => {
+    const manager = bareManager();
+    const perTestPath = join(directory, 'mux-sessions.json');
+    writeFileSync(perTestPath, 'per-test sentinel', { mode: 0o600 });
+    await manager.flushSessionsDurably();
+    expect(JSON.parse(readFileSync(join(moduleDataDirectory, 'mux-sessions.json'), 'utf8'))).toEqual([]);
+    expect(readFileSync(perTestPath, 'utf8')).toBe('per-test sentinel');
+  });
   it.each([
     '1|9|garbage|%7|700',
     '1|9|KILL|%7|700',
@@ -460,6 +487,12 @@ describe('native recovery pane frame validation', () => {
         if (command.includes('capture-pane')) return { stdout: 'Sanitized ready screen', stderr: '' };
         throw new Error('Unmocked native command forbidden');
       });
+      const capture = vi
+        .spyOn(
+          manager as unknown as { captureRecoveryComposer(pane: string, pid: number): string },
+          'captureRecoveryComposer'
+        )
+        .mockReturnValue('Sanitized ready screen');
       expect(await manager.inspectPaneForRecovery('codeman-aaaaaaaa')).toEqual({
         dead,
         status,
@@ -469,7 +502,9 @@ describe('native recovery pane frame validation', () => {
         paneSignalToken: frame.split('|')[2],
         screen: dead ? null : 'Sanitized ready screen',
       });
-      expect(commands()).toHaveLength(dead ? 1 : 2);
+      expect(commands()).toHaveLength(1);
+      expect(capture).toHaveBeenCalledTimes(dead ? 0 : 1);
+      if (!dead) expect(capture).toHaveBeenCalledWith('%7', 700);
     }
   );
 });
@@ -854,7 +889,8 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       .map(([command]) => String(command))
       .filter((command) => command.includes('capture-pane'));
     expect(captures).toHaveLength(6);
-    expect(captures.every((command) => command.includes(' -J '))).toBe(true);
+    expect(captures.slice(0, 3).every((command) => command.includes(' -e '))).toBe(true);
+    expect(captures.slice(3).every((command) => command.includes(' -J '))).toBe(true);
     expect(childCommands().filter(isEnter)).toHaveLength(1);
   });
 
@@ -1238,5 +1274,81 @@ describe('native restart final preparation boundary', () => {
     expect(await f.deliver()).toBe('unknown');
     expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(1);
     expect(commands().filter((command) => command.includes('kill-'))).toHaveLength(0);
+  });
+});
+
+describe('usage-policy prose at native input boundaries', () => {
+  it.each([
+    'Consider usage limits and rate limits.',
+    '• What would you like me to tell the worker?',
+    'Usage limit reached',
+    'Would you like to run this command?',
+  ])('retains quota notices without treating plural policy prose as one: %s', async (prefix) => {
+    const f = await fixture('continue');
+    f.pane.screen = prefix + '\n' + f.pane.screen;
+    const original = effects.exec.getMockImplementation()!;
+    effects.exec.mockImplementation(async (command: string) => {
+      const result = await original(command);
+      if (isLiteral(command)) f.pane.screen = prefix + '\n' + f.pane.screen;
+      return result;
+    });
+    expect(await f.deliver()).toBe(prefix.startsWith('Consider') || prefix.startsWith('• What') ? 'sent' : 'not-sent');
+    expect(childCommands().some(isEnter)).toBe(prefix.startsWith('Consider') || prefix.startsWith('• What'));
+  });
+});
+
+describe('native folded literal acknowledgment', () => {
+  it.each([
+    'valid',
+    'unicode',
+    'padded-footer',
+    'missing-receipt',
+    'wrong-hash',
+    'owner-input',
+    'later-auto',
+    'wrong-count',
+    'changed-footer',
+    'reserved',
+  ])('binds Enter to our exact applied literal: %s', async (variant) => {
+    const prompt = variant === 'unicode' ? '😀'.repeat(1500) : 'A'.repeat(2894);
+    const f = await fixture('continue', prompt);
+    f.pane.screen = '› \n\n  fixture-model high · /tmp\n';
+    const original = effects.exec.getMockImplementation()!;
+    effects.exec.mockImplementation(async (command: string) => {
+      const result = await original(command);
+      if (isLiteral(command) && acceptedPackets.get(inputPacket(command)!.nonce) === 'sent') {
+        const packet = inputPacket(command)! as NonNullable<ReturnType<typeof inputPacket>> & {
+          counter: number;
+          conversationId: string;
+        };
+        const state = JSON.parse(readFileSync(f.pane.inputProvenance.fileWitness!.path, 'utf8'));
+        state.counters.auto = packet.counter + (variant === 'later-auto' ? 1 : 0);
+        if (variant === 'owner-input') state.counters['owner-pty']++;
+        state.receipts =
+          variant === 'missing-receipt'
+            ? []
+            : [
+                {
+                  channel: packet.channel,
+                  counter: packet.counter,
+                  nonce: packet.nonce,
+                  conversationId: packet.conversationId,
+                  hash:
+                    variant === 'wrong-hash'
+                      ? '0'.repeat(64)
+                      : createHash('sha256').update(Buffer.from(packet.data, 'base64')).digest('hex'),
+                  status: variant === 'reserved' ? 'reserved' : 'sent',
+                },
+              ];
+        updateFakeInputProvenance(f.pane.inputProvenance, {}, () => state);
+        f.pane.screen = `› [Pasted Content ${Array.from(prompt).length + (variant === 'wrong-count' ? 1 : 0)} chars]\n${variant === 'padded-footer' ? ' ' : ''}\n  fixture-model ${variant === 'changed-footer' ? 'low' : 'high'} · /tmp\n`;
+      }
+      return result;
+    });
+    const result = await f.deliver();
+    const submitted = childCommands().some(isEnter);
+    expect(submitted).toBe(variant === 'valid' || variant === 'unicode' || variant === 'padded-footer');
+    expect(childCommands().some(isLiteral)).toBe(true);
+    if (submitted) expect(result).toBe('sent');
   });
 });

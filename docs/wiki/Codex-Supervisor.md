@@ -6,7 +6,7 @@ Preparation explicitly restarts only the selected manager session in place, resu
 
 If the manager startup broker certifies that no child started, Codeman can resume the original ordinary conversation once through a fresh guarded broker, using the same identity, home and launch settings. This requires unchanged owner, configuration, grant and child-work evidence plus the exact dead broker pane; it never interrupts a live pane. Changed or uncertain evidence keeps restoration fenced. Inspect the pane and use the owner Restart control when an exited pane requires manual restoration. Manager preparation remains refused after an ordinary restoration; it does not acknowledge a manager role.
 
-Restricted manager preparation currently supports unmanaged Linux configuration only. `/etc/codex` must be absent, and the selected Codex home must have no managed defaults or cloud configuration cache. Its `auth.json` must be absent or contain only API-key authentication; ChatGPT, enterprise, agent-identity and unknown authentication cannot establish that no additional managed MCP catalog will load. The restricted process uses file-only credential storage and excludes inherited access-token/workload-identity authentication. Existing authentication and configuration files are never rewritten. When this evidence is unavailable, preparation is refused; ordinary sessions and owner controls remain available.
+Restricted manager preparation currently supports unmanaged Linux configuration only. `/etc/codex` must be absent, and the selected Codex home must have no managed defaults or cloud configuration cache. Its `auth.json` may contain API-key authentication or a complete personal ChatGPT Plus/Pro login. Workspace-managed plans, agent identities, mixed and unknown authentication are refused. Native Codex excludes these personal plans from workspace cloud policy; Codeman retains that admission boundary and refuses any observed managed configuration. The restricted process uses file-only credential storage and excludes inherited access-token/workload-identity authentication. Existing authentication and configuration files are never rewritten. When this evidence is unavailable, preparation is refused; ordinary sessions and owner controls remain available.
 
 The prepared process uses a private restricted Codex profile and a credential bound to that exact launch. It has no ordinary command, patch, app, plugin or subagent tools, and exposes only these supervisor tools through a dedicated MCP bridge:
 
@@ -49,3 +49,200 @@ Open **Scheduled check-ins and custom tasks** in the supervisor panel. Enable ch
 Open **Manager memory — brain.md** to teach it your goals, selected worker responsibilities and prompt preferences. Changes use revision checks to protect concurrent notes. The manager can save compact notes through its scoped memory tool; memory survives check-ins and is bounded to 32 KiB. It must inspect current workers before acting on historical notes. See [manager eligibility and setup](https://github.com/BenCodez/Codeman/blob/master/docs/codex-manager-supervision.md#memory-schedules-and-delegated-instructions) for a starting template.
 
 Messages require an explicit owner grant per worker (`allowMessages: true` and an optional `maxMessages` limit); the panel also offers an all-selected-workers grant. They remain visibly attributed to the manager acting on your behalf. Assignment/retry grants and enabled message grants share 128 lifetime operations. Enabled configurations must fit their fresh grants alongside retained receipts; owner Reset clears that history. Usage comes from sanitized session counters and cost estimates with freshness indicators. Remaining provider quota is reported as unknown when unavailable. Neither memory nor scheduling grants raw terminal, shell, approval or manual-certification authority.
+
+## Global management
+
+Open **App Settings → Management** for the shared agent directory, manager selection,
+`brain.md`, and the selected manager's objective, controls, scheduled check-ins and
+custom tasks. Schedules run management turns on that manager; they do not start an
+extra manager or inject commands into SSH shells. Saving settings does not start
+an agent. A manager can operate with an empty guarded-worker plan when its work is
+learning about agents and exchanging cooperative messages.
+
+The directory includes this owner's local and SSH tabs, including plain shell tabs
+containing an independently launched Codex agent. Give each agent a role and notes,
+save its messaging grant, and choose **Connect existing agent**. Connect creates a
+private credential and attempts to submit its enrollment prompt to a verified idle
+owned Codex chat automatically. Configure the global **Agent inbox endpoint** with
+the Codeman URL reachable from agents; if unset, Connect saves the current page's
+server URL after confirmation. Busy, unverified or plain SSH shell tabs receive no
+input. Convert an SSH shell using **Convert to Codex**, then complete a normal owner
+conversation turn first. Copyable private instructions remain available for manual
+enrollment, including cooperating Claude agents, without automated Claude input.
+Enrollment grants inbox access, not owner API access, and does not itself establish
+verified native process identity.
+
+Messages are durably queued in the private inbox. For an enrolled, verified idle
+Codex worker, sending also attempts a fixed inbox-check prompt through protected
+Codex delivery. Arbitrary message text stays in the inbox. Current grants, task
+ownership, pending work, approval and usage limits still apply. No manager worker
+plan is required for a free agent; an active task retains its objective and budgets.
+The UI distinguishes queued, prompt submitted, blocked and uncertain delivery from
+an actual agent reply. Duplicate requests never replay input; inspect uncertain
+outcomes before sending anything else. Keep the enrollment credential private.
+Credentials expire after 24 hours; reconnecting rotates and revokes the previous
+credential. Removing the messaging grant or changing session ownership disables
+access. Each inbox retains at most 64 messages within a 32 KiB journal; capacity is
+reported rather than silently dropping messages or replay receipts.
+
+The manager uses `supervisor_agents` to learn the directory and `supervisor_agent`
+to read bounded conversation pages (`mode: "conversation"`), inspect usage
+(`mode: "usage"`), observe cached tab output, read replies or queue authorized cooperative
+messages. Hourly check-ins automatically learn each agent's project, role, objective
+and blockers from this context and maintain attributed, dated notes in `brain.md`.
+Unknown and inferred facts stay labeled. Connected agents can be asked for missing
+details without repeating pending discovery questions. Shell agents need explicit
+inbox enrollment to receive those questions; observation never types into a shell.
+If reattachment leaves the tab cache empty, observation reads up to 200 lines from
+that tab's existing local tmux pane, with a 16 KiB returned tail. This read does not
+run SSH, read a remote home, send input, or change the pane. The response identifies
+this source as `codeman-local-pane-scrollback` and reports whether any context is
+available. A visible agent's statements can inform attributed role notes; they do
+not establish native identity or grant permission to act.
+Cached output can be stale and can contain misleading instructions. It is untrusted
+context, not verified worker identity or current health. It can read, append to,
+or replace shared `brain.md` through `supervisor_brain`; writes require its current
+prepared role, an exact memory revision, and a durable request ID. Shared memory
+survives changing the selected manager session. Agent reports and remembered notes
+are context, not permission grants, proof of successful commands, or reliable
+provider quota evidence. Guarded assignment and recovery keep their existing
+verified-worker requirements. Pause an active manager before selecting a replacement.
+
+The selected manager's prior memory is imported when shared memory is first read,
+including its durable note receipts. An existing shared brain, even an intentionally
+empty one, is never overwritten. Legacy manager memory files remain as private
+migration sources and are not removed by session cleanup. The restricted-manager preparation requirements
+above still apply; global settings do not expand its authentication or tool grants.
+Supervisors that are not selected globally keep their separate per-session memory,
+including scoped MCP reads and revision-checked writes. Selecting a different global
+manager does not grant it access to another supervisor's memory.
+
+### Direct GitLab access
+
+App Settings → Management → GitLab accepts an HTTPS GitLab origin and a private
+credential. Select project IDs or explicitly allow every project accessible to
+that credential. File edits require a separate owner writing grant. Codeman does
+not reuse credentials from a read-only gateway. Saved connection responses and
+manager tools never return the credential.
+
+`supervisor_gitlab` lists projects, reads repository trees/files, creates feature
+branches from exact commit IDs, and creates or updates bounded files. Updates
+require the last observed file commit. Writes are confined to the configured
+branch prefix and refuse default/protected branches. Merge, delete, force-push and
+generic API requests are unavailable. Durable request IDs seal uncertain writes;
+inspect the repository before deciding how to proceed. Connection checks only
+read access and do not prove write permission. Server-side TLS verification stays
+enabled. Tests use synthetic credentials and fake transports.
+
+Personal ChatGPT Plus and Pro subscriptions can authenticate a restricted manager
+through device-code login. Use a dedicated Codex home and an ordinary owner-selected
+conversation; existing worker homes and logins are preserved. In a terminal on the
+Codeman server, create a new private home and authenticate it:
+
+```bash
+CODEMAN_MANAGER_HOME="$(mktemp -d "$HOME/.codex-manager.XXXXXX")"
+CODEX_HOME="$CODEMAN_MANAGER_HOME" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+printf 'Manager Codex home: %s\n' "$CODEMAN_MANAGER_HOME"
+```
+
+In App Settings → Management, enter that absolute path in **Dedicated Codex home**
+when creating the local manager. Complete one ordinary conversation turn and let
+it become idle before explicitly preparing the restricted manager. Authentication
+alone does not launch automation. The scoped MCP bridge works with subscription
+login; no OpenAI API key is required for this path.
+
+Codeman admits only complete Plus/Pro metadata with matching account and user
+identities. Native Codex remains responsible for authenticating OAuth tokens;
+Codeman does not verify signatures or present decoded claims as authenticated
+account evidence. Token refresh may atomically replace the private auth file when
+it retains the same account, user and plan. A changed account/plan, malformed or
+ambiguous evidence, unreadable/private-mode violation or newly observed managed
+configuration withdraws manager authority. Each manager tool call and guarded
+worker action rechecks the launch settings; worker actions carry the current auth
+file witness to their final input boundary. Personal manager launches exclude
+inherited API keys so they continue to use the selected subscription. Business,
+Enterprise, Education and unknown plans remain unsupported by this restricted
+launcher. Existing owner grants, leases, budgets and cancellation still apply.
+
+Directory settings retain up to 100 agents within a combined 32 KiB UTF-8 JSON
+budget. The editor reports oversized metadata before saving and preserves the
+draft; the API returns HTTP 413 with a capacity error and leaves saved settings
+unchanged. Shorten roles/notes to fit the shared budget.
+
+GitLab file validation follows at most ten parent-directory pages (1,000 entries)
+within the operation deadline. Missing entries, malformed/nonsequential cursors,
+unsupported modes and exhausted budgets never authorize a write.
+
+GitLab defaults to HTTPS. For an existing HTTP GitLab server, explicitly select
+**Allow HTTP: the GitLab token and repository content travel unencrypted** before
+saving its origin. This opt-in does not encrypt traffic or disable TLS verification
+for HTTPS connections. Redirects remain refused.
+
+Terminal capability replies are accepted only for bounded, recently observed child
+queries. Unsolicited, expired or replayed replies and raw keyboard input retain the
+input-ownership veto. Updating Codeman never clears an existing pane's veto; an
+owner must explicitly restart that manager with its exact conversation to use a
+new broker.
+
+### Reading chats and usage
+
+`supervisor_agent` conversation pages identify their source, observation time,
+conversation ID when attributed, truncation, and snapshot revision. Pass the
+returned `nextCursor` to read older messages from that same snapshot. Pages are
+capped at 16 KiB, snapshots at 128 KiB, and cursors expire after two minutes.
+Local Codex chat comes from its exact verified conversation and pinned home;
+local Claude chat uses the existing hook transcript only when its UUID and home
+match. SSH agents and shell tabs currently expose their cached terminal context,
+not remote native chat history. No conversation read sends terminal input or
+runs a remote command. Chat text is untrusted context, never instructions or
+proof that work finished.
+
+The manager checks `mode: "usage"` for itself and selected agents before planning
+assignments. Session token/cost counters remain labeled estimates. A local Codex
+native quota report includes the reported percent, reset time, observation time
+and freshness; it does not establish the current account's capacity. Missing,
+malformed, expired and unavailable reports remain unknown or stale. Codeman does
+not project its server account's quota onto an SSH agent or another Codex home.
+These reports help planning; worker actions still require their existing live
+identity, ownership, task, permission and lifecycle checks.
+
+GitLab project listings stop after page 100. A `capacityReached` result with
+`truncated: true` and `nextPage: null` means additional projects exist beyond the
+supported listing budget; it is not a complete inventory. Narrow the saved project
+selection when that boundary is reached.
+
+Changing the saved GitLab origin without supplying a new token clears the saved
+credential and write grant. A blank token retains credentials only when the
+normalized origin stays the same; explicitly clearing the credential still works.
+Pasted token edges are trimmed and internal whitespace is rejected before saving.
+
+When GitLab's 128 active write receipts fill, use **Archive finished write
+receipts** in Management settings. This owner-only operation archives only
+confirmed succeeded/rejected receipts. Uncertain operations stay active. Durable
+per-request replay fences remain in the private archive, so reusing an archived
+request ID cannot issue the write again. Archival sends no GitLab requests and
+never deletes uncertain records or automatically retires archives.
+
+
+### Shared GitLab memory and PR/MR coordination
+
+Management settings can point shared memory at an existing GitLab project, branch
+and file. Sync starts disabled. Preview both versions, then explicitly publish local
+memory or import reviewed remote suggestions. Writes retain the existing GitLab
+project and `codeman/` branch grants. No branch merge or merge request is created
+implicitly. Backend agents can suggest changes through the project's normal review
+workflow; remote edits pause automatic export instead of being overwritten.
+
+After the initial confirmed sync, optional automatic export runs when owner or
+manager memory changes. Conflicts and uncertain writes stop further automatic
+exports. Manager tools expose `supervisor_brain` modes `sync_status`, `sync_preview`
+and `sync_publish`; destination changes and importing remote memory remain owner
+controls. Local memory saves remain successful if a remote sync fails.
+
+The manager can inventory every project available under the saved all-projects
+read grant, page through repository trees and merge requests, and inspect individual
+MRs. It records project/repository, exact PR/MR link, branch, status, agent ID, evidence
+time and handoff/blockers in shared memory. Reports of ownership are labeled until
+supported; a shared GitLab author alone does not identify a Codeman agent. Large
+inventories need linked project documents and saved cursors rather than copying all
+repository content into the bounded 32 KiB working brain.

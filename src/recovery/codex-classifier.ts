@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /**
  * @fileoverview Bounded Codex rollout classifier. Never classifies assistant prose as a control event.
  * Event shapes follow openai/codex rust-v0.162.1 protocol.rs (task_started/task_complete aliases,
@@ -112,6 +113,79 @@ function rateLimits(value: unknown): boolean {
 }
 
 /** Only reviewed passive protocol events may leave a terminal result unchanged. */
+/** Applied settings are owner intent, never an approval or a permission grant. */
+function validThreadSettings(p: JsonObject, conversationId: string): boolean {
+  const settings = object(p.thread_settings);
+  if (p.thread_id !== conversationId || !settings) return false;
+  const text = (value: unknown): value is string =>
+    typeof value === 'string' && value.length > 0 && value.length <= 4096;
+  const absolute = (value: unknown) => text(value) && value.startsWith('/') && !value.includes('\0');
+  const approval = object(settings.approval_policy);
+  const granular = approval && object(approval.granular);
+  const approvalKeys = ['sandbox_approval', 'rules', 'skill_approval', 'request_permissions', 'mcp_elicitations'];
+  const knownApproval =
+    ['untrusted', 'on-failure', 'on-request', 'never'].includes(String(settings.approval_policy)) ||
+    (!!approval &&
+      Object.keys(approval).length === 1 &&
+      !!granular &&
+      Object.keys(granular).length === approvalKeys.length &&
+      approvalKeys.every((key) => typeof granular[key] === 'boolean'));
+  const profile = object(settings.permission_profile);
+  const fileSystem = profile && object(profile.file_system);
+  const collaboration = object(settings.collaboration_mode);
+  const collaborationSettings = collaboration && object(collaboration.settings);
+  return (
+    text(settings.model) &&
+    text(settings.model_provider_id) &&
+    absolute(settings.cwd) &&
+    knownApproval &&
+    ['user', 'guardian_subagent'].includes(String(settings.approvals_reviewer)) &&
+    profile?.type === 'managed' &&
+    fileSystem?.type === 'restricted' &&
+    Array.isArray(fileSystem.entries) &&
+    fileSystem.entries.length <= 1024 &&
+    fileSystem.entries.every((entry) => {
+      const rule = object(entry);
+      const path = rule && object(rule.path);
+      const special = path && object(path.value);
+      const validPath =
+        path?.type === 'path'
+          ? absolute(path.path)
+          : path?.type === 'special' &&
+            !!special &&
+            Object.keys(special).length === 1 &&
+            ['root', 'slash_tmp', 'tmpdir'].includes(String(special.kind));
+      return (
+        !!rule &&
+        validPath &&
+        ['read', 'write', 'none'].includes(String(rule.access)) &&
+        (rule.missing_path_behavior === undefined || rule.missing_path_behavior === 'skip')
+      );
+    }) &&
+    ['restricted', 'enabled'].includes(String(profile.network)) &&
+    (settings.service_tier === undefined || settings.service_tier === null || text(settings.service_tier)) &&
+    (settings.runtime_workspace_roots === undefined ||
+      (Array.isArray(settings.runtime_workspace_roots) &&
+        settings.runtime_workspace_roots.length <= 100 &&
+        settings.runtime_workspace_roots.every(absolute))) &&
+    !!collaboration &&
+    ['default', 'plan'].includes(String(collaboration.mode)) &&
+    !!collaborationSettings &&
+    text(collaborationSettings.model) &&
+    (collaborationSettings.developer_instructions === undefined ||
+      collaborationSettings.developer_instructions === null ||
+      typeof collaborationSettings.developer_instructions === 'string') &&
+    (collaborationSettings.reasoning_effort === undefined ||
+      collaborationSettings.reasoning_effort === null ||
+      CODEX_REASONING_EFFORTS.includes(
+        collaborationSettings.reasoning_effort as (typeof CODEX_REASONING_EFFORTS)[number]
+      )) &&
+    Array.isArray(settings.disabled_plugin_ids) &&
+    settings.disabled_plugin_ids.length <= 100 &&
+    settings.disabled_plugin_ids.every(text)
+  );
+}
+
 function passiveEvent(p: JsonObject): boolean {
   if (p.type === 'agent_message')
     return (
@@ -255,6 +329,13 @@ function classifyError(error: JsonObject): { activity: RecoveryActivity; reason:
     return { activity: 'blocked', reason: 'usage-limit' };
   }
   if (kind === 'unauthorized') return { activity: 'blocked', reason: 'authentication-required' };
+  // Native Codex uses this exact terminal error when its per-turn config reload
+  // fails. An explicit new owner prompt may retry after the configuration is
+  // repaired; completion alone cannot clear the pause. Unknown errors and
+  // explicit auth/quota/permission events retain their independent vetoes.
+  if (kind === 'other' && message === 'failed to load workspace requirements')
+    return { activity: 'paused', reason: 'approval-required' };
+
   if (kind === 'activeturnnotsteerable' || kind === 'threadrollbackfailed') {
     return { activity: 'unknown', reason: 'observing' };
   }
@@ -325,6 +406,47 @@ export function hasCodexComposerText(screen: string, expected?: string): boolean
   );
 }
 
+/** Owner-triggered setup may supersede a validated native settings change only.
+ * This is eligibility for one fixed setup prompt, never recovery authority.
+ */
+export function permitsCodexManagerSetup(
+  tail: string,
+  context: CodexClassificationContext,
+  launchStartedAt: number
+): boolean {
+  if (
+    context.tailTruncated !== false ||
+    !Number.isFinite(launchStartedAt) ||
+    launchStartedAt <= 0 ||
+    launchStartedAt > context.now
+  )
+    return false;
+  const original = classifyCodexTail(tail, context);
+  if (original.activity !== 'paused' || original.reason !== 'approval-required') return false;
+  let currentSettings = false;
+  const retained: string[] = [];
+  try {
+    for (const line of tail.split('\n')) {
+      if (!line) continue;
+      const row = object(JSON.parse(line));
+      const payload = row && object(row.payload);
+      if (row?.type === 'event_msg' && payload?.type === 'thread_settings_applied') {
+        if (!validThreadSettings(payload, context.conversationId)) return false;
+        const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
+        if (!Number.isFinite(at) || at > context.now) return false;
+        if (at >= launchStartedAt) currentSettings = true;
+        continue;
+      }
+      retained.push(line);
+    }
+  } catch {
+    return false;
+  }
+  if (!currentSettings) return false;
+  const prior = classifyCodexTail(retained.length ? retained.join('\n') + '\n' : '', context);
+  return ['idle', 'completed'].includes(prior.activity);
+}
+
 export function classifyCodexTail(tail: string, context: CodexClassificationContext): RecoveryObservation {
   const unknown: RecoveryObservation = {
     activity: 'unknown',
@@ -333,7 +455,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     conversationId: context.conversationId,
     safeToAct: false,
   };
-  if (Buffer.byteLength(tail) > 262_144 || (tail && !tail.endsWith('\n'))) return unknown;
+  if (Buffer.byteLength(tail) > MAX_CODEX_ROLLOUT_BYTES || (tail && !tail.endsWith('\n'))) return unknown;
   let result = unknown;
   let turnId: string | undefined;
   let terminalError: JsonObject | undefined;
@@ -351,6 +473,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
   const pendingAgents = new Set<string>();
   const childActivityAt = new Map<string, number>();
   const commands = new Map<string, { startedAt: number; signature: string; open: boolean }>();
+  const mcpCalls = new Map<string, { startedAt: number; signature: string; open: boolean }>();
   const updateChild = (
     rawId: unknown,
     status: unknown,
@@ -437,7 +560,13 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
         return undefined;
       return Math.max(at, Number(nativeAt));
     };
-    if (p.type === 'user_message' || (p.type === 'item_completed' && object(p.item)?.type === 'UserMessage')) {
+    if (p.type === 'thread_settings_applied') {
+      if (!validThreadSettings(p, context.conversationId)) return unknown;
+      // Settings changes cannot revive older interrupted work or clear child,
+      // authentication or quota vetoes. A later exact ordinary owner message
+      // must supersede this control change before normal lifecycle evidence.
+      update('paused', 'approval-required');
+    } else if (p.type === 'user_message' || (p.type === 'item_completed' && object(p.item)?.type === 'UserMessage')) {
       const submitted = object(p.item);
       if (
         p.type === 'user_message'
@@ -478,10 +607,24 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
         if (!message.trim() || submittedAt <= latestVetoAt) return unknown;
       }
       submissionHash = createHash('sha256').update(message.trim()).digest('hex');
-      // A new prompt can precede task_started in the journal. It already supersedes the old failure.
-      turnId = undefined;
-      hasTurnStart = false;
-      turnStartedAt = 0;
+      // Native paginated history can persist task_started before its own
+      // completed UserMessage. Preserve only that exact still-running turn;
+      // legacy/new-turn input continues to invalidate older failure authority.
+      const retainsStartedTurn =
+        p.type === 'item_completed' &&
+        p.turn_id === turnId &&
+        hasTurnStart &&
+        result.activity === 'working' &&
+        result.reason === 'turn-running' &&
+        Number.isSafeInteger(p.started_at_ms) &&
+        Number(p.started_at_ms) > 0 &&
+        Number(p.started_at_ms) >= turnStartedAt - 2000 &&
+        Number(p.completed_at_ms) >= turnStartedAt;
+      if (!retainsStartedTurn) {
+        turnId = undefined;
+        hasTurnStart = false;
+        turnStartedAt = 0;
+      }
       pendingApproval = false;
       terminalError = undefined;
       update('working', 'turn-running');
@@ -720,6 +863,139 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
         Buffer.from(p.chunk, 'base64').toString('base64') !== p.chunk
       )
         return unknown;
+    } else if ((p.type === 'item_started' || p.type === 'item_completed') && object(p.item)?.type === 'McpToolCall') {
+      // rust-v0.162.1 protocol/items.rs: native rollouts may persist only the
+      // completed item, carrying its own paired begin/end timestamps.
+      const item = object(p.item)!;
+      const id = token(item.id);
+      const startedAt = p.started_at_ms;
+      const completedAt = p.completed_at_ms;
+      const duration = item.duration == null ? undefined : object(item.duration);
+      const error = item.error == null ? undefined : object(item.error);
+      const response = item.result == null ? undefined : object(item.result);
+      if (
+        !id ||
+        p.thread_id !== context.conversationId ||
+        !turnId ||
+        p.turn_id !== turnId ||
+        !token(item.server) ||
+        !token(item.tool) ||
+        item.arguments === undefined ||
+        !Number.isSafeInteger(startedAt) ||
+        Number(startedAt) <= 0 ||
+        Number(startedAt) < turnStartedAt - 2000 ||
+        Number(startedAt) > Math.min(context.now + 2000, at + 2000) ||
+        (item.duration != null &&
+          (!duration ||
+            !Number.isSafeInteger(duration.secs) ||
+            Number(duration.secs) < 0 ||
+            !Number.isInteger(duration.nanos) ||
+            Number(duration.nanos) < 0 ||
+            Number(duration.nanos) >= 1_000_000_000))
+      )
+        return unknown;
+      const signature = JSON.stringify([p.turn_id, item.server, item.tool, item.arguments]);
+      const previous = mcpCalls.get(id);
+      if (p.type === 'item_started') {
+        if (
+          previous ||
+          item.status !== 'inProgress' ||
+          item.error != null ||
+          item.result != null ||
+          item.duration != null
+        )
+          return unknown;
+        mcpCalls.set(id, { startedAt: Number(startedAt), signature, open: true });
+        terminalError = undefined;
+        update('working', 'turn-running');
+      } else {
+        if (
+          !Number.isSafeInteger(completedAt) ||
+          Number(completedAt) < Number(startedAt) ||
+          Number(completedAt) > Math.min(context.now + 2000, at + 2000) ||
+          (previous && (!previous.open || previous.signature !== signature || previous.startedAt !== startedAt)) ||
+          !['completed', 'failed'].includes(String(item.status))
+        )
+          return unknown;
+        if (item.status === 'failed') {
+          if (
+            !error ||
+            Object.keys(error).length !== 1 ||
+            typeof error.message !== 'string' ||
+            !error.message.trim() ||
+            item.result != null
+          )
+            return unknown;
+          if (error.message === 'MCP tool call requires approval, but approval policy is never') {
+            update('paused', 'approval-required');
+            latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else if (
+            item.server === 'codeman_supervisor' &&
+            item.tool === 'supervisor_gitlab' &&
+            ['projects', 'tree', 'file', 'merge_requests', 'merge_request'].includes(
+              String(object(item.arguments)?.operation)
+            ) &&
+            Object.keys(object(item.arguments)!).every((key) =>
+              ['operation', 'projectId', 'branch', 'path', 'state', 'page', 'iid'].includes(key)
+            ) &&
+            error.message ===
+              'tool call error: tool call failed for `codeman_supervisor/supervisor_gitlab`\n\nCaused by:\n    Mcp error: -32000: Supervisor operation refused or acceptance is uncertain; inspect status and retain the same requestId'
+          ) {
+            // These exact legacy bridge requests only read GitLab. Retain the
+            // failure as an owner-intent fence; no automatic retry or write is authorized.
+            update('paused', 'approval-required');
+            latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else if (
+            item.server === 'codeman_supervisor' &&
+            item.tool === 'supervisor_brain' &&
+            object(item.arguments)?.mode === 'read' &&
+            Object.keys(object(item.arguments)!).length === 1 &&
+            (error.message ===
+              'tool call error: tool call failed for `codeman_supervisor/supervisor_brain`\n\nCaused by:\n    Transport closed' ||
+              error.message ===
+                'tool call error: tool call failed for `codeman_supervisor/supervisor_brain`\n\nCaused by:\n    Mcp error: -32002: Manager bridge request failed; acceptance may be uncertain. Retain requestId and inspect durable status before retrying.')
+          ) {
+            // This exact operation cannot affect a worker or write memory. Its
+            // failure still requires later owner intent, never an automatic retry.
+            update('paused', 'approval-required');
+            latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else if (
+            item.server === 'codeman_supervisor' &&
+            /^supervisor_(?:status|workers|assign|retry|message|brain|agents|agent|gitlab)$/.test(String(item.tool)) &&
+            error.message ===
+              'tool call error: tool call failed for `codeman_supervisor/' +
+                item.tool +
+                '`\n\nCaused by:\n    Mcp error: -32001: Current prepared manager authority is required'
+          ) {
+            update('paused', 'approval-required');
+            latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else if (
+            item.server === 'codeman_supervisor' &&
+            /^supervisor_(?:status|workers|assign|retry|message|brain|agents|agent|gitlab)$/.test(String(item.tool)) &&
+            error.message ===
+              'tool call error: tool call failed for `codeman_supervisor/' +
+                item.tool +
+                '`\n\nCaused by:\n    Mcp error: -32602: Invalid manager tool arguments'
+          ) {
+            // This exact bridge validation response precedes every tool effect.
+            // Close only this call; retain all other pending/control vetoes.
+          } else {
+            const failure = classifyError(error);
+            update(failure.activity, failure.reason);
+          }
+        } else {
+          if (
+            item.error != null ||
+            !response ||
+            !Array.isArray(response.content) ||
+            !response.content.every((block) => !!object(block)) ||
+            (response.isError !== undefined && typeof response.isError !== 'boolean')
+          )
+            return unknown;
+          if (response.isError === true) update('blocked', 'observing');
+        }
+        mcpCalls.set(id, { startedAt: Number(startedAt), signature, open: false });
+      }
     } else if ((p.type === 'item_started' || p.type === 'item_completed') && object(p.item)) {
       const item = object(p.item)!;
       const itemAt = p.type === 'item_started' ? p.started_at_ms : p.completed_at_ms;
@@ -766,7 +1042,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     return { ...result, activity: 'paused', reason: ownerVetoReason, safeToAct: false };
   }
   if (
-    [...commands.values()].some((command) => command.open) &&
+    ([...commands.values()].some((command) => command.open) || [...mcpCalls.values()].some((call) => call.open)) &&
     !['unknown', 'blocked', 'paused'].includes(result.activity)
   ) {
     return { ...result, activity: 'watching', reason: 'background-work', safeToAct: false };
@@ -788,10 +1064,10 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     if (/sign in|log in|authentication failed/i.test(screen)) {
       return { ...result, activity: 'blocked', reason: 'authentication-required', safeToAct: false };
     }
-    if (/usage limit|limit reached/i.test(screen)) {
+    if (/\busage limit\b|\blimit reached\b/i.test(screen)) {
       return { ...result, activity: 'blocked', reason: 'usage-limit', safeToAct: false };
     }
-    if (/would you like|approve this|allow this|press enter to confirm/i.test(screen)) {
+    if (/(?:^|\n)[ \t]*(?:[•›][ \t]*)?would you like\b|approve this|allow this|press enter to confirm/i.test(screen)) {
       return { ...result, activity: 'paused', reason: 'approval-required', safeToAct: false };
     }
     // Native busy hints cannot clear structured vetoes or active child work.

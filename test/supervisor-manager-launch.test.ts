@@ -1,5 +1,6 @@
 /** Actual private profile files and Session conversion; all native effects are explicit fakes. */
 import fs from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -8,6 +9,7 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { parse } from 'smol-toml';
 import { Session } from '../src/session.js';
+import { TmuxManager } from '../src/tmux-manager.js';
 import { WebServer } from '../src/web/server.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import {
@@ -17,6 +19,7 @@ import {
   type SupervisorManagerLaunch,
 } from '../src/supervisor/manager-launch.js';
 import { createDeferred } from './mocks/index.js';
+import { personalAuth } from './mocks/subscription-auth.js';
 import { supervisorManagerBridgeCommand } from '../src/supervisor/manager-bridge-command.js';
 
 const catalogRead = vi.hoisted(() => vi.fn());
@@ -69,7 +72,11 @@ async function profile() {
   return { ...p, profile: prepared! };
 }
 
-function prepareAt(p: { home: string; work: string }, isCurrent = () => true) {
+function prepareAt(
+  p: { home: string; work: string },
+  isCurrent = () => true,
+  additionalFiles?: readonly import('../src/recovery/private-file-witness.js').PrivateFileWitness[]
+) {
   return prepareSupervisorManagerLaunch({
     home: p.home,
     workingDir: p.work,
@@ -79,6 +86,7 @@ function prepareAt(p: { home: string; work: string }, isCurrent = () => true) {
     endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp',
     bridgeCommand: 'codeman',
     bridgeArgs: ['agent', 'supervisor-mcp'],
+    additionalFiles,
     isCurrent,
   });
 }
@@ -301,8 +309,14 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
   const text = await fs.readFile(prepared!.file, 'utf8');
   expect(text).not.toContain(TOKEN);
   const parsed = parse(text),
-    servers = parsed.mcp_servers as Record<string, { command: string; args: string[]; enabled_tools: string[] }>;
+    servers = parsed.mcp_servers as Record<
+      string,
+      { command: string; args: string[]; enabled_tools: string[]; default_tools_approval_mode: string }
+    >;
   expect(Object.keys(servers)).toEqual(['codeman_supervisor']);
+  expect(servers.codeman_supervisor.default_tools_approval_mode).toBe('approve');
+  expect(parsed).not.toHaveProperty('default_tools_approval_mode');
+  expect(parsed.apps).toBeUndefined();
   expect(servers.codeman_supervisor.enabled_tools).toEqual([
     'supervisor_status',
     'supervisor_workers',
@@ -310,6 +324,9 @@ it('loads the exact adjacent named profile and keeps the only credential in its 
     'supervisor_retry',
     'supervisor_message',
     'supervisor_brain',
+    'supervisor_agents',
+    'supervisor_agent',
+    'supervisor_gitlab',
   ]);
   const credentialFile = servers.codeman_supervisor.args.at(-1)!;
   expect(JSON.parse(await fs.readFile(credentialFile, 'utf8'))).toEqual({
@@ -792,8 +809,10 @@ async function fixture() {
   const p = await paths();
   vi.stubEnv('CODEMAN_DATA_DIR', join(p.root, 'data'));
   await fs.mkdir(join(p.root, 'data'));
-  let current = true,
-    acknowledged: SupervisorManagerLaunch | undefined;
+  let current = true;
+  const native = Object.create(TmuxManager.prototype) as TmuxManager;
+  const launches = new Map();
+  Reflect.set(native, 'supervisorManagerLaunches', launches);
   const record: MuxSession = {
     sessionId: SID,
     muxName: 'codeman-11111111',
@@ -808,15 +827,17 @@ async function fixture() {
   const respawn = vi.fn(async (options) => {
     expect(options.codexConfig.resumeSessionId).toBe(CID);
     if (!options.ownerLaunchIsCurrent() || !(await options.supervisorManager.confirm())) return null;
-    acknowledged = options.supervisorManager;
     record.pid = 700;
+    record.recoveryInputBroker = CID;
+    launches.set(SID, { profile: options.supervisorManager, record, pid: record.pid, incarnation: CID });
     return 700;
   });
+  Reflect.set(native, 'sessions', new Map([[SID, record]]));
   const mux = {
     inspectPaneForRecovery: vi.fn(async () => ({ dead: false, panePid: record.pid, paneId: '%7', screen: '› ' })),
     respawnPane: respawn,
-    isSupervisorManagerLaunchCurrent: (_id: string, profile: SupervisorManagerLaunch) =>
-      acknowledged === profile && record.pid === 700,
+    isSupervisorManagerLaunchCurrent: native.isSupervisorManagerLaunchCurrent.bind(native),
+    isSupervisorManagerOwnerInputCurrent: native.isSupervisorManagerOwnerInputCurrent.bind(native),
     isAvailable: () => true,
     clearPaneExit: () => {},
   } as unknown as TerminalMultiplexer;
@@ -844,7 +865,7 @@ async function fixture() {
     options: { token: TOKEN, endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp', isCurrent: () => current },
   };
 }
-it('ordinary restored Session cannot adopt a manager role; exact acknowledged restricted conversion works and owner intent revokes it', async () => {
+it('ordinary restored Session cannot adopt a manager role; tracked teaching retains the exact restricted conversion', async () => {
   const f = await fixture();
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
   expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
@@ -863,6 +884,10 @@ it('ordinary restored Session cannot adopt a manager role; exact acknowledged re
   expect(f.session.getRecoveryContext().codexHome).toBe(f.home);
   f.session.trackUserInput('Owner takes over\r');
   await Reflect.get(f.session, '_recoveryFencePublication');
+  // Tracked teaching revokes task authority at the server boundary, while the
+  // native process must retain its exact launch files for per-turn reloads.
+  expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(true);
+  Reflect.set(f.session, '_recoveryUntrackedInput', true);
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
   await f.session.revokeSupervisorManagerLaunch();
   expect(await fs.readdir(f.home)).toEqual([]);
@@ -949,3 +974,122 @@ it('a changed caller, lifecycle, pending broker or nonempty composer refuses con
   expect(await draft.session.prepareSupervisorManager(draft.options)).toBe(false);
   expect(draft.respawn).not.toHaveBeenCalled();
 });
+
+it.each(['plus', 'pro'])(
+  'prepares personal %s login and retains exact launch through atomic token refresh',
+  async (plan) => {
+    const p = await paths();
+    const path = join(p.home, 'auth.json');
+    await fs.writeFile(path, JSON.stringify(personalAuth(plan)), { mode: 0o600 });
+    const prepared = await prepareAt(p);
+    expect(prepared).toBeDefined();
+    const original = prepared!.files.find((file) => file.path === path)!;
+    expect(await prepared!.confirm()).toBe(true);
+    await fs.writeFile(path + '.new', JSON.stringify(personalAuth(plan, undefined, undefined, 2)), { mode: 0o600 });
+    await fs.rename(path + '.new', path);
+    expect(await prepared!.confirm()).toBe(true);
+    expect(prepared!.files.find((file) => file.path === path)!.hash).not.toBe(original.hash);
+    expect(prepared!.conversationId).toBe(CID);
+    expect(supervisorManagerCommand(prepared!, { noDaemon: true })).toContain('-u OPENAI_API_KEY -u CODEX_API_KEY');
+    expect(supervisorManagerCommand(prepared!, { noDaemon: true })).toContain('--disable shell_tool');
+    expect(supervisorManagerCommand(prepared!, { noDaemon: true })).not.toContain('synthetic-refresh');
+    await fs.writeFile(path, JSON.stringify(personalAuth(plan, 'different-account')));
+    expect(await prepared!.confirm()).toBe(false);
+    expect(prepared!.isCurrent()).toBe(false);
+    await prepared!.revoke();
+    expect(JSON.parse(await fs.readFile(path, 'utf8')).tokens.account_id).toBe('different-account');
+  }
+);
+
+it('withdraws subscription launch authority if managed policy appears after preparation', async () => {
+  const p = await paths();
+  await fs.writeFile(join(p.home, 'auth.json'), JSON.stringify(personalAuth()), { mode: 0o600 });
+  const prepared = await prepareAt(p);
+  expect(prepared).toBeDefined();
+  await fs.writeFile(join(p.home, 'cloud-config-bundle-cache.json'), '{}');
+  expect(await prepared!.confirm()).toBe(false);
+  await prepared!.revoke();
+});
+
+it('allows new manager rollout bytes at runtime while retaining static restrictions and fresh authentication', async () => {
+  const p = await paths();
+  await fs.writeFile(join(p.home, 'auth.json'), JSON.stringify(personalAuth()), { mode: 0o600 });
+  const path = join(p.root, 'rollout.jsonl');
+  await fs.writeFile(path, 'initial conversation evidence');
+  const stat = await fs.lstat(path);
+  const source = {
+    path,
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    hash: createHash('sha256').update('initial conversation evidence').digest('hex'),
+    maxBytes: 262144,
+  };
+  const prepared = await prepareAt(p, () => true, [source]);
+  expect(prepared).toBeDefined();
+  expect(await prepared!.confirm()).toBe(true);
+  await fs.appendFile(path, '\nmanager completed a normal turn');
+  expect(await prepared!.confirm(true)).toBe(true);
+  await fs.appendFile(prepared!.file, '\n[plugins.unsafe]\nenabled=true\n');
+  expect(await prepared!.confirm(true)).toBe(false);
+  await prepared!.revoke();
+});
+
+it('keeps automatic launch authority fenced while real-profile owner setup writes publish their durable fence', async () => {
+  const f = await fixture();
+  expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+  const profile = Reflect.get(f.session, '_supervisorManagerProfile') as SupervisorManagerLaunch;
+  const ownerFrame = f.session.captureSupervisorManagerOwnerInputAuthority()!;
+  expect(ownerFrame()).toBe(true);
+  const previousPty = f.session.ptyProcess;
+  const write = vi.fn(() => {
+    expect(profile.isCurrent()).toBe(false);
+    expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
+    expect(ownerFrame()).toBe(true);
+  });
+  Reflect.set(f.session, 'ptyProcess', { write });
+  const clientId = 'real-manager-setup-owner';
+  try {
+    expect(f.session.shouldApplyInput(clientId, 1)).toBe(true);
+    expect(
+      await f.session.writeAsync('Reply READY only.', {
+        fromUser: true,
+        inputSeq: { clientId, seq: 1 },
+        isCurrent: ownerFrame,
+      })
+    ).toBe(true);
+    expect(f.session.getRecoveryContext().switchPending).toBe(true);
+    expect(profile.isCurrent()).toBe(false);
+    expect(await ownerFrame.confirm()).toBe(true);
+    expect(f.session.shouldApplyInput(clientId, 2)).toBe(true);
+    expect(
+      await f.session.writeAsync('\r', { fromUser: true, inputSeq: { clientId, seq: 2 }, isCurrent: ownerFrame })
+    ).toBe(true);
+    expect(write).toHaveBeenCalledTimes(2);
+    expect(f.session.getRecoveryContext().switchPending).toBe(false);
+    expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(true);
+  } finally {
+    Reflect.set(f.session, 'ptyProcess', previousPty);
+  }
+});
+
+it.each(['untracked', 'home', 'replacement'] as const)(
+  'owner setup continuity cannot cross %s changes in a real prepared profile',
+  async (kind) => {
+    const f = await fixture();
+    expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
+    const original = Reflect.get(f.session, '_supervisorManagerProfile');
+    const ownerFrame = f.session.captureSupervisorManagerOwnerInputAuthority()!;
+    expect(ownerFrame()).toBe(true);
+    Reflect.set(f.session, '_recoverySwitchPending', true);
+    if (kind === 'untracked') Reflect.set(f.session, '_recoveryUntrackedInput', true);
+    if (kind === 'home') Reflect.set(f.session, '_envOverrides', { CODEX_HOME: f.home + '-other' });
+    if (kind === 'replacement') Reflect.set(f.session, '_supervisorManagerProfile', Object.create(original));
+    expect(ownerFrame()).toBe(false);
+    expect(await ownerFrame.confirm()).toBe(false);
+    expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
+    Reflect.set(f.session, '_supervisorManagerProfile', original);
+  }
+);

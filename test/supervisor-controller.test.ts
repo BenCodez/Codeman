@@ -1823,6 +1823,16 @@ describe('SupervisorController', () => {
     expect(task.objective?.length).toBeLessThanOrEqual(4000);
     expect(task.objective).toContain('supervisor_workers');
     expect(task.objective).toContain('supervisor_assign');
+    expect(task.objective).toContain('attributed PR/MR→agent, repo/branch, status/blockers/handoffs');
+    expect(task.objective).toContain('Reports are claims; commit authors prove no agent ownership');
+    expect(task.objective).toContain('granted supervisor_gitlab merge_requests/merge_request if available');
+    expect(task.objective).toContain('manual certification is owner-only');
+    expect(task.objective).toContain('Never interrupt/kill/spawn/merge/deploy/expand privileges');
+    expect(task.config).toEqual({
+      enabled: false,
+      maxContinuations: 10,
+      maxRuntimeMs: SUPERVISOR_MANAGER_MAX_RUNTIME_MS,
+    });
   });
 
   describe('worker runtime authority', () => {
@@ -2419,4 +2429,13 @@ describe('shared lifetime supervisor request allocation', () => {
       await expect(reloaded.reset()).resolves.toMatchObject({ workers: [], handledRequestIds: [] });
     }
   );
+});
+
+it('starts a bounded directory-and-inbox manager without granting native worker assignments', async () => {
+  const h = harness();
+  await h.controller.configure({ ...config, workers: [] });
+  expect((await h.controller.start()).phase).toBe('active');
+  expect(h.deps.startManager).toHaveBeenCalled();
+  await expect(h.controller.assign(WORKER, 'not-granted-worker')).rejects.toBeInstanceOf(SupervisorValidationError);
+  expect(h.worker.task.resume).not.toHaveBeenCalled();
 });

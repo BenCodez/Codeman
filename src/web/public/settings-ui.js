@@ -407,6 +407,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   openAppSettings() {
+    void this.loadManagementSettings?.();
     // Load current settings
     const settings = this.loadAppSettingsFromStorage();
     document.getElementById('appSettingsDisplayName').value = settings.displayName || 'Codeman';
@@ -753,6 +754,7 @@ Object.assign(CodemanApp.prototype, {
   switchSettingsTab(sectionId) {
     // The Shortcuts list renders lazily so it reflects the CURRENT registry
     // (defaults + overrides) every time it is reached.
+    if (sectionId === 'settings-management') void this.loadManagementSettings?.();
     if (sectionId === 'settings-shortcuts') this.renderShortcutSettingsList?.();
     const doc = document.getElementById('appSettingsDoc');
     const section = document.getElementById(sectionId);
@@ -1177,6 +1179,7 @@ Object.assign(CodemanApp.prototype, {
   },
 
   closeAppSettings() {
+    this.closeManagementSettings?.();
     this._toggleSettingsJump(false);
     document.getElementById('appSettingsModal').classList.remove('active');
 

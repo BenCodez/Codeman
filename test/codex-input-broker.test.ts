@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from '../src/recovery/codex-evidence-limits.js';
 /** Real broker and disposable Python child; no tmux, Codex, SSH or live session effects. */
 import { createHash, createHmac } from 'node:crypto';
 import type { PrivateFileWitness } from '../src/recovery/private-file-witness.js';
@@ -5,6 +6,7 @@ import fs from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import * as nodePty from 'node-pty';
 import { afterEach, expect, it, vi } from 'vitest';
 import {
   CodexInputBroker,
@@ -575,14 +577,14 @@ async function witness(path: string, maxBytes = 2_097_152): Promise<PrivateFileW
   };
 }
 
-it.each([262_144, 2_097_152])(
+it.each([262_144, 2_097_152, 3_145_728])(
   'verifies actual %i-byte private evidence before startup and automatic delivery',
   async (size) => {
     let file!: PrivateFileWitness;
     const { broker, child, bytes } = await fixture(0, undefined, undefined, async (codec, root) => {
       const path = join(root, 'private-grant');
       await fs.writeFile(path, Buffer.alloc(size, 97), { mode: 0o600 });
-      file = await witness(path);
+      file = await witness(path, MAX_CODEX_ROLLOUT_BYTES);
       await codec.setStartupAuthority([file]);
     });
     expect(await broker.startupReceipt(child.pid!)).toBe('started');
@@ -1304,4 +1306,185 @@ it('keeps output alive and disables later input after one lock-close failure', a
   expect((await bytes()).toString()).toBe('First owner bytes');
   expect(output().length).toBeGreaterThan(before);
   expect(child.exitCode).toBeNull();
+});
+
+it('starts under a real outer terminal and sizes the child after its PTY exists', async () => {
+  const root = await fs.mkdtemp(join(homedir(), 'broker-real-tty-'));
+  let terminal: nodePty.IPty | undefined;
+  let exited = false;
+  try {
+    const childPath = join(root, 'fake-terminal-child.py');
+    await fs.writeFile(
+      childPath,
+      `import fcntl, os, struct, termios, time
+end = time.monotonic() + 2
+while time.monotonic() < end:
+    rows, cols, _, _ = struct.unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\\0' * 8))
+    if (rows, cols) == (30, 100): break
+    time.sleep(.01)
+os.write(1, ('FAKE_TTY_READY:%s:%s\\n' % (rows, cols)).encode())
+`
+    );
+    const broker = await CodexInputBroker.create(join(root, 'control'), SID, `exec python3 ${quote(childPath)}`, root);
+    terminal = nodePty.spawn(
+      'python3',
+      [join(broker.directory, 'broker.py'), broker.directory, broker.configurationDigest],
+      {
+        name: 'xterm-256color',
+        cols: 100,
+        rows: 30,
+        cwd: root,
+        env: { ...process.env, CODEX_HOME: root },
+      }
+    );
+    let output = '';
+    terminal.onData((data) => {
+      output += data;
+    });
+    const done = new Promise<number>((resolve) =>
+      terminal!.onExit(({ exitCode }) => {
+        exited = true;
+        resolve(exitCode);
+      })
+    );
+    const exitCode = await Promise.race([
+      done,
+      new Promise<never>((_, reject) => setTimeout(() => reject(Error('Fake terminal child timed out')), 4000)),
+    ]);
+    expect(output).toContain('FAKE_TTY_READY:30:100');
+    expect(output).not.toContain('input reliability guard unavailable');
+    expect(exitCode).toBe(0);
+    const state = await broker.readState();
+    expect(state?.startup.status).toBe('started');
+    expect(state?.closed).toBe(true);
+    expect(state?.exitStatus).toBe(0);
+  } finally {
+    if (terminal && !exited) terminal.kill(); // Disposable fake child only.
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
+it('admits only bounded terminal replies paired with fresh child queries, including fragments', async () => {
+  const { broker, child, bytes } = await fixture(0, undefined, (source) =>
+    source.replace(
+      "os.write(1, b'FAKE_CHILD_READY\\n')",
+      "os.write(1, b'\\x1b[c\\x1b[6n\\x1b]11;?\\x07FAKE_CHILD_READY\\n')"
+    )
+  );
+  const replies = ['\x1b[?1;2c', '\x1b[12;4R', '\x1b]11;rgb:0000/1111/ffff\x1b\\'];
+  for (const reply of replies) {
+    child.stdin.write(reply.slice(0, 2));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    child.stdin.write(reply.slice(2));
+  }
+  await eventually(async () => (await bytes()).toString() === replies.join(''));
+  expect(await broker.prove(child.pid!)).toMatchObject({ rawGeneration: 0 });
+  child.stdin.write(replies[0]); // A replay has no pending query.
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});
+
+it.each(['\x1b[12;4R', '/resume unsafe\r', '\x1b[?1;2c/resume unsafe\r'])(
+  'retains the raw-input veto for unpaired or mixed input %j',
+  async (data) => {
+    const { broker, child } = await fixture(0, undefined, (source) =>
+      source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[cFAKE_CHILD_READY\\n')")
+    );
+    child.stdin.write(data);
+    await eventually(async () => (await broker.readState())?.tainted === true);
+    expect(await broker.prove(child.pid!)).toBeUndefined();
+  }
+);
+
+it.each(['', '0'])('accepts a single primary device reply for CSI %s c only once', async (parameter) => {
+  const { broker, child, bytes } = await fixture(0, undefined, (source) =>
+    source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", `os.write(1, b'\\x1b[${parameter}cFAKE_CHILD_READY\\n')`)
+  );
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await bytes()).toString() === '\x1b[?1;2c');
+  expect(await broker.prove(child.pid!)).toMatchObject({ rawGeneration: 0 });
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});
+
+it('does not authorize a primary device reply for an unsupported parameter', async () => {
+  const { broker, child } = await fixture(0, undefined, (source) =>
+    source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[1cFAKE_CHILD_READY\\n')")
+  );
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});
+
+it('does not accept a terminal reply after its query expires', async () => {
+  const { broker, child } = await fixture(
+    0,
+    (source) => source.replace('now + 2)', 'now - 1)'),
+    (source) => source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[cFAKE_CHILD_READY\\n')")
+  );
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});
+
+it('admits native focus notifications only while the exact child enables mode1004, including fragments', async () => {
+  const { broker, child, bytes } = await fixture(0, undefined, (source) =>
+    source.replace(
+      "os.write(1, b'FAKE_CHILD_READY\\n')",
+      "os.write(1, b'\\x1b[?10'); os.write(1, b'04hFAKE_CHILD_READY\\n')"
+    )
+  );
+  for (const report of ['\x1b[I', '\x1b[O', '\x1b[I']) {
+    child.stdin.write(report.slice(0, 2));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    child.stdin.write(report.slice(2));
+  }
+  await eventually(async () => (await bytes()).toString() === '\x1b[I\x1b[O\x1b[I');
+  expect(await broker.prove(child.pid!)).toMatchObject({ rawGeneration: 0 });
+  const frame = broker.frame('auto', 'Known input', CID, undefined, [], OWNERS)!;
+  child.stdin.write(frame.data);
+  expect(await broker.receipt(frame.receipt)).toBe('sent');
+});
+
+it.each(['\x1b[I', '\x1b[O'])('keeps unsolicited or disabled focus reports tainted: %j', async (report) => {
+  for (const mode of ['', '\\x1b[?1004h\\x1b[?1004l']) {
+    const { broker, child } = await fixture(0, undefined, (source) =>
+      source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", `os.write(1, b'${mode}FAKE_CHILD_READY\\n')`)
+    );
+    child.stdin.write(report);
+    await eventually(async () => (await broker.readState())?.tainted === true);
+    expect(await broker.prove(child.pid!)).toBeUndefined();
+  }
+});
+
+it.each(['/resume unsafe\r', '\x1b[<0;1;1M', '\x1b[IX', '\x1b[200~unsafe\x1b[201~'])(
+  'retains the raw-input veto for arbitrary or mixed bytes while focus reporting is enabled: %j',
+  async (data) => {
+    const { broker, child } = await fixture(0, undefined, (source) =>
+      source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[?1004hFAKE_CHILD_READY\\n')")
+    );
+    child.stdin.write(data);
+    await eventually(async () => (await broker.readState())?.tainted === true);
+    expect(await broker.prove(child.pid!)).toBeUndefined();
+  }
+);
+
+it('revokes focus reporting immediately when the live child disables1004', async () => {
+  const f = await fixture(0, undefined, (source) =>
+    source
+      .replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[?1004hFAKE_CHILD_READY\\n')")
+      .replace(
+        "while not os.path.exists(os.path.join(root, 'stop')):",
+        "while not os.path.exists(os.path.join(root, 'stop')):\n    if os.path.exists(os.path.join(root, 'disable-focus')):\n        os.unlink(os.path.join(root, 'disable-focus'))\n        os.write(1, b'\\x1b[?1004lFOCUS_DISABLED\\n')"
+      )
+  );
+  f.child.stdin.write('\x1b[I');
+  await eventually(async () => (await f.bytes()).toString() === '\x1b[I');
+  expect(await f.broker.prove(f.child.pid!)).toMatchObject({ rawGeneration: 0 });
+  await fs.writeFile(join(f.root, 'disable-focus'), 'disable');
+  await eventually(async () => f.output().includes('FOCUS_DISABLED'));
+  f.child.stdin.write('\x1b[O');
+  await eventually(async () => (await f.broker.readState())?.tainted === true);
+  expect(await f.broker.prove(f.child.pid!)).toBeUndefined();
 });

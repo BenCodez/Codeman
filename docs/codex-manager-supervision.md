@@ -2,6 +2,10 @@
 
 Choose an owned local managed Codex session with an isolated `--no-daemon` conversation. The manager uses the Codex executable that Codeman resolves on its local host, in a separate managed session with an owner-selected home. It does not adopt an unrelated running Codex process. Before starting the manager, submit at least one ordinary prompt through Codeman in its current thread and each selected worker's current thread. Codeman must match that exact tracked submission to complete current history. A new or resumed pane with only a launch seed requires this owner step before automatic manager or worker input.
 
+**Start manager** performs preparation and Start as one confirmed owner action. It preserves the exact conversation and connects restricted tools. If the newly restricted native process is paused only by a validated settings event at a verified empty composer, Codeman sends the fixed `Reply READY only.` setup prompt as separate tracked text and Enter frames, waits for exact native completion and rechecks tool discovery before starting. Other approvals, authentication or usage limits, unknown history and pending children still stop setup. Preparation does not recover an exited process or create a fresh chat.
+
+Setup keeps a durable request receipt before each input phase and before Start. A lost response, partial write or interrupted process never authorizes replay. The browser retains that request ID; repeating it returns its receipt. Unresolved setup requires owner inspection before another request. The private setup journal retains at most 128 current receipts. Finalized started/refused receipts move to immutable private archive files before leaving that journal; replaying their request IDs returns the original receipt. Preparing and uncertain receipts are never archived or pruned. Archive storage grows with completed requests to preserve exact replay fences. **Prepare restricted manager** remains an inspection and preparation control without starting the saved objective.
+
 The manager bridge requires Codeman to listen on numeric IPv4 loopback (`127.0.0.1`) or the IPv4 wildcard (`0.0.0.0`). Specific LAN/VPN addresses, IPv6-only binds and ambiguous hostnames cannot offer a new manager. Existing roles remain available for inspection and reset. This restriction does not change the server's binding or start another listener.
 
 The local manager and its local workers need distinct effective, owner-authorized `CODEX_HOME` directories, for example `/work/codex-manager` and `/work/codex-worker`. Current-thread history belongs to each home: distinct UUIDs sharing one local home cannot both retain current-thread authority. Configuration rejects a local worker sharing the manager's home. Workers sharing a home with each other may later require attention when its latest thread changes. Owned SSH workers use their remote filesystem domain, so the same path string on a remote host does not share the local manager's history. Choose these homes explicitly when launching sessions; Codeman does not change homes automatically.
@@ -18,6 +22,10 @@ Codex's built-in MCP resource helpers are registered independently of the server
 
 ## Memory, schedules and delegated instructions
 
+In **App Settings → Management → Give manager work**, describe the outcome and its completion criteria, then select **Queue request**. The optional **Start the configured manager if paused** checkbox asks for explicit setup and Start confirmation. Work is saved as a single-run scheduled task; a busy manager waits for verified idle delivery. The form does not type into a worker terminal or replace its existing chat. It preserves current schedules, grants and runtime limits. Required worker evidence and owner acceptance remain necessary; “accepted by manager” confirms delivery, not completed work. Open the manager conversation for its progress and evidence reports.
+
+Use **Refresh work status** to inspect queued, accepted, refused or uncertain delivery. An unconfirmed save retains its exact request ID and draft. Refresh before trying again; the same ID cannot be rebound to different work. Requests share the existing 12 custom task slots and 128 lifetime delivery receipts. At capacity, inspect tasks through manager schedules; no old work or receipt is removed automatically. The manager is instructed to keep unfinished requests in shared memory, inspect usage and blockers, delegate only within current grants, and request owner review for manual criteria.
+
 The supervisor panel has **Scheduled check-ins and custom tasks** and **Manager memory — brain.md** controls. Open each section to load its current state. Check-ins default to off with a 60-minute interval. Custom tasks have a name, instructions, a one-off or recurring schedule, and a maximum run count. Save before selecting **Run saved task now**. These instructions target the existing prepared manager; they do not create another session or grant shell access. Paused roles, current work, uncertain delivery, owner intent and existing runtime/continuation budgets remain authoritative. An application restart still requires explicit owner preparation and Start. Schedules share a lifetime capacity of 128 run receipts. Enabled check-ins reserve up to 100 runs; all configured custom tasks must fit in the remaining capacity, including disabled tasks that can still be run manually. Completed attempts and retained request receipts still count after a task is edited or removed. Overallocated saves are refused before dispatch; old receipts are retained to prevent replay. Confirmed session deletion cleans up its saved schedules and private memory. Detach, restart and failed deletion retain them; uncertain cleanup is preserved for a later guarded retry.
 
 Teach the manager your goals, architecture, worker responsibilities and prompt conventions in its conversation or in the memory editor. Keep worker management paused while teaching, or teach before its first Start; ask it to remember stable facts in `brain.md`, then select **Start manager** when you want worker management to resume. The `supervisor_brain` tool reads this manager's private persistent `brain.md` and can append compact notes with a durable request ID. Owner edits use a revision check so concurrent notes cannot be overwritten silently. Unavailable or malformed memory is reported as unavailable rather than replaced. Memory is bounded to 32 KiB and 64 retained note receipts. The manager has no general filesystem tool: it accesses only its scoped memory through Codeman, outside the Codex installation and home.
@@ -30,19 +38,23 @@ Useful initial memory:
 
 ```markdown
 # Goals
+
 Deliver small, verified changes. Ask me when priorities conflict.
 
 ## Worker roles
+
 - API worker: backend implementation and backend tests.
 - UI worker: frontend implementation and browser tests.
-Use the actual selected worker IDs from supervisor_workers.
+  Use the actual selected worker IDs from supervisor_workers.
 
 ## Prompt conventions
+
 Give one clear objective, necessary context, constraints and acceptance criteria.
 Read the latest checkpoint before sending another instruction.
 Keep prompts concise; do not repeat entire histories.
 
 ## Usage
+
 Inspect usage and current health before assigning work.
 Distinguish estimates from verified limits; report unknown quota honestly.
 ```
@@ -52,3 +64,11 @@ Memory supplies context, not automatic knowledge or additional permission. Refre
 ## Future Claude managers
 
 The supervisor controller expresses manager authority through dependency interfaces, while the current server integration, restricted launcher and conversation evidence adapter support Codex. A future Claude manager can reuse the scoped MCP operations, launch-bound credentials, worker leases, durable request IDs, assignment and runtime budgets, and cancellation rules. It needs its own restricted launcher and evidence adapter proving exact conversation identity, effective home and configuration, fresh progress, and the absence of pending child work before it becomes eligible. Its effective tool inventory must enforce the same restrictions; an ordinary Claude session cannot be granted the manager role. Owner intent, permission and authentication limits, uncertain delivery and owner-only manual certification retain their vetoes. Existing Claude sessions and their controls remain independent of manager eligibility.
+
+Native folded-paste acknowledgement is currently supported only for owned local automatic input; an owned SSH worker showing a folded composer requires owner attention and does not receive automatic Enter.
+
+Native MCP tool calls are lifecycle evidence, never proof that an owner objective is complete. Current paginated history must contain exact call identity and valid paired start/end timestamps; an unfinished call blocks automatic continuation. A native approval-policy refusal remains paused until a later ordinary owner submission. Unknown tool errors and incomplete legacy MCP end records remain conservative vetoes.
+
+## GitLab merge request context
+
+The owner-configured GitLab connection supports read-only `merge_requests` for a project (optional `state` and `page`) and `merge_request` for a project-local `iid`. These use the existing allowed-project or all-projects grant; a write grant is unnecessary. Lists contain at most 50 requests per page and stop at page 100, with explicit pagination and capacity flags. Returned context includes author, source and target branches, state, merge status, URL, SHA and a description limited to 8 KiB. All repository text is untrusted. A GitLab author identifies a GitLab account; it does not prove which Codeman agent created the change. Agent attribution and handoffs need separately recorded evidence. These operations do not create, approve or merge requests.

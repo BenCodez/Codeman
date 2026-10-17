@@ -94,7 +94,11 @@ beforeEach(async () => {
       expect(records.find((entry) => entry.sessionId === material.sessionId)?.recoveryInputBrokerPending).toBe(
         material.incarnation
       );
-      expect(options).toEqual({ root: '/fixture/private', ownerInitialLaunch: true });
+      expect(options).toEqual({
+        root: '/fixture/private',
+        ownerInitialLaunch: !options.expectedPane,
+        ...(options.expectedPane ? { expectedPane: options.expectedPane } : {}),
+      });
     }
     return {
       status: 'provisioned',
@@ -110,7 +114,7 @@ beforeEach(async () => {
     const record = records.find((entry) => entry.sessionId === request.sessionId)!;
     expect(record.recoveryInputBrokerPending).toBe(request.descriptor.incarnation);
     expect(record.recoveryInputBroker).toBeUndefined();
-    expect(record.pid).toBe(0);
+    expect(record.pid).toBe(record.remoteShellConversion ? 7007 : 0);
     const state: CodexBrokerState = {
       version: 1,
       sessionId: request.sessionId,
@@ -928,3 +932,119 @@ it.each([
     } else if (kind !== 'unknown-remote') expect((await fs.lstat(receipt)).isFile()).toBe(true);
   }
 );
+
+it('converts only the certified replacement pane with durable broker reservation and preserved old shell', async () => {
+  const { manager, options } = fixture();
+  options.codexConfig = { noDaemon: true, resumeSessionId: SID };
+  options.recoveryCodexHome = '/fixture/codex-home';
+  const source: MuxSession = {
+    sessionId: options.sessionId,
+    muxName: `codeman-${options.sessionId.slice(0, 8)}`,
+    mode: 'shell',
+    workingDir: options.workingDir,
+    remote: options.remote,
+    owner: options.owner,
+    createdAt: 1,
+    pid: 7007,
+    attached: true,
+    remoteShellConversion: {
+      phase: 'pending',
+      conversationId: SID,
+      codexHome: '/fixture/codex-home',
+      retainedSessionName: 'codeman-retained-aaaaaaaa',
+    },
+  };
+  manager.registerSession(source);
+  await manager.flushSessionsDurably();
+  const replacementPane = { paneId: '%9', panePid: 9009, status: 1 };
+  const converted = await manager.convertOwnedRemoteShell(options, replacementPane, source);
+  expect(converted).not.toBe(source);
+  expect(converted).toMatchObject({
+    mode: 'codex',
+    recoveryIsolated: true,
+    recoveryCodexHome: '/fixture/codex-home',
+    codexRestoreUncertain: false,
+    remoteShellConversion: { phase: 'pending' },
+    codexRestoreConfig: options.codexConfig,
+  });
+  expect(converted.recoveryInputBroker).toBeDefined();
+  expect(converted.recoveryInputBrokerPending).toBeUndefined();
+  expect(source).toMatchObject({ mode: 'shell', pid: 7007, remoteShellConversion: { phase: 'pending' } });
+  expect(effects.provision.mock.calls[0][3]).toEqual({ planOnly: true, expectedPane: replacementPane });
+  expect(effects.provision.mock.calls[1][3]).toEqual({
+    root: '/fixture/private',
+    ownerInitialLaunch: false,
+    expectedPane: replacementPane,
+  });
+  const commands = [...effects.sync.mock.calls, ...effects.exec.mock.calls].map(([command]) => String(command));
+  expect(commands.some((command) => command.includes('kill-session'))).toBe(false);
+  expect(commands.some((command) => command.includes('respawn-pane') && command.includes('attach'))).toBe(true);
+  // Until main state commits, generic input, creation and reconnect cannot cross this exact attempt.
+  expect(manager.canDeliverCodexOwnerInput(options.sessionId)).toBe(false);
+  expect(await manager.respawnPane({ ...options, remoteAttachOnly: true })).toBeNull();
+  await expect(manager.createSession(options)).rejects.toThrow('requires owner inspection');
+});
+
+it('refuses conversion of a shell without a durable exact identity/home reservation', async () => {
+  const { manager, options } = fixture();
+  options.codexConfig = { noDaemon: true, resumeSessionId: SID };
+  options.recoveryCodexHome = '/fixture/codex-home';
+  const source: MuxSession = {
+    sessionId: options.sessionId,
+    muxName: `codeman-${options.sessionId.slice(0, 8)}`,
+    mode: 'shell',
+    workingDir: options.workingDir,
+    remote: options.remote,
+    owner: options.owner,
+    createdAt: 1,
+    pid: 7007,
+    attached: true,
+  };
+  manager.registerSession(source);
+  await expect(
+    manager.convertOwnedRemoteShell(options, { paneId: '%9', panePid: 9009, status: 1 }, source)
+  ).rejects.toThrow('authority is unavailable');
+  expect(effects.provision).not.toHaveBeenCalled();
+  expect(effects.observe).not.toHaveBeenCalled();
+  expect(manager.getSession(options.sessionId)).toBe(source);
+});
+
+it('retains the exact new reservation without replay when conversion launch evidence is lost', async () => {
+  const { manager, options } = fixture();
+  options.codexConfig = { noDaemon: true, resumeSessionId: SID };
+  options.recoveryCodexHome = '/fixture/codex-home';
+  const source: MuxSession = {
+    sessionId: options.sessionId,
+    muxName: `codeman-${options.sessionId.slice(0, 8)}`,
+    mode: 'shell',
+    workingDir: options.workingDir,
+    remote: options.remote,
+    owner: options.owner,
+    createdAt: 1,
+    pid: 7007,
+    attached: true,
+    remoteShellConversion: {
+      phase: 'pending',
+      conversationId: SID,
+      codexHome: '/fixture/codex-home',
+      retainedSessionName: 'codeman-retained-aaaaaaaa',
+    },
+  };
+  manager.registerSession(source);
+  await manager.flushSessionsDurably();
+  effects.observe.mockResolvedValueOnce({ status: 'unknown' });
+  const pane = { paneId: '%9', panePid: 9009, status: 1 };
+  await expect(manager.convertOwnedRemoteShell(options, pane, source)).rejects.toThrow(
+    'receipt needs owner inspection'
+  );
+  const pending = manager.getSession(options.sessionId)!;
+  expect(pending).not.toBe(source);
+  expect(pending.remoteShellConversion?.phase).toBe('pending');
+  expect(pending.recoveryInputBrokerPending).toBeDefined();
+  expect(pending.recoveryInputBroker).toBeUndefined();
+  expect(source).toMatchObject({ mode: 'shell', pid: 7007 });
+  const calls = effects.provision.mock.calls.length;
+  await expect(manager.convertOwnedRemoteShell(options, pane, source)).rejects.toThrow('authority is unavailable');
+  expect(effects.provision).toHaveBeenCalledTimes(calls);
+  expect(manager.canDeliverCodexOwnerInput(options.sessionId)).toBe(false);
+});

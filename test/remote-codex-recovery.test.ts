@@ -326,6 +326,20 @@ cp.execFileSync=function(file,args,options){
       expect(await input(q.prompt)).toMatchObject({ status: 'sent', submittedAt: expect.any(Number) });
       expect((await f.bytes()).toString()).toBe(q.prompt + '\r');
       await f.marker('bytes', '');
+      // Policy prose is not a singular native quota notice, at both remote
+      // initial admission and the final post-literal composer check.
+      f.env.FIXTURE_SCREEN_PREFIX = 'Consider usage limits and rate limits.\n';
+      expect(await input(q.prompt)).toMatchObject({ status: 'sent' });
+      expect((await f.bytes()).toString()).toBe(q.prompt + '\r');
+      await f.marker('bytes', '');
+      f.env.FIXTURE_SCREEN_PREFIX = '• What would you like me to tell the worker?\n';
+      expect(await input(q.prompt)).toMatchObject({ status: 'sent' });
+      expect((await f.bytes()).toString()).toBe(q.prompt + '\r');
+      await f.marker('bytes', '');
+      f.env.FIXTURE_SCREEN_PREFIX = 'Usage limit reached\n';
+      expect(await input(q.prompt)).toMatchObject({ status: 'not-sent' });
+      expect(await f.bytes()).toHaveLength(0);
+      delete f.env.FIXTURE_SCREEN_PREFIX;
       const delayedPrompt = 'Record the remote send instant before this delayed acknowledgement.';
       await f.marker('enter-delay', '0.4');
       const delayedReceipt = await input(delayedPrompt).then(async (receipt) => {

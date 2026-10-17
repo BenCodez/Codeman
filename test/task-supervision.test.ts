@@ -2674,3 +2674,96 @@ describe('explicit blocked-task resume keeps observing without stale continuatio
     }
   });
 });
+
+describe('missing task identity is not a positive identity change', () => {
+  async function watching() {
+    const f = fixture();
+    await configure(f.controller);
+    await f.controller.resume();
+    const promptHash = f.controller.getStatus().inFlight!.promptHash;
+    f.set({ activity: 'working', reason: 'turn-running', submissionKey: 'accepted', submissionHash: promptHash });
+    await f.controller.refresh();
+    expect(f.controller.getStatus().inFlight).toBeUndefined();
+    f.act.mockClear();
+    f.recover.mockClear();
+    return f;
+  }
+  it('waits through repeated incomplete reads without consuming commands, markers or completion', async () => {
+    const f = await watching();
+    const before = f.controller.getStatus();
+    f.set({ conversationId: undefined, activity: 'unknown', reason: 'identity-unverified', safeToAct: false });
+    f.commands.set(commandHash('npm test'), { startedAt: 10000, completedAt: 10001 });
+    f.marker({
+      key: 'unverified-marker',
+      at: 10001,
+      latestAt: 10001,
+      submissionKey: 'accepted',
+      progress: { outcome: 'completed' },
+    });
+    for (let attempt = 0; attempt < 4; attempt++) await f.controller.refresh();
+    expect(f.controller.getStatus()).toEqual(before);
+    expect(f.act).not.toHaveBeenCalled();
+    expect(f.recover).not.toHaveBeenCalled();
+    f.marker(undefined);
+    f.commands.clear();
+    f.set({ conversationId: id, activity: 'working', reason: 'turn-running' });
+    await f.controller.refresh();
+    expect(f.controller.getStatus().phase).toBe('watching');
+    expect(f.act).not.toHaveBeenCalled();
+    f.controller.stop();
+  });
+  it('blocks immediately on a positively different UUID after an incomplete read', async () => {
+    const f = await watching();
+    f.set({ conversationId: undefined, activity: 'unknown', reason: 'identity-unverified' });
+    await f.controller.refresh();
+    f.set({ conversationId: '22222222-2222-4222-8222-222222222222', activity: 'working', reason: 'turn-running' });
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({
+      phase: 'blocked',
+      reason: 'identity-changed',
+      conversationId: id,
+    });
+    expect(f.act).not.toHaveBeenCalled();
+    f.controller.stop();
+  });
+  it('retains pending delivery without reconciliation and preserves its acceptance timeout', async () => {
+    const f = fixture();
+    await configure(f.controller);
+    await f.controller.resume();
+    const flight = f.controller.getStatus().inFlight!;
+    f.set({
+      conversationId: undefined,
+      activity: 'unknown',
+      reason: 'identity-unverified',
+      submissionHash: flight.promptHash,
+    });
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'watching', inFlight: flight });
+    f.clock(flight.startedAt + 60_000);
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({
+      phase: 'paused',
+      reason: 'acceptance-unverified',
+      inFlight: flight,
+    });
+    expect(f.act).toHaveBeenCalledOnce();
+    f.controller.stop();
+  });
+  it('keeps runtime budgets and subsequent genuine permission vetoes active', async () => {
+    const f = await watching();
+    f.set({ conversationId: undefined, activity: 'unknown', reason: 'identity-unverified' });
+    f.clock(f.controller.getStatus().startedAt! + f.controller.getStatus().config.maxRuntimeMs);
+    await f.controller.refresh();
+    expect(f.controller.getStatus()).toMatchObject({ phase: 'blocked', reason: 'budget-exhausted' });
+    expect(f.act).not.toHaveBeenCalled();
+    f.controller.stop();
+    const g = await watching();
+    g.set({ conversationId: undefined, activity: 'unknown', reason: 'identity-unverified' });
+    await g.controller.refresh();
+    g.set({ conversationId: id, activity: 'paused', reason: 'approval-required' });
+    await g.controller.refresh();
+    expect(g.controller.getStatus()).toMatchObject({ phase: 'paused', reason: 'approval-required' });
+    expect(g.act).not.toHaveBeenCalled();
+    g.controller.stop();
+  });
+});

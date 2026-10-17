@@ -10,6 +10,8 @@ interface Entry {
   readonly key: string;
   readonly isCurrent: () => boolean;
   readonly canOperate: () => boolean;
+  initialized: boolean;
+  toolsDiscovered: boolean;
 }
 const TOKEN = /^codeman-manager-v1\.[a-f0-9]{64}$/;
 const SESSION = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
@@ -39,7 +41,14 @@ export class ManagerCredentialRegistry {
       sessionId: options.sessionId,
       ...(options.owner !== undefined ? { owner: options.owner } : {}),
     });
-    const entry: Entry = { scope, key, isCurrent: options.isCurrent, canOperate: options.canOperate ?? (() => true) };
+    const entry: Entry = {
+      scope,
+      key,
+      isCurrent: options.isCurrent,
+      canOperate: options.canOperate ?? (() => true),
+      initialized: false,
+      toolsDiscovered: false,
+    };
     this.entries.set(key, entry);
     this.scopes.set(scope, entry);
     return {
@@ -82,6 +91,23 @@ export class ManagerCredentialRegistry {
     } catch {
       return false;
     }
+  }
+
+  /** Only validated, authenticated native MCP discovery establishes bridge readiness. */
+  recordInitialization(scope: SupervisorManagerScope): void {
+    if (this.isCurrent(scope)) this.scopes.get(scope)!.initialized = true;
+  }
+
+  recordToolsDiscovery(scope: SupervisorManagerScope): void {
+    if (!this.isCurrent(scope)) return;
+    const entry = this.scopes.get(scope)!;
+    if (entry.initialized) entry.toolsDiscovered = true;
+  }
+
+  hasToolsDiscovery(sessionId: string): boolean {
+    for (const entry of this.entries.values())
+      if (entry.scope.sessionId === sessionId && entry.toolsDiscovered && this.isCurrent(entry.scope)) return true;
+    return false;
   }
 
   revokeSession(sessionId: string): void {

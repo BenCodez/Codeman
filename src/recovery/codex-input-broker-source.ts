@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** @fileoverview Python's standard library owns the child PTY and journals input before forwarding it. */
 export const CODEX_INPUT_BROKER_SOURCE = String.raw`
 import base64, errno, fcntl, hashlib, hmac, json, os, pty, re, select, signal, sys, termios, threading, time, tty
@@ -52,7 +53,7 @@ def files_current(files, own_path, paths=None, missing=None):
     for witness in unique.values():
         if (not isinstance(witness, dict) or set(witness) != {'path', 'dev', 'ino', 'size', 'mtimeMs', 'ctimeMs', 'hash', 'maxBytes'} or
             not isinstance(witness['path'], str) or not os.path.isabs(witness['path']) or
-            type(witness['maxBytes']) is not int or not 0 < witness['maxBytes'] <= 2097152):
+            type(witness['maxBytes']) is not int or not 0 < witness['maxBytes'] <= ${MAX_CODEX_ROLLOUT_BYTES}):
             return False
         if witness['path'] == own_path:
             continue
@@ -366,6 +367,7 @@ def run():
     if original is not None:
         tty.setraw(0, termios.TCSANOW)
     def resize(_signal=None, _frame=None):
+        if master < 0: return
         try:
             size = fcntl.ioctl(0, termios.TIOCGWINSZ, b'\0' * 8)
             fcntl.ioctl(master, termios.TIOCSWINSZ, size)
@@ -408,13 +410,76 @@ def run():
         return child_status is None
     def child_ready():
         return poll_child() and (not sys.platform.startswith('linux') or process_identity(child)[1] not in ('Z', 'X', 'x', 'T', 't'))
+    # A terminal emulator replies to child queries directly on the outer PTY,
+    # outside Codeman's authenticated owner frames. Admit only a bounded exact
+    # protocol reply to a recently observed query; all other raw bytes still taint.
+    terminal_queries = []
+    terminal_tail = b''
+    focus_reporting = False
+    focus_mode_pattern = re.compile(rb'\x1b\[\?1004([hl])')
+    query_pattern = re.compile(rb'\x1b(?:\[(?:(?:[>?]?|0)c|[56]n|\?u|\?(?:2026|2004|1004)\$p)|\](?:10|11|12);\?(?:\x07|\x1b\\))')
+    def track_terminal_queries(output):
+        nonlocal terminal_tail, focus_reporting
+        now = time.monotonic()
+        terminal_queries[:] = [item for item in terminal_queries if item[1] > now]
+        combined = terminal_tail + output
+        for match in focus_mode_pattern.finditer(combined):
+            if match.end() > len(terminal_tail):
+                focus_reporting = match.group(1) == b'h'
+        for match in query_pattern.finditer(combined):
+            if match.end() > len(terminal_tail) and len(terminal_queries) < 32:
+                terminal_queries.append((match.group(), now + 2))
+        terminal_tail = combined[-32:]
+    def terminal_reply_length(expired):
+        if expired: return 0
+        now = time.monotonic()
+        terminal_queries[:] = [item for item in terminal_queries if item[1] > now]
+        # Focus reports are notifications, not owner commands. Admit them only
+        # while this exact child has explicitly enabled DEC mode 1004; disabling
+        # it revokes admission immediately. Partial/other raw input still taints.
+        if focus_reporting:
+            for report in (b'\x1b[I', b'\x1b[O'):
+                if pending.startswith(report): return len(report)
+                if report.startswith(bytes(pending)): return -1
+        if not terminal_queries or not pending.startswith(b'\x1b'): return 0
+        data = bytes(pending[:128])
+        end = None
+        if data.startswith(b'\x1b['):
+            for i in range(2, len(data)):
+                if 0x40 <= data[i] <= 0x7e:
+                    end = i + 1
+                    break
+        elif data.startswith(b'\x1b]'):
+            finish = re.search(rb'\x07|\x1b\\', data[2:])
+            if finish: end = 2 + finish.end()
+        elif len(data) > 1: return 0
+        if end is None:
+            return -1 if len(data) < 128 else 0
+        reply = data[:end]
+        for index, (query, _) in enumerate(terminal_queries):
+            pattern = None
+            if query in (b'\x1b[c', b'\x1b[0c'): pattern = rb'\x1b\[\?[0-9;]{1,48}c'
+            elif query == b'\x1b[>c': pattern = rb'\x1b\[>[0-9;]{1,48}c'
+            elif query == b'\x1b[6n': pattern = rb'\x1b\[[1-9][0-9]{0,4};[1-9][0-9]{0,4}R'
+            elif query == b'\x1b[5n': pattern = rb'\x1b\[0n'
+            elif query == b'\x1b[?u': pattern = rb'\x1b\[\?[0-9]{1,5}u'
+            elif query.startswith(b'\x1b[?'):
+                pattern = re.escape(query[:-2]) + rb';[0-4]\$y'
+            elif query.startswith(b'\x1b]'):
+                pattern = re.escape(query[0:5]) + rb'rgb:[a-fA-F0-9]{1,4}/[a-fA-F0-9]{1,4}/[a-fA-F0-9]{1,4}(?:\x07|\x1b\\)'
+            if pattern and re.fullmatch(pattern, reply):
+                del terminal_queries[index]
+                return end
+        return 0
     def drain_output(ready):
         nonlocal output_open, master_open
         if master in ready and master_open:
             try:
                 output = os.read(master, min(32768, output_limit - len(output_pending)))
                 if not output: master_open = False
-                elif output_open: output_pending.extend(output)
+                elif output_open:
+                    track_terminal_queries(output)
+                    output_pending.extend(output)
             except BlockingIOError:
                 pass
             except OSError as error:
@@ -776,6 +841,16 @@ def run():
     def consume(expired=False):
         nonlocal deadline, writable
         while pending and writable:
+            terminal_length = terminal_reply_length(expired)
+            if terminal_length < 0:
+                deadline = deadline or time.monotonic() + 1
+                break
+            if terminal_length:
+                # Never admit printable input, a replay, or an unsolicited report.
+                forward(bytes(pending[:terminal_length]))
+                del pending[:terminal_length]
+                deadline = None
+                continue
             if expired and PREFIX.startswith(bytes(pending)):
                 reject_control()
                 return

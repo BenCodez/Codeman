@@ -969,6 +969,26 @@ export class TaskController {
       const revision = this.revision;
       const { observation: o, commands, marker } = await this.deps.observe();
       if (this.stopped || revision !== this.revision) return this.getStatus();
+      // An incomplete native read proves neither a new identity nor progress.
+      // Retain the existing identity and poll again without consuming any evidence.
+      if (
+        this.state.conversationId &&
+        o.conversationId === undefined &&
+        o.activity === 'unknown' &&
+        o.reason === 'identity-unverified' &&
+        o.safeToAct === false
+      ) {
+        if (receiptOnly) return this.getStatus();
+        if (this.state.inFlight && this.now() - this.state.inFlight.startedAt >= 60_000) {
+          this.state.phase = 'paused';
+          return this.save('acceptance-unverified');
+        }
+        if (this.runtimeBudgetExpired()) {
+          this.state.phase = 'blocked';
+          return this.save('budget-exhausted');
+        }
+        return this.getStatus();
+      }
       if (this.state.conversationId && o.conversationId !== this.state.conversationId) {
         if (receiptOnly) return this.getStatus();
         this.state.phase = 'blocked';
