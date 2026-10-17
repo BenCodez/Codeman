@@ -9,6 +9,7 @@ import { promisify } from 'node:util';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { parse } from 'smol-toml';
 import { Session } from '../src/session.js';
+import { TmuxManager } from '../src/tmux-manager.js';
 import { WebServer } from '../src/web/server.js';
 import type { MuxSession, TerminalMultiplexer } from '../src/mux-interface.js';
 import {
@@ -802,8 +803,10 @@ async function fixture() {
   const p = await paths();
   vi.stubEnv('CODEMAN_DATA_DIR', join(p.root, 'data'));
   await fs.mkdir(join(p.root, 'data'));
-  let current = true,
-    acknowledged: SupervisorManagerLaunch | undefined;
+  let current = true;
+  const native = Object.create(TmuxManager.prototype) as TmuxManager;
+  const launches = new Map();
+  Reflect.set(native, 'supervisorManagerLaunches', launches);
   const record: MuxSession = {
     sessionId: SID,
     muxName: 'codeman-11111111',
@@ -818,15 +821,17 @@ async function fixture() {
   const respawn = vi.fn(async (options) => {
     expect(options.codexConfig.resumeSessionId).toBe(CID);
     if (!options.ownerLaunchIsCurrent() || !(await options.supervisorManager.confirm())) return null;
-    acknowledged = options.supervisorManager;
     record.pid = 700;
+    record.recoveryInputBroker = CID;
+    launches.set(SID, { profile: options.supervisorManager, record, pid: record.pid, incarnation: CID });
     return 700;
   });
+  Reflect.set(native, 'sessions', new Map([[SID, record]]));
   const mux = {
     inspectPaneForRecovery: vi.fn(async () => ({ dead: false, panePid: record.pid, paneId: '%7', screen: '› ' })),
     respawnPane: respawn,
-    isSupervisorManagerLaunchCurrent: (_id: string, profile: SupervisorManagerLaunch) =>
-      acknowledged === profile && record.pid === 700,
+    isSupervisorManagerLaunchCurrent: native.isSupervisorManagerLaunchCurrent.bind(native),
+    isSupervisorManagerOwnerInputCurrent: native.isSupervisorManagerOwnerInputCurrent.bind(native),
     isAvailable: () => true,
     clearPaneExit: () => {},
   } as unknown as TerminalMultiplexer;

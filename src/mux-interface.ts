@@ -369,6 +369,11 @@ export interface PaneCaptureOptions {
  * - `paneExitsUpdated` () - A pane read finished; ask `getPaneExit()` per session
  */
 export interface TerminalMultiplexer extends EventEmitter {
+  /** Exact launch continuity for owner input only; never automatic manager readiness. */
+  isSupervisorManagerOwnerInputCurrent?(
+    sessionId: string,
+    profile: import('./supervisor/manager-launch.js').SupervisorManagerLaunch
+  ): boolean;
   isSupervisorManagerLaunchCurrent?(
     sessionId: string,
     profile: import('./supervisor/manager-launch.js').SupervisorManagerLaunch

@@ -2017,6 +2017,15 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   >();
 
   isSupervisorManagerLaunchCurrent(sessionId: string, profile: SupervisorManagerLaunch): boolean {
+    return this.hasSupervisorManagerProcessProof(sessionId, profile) && profile.isCurrent();
+  }
+
+  /** Same exact native launch; only a queued owner frame may bridge its own input fence. */
+  isSupervisorManagerOwnerInputCurrent(sessionId: string, profile: SupervisorManagerLaunch): boolean {
+    return this.hasSupervisorManagerProcessProof(sessionId, profile) && profile.isOwnerInputCurrent?.() === true;
+  }
+
+  private hasSupervisorManagerProcessProof(sessionId: string, profile: SupervisorManagerLaunch): boolean {
     const proof = this.supervisorManagerLaunches?.get(sessionId);
     const record = this.sessions.get(sessionId);
     return (
@@ -2026,8 +2035,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       record.pid === proof.pid &&
       record.recoveryInputBroker === proof.incarnation &&
       record.recoveryInputBrokerPending === undefined &&
-      !record.codexRestoreUncertain &&
-      profile.isCurrent()
+      !record.codexRestoreUncertain
     );
   }
 

@@ -2828,7 +2828,7 @@ export class Session extends EventEmitter {
         context.noDaemon &&
         !context.untrackedInput &&
         !context.inputBrokerPending &&
-        this._mux?.isSupervisorManagerLaunchCurrent?.(this.id, profile) === true
+        this._mux?.isSupervisorManagerOwnerInputCurrent?.(this.id, profile) === true
       );
     };
     return Object.assign(current, {

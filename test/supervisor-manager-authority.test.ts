@@ -16,6 +16,7 @@ import { registerSupervisorRoutes } from '../src/web/routes/supervisor-routes.js
 import { createRouteTestHarness } from './routes/_route-test-utils.js';
 import { Session } from '../src/session.js';
 import { TmuxManager } from '../src/tmux-manager.js';
+import * as ManagerCatalog from '../src/supervisor/manager-catalog.js';
 import type { MuxSession, RecoveryMuxDispatchGuard, TerminalMultiplexer } from '../src/mux-interface.js';
 import { TaskController, type TaskDependencies } from '../src/supervision/controller.js';
 import type { TaskState } from '../src/supervision/schema.js';
@@ -618,6 +619,122 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it('prepares and starts through the real WebServer, Session, profile and tmux continuity predicates', async () => {
+    await manager.pause();
+    await managerTask.update({ config: { enabled: false } });
+    observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+    await appendFile(
+      rolloutPath,
+      JSON.stringify({
+        timestamp: new Date(Date.now()).toISOString(),
+        type: 'event_msg',
+        payload: { type: 'task_complete', turn_id: 'manager-turn' },
+      }) + '\n'
+    );
+    vi.spyOn(ManagerCatalog, 'readSupervisorManagerCatalog').mockResolvedValue(
+      JSON.stringify({
+        models: [{ slug: 'owner-model', description: 'fixture', apply_patch_tool_type: null, tool_mode: 'direct' }],
+      })
+    );
+    vi.mocked(managerSession.isSupervisorManagerLaunchCurrent).mockRestore();
+    vi.mocked(managerSession.captureSupervisorManagerLaunchAuthority).mockRestore();
+    vi.mocked(managerSession.confirmSupervisorManagerLaunch).mockRestore();
+    const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
+    const record = Reflect.get(managerSession, '_muxSession') as MuxSession;
+    Reflect.set(managerSession, 'workingDir', fixtureData);
+    record.workingDir = fixtureData;
+    const preparing = vi.spyOn(managerSession, 'prepareSupervisorManager');
+    const native = Object.create(TmuxManager.prototype) as TmuxManager;
+    const launches = new Map();
+    Reflect.set(native, 'supervisorManagerLaunches', launches);
+    Reflect.set(native, 'sessions', new Map([[MANAGER, record]]));
+    Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', native.isSupervisorManagerLaunchCurrent.bind(native));
+    Reflect.set(mux, 'isSupervisorManagerOwnerInputCurrent', native.isSupervisorManagerOwnerInputCurrent.bind(native));
+    let draft = '';
+    const line = (payload: unknown) =>
+      JSON.stringify({ timestamp: new Date(Date.now()).toISOString(), type: 'event_msg', payload }) + '\n';
+    Reflect.set(mux, 'inspectPaneForRecovery', async () => ({
+      dead: false,
+      paneId: '%7',
+      panePid: record.pid,
+      screen: `› ${draft}\n\n  fixture default · /fixture\n  ? for shortcuts\n`,
+    }));
+    Reflect.set(mux, 'respawnPane', async (options: import('../src/mux-interface.js').RespawnPaneOptions) => {
+      expect(options.ownerLaunchIsCurrent?.()).toBe(true);
+      expect(await options.supervisorManager?.confirm()).toBe(true);
+      record.recoveryInputBroker = inputProofs.get(managerSession)!.incarnation;
+      launches.set(MANAGER, {
+        profile: options.supervisorManager,
+        record,
+        pid: record.pid,
+        incarnation: record.recoveryInputBroker,
+      });
+      await appendFile(
+        rolloutPath,
+        line({
+          type: 'thread_settings_applied',
+          thread_id: MANAGER_THREAD,
+          thread_settings: {
+            model: 'owner-model',
+            model_provider_id: 'fixture',
+            approval_policy: 'on-request',
+            approvals_reviewer: 'user',
+            permission_profile: {
+              type: 'managed',
+              file_system: { type: 'restricted', entries: [] },
+              network: 'restricted',
+            },
+            cwd: '/fixture',
+            runtime_workspace_roots: ['/fixture'],
+            collaboration_mode: { mode: 'default', settings: { model: 'owner-model' } },
+            disabled_plugin_ids: [],
+          },
+        })
+      );
+      observation = { ...observation, activity: 'paused', reason: 'approval-required' };
+      return record.pid;
+    });
+    const writes: string[] = [];
+    const previousPty = managerSession.ptyProcess;
+    Reflect.set(managerSession, 'ptyProcess', {
+      write: (input: string) => {
+        writes.push(input);
+        if (input !== '\r') draft = input;
+        else {
+          draft = '';
+          appendFileSync(
+            rolloutPath,
+            line({ type: 'user_message', message: writes[0] }) +
+              line({ type: 'task_started', turn_id: 'setup-turn' }) +
+              line({ type: 'task_complete', turn_id: 'setup-turn' })
+          );
+          observation = {
+            ...observation,
+            activity: 'completed',
+            reason: 'turn-completed',
+            submissionHash: createHash('sha256').update(writes[0]).digest('hex'),
+          };
+        }
+      },
+    });
+    try {
+      const result = await Reflect.get(server, 'setupAndStartSupervisorManager').call(
+        server,
+        managerSession,
+        'full-manager-setup-regression',
+        () => true
+      );
+      expect(preparing).toHaveBeenCalledOnce();
+      expect(await preparing.mock.results[0].value).toBe(true);
+      expect(result.phase).toBe('started');
+      expect(writes).toEqual(['Reply READY only.', '\r']);
+      expect(managerSession.isSupervisorManagerLaunchCurrent()).toBe(true);
+      expect(manager.getStatus().phase).toBe('active');
+    } finally {
+      Reflect.set(managerSession, 'ptyProcess', previousPty);
+    }
+  });
+
   it.each(['completed', 'draft-changed', 'owner-cancelled'] as const)(
     'uses real tagged owner writes for the bounded setup turn: %s',
     async (kind) => {
@@ -665,6 +782,7 @@ describe('manager authority at the real server boundary', () => {
       Reflect.set(managerSession, '_supervisorManagerProfile', profile);
       const mux = Reflect.get(managerSession, '_mux') as TerminalMultiplexer;
       Reflect.set(mux, 'isSupervisorManagerLaunchCurrent', () => true);
+      Reflect.set(mux, 'isSupervisorManagerOwnerInputCurrent', () => true);
       let draft = '',
         current = true;
       Reflect.set(mux, 'inspectPaneForRecovery', async () => ({
