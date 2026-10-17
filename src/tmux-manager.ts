@@ -25,7 +25,12 @@ import { EventEmitter } from 'node:events';
 import { supervisorManagerCommand, type SupervisorManagerLaunch } from './supervisor/manager-launch.js';
 import { createHash, randomUUID } from 'node:crypto';
 import { pruneCodexInputBrokers, type BrokerCleanupReferenceProvider } from './recovery/codex-broker-cleanup.js';
-import { CodexInputBroker, type CodexBrokerProof, type CodexOwnerInputFrame } from './recovery/codex-input-broker.js';
+import {
+  CodexInputBroker,
+  type CodexBrokerProof,
+  type CodexOwnerInputFrame,
+  type BrokerReceipt,
+} from './recovery/codex-input-broker.js';
 import {
   ownedRemoteBrokerCache,
   type OwnedRemoteBrokerScope,
@@ -43,7 +48,7 @@ import { promisify } from 'node:util';
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
-import { existsSync, readFileSync, constants } from 'node:fs';
+import { existsSync, readFileSync, lstatSync, constants } from 'node:fs';
 import { writeFile, rename, mkdir, open, unlink, lstat, link } from 'node:fs/promises';
 import { dirname, join, isAbsolute, posix } from 'node:path';
 import { homedir } from 'node:os';
@@ -52,6 +57,7 @@ import { hasEmptyCodexComposer } from './recovery/codex-classifier.js';
 import {
   normalizeCodexComposerCapture,
   hasAcknowledgedCodexComposerCapture,
+  hasMatchingFoldedCodexPasteCapture,
 } from './recovery/codex-composer-capture.js';
 import {
   dataPath,
@@ -6657,6 +6663,63 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const hasCarriageReturn = input.includes('\r');
       const textPart = input.replace(/\r/g, '').replace(/\n/g, '').trimEnd();
       let composerScreen: string | undefined;
+      // Only an applied literal from THIS dispatch can explain native folding.
+      let appliedLiteral: BrokerReceipt | undefined;
+      let appliedLiteralWitness: PrivateFileWitness | undefined;
+      const refreshAppliedLiteral = async () => {
+        appliedLiteralWitness = undefined;
+        const proof = recoveryGuard?.inputProof;
+        if (!appliedLiteral || !inputBroker || !proof || session.remote) return;
+        const state = await inputBroker.readState();
+        if (
+          !state ||
+          state.closed ||
+          state.tainted ||
+          state.startup.status !== 'started' ||
+          state.incarnation !== proof.incarnation ||
+          state.pid !== proof.brokerPid ||
+          state.childPid !== proof.childPid ||
+          state.brokerStart !== proof.brokerStart ||
+          state.childStart !== proof.childStart ||
+          state.rawGeneration !== proof.rawGeneration ||
+          state.launchDigest !== proof.launchDigest ||
+          state.homeDigest !== proof.homeDigest ||
+          state.counters.auto !== appliedLiteral.counter ||
+          Object.entries(proof.ownerCounters).some(
+            ([channel, counter]) => state.counters[channel as keyof typeof state.counters] !== counter
+          ) ||
+          state.receipts.some((receipt) => receipt.status === 'reserved') ||
+          !state.receipts.some(
+            (receipt) =>
+              receipt.status === 'sent' &&
+              receipt.channel === 'auto' &&
+              receipt.counter === appliedLiteral!.counter &&
+              receipt.nonce === appliedLiteral!.nonce &&
+              receipt.conversationId === appliedLiteral!.conversationId &&
+              receipt.hash === appliedLiteral!.hash
+          )
+        )
+          return;
+        appliedLiteralWitness = state.fileWitness;
+      };
+      const appliedLiteralCurrent = () => {
+        const witness = appliedLiteralWitness;
+        if (!witness) return false;
+        try {
+          const stat = lstatSync(witness.path);
+          return (
+            stat.isFile() &&
+            !stat.isSymbolicLink() &&
+            stat.dev === witness.dev &&
+            stat.ino === witness.ino &&
+            stat.size === witness.size &&
+            stat.mtimeMs === witness.mtimeMs &&
+            stat.ctimeMs === witness.ctimeMs
+          );
+        } catch {
+          return false;
+        }
+      };
       const nativePredicate = livePane
         ? [
             `#{==:#{session_name},${muxName}}`,
@@ -6826,7 +6889,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         }
         const receipt = await inputBroker.receipt(frame.receipt);
         if (receipt === 'not-sent') recoveryGuard?.noteBrokerRefusal?.();
-        if (receipt === 'sent') recoveryGuard?.noteBrokerSent?.();
+        if (receipt === 'sent') {
+          recoveryGuard?.noteBrokerSent?.();
+          if (
+            recoveryGuard &&
+            bracketedPaste &&
+            data === textPart &&
+            frame.receipt.channel === 'auto' &&
+            frame.receipt.conversationId === recoveryGuard.conversationId &&
+            frame.receipt.hash === createHash('sha256').update(brokerData).digest('hex')
+          )
+            appliedLiteral = { ...frame.receipt };
+        }
         return receipt === 'sent';
       };
       let admittedEmptyComposer: string | undefined;
@@ -6875,7 +6949,9 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
             (expected === undefined
               ? hasEmptyCodexComposer(screen)
               : admittedEmptyComposer !== undefined &&
-                hasAcknowledgedCodexComposerCapture(screen, expected, admittedEmptyComposer));
+                (hasAcknowledgedCodexComposerCapture(screen, expected, admittedEmptyComposer) ||
+                  (appliedLiteralCurrent() &&
+                    hasMatchingFoldedCodexPasteCapture(screen, expected, admittedEmptyComposer))));
           if (accepted) {
             composerScreen = screen;
             if (expected === undefined) admittedEmptyComposer = screen;
@@ -6891,9 +6967,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         const started = performance.now();
         const expiry = Number(process.hrtime.bigint() / 1_000_000n) + 2_000;
         if (!recoveryGuard) return { started, expiry };
-        if (!(await prepared()) || !composerCurrent(expected)) return undefined;
+        if (!(await prepared())) return undefined;
+        if (expected !== undefined) await refreshAppliedLiteral();
+        if (!composerCurrent(expected)) return undefined;
         const screen = composerScreen;
         if (!(await prepared())) return undefined;
+        if (expected !== undefined) await refreshAppliedLiteral();
         return { screen, started, expiry };
       };
       const confirmDispatch = (admission: DispatchAdmission | undefined, expected?: string): boolean => {

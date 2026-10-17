@@ -235,6 +235,11 @@ async function fixture(
       pane.screen = `› ${prompt.replace(/\r/g, '').replace(/\n/g, '').trimEnd()}\n  fixture-model high · /tmp\n`;
     return { stdout: '', stderr: '' };
   });
+  // Native styled capture is a single OS boundary; keep it synthetic alongside
+  // the existing command/cursor fixtures and never invoke execFileSync here.
+  vi.spyOn(manager as unknown as { captureRecoveryComposer(): string }, 'captureRecoveryComposer').mockImplementation(
+    () => effects.sync('capture-pane -p -e -t %7')
+  );
   // These would read server credential env/bin locations; the effect boundary under test needs neither.
   vi.spyOn(manager as unknown as { _configureCliEnv(): void }, '_configureCliEnv').mockImplementation(() => {});
   vi.spyOn(
@@ -460,6 +465,12 @@ describe('native recovery pane frame validation', () => {
         if (command.includes('capture-pane')) return { stdout: 'Sanitized ready screen', stderr: '' };
         throw new Error('Unmocked native command forbidden');
       });
+      const capture = vi
+        .spyOn(
+          manager as unknown as { captureRecoveryComposer(pane: string, pid: number): string },
+          'captureRecoveryComposer'
+        )
+        .mockReturnValue('Sanitized ready screen');
       expect(await manager.inspectPaneForRecovery('codeman-aaaaaaaa')).toEqual({
         dead,
         status,
@@ -469,7 +480,9 @@ describe('native recovery pane frame validation', () => {
         paneSignalToken: frame.split('|')[2],
         screen: dead ? null : 'Sanitized ready screen',
       });
-      expect(commands()).toHaveLength(dead ? 1 : 2);
+      expect(commands()).toHaveLength(1);
+      expect(capture).toHaveBeenCalledTimes(dead ? 0 : 1);
+      if (!dead) expect(capture).toHaveBeenCalledWith('%7', 700);
     }
   );
 });
@@ -854,7 +867,8 @@ describe('direct TUI composer edits at automatic input boundaries', () => {
       .map(([command]) => String(command))
       .filter((command) => command.includes('capture-pane'));
     expect(captures).toHaveLength(6);
-    expect(captures.every((command) => command.includes(' -J '))).toBe(true);
+    expect(captures.slice(0, 3).every((command) => command.includes(' -e '))).toBe(true);
+    expect(captures.slice(3).every((command) => command.includes(' -J '))).toBe(true);
     expect(childCommands().filter(isEnter)).toHaveLength(1);
   });
 
@@ -1238,5 +1252,60 @@ describe('native restart final preparation boundary', () => {
     expect(await f.deliver()).toBe('unknown');
     expect(commands().filter((command) => command.includes('respawn-pane'))).toHaveLength(1);
     expect(commands().filter((command) => command.includes('kill-'))).toHaveLength(0);
+  });
+});
+
+describe('native folded literal acknowledgment', () => {
+  it.each([
+    'valid',
+    'unicode',
+    'missing-receipt',
+    'wrong-hash',
+    'owner-input',
+    'later-auto',
+    'wrong-count',
+    'changed-footer',
+    'reserved',
+  ])('binds Enter to our exact applied literal: %s', async (variant) => {
+    const prompt = variant === 'unicode' ? '😀'.repeat(1500) : 'A'.repeat(2894);
+    const f = await fixture('continue', prompt);
+    f.pane.screen = '› \n\n  fixture-model high · /tmp\n';
+    const original = effects.exec.getMockImplementation()!;
+    effects.exec.mockImplementation(async (command: string) => {
+      const result = await original(command);
+      if (isLiteral(command) && acceptedPackets.get(inputPacket(command)!.nonce) === 'sent') {
+        const packet = inputPacket(command)! as NonNullable<ReturnType<typeof inputPacket>> & {
+          counter: number;
+          conversationId: string;
+        };
+        const state = JSON.parse(readFileSync(f.pane.inputProvenance.fileWitness!.path, 'utf8'));
+        state.counters.auto = packet.counter + (variant === 'later-auto' ? 1 : 0);
+        if (variant === 'owner-input') state.counters['owner-pty']++;
+        state.receipts =
+          variant === 'missing-receipt'
+            ? []
+            : [
+                {
+                  channel: packet.channel,
+                  counter: packet.counter,
+                  nonce: packet.nonce,
+                  conversationId: packet.conversationId,
+                  hash:
+                    variant === 'wrong-hash'
+                      ? '0'.repeat(64)
+                      : createHash('sha256').update(Buffer.from(packet.data, 'base64')).digest('hex'),
+                  status: variant === 'reserved' ? 'reserved' : 'sent',
+                },
+              ];
+        updateFakeInputProvenance(f.pane.inputProvenance, {}, () => state);
+        f.pane.screen = `› [Pasted Content ${Array.from(prompt).length + (variant === 'wrong-count' ? 1 : 0)} chars]\n\n  fixture-model ${variant === 'changed-footer' ? 'low' : 'high'} · /tmp\n`;
+      }
+      return result;
+    });
+    const result = await f.deliver();
+    const submitted = childCommands().some(isEnter);
+    expect(submitted).toBe(variant === 'valid' || variant === 'unicode');
+    expect(childCommands().some(isLiteral)).toBe(true);
+    if (submitted) expect(result).toBe('sent');
   });
 });

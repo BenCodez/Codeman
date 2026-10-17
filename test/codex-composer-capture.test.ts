@@ -79,3 +79,19 @@ it('acknowledges exact submitted text against admitted native footer spacing onl
     ack('› Known task\n\n  example-model high · /tmp\n', 'Known task', baseline.replace('› ', '› Existing draft'))
   ).toBe(false);
 });
+
+it('matches only exact native folded codepoint count and the admitted empty footer', async () => {
+  const { hasMatchingFoldedCodexPasteCapture: match } = await import('../src/recovery/codex-composer-capture.js');
+  const baseline = '› \n\n  example-model high · /tmp\n';
+  const expected = 'Do 😀 work';
+  expect(match('› [Pasted Content 9 chars]\n\n  example-model high · /tmp\n', expected, baseline)).toBe(true);
+  for (const row of [
+    '[Pasted Content 10 chars]',
+    '[Pasted content 9 chars]',
+    '[Pasted Content 09 chars]',
+    '[Pasted Content 9 chars] extra',
+  ])
+    expect(match(`› ${row}\n\n  example-model high · /tmp\n`, expected, baseline)).toBe(false);
+  expect(match('› [Pasted Content 9 chars]\n draft\n\n  example-model high · /tmp\n', expected, baseline)).toBe(false);
+  expect(match('› [Pasted Content 9 chars]\n\n  example-model low · /tmp\n', expected, baseline)).toBe(false);
+});

@@ -40,6 +40,15 @@ export function normalizeCodexComposerCapture(ansi: string, cursor: { row: numbe
  * account for native separator rows. Added draft rows or changed chrome refuse.
  */
 export function hasAcknowledgedCodexComposerCapture(screen: string, expected: string, emptyBaseline: string): boolean {
+  return matchesComposerCapture(screen, expected, emptyBaseline, false);
+}
+
+function matchesComposerCapture(
+  screen: string,
+  expected: string,
+  emptyBaseline: string,
+  exactFooter: boolean
+): boolean {
   if (
     Buffer.byteLength(screen) > 65536 ||
     Buffer.byteLength(emptyBaseline) > 65536 ||
@@ -48,7 +57,7 @@ export function hasAcknowledgedCodexComposerCapture(screen: string, expected: st
   )
     return false;
   if (!hasEmptyCodexComposer(emptyBaseline)) return false;
-  if (hasCodexComposerText(screen, expected)) return true;
+  if (!exactFooter && hasCodexComposerText(screen, expected)) return true;
   const parts = (capture: string) => {
     const rows = capture.split('\n');
     while (rows.length && !rows[rows.length - 1].trim()) rows.pop();
@@ -70,4 +79,12 @@ export function hasAcknowledgedCodexComposerCapture(screen: string, expected: st
     baseline.footer.length > 0 &&
     JSON.stringify(actual.footer) === JSON.stringify(baseline.footer)
   );
+}
+
+/** Structural native folded-paste match only. Callers must separately prove their
+ * own exact applied literal receipt and unchanged input authority before Enter.
+ */
+export function hasMatchingFoldedCodexPasteCapture(screen: string, expected: string, emptyBaseline: string): boolean {
+  if (!expected || Buffer.byteLength(expected) > 65536 || /[\r\n]/.test(expected)) return false;
+  return matchesComposerCapture(screen, `[Pasted Content ${Array.from(expected).length} chars]`, emptyBaseline, true);
 }
