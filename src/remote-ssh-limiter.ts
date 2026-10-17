@@ -1,7 +1,9 @@
 /**
  * @fileoverview Global concurrency limiter for the short-lived `ssh` children that
  * remote-case file access spawns (`src/remote-files.ts`: the realpath+stat probe and
- * the buffered text read).
+ * the buffered text read). A remote session's full-history load reads its scrollback
+ * from the remote tmux through the same pool (`src/remote-pane-history.ts`), with a
+ * bounded wait (`maxWaitMs`) because it has the local capture to fall back on.
  *
  * Two paths can fan those out without a human behind each one:
  *
@@ -93,7 +95,15 @@ export function getRemoteSshLimit(): number {
   return MAX_CONCURRENT_REMOTE_SSH;
 }
 
-function acquire(admission?: RemoteSshAdmission): Promise<void> {
+/** A bounded optional wait for callers with a cheaper fallback than queued SSH. */
+export class RemoteSshSlotTimeoutError extends Error {
+  constructor(maxWaitMs: number) {
+    super(`No remote ssh slot within ${maxWaitMs} ms`);
+    this.name = 'RemoteSshSlotTimeoutError';
+  }
+}
+
+function acquire(admission?: RemoteSshAdmission, maxWaitMs?: number): Promise<void> {
   const failure = admissionFailure(admission);
   if (failure) return Promise.reject(failure);
   if (active < MAX_CONCURRENT_REMOTE_SSH) {
@@ -102,10 +112,21 @@ function acquire(admission?: RemoteSshAdmission): Promise<void> {
   }
   return new Promise<void>((resolve, reject) => {
     let settled = false;
+    const waitUntil =
+      maxWaitMs === undefined
+        ? undefined
+        : performance.now() + (Number.isFinite(maxWaitMs) ? Math.max(0, maxWaitMs) : 0);
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const finish = (failure?: RemoteSshAdmissionError) => {
+    let waitTimer: ReturnType<typeof setTimeout> | undefined;
+    const queuedFailure = () =>
+      admissionFailure(admission) ??
+      (waitUntil !== undefined && performance.now() >= waitUntil
+        ? new RemoteSshSlotTimeoutError(maxWaitMs!)
+        : undefined);
+    const finish = (failure?: RemoteSshAdmissionError | RemoteSshSlotTimeoutError) => {
       settled = true;
       if (timer) clearTimeout(timer);
+      if (waitTimer) clearTimeout(waitTimer);
       const index = waiters.indexOf(grant);
       if (index !== -1) waiters.splice(index, 1);
       if (failure) reject(failure);
@@ -113,22 +134,30 @@ function acquire(admission?: RemoteSshAdmission): Promise<void> {
     };
     const grant = () => {
       if (settled) return false;
-      const failure = admissionFailure(admission);
+      const failure = queuedFailure();
       finish(failure);
       return !failure;
     };
     const check = () => {
-      if (settled || !admission) return;
-      const failure = admissionFailure(admission);
+      if (settled) return;
+      const failure = queuedFailure();
       if (failure) finish(failure);
-      else
-        timer = setTimeout(
-          check,
-          Math.min(admission.isCurrent ? 50 : Infinity, Math.ceil(admission.deadline - performance.now()))
+      else {
+        const now = performance.now();
+        const delay = Math.min(
+          admission?.isCurrent ? 50 : Infinity,
+          admission ? Math.ceil(admission.deadline - now) : Infinity
         );
+        if (Number.isFinite(delay)) timer = setTimeout(check, Math.max(0, delay));
+      }
     };
     waiters.push(grant);
-    if (admission) check();
+    if (maxWaitMs !== undefined)
+      waitTimer = setTimeout(
+        () => finish(admissionFailure(admission) ?? new RemoteSshSlotTimeoutError(maxWaitMs)),
+        Number.isFinite(maxWaitMs) ? Math.max(0, maxWaitMs) : 0
+      );
+    if (admission || maxWaitMs !== undefined) check();
   });
 }
 
@@ -147,9 +176,13 @@ export type RetainRemoteSshSlot = (closed: Promise<unknown>) => void;
 /** Run `task` once an ssh slot is free, retaining any registered child lifetimes. */
 export async function runWithRemoteSshLimit<T>(
   task: (retain: RetainRemoteSshSlot) => Promise<T>,
-  admission?: RemoteSshAdmission
+  options?: Partial<RemoteSshAdmission> & { maxWaitMs?: number }
 ): Promise<T> {
-  await acquire(admission);
+  const admission: RemoteSshAdmission | undefined =
+    options && ('deadline' in options || 'isCurrent' in options)
+      ? { deadline: options.deadline ?? NaN, isCurrent: options.isCurrent }
+      : undefined;
+  await acquire(admission, options?.maxWaitMs);
   const retained: Promise<unknown>[] = [];
   const retain: RetainRemoteSshSlot = (closed) => {
     retained.push(Promise.resolve(closed).catch(() => {}));

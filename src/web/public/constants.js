@@ -116,6 +116,21 @@ const MAX_NOTIFICATION_DURATION_MS = 300000; // Longest configurable toast / bro
 const THROTTLE_DELAY_MS = 100;              // General UI throttle delay
 const TERMINAL_CHUNK_SIZE = 32 * 1024;      // 32KB chunks for terminal buffer loading
 const TERMINAL_TAIL_SIZE = 1024 * 1024;     // 1MB tail for initial load (more scrollback on tab switch)
+// A shell's automatic loads (tab select, drop recovery, a tile's load) read
+// tmux's RENDERED history, never the raw byte recording: that recording holds
+// full-screen repaints (an ssh'd tmux, less, a TUI) drawn for the pane size of
+// the moment, and replayed into a terminal of another height each repaint
+// scrolls its top row into scrollback, so one line shows up dozens of times.
+// `lines=` bounds the synchronous capture-pane (~8 ms per 1000 lines measured,
+// so ~0.1 s here); the server reports a cut as 'tail', and scroll-to-top pulls
+// the older lines as before. `alt=recording`: a pane in the alternate screen (a
+// nested tmux, as in remote SSH and Docker cases, but also vim or less while
+// open) gains no tmux history, so the server loads it the old way, visible
+// frame over the tailed byte recording.
+// A grid tile appends its own `lines=` to SHELL_LOAD_BASE_QUERY.
+const SHELL_LOAD_HISTORY_LINES = 10000;
+const SHELL_LOAD_BASE_QUERY = `full=1&tail=${TERMINAL_TAIL_SIZE}&alt=recording`;
+const SHELL_LOAD_QUERY = `${SHELL_LOAD_BASE_QUERY}&lines=${SHELL_LOAD_HISTORY_LINES}`;
 const SYNC_WAIT_TIMEOUT_MS = 50;            // Wait timeout for terminal sync
 const STATS_POLLING_INTERVAL_MS = 2000;     // System stats polling
 const TUI_REDRAW_SETTLE_MS = 400;           // Grace for a TUI to redraw after a real resize, before fetching its buffer
@@ -707,6 +722,45 @@ function computeConnectionLossUi(input) {
       'If you reach Codeman over Tailscale or a VPN, check that it is connected.',
     retryInSec,
   };
+}
+
+// Session Options → Respawn → "Prompt cache": one sentence of the main
+// conversation's cache state as Claude Code reports it on the statusline
+// (`session.promptCache`, v2.1.251+). A clock time rather than a countdown
+// because the row refreshes on SSE, not on a timer, and a countdown would sit
+// stale between turns. Pure: no DOM, `now` is passed in. `statusLine` is the
+// session's `statusLineExporter`: a launch without the exporter never reports, so
+// it says why instead of "not reported yet" forever.
+const PROMPT_CACHE_NOT_COLLECTED = {
+  'collection-off':
+    'Not collected: Plan Usage was off when this session started. Turn it on in App Settings; sessions started after that report it.',
+  'workspace-statusline':
+    "Not collected: this workspace's .claude/settings.local.json sets its own statusLine, which Codeman never replaces.",
+  remote: 'Not collected for remote and Docker sessions.',
+};
+function formatPromptCacheStatus(cache, now, statusLine) {
+  if (PROMPT_CACHE_NOT_COLLECTED[statusLine]) return PROMPT_CACHE_NOT_COLLECTED[statusLine];
+  if (!cache || typeof cache.warm !== 'boolean') {
+    return 'Not reported yet. Claude Code 2.1.251 or newer reports it after the first response.';
+  }
+  const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const kTokens = (n) => (n >= 1000 ? `${Math.round(n / 1000)}k` : `${n}`);
+  const stake = cache.recacheTokensIfCold;
+  const tokens = Number.isFinite(stake) && stake > 0 ? kTokens(stake) : null;
+  const parts = [];
+  if (cache.warm && Number.isFinite(cache.expiresAt) && cache.expiresAt > now) {
+    const ttl = cache.ttl ? ` (${cache.ttl} cache)` : '';
+    parts.push(`Warm until ${clock(cache.expiresAt)}${ttl}.`);
+    if (tokens) parts.push(`About ${tokens} tokens would be re-cached if it goes cold.`);
+  } else {
+    parts.push(tokens ? `Cold. The next turn re-caches about ${tokens} tokens.` : 'Cold.');
+  }
+  // A compaction or a tool-result clearing leaves no re-cache stake to show until the next
+  // request; naming when it happened explains the gap. Never an alert.
+  if (Number.isFinite(cache.compactedAt)) parts.push(`Context compacted at ${clock(cache.compactedAt)}.`);
+  if (Number.isFinite(cache.hitRatio)) parts.push(`${Math.round(cache.hitRatio * 100)}% cache hit rate.`);
+  if (cache.lastMissCauses && cache.lastMissCauses.length) parts.push(`Last miss: ${cache.lastMissCauses.join(', ')}.`);
+  return parts.join(' ');
 }
 
 // SSE staleness policy: is this stream a zombie?
@@ -1460,6 +1514,9 @@ if (typeof window !== 'undefined') {
     compute: computeSseStale,
     TIMEOUT_MS: SSE_STALE_TIMEOUT_MS,
   };
+  window.CodemanPromptCache = {
+    format: formatPromptCacheStatus,
+  };
   window.CodemanSessionOrder = {
     RANK: SESSION_ACTIVITY_RANK,
     anchor: sessionActivityAnchor,
@@ -1520,6 +1577,15 @@ function scheduleBackground(fn) {
 // DEC mode 2026 marker stripping — xterm.js 6.0 handles sync natively,
 // but server-sent terminal buffers may still contain markers from Claude CLI.
 const DEC_SYNC_STRIP_RE = /\x1b\[\?2026[hl]/g;
+
+// OSC 52 clipboard writes stripping — a replay re-feeds the raw byte history, and
+// xterm parses it after chunkedTerminalWrite has already released the load
+// gate, so an OSC 52 left in would re-copy old text on every tab switch. The
+// 8-bit C1 forms (OSC \x9d, ST \x9c) too: xterm.js still parses those.
+const OSC52_STRIP_RE = /(?:\x1b\]|\x9d)52;[^\x07\x1b\x9c]*(?:\x07|\x1b\\|\x9c)/g;
+// The same OSC 52 text arriving again within this window is one copy delivered
+// several ways (direct, tmux load-buffer -w, tmux set-clipboard forwarding).
+const OSC52_DEDUPE_MS = 1000;
 
 // Built-in respawn configuration presets
 const BUILTIN_RESPAWN_PRESETS = [
@@ -1648,6 +1714,7 @@ const SSE_EVENTS = {
   SESSION_STATUS_TELEMETRY: 'session:statusTelemetry',
   SESSION_RECOVERY: 'session:recovery',
   SESSION_TASK: 'session:task',
+  SESSION_PROMPT_CACHE: 'session:promptCache',
 
   // Scheduled runs
   SCHEDULED_CREATED: 'scheduled:created',
@@ -1876,7 +1943,10 @@ function escapeHtml(text) {
 function formatHistoryBytes(bytes) {
   const n = typeof bytes === 'number' && isFinite(bytes) && bytes > 0 ? bytes : 0;
   if (n < 1024) return 'less than 1 KB';
-  if (n < 1024 * 1024) return `${Math.round(n / 1024)} KB`;
+  // Switch on the ROUNDED value: a 1 MiB tail cut back to a line boundary is
+  // just under 1 MiB and used to print as "1024 KB".
+  const kb = Math.round(n / 1024);
+  if (kb < 1024) return `${kb} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
@@ -1890,12 +1960,27 @@ function formatHistoryBytes(bytes) {
  *   - atCeiling:   the FULL capture itself hit the byte ceiling
  *   - exhausted:   a full pull was refused as a downgrade, so this is all there is
  *
+ * ⚠️ `truncated` measures the server's BYTE stream, not history a pull can
+ * return. `paneHistoryLines` (tmux `#{history_size}`) is the latter: 0 means the
+ * pane keeps no scrollback at all (a fullscreen CLI in the alternate screen,
+ * whose transcript lives in the CLI and is scrolled there), so the bytes a tail
+ * cut dropped are old repaint frames that `full=1` cannot bring back. Measured
+ * on live fullscreen claude panes: "4.8 MB more" was ~33 copies of one frame,
+ * and the button only ever ended in the downgrade refusal. Nothing to offer,
+ * nothing to say. Absent means unknown and keeps the byte-based behaviour.
+ *
  * @param {{truncated?: boolean, reason?: string|null, source?: string|null,
- *          fullSize?: number, retainedBytes?: number, exhausted?: boolean}} state
+ *          fullSize?: number, retainedBytes?: number, exhausted?: boolean,
+ *          paneHistoryLines?: number|null, historyLinesCut?: boolean}} state
  * @returns {{visible: boolean, message: string, canLoadMore: boolean}}
  */
 function computeHistoryTruncationNotice(state = {}) {
   if (!state.truncated) return { visible: false, message: '', canLoadMore: false };
+  const historyLines =
+    typeof state.paneHistoryLines === 'number' && Number.isFinite(state.paneHistoryLines)
+      ? Math.max(0, state.paneHistoryLines)
+      : null;
+  if (historyLines === 0) return { visible: false, message: '', canLoadMore: false };
 
   const retained = Math.max(0, state.retainedBytes || 0);
   const dropped = Math.max(0, (state.fullSize || 0) - retained);
@@ -1918,9 +2003,22 @@ function computeHistoryTruncationNotice(state = {}) {
       canLoadMore: false,
     };
   }
+  // Name what a pull can actually return when the server said: the byte gap
+  // counts repaints and redraw bloat, and overstates it many times over.
+  // Without that count, a `lines=`-bounded capture is cut by tmux before any
+  // bytes are counted, so its fullSize is the window itself and the remainder's
+  // size is unknown: say that more exists without inventing an amount. That
+  // holds even when `tail` also cut bytes off the window (`dropped`), since tmux
+  // still holds more beyond it (`historyLinesCut`, set by the server).
+  const remainder =
+    dropped > 0 && !state.historyLinesCut ? `${formatHistoryBytes(dropped)} more` : 'Earlier output';
+  const more =
+    historyLines !== null
+      ? `${historyLines.toLocaleString('en-US')} ${historyLines === 1 ? 'line of scrollback is' : 'lines of scrollback are'} retained.`
+      : `${remainder} may still be retained.`;
   return {
     visible: true,
-    message: `Showing the most recent ${shown} of this session. ${formatHistoryBytes(dropped)} more may still be retained.`,
+    message: `Showing the most recent ${shown} of this session. ${more}`,
     canLoadMore: true,
   };
 }
@@ -1965,7 +2063,7 @@ function computeRewriteScrollLine(input) {
  * a `/g` regex, so {@link absoluteFilePathPattern} mints a fresh one per call.
  */
 const FILE_PATH_LINK_PATTERN =
-  /(\/(?:home|Users|tmp|var|private|opt|mnt|srv|media|data|workspace)\/[^\s"'<>|;&\n\x00-\x1f]*\.(?:log|txt|json|md|ya?ml|csv|xml|sh|py|tsx|ts|jsx|js|mjs|cjs|css|html|toml|ini|sql|png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf|docx|pptx|xlsx|mp4|webm|mov|mp3|wav))\b/g;
+  /(\/(?:home|Users|tmp|var|private|opt|mnt|srv|media|data|workspace)\/[^\s"'<>|;&\n\x00-\x1f]*\.(?:log|txt|json|markdown|md|ya?ml|csv|tsv|xml|sh|py|tsx|ts|jsx|js|mjs|cjs|css|html?|toml|ini|sql|png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf|docx|pptx|xlsx|zip|mp4|webm|mov|m4v|ogv|mp3|wav))\b/g;
 
 /** A fresh, zero-state instance of {@link FILE_PATH_LINK_PATTERN}. */
 function absoluteFilePathPattern() {
@@ -1977,19 +2075,173 @@ function absoluteFilePathPattern() {
  * points at goes to the tail/log viewer, which is the right home for a growing
  * text file and the wrong one for bytes (tailing a PNG shows binary noise).
  *
+ * Markdown is here too (owner decision 2026-10-13): an agent's `.md` is a
+ * document to read, so the preview renders it (its MD pill gives the source)
+ * instead of the log viewer streaming it as raw text. Other text (.log, .txt,
+ * .json, code) keeps the log viewer, which follows a file still being written.
+ *
  * The media entries mirror VIDEO_ATTACHMENT_EXTENSIONS/AUDIO_ATTACHMENT_EXTENSIONS
  * (src/attachment-registry.ts, the single source) — they diverged once and an
  * in-workspace `.m4a` opened as binary noise in the log viewer while the same
  * file in /tmp played fine. test/media-extension-parity.test.ts pins the sync.
  */
 const FILE_PREVIEW_EXTENSIONS = new Set(
-  ('png jpg jpeg gif webp avif bmp ico svg pdf docx pptx xlsx mp4 webm mov m4v ogv mp3 wav ogg oga m4a aac flac opus').split(' ')
+  ('png jpg jpeg gif webp avif bmp ico svg pdf docx pptx xlsx mp4 webm mov m4v ogv mp3 wav ogg oga m4a aac flac opus md markdown').split(' ')
 );
 
 /** Whether a path's extension is one {@link FILE_PREVIEW_EXTENSIONS} covers. */
 function previewsInFileViewer(filePath) {
   const ext = String(filePath || '').split('.').pop().toLowerCase();
   return FILE_PREVIEW_EXTENSIONS.has(ext);
+}
+
+/**
+ * Home-relative and relative file paths: `~/repos/x/garage.png` (how Claude Code
+ * echoes an attached image), `builds/captures/shot.png`, `./a.md`, `../b.json`,
+ * or a bare `look_montage.png`. Same extension list and body as
+ * {@link FILE_PATH_LINK_PATTERN} (test/link-provider-regex.test.ts pins the two
+ * equal).
+ *
+ * Without a known root to anchor on, the START is what has to be unambiguous:
+ * group 1 is the boundary in front of the path (line start, whitespace, a quote,
+ * an opening bracket, `=`, `,`, `>`), so a match can never begin in the middle of
+ * a word, of an absolute path (`/nix/store/x.png` is not `nix/store/x.png`) or of
+ * a URL. The path itself is group 2. Its first character is never `/`: absolute
+ * paths belong to the rooted pattern, which deliberately leaves `/etc` out. A
+ * token containing `://` is a URL, never a path. Brackets, `=` and `,` end a
+ * relative path (unlike a rooted one): `(garage.png)` and `OUT=shots/a.png` link
+ * the file, not the punctuation around it.
+ *
+ * ⚠ Like its sibling, never share an instance (`lastIndex`): use
+ * {@link findFilePathLinks}.
+ */
+const RELATIVE_FILE_PATH_LINK_PATTERN =
+  /(^|[\s"'`(\[{<>=,])((?![^\s"'`<>|;&()[\]{}=,\n\x00-\x1f]*:\/\/)(?:~\/|[^\s"'`<>|;&()[\]{}=,\/~\n\x00-\x1f])[^\s"'`<>|;&()[\]{}=,\n\x00-\x1f]*\.(?:log|txt|json|markdown|md|ya?ml|csv|tsv|xml|sh|py|tsx|ts|jsx|js|mjs|cjs|css|html?|toml|ini|sql|png|jpe?g|gif|webp|avif|bmp|ico|svg|pdf|docx|pptx|xlsx|zip|mp4|webm|mov|m4v|ogv|mp3|wav))\b/g;
+
+/** The `(?:log|txt|…)` extension group, read off the rooted pattern so it cannot drift. */
+const FILE_LINK_EXTENSION_GROUP = /\\\.(\(\?:[^()]*\))\)\\b$/.exec(FILE_PATH_LINK_PATTERN.source)[1];
+
+/**
+ * Every linkable file path in `text`, in order: absolute (rooted) paths first,
+ * then `~/` and relative ones, then folder paths — each only where it overlaps
+ * neither an earlier one nor a URL.
+ *
+ * The one entry point for both consumers (terminal link provider, response
+ * viewer), so a path form is clickable in both or in neither.
+ *
+ * @param {string} text
+ * @returns {Array<{path: string, index: number, folder?: true}>} `index` is where `path` starts in
+ *   `text`; `folder` marks a folder path (folder grid) rather than a file.
+ */
+function findFilePathLinks(text) {
+  const value = String(text || '');
+  const found = [];
+  const overlaps = (index, length) => found.some((f) => index < f.index + f.path.length && f.index < index + length);
+  // Web URLs are never cut into a path: `https://x.io/a/home/b.png` and
+  // `?img=b.png` belong to the URL link, not to a second, overlapping file link.
+  // (`file:///home/x.png` is not one of them: its path is the file.)
+  const urls = [];
+  const urlPattern = /\bhttps?:\/\/\S+/gi;
+  let match;
+  while ((match = urlPattern.exec(value)) !== null) urls.push({ index: match.index, path: match[0] });
+  const inUrl = (index, length) => urls.some((u) => index < u.index + u.path.length && u.index < index + length);
+
+  const absolute = absoluteFilePathPattern();
+  while ((match = absolute.exec(value)) !== null) {
+    if (!inUrl(match.index, match[1].length)) found.push({ path: match[1], index: match.index });
+  }
+  const relative = new RegExp(RELATIVE_FILE_PATH_LINK_PATTERN.source, 'g');
+  while ((match = relative.exec(value)) !== null) {
+    const path = match[2];
+    const index = match.index + match[1].length;
+    if (overlaps(index, path.length) || inUrl(index, path.length)) continue;
+    found.push({ path, index });
+  }
+  const folders = new RegExp(FOLDER_PATH_LINK_PATTERN.source, 'g');
+  while ((match = folders.exec(value)) !== null) {
+    const path = folderLinkPath(match[2]);
+    const index = match.index + match[1].length;
+    if (!path || overlaps(index, path.length) || inUrl(index, path.length)) continue;
+    found.push({ path, index, folder: true });
+  }
+  return found.sort((a, b) => a.index - b.index);
+}
+
+/**
+ * Folder paths, for the folder grid: rooted like {@link FILE_PATH_LINK_PATTERN}
+ * (`/mnt/raid1/neon_getaway/styleframes`), `~/renders`, or relative with a
+ * trailing slash (`builds/captures/`). Same boundary in front as the relative
+ * file pattern (group 1), the candidate itself is group 2 and goes through
+ * {@link folderLinkPath}, which decides whether it reads as a folder at all.
+ * File links are found first and win any overlap. A folder path ends at `:`,
+ * which is also a boundary in front: `PATH=/a/bin:/b/bin` is two candidates, and
+ * the `://` lookahead stops at the next colon instead of rescanning the token from
+ * every one (quadratic on `a:a:a:…//`).
+ *
+ * ⚠ Like its siblings, never share an instance (`lastIndex`): use
+ * {@link findFilePathLinks}.
+ */
+const FOLDER_PATH_LINK_PATTERN =
+  /(^|[\s"'`(\[{<>=,:])((?:\/(?:home|Users|tmp|var|private|opt|mnt|srv|media|data|workspace)\/|~\/|(?![^\s"'`<>|;&()[\]{}=,:\n\x00-\x1f]*:\/\/)[^\s"'`<>|;&()[\]{}=,:\/~\n\x00-\x1f])[^\s"'`<>|;&()[\]{}=,:\n\x00-\x1f]*)/g;
+
+/**
+ * A {@link FOLDER_PATH_LINK_PATTERN} candidate as a folder link, or null.
+ *
+ * Sentence punctuation after the path is not part of it. A path ending in `/` is
+ * a folder; otherwise only a rooted or `~/` path whose last segment has no
+ * extension (`.cache` and `styleframes` do, `a.rs` does not) — a relative word
+ * without a slash at the end is prose, not a folder.
+ */
+function folderLinkPath(candidate) {
+  // `$` and `#` too: a shell prompt (`user@host:~/proj$ `, `root@c:/app# `) ends
+  // its cwd with one. A folder whose name really ends in one links one short.
+  const path = String(candidate || '').replace(/[.,:;!?'"$#]+$/, '');
+  if (!path || path === '~/' || /^\/[^/]+\/$/.test(path)) return null;
+  if (path.endsWith('/')) return /[^/.]/.test(path) ? path : null;
+  if (!path.startsWith('/') && !path.startsWith('~/')) return null;
+  const last = path.slice(path.lastIndexOf('/') + 1);
+  return /^\.?[^.]+$/.test(last) ? path : null;
+}
+
+/**
+ * Where a clicked path points, as the preview routes need it.
+ *
+ * Absolute and `~/` paths pass through unchanged — `~` is the home of the
+ * session's HOST, which only the server knows (a remote case's home is on the
+ * remote machine), so the server expands it. A relative path is resolved
+ * against the session's working directory, `.` and `..` collapsed, so a
+ * `../other/x.png` ends up outside the workspace and routes like any other
+ * external path. Without a working directory it is returned as is.
+ *
+ * @param {string} filePath
+ * @param {string} [workingDir]
+ * @returns {string}
+ */
+function resolveLinkedFilePath(filePath, workingDir) {
+  const path = String(filePath || '');
+  if (!path || path.startsWith('/') || path.startsWith('~/') || !workingDir) return path;
+  const parts = [];
+  for (const part of `${workingDir}/${path}`.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') parts.pop();
+    else parts.push(part);
+  }
+  return `/${parts.join('/')}`;
+}
+
+/**
+ * Extensions the file preview renders as a PAGE, from the sandboxed
+ * `/html-view/<cap>/` route (src/web/routes/html-view-routes.ts, whose
+ * HTML_VIEW_EXTENSIONS this mirrors; test/file-preview-html-page.test.ts pins
+ * the two equal). The terminal sends a click on one to the preview, never to
+ * the log viewer, and the preview renders it with a Page pill back to source.
+ */
+const HTML_PAGE_EXTENSIONS = new Set(['html', 'htm']);
+
+/** Whether a path names a file the preview renders as a page ({@link HTML_PAGE_EXTENSIONS}). */
+function rendersAsPage(filePath) {
+  const ext = String(filePath || '').split('.').pop().toLowerCase();
+  return HTML_PAGE_EXTENSIONS.has(ext);
 }
 
 
@@ -2094,6 +2346,134 @@ function terminalLogicalLine(buffer, row, cols, maxRows) {
   };
 
   return { startRow, endRow, text, offsetToCell, cellToOffset };
+}
+
+/** Roots of {@link FILE_PATH_LINK_PATTERN}, read off its source (`home|Users|…`). */
+const FILE_LINK_ROOT_GROUP = /^\(\\\/\(\?:([^()]*)\)/.exec(FILE_PATH_LINK_PATTERN.source)[1];
+const PATH_TOKEN_ENDS_WITH_EXTENSION = new RegExp(`\\.${FILE_LINK_EXTENSION_GROUP}$`);
+const PATH_TOKEN_HAS_EXTENSION = new RegExp(`\\.${FILE_LINK_EXTENSION_GROUP}\\b`);
+const PATH_TOKEN_STARTS_NEW_PATH = new RegExp(`^(?:~\\/|\\/(?:${FILE_LINK_ROOT_GROUP})\\/)`);
+/** A relative head that names its own location (`./a`, `../a`) is an entry of its own. */
+const PATH_TOKEN_STARTS_EXPLICIT_RELATIVE = /^\.{1,2}\//;
+/** First directory of a path, a leading `/` or `./` ignored: `src` for `src/a.ts` and `/src/a.ts`. */
+const pathFirstSegment = (path) => path.replace(/^(?:\.?\/)+/, '').split('/')[0];
+
+/**
+ * Whether the line `nextText` carries on a file path `prevText` broke off.
+ *
+ * Answers `'join'` when the path ends (reaches a known extension) on the next
+ * line, `'chain'` when the next line is nothing but more of the path (a path
+ * spanning three or more lines; only worth keeping once a later line ends it),
+ * and `null` otherwise. The broken-off token must already look like a path in
+ * progress: it contains a `/`, ends on a path character and does not yet end
+ * on an extension. A next line that opens a NEW path is never glued on: a rooted
+ * one (`/home/…`, `~/…`), `./…`/`../…`, or a relative one that opens on the same
+ * top directory the broken token did (the next entry of a listing).
+ */
+function pathContinuation(prevText, nextText) {
+  const tail = /[^\s"'<>|;&]+$/.exec(String(prevText || '').replace(/\s+$/, ''))?.[0] || '';
+  if (!tail.includes('/') || !/[\w\-.~+@%/]$/.test(tail) || PATH_TOKEN_ENDS_WITH_EXTENSION.test(tail)) return null;
+  const next = String(nextText || '').replace(/^\s+/, '');
+  const head = /^[^\s"'<>|;&]+/.exec(next)?.[0] || '';
+  if (!head || PATH_TOKEN_STARTS_NEW_PATH.test(head) || PATH_TOKEN_STARTS_EXPLICIT_RELATIVE.test(head)) return null;
+  // A listing (`git ls-files`, `find`, `ls -R`) puts one path per row, so `src/components`
+  // followed by `src/index.ts` is two entries, not one path broken after `src/components`.
+  // A wrapped path continues INSIDE a name: its next row does not open on the same top directory.
+  if (head.includes('/') && pathFirstSegment(head) === pathFirstSegment(tail)) return null;
+  if (PATH_TOKEN_HAS_EXTENSION.test(head)) return 'join';
+  return head === next.replace(/\s+$/, '') ? 'chain' : null;
+}
+
+/**
+ * {@link terminalLogicalLine}, extended across the line breaks a program puts
+ * INSIDE a file path. Used by the link provider only; touch selection keeps the
+ * plain logical line.
+ *
+ * Claude Code wraps its tool output itself, a few columns short of the terminal
+ * edge, so neither continuation signal of terminalLogicalLine fires (no
+ * `isWrapped`, the row does not reach the last column) and a long path was only
+ * linked up to the break:
+ *
+ *       ⎿  BILD /mnt/build/neon_getaway-mgr-hebel/builds/captures/2
+ *          026-10-10/ghost1b_gameplay.png err=0 …
+ *
+ * A following logical line is glued on (its indent dropped, cell mapping kept
+ * exact) when {@link pathContinuation} says it carries the path on and the row it
+ * broke off is at least as long as the row it continues on. Bounded by the same
+ * `maxRows` as the logical line.
+ *
+ * @returns Same shape as {@link terminalLogicalLine}; null when the row does not exist.
+ */
+function terminalPathLine(buffer, row, cols, maxRows) {
+  const base = terminalLogicalLine(buffer, row, cols, maxRows);
+  if (!base) return null;
+  const bound = Math.max(1, maxRows || 12);
+  const lineAt = (r) => terminalLogicalLine(buffer, r, cols, bound);
+  const rowsOf = (line) => line.endRow - line.startRow + 1;
+  // A program breaking a long token fills the row to its wrap width, and no
+  // later row of that block is wider. So the row a path broke off is at least as
+  // long as the row it continues on — which keeps `cd /mnt/foo` from being glued
+  // to a longer `  file.png written` below it.
+  const rowLength = (r) => (buffer.getLine(r)?.translateToString(true) || '').length;
+  const continues = (prev, next, prevText) =>
+    rowLength(prev.endRow) >= rowLength(next.startRow) && pathContinuation(prevText, next.text);
+
+  /** `first` and the lines a path carries on into, stopping at the last confirmed join. */
+  const extend = (first) => {
+    const parts = [first];
+    let text = first.text;
+    let rows = rowsOf(first);
+    let confirmed = 1;
+    for (;;) {
+      const next = lineAt(parts[parts.length - 1].endRow + 1);
+      if (!next || rows + rowsOf(next) > bound) break;
+      const kind = continues(parts[parts.length - 1], next, text);
+      if (!kind) break;
+      parts.push(next);
+      text += next.text.replace(/^\s+/, '');
+      rows += rowsOf(next);
+      if (kind === 'join') confirmed = parts.length;
+    }
+    return parts.slice(0, confirmed);
+  };
+
+  // The hovered row may be the second or third line of a broken path: walk back
+  // to where it could start, then let the forward pass decide what really joins.
+  let first = base;
+  let rows = rowsOf(base);
+  while (first.startRow > 0) {
+    const prev = lineAt(first.startRow - 1);
+    if (!prev || rows + rowsOf(prev) > bound || !continues(prev, first, prev.text)) break;
+    first = prev;
+    rows += rowsOf(prev);
+  }
+  let parts = extend(first);
+  if (parts[parts.length - 1].endRow < base.startRow) parts = extend(base);
+  if (parts.length === 1) return parts[0];
+
+  const segments = [];
+  let text = '';
+  for (const [i, part] of parts.entries()) {
+    const skip = i === 0 ? 0 : part.text.length - part.text.replace(/^\s+/, '').length;
+    segments.push({ part, textStart: text.length, skip });
+    text += part.text.slice(skip);
+  }
+  const offsetToCell = (offset) => {
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const seg = segments[i];
+      if (offset >= seg.textStart || i === 0) return seg.part.offsetToCell(offset - seg.textStart + seg.skip);
+    }
+    return segments[0].part.offsetToCell(offset);
+  };
+  const cellToOffset = (targetRow, targetCol) => {
+    for (const seg of segments) {
+      if (targetRow < seg.part.startRow || targetRow > seg.part.endRow) continue;
+      const offset = seg.part.cellToOffset(targetRow, targetCol);
+      return offset < 0 ? -1 : seg.textStart + Math.max(0, offset - seg.skip);
+    }
+    return -1;
+  };
+  return { startRow: parts[0].startRow, endRow: parts[parts.length - 1].endRow, text, offsetToCell, cellToOffset };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -3008,8 +3388,16 @@ function describeSessionHarness(session, catalog) {
 if (typeof window !== 'undefined') {
   window.CodemanSessionHarness = { describeSessionHarness, SESSION_MODEL_MAX_CHARS };
   window.CodemanHistoryFormat = { formatHistoryBytes, computeHistoryTruncationNotice, computeRewriteScrollLine };
-  window.CodemanFilePaths = { absoluteFilePathPattern, previewsInFileViewer, FILE_PREVIEW_EXTENSIONS };
-  window.CodemanTerminalLines = { terminalLogicalLine };
+  window.CodemanFilePaths = {
+    absoluteFilePathPattern,
+    findFilePathLinks,
+    resolveLinkedFilePath,
+    previewsInFileViewer,
+    FILE_PREVIEW_EXTENSIONS,
+    rendersAsPage,
+    HTML_PAGE_EXTENSIONS,
+  };
+  window.CodemanTerminalLines = { terminalLogicalLine, terminalPathLine };
   window.CodemanUrlSession = { sessionIdFromFragment };
   window.CodemanSplitPane = {
     clampDividerPercent,

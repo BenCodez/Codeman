@@ -183,6 +183,63 @@ describe('workDetect.workingLine is guarded like every other config regex', () =
       expect(compileVersionRegex(src), `${entry.id} declares an awaitingLine the guard refuses`).not.toBeNull();
     }
   });
+
+  it('holds the optional blockedLine to the same guard', () => {
+    // Run over the foot of a capture at every settle and on a timer while a dialog is
+    // up, and a clis.json override can set it.
+    for (const blockedLine of ['(a+)+b', 'a'.repeat(201), '([unclosed', '']) {
+      expectRejected(
+        (e) => {
+          (e.capabilities as Record<string, unknown>).workDetect = {
+            promptGlyph: '>',
+            workingLine: 'working',
+            blockedLine,
+          };
+        },
+        `blockedLine ${JSON.stringify(blockedLine.slice(0, 20))} must be refused at LOAD time`
+      );
+    }
+  });
+
+  it('bounds the blockedLine window and refuses one with no pattern', () => {
+    for (const blockedLines of [0, 25, 2.5]) {
+      expectRejected((e) => {
+        (e.capabilities as Record<string, unknown>).workDetect = {
+          promptGlyph: '>',
+          workingLine: 'working',
+          blockedLine: 'Press enter to confirm$',
+          blockedLines,
+        };
+      }, 'a config file must not be able to widen the search to the whole pane');
+    }
+    expectRejected((e) => {
+      (e.capabilities as Record<string, unknown>).workDetect = {
+        promptGlyph: '>',
+        workingLine: 'working',
+        blockedLines: 4,
+      };
+    }, 'a window with nothing to search is a typo whose failure is otherwise silent');
+  });
+
+  it('accepts a blockedLine with its window, and every shipped one', () => {
+    const entry = baseEntry();
+    (entry.capabilities as Record<string, unknown>).workDetect = {
+      promptGlyph: '>',
+      workingLine: 'working',
+      blockedLine: 'Press enter to confirm$',
+      blockedLines: 24,
+    };
+    expect(CliEntrySchema.safeParse(entry).success).toBe(true);
+    let shipped = 0;
+    for (const stock of STOCK_CLIS) {
+      const src = stock.capabilities.workDetect?.blockedLine;
+      if (!src) continue;
+      shipped++;
+      expect(compileVersionRegex(src), `${stock.id} declares a blockedLine the guard refuses`).not.toBeNull();
+      expect(CliEntrySchema.safeParse(JSON.parse(JSON.stringify(stock))).success).toBe(true);
+    }
+    expect(shipped).toBeGreaterThan(0);
+  });
 });
 
 describe('no shell text can reach the command line', () => {
@@ -417,5 +474,25 @@ describe('capability shapes', () => {
     expectRejected((e) => {
       (e.capabilities as Record<string, unknown>).transcript = 'some-future-format';
     }, 'a transcript reader that does not exist would silently read nothing');
+  });
+  it('takes transcriptPageKeys as an optional boolean, absent meaning no paging', () => {
+    for (const value of [true, false]) {
+      const entry = baseEntry();
+      (entry.capabilities as Record<string, unknown>).transcriptPageKeys = value;
+      expect(CliEntrySchema.safeParse(entry).success, `transcriptPageKeys=${value}`).toBe(true);
+    }
+    const absent = baseEntry();
+    delete (absent.capabilities as Record<string, unknown>).transcriptPageKeys;
+    expect(CliEntrySchema.safeParse(absent).success).toBe(true);
+    expectRejected((e) => {
+      (e.capabilities as Record<string, unknown>).transcriptPageKeys = 'yes';
+    }, 'transcriptPageKeys is a boolean');
+  });
+
+  it('declares transcriptPageKeys for exactly the CLIs measured to page on PageUp/PageDown', () => {
+    // claude (repaint mode), codex and opencode (both on the alternate screen) were
+    // measured paging their own transcript on PageUp/PageDown; no other stock entry has been.
+    const paging = STOCK_CLIS.filter((e) => e.capabilities.transcriptPageKeys === true).map((e) => e.id as string);
+    expect(paging.sort()).toEqual(['claude', 'codex', 'opencode']);
   });
 });

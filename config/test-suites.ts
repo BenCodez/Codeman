@@ -19,10 +19,12 @@
  * why these are a runnable suite (`npm run test:browser`) rather than skipped.
  */
 export const BROWSER_TEST_GLOBS = [
+  'test/tmux-capture-sgr.browser.test.ts',
   'test/tab-rail-resize.browser.test.ts',
   'test/tab-activation.browser.test.ts',
   'test/tab-layout-editing.browser.test.ts',
   'test/tab-rail-search.browser.test.ts',
+  'test/tab-focus.browser.test.ts',
   'test/session-sidebar-ux.browser.test.ts',
   'test/session-options-responsive.browser.test.ts',
   'test/supervisor-ui.browser.test.ts',
@@ -38,6 +40,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/codex-predictive-echo.test.ts', // also needs a real codex binary
   'test/split-pane-terminal.browser.test.ts',
   'test/terminal-tile-scroll.browser.test.ts',
+  'test/terminal-touch-paging.browser.test.ts',
   'test/shift-enter-keypress.browser.test.ts',
   'test/reliable-input-multiwindow.browser.test.ts',
   'test/key-tester.browser.test.ts',
@@ -51,6 +54,7 @@ export const BROWSER_TEST_GLOBS = [
   'test/mobile-ime-preview.browser.test.ts',
   'test/run-mode-menu-scroll.browser.test.ts',
   'test/markdown-anchor-links.browser.test.ts',
+  'test/fullscreen-tab-switch-capture.browser.test.ts',
 ];
 
 /**

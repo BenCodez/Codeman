@@ -60,6 +60,7 @@ import {
   isAdmin,
   isWorkingDirAllowed,
   ownerFor,
+  requireAdmin,
   resolveCasesDir,
   SETTINGS_PATH,
   validatePathWithinBase,
@@ -1536,7 +1537,7 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
     // admin-only in multi-user mode (mirrors host CRUD + the admin-only GET listing).
     const denied = adminOnly(req, reply);
     if (denied) return denied;
-    const { name, path: folderPath } = parseBody(LinkCaseSchema, req.body, 'Invalid request body');
+    const { name, path: folderPath } = parseBody(LinkCaseSchema, req.body);
 
     // Expand ~ to home directory
     const expandedPath = folderPath.startsWith('~') ? join(homedir(), folderPath.slice(1)) : folderPath;
@@ -1665,7 +1666,13 @@ export function registerCaseRoutes(app: FastifyInstance, ctx: EventPort & Config
 
   // ========== Reorder Cases ==========
 
-  app.put('/api/cases/order', async (req): Promise<ApiResponse<{ order: string[] }>> => {
+  app.put('/api/cases/order', async (req, reply): Promise<ApiResponse<{ order: string[] }> | undefined> => {
+    // `caseOrder` is ONE list in the server-wide settings.json, read by every user's
+    // GET /api/cases, so a non-admin's reorder would replace everyone's order (and
+    // publish their case names to every user through GET /api/settings). Admin-only in
+    // multi-user mode, like PUT /api/settings; a per-user order would need per-user
+    // storage. No-op in single-user mode.
+    if (isMultiUserMode() && !requireAdmin(req, reply)) return;
     const { order } = parseBody(CaseOrderSchema, req.body, 'Invalid order data');
 
     try {

@@ -41,7 +41,8 @@ codeman web    # then open http://localhost:3000
 
 **Driving it from code**
 
-- [Driving Codeman From An Agent](Driving-Codeman-From-An-Agent) - the bundled skill, worker sessions, wait primitives.
+- [The Codeman Skill](Codeman-Skill) - one prompt, a whole crew: an agent starting and supervising worker sessions.
+- [Driving Codeman From An Agent](Driving-Codeman-From-An-Agent) - the `codeman agent` commands, the MCP server, wait primitives.
 - [HTTP API](HTTP-API) - the envelope, auth, the endpoint map, SSE events.
 - [Hooks And Integrations](Hooks-And-Integrations) - events flowing back into Codeman.
 
@@ -66,6 +67,7 @@ codeman web    # then open http://localhost:3000
 | [Agent CLIs](Agent-CLIs)                   | Which agent should this session run, and how do I set it up? |
 | [Custom Model Endpoints](Custom-Model-Endpoints) | How do I point a session at my own OpenAI-compatible endpoint? |
 | [Working With Files](Working-With-Files)   | How do I read, edit, and attach files?                     |
+| [Git Worktrees](Git-Worktrees)             | How do several agents work on one repository without sharing a folder? |
 | [Input And Voice](Input-And-Voice)         | How do I talk to an agent, including by voice?             |
 | [Mobile Guide](Mobile-Guide)               | How well does this work on a phone?                        |
 | [Keyboard Shortcuts](Keyboard-Shortcuts)   | What can I drive from the keyboard?                        |
@@ -102,6 +104,7 @@ codeman web    # then open http://localhost:3000
 
 | Page                                                              | What it answers                              |
 | ----------------------------------------------------------------- | -------------------------------------------- |
+| [The Codeman Skill](Codeman-Skill)                                | How do I get an agent to start and run workers for me? |
 | [Driving Codeman From An Agent](Driving-Codeman-From-An-Agent)    | How does an agent spawn and drive workers?   |
 | [HTTP API](HTTP-API)                                              | What can I call, and what comes back?        |
 | [Hooks And Integrations](Hooks-And-Integrations)                  | How do I wire Codeman into something else?   |

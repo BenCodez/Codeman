@@ -76,6 +76,21 @@ function agentDefaults(): Pick<
   };
 }
 
+/**
+ * The agent skill in `<workspace>/.agents/skills/codeman`, the one project skills
+ * directory every CLI that spreads this scans. Measured per CLI on
+ * 2026-10-11 against the installed builds or their source: codex 0.162 (every dir from
+ * the git root down to cwd), gemini (cwd only, behind folder trust, which `--skip-trust`
+ * already answers), opencode 1.3 (cwd up to the worktree), agy 1.3.2 (its `.agents/`
+ * customization root), grok 1.0.5 (each tier from cwd up to the repo root), dsh 0.1.1
+ * (the git root, else cwd) and omp (cwd up to the git root). Claude Code does NOT read
+ * `.agents/skills`, so a case shared with a claude session lists each skill once there.
+ */
+const AGENTS_DIR_SKILL: Pick<CliEntry['capabilities'], 'agentSkillInjection' | 'agentSkillDir'> = {
+  agentSkillInjection: true,
+  agentSkillDir: '.agents/skills',
+};
+
 // `accent` on every entry below (except SHELL, which the frontend renders no
 // distinct color for) is measured from the actual `.btn-toolbar.btn-run.mode-<id>`
 // CSS rule's `border-color` on the OG skin (styles.css) — the single cleanest
@@ -270,6 +285,10 @@ const CLAUDE: CliEntry = {
     // Declared-for-later: the live rule (`_shouldForwardWheelToApp`, terminal-ui.js) is this version
     // AND the server-published `cliMouseTracking` flag (#498), so wiring this field up needs both.
     wheelForward: { mode: 'version-gated', minVersion: '2.1.187' },
+    // A repaint-mode Claude pane keeps no local history, so when the wheel is not
+    // forwarded (older CLI, inline renderer, the local-scrollback opt-out) a scroll is
+    // turned into PageUp/PageDown, which Claude pages its transcript on (#205).
+    transcriptPageKeys: true,
     keyboardAccessory: 'agent',
     privilegedCommandGate: false,
     startMode: 'interactive',
@@ -278,6 +297,7 @@ const CLAUDE: CliEntry = {
     respawn: true,
     effort: true,
     agentSkillInjection: true,
+    agentSkillDir: '.claude/skills',
     statusLineTelemetry: true,
     model: { source: 'claude-settings-file' },
     privilegedParams: [],
@@ -494,8 +514,14 @@ const OPENCODE: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    ...AGENTS_DIR_SKILL,
     altScreen: 'strip-mux-and-mouse',
     echo: { policy: 'buffer', anchor: { kind: 'cursor' }, predictProfile: undefined },
+    // Pages its own transcript on PageUp/PageDown (`messages_page_up/down`) and ignores
+    // SGR wheel reports, and its TUI runs on the alternate screen (1.18.31: tmux
+    // `alternate_on=1`, `history_size=0`), so a pane keeps no local history and the
+    // wheel is turned into page keys or it does nothing at all (#555).
+    transcriptPageKeys: true,
     // Measured on a live opencode 1.3.0 pane (capture-pane every 250-300 ms through real
     // turns at 40, 60, 120 and 200 columns, plus the raw PTY stream, 2026-10-09). Every
     // composer row starts with a `┃` bar, and the submitted prompt lands in the transcript
@@ -536,6 +562,7 @@ const OPENCODE: CliEntry = {
     // opencode's global config dir is xdg-basedir's `$XDG_CONFIG_HOME/opencode`.
     mcpConfig: {
       path: '.config/opencode/opencode.json',
+      altPath: '.config/opencode/opencode.jsonc',
       format: 'opencode-json',
       relocation: { envVar: 'XDG_CONFIG_HOME', path: 'opencode/opencode.json' },
     },
@@ -635,6 +662,7 @@ const CODEX: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    ...AGENTS_DIR_SKILL,
     // Codex draws `› Ask Codex to do anything` on its composer row and
     // `Working (2m 49s • esc to interrupt)` above it while a turn runs. It animates no
     // braille spinner, and it never prints `esc to interrupt` at rest, so that phrase
@@ -657,10 +685,11 @@ const CODEX: CliEntry = {
     // which the agent writes (and while a prompt is typed, the last two). Matching the complete row raises the bar — an assistant
     // message has to end with this exact line, to the character — but nothing here makes
     // forging it impossible, so do not read the Claude comment above as applying here.
-    // What contains it is that codex declares `hooks: 'none'`: no hook event from a codex
-    // session ever reaches `notePrompt()`, so there is no idle item to pre-acknowledge
-    // and a forged label costs a wrong badge and nothing else. A CLI that gains hook
-    // signals must not keep a pattern this soft.
+    // What contains it is that codex declares `hooks: 'none'`: no IDLE prompt from a codex
+    // session ever reaches `notePrompt()` (its screen-read dialogs below open PERMISSION
+    // items, which a watching label never acknowledges), so there is no idle item to
+    // pre-acknowledge and a forged label costs a wrong badge and nothing else. A CLI that
+    // gains idle signals must not keep a pattern this soft.
     // ⚠️ Background TERMINALS are the only background work codex advertises on screen.
     // A sub-agent started without waiting outlives the turn just as a terminal does —
     // measured 2026-09-22, the sandboxed process was still running — and the pane shows
@@ -669,11 +698,45 @@ const CODEX: CliEntry = {
     // composer. So a codex session waiting on a sub-agent reads as plainly idle here.
     // Nothing is misfiled by that (codex raises no idle prompts), and there is no row to
     // match until codex pins one.
+    // Codex is the one CLI Codeman launches with its approvals on by default, and it has no
+    // hook to say it stopped for one, so its dialogs are read off the screen. Measured on a
+    // live codex-cli 0.162.0 pane on 2026-10-14 (`-a on-request -s read-only`, widths 200,
+    // 80, 60, 44 and 36): every dialog it blocks on REPLACES the composer and its footer
+    // with a numbered option list, the selected one marked `›`, over a key-hint row:
+    //   command approval (a network         `› 1. Yes, proceed (y)` ...
+    //   escalation too), edit approval
+    //                                       `  Press enter to confirm or esc to cancel`
+    //   question (request_user_input)       `  › 1. Blue  Write the color blue.` ...
+    //                                       `  tab to add notes | enter to submit answer | esc to interrupt`
+    //   (its notes field open)              `  tab or esc to clear notes | enter to submit answer`
+    //   workspace trust, at startup         `› 1. Trust and continue`
+    //                                       `  enter continue · esc quit`
+    //   (the same prompt reached after the  `  2. Back to Agent Command Center`
+    //   update prompt, 0.162.0, 2026-10-16) `  enter continue · esc back`
+    // The pattern needs both: a `› N.` option row, then the key-hint row, which must END
+    // the window. Below about 60 columns that hint wraps onto rows of its own
+    // (`  Press enter to confirm or esc to` / `  cancel`, or `tab to add notes` /
+    // `enter to submit answer` / `esc to interrupt` one per row), so the hint may run on
+    // over rows that start with two spaces and a lowercase word or arrow, and must end on
+    // one of its own closing words. The transcript can quote every one of those strings
+    // (measured: an answer that printed them verbatim) and still not match, because while
+    // no dialog is up codex keeps its composer row (`› ...`, column 0, which ends the
+    // run) and its footer below anything the agent prints. The longest option list
+    // measured, a question at 36 columns, put the `›` row 16 non-blank rows up; 20 leaves
+    // room for longer option text, and a dialog whose marker scrolls out of the window is
+    // simply not seen (the behaviour before this field). Not matched on purpose:
+    // `Implement this plan?` after a plan turn, whose `enter select · esc back` footer is
+    // the same as `/model`, `/permissions` and `/review`, menus the user opened at the
+    // keyboard; the plan turn has ended there, and the session reads idle as before.
+    // ⚠️ The question dialog's hint contains `esc to interrupt`, the working line, so
+    // such a pane read as WORKING before this field: a blocked screen now wins over it.
     workDetect: {
       promptGlyph: '›',
       workingLine: '[Ee]sc to interrupt',
       watchingLine: String.raw`^\s{0,4}(\d+ background terminals?) running · /ps to view · /stop to close$`,
       watchingLines: 4,
+      blockedLine: String.raw`(?:^|\n) {0,4}› \d\. [\s\S]*\n {2}(?:Press enter to confirm|tab (?:to add|or esc to clear) notes|enter continue)(?:[^\n]|\n {2}(?=[a-z←])){0,120}(?:cancel|interrupt|quit|back|answer|all)$`,
+      blockedLines: 20,
     },
     // The footer under the composer, measured on a live 0.147.0 pane:
     // `  gpt-5.6-terra default · ~/codeman-cases/th-scratch` (model, reasoning effort,
@@ -720,6 +783,11 @@ const CODEX: CliEntry = {
     altScreen: 'strip-full',
     echo: { policy: 'predict', anchor: { kind: 'cursor' }, predictProfile: 'codex' },
     wheelForward: { mode: 'never' }, // #227: codex ignores SGR wheel reports, never forward
+    // ...but it DOES page its transcript on PageUp/PageDown. Measured on 0.157.1 (local,
+    // alternate screen inside tmux, so xterm holds no history) and 0.160 (remote): PageUp
+    // moved the visible transcript while SGR wheel reports and local scrolling did nothing.
+    // This is the page-key fallback for a hollow pane, not wheel forwarding.
+    transcriptPageKeys: true,
     maxFrameBytes: 32 * 1024,
     // codex's own bare-spawn default (no config sent) is already safe (no bypass flag), so
     // the multi-user clamp only needs to force an EXPLICITLY-SENT bypass back off.
@@ -834,6 +902,7 @@ const GEMINI: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    ...AGENTS_DIR_SKILL,
     altScreen: 'strip-full',
     echo: { policy: 'buffer', anchor: { kind: 'cursor' } },
     // Measured on a live Gemini CLI 0.63.0 pane (capture-pane every 300 ms through real
@@ -942,6 +1011,7 @@ const ANTIGRAVITY: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    ...AGENTS_DIR_SKILL,
     altScreen: 'strip-mux-only',
     echo: { policy: 'buffer', anchor: { kind: 'cursor' } },
     // Like codex: an ABSENT config already defaults safe (no bypass flag), so only a
@@ -1037,6 +1107,11 @@ const PI: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    // No agent skill (agentSkillInjection stays false): any project-level `.agents/skills`
+    // or `.pi/skills` makes pi ask "Trust project folder?" at startup
+    // (hasTrustRequiringProjectResources, pi 1.1.0), which would stall a spawned worker on
+    // a dialog. pi reads the user-level `~/.agents/skills` without that prompt, so a pi
+    // user installs it there (`npx skills add Ark0N/Codeman --skill codeman -g`).
     altScreen: 'preserve', // pi's TUI renders into the main screen with terminal-owned scrollback
     echo: { policy: 'buffer', anchor: { kind: 'cursor' } },
     // Measured on a live pi 1.1.0 pane (capture-pane every 250 ms through a turn,
@@ -1187,6 +1262,7 @@ const GROK: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    ...AGENTS_DIR_SKILL,
     // Fullscreen alt-screen TUI with mouse support, same strip as antigravity until measured
     // (opencode's mouse strip is #443): only the tmux-attach-time smcup strip, not Ink's full
     // erase-scrollback+DECSET strip.
@@ -1277,8 +1353,14 @@ const DEEPSEEK: CliEntry = {
     launcherTargetParam: 'profile',
     install: {
       command: {
-        linux: 'npm install -g @deepseek-ai/dsh',
-        darwin: 'npm install -g @deepseek-ai/dsh',
+        // pnpm rides along: `dsh plugin` spawns a literal `pnpm` with no npm fallback, so the
+        // terminal profile this CLI needs before it can run cannot be installed without it (#352).
+        // ⚠️ Only when none is on PATH. `corepack enable` puts a `pnpm` shim in node's own bin
+        // directory, which is npm's global bin for nvm and Homebrew, and `npm install -g pnpm`
+        // refuses to overwrite it (EEXIST). Asked for in the same command as dsh, that failure
+        // took dsh down with it, on exactly the machines that already had a working pnpm.
+        linux: 'npm install -g @deepseek-ai/dsh && (command -v pnpm >/dev/null || npm install -g pnpm)',
+        darwin: 'npm install -g @deepseek-ai/dsh && (command -v pnpm >/dev/null || npm install -g pnpm)',
       },
       npmPackage: '@deepseek-ai/dsh',
       docsUrl: 'https://github.com/deepseek-ai/deepseek-harness',
@@ -1359,6 +1441,7 @@ const DEEPSEEK: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    ...AGENTS_DIR_SKILL,
     // Definitive rather than inferred: the harness TUI reports idle/working/blocked to a
     // supervisor and Codeman is that supervisor. 'supervised' rather than 'always' because
     // the session can disarm the bridge, and docker/remote cannot reach it at all.
@@ -1524,6 +1607,7 @@ const OMP: CliEntry = {
   },
   capabilities: {
     ...agentDefaults(),
+    ...AGENTS_DIR_SKILL,
     // Fullscreen alt-screen TUI, same shape as antigravity/grok: only the
     // tmux-attach-time smcup strip, not Ink's full erase-scrollback+DECSET strip.
     altScreen: 'strip-mux-only',

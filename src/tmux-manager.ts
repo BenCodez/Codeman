@@ -7,13 +7,13 @@
  * - **Persistence**: Sessions survive server restarts and disconnects
  * - **Ghost recovery**: Orphaned sessions are discovered and reattached on startup
  * - **Resource tracking**: Memory, CPU, and child process stats per session
- * - **Reliable input**: `send-keys -l` sends literal text in a single command
+ * - **Reliable input**: a submitted prompt goes in as one bracketed paste, then a separate Enter
  * - **Teammate support**: Immutable pane IDs enable targeting individual teammates
  *
  * tmux sessions are named `codeman-{sessionId}` and stored in ~/.codeman/mux-sessions.json.
  *
  * Key features:
- * - `send-keys 'text' Enter` sends literal text in a single command
+ * - `paste-buffer -p` + a separate `send-keys Enter` submits a prompt (see sendInput)
  * - `list-sessions -F` provides structured queries
  * - `display-message -p '#{pane_pid}'` for reliable PID discovery
  * - Single server architecture
@@ -77,6 +77,7 @@ import {
   type SessionDocker,
   type DockerCommandMode,
   type PaneExit,
+  type StatusLineExporter,
 } from './types.js';
 import { getCli } from './config/cli-registry/registry.js';
 import { currentLocalCodexHome, normalizedCodexHome } from './recovery/codex-home.js';
@@ -458,6 +459,84 @@ export function resolveTmuxPaneTarget(muxName: string, paneTarget?: string): str
   return `${muxName}.${paneTarget}`;
 }
 
+let submitBufferSeq = 0;
+
+/** The tmux commands of one bracketed paste, see buildPasteTextCommands(). */
+export interface PasteTextCommands {
+  /** Fills a buffer of its own with the text. */
+  set: string;
+  /** Pastes that buffer into the target, bracketed, and deletes it (`-d`). */
+  paste: string;
+  /** Deletes the buffer when `paste` failed; `-d` only runs on a successful paste. */
+  discard: string;
+}
+
+/**
+ * Escape a final `;` for tmux. tmux splits commands on an argument that ENDS in
+ * `;` (`set-buffer -- 'a;'` stores `a`, `send-keys -l 'a;'` types `a`, a lone `;`
+ * is no argument at all); a final `\;` is its escape for a literal `;`. A `;`
+ * anywhere else in the argument is literal already. Exported for unit testing.
+ */
+export function escapeTmuxTrailingSemicolon(text: string): string {
+  return text.endsWith(';') ? `${text.slice(0, -1)}\\;` : text;
+}
+
+/**
+ * Whether a text+Enter submit types `text` as keys instead of pasting it: true for
+ * a single character. Claude Code's and Codex's selection dialogs ignore a bracketed
+ * paste, so a pasted `3` + Enter confirms the highlighted option instead of option 3;
+ * a typed `3` selects it. One character cannot form the burst Codex reads as a paste,
+ * so typing it is safe there. Exported for unit testing.
+ */
+export function submitsAsKeys(text: string): boolean {
+  return [...text].length === 1;
+}
+
+/**
+ * tmux commands that type `text` into `target` as ONE bracketed paste, ahead of a
+ * separately sent `Enter` that submits it. Exported for unit testing.
+ *
+ * Why a paste and not `send-keys -l`: Codex detects a paste that arrives WITHOUT
+ * bracketed-paste markers heuristically, from characters arriving in a fast burst,
+ * and folds an Enter that lands inside that burst window into the paste as a
+ * newline. `send-keys -l` types exactly such an unmarked burst, so a text+Enter
+ * pair sat in Codex's composer unsubmitted: always for long text (Codex shows it as
+ * `[Pasted Content N chars]`, which SubmitVerifier cannot match against the prompt,
+ * so nothing re-presses Enter), intermittently for short text at the 50 ms gap.
+ * `paste-buffer -p` wraps the text in the markers (only when the pane asked for
+ * them, so an app without bracketed paste sees the same bytes as before) and the
+ * Enter after it is unambiguous.
+ *
+ * Each call gets its own named buffer so concurrent sends cannot paste each other's
+ * text. tmux keeps a named buffer until something deletes it (`buffer-limit` trims
+ * only automatic ones), hence `discard` for a paste that fails.
+ *
+ * A single character is typed instead (submitsAsKeys), so a dialog answer selects.
+ * A final `;` is escaped (escapeTmuxTrailingSemicolon).
+ */
+export function buildPasteTextCommands(tmux: string, target: string, text: string): PasteTextCommands {
+  const buffer = `codeman-submit-${process.pid}-${++submitBufferSeq}`;
+  return {
+    set: `${tmux} set-buffer -b ${buffer} -- ${shellescape(escapeTmuxTrailingSemicolon(text))}`,
+    paste: `${tmux} paste-buffer -p -d -b ${buffer} -t ${shellescape(target)}`,
+    discard: `${tmux} delete-buffer -b ${buffer}`,
+  };
+}
+
+/**
+ * Run a bracketed paste. A failed paste (the pane or the server is gone) deletes
+ * the buffer before the paste's own error propagates; a failing delete is ignored.
+ */
+export async function pasteText(run: (cmd: string) => Promise<unknown>, cmds: PasteTextCommands): Promise<void> {
+  await run(cmds.set);
+  try {
+    await run(cmds.paste);
+  } catch (err) {
+    await run(cmds.discard).catch(() => undefined);
+    throw err;
+  }
+}
+
 /**
  * Pick the active pane id from `tmux list-panes -F '#{pane_id}:#{pane_active}'`
  * output (lines like `%0:1`). Returns the pane id whose active flag is 1.
@@ -717,19 +796,126 @@ export function normalizeScrollbackEol(buffer: string): string {
   return buffer.replace(/\r?\n/g, '\r\n');
 }
 
+/** `capture-pane -p` text as rows: tmux ends it with one `\n`, and '' has none. */
+function captureRows(text: string): string[] {
+  return text === '' ? [] : text.replace(/\n$/, '').split('\n');
+}
+
+/**
+ * Least overlap that places a frame in a screen: rows compared, and how many
+ * of them hold text. A placement too LOW repeats the rows between the true one
+ * and it, so a short overlap (one `$` or `❯` row, a rule line) is not trusted:
+ * past this, the plain join, which can only lose rows, is the safer answer.
+ */
+const FRAME_MATCH_MIN_ROWS = 3;
+const FRAME_MATCH_MIN_CONTENT_ROWS = 2;
+
+/**
+ * A captured row as plain text: escape sequences (SGR, OSC 8 links) and
+ * trailing blanks dropped. Two tmuxes render the same cell content, but need
+ * not encode its attributes the same way.
+ */
+function capturedRowText(row: string): string {
+  // eslint-disable-next-line no-control-regex
+  return row.replace(/\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]/g, '').trimEnd();
+}
+
+/**
+ * Where a later frame of the same pane begins among the rows of an earlier
+ * screen capture, or -1 when that cannot be told.
+ *
+ * The frame's top rows must equal the screen's rows from that index on, as
+ * text. Two rows are left out of the comparison: the screen's trailing blank
+ * rows (output after the screen read fills them in the frame) and its last
+ * content row (output in flight may have finished it since). Every compared
+ * row must match, the overlap must reach FRAME_MATCH_MIN_ROWS rows with
+ * FRAME_MATCH_MIN_CONTENT_ROWS of them non-blank, and the SMALLEST index wins,
+ * so a block that merely repeats further down is only chosen when nothing
+ * above it matches. A row that changed between the two reads (a spinner, a
+ * clock) fails the true placement; the minimum keeps a lower one from being
+ * taken on a row or two that happen to be equal.
+ *
+ * An agent TUI mid-turn (Claude Code, codex, opencode) is not placed: it keeps
+ * a live region (spinner, composer, footer) pinned to the bottom and inserts new
+ * rows above it, so the frame is not a shifted copy of the screen and the
+ * comparison down to the screen's last content row fails. The caller then falls
+ * back to the plain join. A plain shell places, unless the frame starts on the
+ * second half of a wrapped line: -J holds that line as one screen row, so it
+ * matches nothing and the plain join applies too.
+ */
+export function findFrameInScreen(screenRows: string[], frameRows: string[]): number {
+  const screen = screenRows.map(capturedRowText);
+  const frame = frameRows.map(capturedRowText);
+  let lastContent = screen.length - 1;
+  while (lastContent >= 0 && screen[lastContent] === '') lastContent--;
+  for (let start = 0; start < lastContent; start++) {
+    const overlap = Math.min(lastContent - start, frame.length);
+    if (overlap < FRAME_MATCH_MIN_ROWS) break; // only shrinks from here on
+    let matches = true;
+    let contentRows = 0;
+    for (let k = 0; k < overlap && matches; k++) {
+      if (screen[start + k] !== frame[k]) matches = false;
+      else if (frame[k] !== '') contentRows++;
+    }
+    if (matches && contentRows >= FRAME_MATCH_MIN_CONTENT_ROWS) return start;
+  }
+  return -1;
+}
+
+/**
+ * Put scrollback rows read elsewhere (`PaneCaptureOptions.scrollbackOverride`)
+ * above a visible-frame capture, as one capture in tmux's own shape: rows joined
+ * by a bare `\n`. Undefined or empty scrollback leaves the frame as it is.
+ *
+ * `screen` is that other pane's screen, read right after its scrollback. The
+ * frame is captured later, so rows can have scrolled out of it in between, and
+ * a frame showing part of a taller screen starts below that screen's top.
+ * Either way the screen rows above the frame's first row are in neither the
+ * scrollback nor the frame, so they go between the two. When the frame cannot
+ * be placed in the screen ({@link findFrameInScreen}), the join is the plain
+ * scrollback-over-frame one.
+ */
+export function joinScrollbackAndFrame(scrollback: string | undefined, frame: string, screen?: string): string {
+  let above = scrollback ? captureRows(scrollback) : [];
+  if (screen) {
+    const screenRows = captureRows(screen);
+    const frameStart = findFrameInScreen(screenRows, captureRows(frame));
+    if (frameStart > 0) {
+      // The remote screen is a capture of its own too, encoded from the default
+      // state: the history's last row must not leave its attributes active.
+      if (above.length > 0) above[above.length - 1] += '\x1b[0m';
+      above = above.concat(screenRows.slice(0, frameStart));
+    }
+  }
+  // Separate captures: tmux encodes the frame relative to the DEFAULT state, so
+  // the rows above it must not leave their attributes active.
+  return above.length > 0 ? `${above.join('\n')}\x1b[0m\n${frame}` : frame;
+}
+
 /** Pane geometry and caret position, as `display-message` reports them. */
 interface PaneCursorGeometry {
   cols: number;
   rows: number;
   cursorX: number;
   cursorY: number;
+  /**
+   * `#{history_size}`: rows tmux holds ABOVE the visible frame, i.e. what a
+   * full-history capture can add. Absent when the query did not return it.
+   * Optional and validated on its own, so a bad value never voids the caret.
+   */
+  historyLines?: number;
+  /** Whether the pane is in the alternate screen (`#{alternate_on}`), when tmux reported it. */
+  alternateOn?: boolean;
 }
 
 /**
  * Read the pane's cursor and size, or null when tmux cannot say.
  *
- * Every field is validated together: a caller that gets a value back can place
- * a caret with it, and one that gets null must not try.
+ * The four geometry fields are validated together: a caller that gets a value
+ * back can place a caret with it, and one that gets null must not try. The
+ * optional fifth and sixth fields, the history depth and the alternate-screen
+ * flag, are only informational, so a bad one is dropped rather than
+ * discarding a good caret.
  */
 export function queryPaneCursor(run: () => string): PaneCursorGeometry | null {
   let raw: string;
@@ -739,7 +925,9 @@ export function queryPaneCursor(run: () => string): PaneCursorGeometry | null {
     console.error('[TmuxManager] Failed to query pane cursor after capture:', cursorErr);
     return null;
   }
-  const [cursorX, cursorY, cols, rows] = raw.split(/\s+/).map((value) => parseInt(value, 10));
+  const [cursorX, cursorY, cols, rows, historyLines, alternateOn] = raw
+    .split(/\s+/)
+    .map((value) => parseInt(value, 10));
   if (
     !Number.isFinite(cursorX) ||
     !Number.isFinite(cursorY) ||
@@ -752,7 +940,10 @@ export function queryPaneCursor(run: () => string): PaneCursorGeometry | null {
   ) {
     return null;
   }
-  return { cols, rows, cursorX, cursorY };
+  const geometry: PaneCursorGeometry = { cols, rows, cursorX, cursorY };
+  if (Number.isFinite(historyLines) && historyLines >= 0) geometry.historyLines = historyLines;
+  if (alternateOn === 0 || alternateOn === 1) geometry.alternateOn = alternateOn === 1;
+  return geometry;
 }
 
 /** SGR attributes, which is all `capture-pane -e` emits. */
@@ -1018,6 +1209,19 @@ export function buildRemoteCodexPaneCommand(options: {
     entry,
     mode: 'codex',
   })}`;
+}
+
+/**
+ * The remote tmux socket and session a remote Codeman session's pane is attached
+ * to, matching the command that attached it: an owned session is the one
+ * `buildRemoteLaunchCommand` created on the private socket, a non-owned one is the
+ * discovered session `buildRemoteAttachCommand` joined on `-L codeman`.
+ */
+export function remoteTmuxLocation(remote: SessionRemote, sessionId: string): { socket: string; sessionName: string } {
+  if (remote.owned === false) {
+    return { socket: 'codeman', sessionName: remote.remoteSessionName || remoteTmuxSessionName(sessionId) };
+  }
+  return { socket: REMOTE_TMUX_SOCKET, sessionName: remoteTmuxSessionName(sessionId) };
 }
 
 /**
@@ -3326,6 +3530,27 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   /**
+   * The statusLine exporter for one claude launch, and why it is missing when it is.
+   * Registry-gated (capabilities.statusLineTelemetry, claude only today), local spawns
+   * only (remote/docker have their own separate command builders). Resolving still runs
+   * with collection off, because it also self-heals: it strips any legacy disk-written
+   * exporter from an older Codeman build the first time a session starts in that
+   * workspace again. `state` lands on the mux record so the Status row can
+   * say why no cache report will come, instead of "not reported yet" forever.
+   */
+  private async _resolveStatusLine(
+    mode: SessionMode,
+    workingDir: string,
+    remoteOrDocker: boolean
+  ): Promise<{ command?: string; state?: StatusLineExporter }> {
+    if (!getCli(mode)?.capabilities.statusLineTelemetry) return {};
+    if (remoteOrDocker) return { state: 'remote' };
+    const enabled = await readPlanUsageTelemetryEnabled();
+    const command = await resolveStatusLineCliCommand(workingDir, enabled);
+    return { command, state: command ? 'injected' : enabled ? 'workspace-statusline' : 'collection-off' };
+  }
+
+  /**
    * Export the user's own REAL statusLine command (found by
    * findEffectiveUserStatusLineCommand) via tmux setenv, so the shared
    * exporter script (statusLineExporterScriptContent in hooks-config.ts) can
@@ -3509,14 +3734,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     const envExportsStr = this.buildEnvExports(sessionId, muxName, mode).join(' && ');
 
-    // Registry-gated (capabilities.statusLineTelemetry — claude only today), local
-    // spawns only (remote/docker have their own separate command builders — out of
-    // scope here). Also self-heals: strips any legacy disk-written exporter from an
-    // older Codeman build the first time a session starts in that workspace again.
-    const statusLineCommand =
-      getCli(mode)?.capabilities.statusLineTelemetry && !remote && !docker
-        ? await resolveStatusLineCliCommand(workingDir, await readPlanUsageTelemetryEnabled())
-        : undefined;
+    const { command: statusLineCommand, state: statusLine } = await this._resolveStatusLine(
+      mode,
+      workingDir,
+      !!(remote || docker)
+    );
     // The user's own REAL statusLine, if any (walked via Claude Code's own
     // settings precedence) — exported below so the shared exporter script
     // can wrap it. Only worth discovering when we're actually injecting.
@@ -3930,6 +4152,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         mode,
         attached: false,
         name,
+        statusLine,
       };
       if (inputBroker) {
         this.inputBrokers.set(sessionId, inputBroker);
@@ -4273,11 +4496,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
 
     const envExportsStr = this.buildEnvExports(sessionId, muxName, mode).join(' && ');
 
-    // See createSession()'s identical resolution for rationale.
-    const statusLineCommand =
-      getCli(mode)?.capabilities.statusLineTelemetry && !remote && !docker
-        ? await resolveStatusLineCliCommand(workingDir, await readPlanUsageTelemetryEnabled())
-        : undefined;
+    const { command: statusLineCommand, state: statusLine } = await this._resolveStatusLine(
+      mode,
+      workingDir,
+      !!(remote || docker)
+    );
     const userStatusLineCommand = statusLineCommand ? await findEffectiveUserStatusLineCommand(workingDir) : undefined;
 
     const ordinaryCmd = buildSpawnCommand({
@@ -4638,6 +4861,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           pid,
           incarnation: inputBroker.incarnation,
         });
+      if (this.sessions.get(sessionId) === session && session.statusLine !== statusLine) {
+        session.statusLine = statusLine;
+        this.saveSessions();
+      }
       return pid;
     } catch (err) {
       await restoreRetiredProvenance();
@@ -6194,10 +6421,12 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
   }
 
   /**
-   * Send input directly to a tmux session using `send-keys`.
+   * Send input directly to a tmux session.
    *
-   * Uses tmux send-keys for reliable input delivery:
-   * - `-l` flag sends literal text (no key interpretation)
+   * - Text followed by `\r` goes in as ONE bracketed paste (buildPasteTextCommands),
+   *   so Codex cannot fold the Enter into a paste burst; a single character is typed
+   *   with `send-keys -l` instead, so a dialog answer selects (submitsAsKeys)
+   * - Text without `\r` is typed literally with `send-keys -l` (no key interpretation)
    * - `Enter` key is sent as a SEPARATE tmux invocation after a small delay
    * - Ink (Claude CLI) needs text and Enter split to avoid treating Enter as a newline
    */
@@ -6313,7 +6542,8 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         keys: string,
         data: string,
         expiry: number,
-        finalCurrent: () => boolean
+        finalCurrent: () => boolean,
+        bracketedPaste = false
       ): Promise<boolean> => {
         const actionExpiry =
           recoveryGuard?.actionDeadline === undefined
@@ -6343,6 +6573,19 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
           return false;
         }
         if (!frame || !inputBroker) {
+          if (bracketedPaste) {
+            const commands = buildPasteTextCommands(this.tmux(), muxName, data);
+            await pasteText(async (command) => {
+              // Buffer preparation adds an await: recheck before delivering its
+              // bytes, while still allowing exact buffer cleanup after refusal.
+              if (command !== commands.discard && (!canDispatch() || !finalCurrent()))
+                throw new Error('Input dispatch authority changed');
+              return IS_TEST_MODE
+                ? this.inputCommandRunner!(command)
+                : execAsync(command, { timeout: EXEC_TIMEOUT_MS });
+            }, commands);
+            return true;
+          }
           recoveryGuard?.noteDispatch();
           const result = IS_TEST_MODE
             ? await this.inputCommandRunner!(inputCommand(keys))
@@ -6524,12 +6767,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // Send text first, then Enter as a SEPARATE tmux command after a short delay.
         // Ink (Claude CLI's terminal framework) needs them split — sending both in a
         // single tmux invocation (via \;) causes Ink to interpret Enter as a newline
-        // character in the input buffer rather than as form submission.
+        // character in the input buffer rather than as form submission. Mark
+        // ordinary multi-character input as a bracketed paste; a single-key
+        // dialog answer must remain typed. Authenticated brokers frame their own bytes.
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
         if (
-          !(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry, () =>
-            confirmDispatch(admission)
+          !(await dispatchInput(
+            `-l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
+            textPart,
+            admission!.expiry,
+            () => confirmDispatch(admission),
+            !submitsAsKeys(textPart)
           ))
         )
           return false;
@@ -6545,8 +6794,11 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         const admission = await prepareDispatch();
         if (!confirmDispatch(admission) || !canDispatch()) return false;
         if (
-          !(await dispatchInput(`-l ${shellescape(textPart)}`, textPart, admission!.expiry, () =>
-            confirmDispatch(admission)
+          !(await dispatchInput(
+            `-l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
+            textPart,
+            admission!.expiry,
+            () => confirmDispatch(admission)
           ))
         )
           return false;
@@ -6691,19 +6943,25 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       const textPart = input.replace(/\r/g, '').replace(/\n/g, '').trimEnd();
 
       if (textPart && hasCarriageReturn) {
-        execSync(`${tmux} send-keys -t ${shellescape(target)} -l ${shellescape(textPart)}`, {
-          encoding: 'utf-8',
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        execSync(
+          `${tmux} send-keys -t ${shellescape(target)} -l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
+          {
+            encoding: 'utf-8',
+            timeout: EXEC_TIMEOUT_MS,
+          }
+        );
         execSync(`${tmux} send-keys -t ${shellescape(target)} Enter`, {
           encoding: 'utf-8',
           timeout: EXEC_TIMEOUT_MS,
         });
       } else if (textPart) {
-        execSync(`${tmux} send-keys -t ${shellescape(target)} -l ${shellescape(textPart)}`, {
-          encoding: 'utf-8',
-          timeout: EXEC_TIMEOUT_MS,
-        });
+        execSync(
+          `${tmux} send-keys -t ${shellescape(target)} -l ${shellescape(escapeTmuxTrailingSemicolon(textPart))}`,
+          {
+            encoding: 'utf-8',
+            timeout: EXEC_TIMEOUT_MS,
+          }
+        );
       } else if (hasCarriageReturn) {
         execSync(`${tmux} send-keys -t ${shellescape(target)} Enter`, {
           encoding: 'utf-8',
@@ -6837,7 +7095,14 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         typeof requestedLines === 'number' && Number.isFinite(requestedLines) && requestedLines > 0
           ? Math.trunc(requestedLines)
           : DEFAULT_TMUX_HISTORY_LIMIT;
-      const captureFlags = fullHistory ? `capture-pane -p -e -J -S -${historyLines}` : 'capture-pane -p -e';
+      // With a scrollback override this pane's own history is not read at all:
+      // `-S 0` starts at the top of the visible frame.
+      const scrollbackOverride = fullHistory ? opts?.scrollbackOverride : undefined;
+      const captureFlags = !fullHistory
+        ? 'capture-pane -p -e'
+        : scrollbackOverride !== undefined
+          ? 'capture-pane -p -e -J -S 0'
+          : `capture-pane -p -e -J -S -${historyLines}`;
       // execSync's default maxBuffer (1MB) kills multi-MB scrollback dumps
       // (ENOBUFS) and would silently degrade full-history capture to the byte
       // buffer for exactly the long sessions it exists for — size it from the
@@ -6850,14 +7115,18 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         execOpts.maxBuffer =
           (opts?.maxCaptureBytes ?? DEFAULT_TERMINAL_BUFFER_MAX_BYTES) + FULL_HISTORY_CAPTURE_SLACK_BYTES;
       }
-      const rawCapture = execSync(`${this.tmux()} ${captureFlags} -t ${shellescape(target)}`, execOpts);
+      const rawCapture = joinScrollbackAndFrame(
+        scrollbackOverride,
+        execSync(`${this.tmux()} ${captureFlags} -t ${shellescape(target)}`, execOpts),
+        scrollbackOverride !== undefined ? opts?.scrollbackOverrideScreen : undefined
+      );
       // Query the cursor BEFORE deciding anything else. On the full-history path
       // it settles both how the capture is trimmed and whether a cursor move is
       // appended, and those two have to agree: trailing blank rows are only safe
       // to keep when a move follows to put the caret back above them.
       const geometry = queryPaneCursor(() =>
         execSync(
-          `${this.tmux()} display-message -p -t ${shellescape(target)} '#{cursor_x} #{cursor_y} #{pane_width} #{pane_height}'`,
+          `${this.tmux()} display-message -p -t ${shellescape(target)} '#{cursor_x} #{cursor_y} #{pane_width} #{pane_height} #{history_size} #{alternate_on}'`,
           { encoding: 'utf-8', timeout: EXEC_TIMEOUT_MS }
         )
       );
@@ -6869,12 +7138,24 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // geometry is reported there for diagnosis rather than for repair. Only
       // the caller can see both sizes, so hand it this one.
       if (opts && geometry) opts.capturedGeometry = { cols: geometry.cols, rows: geometry.rows };
+      // Same query, no extra tmux call: how much scrollback a full-history pull
+      // could return. A pane in the alternate screen (fullscreen claude) holds
+      // none, and the partial-history notice must not promise it. A caller that
+      // bounded the capture with `historyLimitLines` also reads it to tell
+      // whether the bound cut anything.
+      if (opts && geometry?.historyLines !== undefined) opts.capturedHistoryLines = geometry.historyLines;
+      // A pane in the alternate screen keeps no history (a nested tmux client
+      // holds it there), so its capture is one screen however deep it reads.
+      if (opts && geometry?.alternateOn !== undefined) opts.capturedAlternateOn = geometry.alternateOn;
 
       if (fullHistory) {
         // Without geometry there is no cursor move, so fall back to the old trim.
         // Keeping the blank rows here would park the caret at the bottom of the
         // pane with nothing to correct it — worse than not trying at all.
-        if (!geometry) return normalizeScrollbackEol(rawCapture.replace(/\n+$/g, ''));
+        if (!geometry) {
+          const trimmed = rawCapture.replace(/\n+$/g, '');
+          return trimmed ? `${normalizeScrollbackEol(trimmed)}\x1b[0m` : '';
+        }
         // Take the line terminator off and nothing else. The trailing blank rows
         // that remain are the real bottom of the screen, and the cursor move
         // below counts up from it. tmux joins rows with a bare `\n`; normalize to
@@ -6888,7 +7169,10 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
         // `_replayWouldShrinkBuffer` exists to refuse, arriving from the server
         // side where that guard cannot see it.
         if (!hasVisibleContent(trimmed)) return '';
-        return `${normalizeScrollbackEol(trimmed)}${formatCursorRestore(geometry)}`;
+        // capture-pane -e can leave the last row's SGR active (e.g. a nested
+        // tmux status bar). Hand live output the same default style as a visible
+        // snapshot, resetting before the cursor move so its position is kept.
+        return `${normalizeScrollbackEol(trimmed)}\x1b[0m${formatCursorRestore(geometry)}`;
       }
 
       const buffer = rawCapture.replace(/\n+$/g, '');
@@ -6897,7 +7181,7 @@ export class TmuxManager extends EventEmitter implements TerminalMultiplexer {
       // positioned snapshot repaint and fall back to the raw capture. Normalize
       // its bare `\n` line endings to `\r\n` so the replay doesn't staircase
       // diagonally in a fresh xterm (COD-138, same reason as the fullHistory path).
-      return normalizeScrollbackEol(buffer);
+      return buffer ? `${normalizeScrollbackEol(buffer)}\x1b[0m` : '';
     } catch (err) {
       // ENOBUFS carries the truncated multi-MB stdout on the error object —
       // log a concise line instead of dumping it into the journal.
