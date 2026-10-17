@@ -67,7 +67,14 @@ function matchesComposerCapture(
         index = i;
         break;
       }
-    return index < 0 ? undefined : { text: rows[index].replace(/^\s*› ?/u, ''), footer: rows.slice(index + 1) };
+    return index < 0
+      ? undefined
+      : {
+          text: rows[index].replace(/^\s*› ?/u, ''),
+          // Native capture may pad a separator/footer row with ASCII spaces. Keep
+          // every row and all visible content, so added draft lines still refuse.
+          footer: rows.slice(index + 1).map((row) => row.replace(/ +$/u, '')),
+        };
   };
   const baseline = parts(emptyBaseline),
     actual = parts(screen);

@@ -95,3 +95,12 @@ it('matches only exact native folded codepoint count and the admitted empty foot
   expect(match('› [Pasted Content 9 chars]\n draft\n\n  example-model high · /tmp\n', expected, baseline)).toBe(false);
   expect(match('› [Pasted Content 9 chars]\n\n  example-model low · /tmp\n', expected, baseline)).toBe(false);
 });
+
+it('ignores native footer space padding while retaining separator count and draft content', async () => {
+  const { hasMatchingFoldedCodexPasteCapture: match } = await import('../src/recovery/codex-composer-capture.js');
+  const baseline = '› \n\n  example-model high · /tmp\n';
+  expect(match('› [Pasted Content 4 chars]\n \n  example-model high · /tmp   \n', 'Task', baseline)).toBe(true);
+  expect(match('› [Pasted Content 4 chars]\n \n \n  example-model high · /tmp\n', 'Task', baseline)).toBe(false);
+  expect(match('› [Pasted Content 4 chars]\n draft \n  example-model high · /tmp\n', 'Task', baseline)).toBe(false);
+  expect(match('› [Pasted Content 4 chars]\n\t\n  example-model high · /tmp\n', 'Task', baseline)).toBe(false);
+});

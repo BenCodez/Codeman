@@ -10,10 +10,10 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { parseNativePaneSignal } from '../src/recovery/native-pane-signal.js';
 import { join } from 'node:path';
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MuxSession } from '../src/mux-interface.js';
 import type { Session as SessionType } from '../src/session.js';
 import type { TmuxManager as ManagerType } from '../src/tmux-manager.js';
@@ -57,16 +57,28 @@ let previousMode: string | undefined;
 const workers: SessionType[] = [];
 const acceptedPackets = new Map<string, 'sent' | 'not-sent'>();
 const loadedFrames = new Map<string, string>();
+let moduleDataDirectory: string;
+const managers: ManagerType[] = [];
 beforeAll(async () => {
   // Enable the real command branches only after every child API is mocked.
   const vitest = process.env.VITEST;
+  const previousModuleData = process.env.CODEMAN_DATA_DIR;
+  // Mux metadata paths are captured at module evaluation, before beforeEach.
+  // Protect durable flushes even when this file is run without the CI config.
+  moduleDataDirectory = mkdtempSync(join(tmpdir(), 'native-recovery-module-data-'));
+  process.env.CODEMAN_DATA_DIR = moduleDataDirectory;
   delete process.env.VITEST;
   try {
     ({ TmuxManager } = await import('../src/tmux-manager.js'));
     ({ Session } = await import('../src/session.js'));
   } finally {
     if (vitest !== undefined) process.env.VITEST = vitest;
+    if (previousModuleData === undefined) delete process.env.CODEMAN_DATA_DIR;
+    else process.env.CODEMAN_DATA_DIR = previousModuleData;
   }
+});
+afterAll(() => {
+  if (moduleDataDirectory) rmSync(moduleDataDirectory, { recursive: true, force: true });
 });
 beforeEach(() => {
   acceptedPackets.clear();
@@ -82,6 +94,7 @@ beforeEach(() => {
 });
 afterEach(async () => {
   for (const worker of workers.splice(0)) await worker.stop(false);
+  for (const manager of managers.splice(0)) await manager.drainSessionSaves();
   if (previousData === undefined) delete process.env.CODEMAN_DATA_DIR;
   else process.env.CODEMAN_DATA_DIR = previousData;
   if (previousMode === undefined) delete process.env.CODEMAN_MULTIUSER;
@@ -99,6 +112,7 @@ function setGrant(granted: boolean) {
 }
 function bareManager(): ManagerType {
   const manager = Object.create(TmuxManager.prototype) as ManagerType;
+  managers.push(manager);
   for (const name of ['sessions', 'inputBrokers', 'inputBrokerLoads', 'inputQueues'])
     Reflect.set(manager, name, new Map());
   Reflect.set(manager, 'sessionSaves', Promise.resolve());
@@ -406,6 +420,14 @@ function commands() {
 }
 
 describe('native recovery pane frame validation', () => {
+  it('confines actual durable mux writes to the pre-import temporary module directory', async () => {
+    const manager = bareManager();
+    const perTestPath = join(directory, 'mux-sessions.json');
+    writeFileSync(perTestPath, 'per-test sentinel', { mode: 0o600 });
+    await manager.flushSessionsDurably();
+    expect(JSON.parse(readFileSync(join(moduleDataDirectory, 'mux-sessions.json'), 'utf8'))).toEqual([]);
+    expect(readFileSync(perTestPath, 'utf8')).toBe('per-test sentinel');
+  });
   it.each([
     '1|9|garbage|%7|700',
     '1|9|KILL|%7|700',
@@ -1259,6 +1281,7 @@ describe('native folded literal acknowledgment', () => {
   it.each([
     'valid',
     'unicode',
+    'padded-footer',
     'missing-receipt',
     'wrong-hash',
     'owner-input',
@@ -1298,13 +1321,13 @@ describe('native folded literal acknowledgment', () => {
                 },
               ];
         updateFakeInputProvenance(f.pane.inputProvenance, {}, () => state);
-        f.pane.screen = `› [Pasted Content ${Array.from(prompt).length + (variant === 'wrong-count' ? 1 : 0)} chars]\n\n  fixture-model ${variant === 'changed-footer' ? 'low' : 'high'} · /tmp\n`;
+        f.pane.screen = `› [Pasted Content ${Array.from(prompt).length + (variant === 'wrong-count' ? 1 : 0)} chars]\n${variant === 'padded-footer' ? ' ' : ''}\n  fixture-model ${variant === 'changed-footer' ? 'low' : 'high'} · /tmp\n`;
       }
       return result;
     });
     const result = await f.deliver();
     const submitted = childCommands().some(isEnter);
-    expect(submitted).toBe(variant === 'valid' || variant === 'unicode');
+    expect(submitted).toBe(variant === 'valid' || variant === 'unicode' || variant === 'padded-footer');
     expect(childCommands().some(isLiteral)).toBe(true);
     if (submitted) expect(result).toBe('sent');
   });
