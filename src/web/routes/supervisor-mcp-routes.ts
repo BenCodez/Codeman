@@ -125,7 +125,9 @@ const tools = toolNames.map((name) => ({
             properties: {
               workerId: { type: 'string', pattern: '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' },
               requestId: { type: 'string', minLength: 8, maxLength: 120, pattern: '^[A-Za-z0-9_:.-]+$' },
-              ...(name === 'supervisor_message' ? { message: { type: 'string', minLength: 1, maxLength: 4000 } } : {}),
+              ...(name === 'supervisor_message'
+                ? { message: { type: 'string', minLength: 1, maxLength: 4000, pattern: '\\S' } }
+                : {}),
             },
             required: ['workerId', 'requestId', ...(name === 'supervisor_message' ? ['message'] : [])],
             additionalProperties: false,

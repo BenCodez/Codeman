@@ -552,3 +552,26 @@ it('aligns advertised and admitted Unicode note sizes, rejecting oversized notes
   }
   expect(f.brain.append).toHaveBeenCalledTimes(3);
 });
+
+it('advertises the same non-whitespace message constraint that runtime admission enforces', async () => {
+  const f = await fixture();
+  const schema = (await f.rpc('tools/list'))
+    .json()
+    .result.tools.find((tool: { name: string }) => tool.name === 'supervisor_message').inputSchema;
+  const validate = new Ajv({ allErrors: true }).compile(schema);
+  for (const message of ['   ', '\r\n', '\u00a0\u2003']) {
+    const args = { workerId: WORKER, requestId: REQUEST, message };
+    expect(validate(args)).toBe(false);
+    expect((await f.rpc('tools/call', { name: 'supervisor_message', arguments: args })).json().error).toMatchObject({
+      code: -32602,
+    });
+  }
+  expect(f.controller.message).not.toHaveBeenCalled();
+  for (const message of ['Inspect the checkpoint', '  Preserve spacing.\nInspect next.  ', '\u2003界\u2003']) {
+    const args = { workerId: WORKER, requestId: REQUEST, message };
+    expect(validate(args)).toBe(true);
+    expect((await f.rpc('tools/call', { name: 'supervisor_message', arguments: args })).json().error).toBeUndefined();
+    expect(f.controller.message).toHaveBeenLastCalledWith(WORKER, REQUEST, message, expect.any(Function));
+  }
+  expect(f.controller.message).toHaveBeenCalledTimes(3);
+});
