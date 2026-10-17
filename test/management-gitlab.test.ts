@@ -198,6 +198,27 @@ describe('private direct GitLab connection', () => {
       capacityReached: false,
     });
   });
+  it('returns the final supported tree page with an explicit capacity boundary', async () => {
+    await configure();
+    const entries = [{ id: sha, name: 'file.ts', path: 'src/file.ts', type: 'blob', mode: '100644' }];
+    transport.mockResolvedValueOnce(json(entries, 200, { 'x-next-page': '101' }));
+    expect(
+      await service.operate('alice', { operation: 'tree', projectId: 1, branch: 'main', path: 'src', page: 100 })
+    ).toEqual({ entries, truncated: true, nextPage: null, capacityReached: true });
+    expect(
+      GitLabOperationSchema.safeParse({ operation: 'tree', projectId: 1, branch: 'main', page: 101 }).success
+    ).toBe(false);
+    transport.mockResolvedValueOnce(json(entries, 200, { 'x-next-page': '' }));
+    expect(
+      await service.operate('alice', { operation: 'tree', projectId: 1, branch: 'main', path: 'src', page: 100 })
+    ).toEqual({ entries, truncated: false, nextPage: null, capacityReached: false });
+    for (const cursor of ['102', '0101', 'NaN']) {
+      transport.mockResolvedValueOnce(json(entries, 200, { 'x-next-page': cursor }));
+      await expect(
+        service.operate('alice', { operation: 'tree', projectId: 1, branch: 'main', page: 100 })
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    }
+  });
   it('checks actual selected project access and the all-project endpoint', async () => {
     await configure();
     const original = transport.getMockImplementation()!;

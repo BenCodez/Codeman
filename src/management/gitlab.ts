@@ -465,9 +465,13 @@ export class GitLabService {
       .max(100)
       .parse(result.json);
     const nextPage = result.nextPage ? Number(result.nextPage) : null;
-    if (result.nextPage && (!/^[1-9][0-9]{0,2}$/.test(result.nextPage) || nextPage !== page + 1 || nextPage > 100))
+    if (
+      nextPage !== null &&
+      (!Number.isSafeInteger(nextPage) || nextPage !== page + 1 || String(nextPage) !== result.nextPage)
+    )
       throw new GitLabError('unavailable');
-    return { entries, truncated: nextPage !== null, nextPage };
+    const capacityReached = nextPage !== null && page >= 100;
+    return { entries, truncated: nextPage !== null, nextPage: capacityReached ? null : nextPage, capacityReached };
   }
   private async file(owner: string, connection: Connection, projectId: number, branch: string, path: string) {
     const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : undefined;

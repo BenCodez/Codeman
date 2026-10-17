@@ -422,6 +422,45 @@ describe('manager authority at the real server boundary', () => {
     );
   }
 
+  it.each(['objective', 'worker-task', 'worker-criteria', 'worker-grants', 'owner-pause'] as const)(
+    'binds durable owner setup replay to unchanged role work and current active state: %s',
+    async (change) => {
+      let status = {
+        ...manager.getStatus(),
+        phase: 'paused' as import('../src/types/supervisor.js').SupervisorState['phase'],
+        reason: 'owner-paused',
+      };
+      vi.spyOn(manager, 'getStatus').mockImplementation(() => structuredClone(status));
+      const start = vi.spyOn(manager, 'start').mockImplementation(async () => {
+        status = {
+          ...status,
+          phase: 'active',
+          reason: 'manager-started',
+          history: [...status.history, { at: Date.now(), reason: 'manager-started' }],
+        };
+        return structuredClone(status);
+      });
+      const prepare = vi.spyOn(server as unknown as Internals, 'prepareSupervisorManager').mockResolvedValue(true);
+      const setup = Reflect.get(server, 'setupAndStartSupervisorManager').bind(server);
+      const requestId = 'owner-role-bound-start';
+      const first = await setup(managerSession, requestId, () => true);
+      expect(first.phase).toBe('started');
+      // Start's own phase/history changes must not invalidate a normal retry.
+      expect(await setup(managerSession, requestId, () => true)).toEqual(first);
+      expect(start).toHaveBeenCalledOnce();
+      if (change === 'objective') status.objective = 'Owner replacement objective';
+      if (change === 'worker-task') status.workers[0].task = 'Owner replacement task';
+      if (change === 'worker-criteria') status.workers[0].criteria[0].description = 'Owner replacement criterion';
+      if (change === 'worker-grants') status.workers[0].maxAssignments++;
+      if (change === 'owner-pause') status = { ...status, phase: 'paused', reason: 'owner-paused' };
+      await expect(setup(managerSession, requestId, () => true)).rejects.toThrow(
+        change === 'owner-pause' ? 'no longer active' : 'scope changed'
+      );
+      expect(start).toHaveBeenCalledOnce();
+      expect(prepare).toHaveBeenCalledOnce();
+    }
+  );
+
   it('owner reset revokes the manager credential and launch artifacts before awaiting its journal', async () => {
     const registry = Reflect.get(
       server,

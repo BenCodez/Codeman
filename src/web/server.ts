@@ -3287,7 +3287,6 @@ export class WebServer extends EventEmitter {
         session.docker,
       ]);
     const captured = configuration();
-    const scope = createHash('sha256').update(captured).digest('hex');
     const role = this.getSupervisorController(session);
     if (!role) throw new SupervisorValidationError('Manager setup is unavailable');
     const roleConfiguration = () => {
@@ -3307,6 +3306,9 @@ export class WebServer extends EventEmitter {
       ]);
     };
     const capturedRole = roleConfiguration();
+    const scope = createHash('sha256')
+      .update(JSON.stringify([captured, capturedRole]))
+      .digest('hex');
     const roleIntent = JSON.stringify([role.getStatus().phase, role.getStatus().reason, role.getStatus().history]);
     let starting = false;
     const current = () =>
@@ -3320,7 +3322,7 @@ export class WebServer extends EventEmitter {
       this.supervisorManagerIsEligible(session) &&
       capturedRole === roleConfiguration();
     this.managerSetupJournal ??= new ManagerSetupJournal();
-    return this.managerSetupJournal.run(session.id, requestId, scope, {
+    const receipt = await this.managerSetupJournal.run(session.id, requestId, scope, {
       current,
       prepare: () => this.prepareSupervisorManager(session, current),
       setupTurn: (reserve) => this.sendManagerSetupTurn(session, requestId, current, reserve),
@@ -3330,6 +3332,14 @@ export class WebServer extends EventEmitter {
         return (await role.start()).phase === 'active' && current();
       },
     });
+    // Own Start changes phase/history, so those do not belong in the durable
+    // request scope. A later owner pause must still prevent stale confirmation.
+    if (
+      receipt.phase === 'started' &&
+      (role.getStatus().phase !== 'active' || capturedRole !== roleConfiguration() || captured !== configuration())
+    )
+      throw new SupervisorValidationError('Previous manager start is no longer active; use a new owner request');
+    return receipt;
   }
 
   private async sendManagerSetupTurn(
