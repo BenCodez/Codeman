@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   MAX_AGENT_OBSERVATION_BYTES,
   observeManagementAgent,
@@ -37,6 +37,74 @@ function fixture() {
   };
 }
 describe('management cached observation', () => {
+  it('learns from a read-only local pane after reattachment leaves the cache empty', () => {
+    const f = fixture();
+    f.agent.textOutput = '';
+    const capture = vi.fn(() => '\u001b[32mMaintaining the API migration tests\u001b[0m');
+    const result = observeManagementAgent(
+      'worker',
+      'manager',
+      'alice',
+      () => f.agent,
+      () => true,
+      capture
+    );
+    expect(result).toMatchObject({
+      source: 'codeman-local-pane-scrollback',
+      output: 'Maintaining the API migration tests',
+      contextAvailable: true,
+      identityVerified: false,
+      workerHealthVerified: false,
+    });
+    expect(capture).toHaveBeenCalledOnce();
+  });
+  it('does not capture panes when cached context is available', () => {
+    const f = fixture();
+    const capture = vi.fn(() => 'unused');
+    observeManagementAgent(
+      'worker',
+      'manager',
+      'alice',
+      () => f.agent,
+      () => true,
+      capture
+    );
+    expect(capture).not.toHaveBeenCalled();
+  });
+  it.each(['cancel', 'replace'] as const)('refuses context when ownership changes during capture: %s', (action) => {
+    const f = fixture();
+    f.agent.textOutput = '';
+    let target: ObservableManagementAgent = f.agent;
+    let current = true;
+    expect(() =>
+      observeManagementAgent(
+        'worker',
+        'manager',
+        'alice',
+        () => target,
+        () => current,
+        () => {
+          if (action === 'cancel') current = false;
+          else target = { ...f.agent };
+          return 'private context';
+        }
+      )
+    ).toThrow();
+  });
+  it('reports missing context when no existing pane can be read', () => {
+    const f = fixture();
+    f.agent.textOutput = '';
+    expect(
+      observeManagementAgent(
+        'worker',
+        'manager',
+        'alice',
+        () => f.agent,
+        () => true,
+        () => null
+      )
+    ).toMatchObject({ contextAvailable: false, output: '', identityVerified: false });
+  });
   it('returns cached context with explicit uncertainty and timestamps', () => {
     const f = fixture();
     expect(f.read()).toMatchObject({

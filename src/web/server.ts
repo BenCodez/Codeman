@@ -1370,7 +1370,23 @@ export class WebServer extends EventEmitter {
         observe: async (scope, agentId, current) => {
           const owner = scope.owner ?? 'admin';
           const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
-          return observeManagementAgent(agentId, scope.sessionId, owner, (id) => this.sessions.get(id), authority);
+          return observeManagementAgent(
+            agentId,
+            scope.sessionId,
+            owner,
+            (id) => this.sessions.get(id),
+            authority,
+            (candidate) => {
+              const pane = this.mux.getSession(candidate.id);
+              if (!pane || !authority()) return null;
+              const output = this.mux.captureActivePaneBuffer?.(pane.muxName, {
+                fullHistory: true,
+                historyLimitLines: 200,
+                maxCaptureBytes: 64 * 1024,
+              });
+              return this.mux.getSession(candidate.id) === pane && authority() ? (output ?? null) : null;
+            }
+          );
         },
         conversation: async (scope, agentId, options, current) => {
           const owner = scope.owner ?? 'admin';

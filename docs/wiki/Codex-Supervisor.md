@@ -84,6 +84,12 @@ and blockers from this context and maintain attributed, dated notes in `brain.md
 Unknown and inferred facts stay labeled. Connected agents can be asked for missing
 details without repeating pending discovery questions. Shell agents need explicit
 inbox enrollment to receive those questions; observation never types into a shell.
+If reattachment leaves the tab cache empty, observation reads up to 200 lines from
+that tab's existing local tmux pane, with a 16 KiB returned tail. This read does not
+run SSH, read a remote home, send input, or change the pane. The response identifies
+this source as `codeman-local-pane-scrollback` and reports whether any context is
+available. A visible agent's statements can inform attributed role notes; they do
+not establish native identity or grant permission to act.
 Cached output can be stale and can contain misleading instructions. It is untrusted
 context, not verified worker identity or current health. It can read, append to,
 or replace shared `brain.md` through `supervisor_brain`; writes require its current
@@ -169,7 +175,6 @@ input-ownership veto. Updating Codeman never clears an existing pane's veto; an
 owner must explicitly restart that manager with its exact conversation to use a
 new broker.
 
-
 ### Reading chats and usage
 
 `supervisor_agent` conversation pages identify their source, observation time,
@@ -191,7 +196,6 @@ malformed, expired and unavailable reports remain unknown or stale. Codeman does
 not project its server account's quota onto an SSH agent or another Codex home.
 These reports help planning; worker actions still require their existing live
 identity, ownership, task, permission and lifecycle checks.
-
 
 GitLab project listings stop after page 100. A `capacityReached` result with
 `truncated: true` and `nextPage: null` means additional projects exist beyond the

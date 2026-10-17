@@ -19,7 +19,8 @@ export function observeManagementAgent(
   managerId: string,
   owner: string,
   lookup: (id: string) => ObservableManagementAgent | undefined,
-  current: () => boolean
+  current: () => boolean,
+  readLocalPane?: (session: ObservableManagementAgent) => string | null
 ) {
   const session = lookup(agentId);
   const allowed = () =>
@@ -31,9 +32,20 @@ export function observeManagementAgent(
     !session.docker &&
     (['codex', 'claude'].includes(session.mode) || (!!session.remote && session.mode === 'shell'));
   if (!allowed() || !session) throw new BrainStoreError('forbidden');
-  // This reads Codeman's existing output cache. It never runs SSH, captures a pane,
-  // submits input, reads a Codex home or asserts that a remote shell contains Codex.
-  const bytes = Buffer.from(stripAnsi(session.textOutput), 'utf8');
+  // Reattached tabs can have an empty output cache until their next repaint.
+  // The fallback reads only the existing local tmux pane, never SSH or input.
+  let output = stripAnsi(session.textOutput);
+  let source = 'codeman-cached-tab-output';
+  if (!output.trim() && readLocalPane) {
+    if (!allowed()) throw new BrainStoreError('forbidden');
+    const pane = readLocalPane(session);
+    if (!allowed()) throw new BrainStoreError('forbidden');
+    if (pane !== null) {
+      output = stripAnsi(pane);
+      source = 'codeman-local-pane-scrollback';
+    }
+  }
+  const bytes = Buffer.from(output, 'utf8');
   let start = Math.max(0, bytes.length - MAX_AGENT_OBSERVATION_BYTES);
   while (start < bytes.length && (bytes[start] & 0xc0) === 0x80) start++;
   const result = {
@@ -45,11 +57,12 @@ export function observeManagementAgent(
     tabStatus: session.status,
     capturedAt: Date.now(),
     lastActivityAt: session.lastActivityAt,
-    source: 'codeman-cached-tab-output',
+    source,
     trust: 'untrusted-context',
     identityVerified: false,
     workerHealthVerified: false,
     output: bytes.subarray(start).toString('utf8'),
+    contextAvailable: !!output.trim(),
     truncated: start > 0,
   };
   if (!allowed()) throw new BrainStoreError('forbidden');

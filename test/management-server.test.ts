@@ -360,6 +360,63 @@ it('imports the selected manager memory and its receipts on the first global con
   for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
 });
 
+it('reads only the selected owner tab through MCP when its post-restart cache is empty', async () => {
+  const h = await fixture();
+  const config = (await h.app.inject({ method: 'GET', url: '/api/management', headers: ownerHeaders })).json().data;
+  expect(
+    (
+      await h.app.inject({
+        method: 'PUT',
+        url: '/api/management',
+        headers: ownerHeaders,
+        payload: { ifMatch: config.revision, managerSessionId: MANAGER, agents: [] },
+      })
+    ).statusCode
+  ).toBe(200);
+  vi.spyOn(h.manager, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
+  vi.spyOn(h.server as never, 'getSupervisorController' as never).mockReturnValue({
+    confirmManagerLaunch: async () => true,
+    captureBrainAuthority: async (current: () => boolean) => current,
+  } as never);
+  const mux = Reflect.get(h.server, 'mux') as TmuxManager;
+  const pane = { sessionId: SHELL, muxName: 'codeman-fixture' };
+  vi.spyOn(mux, 'getSession').mockImplementation((id) => (id === SHELL ? (pane as never) : undefined));
+  const capture = vi.spyOn(mux, 'captureActivePaneBuffer').mockReturnValue('Agent report: maintain backend tests.');
+  const credentials = Reflect.get(
+    h.server,
+    'supervisorManagerCredentials'
+  ) as import('../src/supervisor/manager-credentials.js').ManagerCredentialRegistry;
+  const issued = credentials.issue({ sessionId: MANAGER, isCurrent: () => true, canOperate: () => true });
+  const call = (agentId: string) =>
+    h.app.inject({
+      method: 'POST',
+      url: '/api/supervisor-mcp',
+      headers: { host: '127.0.0.1', authorization: 'Bearer ' + issued.token },
+      payload: {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: { name: 'supervisor_agent', arguments: { mode: 'observe', agentId } },
+      },
+    });
+  const response = (await call(SHELL)).json();
+  expect(response.error).toBeUndefined();
+  expect(JSON.parse(response.result.content[0].text)).toMatchObject({
+    source: 'codeman-local-pane-scrollback',
+    output: 'Agent report: maintain backend tests.',
+    identityVerified: false,
+  });
+  expect(capture).toHaveBeenCalledWith('codeman-fixture', {
+    fullHistory: true,
+    historyLimitLines: 200,
+    maxCaptureBytes: 65536,
+  });
+  capture.mockClear();
+  expect((await call(OTHER)).json().error).toBeDefined();
+  expect(capture).not.toHaveBeenCalled();
+  for (const effect of h.effects) expect(effect).not.toHaveBeenCalled();
+});
+
 it('keeps unselected supervisor MCP memory private and writable without global selection', async () => {
   const h = await fixture();
   const legacy = Reflect.get(h.server, 'supervisorBrainStore') as import('../src/supervisor/brain.js').BrainStore;
