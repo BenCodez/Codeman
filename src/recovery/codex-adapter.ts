@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** @fileoverview Codex-specific recovery authority for verified local and owned SSH panes. */
 import { createHash } from 'node:crypto';
 import type { Session } from '../session.js';
@@ -1016,7 +1017,7 @@ export class CodexRecoveryAdapter {
         mtimeMs: leaf.mtimeMs,
         ctimeMs: leaf.ctimeMs,
         hash: createHash('sha256').update(expected.tail).digest('hex'),
-        maxBytes: 262_144,
+        maxBytes: MAX_CODEX_ROLLOUT_BYTES,
       },
     ];
     authority.paths = expected.witness.paths.map((path) => ({ ...path }));

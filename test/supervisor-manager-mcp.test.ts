@@ -769,3 +769,24 @@ it('accepts native first-page discovery and MCP metadata without expanding tool 
   expect(f.controller.message).not.toHaveBeenCalled();
   expect(f.generic).not.toHaveBeenCalled();
 });
+
+it('records discovery only after valid authenticated initialization and tools listing', async () => {
+  const f = await fixture();
+  await f.rpc('tools/list');
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('initialize', { protocolVersion: '2025-03-26' });
+  await f.rpc('tools/list');
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('initialize', {
+    protocolVersion: '2025-03-26',
+    capabilities: {},
+    clientInfo: { name: 'native-fixture', version: '1' },
+  });
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('tools/list', { cursor: 12 });
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+  await f.rpc('tools/list', { _meta: {}, cursor: undefined });
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(true);
+  f.revoke();
+  expect(f.registry.hasToolsDiscovery(SID)).toBe(false);
+});

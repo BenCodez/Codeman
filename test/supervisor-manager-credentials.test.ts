@@ -101,3 +101,33 @@ it('requires a literal current readiness grant independently of inspection authe
   issued.revoke();
   expect(registry.canOperate(scope)).toBe(false);
 });
+
+it('requires ordered authenticated MCP discovery from the exact current launch', () => {
+  const registry = new ManagerCredentialRegistry();
+  let current = true;
+  const first = registry.issue({ sessionId: SID, isCurrent: () => current });
+  const scope = registry.resolve(first.token)!;
+  expect(registry.hasToolsDiscovery(SID)).toBe(false);
+  registry.recordToolsDiscovery(scope);
+  expect(registry.hasToolsDiscovery(SID)).toBe(false);
+  registry.recordInitialization({ ...scope });
+  registry.recordToolsDiscovery(scope);
+  expect(registry.hasToolsDiscovery(SID)).toBe(false);
+  registry.recordInitialization(scope);
+  expect(registry.hasToolsDiscovery(SID)).toBe(false);
+  registry.recordToolsDiscovery(scope);
+  expect(registry.hasToolsDiscovery(SID)).toBe(true);
+  current = false;
+  expect(registry.hasToolsDiscovery(SID)).toBe(false);
+  current = true;
+  const replacement = registry.issue({ sessionId: SID, isCurrent: () => true });
+  registry.recordInitialization(scope);
+  registry.recordToolsDiscovery(scope);
+  expect(registry.hasToolsDiscovery(SID)).toBe(false);
+  const next = registry.resolve(replacement.token)!;
+  registry.recordInitialization(next);
+  registry.recordToolsDiscovery(next);
+  expect(registry.hasToolsDiscovery(SID)).toBe(true);
+  registry.revokeAll();
+  expect(registry.hasToolsDiscovery(SID)).toBe(false);
+});

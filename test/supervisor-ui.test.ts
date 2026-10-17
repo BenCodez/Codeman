@@ -341,6 +341,36 @@ describe('Codex supervisor UI', () => {
     expect(read('index.html')).toMatch(/--no-daemon.*verified Codex identity/s);
   });
 
+  it.each([true, false, undefined])(
+    'one-action Start requires confirmed preparation with literal readiness: %s',
+    async (ready) => {
+      const h = harness();
+      h.app.openSupervisorOptions(SID);
+      await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+      vi.spyOn(h.dom.window, 'confirm').mockReturnValue(true);
+      h.app._apiJson.mockClear();
+      h.app._apiJson.mockImplementation(async (url: string) =>
+        url.endsWith('/prepare-manager') ? { managerReady: ready, managerInspectionOnly: ready === false } : state()
+      );
+      await h.app.setupAndStartSupervisorManager();
+      expect(h.app._apiJson.mock.calls[0]).toEqual([
+        `/api/sessions/${SID}/supervisor/prepare-manager`,
+        { method: 'POST', body: { confirmRestrictedManager: true } },
+      ]);
+      expect(h.app._apiJson.mock.calls.some(([url]: [string]) => url.endsWith('/start'))).toBe(ready === true);
+    }
+  );
+
+  it('does not prepare or start after cancelling the combined confirmation', async () => {
+    const h = harness();
+    h.app.openSupervisorOptions(SID);
+    await vi.waitFor(() => expect(h.app._supervisorView.busy).toBe(false));
+    vi.spyOn(h.dom.window, 'confirm').mockReturnValue(false);
+    h.app._apiJson.mockClear();
+    await h.app.setupAndStartSupervisorManager();
+    expect(h.app._apiJson).not.toHaveBeenCalled();
+  });
+
   it('requires separate owner confirmation to prepare the exact manager without starting it', async () => {
     const h = harness();
     h.app.openSupervisorOptions(SID);

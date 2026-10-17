@@ -11,6 +11,7 @@ import { clampRecoveryLaunchForOwner } from '../src/session-env-clamp.js';
 import { dataPath } from '../src/config/instance.js';
 import { currentLocalCodexHome } from '../src/recovery/codex-home.js';
 import { WebServer } from '../src/web/server.js';
+import { ManagerCredentialRegistry } from '../src/supervisor/manager-credentials.js';
 import { registerSupervisorRoutes } from '../src/web/routes/supervisor-routes.js';
 import { createRouteTestHarness } from './routes/_route-test-utils.js';
 import { Session } from '../src/session.js';
@@ -204,6 +205,8 @@ describe('manager authority at the real server boundary', () => {
   let previousPassword: string | undefined;
 
   beforeEach(async () => {
+    // Native MCP transport is separately exercised through the real route suite.
+    vi.spyOn(ManagerCredentialRegistry.prototype, 'hasToolsDiscovery').mockReturnValue(true);
     previousData = process.env.CODEMAN_DATA_DIR;
     previousMode = process.env.CODEMAN_MULTIUSER;
     previousPassword = process.env.CODEMAN_PASSWORD;
@@ -610,6 +613,36 @@ describe('manager authority at the real server boundary', () => {
       expect(prepare).toHaveBeenCalledTimes(verified ? 1 : 0);
     }
   );
+
+  it('requires native tool discovery and refreshes idle evidence after an earlier ready result', async () => {
+    await manager.pause();
+    observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+    vi.mocked(ManagerCredentialRegistry.prototype.hasToolsDiscovery).mockReturnValue(false);
+    let launched = false;
+    let offset = 0;
+    const now = performance.now();
+    vi.spyOn(performance, 'now').mockImplementation(() => now + offset);
+    const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+    const original = observe.getMockImplementation()!;
+    observe.mockImplementation(async function () {
+      const result = await original.call(this);
+      if (launched) offset += 5_001;
+      return result;
+    });
+    const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockImplementation(async () => {
+      launched = true;
+      return true;
+    });
+    expect(await internals.prepareSupervisorManager(managerSession, () => true)).toEqual({ inspectionOnly: true });
+    await expect(manager.start()).rejects.toThrow(/restricted manager/);
+    vi.mocked(ManagerCredentialRegistry.prototype.hasToolsDiscovery).mockReturnValue(true);
+    expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(true);
+    observation = { ...observation, activity: 'working', processReady: true };
+    expect(await internals.prepareSupervisorManager(managerSession, () => true)).toEqual({ inspectionOnly: true });
+    expect(prepare).toHaveBeenCalledOnce();
+    await expect(manager.start()).rejects.toThrow(/restricted manager/);
+    expect(effects).not.toHaveBeenCalled();
+  });
 
   it('prepares only a verified idle manager with explicit request scope, retaining UUID and private startup evidence', async () => {
     await manager.pause();

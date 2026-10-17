@@ -734,3 +734,28 @@ it('requires a new owner turn after the native workspace reload failure', () => 
     )
   ).toMatchObject({ activity: 'paused', safeToAct: false });
 });
+
+it('retains early child and approval vetoes across a complete larger conversation', () => {
+  const padding = (
+    JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'x'.repeat(1024) }] },
+    }) + '\n'
+  ).repeat(300);
+  const completed = line(complete(), NOW - 1000) + '\n';
+  const full = line(start(), NOW - 10000) + '\n' + padding + completed;
+  expect(Buffer.byteLength(full)).toBeGreaterThan(262144);
+  expect(classifyCodexTail(full, context())).toMatchObject({ activity: 'completed' });
+  for (const veto of [
+    { type: 'request_permissions' },
+    { type: 'collab_agent_spawn_begin', call_id: 'pending', sender_thread_id: THREAD, started_at_ms: NOW - 9000 },
+  ]) {
+    const result = classifyCodexTail(
+      line(start(), NOW - 10000) + '\n' + line(veto, NOW - 9000) + '\n' + padding + completed,
+      context()
+    );
+    expect(result.activity).not.toBe('completed');
+    expect(result.safeToAct).toBe(false);
+  }
+  expect(classifyCodexTail(full, context({ tailTruncated: true }))).toMatchObject({ safeToAct: false });
+});

@@ -274,6 +274,7 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
           .strict()
           .safeParse(params);
         if (!init.success) return fail(id, -32602, 'Invalid initialization');
+        ctx.credentials.recordInitialization(scope);
         return send({
           jsonrpc: '2.0',
           id,
@@ -312,6 +313,7 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
       if (method === 'tools/list') {
         if (params !== undefined && !Discovery.safeParse(params).success)
           return fail(id, -32602, 'Invalid tools request');
+        ctx.credentials.recordToolsDiscovery(scope);
         return send({
           jsonrpc: '2.0',
           id,

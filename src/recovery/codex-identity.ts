@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /**
  * @fileoverview Fail-closed attribution of an isolated Codex pane to its rollout.
  *
@@ -60,7 +61,7 @@ export interface CodexIdentityResult {
 export { checkCodexIdentityWitness as confirmCodexIdentityWitness } from './codex-witness-check.js';
 
 const HEAD_BYTES = 128 * 1024;
-const TAIL_BYTES = 256 * 1024;
+const TAIL_BYTES = MAX_CODEX_ROLLOUT_BYTES;
 const HISTORY_BYTES = 256 * 1024;
 const HISTORY_WINDOW_MS = 2_000;
 const WALL_CLOCK_MS = 2_000;

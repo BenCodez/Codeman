@@ -854,7 +854,7 @@ async function fixture() {
     options: { token: TOKEN, endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp', isCurrent: () => current },
   };
 }
-it('ordinary restored Session cannot adopt a manager role; exact acknowledged restricted conversion works and owner intent revokes it', async () => {
+it('ordinary restored Session cannot adopt a manager role; tracked teaching retains the exact restricted conversion', async () => {
   const f = await fixture();
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
   expect(await f.session.prepareSupervisorManager(f.options)).toBe(true);
@@ -873,6 +873,10 @@ it('ordinary restored Session cannot adopt a manager role; exact acknowledged re
   expect(f.session.getRecoveryContext().codexHome).toBe(f.home);
   f.session.trackUserInput('Owner takes over\r');
   await Reflect.get(f.session, '_recoveryFencePublication');
+  // Tracked teaching revokes task authority at the server boundary, while the
+  // native process must retain its exact launch files for per-turn reloads.
+  expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(true);
+  Reflect.set(f.session, '_recoveryUntrackedInput', true);
   expect(f.session.isSupervisorManagerLaunchCurrent()).toBe(false);
   await f.session.revokeSupervisorManagerLaunch();
   expect(await fs.readdir(f.home)).toEqual([]);

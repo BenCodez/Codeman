@@ -176,6 +176,7 @@ import { SessionActionArbiter } from '../supervision/action-arbiter.js';
 import { SupervisorController, SupervisorValidationError, classifyTaskKickoff } from '../supervisor/controller.js';
 import { haveDistinctSupervisorHomes } from '../supervisor/home-identity.js';
 import { ManagerCredentialRegistry } from '../supervisor/manager-credentials.js';
+import { MAX_CODEX_ROLLOUT_BYTES } from '../recovery/codex-evidence-limits.js';
 import { drainSupervisorManagerRetirements } from '../supervisor/manager-launch.js';
 import { registerSupervisorMcpRoutes } from './routes/supervisor-mcp-routes.js';
 import { buildSupervisorManagerTask, managerProgressAllowsAction } from '../supervisor/manager-task.js';
@@ -3024,7 +3025,7 @@ export class WebServer extends EventEmitter {
           mtimeMs: leaf.mtimeMs,
           ctimeMs: leaf.ctimeMs,
           hash: createHash('sha256').update(source.identity.tail).digest('hex'),
-          maxBytes: 262_144,
+          maxBytes: MAX_CODEX_ROLLOUT_BYTES,
         },
       ];
       const grantFile = grant.getFileWitness?.() ?? grant.fileWitness;
@@ -3066,7 +3067,7 @@ export class WebServer extends EventEmitter {
         checking = false;
       const checkReadiness = async (requestCurrent: () => boolean): Promise<boolean | { inspectionOnly: true }> => {
         if (requestCurrent() !== true) return scopeCurrent() ? false : refuse();
-        if (operationReady) return launchIsCurrent() ? true : refuse();
+        if (!launchIsCurrent()) return refuse();
         if (checking) return launchIsCurrent() ? { inspectionOnly: true } : false;
         checking = true;
         try {
@@ -3086,6 +3087,9 @@ export class WebServer extends EventEmitter {
                 requestCurrent() === true &&
                 current() &&
                 grant.isCurrent() &&
+                this.supervisorManagerCredentials.hasToolsDiscovery(session.id) &&
+                !session.isBusy() &&
+                !session.watching &&
                 observed.conversationId === session.codexConfig?.resumeSessionId &&
                 ['idle', 'completed'].includes(observed.activity) &&
                 hasFreshProcessReady(observed, launchStartedAt, Date.now())
@@ -3107,6 +3111,7 @@ export class WebServer extends EventEmitter {
           } catch {
             /* A failed observation never certifies readiness. */
           }
+          operationReady = false;
           // A cancelled recheck grants nothing and leaves the previous read-only proof intact.
           if (requestCurrent() !== true && scopeCurrent()) return false;
           return refuse();

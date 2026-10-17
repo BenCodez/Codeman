@@ -601,6 +601,7 @@ describe('Codex supervisor UI in Chromium', () => {
         await page.getByRole('button', { name: 'Prepare restricted manager' }).click();
         await page.waitForFunction(() => !(window as any).app._supervisorView.busy);
         expect(await page.locator('#supervisorPhase').textContent()).toBe('Ready');
+        page.once('dialog', (dialog) => void dialog.accept());
         await page.getByRole('button', { name: 'Start manager' }).click();
         await page.getByRole('button', { name: 'Assign task' }).click();
         await page.waitForFunction(() => !(window as any).app._supervisorView.workersBusy);

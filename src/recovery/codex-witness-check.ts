@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /** Bounded private FD verification; a stalled home never blocks the server's event loop. */
 import { createHash } from 'node:crypto';
 import { constants, type Stats } from 'node:fs';
@@ -153,7 +154,7 @@ async function verify(
       ...identity.witness!.paths.find((input) => input.path === identity.path && input.kind === 'file')!,
       path: identity.path!,
       hash: hashes[index],
-      maxBytes: 262_144,
+      maxBytes: MAX_CODEX_ROLLOUT_BYTES,
     }));
     for (const leaf of [...leaves, ...files]) {
       const matchesLeaf = (stat: Stats) =>

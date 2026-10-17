@@ -449,13 +449,15 @@ Object.assign(CodemanApp.prototype, {
       workers,
     });
   },
-  async prepareSupervisorManager() {
+  async prepareSupervisorManager(startAfter = false) {
     const view = this._supervisorView;
     if (!view?.state || view.busy || view.state.phase === 'active' || view.state.inFlight) return;
     if (
       !window.confirm(
         supervisorUiTranslate(
-          'Prepare this session as a restricted manager? This restarts the manager session in place using its verified conversation and restricted supervisor tools. Active work or uncertain delivery will refuse preparation.'
+          startAfter
+            ? 'Prepare and start this manager? The verified conversation is retained. Preparation may restart only this manager to connect restricted tools; Start runs the saved objective and enabled schedules. Active work or uncertain delivery will refuse setup.'
+            : 'Prepare this session as a restricted manager? This restarts the manager session in place using its verified conversation and restricted supervisor tools. Active work or uncertain delivery will refuse preparation.'
         )
       ) ||
       this._supervisorView !== view
@@ -475,6 +477,10 @@ Object.assign(CodemanApp.prototype, {
       view.busy = false;
     }
     if (this._supervisorView !== view) return;
+    if (prepared?.managerReady === true && startAfter) {
+      await this._performSupervisorRequest('/start', 'POST');
+      return;
+    }
     if (prepared?.managerReady === true)
       this.showToast(supervisorUiTranslate('Restricted manager prepared. Select Start manager to begin.'), 'success');
     else if (prepared?.managerReady === false && prepared?.managerInspectionOnly === true)
@@ -492,6 +498,9 @@ Object.assign(CodemanApp.prototype, {
         'error'
       );
     await this.loadSupervisorStatus();
+  },
+  async setupAndStartSupervisorManager() {
+    await this.prepareSupervisorManager(true);
   },
   async supervisorAction(action) {
     if (!['start', 'pause', 'reset'].includes(action)) return;

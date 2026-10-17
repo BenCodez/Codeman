@@ -1,3 +1,4 @@
+import { MAX_CODEX_ROLLOUT_BYTES } from './codex-evidence-limits.js';
 /**
  * @fileoverview Bounded Codex rollout classifier. Never classifies assistant prose as a control event.
  * Event shapes follow openai/codex rust-v0.162.1 protocol.rs (task_started/task_complete aliases,
@@ -413,7 +414,7 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
     conversationId: context.conversationId,
     safeToAct: false,
   };
-  if (Buffer.byteLength(tail) > 262_144 || (tail && !tail.endsWith('\n'))) return unknown;
+  if (Buffer.byteLength(tail) > MAX_CODEX_ROLLOUT_BYTES || (tail && !tail.endsWith('\n'))) return unknown;
   let result = unknown;
   let turnId: string | undefined;
   let terminalError: JsonObject | undefined;
