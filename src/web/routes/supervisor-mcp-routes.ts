@@ -24,6 +24,7 @@ export interface SupervisorMcpContext {
         ): ReturnType<SupervisorController['retry']>;
         message?(workerId: string, requestId: string, message: string, isCurrent?: () => boolean): Promise<unknown>;
         getManagerUsage?(): unknown;
+        confirmManagerLaunch?(): Promise<boolean>;
         captureBrainAuthority?(isCurrent: () => boolean): Promise<(() => boolean) | undefined>;
       })
     | undefined;
@@ -351,6 +352,8 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
       if (!args.success) return fail(id, -32602, 'Invalid manager tool arguments');
       const controller = ctx.resolveController(scope);
       if (!controller || !current()) return fail(id, -32001, 'Manager role is no longer current');
+      if (controller.confirmManagerLaunch && (!(await controller.confirmManagerLaunch()) || !current()))
+        return fail(id, -32001, 'Manager authentication or restricted configuration changed');
       let result: unknown;
       if (call.data.name === 'supervisor_status')
         result = {

@@ -59,6 +59,27 @@ describe('owner-global management and cooperative inbox', () => {
       agents: [{ sessionId: 'session-one', role: 'backend', notes: 'Owner-taught role', allowMessages: true }],
     });
   };
+  it('rejects oversized serialized configuration with capacity while preserving prior settings', async () => {
+    await enable();
+    const before = await service.read('alice');
+    const authority = await service.captureConfiguration('alice', () => true);
+    sessions = Array.from({ length: 100 }, (_, i) => ({ ...sessions[0], id: 'agent-' + i }));
+    const agents = sessions.map((session) => ({
+      sessionId: session.id,
+      role: '',
+      notes: '界'.repeat(2000),
+      allowMessages: false,
+    }));
+    await expect(
+      service.configure('alice', { ifMatch: before.revision, managerSessionId: null, agents })
+    ).rejects.toMatchObject({ code: 'capacity' });
+    expect(await service.read('alice')).toEqual(before);
+    expect(authority.current()).toBe(true);
+    const valid = agents.map((agent) => ({ ...agent, notes: 'Brief role' }));
+    expect(
+      (await service.configure('alice', { ifMatch: before.revision, managerSessionId: null, agents: valid })).agents
+    ).toHaveLength(100);
+  });
   it('persists global selection and isolates even an administrative owner from other sessions', async () => {
     const data = await enable();
     expect(data.agents.map((a) => a.sessionId)).toEqual(['session-one', 'manager-one']);

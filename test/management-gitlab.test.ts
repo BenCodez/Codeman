@@ -134,6 +134,48 @@ describe('private direct GitLab connection', () => {
     });
     expect(transport.mock.calls.some(([url]) => url.endsWith('/projects?per_page=50&page=1'))).toBe(true);
   });
+  it('finds a regular file on a later tree page for reads and guarded updates', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) => {
+      const u = new URL(url);
+      if (u.pathname.endsWith('/repository/tree') && u.searchParams.get('page') === '1')
+        return json([{ id: sha, name: 'other.ts', path: 'src/other.ts', type: 'blob', mode: '100644' }], 200, {
+          'x-next-page': '2',
+        });
+      return original(url, init);
+    });
+    expect(
+      await service.operate('alice', { operation: 'file', projectId: 1, branch: 'main', path: 'src/file.ts' })
+    ).toMatchObject({ content });
+    expect(await service.operate('alice', fileOperation)).toMatchObject({ status: 'succeeded' });
+    expect(
+      transport.mock.calls.filter(
+        ([url]) => url.includes('/repository/tree') && new URL(url).searchParams.get('page') === '2'
+      )
+    ).toHaveLength(2);
+  });
+  it('bounds directory pagination and refuses malformed cursors without a file write', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    for (const cursor of ['NaN', '1', '3', '101', '02']) {
+      transport.mockImplementation(async (url: string, init: RequestInit) =>
+        url.includes('/repository/tree') ? json([], 200, { 'x-next-page': cursor }) : original(url, init)
+      );
+      await expect(
+        service.operate('alice', { operation: 'file', projectId: 1, branch: 'main', path: 'src/file.ts' })
+      ).rejects.toMatchObject({ code: 'unavailable' });
+    }
+    transport.mockClear();
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      url.includes('/repository/tree')
+        ? json([], 200, { 'x-next-page': String(Number(new URL(url).searchParams.get('page')) + 1) })
+        : original(url, init)
+    );
+    await expect(service.operate('alice', fileOperation)).rejects.toMatchObject({ code: 'capacity' });
+    expect(transport.mock.calls.filter(([url]) => url.includes('/repository/tree'))).toHaveLength(10);
+    expect(transport.mock.calls.some(([, init]) => init.method === 'PUT')).toBe(false);
+  });
   it('validates UTF-8 blob content and rejects symlinks, stale blob metadata and unsafe paths', async () => {
     await configure();
     expect(

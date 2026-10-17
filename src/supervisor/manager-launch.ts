@@ -8,6 +8,7 @@ import type { CodexConfig } from '../types.js';
 import { readSupervisorManagerCatalog, MAX_SUPERVISOR_CATALOG_BYTES } from './manager-catalog.js';
 import type { PrivateFileWitness } from '../recovery/private-file-witness.js';
 import { checkPrivateFileWitnesses } from '../recovery/codex-witness-check.js';
+import { inspectManagerAuth, readPersonalManagerAuth } from './manager-auth.js';
 
 const MAX_FILE = 65_536;
 const issued = new WeakSet<SupervisorManagerLaunch>();
@@ -41,13 +42,15 @@ const quote = (text: string) => (/^[A-Za-z0-9_./:=@%+,-]+$/.test(text) ? text : 
 export interface SupervisorManagerLaunch {
   readonly expectedPane: Readonly<{ paneId: string; panePid: number }>;
   readonly conversationId: string;
+  readonly authMode: 'none' | 'apikey' | 'chatgpt';
   readonly home: string;
   readonly name: string;
   readonly file: string;
   readonly files: readonly PrivateFileWitness[];
   readonly missing: readonly string[];
   isCurrent(): boolean;
-  confirm(): Promise<boolean>;
+  /** Runtime rechecks omit the one-time pre-conversion rollout witnesses. */
+  confirm(runtime?: boolean): Promise<boolean>;
   /** Revoke immediately, then remove only this invocation's verified private artifacts. */
   revoke(): Promise<boolean>;
 }
@@ -101,7 +104,8 @@ export function supervisorManagerCommand(profile: SupervisorManagerLaunch, confi
   );
   // Unset after tmux's normal exports: neither inherited server credentials nor
   // hooks are available to this restricted process or its one trusted bridge.
-  return `env -u CODEMAN_PASSWORD -u CODEMAN_USERNAME -u CODEMAN_HOOK_SECRET -u CODEMAN_HOOK_SECRET_FILE -u CODEMAN_QR_TOKEN -u CODEX_ACCESS_TOKEN -u OPENAI_FEDERATION_RULE_ID -u OPENAI_IDENTITY_TOKEN_FILE -u OPENAI_WORKLOAD_IDENTITY_CONTEXT CODEMAN_SUPERVISOR_SCOPED=1 ${args.map(quote).join(' ')}`;
+  const subscriptionAuth = profile.authMode === 'chatgpt' ? '-u OPENAI_API_KEY -u CODEX_API_KEY ' : '';
+  return `env ${subscriptionAuth}-u CODEMAN_PASSWORD -u CODEMAN_USERNAME -u CODEMAN_HOOK_SECRET -u CODEMAN_HOOK_SECRET_FILE -u CODEMAN_QR_TOKEN -u CODEX_ACCESS_TOKEN -u OPENAI_FEDERATION_RULE_ID -u OPENAI_IDENTITY_TOKEN_FILE -u OPENAI_WORKLOAD_IDENTITY_CONTEXT CODEMAN_SUPERVISOR_SCOPED=1 ${args.map(quote).join(' ')}`;
 }
 
 export async function prepareSupervisorManagerLaunch(options: {
@@ -153,6 +157,7 @@ export async function prepareSupervisorManagerLaunch(options: {
     const files: PrivateFileWitness[] = (options.additionalFiles ?? []).map((value) => ({ ...value })),
       missing: string[] = [];
     if (files.length > 4) return undefined;
+    const startupFileCount = files.length;
     const read = async (path: string, maxBytes = MAX_FILE): Promise<string | undefined> => {
       if (!current()) throw new Error('Manager preparation cancelled');
       let before: Stats;
@@ -237,33 +242,26 @@ export async function prepareSupervisorManagerLaunch(options: {
         )
           return undefined;
       }
-      // A new no-daemon process has no ephemeral auth. Force file-only storage
-      // and admit only no stored auth or the documented API-key-only shape.
-      // ChatGPT/PAT/agent-identity auth can fetch an enterprise bundle at launch.
-      const authText = await read(join(home, 'auth.json'));
+      // Personal Plus/Pro credentials do not load workspace cloud policy in native
+      // Codex. Keep API auth byte-pinned; personal token refreshes must retain identity.
+      const authPath = join(home, 'auth.json');
+      const authText = await read(authPath);
+      let authMode: 'none' | 'apikey' | 'chatgpt' = 'none';
+      let personalIdentity: string | undefined;
+      let authWitness: PrivateFileWitness | undefined;
       if (authText !== undefined) {
-        const auth: unknown = JSON.parse(authText);
-        if (!auth || typeof auth !== 'object' || Array.isArray(auth)) return undefined;
-        const value = auth as Record<string, unknown>;
-        const allowed = new Set([
-          'auth_mode',
-          'OPENAI_API_KEY',
-          'tokens',
-          'last_refresh',
-          'agent_identity',
-          'personal_access_token',
-          'bedrock_api_key',
-          'bedrock_access_keys',
-        ]);
-        if (
-          Object.keys(value).some((key) => !allowed.has(key)) ||
-          (value.auth_mode !== undefined && value.auth_mode !== null && value.auth_mode !== 'apikey') ||
-          typeof value.OPENAI_API_KEY !== 'string' ||
-          !value.OPENAI_API_KEY.trim() ||
-          Object.keys(value).some((key) => !['auth_mode', 'OPENAI_API_KEY'].includes(key) && value[key] !== null)
-        )
-          return undefined;
+        const auth = inspectManagerAuth(authText);
+        if (!auth) return undefined;
+        authMode = auth.mode;
+        if (auth.mode === 'chatgpt') {
+          personalIdentity = auth.identity;
+          authWitness = await readPersonalManagerAuth(authPath, personalIdentity, current);
+          const initial = files.find((file) => file.path === authPath);
+          if (!authWitness || !initial || JSON.stringify(authWitness) !== JSON.stringify(initial)) return undefined;
+          files.splice(files.indexOf(initial), 1);
+        }
       }
+      const witnessedFiles = () => [...files, ...(authWitness ? [authWitness] : [])];
       let directory = resolve(workingDir);
       for (let depth = 0; ; depth++) {
         if (depth > 32) return undefined;
@@ -410,7 +408,7 @@ export async function prepareSupervisorManagerLaunch(options: {
         !owned ||
         !credentialOwned ||
         !catalogOwned ||
-        files.length > 8 ||
+        witnessedFiles().length > 8 ||
         !directoryOwned ||
         privateOwned.dev !== directoryOwned.dev ||
         privateOwned.ino !== directoryOwned.ino ||
@@ -426,10 +424,13 @@ export async function prepareSupervisorManagerLaunch(options: {
       const result: SupervisorManagerLaunch = Object.freeze({
         expectedPane: Object.freeze({ ...options.expectedPane }),
         conversationId,
+        authMode,
         home,
         name,
         file,
-        files: Object.freeze(files.map((value) => Object.freeze(value))),
+        get files() {
+          return Object.freeze(witnessedFiles().map((value) => Object.freeze({ ...value })));
+        },
         missing: Object.freeze(missing),
         isCurrent: permanentCurrent,
         revoke: () => {
@@ -499,14 +500,26 @@ export async function prepareSupervisorManagerLaunch(options: {
           })();
           return retirement;
         },
-        confirm: async () => {
+        confirm: async (runtime = false) => {
           if (!permanentCurrent() || pending.has(home) || retirements.has(home) || pending.size + retirements.size >= 2)
             return false;
           const limit = performance.now() + 2_000;
           pending.add(home);
           const verify = (async () => {
             try {
-              if (!(await checkPrivateFileWitnesses(files, limit))) return false;
+              const refreshed = personalIdentity
+                ? await readPersonalManagerAuth(
+                    authPath,
+                    personalIdentity,
+                    () => permanentCurrent() && performance.now() < limit
+                  )
+                : undefined;
+              if (personalIdentity && !refreshed) return false;
+              const snapshot = [
+                ...(runtime ? files.slice(startupFileCount) : files),
+                ...(refreshed ? [refreshed] : []),
+              ];
+              if (!(await checkPrivateFileWitnesses(snapshot, limit))) return false;
               for (const path of missing) {
                 try {
                   await fs.lstat(path);
@@ -516,7 +529,10 @@ export async function prepareSupervisorManagerLaunch(options: {
                 }
                 if (!permanentCurrent() || performance.now() >= limit) return false;
               }
-              return permanentCurrent() && (await checkPrivateFileWitnesses(files, limit)) && permanentCurrent();
+              if (!permanentCurrent() || !(await checkPrivateFileWitnesses(snapshot, limit)) || !permanentCurrent())
+                return false;
+              if (refreshed) authWitness = refreshed;
+              return true;
             } catch {
               return false;
             } finally {

@@ -3299,7 +3299,13 @@ export class WebServer extends EventEmitter {
       source?: import('../recovery/types.js').RecoveryEvidenceSource
     ): Promise<boolean> => {
       const expected = managerEvidence;
-      if (!expected || !hasManagerAuthority()) return false;
+      if (
+        !expected ||
+        !hasManagerAuthority() ||
+        !(await session.confirmSupervisorManagerLaunch()) ||
+        !hasManagerAuthority()
+      )
+        return false;
       let verified = false;
       try {
         const managerSource = managerAdapter.getLocalEvidenceSource(expected.conversationId, expected.generation);
@@ -3309,7 +3315,11 @@ export class WebServer extends EventEmitter {
           // A fresh ordered manager probe changes its own journal bytes.
           // confirmLocalEvidence supplies that refreshed manager file witness;
           // only a separate worker source keeps its previously captured files.
-          files: [...(source?.files ?? []), ...(expected.grantFile ? [expected.grantFile] : [])],
+          files: [
+            ...(source?.files ?? []),
+            ...(expected.grantFile ? [expected.grantFile] : []),
+            ...(session.getSupervisorManagerAuthWitness() ? [session.getSupervisorManagerAuthWitness()!] : []),
+          ],
         };
         verified =
           !!managerSource?.inputBroker &&
@@ -3522,6 +3532,7 @@ export class WebServer extends EventEmitter {
             };
           return result;
         },
+        confirmManagerLaunch: () => session.confirmSupervisorManagerLaunch(),
         captureBrainAuthority: async (caller) => {
           const launch = session.captureSupervisorManagerLaunchAuthority();
           const configuration = JSON.stringify([
@@ -3544,7 +3555,7 @@ export class WebServer extends EventEmitter {
                 session.codexConfig,
                 session.getEnvOverridesForPersist(),
               ]);
-          if (!current()) return undefined;
+          if (!current() || !(await session.confirmSupervisorManagerLaunch()) || !current()) return undefined;
           const config = session.codexConfig,
             env = session.getEnvOverridesForPersist();
           const grant = await clampRecoveryLaunchForOwner(session.owner, { codexConfig: config }, env);
@@ -3579,13 +3590,22 @@ export class WebServer extends EventEmitter {
           return (
             issuer && {
               ...issuer,
-              files: [...(issuer.files ?? []), ...(evidence.grantFile ? [evidence.grantFile] : [])],
+              files: [
+                ...(issuer.files ?? []),
+                ...(evidence.grantFile ? [evidence.grantFile] : []),
+                ...(session.getSupervisorManagerAuthWitness() ? [session.getSupervisorManagerAuthWitness()!] : []),
+              ],
             }
           );
         },
         validateManagerAuthority: async () => {
           managerEvidence = undefined;
-          if (!hasManagerTaskAuthority()) return false;
+          if (
+            !hasManagerTaskAuthority() ||
+            !(await session.confirmSupervisorManagerLaunch()) ||
+            !hasManagerTaskAuthority()
+          )
+            return false;
           const scope = managerScope();
           const managerConfig = session.codexConfig;
           const context = session.getRecoveryContext();

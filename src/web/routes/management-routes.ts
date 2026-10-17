@@ -53,7 +53,15 @@ export function registerManagementRoutes(app: FastifyInstance, context: Manageme
         if (error instanceof BrainStoreError)
           throw Object.assign(new Error(`Management ${error.code}`), {
             statusCode:
-              error.code === 'forbidden' ? 403 : error.code === 'invalid' ? 400 : error.code === 'conflict' ? 409 : 503,
+              error.code === 'forbidden'
+                ? 403
+                : error.code === 'invalid'
+                  ? 400
+                  : error.code === 'conflict'
+                    ? 409
+                    : error.code === 'capacity'
+                      ? 413
+                      : 503,
           });
         throw Object.assign(new Error('Management unavailable'), { statusCode: 503 });
       });

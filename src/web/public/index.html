@@ -3410,6 +3410,9 @@
                 <fieldset class="task-form" id="managementCreateSettings" disabled>
                   <label for="managementCreateWorkingDir">Manager working directory on this server (absolute path)</label>
                   <input class="set-input" id="managementCreateWorkingDir" type="text" maxlength="4096" placeholder="Enter an existing local working directory" autocomplete="off" spellcheck="false">
+                  <label for="managementCreateCodexHome">Dedicated Codex home (absolute path, optional)</label>
+                  <input class="set-input" id="managementCreateCodexHome" type="text" maxlength="4096" placeholder="Separate home authenticated with your Codex subscription" autocomplete="off" spellcheck="false">
+                  <p class="set-group-hint">Use a separate Codex home for the manager. Sign in there with device code before preparing it. Your other Codex logins stay unchanged. Personal Plus and Pro subscriptions are supported; workspace-managed authentication requires additional compatibility checks.</p>
                   <button type="button" class="btn-toolbar" onclick="app.createGlobalManagementSession()">Create local management Codex</button>
                 </fieldset>
                 <p id="managementCreateStatus" role="status" aria-live="polite">Use an existing directory where this owner may work.</p>

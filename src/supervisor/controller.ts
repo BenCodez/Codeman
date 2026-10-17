@@ -98,6 +98,7 @@ export interface SupervisorDependencies {
     instructions: string,
     authority: RecoveryActionAuthority
   ): Promise<'sent' | 'not-sent' | 'unknown'>;
+  confirmManagerLaunch?(): Promise<boolean>;
   captureBrainAuthority?(caller: () => boolean): Promise<(() => boolean) | undefined>;
   changed(state: SupervisorState): void;
   now?: () => number;
@@ -140,6 +141,9 @@ export class SupervisorController {
 
   getManagerUsage(): SupervisorUsage | undefined {
     return this.deps.managerUsage?.();
+  }
+  confirmManagerLaunch(): Promise<boolean> {
+    return this.stopped ? Promise.resolve(false) : (this.deps.confirmManagerLaunch?.() ?? Promise.resolve(false));
   }
   captureBrainAuthority(caller: () => boolean): Promise<(() => boolean) | undefined> {
     return this.stopped || caller() !== true

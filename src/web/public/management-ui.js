@@ -71,6 +71,11 @@ Object.assign(CodemanApp.prototype, {
       this.showToast('Enter an absolute local working directory on the Codeman server.', 'warning');
       return;
     }
+    const codexHome = document.getElementById('managementCreateCodexHome')?.value.trim() || '';
+    if (codexHome && (!codexHome.startsWith('/') || codexHome.length > 4096 || /[\x00-\x1f\x7f]/.test(codexHome))) {
+      this.showToast('Enter an absolute dedicated Codex home on the Codeman server.', 'warning');
+      return;
+    }
     const creation = { busy: true, uncertain: false, sessionId: null };
     this._managementCreation = creation;
     this.renderManagementCreation();
@@ -82,6 +87,7 @@ Object.assign(CodemanApp.prototype, {
           name: 'Management Codex',
           workingDir,
           mode: 'codex',
+          ...(codexHome ? { envOverrides: { CODEX_HOME: codexHome } } : {}),
           codexConfig: { noDaemon: true, noAltScreen: true, dangerouslyBypassApprovals: false },
         },
       });
@@ -225,6 +231,11 @@ Object.assign(CodemanApp.prototype, {
         notes: notes.value,
         allowMessages: grant.checked,
       }));
+    const config = { managerSessionId: document.getElementById('managementManager').value || null, agents };
+    if (new TextEncoder().encode(JSON.stringify(config)).byteLength > 32768) {
+      this.showToast('Saved directory metadata exceeds 32 KiB. Shorten agent notes or roles before saving.', 'warning');
+      return;
+    }
     view.busy = true;
     this._renderManagementBusy(view);
     let snapshot;

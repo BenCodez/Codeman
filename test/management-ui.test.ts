@@ -74,6 +74,16 @@ describe('Global management settings', () => {
     expect(app._apiJson.mock.calls.map(([path]: [string]) => path)).toEqual(['/api/management']);
     expect(get('managementBrainMarkdown').value).toBe('Remember agents');
   });
+  it('keeps oversized notes editable and reports directory capacity before sending a save', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    const row = app._managementView.rows[1];
+    app._managementView.rows = Array.from({ length: 20 }, () => ({ ...row, notes: { value: '界'.repeat(2000) } }));
+    await app.saveManagementSettings();
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    expect(get('managementSettings').disabled).toBe(false);
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('32 KiB'), 'warning');
+  });
   it('saves global edits and grants using the observed revision and retains drafts on conflict', async () => {
     const { app, get } = harness();
     await app.loadManagementSettings();
@@ -199,6 +209,29 @@ describe('Global management settings', () => {
     expect(get('supervisor-tab').classList.contains('set-section')).toBe(true);
     expect(get('supervisorBrainPanel').hidden).toBe(false);
     expect(app.closeSupervisorOptions).toHaveBeenCalledTimes(1);
+  });
+  it('binds a new subscription manager to its explicit separate Codex home', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementCreateWorkingDir').value = '/synthetic/work';
+    get('managementCreateCodexHome').value = '/synthetic/manager-home';
+    app._apiJson.mockResolvedValueOnce({ session: { id: manager, mode: 'codex' } });
+    await app.createGlobalManagementSession();
+    expect(app._apiJson).toHaveBeenLastCalledWith(
+      '/api/sessions',
+      expect.objectContaining({
+        body: expect.objectContaining({ envOverrides: { CODEX_HOME: '/synthetic/manager-home' } }),
+      })
+    );
+  });
+  it('rejects an invalid manager home before creating a session', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementCreateWorkingDir').value = '/synthetic/work';
+    get('managementCreateCodexHome').value = 'relative-home';
+    await app.createGlobalManagementSession();
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    expect(app.showToast).toHaveBeenCalled();
   });
   it('creates one ordinary local manager candidate from an empty manager picker only on owner action', async () => {
     const { app, get } = harness();

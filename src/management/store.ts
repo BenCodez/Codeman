@@ -3,7 +3,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { dataPath } from '../config/instance.js';
-import { BrainStore, BrainStoreError } from '../supervisor/brain.js';
+import { BrainStore, BrainStoreError, MAX_BRAIN_BYTES } from '../supervisor/brain.js';
 
 const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 const Id = z.string().regex(/^[\w-]{1,100}$/);
@@ -147,10 +147,12 @@ export class ManagementService {
         ?.managerActive
     )
       throw new BrainStoreError('forbidden');
-    this.epochs.set(owner, (this.epochs.get(owner) ?? 0) + 1);
     const value = Config.parse({ managerSessionId: input.managerSessionId, agents: input.agents });
     if (new Set(value.agents.map((a) => a.sessionId)).size !== value.agents.length)
       throw new BrainStoreError('invalid');
+    const serialized = JSON.stringify(value);
+    if (Buffer.byteLength(serialized) > MAX_BRAIN_BYTES) throw new BrainStoreError('capacity');
+    this.epochs.set(owner, (this.epochs.get(owner) ?? 0) + 1);
     const current = () => {
       try {
         if (!this.ownerCurrent(owner) || extraCurrent() !== true) return false;
@@ -167,7 +169,7 @@ export class ManagementService {
       }
     };
     try {
-      await this.config.replace(digest(owner), JSON.stringify(value), input.ifMatch, current);
+      await this.config.replace(digest(owner), serialized, input.ifMatch, current);
     } finally {
       this.epochs.set(owner, (this.epochs.get(owner) ?? 0) + 1);
     }

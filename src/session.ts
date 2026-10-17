@@ -34,7 +34,7 @@ import { supervisorManagerBridgeCommand } from './supervisor/manager-bridge-comm
 import { createHash } from 'node:crypto';
 import { getDataDirPath } from './config/instance.js';
 import { RetiredInputClients } from './input-client-retirement.js';
-import { basename } from 'node:path';
+import { basename, join } from 'node:path';
 import { execSync, execFileSync } from 'node:child_process';
 import { v4 as uuidv4 } from 'uuid';
 import * as pty from 'node-pty';
@@ -2509,6 +2509,23 @@ export class Session extends EventEmitter {
     // durable publication. It does not replace the exact restricted launch.
     if (profile && !profileCurrent && !context.switchPending) void this.revokeSupervisorManagerLaunch();
     return current;
+  }
+
+  /** Revalidate private settings and same-account subscription refreshes before manager work. */
+  async confirmSupervisorManagerLaunch(): Promise<boolean> {
+    const profile = this._supervisorManagerProfile;
+    return (
+      !!profile &&
+      this.isSupervisorManagerLaunchCurrent() &&
+      (await profile.confirm(true)) &&
+      this._supervisorManagerProfile === profile &&
+      this.isSupervisorManagerLaunchCurrent()
+    );
+  }
+
+  getSupervisorManagerAuthWitness(): import('./recovery/private-file-witness.js').PrivateFileWitness | undefined {
+    const profile = this._supervisorManagerProfile;
+    return profile?.files?.find((file) => file.path === join(profile.home, 'auth.json'));
   }
 
   /** Process-local proof for this exact acknowledged profile, never a replacement launch. */

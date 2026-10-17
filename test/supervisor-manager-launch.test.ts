@@ -1,5 +1,6 @@
 /** Actual private profile files and Session conversion; all native effects are explicit fakes. */
 import fs from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,7 @@ import {
   type SupervisorManagerLaunch,
 } from '../src/supervisor/manager-launch.js';
 import { createDeferred } from './mocks/index.js';
+import { personalAuth } from './mocks/subscription-auth.js';
 import { supervisorManagerBridgeCommand } from '../src/supervisor/manager-bridge-command.js';
 
 const catalogRead = vi.hoisted(() => vi.fn());
@@ -69,7 +71,11 @@ async function profile() {
   return { ...p, profile: prepared! };
 }
 
-function prepareAt(p: { home: string; work: string }, isCurrent = () => true) {
+function prepareAt(
+  p: { home: string; work: string },
+  isCurrent = () => true,
+  additionalFiles?: readonly import('../src/recovery/private-file-witness.js').PrivateFileWitness[]
+) {
   return prepareSupervisorManagerLaunch({
     home: p.home,
     workingDir: p.work,
@@ -79,6 +85,7 @@ function prepareAt(p: { home: string; work: string }, isCurrent = () => true) {
     endpoint: 'http://127.0.0.1:3000/api/supervisor-mcp',
     bridgeCommand: 'codeman',
     bridgeArgs: ['agent', 'supervisor-mcp'],
+    additionalFiles,
     isCurrent,
   });
 }
@@ -951,4 +958,66 @@ it('a changed caller, lifecycle, pending broker or nonempty composer refuses con
   } as never);
   expect(await draft.session.prepareSupervisorManager(draft.options)).toBe(false);
   expect(draft.respawn).not.toHaveBeenCalled();
+});
+
+it.each(['plus', 'pro'])(
+  'prepares personal %s login and retains exact launch through atomic token refresh',
+  async (plan) => {
+    const p = await paths();
+    const path = join(p.home, 'auth.json');
+    await fs.writeFile(path, JSON.stringify(personalAuth(plan)), { mode: 0o600 });
+    const prepared = await prepareAt(p);
+    expect(prepared).toBeDefined();
+    const original = prepared!.files.find((file) => file.path === path)!;
+    expect(await prepared!.confirm()).toBe(true);
+    await fs.writeFile(path + '.new', JSON.stringify(personalAuth(plan, undefined, undefined, 2)), { mode: 0o600 });
+    await fs.rename(path + '.new', path);
+    expect(await prepared!.confirm()).toBe(true);
+    expect(prepared!.files.find((file) => file.path === path)!.hash).not.toBe(original.hash);
+    expect(prepared!.conversationId).toBe(CID);
+    expect(supervisorManagerCommand(prepared!, { noDaemon: true })).toContain('-u OPENAI_API_KEY -u CODEX_API_KEY');
+    expect(supervisorManagerCommand(prepared!, { noDaemon: true })).toContain('--disable shell_tool');
+    expect(supervisorManagerCommand(prepared!, { noDaemon: true })).not.toContain('synthetic-refresh');
+    await fs.writeFile(path, JSON.stringify(personalAuth(plan, 'different-account')));
+    expect(await prepared!.confirm()).toBe(false);
+    expect(prepared!.isCurrent()).toBe(false);
+    await prepared!.revoke();
+    expect(JSON.parse(await fs.readFile(path, 'utf8')).tokens.account_id).toBe('different-account');
+  }
+);
+
+it('withdraws subscription launch authority if managed policy appears after preparation', async () => {
+  const p = await paths();
+  await fs.writeFile(join(p.home, 'auth.json'), JSON.stringify(personalAuth()), { mode: 0o600 });
+  const prepared = await prepareAt(p);
+  expect(prepared).toBeDefined();
+  await fs.writeFile(join(p.home, 'cloud-config-bundle-cache.json'), '{}');
+  expect(await prepared!.confirm()).toBe(false);
+  await prepared!.revoke();
+});
+
+it('allows new manager rollout bytes at runtime while retaining static restrictions and fresh authentication', async () => {
+  const p = await paths();
+  await fs.writeFile(join(p.home, 'auth.json'), JSON.stringify(personalAuth()), { mode: 0o600 });
+  const path = join(p.root, 'rollout.jsonl');
+  await fs.writeFile(path, 'initial conversation evidence');
+  const stat = await fs.lstat(path);
+  const source = {
+    path,
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    hash: createHash('sha256').update('initial conversation evidence').digest('hex'),
+    maxBytes: 262144,
+  };
+  const prepared = await prepareAt(p, () => true, [source]);
+  expect(prepared).toBeDefined();
+  expect(await prepared!.confirm()).toBe(true);
+  await fs.appendFile(path, '\nmanager completed a normal turn');
+  expect(await prepared!.confirm(true)).toBe(true);
+  await fs.appendFile(prepared!.file, '\n[plugins.unsafe]\nenabled=true\n');
+  expect(await prepared!.confirm(true)).toBe(false);
+  await prepared!.revoke();
 });

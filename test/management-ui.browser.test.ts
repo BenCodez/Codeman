@@ -219,6 +219,7 @@ describe('Global management controls in Chromium', () => {
       expect(await page.locator('#managementManager option').count()).toBe(1);
       expect(await page.locator('#managementCreateStatus').textContent()).toContain('existing directory');
       await page.locator('#managementCreateWorkingDir').fill('/tmp/owner-project');
+      await page.locator('#managementCreateCodexHome').fill('/synthetic/subscription-manager');
       await page.getByRole('button', { name: 'Create local management Codex', exact: true }).click();
       await page.waitForFunction(() => !document.getElementById('managementOpenCreatedSession')!.hidden);
       expect(
@@ -232,6 +233,7 @@ describe('Global management controls in Chromium', () => {
           name: 'Management Codex',
           workingDir: '/tmp/owner-project',
           mode: 'codex',
+          envOverrides: { CODEX_HOME: '/synthetic/subscription-manager' },
           codexConfig: { noDaemon: true, noAltScreen: true, dangerouslyBypassApprovals: false },
         },
       ]);

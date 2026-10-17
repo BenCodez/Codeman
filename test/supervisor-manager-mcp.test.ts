@@ -79,6 +79,7 @@ async function fixture(
       if (!isCurrent?.()) throw Error('cancelled');
       return state;
     }),
+    confirmManagerLaunch: vi.fn(async () => true),
     captureBrainAuthority: vi.fn(async (isCurrent: () => boolean) => (isCurrent() ? isCurrent : undefined)),
   };
   const resolve = vi.fn((scope) =>
@@ -691,4 +692,21 @@ it('gates GitLab reads and writes on current prepared manager authority and stri
   expect((await call({ operation: 'projects' })).json().error.code).toBe(-32001);
   expect(f.gitlab.operate).toHaveBeenCalledOnce();
   expect(f.generic).not.toHaveBeenCalled();
+});
+
+it('blocks manager tools after current native authentication proof is lost', async () => {
+  const f = await fixture('owner-password', false, false, true, true, true);
+  f.controller.confirmManagerLaunch.mockResolvedValue(false);
+  for (const [name, args] of [
+    ['supervisor_status', {}],
+    ['supervisor_brain', { mode: 'read' }],
+    ['supervisor_agents', {}],
+    ['supervisor_gitlab', { operation: 'projects' }],
+    ['supervisor_assign', { workerId: WORKER, requestId: REQUEST }],
+  ] as const)
+    expect((await f.rpc('tools/call', { name, arguments: args })).json().error.code).toBe(-32001);
+  expect(f.controller.assign).not.toHaveBeenCalled();
+  expect(f.brain.read).not.toHaveBeenCalled();
+  expect(f.management.directory).not.toHaveBeenCalled();
+  expect(f.gitlab.operate).not.toHaveBeenCalled();
 });

@@ -123,6 +123,9 @@ async function fakeSession(id: string, conversationId: string): Promise<Session>
   });
   // This suite isolates Task/native issuer authority after the separate restricted launch boundary.
   vi.spyOn(session, 'isSupervisorManagerLaunchCurrent').mockReturnValue(true);
+  vi.spyOn(session, 'confirmSupervisorManagerLaunch').mockImplementation(async () =>
+    session.isSupervisorManagerLaunchCurrent()
+  );
   vi.spyOn(session, 'captureSupervisorManagerLaunchAuthority').mockImplementation(() =>
     Object.assign(() => session.isSupervisorManagerLaunchCurrent(), {
       revoke: () => session.revokeSupervisorManagerLaunch(),

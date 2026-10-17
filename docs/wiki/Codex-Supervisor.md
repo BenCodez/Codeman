@@ -6,7 +6,7 @@ Preparation explicitly restarts only the selected manager session in place, resu
 
 If the manager startup broker certifies that no child started, Codeman can resume the original ordinary conversation once through a fresh guarded broker, using the same identity, home and launch settings. This requires unchanged owner, configuration, grant and child-work evidence plus the exact dead broker pane; it never interrupts a live pane. Changed or uncertain evidence keeps restoration fenced. Inspect the pane and use the owner Restart control when an exited pane requires manual restoration. Manager preparation remains refused after an ordinary restoration; it does not acknowledge a manager role.
 
-Restricted manager preparation currently supports unmanaged Linux configuration only. `/etc/codex` must be absent, and the selected Codex home must have no managed defaults or cloud configuration cache. Its `auth.json` must be absent or contain only API-key authentication; ChatGPT, enterprise, agent-identity and unknown authentication cannot establish that no additional managed MCP catalog will load. The restricted process uses file-only credential storage and excludes inherited access-token/workload-identity authentication. Existing authentication and configuration files are never rewritten. When this evidence is unavailable, preparation is refused; ordinary sessions and owner controls remain available.
+Restricted manager preparation currently supports unmanaged Linux configuration only. `/etc/codex` must be absent, and the selected Codex home must have no managed defaults or cloud configuration cache. Its `auth.json` may contain API-key authentication or a complete personal ChatGPT Plus/Pro login. Workspace-managed plans, agent identities, mixed and unknown authentication are refused. Native Codex excludes these personal plans from workspace cloud policy; Codeman retains that admission boundary and refuses any observed managed configuration. The restricted process uses file-only credential storage and excludes inherited access-token/workload-identity authentication. Existing authentication and configuration files are never rewritten. When this evidence is unavailable, preparation is refused; ordinary sessions and owner controls remain available.
 
 The prepared process uses a private restricted Codex profile and a credential bound to that exact launch. It has no ordinary command, patch, app, plugin or subagent tools, and exposes only these supervisor tools through a dedicated MCP bridge:
 
@@ -108,8 +108,41 @@ inspect the repository before deciding how to proceed. Connection checks only
 read access and do not prove write permission. Server-side TLS verification stays
 enabled. Tests use synthetic credentials and fake transports.
 
-ChatGPT device-code login authenticates ordinary Codex sessions. The current
-restricted manager preparation accepts API-key authentication only: ChatGPT login
-may introduce managed configuration that this launcher cannot yet prove preserves
-its restricted tool catalog. Device-code login alone does not make that session
-eligible as a restricted manager.
+Personal ChatGPT Plus and Pro subscriptions can authenticate a restricted manager
+through device-code login. Use a dedicated Codex home and an ordinary owner-selected
+conversation; existing worker homes and logins are preserved. In a terminal on the
+Codeman server, create a new private home and authenticate it:
+
+```bash
+CODEMAN_MANAGER_HOME="$(mktemp -d "$HOME/.codex-manager.XXXXXX")"
+CODEX_HOME="$CODEMAN_MANAGER_HOME" codex -c 'cli_auth_credentials_store="file"' login --device-auth
+printf 'Manager Codex home: %s\n' "$CODEMAN_MANAGER_HOME"
+```
+
+In App Settings → Management, enter that absolute path in **Dedicated Codex home**
+when creating the local manager. Complete one ordinary conversation turn and let
+it become idle before explicitly preparing the restricted manager. Authentication
+alone does not launch automation. The scoped MCP bridge works with subscription
+login; no OpenAI API key is required for this path.
+
+Codeman admits only complete Plus/Pro metadata with matching account and user
+identities. Native Codex remains responsible for authenticating OAuth tokens;
+Codeman does not verify signatures or present decoded claims as authenticated
+account evidence. Token refresh may atomically replace the private auth file when
+it retains the same account, user and plan. A changed account/plan, malformed or
+ambiguous evidence, unreadable/private-mode violation or newly observed managed
+configuration withdraws manager authority. Each manager tool call and guarded
+worker action rechecks the launch settings; worker actions carry the current auth
+file witness to their final input boundary. Personal manager launches exclude
+inherited API keys so they continue to use the selected subscription. Business,
+Enterprise, Education and unknown plans remain unsupported by this restricted
+launcher. Existing owner grants, leases, budgets and cancellation still apply.
+
+Directory settings retain up to 100 agents within a combined 32 KiB UTF-8 JSON
+budget. The editor reports oversized metadata before saving and preserves the
+draft; the API returns HTTP 413 with a capacity error and leaves saved settings
+unchanged. Shorten roles/notes to fit the shared budget.
+
+GitLab file validation follows at most ten parent-directory pages (1,000 entries)
+within the operation deadline. Missing entries, malformed/nonsequential cursors,
+unsupported modes and exhausted budgets never authorize a write.

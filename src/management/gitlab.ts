@@ -349,12 +349,20 @@ export class GitLabService {
       )
       .max(100)
       .parse(result.json);
-    return { entries, truncated: !!result.nextPage, nextPage: result.nextPage ? Number(result.nextPage) : null };
+    const nextPage = result.nextPage ? Number(result.nextPage) : null;
+    if (result.nextPage && (!/^[1-9][0-9]{0,2}$/.test(result.nextPage) || nextPage !== page + 1 || nextPage > 100))
+      throw new GitLabError('unavailable');
+    return { entries, truncated: nextPage !== null, nextPage };
   }
   private async file(owner: string, connection: Connection, projectId: number, branch: string, path: string) {
     const parent = path.includes('/') ? path.slice(0, path.lastIndexOf('/')) : undefined;
-    const listing = await this.tree(owner, connection, projectId, branch, parent);
-    const entry = listing.entries.find((item) => item.path === path);
+    let listing = await this.tree(owner, connection, projectId, branch, parent);
+    let entry = listing.entries.find((item) => item.path === path);
+    for (let pages = 1; !entry && listing.nextPage !== null; pages++) {
+      if (pages >= 10) throw new GitLabError('capacity');
+      listing = await this.tree(owner, connection, projectId, branch, parent, listing.nextPage);
+      entry = listing.entries.find((item) => item.path === path);
+    }
     if (!entry || entry.type !== 'blob' || !['100644', '100755'].includes(entry.mode))
       throw new GitLabError('forbidden');
     const result = await this.get(
