@@ -1,5 +1,6 @@
 /** @fileoverview Only bounded paired structured execution evidence proves command success. */
 import { createHash } from 'node:crypto';
+import { MAX_CODEX_ROLLOUT_BYTES } from '../recovery/codex-evidence-limits.js';
 import { isCodexRolloutRecord } from '../recovery/codex-classifier.js';
 const SUPPORTED_POSIX_SHELLS = new Set([
   'bash',
@@ -27,13 +28,14 @@ export interface CommandSuccessEvidence {
 }
 export function successfulCommands(tail: string, since: number, now: number): Map<string, CommandSuccessEvidence> {
   const result = new Map<string, CommandSuccessEvidence>();
-  if (Buffer.byteLength(tail) > 262144 || !tail.endsWith('\n')) return result;
+  if (Buffer.byteLength(tail) > MAX_CODEX_ROLLOUT_BYTES || !tail.endsWith('\n')) return result;
   const pending = new Map<string, { command: string; at: number }>();
   const begunCalls = new Set<string>();
   const endedCalls = new Set<string>();
   const latest = new Map<string, { at: number; callId: string }>();
   for (const line of tail.split('\n')) {
     if (!line.trim()) continue;
+    if (line.length > 262_144) return new Map();
     let row;
     try {
       row = JSON.parse(line);
@@ -125,10 +127,11 @@ export interface TaskProgressMarker {
 }
 
 export function latestProgressMarker(tail: string, since: number, now: number): TaskProgressMarker | undefined {
-  if (Buffer.byteLength(tail) > 262144) return undefined;
+  if (Buffer.byteLength(tail) > MAX_CODEX_ROLLOUT_BYTES) return undefined;
   const complete = tail.endsWith('\n');
   let marker: TaskProgressMarker | undefined;
   let submissionKey: string | undefined;
+  let nativeSubmission: { threadId: string; turnId: string } | undefined;
   const uncertain = (line: string): TaskProgressMarker | undefined =>
     marker || line.includes('CODEMAN_TASK_PROGRESS ')
       ? {
@@ -142,6 +145,7 @@ export function latestProgressMarker(tail: string, since: number, now: number): 
   const lines = tail.split('\n');
   for (const [index, line] of lines.entries()) {
     if (!line.trim()) continue;
+    if (line.length > 262_144) return uncertain(line);
     let row;
     try {
       row = JSON.parse(line);
@@ -149,7 +153,7 @@ export function latestProgressMarker(tail: string, since: number, now: number): 
       return uncertain(line);
     }
     if (!row || typeof row !== 'object' || Array.isArray(row)) return uncertain(line);
-    const at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
+    let at = typeof row.timestamp === 'string' ? Date.parse(row.timestamp) : NaN;
     const p = row.payload;
     if (!isCodexRolloutRecord(row)) return uncertain(line);
     if (row.type !== 'event_msg') continue;
@@ -166,10 +170,48 @@ export function latestProgressMarker(tail: string, since: number, now: number): 
       // prevents a future-dated prior turn marker from crossing a new user submission.
       submissionKey = createHash('sha256').update(line).digest('hex');
       marker = undefined;
+      nativeSubmission =
+        p.type === 'item_completed' &&
+        typeof p.thread_id === 'string' &&
+        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(p.thread_id) &&
+        typeof p.turn_id === 'string' &&
+        /^[\w-]{1,100}$/.test(p.turn_id)
+          ? { threadId: p.thread_id, turnId: p.turn_id }
+          : undefined;
       continue;
     }
-    if (p.type !== 'agent_message' || typeof p.message !== 'string' || at < since) continue;
-    const message = p.message.trim();
+    let message: string;
+    if (p.type === 'agent_message' && typeof p.message === 'string') message = p.message;
+    else if (p.type === 'item_completed' && p.item?.type === 'AgentMessage') {
+      const item = p.item;
+      if (
+        !nativeSubmission ||
+        p.thread_id !== nativeSubmission.threadId ||
+        p.turn_id !== nativeSubmission.turnId ||
+        typeof item.id !== 'string' ||
+        !/^[\w-]{1,100}$/.test(item.id) ||
+        !Array.isArray(item.content) ||
+        !item.content.every(
+          (block: unknown) =>
+            !!block &&
+            typeof block === 'object' &&
+            !Array.isArray(block) &&
+            (block as { type?: unknown }).type === 'Text' &&
+            typeof (block as { text?: unknown }).text === 'string'
+        ) ||
+        (item.questions !== undefined && (!Array.isArray(item.questions) || item.questions.length !== 0)) ||
+        !Number.isSafeInteger(p.completed_at_ms) ||
+        p.completed_at_ms <= 0 ||
+        p.completed_at_ms > Math.min(now + 2000, at + 2000) ||
+        (p.started_at_ms !== undefined &&
+          (!Number.isSafeInteger(p.started_at_ms) || p.started_at_ms <= 0 || p.started_at_ms > p.completed_at_ms))
+      )
+        return uncertain(line);
+      message = item.content.map((block: { text: string }) => block.text).join('');
+      at = p.completed_at_ms;
+    } else continue;
+    if (at < since) continue;
+    message = message.trim();
     if (!message.startsWith('CODEMAN_TASK_PROGRESS ')) continue;
     if (!complete && index === lines.length - 1) return uncertain(line);
     if (message.length > 16000) {
