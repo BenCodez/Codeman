@@ -931,6 +931,20 @@ export function classifyCodexTail(tail: string, context: CodexClassificationCont
             latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
           } else if (
             item.server === 'codeman_supervisor' &&
+            item.tool === 'supervisor_brain' &&
+            object(item.arguments)?.mode === 'read' &&
+            Object.keys(object(item.arguments)!).length === 1 &&
+            (error.message ===
+              'tool call error: tool call failed for `codeman_supervisor/supervisor_brain`\n\nCaused by:\n    Transport closed' ||
+              error.message ===
+                'tool call error: tool call failed for `codeman_supervisor/supervisor_brain`\n\nCaused by:\n    Mcp error: -32002: Manager bridge request failed; acceptance may be uncertain. Retain requestId and inspect durable status before retrying.')
+          ) {
+            // This exact operation cannot affect a worker or write memory. Its
+            // failure still requires later owner intent, never an automatic retry.
+            update('paused', 'approval-required');
+            latestVetoAt = Math.max(latestVetoAt, Number(completedAt));
+          } else if (
+            item.server === 'codeman_supervisor' &&
             /^supervisor_(?:status|workers|assign|retry|message|brain|agents|agent|gitlab)$/.test(String(item.tool)) &&
             error.message ===
               'tool call error: tool call failed for `codeman_supervisor/' +

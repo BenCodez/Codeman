@@ -1081,3 +1081,83 @@ it('requires later owner intent after the exact scoped manager authority refusal
       )
     ).toMatchObject({ activity: 'blocked', safeToAct: false });
 });
+
+it('allows later owner intent to supersede only an exact failed brain read with closed transport', () => {
+  const message =
+    'tool call error: tool call failed for `codeman_supervisor/supervisor_brain`\n\nCaused by:\n    Transport closed';
+  const boundedFailure =
+    'tool call error: tool call failed for `codeman_supervisor/supervisor_brain`\n\nCaused by:\n    Mcp error: -32002: Manager bridge request failed; acceptance may be uncertain. Retain requestId and inspect durable status before retrying.';
+  const row = (patch: Payload = {}, envelope: Payload = {}): Payload => ({
+    type: 'item_completed',
+    thread_id: THREAD,
+    turn_id: TURN,
+    started_at_ms: NOW - 9000,
+    completed_at_ms: NOW - 8000,
+    item: {
+      type: 'McpToolCall',
+      id: 'closed-brain-read',
+      server: 'codeman_supervisor',
+      tool: 'supervisor_brain',
+      arguments: { mode: 'read' },
+      status: 'failed',
+      error: { message },
+      duration: { secs: 0, nanos: 0 },
+      ...patch,
+    },
+    ...envelope,
+  });
+  const ownerTurn: Payload[] = [
+    { type: 'user_message', message: 'Owner restored the scoped bridge; reply READY.' },
+    start('new-owner-turn'),
+    complete(undefined, 'new-owner-turn'),
+  ];
+  expect(classifyCodexTail(tail(start(), row(), complete()), context())).toMatchObject({
+    activity: 'paused',
+    reason: 'approval-required',
+    safeToAct: false,
+  });
+  expect(classifyCodexTail(tail(start(), row(), complete(), ...ownerTurn), context()).activity).toBe('completed');
+  expect(
+    classifyCodexTail(tail(start(), row({ error: { message: boundedFailure } }), complete()), context())
+  ).toMatchObject({ activity: 'paused', reason: 'approval-required', safeToAct: false });
+  expect(
+    classifyCodexTail(tail(start(), row({ error: { message: boundedFailure } }), complete(), ...ownerTurn), context())
+      .activity
+  ).toBe('completed');
+  for (const bad of [
+    row({ arguments: { mode: 'append', note: 'write' }, error: { message: boundedFailure } }),
+    row({ arguments: { mode: 'append', note: 'write' } }),
+    row({ arguments: { mode: 'replace', markdown: 'write' } }),
+    row({ tool: 'supervisor_assign' }),
+    row({ tool: 'supervisor_message' }),
+    row({ server: 'other_server' }),
+    row({ arguments: { mode: 'read', requestId: 'extra-key' } }),
+    row({ arguments: { action: 'read' } }),
+    row({ arguments: ['read'] }),
+    row({ error: { message: message + '\nAuthentication failed' } }),
+    row({}, { started_at_ms: undefined }),
+  ]) {
+    const result = classifyCodexTail(tail(start(), bad, complete(), ...ownerTurn), context());
+    expect(result.activity).not.toBe('completed');
+    expect(result.safeToAct).toBe(false);
+  }
+  const child = { type: 'collab_agent_spawn_end', new_thread_id: AGENT, status: 'running' };
+  expect(classifyCodexTail(tail(start(), child, row(), complete(), ...ownerTurn), context())).toMatchObject({
+    activity: 'watching',
+    reason: 'background-work',
+    safeToAct: false,
+  });
+  for (const codex_error_info of ['Unauthorized', 'UsageLimitExceeded'])
+    expect(
+      classifyCodexTail(
+        tail(
+          start(),
+          { type: 'error', message: 'Existing native veto', codex_error_info },
+          row(),
+          complete(),
+          ...ownerTurn
+        ),
+        context()
+      )
+    ).toMatchObject({ activity: 'blocked', safeToAct: false });
+});
