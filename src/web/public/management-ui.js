@@ -626,8 +626,15 @@ Object.assign(CodemanApp.prototype, {
       return;
     const selection = { sessionId, busy: false, request: null };
     view.agent = selection;
-    document.getElementById('managementAgentTools').hidden = false;
-    document.getElementById('managementAgentToolsTitle').textContent = agent.name || sessionId;
+    const panel = document.getElementById('managementAgentTools');
+    panel.hidden = false;
+    const title = document.getElementById('managementAgentToolsTitle');
+    title.textContent = agent.name || sessionId;
+    title.tabIndex = -1;
+    // The directory and manager controls can be several screens tall. Bring
+    // the result into view instead of opening an invisible panel below them.
+    panel.scrollIntoView?.({ block: 'start' });
+    title.focus({ preventScroll: true });
     document.getElementById('managementAgentToolsStatus').textContent = enroll
       ? 'Creating private connection instructions…'
       : 'Messages are queued until this agent reads its inbox.';

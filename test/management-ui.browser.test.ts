@@ -179,6 +179,11 @@ describe('Global management controls in Chromium', () => {
       expect(await page.locator('#managementBrainStatus').textContent()).toContain('saved');
       expect(await page.getByRole('button', { name: 'Connect existing agent', exact: true }).isEnabled()).toBe(false);
       await page.getByRole('button', { name: 'Open agent inbox and replies', exact: true }).click();
+      await page.waitForFunction(() => {
+        const title = document.getElementById('managementAgentToolsTitle');
+        const rect = title?.getBoundingClientRect();
+        return !!rect && rect.top >= 0 && rect.bottom <= innerHeight && document.activeElement === title;
+      });
       expect(await page.locator('#managementMessageThread').textContent()).toContain('remote builds');
       await page.locator('#managementMessageDraft').fill('Please report build usage.');
       await page.getByRole('button', { name: 'Queue message', exact: true }).click();
@@ -189,6 +194,10 @@ describe('Global management controls in Chromium', () => {
       expect(await page.locator('#managementMessageDraft').inputValue()).toBe('');
       page.once('dialog', (dialog) => void dialog.accept());
       await page.getByRole('button', { name: 'Rotate connection instructions', exact: true }).click();
+      await page.waitForFunction(() => {
+        const rect = document.getElementById('managementAgentToolsTitle')?.getBoundingClientRect();
+        return !!rect && rect.top >= 0 && rect.bottom <= innerHeight;
+      });
       await page.waitForFunction(() =>
         (document.getElementById('managementEnrollmentInstructions') as HTMLTextAreaElement).value.includes(
           'Private fixture enrollment capability'

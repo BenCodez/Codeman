@@ -2560,8 +2560,11 @@ Object.assign(CodemanApp.prototype, {
     const id = this.editingSessionId, button = document.getElementById('sshCodexConversionPreview');
     const status = document.getElementById('sshCodexConversionStatus'), details = document.getElementById('sshCodexConversionDetails');
     if (!id || !button || !status || !details) return;
+    const buttonLabel = button.textContent;
     button.disabled = true; details.replaceChildren(); details.hidden = true; this._sshCodexConversionPlan = null;
+    button.textContent = 'Checking existing chats…';
     status.textContent = 'Inspecting the owned shell and existing conversations. This does not change the pane.';
+    status.scrollIntoView?.({ block: 'nearest' });
     try {
       const response = await fetch(`/api/sessions/${encodeURIComponent(id)}/codex-conversion/preview`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
       const result = await response.json();
@@ -2591,8 +2594,9 @@ Object.assign(CodemanApp.prototype, {
       confirm.addEventListener('click', () => void this.confirmSshCodexConversion(select.value));
       details.append(summary,label,select,settings,consent,confirm); details.hidden = false; refresh();
       status.textContent = plan.conversations.length ? plan.notice : 'No existing conversation was found for this exact home and working directory. Start or resume Codex normally first; nothing was changed.';
-    } catch(error) { if (this.editingSessionId === id) status.textContent = error.message; }
-    finally { if (this.editingSessionId === id) button.disabled = false; }
+      details.scrollIntoView?.({ block: 'nearest' });
+    } catch(error) { if (this.editingSessionId === id) { status.textContent = error.message || 'Conversion preview unavailable. Nothing was changed.'; this.showToast(status.textContent, 'error'); status.scrollIntoView?.({ block: 'nearest' }); } }
+    finally { if (this.editingSessionId === id) { button.disabled = false; button.textContent = buttonLabel; } }
   },
 
   async confirmSshCodexConversion(conversationId) {

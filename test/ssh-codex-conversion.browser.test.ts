@@ -20,6 +20,60 @@ describe('in-place SSH Codex conversion controls', () => {
   afterAll(async () => {
     await browser?.close();
   });
+  it('shows immediate progress and a visible refusal without confirming conversion', async () => {
+    const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let confirmations = 0;
+    try {
+      await page.route('**/*', async (route) => {
+        if (route.request().isNavigationRequest())
+          return route.fulfill({
+            status: 200,
+            contentType: 'text/html',
+            body: `<!doctype html><html><head><meta charset="UTF-8"><style>${styles}</style></head><body>${markup}</body></html>`,
+          });
+        if (route.request().url().endsWith('/preview')) {
+          await gate;
+          return route.fulfill({
+            status: 200,
+            contentType: 'application/json',
+            body: JSON.stringify({ success: false, error: 'Return to an idle shell before conversion.' }),
+          });
+        }
+        if (route.request().url().endsWith('/confirm')) confirmations++;
+        return route.fulfill({ status: 204, body: '' });
+      });
+      await page.goto('http://codeman-conversion.test', { waitUntil: 'domcontentloaded' });
+      await page.addScriptTag({ content: 'class CodemanApp {}; window.CodemanApp=CodemanApp;' });
+      await page.addScriptTag({ content: controller });
+      await page.evaluate((id) => {
+        const app = new (window as any).CodemanApp();
+        app.editingSessionId = id;
+        (window as any).toasts = [];
+        app.showToast = (message: string) => (window as any).toasts.push(message);
+        (window as any).app = app;
+        document.getElementById('sshCodexConversionSection')!.style.display = '';
+      }, SID);
+      const button = page.locator('#sshCodexConversionPreview');
+      await button.click();
+      expect(await button.textContent()).toBe('Checking existing chats…');
+      expect(await button.isDisabled()).toBe(true);
+      release();
+      await page.waitForFunction(() =>
+        document.getElementById('sshCodexConversionStatus')?.textContent?.includes('Return to an idle shell')
+      );
+      expect(await page.evaluate(() => (window as any).toasts)).toContain('Return to an idle shell before conversion.');
+      expect(await button.isEnabled()).toBe(true);
+      expect(await button.textContent()).toBe('Convert to Codex chat…');
+      expect(confirmations).toBe(0);
+    } finally {
+      release();
+      await page.close();
+    }
+  });
   for (const recoverable of [true, false])
     it(`only enables another preview after a certified refusal: ${recoverable}`, async () => {
       const page = await browser.newPage({ viewport: { width: 390, height: 900 } });
