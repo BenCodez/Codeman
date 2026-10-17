@@ -66,7 +66,8 @@ import {
   type BrokerCleanupReferenceSnapshot,
 } from '../recovery/codex-broker-cleanup.js';
 import { getStore } from '../state-store.js';
-import { TabLayoutService } from '../tab-layout-service.js';
+import { TabLayoutService, type SessionPlacementHint } from '../tab-layout-service.js';
+import type { TabLayout } from '../tab-layout.js';
 import { ownerLayoutKey } from '../tab-layout-persistence.js';
 import { readWebviews } from '../webview-store.js';
 import { extractCompletionPhrase } from '../ralph-config.js';
@@ -82,6 +83,7 @@ import {
 import { imageWatcher } from '../image-watcher.js';
 import { workflowRunWatcher, summarizeRun } from '../workflow-run-watcher.js';
 import { attachmentRegistry, buildFileThumbnailRoute, registerExternalAttachment } from '../attachment-registry.js';
+import { folderGrants } from '../folder-listing.js';
 import { getCli, enabledClis, listClis } from '../config/cli-registry/registry.js';
 import { isCliEntryInstalled, probeStockCliAvailability } from '../utils/cli-installed-probes.js';
 import { customModelConfigDir, removeConfigDir } from '../custom-model-injection-apply.js';
@@ -117,6 +119,7 @@ import { sessionWaits } from './session-wait-registry.js';
 import { intentStore } from '../intent-store.js';
 import { AI_CHECK_MODEL } from '../config/ai-defaults.js';
 import { approvalInbox } from './approval-inbox.js';
+import { SCREEN_BLOCKED_SOURCE } from './screen-blocked.js';
 import { stopDeepSeekWeb } from '../deepseek-web-server.js';
 import {
   wireRespawnListeners,
@@ -190,6 +193,7 @@ import { CodexRecoveryAdapter } from '../recovery/codex-adapter.js';
 import { currentLocalCodexHome } from '../recovery/codex-home.js';
 import { clampRecoveryLaunchForOwner } from '../session-env-clamp.js';
 import { ownedRemoteBrokerCache } from '../recovery/remote-input-broker-cache.js';
+import { MAX_ROUTE_PARAM_LENGTH } from './route-helpers.js';
 import { getLatestPlanUsage, setLatestCodexPlanUsage } from './plan-usage-latest.js';
 import { telemetrySignature } from '../usage-telemetry.js';
 import { readCodexPlanUsage, resolveCodexBinaryPath } from '../utils/codex-cli-resolver.js';
@@ -211,6 +215,7 @@ import {
   registerTeamRoutes,
   registerMuxRoutes,
   registerFileRoutes,
+  registerHtmlViewRoutes,
   registerScheduledRoutes,
   registerHookEventRoutes,
   registerApprovalRoutes,
@@ -220,6 +225,7 @@ import {
   registerStatusTelemetryRoutes,
   registerSystemRoutes,
   registerCaseRoutes,
+  registerWorktreeRoutes,
   registerSessionRoutes,
   registerRespawnRoutes,
   registerRecoveryRoutes,
@@ -489,9 +495,14 @@ export class WebServer extends EventEmitter {
     const rewriteUrl = (req: { url?: string }): string => rewriteApiV1Url(stripBasePath(this.basePath, req.url || ''));
     if (https) {
       const { key, cert } = getOrCreateSelfSignedCert();
-      this.app = Fastify({ logger: false, https: { key, cert }, rewriteUrl });
+      this.app = Fastify({
+        logger: false,
+        https: { key, cert },
+        rewriteUrl,
+        routerOptions: { maxParamLength: MAX_ROUTE_PARAM_LENGTH },
+      });
     } else {
-      this.app = Fastify({ logger: false, rewriteUrl });
+      this.app = Fastify({ logger: false, rewriteUrl, routerOptions: { maxParamLength: MAX_ROUTE_PARAM_LENGTH } });
     }
     this.mux = createMultiplexer();
     this.sse = new SseStreamManager(
@@ -513,6 +524,9 @@ export class WebServer extends EventEmitter {
         this.cachedLightState = null;
         this.sse.broadcastSessionOrder(change);
       },
+      // Fresh, not the 2s cache: the settings PUT does not invalidate it, and a
+      // flip must apply to the very next spawn.
+      childrenFollowParent: async () => (await this.readSettings(true)).spawnedTabsFollowParent === true,
     });
     if (this.testMode) this.tabLayouts.markRestorationSkipped();
 
@@ -765,16 +779,25 @@ export class WebServer extends EventEmitter {
     }
   }
 
-  /** Register with the owner layout, deferring historical writes for tentative rebuilds. */
-  private async registerSessionWithLayout(session: Session, options?: { tentative?: boolean }): Promise<void> {
+  /**
+   * Add a tentative session only after its owner layout accepts the creation.
+   * The session enters the live map inside the layout service's owner lock, so
+   * the placement it asked for (`tabGroupId`) lands in the same versioned write
+   * that first records it.
+   */
+  private async registerSessionWithLayout(
+    session: Session,
+    options?: SessionPlacementHint & { tentative?: boolean }
+  ): Promise<TabLayout> {
+    // A restore may enter the live map for layout/listener preparation, but no
+    // state writer may replace its historical record before final restore commit.
     if (options?.tentative) this.tentativeSessionRegistrations.add(session);
-    this.sessions.set(session.id, session);
-    try {
-      await this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner));
-    } catch (error) {
-      if (this.sessions.get(session.id) === session) this.sessions.delete(session.id);
-      throw error;
-    }
+    return this.tabLayouts.sessionCreated(ownerLayoutKey(session.owner), session.id, options, () => {
+      this.sessions.set(session.id, session);
+      return () => {
+        if (this.sessions.get(session.id) === session) this.sessions.delete(session.id);
+      };
+    });
   }
 
   /** End restore preparation only once every awaited finalization has succeeded. */
@@ -1207,6 +1230,7 @@ export class WebServer extends EventEmitter {
     registerTeamRoutes(this.app, ctx);
     registerMuxRoutes(this.app, ctx);
     registerFileRoutes(this.app, ctx);
+    registerHtmlViewRoutes(this.app, ctx);
     registerScheduledRoutes(this.app, ctx);
     registerHookEventRoutes(this.app, ctx);
     registerApprovalRoutes(this.app, ctx);
@@ -1216,6 +1240,7 @@ export class WebServer extends EventEmitter {
     registerStatusTelemetryRoutes(this.app, ctx);
     registerSystemRoutes(this.app, ctx);
     registerCaseRoutes(this.app, ctx);
+    registerWorktreeRoutes(this.app, ctx);
     // The registry's lifetime is the server's: it drops per-session wake state on every
     // cleanup path and resolves in-flight wakes on shutdown.
     this.remoteWake = registerSessionRoutes(this.app, ctx);
@@ -1726,6 +1751,7 @@ export class WebServer extends EventEmitter {
       fileStreamManager.closeSessionStreams(sessionId);
       // Drop live external attachment registrations for this session
       attachmentRegistry.clearSession(sessionId);
+      folderGrants.clearSession(sessionId);
       // Stop watching for images in this session's directory
       imageWatcher.unwatchSession(sessionId);
       // Clean up pasted images directory for this session. The dir belongs to the
@@ -2022,6 +2048,19 @@ export class WebServer extends EventEmitter {
     html = html.replace(
       '</head>',
       () => `<script>window.__codemanTranscriptGutter=${JSON.stringify(gutterClis)};</script>\n</head>`
+    );
+    // Which run modes page their own transcript on PageUp/PageDown, for the scroll
+    // fallback over a pane with no local history (`_maybePageCliTranscript`). Read off
+    // the `transcriptPageKeys` capability, never an id list here, and injected for a
+    // solo window too for the same reason as the gutter map: it scrolls a terminal.
+    // Ids only, which the registry schema bounds to kebab tokens, so JSON.stringify
+    // alone is enough.
+    const pageKeyClis = enabledClis()
+      .filter((entry) => entry.capabilities.transcriptPageKeys === true)
+      .map((entry) => entry.id);
+    html = html.replace(
+      '</head>',
+      () => `<script>window.__codemanTranscriptPageKeys=${JSON.stringify(pageKeyClis)};</script>\n</head>`
     );
     if (!soloSessionId && process.env.CODEMAN_GESTURE === '1') {
       html = html.replace('</head>', () => `<script>window.__codemanGestureAvailable=true;</script>\n</head>`);
@@ -4315,9 +4354,12 @@ export class WebServer extends EventEmitter {
       // Approvals Inbox item id: lets sw.js answer an Approve/Deny action
       // click directly (POST /api/approvals/:id/answer) with no tab open.
       // Gated on the opt-in setting together with the action buttons.
+      // Approve/Deny only when we also have an approvalId to answer with.
+      // Supervised-hook CLIs (DeepSeek) omit approvalId upstream so this also
+      // strips their action buttons — buttons without an id can never answer.
       approvalId: approvalsEnabled && typeof data.approvalId === 'string' ? data.approvalId : undefined,
       urgency: template.urgency,
-      actions: approvalsEnabled ? template.actions : undefined,
+      actions: approvalsEnabled && typeof data.approvalId === 'string' ? template.actions : undefined,
     });
 
     for (const sub of subscriptions) {
@@ -4377,6 +4419,14 @@ export class WebServer extends EventEmitter {
     } else if (event === SseEvent.HookPermissionPrompt && data.tool_name) {
       body += body ? ' ' : '';
       body += `Tool: ${String(data.tool_name)}`;
+    } else if (event === SseEvent.HookPermissionPrompt && data.source === SCREEN_BLOCKED_SOURCE && data.message) {
+      // A dialog read off a hook-less CLI's screen (web/screen-blocked.ts), whose message
+      // is built from the CLI's label, never from the screen. Keyed on the source so a
+      // Claude hook's own `message` keeps the body it always had; capped like the error
+      // text, since a hook poster holding the secret can claim the source too (as it can
+      // already claim any `tool_name` above).
+      body += body ? ' ' : '';
+      body += String(data.message).slice(0, 200);
     }
     return body;
   }
@@ -5106,6 +5156,7 @@ export class WebServer extends EventEmitter {
     // otherwise meet the retry, which reuses the same session id by design.
     this.stopTranscriptWatcher(sessionId);
     attachmentRegistry.clearSession(sessionId);
+    folderGrants.clearSession(sessionId);
     sessionWaits.notifySignal(sessionId, 'exit');
     sessionWaits.cancelAll(sessionId);
     approvalInbox.resolveForSession(sessionId, 'session_ended');
@@ -5332,6 +5383,11 @@ export class WebServer extends EventEmitter {
               // tile header keeps naming it until the next report; an idle claude
               // session re-renders its statusline only on its next turn.
               displayModel: savedState?.displayModel,
+              // The last prompt-cache report, restored for the same reason: an idle claude
+              // session re-renders its statusline only on its next turn, so without this the
+              // Session Options readout would read "not reported yet" after every restart. The
+              // readout is time-aware, so a value past its expiry shows as cold, not stale-warm.
+              promptCache: savedState?.promptCache,
               // A record rebuilt from the socket has no provenance, so its
               // apparent locality is a guess (see `MuxSession.discovered`).
               discoveredMuxSession: muxSession.discovered,
@@ -5452,6 +5508,17 @@ export class WebServer extends EventEmitter {
               // Flicker filter (frontend-applied but persisted)
               if (savedState.flickerFilterEnabled !== undefined) {
                 session.flickerFilterEnabled = savedState.flickerFilterEnabled;
+              }
+              // Tab colour, pin and the image watcher are user-set and persisted like the settings
+              // above, but this path never read them back: after a restart every surviving pane came
+              // back uncoloured and unpinned with its image watcher off, and the next persist
+              // overwrote the saved values. `reapplyPersistedSessionState()` (the reboot-restore
+              // path) already restores all three. The watcher flag has to be set before
+              // `setupSessionListeners()` below, which reads it to decide whether to start one.
+              if (savedState.color) session.setColor(savedState.color);
+              if (savedState.pinned) session.restorePin(true, savedState.pinnedAt);
+              if (savedState.imageWatcherEnabled !== undefined) {
+                session.imageWatcherEnabled = savedState.imageWatcherEnabled;
               }
               // Respawn controller (not supported for external-CLI sessions)
               if (

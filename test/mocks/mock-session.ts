@@ -7,6 +7,7 @@ import { vi } from 'vitest';
 import type { CodexRestoreLaunchGuard } from '../../src/mux-interface.js';
 import type {
   CodexConfig,
+  PromptCacheStatus,
   SessionAttachmentHistoryItem,
   SessionStatus,
   SessionRemote,
@@ -48,6 +49,13 @@ export class MockSession extends EventEmitter {
    * need to be able to set it.
    */
   watching: string | null = null;
+  /** Mirrors Session.promptCache / setPromptCache (fed by POST /api/status-telemetry). */
+  promptCache: PromptCacheStatus | null = null;
+  setPromptCache(status: PromptCacheStatus): boolean {
+    const changed = JSON.stringify(status) !== JSON.stringify(this.promptCache);
+    this.promptCache = status;
+    return changed;
+  }
   private _activeChildProcesses: { pid: number; command: string }[] = [];
   ralphTracker: null = null;
   writeBuffer: string[] = [];

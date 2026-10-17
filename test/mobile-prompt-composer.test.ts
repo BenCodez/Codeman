@@ -27,6 +27,9 @@ function loadComposer(sessionId = 'session-1') {
       localEcho.pendingText = '';
     }),
     suppressBufferDetection: vi.fn(),
+    appendText: vi.fn((text: string) => {
+      localEcho.pendingText += text;
+    }),
   };
   const app = {
     activeSessionId: sessionId,
@@ -43,6 +46,14 @@ function loadComposer(sessionId = 'session-1') {
     _predictiveEcho: { clearPredictions: vi.fn() },
     _sendInputAsync: vi.fn(),
     _uploadAndInsertImages: vi.fn(async () => ['/tmp/image-one.png']),
+    _promptAttachKind: (file: { type: string; name?: string }) =>
+      file.type.startsWith('image/')
+        ? 'image'
+        : file.type.startsWith('video/')
+          ? 'video'
+          : /\.(pdf|docx|txt|md)$/i.test(file.name || '')
+            ? 'document'
+            : null,
     showToast: vi.fn(),
   };
   const schedule = (callback: () => void, delay = 0) => {
@@ -116,7 +127,7 @@ describe('mobile prompt composer', () => {
     expect((document.querySelector('.prompt-composer-textarea') as HTMLTextAreaElement).value).toBe(input.value);
   });
 
-  it('pins shell paste and its delayed Enter to the original session across a tab switch', () => {
+  it('pins literal shell paste to the original session across a tab switch without adding Enter', () => {
     const { app, bar, document, runTimers } = loadComposer();
     app.sessions.set('session-1', { mode: 'shell' });
     bar.pasteFromClipboard();
@@ -124,15 +135,16 @@ describe('mobile prompt composer', () => {
     app.activeSessionId = 'session-2';
     (document.querySelector('.paste-send') as HTMLButtonElement).click();
     runTimers();
-    expect(app._sendInputAsync.mock.calls).toEqual([
-      ['session-1', 'fixture command'],
-      ['session-1', '\r', { useMux: true }],
-    ]);
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'fixture command']]);
   });
 
-  it.each(['  first line\nsecond line  \t', ' \t\n\n \t', 'λ🙂\n尾 \t'])(
-    'preserves shell paste %j through HTTP fallback, durable reload and a separate Enter',
-    async (text) => {
+  it.each([
+    ['  first line\nsecond line  \t', '\x1b[200~  first line\rsecond line  \t\x1b[201~'],
+    [' \t\n\n \t', '\x1b[200~ \t\r\r \t\x1b[201~'],
+    ['λ🙂\n尾 \t', '\x1b[200~λ🙂\r尾 \t\x1b[201~'],
+  ])(
+    'preserves shell paste %j through HTTP fallback and reload; only explicit owner Enter submits',
+    async (text, framed) => {
       const journal = browserInputJournal();
       const browser = journal.open(); // No WebSocket: actual POST fallback.
       const { app, bar, document, runTimers } = loadComposer();
@@ -145,18 +157,24 @@ describe('mobile prompt composer', () => {
       (document.querySelector('.paste-send') as HTMLButtonElement).click();
       await settleInput(browser.app);
       expect(browser.fetches.map(({ body }) => body)).toEqual([
-        { clientId: browser.app._clientId, seq: 1, input: text },
+        { clientId: browser.app._clientId, seq: 1, input: framed },
       ]);
       expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
-        { data: text, useMux: false },
+        { data: framed, useMux: false },
       ]);
-      // A failed prefix remains durable; the delayed Enter cannot overtake it.
+      // A failed paste stays durable. Timers and a tab switch cannot submit it.
       app.activeSessionId = 'session-2';
       runTimers();
       await settleInput(browser.app);
+      expect(journal.records()).toHaveLength(1);
+      expect(app._sendInputAsync).toHaveBeenCalledOnce();
+      // The owner returns to the original shell and explicitly presses Enter.
+      app.activeSessionId = 'session-1';
+      app._sendInputAsync(app.activeSessionId, '\r', { useMux: true });
+      await settleInput(browser.app);
       const records = journal.records().map(({ value }) => value);
       expect(records.map(({ data, useMux }) => ({ data, useMux }))).toEqual([
-        { data: text, useMux: false },
+        { data: framed, useMux: false },
         { data: '\r', useMux: true },
       ]);
       expect(records[1].after).toEqual({ cid: records[0].cid, seq: records[0].seq });
@@ -165,7 +183,7 @@ describe('mobile prompt composer', () => {
       reloaded.app._drainSession('session-1');
       await settleInput(reloaded.app);
       expect(reloaded.fetches).toEqual([
-        { sid: 'session-1', body: { clientId: records[0].cid, seq: records[0].seq, input: text } },
+        { sid: 'session-1', body: { clientId: records[0].cid, seq: records[0].seq, input: framed } },
         { sid: 'session-1', body: { clientId: records[1].cid, seq: records[1].seq, input: '\r', useMux: true } },
       ]);
       expect(journal.records()).toEqual([]);
@@ -173,22 +191,25 @@ describe('mobile prompt composer', () => {
     }
   );
 
-  it('keeps connected shell paste byte-exact while Enter remains a separate durable occurrence', () => {
+  it('keeps connected bracketed shell paste byte-exact and waits for a separate manual Enter', () => {
     const journal = browserInputJournal();
     const browser = journal.open();
     browser.socket('session-1');
     const { app, bar, document, runTimers } = loadComposer();
     app.sessions.set('session-1', { mode: 'shell' });
     app._sendInputAsync.mockImplementation((...args) => Reflect.apply(browser.app._sendInputAsync, browser.app, args));
-    const text = '  first\nlast \t';
+    const text = '  first\nlast \t',
+      framed = '\x1b[200~  first\rlast \t\x1b[201~';
     bar.pasteFromClipboard();
     (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = text;
     (document.querySelector('.paste-send') as HTMLButtonElement).click();
-    expect(browser.frames.map(({ d }) => d)).toEqual([text]);
+    expect(browser.frames.map(({ d }) => d)).toEqual([framed]);
     runTimers();
-    expect(browser.frames.map(({ d }) => d)).toEqual([text, '\r']);
+    expect(browser.frames.map(({ d }) => d)).toEqual([framed]);
+    app._sendInputAsync('session-1', '\r', { useMux: true });
+    expect(browser.frames.map(({ d }) => d)).toEqual([framed, '\r']);
     expect(journal.records().map(({ value }) => ({ data: value.data, useMux: value.useMux }))).toEqual([
-      { data: text, useMux: false },
+      { data: framed, useMux: false },
       { data: '\r', useMux: true },
     ]);
     expect(browser.fetches).toEqual([]);
@@ -434,7 +455,7 @@ describe('mobile prompt composer', () => {
     expect(app.showToast).not.toHaveBeenCalled();
   });
 
-  it('preserves the draft and focuses xterm when Use terminal keyboard is chosen', () => {
+  it('returns the text to the prompt and focuses xterm when Use terminal keyboard is chosen', () => {
     const { app, bar, document, localEcho, runTimers } = loadComposer();
     const composeButton = mountComposeButton(bar, document);
     bar.composePrompt();
@@ -443,11 +464,13 @@ describe('mobile prompt composer', () => {
     (document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).click();
 
     expect(app.terminal.focus).toHaveBeenCalledOnce();
-    expect(composeButton.classList.contains('has-draft')).toBe(true);
-    expect(composeButton.title).toBe('Resume saved prompt draft');
+    // The text is on the prompt now, not parked, so there is no draft to resume.
+    expect(localEcho.pendingText).toBe('keep this');
+    expect(composeButton.classList.contains('has-draft')).toBe(false);
     runTimers();
-    localEcho.pendingText = '; then continue';
+    localEcho.pendingText += '; then continue';
     bar.composePrompt();
+    // Adopted back exactly once: a surviving draft would double the first half.
     expect(textarea(document).value).toBe('keep this; then continue');
   });
 
@@ -480,6 +503,138 @@ describe('mobile prompt composer', () => {
       expect(app._sendInputAsync).not.toHaveBeenCalled();
     }
   );
+
+  it('hands a single-line draft back to the terminal prompt and keeps no draft', () => {
+    const { app, bar, document } = loadComposer();
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'describe this image';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+
+    (document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).click();
+
+    expect(app._localEchoOverlay.appendText).toHaveBeenCalledWith('describe this image');
+    expect(document.querySelector('.prompt-composer-overlay')).toBeNull();
+    bar.composePrompt();
+    expect(textarea(document).value).toBe('describe this image');
+  });
+
+  it('writes the text to the PTY when the session has no buffer overlay, as codex does', () => {
+    const { app, bar, document } = loadComposer();
+    // Codex turns the buffer overlay off and echoes write-through instead.
+    app._localEchoEnabled = false;
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'describe this image';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+
+    (document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).click();
+
+    expect(app._localEchoOverlay.appendText).not.toHaveBeenCalled();
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', ' describe this image');
+    expect(app._predictiveEcho.clearPredictions).toHaveBeenCalled();
+  });
+
+  it('writes the handoff to the PTY, not the parked overlay, while the tile grid owns the terminal', () => {
+    const { app, bar, document } = loadComposer();
+    // The grid parks and hides the main terminal, and a tile's Enter cannot flush
+    // its overlay, so the text would strand there (same guard as _attachFromToolbar).
+    app._tilesOwnTerminal = () => true;
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'describe this image';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+
+    (document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).click();
+
+    expect(app._localEchoOverlay.appendText).not.toHaveBeenCalled();
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', ' describe this image');
+  });
+
+  it('refuses an oversized handoff with the draft intact rather than losing it from both surfaces', () => {
+    const { app, bar, document } = loadComposer();
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'x'.repeat(bar._composerMaxLength + 1);
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+
+    (document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).click();
+
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    expect(app._localEchoOverlay.appendText).not.toHaveBeenCalled();
+    expect(app.showToast).toHaveBeenCalled();
+    // Still open, still holding the text.
+    expect(document.querySelector('.prompt-composer-overlay')).not.toBeNull();
+    expect(textarea(document).value.length).toBe(bar._composerMaxLength + 1);
+  });
+
+  it('disables the terminal handoff while an upload is in flight', async () => {
+    const { app, bar, document } = loadComposer();
+    let finishUpload!: (paths: string[]) => void;
+    app._uploadAndInsertImages.mockImplementation(
+      () => new Promise<string[]>((resolveUpload) => (finishUpload = resolveUpload))
+    );
+    bar.composePrompt();
+    const fileInput = document.querySelector('.paste-file-input') as HTMLInputElement;
+    const image = new document.defaultView!.File(['image'], 'shot.png', { type: 'image/png' });
+    Object.defineProperty(fileInput, 'files', { configurable: true, value: [image] });
+    fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
+
+    // Tapping it mid-upload would close the overlay and let the upload rebuild a
+    // draft holding only the paths, which the next open would prepend.
+    expect((document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).disabled).toBe(true);
+    finishUpload(['/tmp/image-one.png']);
+    await vi.waitFor(() =>
+      expect((document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).disabled).toBe(false)
+    );
+  });
+
+  it('writes to the PTY when the session is in echo passthrough, where Enter skips the overlay', () => {
+    const { app, bar, document } = loadComposer();
+    app._echoPassthroughSessions = new Set(['session-1']);
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'describe this image';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+
+    (document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).click();
+
+    expect(app._localEchoOverlay.appendText).not.toHaveBeenCalled();
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', ' describe this image');
+  });
+
+  // Forward lock, not a check on this diff: the pre-change handoff also preserved
+  // the draft and never appended, so this passes on either side of the change. It
+  // exists to pin that multi-line stays parked if the single-line route is widened.
+  it('parks a multi-line draft instead of mangling it on the single-line prompt', () => {
+    const { app, bar, document } = loadComposer();
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'first line\nsecond line';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+
+    (document.querySelector('.prompt-composer-terminal') as HTMLButtonElement).click();
+
+    expect(app._localEchoOverlay.appendText).not.toHaveBeenCalled();
+    bar.composePrompt();
+    expect(textarea(document).value).toBe('first line\nsecond line');
+  });
+
+  it('separates a parked draft from text put on the prompt before the next open', () => {
+    const { bar, document, localEcho, runTimers } = loadComposer();
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'describe this';
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+    (document.querySelector('.paste-cancel') as HTMLButtonElement).click(); // parks the draft
+    runTimers();
+    // The toolbar Attach put a path on the now-empty prompt with no leading gap.
+    localEcho.pendingText = '/case/.codeman-uploads/paste-1-a.png ';
+
+    bar.composePrompt();
+
+    expect(textarea(document).value).toBe('describe this /case/.codeman-uploads/paste-1-a.png ');
+  });
 
   it('finishes an upload into a reopened composer without restoring a deleted session draft', async () => {
     const { app, bar, document } = loadComposer();
@@ -542,5 +697,230 @@ describe('mobile prompt composer', () => {
     finishUploads[1](['/tmp/second.png']);
     await vi.waitFor(() => expect(input.value).toBe('/tmp/first.png /tmp/second.png'));
     expect((document.querySelector('.paste-send') as HTMLButtonElement).disabled).toBe(false);
+  });
+
+  it('offers videos and documents in the Attach key picker and filters the pick through the shared classifier', async () => {
+    const { app, bar, document } = loadComposer();
+    bar.composePrompt();
+    const fileInput = document.querySelector('.paste-file-input') as HTMLInputElement;
+    expect(fileInput.getAttribute('accept')).toBe(
+      'image/*,video/*,.pdf,.docx,.pptx,.xlsx,.zip,.txt,.md,.csv,.tsv,.json,.log,.yaml,.yml,.xml'
+    );
+    expect((document.querySelector('.paste-image') as HTMLButtonElement).textContent).toBe('📎 Attach');
+    const video = new document.defaultView!.File(['clip'], 'clip.mov', { type: 'video/quicktime' });
+    const pdf = new document.defaultView!.File(['%PDF'], 'notes.pdf', { type: 'application/pdf' });
+    const script = new document.defaultView!.File(['#!/bin/sh'], 'run.sh', { type: 'text/x-shellscript' });
+    Object.defineProperty(fileInput, 'files', { configurable: true, value: [video, pdf, script] });
+
+    app.activeSessionId = 'session-2';
+    fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
+    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([video, pdf], { sessionId: 'session-1', insert: false });
+    await vi.waitFor(() => expect(textarea(document).value).toContain('/tmp/image-one.png'));
+  });
+
+  it('puts an uploaded document path into the draft like a photo', async () => {
+    const { app, bar, document } = loadComposer();
+    app._uploadAndInsertImages.mockResolvedValueOnce(['/case/.codeman-uploads/paste-1-ab-notes.pdf']);
+    bar.composePrompt();
+    const input = textarea(document);
+    input.value = 'summarize';
+    input.selectionStart = input.selectionEnd = input.value.length;
+    input.dispatchEvent(new document.defaultView!.Event('input', { bubbles: true }));
+    const fileInput = document.querySelector('.paste-file-input') as HTMLInputElement;
+    const pdf = new document.defaultView!.File(['%PDF'], 'notes.pdf', { type: '' }); // no MIME: the name decides
+    Object.defineProperty(fileInput, 'files', { configurable: true, value: [pdf] });
+    fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
+    await vi.waitFor(() => expect(input.value).toBe('summarize /case/.codeman-uploads/paste-1-ab-notes.pdf'));
+    expect(app.terminal.paste).not.toHaveBeenCalled();
+  });
+
+  it('takes a video pasted into the editor through the shared classifier', () => {
+    const { app, bar, document } = loadComposer();
+    bar.composePrompt();
+    const input = textarea(document);
+    const video = new document.defaultView!.File(['clip'], 'clip.mp4', { type: 'video/mp4' });
+    const event = new document.defaultView!.Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+      value: {
+        items: [
+          { type: 'text/plain', getAsFile: () => null },
+          { type: 'video/mp4', getAsFile: () => video },
+        ],
+      },
+    });
+    app.activeSessionId = 'session-2';
+    input.dispatchEvent(event);
+    expect(event.defaultPrevented).toBe(true);
+    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([video], { sessionId: 'session-1', insert: false });
+  });
+});
+
+// The shell bar's Paste button (and Compose, which redirects here for a shell
+// session) must deliver a multi-line block the way a real terminal paste does:
+// one bracketed write, so the shell takes the block as one edit instead of
+// running every line the moment its newline arrives, and no Enter, so the
+// user reviews the block at the prompt before running it.
+describe('mobile shell Paste', () => {
+  beforeEach(() => vi.restoreAllMocks());
+
+  function openShellPaste() {
+    const harness = loadComposer();
+    harness.app.sessions.set('session-1', { mode: 'shell' });
+    harness.bar.composePrompt();
+    const input = harness.document.querySelector('.paste-textarea') as HTMLTextAreaElement;
+    const send = harness.document.querySelector('.paste-overlay .paste-send') as HTMLButtonElement;
+    return { ...harness, input, send };
+  }
+
+  it.each([false, undefined, null, 'true', 1])(
+    'uses literal paste without injected markers or Enter for disabled/unknown mode %j',
+    (mode) => {
+      const { app, input, send, runTimers } = openShellPaste();
+      Reflect.set(app.terminal.modes, 'bracketedPasteMode', mode);
+      input.value = '  λ🙂\nsecond line  \t';
+      send.click();
+      runTimers();
+      expect(app._sendInputAsync.mock.calls).toEqual([['session-1', '  λ🙂\rsecond line  \t']]);
+    }
+  );
+
+  it('reads the original shell current mode at Send rather than reusing a stale enabled value from dialog open', () => {
+    const { app, input, send } = openShellPaste();
+    input.value = 'literal command';
+    app.terminal.modes.bracketedPasteMode = false;
+    send.click();
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'literal command']]);
+  });
+
+  it('treats an unreadable negotiation as disabled and retains oversized literal text for trimming', () => {
+    const { app, bar, document, input, send } = openShellPaste();
+    Object.defineProperty(app.terminal, 'modes', {
+      get() {
+        throw Error('mode unavailable');
+      },
+    });
+    input.value = 'literal command';
+    send.click();
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'literal command']]);
+    bar.pasteFromClipboard();
+    const large = document.querySelector('.paste-textarea') as HTMLTextAreaElement;
+    large.value = 'x'.repeat(bar._composerMaxLength + 1);
+    (document.querySelector('.paste-send') as HTMLButtonElement).click();
+    expect(app._sendInputAsync).toHaveBeenCalledOnce();
+    expect(large.isConnected).toBe(true);
+    expect(large.value).toHaveLength(bar._composerMaxLength + 1);
+  });
+
+  it('does not borrow another tab mode through the reused primary terminal', () => {
+    const { app, input, send } = openShellPaste();
+    input.value = 'original\ntarget';
+    app.activeSessionId = 'session-2';
+    app.terminal.modes.bracketedPasteMode = true;
+    send.click();
+    expect(app._sendInputAsync.mock.calls).toEqual([['session-1', 'original\rtarget']]);
+  });
+
+  it.each([true, false])(
+    'retains a live exact tile mode only while that tile still owns its target: %s',
+    (retained) => {
+      const { app, bar, document } = loadComposer();
+      app.sessions.set('session-1', { mode: 'shell' });
+      const tile = { sessionId: 'session-1', terminal: app.terminal, _destroyed: false };
+      Reflect.set(app, '_focusedPane', () => ({
+        terminal: tile.terminal,
+        sessionId: 'session-1',
+        isPrimary: false,
+        tile,
+      }));
+      bar.pasteFromClipboard();
+      (document.querySelector('.paste-textarea') as HTMLTextAreaElement).value = 'tile paste';
+      app.activeSessionId = 'session-2';
+      if (!retained) tile.sessionId = 'session-2';
+      (document.querySelector('.paste-send') as HTMLButtonElement).click();
+      expect(app._sendInputAsync.mock.calls).toEqual([
+        ['session-1', retained ? '\x1b[200~tile paste\x1b[201~' : 'tile paste'],
+      ]);
+    }
+  );
+
+  it('sends a multi-line block once, bracketed, and never presses Enter', () => {
+    const { app, document, input, send, runTimers } = openShellPaste();
+    expect(document.querySelector('.prompt-composer-overlay')).toBeNull();
+    input.value = 'cd ~/dotfiles\ngit pull\n./sync.sh';
+
+    send.click();
+    runTimers();
+
+    expect(app._sendInputAsync).toHaveBeenCalledOnce();
+    expect(app._sendInputAsync).toHaveBeenCalledWith(
+      'session-1',
+      '\x1b[200~cd ~/dotfiles\rgit pull\r./sync.sh\x1b[201~'
+    );
+    expect(document.querySelector('.paste-overlay')).toBeNull();
+  });
+
+  it('normalizes CRLF line endings to the CR a terminal paste carries', () => {
+    const { app, input, send } = openShellPaste();
+    input.value = 'echo one\r\necho two';
+
+    send.click();
+
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[200~echo one\recho two\x1b[201~');
+  });
+
+  it('drops paste markers inside the text, so a pasted ESC[201~ cannot end the bracket early', () => {
+    const { app, input, send } = openShellPaste();
+    // A pastejacking page can put the end marker on the clipboard: everything
+    // after it would be typed as keys, and its CR would run a command.
+    input.value = 'echo safe\x1b[201~\nrm -rf ~/x\x1b[200~';
+
+    send.click();
+
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', '\x1b[200~echo safe\rrm -rf ~/x\x1b[201~');
+  });
+
+  it('refuses a paste longer than one input frame and keeps the text for trimming', () => {
+    const { app, bar, document, input, send } = openShellPaste();
+    input.value = 'x'.repeat(bar._composerMaxLength + 1);
+
+    send.click();
+
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    expect(app.showToast).toHaveBeenCalledWith(expect.stringContaining('too long'), 'error');
+    expect(document.querySelector('.paste-overlay')).not.toBeNull();
+    expect(input.value.length).toBe(bar._composerMaxLength + 1);
+  });
+
+  it('delivers to the shell it was opened for after a tab switch', () => {
+    const { app, input, send } = openShellPaste();
+    input.value = 'ls\npwd';
+    app.activeSessionId = 'session-2';
+
+    send.click();
+
+    expect(app._sendInputAsync).toHaveBeenCalledWith('session-1', 'ls\rpwd');
+  });
+
+  it('uploads a picked image to the shell it was opened for after a tab switch', () => {
+    const { app, document } = openShellPaste();
+    app.activeSessionId = 'session-2';
+    const fileInput = document.querySelector('.paste-overlay .paste-file-input') as HTMLInputElement;
+    const image = new document.defaultView!.File(['image'], 'shot.png', { type: 'image/png' });
+    Object.defineProperty(fileInput, 'files', { configurable: true, value: [image] });
+
+    fileInput.dispatchEvent(new document.defaultView!.Event('change', { bubbles: true }));
+
+    expect(app._uploadAndInsertImages).toHaveBeenCalledWith([image], { sessionId: 'session-1' });
+    expect(document.querySelector('.paste-overlay')).toBeNull();
+  });
+
+  it('sends nothing for an empty paste', () => {
+    const { app, document, send, runTimers } = openShellPaste();
+
+    send.click();
+    runTimers();
+
+    expect(app._sendInputAsync).not.toHaveBeenCalled();
+    expect(document.querySelector('.paste-overlay')).toBeNull();
   });
 });

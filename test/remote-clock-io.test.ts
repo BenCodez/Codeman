@@ -1,4 +1,4 @@
-/** Shared SSH admission and native clock provenance; exec is exclusively an injected fixture. */
+/** @fileoverview Shared SSH admission and native clock provenance; exec is exclusively an injected fixture. */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -50,6 +50,7 @@ let cache: OwnedRemoteBrokerCache;
 let root: string;
 const provision = vi.fn();
 const reserve = vi.fn();
+const rollback = vi.fn();
 const scope = () => ({ sessionId: SID, remote, workingDir: remote.remotePath, codexHome: '/fixture/codex' });
 function privateProof(closed = false) {
   const directory = '/fixture/private/' + SID + '/' + material.config.incarnation;
@@ -128,6 +129,7 @@ function scopedAuthority(authority: RemoteCodexActionAuthority) {
   return {
     ...(typeof authority === 'function' ? { check: authority, isCurrent: authority } : authority),
     reserveInputBroker: reserve,
+    rollbackInputBroker: rollback,
     commitInputBroker: async () => true,
   };
 }
@@ -230,6 +232,12 @@ beforeEach(async () => {
     await writeFile(join(root, 'pending-incarnation.json'), JSON.stringify({ oldInc, newInc }));
     return true;
   });
+  rollback.mockReset().mockImplementation(async (oldInc: string, newInc: string) => {
+    const file = join(root, 'pending-incarnation.json');
+    expect(JSON.parse(await readFile(file, 'utf8'))).toEqual({ oldInc, newInc });
+    await rm(file);
+    return true;
+  });
   fixture.exec.mockReset();
   validExec();
   provision.mockReset().mockImplementation(async (_command: string, input: string) => {
@@ -288,6 +296,33 @@ describe('shared queued SSH mutations', () => {
       expect(await pending).toEqual(kind === 'input' ? { status: 'not-sent' } : 'not-sent');
       expect(authority).toHaveBeenCalled();
       expect(reserve).toHaveBeenCalledTimes(kind === 'input' ? 0 : 1);
+      expect(provision).not.toHaveBeenCalled();
+      expect(fixture.exec).not.toHaveBeenCalled();
+      expect(rollback).toHaveBeenCalledTimes(kind === 'input' ? 0 : 1);
+      if (kind !== 'input')
+        await expect(readFile(join(root, 'pending-incarnation.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+    }
+  );
+  it.each(['restart', 'restore'] as const)(
+    'retains the queued %s pending reservation when its certified no-effect rollback is unacknowledged',
+    async (kind) => {
+      const release = createDeferred<void>();
+      const holding = Array.from({ length: getRemoteSshLimit() }, () => runWithRemoteSshLimit(() => release.promise));
+      rollback.mockResolvedValueOnce(false);
+      let current = true;
+      const pending = mutations[kind](remote, request(60_000, kind), () => current);
+      try {
+        await vi.waitFor(() => expect(getQueuedRemoteSshCount()).toBe(1));
+        current = false;
+      } finally {
+        release.resolve();
+        await Promise.all(holding);
+      }
+      expect(await pending).toBe('unknown');
+      const binding = JSON.parse(await readFile(join(root, 'pending-incarnation.json'), 'utf8'));
+      expect(binding.oldInc).toBe(material.config.incarnation);
+      expect(cache.get(scope(), binding.newInc)?.incarnation).toBe(binding.newInc);
+      expect(rollback).toHaveBeenCalledWith(binding.oldInc, binding.newInc);
       expect(provision).not.toHaveBeenCalled();
       expect(fixture.exec).not.toHaveBeenCalled();
     }

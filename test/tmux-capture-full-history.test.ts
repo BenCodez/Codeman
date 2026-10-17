@@ -11,7 +11,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { formatCursorRestore, formatPaneSnapshot, hasVisibleContent } from '../src/tmux-manager.js';
+import { formatCursorRestore, formatPaneSnapshot, hasVisibleContent, queryPaneCursor } from '../src/tmux-manager.js';
 
 describe('tmux full-history pane capture (COD-47)', () => {
   const source = readFileSync(resolve(import.meta.dirname, '../src/tmux-manager.ts'), 'utf8');
@@ -34,6 +34,14 @@ describe('tmux full-history pane capture (COD-47)', () => {
     // scrollback than the configured history limit retains; `-J` re-joins
     // lines hard-wrapped at the capture-time pane width.
     expect(source).toContain('capture-pane -p -e -J -S -${historyLines}');
+  });
+
+  it('a full capture with a scrollbackOverride (remote history) reads the visible frame only (-J -S 0)', () => {
+    // The remote tmux supplied the history; reading local history too would
+    // splice two histories above one frame.
+    expect(methodBody).toContain('scrollbackOverride !== undefined');
+    expect(methodBody).toContain("'capture-pane -p -e -J -S 0'");
+    expect(methodBody).toContain('joinScrollbackAndFrame(');
   });
 
   it('full-history exec sets an explicit maxBuffer (default 1MB would ENOBUFS multi-MB dumps)', () => {
@@ -72,7 +80,7 @@ describe('tmux full-history pane capture (COD-47)', () => {
     // up from them, so the two decisions travel together: no geometry, no move,
     // and the old trim applies instead.
     expect(methodBody).toContain("rawCapture.replace(/\\n$/, '')");
-    expect(methodBody).toContain("if (!geometry) return normalizeScrollbackEol(rawCapture.replace(/\\n+$/g, ''))");
+    expect(methodBody).toContain("const trimmed = rawCapture.replace(/\\n+$/g, '')");
   });
 
   it('defers to the byte history when the pane holds nothing visible', () => {
@@ -136,7 +144,7 @@ describe('the geometry a capture reports back', () => {
     const write = methodBody.indexOf('opts.capturedGeometry = { cols: geometry.cols, rows: geometry.rows }');
     // Anchor on the REPLAY branch, not the earlier `if (fullHistory)` that only
     // sizes the exec buffer.
-    const replayBranch = methodBody.indexOf('if (!geometry) return normalizeScrollbackEol(');
+    const replayBranch = methodBody.indexOf('if (!geometry) {');
     const visibleReturn = methodBody.indexOf('if (geometry) return formatPaneSnapshot(');
     expect(write).toBeGreaterThan(-1);
     expect(replayBranch).toBeGreaterThan(-1);
@@ -150,6 +158,50 @@ describe('the geometry a capture reports back', () => {
     // snapshot repaint is skipped in that case. Reporting a size anyway would
     // describe a frame that was never positioned.
     expect(methodBody).toContain('if (opts && geometry)');
+  });
+});
+
+describe('the capture reports how much scrollback tmux holds (#{history_size})', () => {
+  const source = readFileSync(resolve(import.meta.dirname, '../src/tmux-manager.ts'), 'utf8');
+  const methodStart = source.indexOf('capturePaneBuffer(muxName: string');
+  const methodBody = source.slice(methodStart, source.indexOf('captureActivePaneBuffer(muxName: string', methodStart));
+
+  it('reads it from the one cursor query the capture already makes', () => {
+    // No extra tmux call: every capture is a synchronous exec on the server.
+    expect(methodBody).toContain(
+      "'#{cursor_x} #{cursor_y} #{pane_width} #{pane_height} #{history_size} #{alternate_on}'"
+    );
+    expect(methodBody.match(/display-message/g)).toHaveLength(1);
+    expect(methodBody).toContain('opts.capturedHistoryLines = geometry.historyLines');
+  });
+
+  it('parses the fifth field as historyLines', () => {
+    expect(queryPaneCursor(() => '3 5 120 40 812\n')).toEqual({
+      cursorX: 3,
+      cursorY: 5,
+      cols: 120,
+      rows: 40,
+      historyLines: 812,
+    });
+    // A pane in the alternate screen (fullscreen claude) holds none.
+    expect(queryPaneCursor(() => '0 31 187 32 0')?.historyLines).toBe(0);
+  });
+
+  it('never lets a missing or bad history field void the caret', () => {
+    for (const raw of ['3 5 120 40', '3 5 120 40 ', '3 5 120 40 x', '3 5 120 40 -1']) {
+      const geometry = queryPaneCursor(() => raw);
+      expect(geometry).toEqual({ cursorX: 3, cursorY: 5, cols: 120, rows: 40 });
+      expect(geometry && 'historyLines' in geometry).toBe(false);
+    }
+  });
+
+  it('still returns null when the geometry itself is bad', () => {
+    expect(queryPaneCursor(() => 'x 5 120 40 812')).toBeNull();
+    expect(
+      queryPaneCursor(() => {
+        throw new Error('no pane');
+      })
+    ).toBeNull();
   });
 });
 
@@ -169,5 +221,47 @@ describe('why a capture has to report its height', () => {
     expect(Math.max(...addressed)).toBe(50);
     // A 30-row terminal cannot honour 20 of those addresses.
     expect(addressed.filter((row) => row > 30)).toHaveLength(20);
+  });
+});
+
+describe('queryPaneCursor history depth', () => {
+  it('reads tmux history_size as an optional fifth field', () => {
+    expect(queryPaneCursor(() => '4 22 133 24 25000\n')).toEqual({
+      cols: 133,
+      rows: 24,
+      cursorX: 4,
+      cursorY: 22,
+      historyLines: 25000,
+    });
+  });
+
+  it('keeps the geometry and omits the depth when the fifth field is missing or invalid', () => {
+    for (const raw of ['4 22 133 24', '4 22 133 24 abc', '4 22 133 24 -1']) {
+      const geometry = queryPaneCursor(() => raw);
+      expect(geometry, raw).toEqual({ cols: 133, rows: 24, cursorX: 4, cursorY: 22 });
+    }
+  });
+
+  it('reads tmux alternate_on as an optional sixth field', () => {
+    expect(queryPaneCursor(() => '4 22 133 24 29 1\n')).toEqual({
+      cols: 133,
+      rows: 24,
+      cursorX: 4,
+      cursorY: 22,
+      historyLines: 29,
+      alternateOn: true,
+    });
+    expect(queryPaneCursor(() => '4 22 133 24 29 0')?.alternateOn).toBe(false);
+    for (const raw of ['4 22 133 24 29', '4 22 133 24 29 2', '4 22 133 24 29 x']) {
+      expect(
+        queryPaneCursor(() => raw),
+        raw
+      ).not.toHaveProperty('alternateOn');
+    }
+  });
+
+  it('asks tmux for the history depth and alternate screen in the same display-message as the cursor', () => {
+    const source = readFileSync(resolve(import.meta.dirname, '../src/tmux-manager.ts'), 'utf8');
+    expect(source).toContain("'#{cursor_x} #{cursor_y} #{pane_width} #{pane_height} #{history_size} #{alternate_on}'");
   });
 });

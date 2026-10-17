@@ -163,9 +163,14 @@ respawn, Ralph, the orchestrator, search, and admin. Each route module carries a
 If the caller is an agent running _inside_ a Codeman session, install the packaged
 agent skill instead of teaching it these calls by hand: `skills/codeman` in the repo
 (`npx skills add Ark0N/Codeman --skill codeman -g`, or `codeman skill install
-[--case <name>]`, or the synced `agentSkillEnabled` App Setting for automatic
-per-case injection on Claude session create). The skill carries the guard, the
-safety rules, and verified wait/orchestration recipes.
+[--case <name>] [--mode <mode>]`, or the synced `agentSkillEnabled` App Setting for
+automatic per-case injection on session create, into the directory each CLI scans for
+skills). The skill carries the guard, the safety rules, and verified
+wait/orchestration recipes.
+
+If the caller speaks the Model Context Protocol (Claude Desktop, Cursor, Codex, any MCP
+client), point it at `codeman mcp` instead: seven tools over these same endpoints,
+configured with `CODEMAN_API_URL`. See the README section "MCP server".
 
 The common ones:
 
@@ -215,17 +220,18 @@ whether your integration works, and the last one is what actually bites:
   to die in the field.
 - **`wait.timeoutMs`** is the timeout after server-side clamping (600 s ceiling by
   default). Read it rather than assuming you got what you asked for.
-- **`stop` and `blocked` only exist for `claude` sessions**, and on a `shell` session
-  even `idle` fires only once at startup, so send-and-wait there can only time out.
+- **`stop` only exists for `claude` (and `deepseek`) sessions, `blocked` also for
+  `codex`** (read off its screen), and on a `shell` session even `idle` fires only once
+  at startup, so send-and-wait there can only time out.
   See the Gotchas below.
 
 ⚠️ **There is no readiness signal, and skipping readiness is the failure that looks
 like success.** A session reports `idle` before its CLI has spawned, and a `claude`
 worker in a brand-new case comes up on the CLI's **trust dialog**, which has a ❯
-prompt of its own. Prompt it at that moment and the text lands in the dialog, the
-`\r` does not get past it, and the session's startup `idle` lands inside the wait
-window: the wait resolves on `idle` in a couple of seconds with `timedOut: false`,
-indistinguishable from a finished turn. Wait for the pid, then wait for the
+prompt of its own. Prompt it at that moment and the text lands in the dialog,
+whose highlighted option is `No, exit`, so the prompt's `\r` quits the CLI. Codeman
+holds the session's `idle` while the dialog is on screen, which makes waiting for
+`idle` safe but still not a readiness signal. Wait for the pid, then wait for the
 composer, answering the dialog only as the bounded fallback.
 
 ⚠️ **Answering it is not "press Enter".** Claude Code 2.1.252 dropped the options'
@@ -433,9 +439,11 @@ Every one of these has cost somebody real time.
   a multi-word match is unreliable there. Match one short space-free token, ideally
   one you printed yourself, and keep it out of the typed line (your own keystrokes
   echo into the stream).
-- **`stop` and `blocked` never fire for `shell`, `opencode`, `codex`, `gemini`,
-  `antigravity` or `pi` sessions.** They come from Claude Code hooks, which no other mode
-  installs, so only `idle`, `working` and `exit` exist there. Asking for them
+- **`stop` and `blocked` never fire for `shell`, `opencode`, `gemini`, `antigravity` or
+  `pi` sessions, and `stop` never for `codex`.** They come from Claude Code hooks, which
+  no other mode installs, so only `idle`, `working` and `exit` exist there. The exception
+  is `blocked` on `codex`, which Codeman raises from the approval, question and trust
+  dialogs it reads off codex's screen. Asking for them
   explicitly is a `400`; omitting `until` is safe, since the server drops them from
   the default set and echoes what it actually waited on as `wait.until`. Even in
   `claude` mode, a Docker case needs `CODEMAN_DOCKER_BRIDGE_HOOKS=1` for hooks to

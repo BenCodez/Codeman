@@ -16,6 +16,17 @@
  */
 import { describe, expect, it, vi, afterEach } from 'vitest';
 import { Session } from '../src/session.js';
+
+// The restart case below starts a real direct-PTY session; the real `claude` must never
+// run from a test, so pty.spawn runs a harmless stand-in instead.
+vi.mock('node-pty', async (importOriginal) => {
+  const real = await importOriginal<typeof import('node-pty')>();
+  return {
+    ...real,
+    spawn: (_file: string, _args: string[] | string, options: import('node-pty').IPtyForkOptions) =>
+      real.spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], options),
+  };
+});
 import {
   isTrustDialogScreen,
   compactScreenText,
@@ -141,7 +152,7 @@ describe('trustDialogNextKey', () => {
   });
 });
 
-describe('Session trust-dialog auto-accept', () => {
+describe('Session trust-dialog auto-accept', async () => {
   afterEach(() => vi.useRealTimers());
 
   /** A session whose pane renders `screen`, recording everything written to it. */
@@ -166,86 +177,251 @@ describe('Session trust-dialog auto-accept', () => {
       _interactiveStartedAt: number;
     };
     internals._interactiveStartedAt = Date.now();
-    return { session, writes, tick: () => internals._maybeAcceptTrustDialog() };
+    return {
+      session,
+      writes,
+      tick: async () => {
+        internals._maybeAcceptTrustDialog();
+        // Session input uses its real FIFO; settle its queued write without
+        // advancing the retry window or bypassing lifecycle/ownership guards.
+        await vi.advanceTimersByTimeAsync(0);
+      },
+    };
   }
 
-  it('presses Enter when the dialog is on screen', () => {
+  it('presses Enter when the dialog is on screen', async () => {
     vi.useFakeTimers();
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG);
-    tick();
+    await tick();
     expect(writes).toEqual(['\r']);
   });
 
-  it('walks the 2.1.252 dialog onto the trust option before it confirms', () => {
+  it('walks the 2.1.252 dialog onto the trust option before it confirms', async () => {
     vi.useFakeTimers();
     // The whole point: no Enter goes out while "No, exit" is highlighted.
     let screen = RENDERED_DIALOG_2_1_252;
     const { writes, tick } = sessionShowing(() => screen);
-    tick();
+    await tick();
     expect(writes).toEqual([TRUST_KEY_DOWN]);
 
     screen = RENDERED_DIALOG_2_1_252_ON_YES;
-    vi.advanceTimersByTime(2000);
-    tick();
+    await vi.advanceTimersByTimeAsync(2000);
+    await tick();
     expect(writes).toEqual([TRUST_KEY_DOWN, TRUST_KEY_CONFIRM]);
   });
 
-  it('never presses Enter while the cursor sits on "No, exit"', () => {
+  it('never presses Enter while the cursor sits on "No, exit"', async () => {
     vi.useFakeTimers();
     // A dialog that never moves (a dropped arrow, a wedged pane) must run out of
     // attempts pressing arrows, not answer *exit* on the way.
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG_2_1_252);
     for (let i = 0; i < 20; i++) {
-      tick();
-      vi.advanceTimersByTime(2000);
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
     }
     expect(writes).toEqual(Array(TRUST_DIALOG_MAX_ATTEMPTS).fill(TRUST_KEY_DOWN));
   });
 
-  it('retries a dropped keystroke, then gives up rather than typing forever', () => {
+  it('retries a dropped keystroke, then gives up rather than typing forever', async () => {
     vi.useFakeTimers();
     // Ink can drop a keystroke while it is still mounting the widget, so one
     // press is not always enough; a stuck dialog must not become an Enter loop.
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG);
     for (let i = 0; i < 20; i++) {
-      tick();
-      vi.advanceTimersByTime(2000);
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
     }
     expect(writes.length).toBe(TRUST_DIALOG_MAX_ATTEMPTS);
   });
 
-  it('stops once the dialog is answered', () => {
+  it('stops once the dialog is answered', async () => {
     vi.useFakeTimers();
     let screen = RENDERED_DIALOG;
     const { writes, tick } = sessionShowing(() => screen);
-    tick();
+    await tick();
     expect(writes).toEqual(['\r']);
 
     screen = RENDERED_MAIN_UI;
     for (let i = 0; i < 5; i++) {
-      vi.advanceTimersByTime(2000);
-      tick();
+      await vi.advanceTimersByTimeAsync(2000);
+      await tick();
     }
     expect(writes).toEqual(['\r']);
   });
 
-  it('never answers a dialog-looking screen outside the startup window', () => {
+  it('never answers a dialog-looking screen outside the startup window', async () => {
     vi.useFakeTimers();
     // A live agent can print this text hours in; only a launching pane can be
     // showing the real widget.
     const { writes, tick } = sessionShowing(() => RENDERED_DIALOG);
-    vi.advanceTimersByTime(10 * 60_000);
-    tick();
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    await tick();
     expect(writes).toEqual([]);
   });
 
-  it('does not press Enter on a normal screen', () => {
+  it('reads the dialog that painted inside the throttle of the read before it', async () => {
+    vi.useFakeTimers();
+    // Measured on 2.1.294: one read at +156 ms saw a blank pane, the dialog painted
+    // within the throttle, and a quiet dialog sends no further output to read on.
+    let screen = '';
+    const { writes, tick } = sessionShowing(() => screen);
+    await tick();
+    await vi.advanceTimersByTimeAsync(500);
+    screen = RENDERED_DIALOG_2_1_252;
+    await tick(); // the dialog's own paint: throttled, and the last output the pane produces
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(writes[0]).toBe(TRUST_KEY_DOWN);
+  });
+
+  it('cancels a deferred read when the session is stopped', async () => {
+    vi.useFakeTimers();
+    // DELETE goes through stop(), and a read deferred just before it must not outlive it.
+    let screen = '';
+    const { session, tick } = sessionShowing(() => screen);
+    await tick();
+    screen = RENDERED_DIALOG_2_1_252;
+    const before = vi.getTimerCount();
+    await tick(); // throttled, so a read is deferred
+    expect(vi.getTimerCount()).toBe(before + 1);
+    await session.stop(false);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('neither scans nor arms a timer once the session is stopped', async () => {
+    vi.useFakeTimers();
+    // Killing the pane produces output of its own, and the buffer tail still shows the
+    // dialog, so a deleted session went on "answering" it on a timer for several seconds.
+    const { session, tick } = sessionShowing(() => RENDERED_DIALOG_2_1_252);
+    await session.stop(false);
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+    await tick();
+    await tick(); // inside the throttle of the first
+    expect(vi.getTimerCount()).toBe(0);
+    expect(log.mock.calls.some(([line]) => String(line).includes('trust dialog'))).toBe(false);
+    log.mockRestore();
+  });
+
+  it('keeps a pending pane lifecycle veto before queuing a trust-dialog answer', async () => {
+    vi.useFakeTimers();
+    const { session, writes, tick } = sessionShowing(() => RENDERED_DIALOG);
+    Reflect.set(session, '_paneLifecycleOps', 1);
+    await tick();
+    expect(writes).toEqual([]);
+    Reflect.set(session, '_paneLifecycleOps', 0);
+    await vi.advanceTimersByTimeAsync(2000);
+    await tick();
+    expect(writes).toEqual([TRUST_KEY_CONFIRM]);
+    await session.stop(false);
+  });
+
+  it('does not press Enter on a normal screen', async () => {
     vi.useFakeTimers();
     const { writes, tick } = sessionShowing(() => RENDERED_MAIN_UI);
     for (let i = 0; i < 5; i++) {
-      tick();
-      vi.advanceTimersByTime(2000);
+      await tick();
+      await vi.advanceTimersByTimeAsync(2000);
     }
     expect(writes).toEqual([]);
+  });
+});
+
+describe('Session idle detection while the trust dialog is up', () => {
+  afterEach(() => vi.useRealTimers());
+
+  /** A just-launched pane (busy, inside the startup window) rendering `screen` (null: capture failed). */
+  function launchingSession(screen: () => string | null) {
+    const mux = { isAvailable: () => true, capturePaneText: () => screen() };
+    const session = new Session({
+      workingDir: '/tmp',
+      mode: 'claude',
+      mux,
+      muxSession: { muxName: 'codeman-test', sessionId: 'test', createdAt: Date.now() },
+    } as unknown as ConstructorParameters<typeof Session>[0]);
+    const internals = session as unknown as {
+      _detectInteractiveActivity(data: string): void;
+      _markActivity(): void;
+      _interactiveStartedAt: number;
+      _status: string;
+    };
+    internals._interactiveStartedAt = Date.now();
+    internals._status = 'busy'; // what startInteractive() leaves a new pane at
+    let idles = 0;
+    session.on('idle', () => idles++);
+    /** One repaint carrying a `❯`, which is what arms the idle confirmation. */
+    const paint = (chunk: string) => {
+      internals._markActivity();
+      internals._detectInteractiveActivity(chunk);
+    };
+    return { session, paint, idles: () => idles };
+  }
+
+  it('does not call the dialog idle, although its own ❯ arms the check', () => {
+    vi.useFakeTimers();
+    const { session, paint, idles } = launchingSession(() => RENDERED_DIALOG_2_1_252);
+    paint(RENDERED_DIALOG_2_1_252);
+    vi.advanceTimersByTime(30_000);
+    expect(session.status).toBe('busy');
+    expect(idles()).toBe(0);
+  });
+
+  it('goes idle once the dialog has been answered and the composer is up', () => {
+    vi.useFakeTimers();
+    let screen = RENDERED_DIALOG_2_1_252;
+    const { session, paint, idles } = launchingSession(() => screen);
+    paint(RENDERED_DIALOG_2_1_252);
+    vi.advanceTimersByTime(10_000);
+    expect(session.status).toBe('busy');
+
+    // No new output needed: the check keeps re-reading the screen on its own.
+    screen = RENDERED_MAIN_UI.replace('✻ Actualizing… (13m 23s · ↓ 47.5k tokens)', '');
+    vi.advanceTimersByTime(10_000);
+    expect(session.status).toBe('idle');
+    expect(idles()).toBe(1);
+  });
+
+  it('keeps holding when a capture fails after the dialog was seen', () => {
+    vi.useFakeTimers();
+    // A failed capture says nothing about whether the dialog went away.
+    let screen: string | null = RENDERED_DIALOG_2_1_252;
+    const { session, paint, idles } = launchingSession(() => screen);
+    paint(RENDERED_DIALOG_2_1_252);
+    vi.advanceTimersByTime(5000);
+    screen = null;
+    vi.advanceTimersByTime(20_000);
+    expect(session.status).toBe('busy');
+    expect(idles()).toBe(0);
+  });
+
+  it("does not carry the last pane's dialog verdict into a restarted pane", async () => {
+    // The session saw the dialog on its last pane, then restarted where no capture can
+    // replace that verdict (here the direct-PTY fallback, which has no pane to read; a
+    // failed capture keeps it the same way). The new pane must still be able to go idle.
+    const session = new Session({ workingDir: '/tmp', mode: 'claude', useMux: false });
+    (session as unknown as { _lastPaneProbeTrustDialog: boolean })._lastPaneProbeTrustDialog = true;
+    try {
+      await session.startInteractive();
+      vi.useFakeTimers();
+      const internals = session as unknown as {
+        _detectInteractiveActivity(data: string): void;
+        _markActivity(): void;
+      };
+      internals._markActivity();
+      internals._detectInteractiveActivity('❯ ');
+      vi.advanceTimersByTime(30_000);
+      expect(session.status).toBe('idle');
+    } finally {
+      vi.useRealTimers();
+      await session.stop();
+    }
+  });
+
+  it('lets a dialog-looking screen go idle outside the startup window', () => {
+    vi.useFakeTimers();
+    // A live agent can print the dialog's words hours in, and must not be held busy.
+    const { session, paint } = launchingSession(() => RENDERED_DIALOG_2_1_252);
+    vi.advanceTimersByTime(10 * 60_000);
+    paint(RENDERED_DIALOG_2_1_252);
+    vi.advanceTimersByTime(30_000);
+    expect(session.status).toBe('idle');
   });
 });

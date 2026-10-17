@@ -5,13 +5,15 @@
 
 import type { Session } from '../../session.js';
 import type { SessionState } from '../../types.js';
+import type { TabLayout } from '../../tab-layout.js';
+import type { SessionPlacementHint } from '../../tab-layout-service.js';
 
 export interface SessionPort {
   readonly sessions: ReadonlyMap<string, Session>;
   /** Fence pre-reboot recovery evidence without resetting settings or retry budgets. */
   prepareRebootRestoreRecovery?(sessionId: string): Promise<void>;
-  /** Tentative restores preserve the historical record through every state writer until committed. */
-  addSession(session: Session, options?: { tentative?: boolean }): Promise<void>;
+  /** Register with owner layout placement; tentative restores preserve historical state until commit. */
+  addSession(session: Session, options?: SessionPlacementHint & { tentative?: boolean }): Promise<TabLayout>;
   commitSessionRegistration(session: Session): void;
   /** Strict main-state and mux-metadata acknowledgement before a reboot offer is consumed. */
   persistRebootRestoreDurably(session: Session, isCurrent: () => boolean): Promise<void>;

@@ -1,16 +1,20 @@
 /**
  * @fileoverview Tests for the remote-file ssh concurrency limiter
  * (`src/remote-ssh-limiter.ts`): the cap holds under interleaved async resumption,
- * waiters are served FIFO, and a task that throws still releases its slot.
+ * waiters are served FIFO, a task that throws still releases its slot, and a
+ * bounded (`maxWaitMs`) waiter that times out neither runs nor leaks a slot.
  *
  * Port: N/A (no HTTP server).
  */
 
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
+import { performance } from 'node:perf_hooks';
 import {
   getActiveRemoteSshCount,
   getQueuedRemoteSshCount,
   getRemoteSshLimit,
+  RemoteSshSlotTimeoutError,
+  RemoteSshAdmissionError,
   runWithRemoteSshLimit,
 } from '../src/remote-ssh-limiter.js';
 
@@ -63,5 +67,137 @@ describe('runWithRemoteSshLimit', () => {
     );
     expect(getActiveRemoteSshCount()).toBe(0);
     expect(await runWithRemoteSshLimit(async () => 'after')).toBe('after');
+  });
+
+  describe('maxWaitMs', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+      vi.restoreAllMocks();
+    });
+
+    it('a waiter that times out leaves the queue, never runs, and takes no slot', async () => {
+      vi.useFakeTimers();
+      const cap = getRemoteSshLimit();
+      const gates = Array.from({ length: cap }, () => deferred());
+      const holders = gates.map((gate) => runWithRemoteSshLimit(() => gate.promise));
+      await Promise.resolve();
+      expect(getActiveRemoteSshCount()).toBe(cap);
+
+      let ran = false;
+      const bounded = runWithRemoteSshLimit(
+        async () => {
+          ran = true;
+        },
+        { maxWaitMs: 1500 }
+      );
+      const outcome = expect(bounded).rejects.toBeInstanceOf(RemoteSshSlotTimeoutError);
+      // An unbounded waiter queued BEHIND it still gets the next slot.
+      let laterRan = false;
+      const later = runWithRemoteSshLimit(async () => {
+        laterRan = true;
+      });
+      expect(getQueuedRemoteSshCount()).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(1500);
+      await outcome;
+      expect(ran).toBe(false);
+      expect(getQueuedRemoteSshCount()).toBe(1);
+      expect(getActiveRemoteSshCount()).toBe(cap);
+
+      gates[0].resolve();
+      await later;
+      expect(laterRan).toBe(true);
+      expect(ran).toBe(false);
+
+      for (const gate of gates) gate.resolve();
+      await Promise.all(holders);
+      expect(getActiveRemoteSshCount()).toBe(0);
+      expect(getQueuedRemoteSshCount()).toBe(0);
+    });
+
+    it('a waiter handed a slot in time runs and releases normally', async () => {
+      vi.useFakeTimers();
+      const cap = getRemoteSshLimit();
+      const gates = Array.from({ length: cap }, () => deferred());
+      const holders = gates.map((gate) => runWithRemoteSshLimit(() => gate.promise));
+      await Promise.resolve();
+
+      const bounded = runWithRemoteSshLimit(async () => 'ran', { maxWaitMs: 1500 });
+      await vi.advanceTimersByTimeAsync(1000);
+      gates[0].resolve();
+      expect(await bounded).toBe('ran');
+      // The cancelled timer firing later must not disturb anything.
+      await vi.advanceTimersByTimeAsync(1000);
+
+      for (const gate of gates) gate.resolve();
+      await Promise.all(holders);
+      expect(getActiveRemoteSshCount()).toBe(0);
+      expect(getQueuedRemoteSshCount()).toBe(0);
+    });
+
+    it.each(['expired', 'cancelled', 'slot-timeout', 'accepted'] as const)(
+      'combines bounded queue waits with owner admission and retained children (%s)',
+      async (kind) => {
+        vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+        let now = 0,
+          current = true;
+        vi.spyOn(performance, 'now').mockImplementation(() => now);
+        const gates = Array.from({ length: getRemoteSshLimit() }, deferred),
+          child = deferred();
+        const holders = gates.map((gate) => runWithRemoteSshLimit(() => gate.promise));
+        await Promise.resolve();
+        const effect = vi.fn(async (retain: (closed: Promise<void>) => void) => {
+          if (kind === 'accepted') retain(child.promise);
+          return 'sent';
+        });
+        const bounded = runWithRemoteSshLimit(effect, {
+          deadline: kind === 'expired' ? 20 : 100,
+          maxWaitMs: kind === 'slot-timeout' ? 20 : 100,
+          isCurrent: () => current,
+        }).catch((error) => error);
+        let laterRan = false;
+        const later = runWithRemoteSshLimit(async () => {
+          laterRan = true;
+        });
+        try {
+          if (kind === 'accepted') {
+            now = 10;
+            gates[0].resolve();
+            expect(await bounded).toBe('sent');
+            expect(effect).toHaveBeenCalledOnce();
+            expect(laterRan).toBe(false);
+            expect(getActiveRemoteSshCount()).toBe(getRemoteSshLimit());
+            child.resolve();
+          } else {
+            if (kind === 'cancelled') current = false;
+            now = kind === 'cancelled' ? 50 : 20;
+            await vi.advanceTimersByTimeAsync(now);
+            const refusal = await bounded;
+            if (kind === 'slot-timeout') expect(refusal).toBeInstanceOf(RemoteSshSlotTimeoutError);
+            else {
+              expect(refusal).toBeInstanceOf(RemoteSshAdmissionError);
+              expect(refusal.reason).toBe(kind);
+            }
+            expect(effect).not.toHaveBeenCalled();
+            expect(laterRan).toBe(false);
+            expect(getQueuedRemoteSshCount()).toBe(1);
+            gates[0].resolve();
+          }
+          await later;
+          expect(laterRan).toBe(true);
+        } finally {
+          child.resolve();
+          gates.forEach((gate) => gate.resolve());
+          await Promise.all([...holders, later]);
+        }
+        expect(getActiveRemoteSshCount()).toBe(0);
+        expect(getQueuedRemoteSshCount()).toBe(0);
+      }
+    );
+
+    it('takes a free slot at once without starting a timer', async () => {
+      expect(await runWithRemoteSshLimit(async () => 'free', { maxWaitMs: 0 })).toBe('free');
+      expect(getActiveRemoteSshCount()).toBe(0);
+    });
   });
 });

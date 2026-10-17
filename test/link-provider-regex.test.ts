@@ -36,7 +36,14 @@ function shippedPattern(name: string): RegExp {
   return new RegExp(lit.slice(1, lastSlash), lit.slice(lastSlash + 1));
 }
 
-const PATTERN_NAMES = ['urlPattern', 'cmdPattern', 'FILE_PATH_LINK_PATTERN', 'bashPattern'];
+const PATTERN_NAMES = [
+  'urlPattern',
+  'cmdPattern',
+  'FILE_PATH_LINK_PATTERN',
+  'RELATIVE_FILE_PATH_LINK_PATTERN',
+  'FOLDER_PATH_LINK_PATTERN',
+  'bashPattern',
+];
 
 /** Lines that made 0.9.10's cmdPattern backtrack exponentially (>2s each). */
 const KILLER_LINES = [
@@ -49,6 +56,8 @@ const KILLER_LINES = [
   // long URL-ish and path-ish soup for the other patterns
   'https://example.com/' + 'a/'.repeat(1500) + ' ' + '/home/x/'.repeat(400) + '.'.repeat(2000),
   'Bash(' + 'x'.repeat(4000),
+  // a colon run ending in `//`: a folder body that kept `:` rescanned it for `://` from every colon
+  'a:'.repeat(16000) + '//',
 ];
 
 describe('terminal link-provider regexes (shipped source)', () => {
@@ -139,6 +148,12 @@ describe('terminal link-provider regexes (shipped source)', () => {
       // paths at all outside /var and /tmp.
       '/Users/arbbot/codeman-cases/report.docx',
       '/mnt/d/captures/demo.mp4',
+      // Camera-roll video uploads the agent echoes back (VIDEO_ATTACHMENT_EXTENSIONS).
+      '/home/a/.codeman-uploads/paste-1-ab.m4v',
+      '/home/a/.codeman-uploads/paste-2-cd.ogv',
+      // Document uploads the agent echoes back (zip and tsv join the already-matched office/text set).
+      '/home/a/.codeman-uploads/paste-3-ef-archive.zip',
+      '/home/a/.codeman-uploads/paste-4-gh-data.tsv',
       // Longer extension of a family must win over its prefix (tsx over ts).
       '/home/a/src/App.tsx',
     ];
@@ -167,11 +182,17 @@ describe('terminal link-provider regexes (shipped source)', () => {
     }
   });
 
-  it('terminal-ui builds its path pattern from the shared factory', () => {
+  it('terminal-ui finds its paths through the shared helper', () => {
     // Structural guard: a local literal here would drift from the response
     // viewer's linkifier, which is the divergence the move exists to prevent.
-    expect(SOURCE).toContain('absoluteFilePathPattern()');
+    expect(SOURCE).toContain('findFilePathLinks(lineText)');
     expect(SOURCE).not.toMatch(/const extPattern =\s*\n?\s*\//);
+  });
+
+  it('the rooted and the relative path pattern link the same extensions', () => {
+    const extensions = (name: string) => /\\\.\(\?:([^()]*)\)\)\\b$/.exec(shippedPattern(name).source)?.[1];
+    expect(extensions('FILE_PATH_LINK_PATTERN')).toBeTruthy();
+    expect(extensions('RELATIVE_FILE_PATH_LINK_PATTERN')).toBe(extensions('FILE_PATH_LINK_PATTERN'));
   });
 
   it('cmdPattern arg group cannot match empty tokens (the exponential trigger)', () => {

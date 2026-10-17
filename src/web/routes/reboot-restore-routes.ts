@@ -45,7 +45,7 @@ import {
 import { Session } from '../../session.js';
 import { resolveClaudeModeForUsername } from '../../user-store.js';
 import { getCli } from '../../config/cli-registry/registry.js';
-import { applyWorkspaceHooks, seedAgentSessionPreamble } from '../../hooks-config.js';
+import { agentSkillDir, applyWorkspaceHooks, seedAgentSessionPreamble } from '../../hooks-config.js';
 import { getLifecycleLog } from '../../session-lifecycle-log.js';
 import { STATS_COLLECTION_INTERVAL_MS } from '../../config/server-timing.js';
 import { SseEvent } from '../sse-events.js';
@@ -733,7 +733,7 @@ export function registerRebootRestoreRoutes(app: FastifyInstance, ctx: RebootRes
           // skill falls back to writing out the whole ~150-line §0 preamble. Remote and
           // docker sessions never reach here (the plan rejects them as
           // `remote-or-docker`), so the local-only condition is structural.
-          if (getCli(session.mode)?.capabilities.agentSkillInjection) {
+          if (agentSkillDir(getCli(session.mode)?.capabilities)) {
             const agentSkillEnabled = await ctx.getAgentSkillEnabled();
             if (!rebootRestoreRegistry.isHeld(entry, owner)) {
               await discardCancelledRestore();

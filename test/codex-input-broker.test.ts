@@ -139,18 +139,23 @@ it('preserves a 64KiB UTF-8 owner paste, controls and split frame bytes exactly'
   expect(await broker.prove(child.pid!)).toMatchObject({ rawGeneration: 0, closed: false });
 });
 
-it('accepts literal then Enter as distinct automatic effects and consumes duplicates once', async () => {
-  const { broker, child, bytes } = await fixture();
-  const literal = broker.frame('auto', 'Continue fixture', CID, undefined, [], OWNERS)!;
-  child.stdin.write(literal.data);
-  expect(await broker.receipt(literal.receipt)).toBe('sent');
-  child.stdin.write(literal.data);
-  const enter = broker.frame('auto', '\r', CID, undefined, [], OWNERS)!;
-  child.stdin.write(enter.data);
-  expect(await broker.receipt(enter.receipt)).toBe('sent');
-  await eventually(async () => (await bytes()).length === Buffer.byteLength('Continue fixture\r'));
-  expect((await bytes()).toString()).toBe('Continue fixture\r');
-});
+it.each([false, true])(
+  'accepts literal then Enter as distinct automatic effects and consumes duplicates once (bracketed=%s)',
+  async (bracketed) => {
+    const { broker, child, bytes } = await fixture();
+    const input = bracketed ? '\x1b[200~Continue fixture\x1b[201~' : 'Continue fixture';
+    const literal = broker.frame('auto', input, CID, undefined, [], OWNERS)!;
+    expect(literal.receipt.hash).toBe(createHash('sha256').update(input).digest('hex'));
+    child.stdin.write(literal.data);
+    expect(await broker.receipt(literal.receipt)).toBe('sent');
+    child.stdin.write(literal.data);
+    const enter = broker.frame('auto', '\r', CID, undefined, [], OWNERS)!;
+    child.stdin.write(enter.data);
+    expect(await broker.receipt(enter.receipt)).toBe('sent');
+    await eventually(async () => (await bytes()).length === Buffer.byteLength(input + '\r'));
+    expect((await bytes()).toString()).toBe(input + '\r');
+  }
+);
 
 it('journals direct terminal input before forwarding it and refuses later automatic bytes', async () => {
   const { broker, child, bytes } = await fixture();

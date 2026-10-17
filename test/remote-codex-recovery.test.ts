@@ -577,20 +577,27 @@ cp.execFileSync=function(file,args,options){
     for (const kind of ['restart', 'restore'] as const) {
       const existing = await controlled();
       try {
-        const result = await existing.rotate(kind, () => {
+        let reserved: string | undefined;
+        const result = await existing.rotate(kind, (authority) => {
+          const rotation = authority as typeof authority & {
+            reserveInputBroker(old: string, next: string): Promise<boolean>;
+          };
+          const reserve = rotation.reserveInputBroker;
+          rotation.reserveInputBroker = async (old, next) => {
+            reserved = next;
+            return reserve(old, next);
+          };
           if (kind === 'restart') writeFileSync(join(existing.root, 'pane'), `0|||%7|${existing.worker.pid}\n`);
           else rmSync(join(existing.root, 'missing'));
         });
         expect(result.result).toBe('not-sent');
-        // Material and the pending incarnation are retained before the first
-        // provisioning effect, including a certified native preflight refusal.
-        expect(result.pending).toMatch(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
-        expect(result.pending).not.toBe(existing.descriptor.incarnation);
-        expect(existing.cache.get(existing.scope, result.pending!)).toMatchObject({
-          incarnation: result.pending,
-          directory: join(existing.descriptor.directory, '..', result.pending!),
-          homeDigest: sha(existing.home),
-        });
+        // Certified native refusal plus an acknowledged exact pending rollback
+        // releases only this unprovisioned incarnation, preserving the old worker.
+        expect(reserved).toMatch(/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+        expect(reserved).not.toBe(existing.descriptor.incarnation);
+        expect(result.pending).toBeUndefined();
+        expect(existing.cache.get(existing.scope, reserved!)).toBeUndefined();
+        expect(await existing.cache.load(existing.scope, reserved!)).toBeUndefined();
         expect(existing.cache.get(existing.scope, existing.descriptor.incarnation)).toEqual(existing.descriptor);
         expect(result.promoted).toBeUndefined();
         expect(await existing.starts()).toBe(1);

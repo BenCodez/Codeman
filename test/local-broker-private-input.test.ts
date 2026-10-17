@@ -51,6 +51,7 @@ beforeAll(async () => {
 const ID = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
 const CID = '11111111-2222-3333-4444-555555555555';
 const PROMPT = 'Private owner task 🧭';
+const PASTED_PROMPT = `\x1b[200~${PROMPT}\x1b[201~`;
 let root: string;
 let screen: string;
 let paneId: string;
@@ -169,7 +170,8 @@ beforeEach(async () => {
     const data = Buffer.from(packet.data, 'base64').toString();
     receipts.set(packet.nonce, 'sent');
     if (packet.channel !== 'probe') chunks.push(data);
-    screen = data === '\r' ? '›\n  fixture-model high · /tmp\n' : `› ${data}\n  fixture-model high · /tmp\n`;
+    const composer = data.startsWith('\x1b[200~') && data.endsWith('\x1b[201~') ? data.slice(6, -6) : data;
+    screen = data === '\r' ? '›\n  fixture-model high · /tmp\n' : `› ${composer}\n  fixture-model high · /tmp\n`;
     if (losePasteReply) throw new Error('Fixture paste acknowledgement lost');
     return { stdout: pasteOutput, stderr: '' };
   });
@@ -273,8 +275,13 @@ it.each(['automatic', 'owner'] as const)('pipes private %s literal and Enter fra
   const delivered = await f.manager.sendInput(ID, `${PROMPT}\r`, kind === 'automatic' ? f.guard : undefined);
   assertPrivateArguments();
   expect(delivered).toBe(true);
-  expect(chunks).toEqual([PROMPT, '\r']);
+  expect(chunks).toEqual([PASTED_PROMPT, '\r']);
   expect(loaded).toHaveLength(2);
+  const acknowledged = vi.mocked(f.broker.receipt).mock.calls.map(([receipt]) => receipt);
+  expect(acknowledged.map((receipt) => receipt.hash)).toEqual(
+    [PASTED_PROMPT, '\r'].map((data) => createHash('sha256').update(data).digest('hex'))
+  );
+  expect(acknowledged.map((receipt) => receipt.counter)).toEqual([1, 2]);
   expect(trace.filter((stage) => stage !== 'native')).toEqual([
     'load',
     'load-close',
@@ -399,7 +406,7 @@ it.each(['lost-paste', 'paste-output'] as const)(
     if (change === 'lost-paste') losePasteReply = true;
     else pasteOutput = 'Unexpected paste acknowledgement';
     expect(await f.manager.sendInput(ID, `${PROMPT}\r`, f.guard)).toBe(false);
-    expect(chunks).toEqual([PROMPT]);
+    expect(chunks).toEqual([PASTED_PROMPT]);
     expect(loaded).toHaveLength(1);
     expect(f.guard.noteDispatch).toHaveBeenCalledOnce();
     expect(f.guard.noteBrokerSent).not.toHaveBeenCalled();
@@ -416,3 +423,50 @@ it('uses the same private pipe and guarded native paste for a zero-child-byte pr
   expect(chunks).toEqual([]);
   assertPrivateArguments();
 });
+
+it.each(['long', 'already-bracketed', 'single-key', 'text-only', 'budget-boundary', 'over-budget'] as const)(
+  'keeps authenticated paste bytes and their exact size budget for %s input',
+  async (kind) => {
+    const f = fixture();
+    const text =
+      kind === 'single-key'
+        ? '3'
+        : kind === 'budget-boundary'
+          ? 'a'.repeat(65_536 - 12)
+          : kind === 'over-budget'
+            ? 'a'.repeat(65_536 - 11)
+            : kind === 'already-bracketed'
+              ? PASTED_PROMPT
+              : kind === 'long'
+                ? 'owner prompt 🧭 '.repeat(200).trimEnd()
+                : PROMPT;
+    const expected =
+      kind === 'single-key' || kind === 'text-only' || kind === 'already-bracketed'
+        ? text
+        : `\x1b[200~${text}\x1b[201~`;
+    const frame = vi.spyOn(f.broker, 'frame');
+    expect(await f.manager.sendInput(ID, text + (kind === 'text-only' ? '' : '\r'))).toBe(kind !== 'over-budget');
+    if (kind === 'over-budget') {
+      expect(chunks).toEqual([]);
+      expect(loaded).toEqual([]);
+      expect(frame.mock.results[0].value).toBeUndefined();
+      expect(f.broker.canFrame).toBe(true);
+      // Refused oversized framing consumed no signed sequence or native effect.
+      expect(await f.manager.sendInput(ID, '3\r')).toBe(true);
+      expect(chunks).toEqual(['3', '\r']);
+      expect(vi.mocked(f.broker.receipt).mock.calls.map(([receipt]) => receipt.counter)).toEqual([1, 2]);
+    } else {
+      expect(chunks).toEqual(kind === 'text-only' ? [expected] : [expected, '\r']);
+      expect(Buffer.byteLength(chunks[0])).toBeLessThanOrEqual(65_536);
+      const packet = JSON.parse(Buffer.from(loaded[0].data.split(':')[1], 'base64').toString());
+      expect(Buffer.from(packet.data, 'base64').toString()).toBe(expected);
+      expect(loaded[0].data.match(/CODEMAN_INPUT_V1:/g)).toHaveLength(1);
+      expect(frame.mock.results[0].value.receipt.hash).toBe(createHash('sha256').update(expected).digest('hex'));
+      if (kind !== 'single-key' && kind !== 'text-only') {
+        expect(chunks[0].match(/\x1b\[200~/g)).toHaveLength(1);
+        expect(chunks[0].match(/\x1b\[201~/g)).toHaveLength(1);
+      }
+    }
+    assertPrivateArguments();
+  }
+);
