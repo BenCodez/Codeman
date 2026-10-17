@@ -185,6 +185,7 @@ import { SupervisorAutomationStore } from '../supervisor/automation-store.js';
 import { BrainStore } from '../supervisor/brain.js';
 import { ManagementService } from '../management/store.js';
 import { GitLabService } from '../management/gitlab.js';
+import { observeManagementAgent } from '../management/observation.js';
 import { registerManagementGitLabRoutes } from './routes/management-gitlab-routes.js';
 import { registerManagementRoutes } from './routes/management-routes.js';
 import { registerManagementAgentAuth } from './middleware/management-agent-auth.js';
@@ -1343,6 +1344,11 @@ export class WebServer extends EventEmitter {
             current
           );
           return this.managementService.directory(scope.owner ?? 'admin', authority);
+        },
+        observe: async (scope, agentId, current) => {
+          const owner = scope.owner ?? 'admin';
+          const authority = await this.managementService.captureManager(owner, scope.sessionId, current);
+          return observeManagementAgent(agentId, scope.sessionId, owner, (id) => this.sessions.get(id), authority);
         },
         thread: async (scope, agentId, current) => {
           const authority = await this.managementService.captureManager(

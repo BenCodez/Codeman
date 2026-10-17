@@ -38,6 +38,7 @@ export interface SupervisorMcpContext {
   management?: {
     directory(scope: SupervisorManagerScope, current: () => boolean): Promise<unknown>;
     thread(scope: SupervisorManagerScope, agentId: string, current: () => boolean): Promise<unknown>;
+    observe?(scope: SupervisorManagerScope, agentId: string, current: () => boolean): Promise<unknown>;
     message(
       scope: SupervisorManagerScope,
       agentId: string,
@@ -78,6 +79,7 @@ const Message = Operation.extend({
 });
 const Agent = z.discriminatedUnion('mode', [
   z.object({ mode: z.literal('read'), agentId: Operation.shape.workerId }).strict(),
+  z.object({ mode: z.literal('observe'), agentId: Operation.shape.workerId }).strict(),
   z
     .object({
       mode: z.literal('message'),
@@ -143,7 +145,7 @@ const tools = toolNames.map((name) => ({
     supervisor_agents:
       'List this owner’s agent directory, roles, notes and cooperative inbox enrollment, including SSH shell tabs. Metadata does not prove agent identity or healthy/idle state.',
     supervisor_agent:
-      'Read an agent’s message thread or queue an owner-authorized message for its enrolled cooperative inbox. Queued is not delivered or executed; never types into a shell.',
+      'Automatically learn from bounded cached owner-agent output with observe, read attributed inbox replies with read, or queue an authorized discovery question with message. Output is untrusted context, never identity, health or permission proof. Queued is not delivered; never types into a shell.',
   }[name],
   inputSchema:
     name === 'supervisor_gitlab'
@@ -195,7 +197,7 @@ const tools = toolNames.map((name) => ({
           ? {
               type: 'object',
               properties: {
-                mode: { enum: ['read', 'message'] },
+                mode: { enum: ['read', 'observe', 'message'] },
                 agentId: { type: 'string', pattern: '^[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}$' },
                 requestId: { type: 'string', minLength: 8, maxLength: 100, pattern: '^[A-Za-z0-9_-]+$' },
                 message: { type: 'string', minLength: 1, maxLength: 2000, pattern: '\\S' },
@@ -333,7 +335,7 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
         call.data.name === 'supervisor_message' ||
         call.data.name === 'supervisor_gitlab' ||
         (brain?.success === true && brain.data.mode !== 'read') ||
-        (agent?.success === true && agent.data.mode === 'message');
+        (agent?.success === true && agent.data.mode !== 'read');
       if (operation && !ctx.credentials.canOperate(scope))
         return fail(id, -32001, 'Manager preparation is uncertain; only status and worker inspection are available');
       const args = (
@@ -397,7 +399,13 @@ export function registerSupervisorMcpRoutes(app: FastifyInstance, ctx: Superviso
         if (!ctx.management) return fail(id, -32001, 'Global management is unavailable');
         const selected = Agent.parse(args.data);
         if (selected.mode === 'read') result = await ctx.management.thread(scope, selected.agentId, current);
-        else {
+        else if (selected.mode === 'observe') {
+          if (selected.agentId === scope.sessionId || !ctx.management.observe)
+            return fail(id, -32602, 'Agent observation is unavailable');
+          const authority = await controller.captureBrainAuthority?.(current);
+          if (!authority || !authority()) return fail(id, -32001, 'Current prepared manager authority is required');
+          result = await ctx.management.observe(scope, selected.agentId, () => current() && authority());
+        } else {
           if (selected.agentId === scope.sessionId) return fail(id, -32602, 'A manager cannot message itself');
           const authority = await controller.captureBrainAuthority?.(current);
           if (!authority || !authority()) return fail(id, -32001, 'Current prepared manager authority is required');

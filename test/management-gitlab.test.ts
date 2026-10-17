@@ -134,6 +134,37 @@ describe('private direct GitLab connection', () => {
     });
     expect(transport.mock.calls.some(([url]) => url.endsWith('/projects?per_page=50&page=1'))).toBe(true);
   });
+  it('checks actual selected project access and the all-project endpoint', async () => {
+    await configure();
+    const original = transport.getMockImplementation()!;
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      new URL(url).pathname === '/api/v4/projects/1' ? json({ message: 'forbidden' }, 403) : original(url, init)
+    );
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+    await configure({ projectIds: [], allowAllProjects: true });
+    expect(await service.check('alice')).toMatchObject({ available: true, projectCount: 1, projectsTruncated: true });
+    transport.mockImplementation(async (url: string, init: RequestInit) =>
+      new URL(url).pathname === '/api/v4/projects' ? json({}, 403) : original(url, init)
+    );
+    await expect(service.check('alice')).rejects.toMatchObject({ code: 'unavailable' });
+  });
+  it('uses bounded parallel project reads and retains configured ordering', async () => {
+    await configure({ projectIds: Array.from({ length: 100 }, (_, i) => i + 1) });
+    let active = 0,
+      peak = 0;
+    transport.mockImplementation(async (url: string) => {
+      const id = Number(new URL(url).pathname.split('/').at(-1));
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      active--;
+      return json({ id, name: String(id), path_with_namespace: `group/${id}`, default_branch: 'main' });
+    });
+    const result = (await service.operate('alice', { operation: 'projects' })) as { projects: { id: number }[] };
+    expect(result.projects.map((p) => p.id)).toEqual(Array.from({ length: 100 }, (_, i) => i + 1));
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(5);
+  });
   it('finds a regular file on a later tree page for reads and guarded updates', async () => {
     await configure();
     const original = transport.getMockImplementation()!;

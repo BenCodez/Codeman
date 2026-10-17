@@ -86,6 +86,10 @@ async function fixture(
     scope.sessionId === SID && scope.owner === (multiuser ? 'alice' : undefined) ? controller : undefined
   );
   const management = {
+    observe: vi.fn(async (_scope, _id, current: () => boolean) => {
+      if (!current()) throw Error('cancelled');
+      return { output: 'Project API', trust: 'untrusted-context', identityVerified: false };
+    }),
     directory: vi.fn(async (_scope, current: () => boolean) => {
       if (!current()) throw Error('cancelled');
       return { agents: [{ sessionId: WORKER, mode: 'shell', remote: true }] };
@@ -623,10 +627,12 @@ it('exposes global agent discovery and cooperative messages without calling nati
   expect(f.management.directory).toHaveBeenCalledOnce();
   for (const args of [
     { mode: 'read', agentId: WORKER },
+    { mode: 'observe', agentId: WORKER },
     { mode: 'message', agentId: WORKER, requestId: REQUEST, message: 'Tell me your project and current role.' },
   ]) {
     expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: args })).json().error).toBeUndefined();
   }
+  expect(f.management.observe).toHaveBeenCalledOnce();
   expect(f.management.thread).toHaveBeenCalledOnce();
   expect(f.management.message).toHaveBeenCalledOnce();
   expect(f.controller.assign).not.toHaveBeenCalled();
@@ -709,4 +715,21 @@ it('blocks manager tools after current native authentication proof is lost', asy
   expect(f.brain.read).not.toHaveBeenCalled();
   expect(f.management.directory).not.toHaveBeenCalled();
   expect(f.gitlab.operate).not.toHaveBeenCalled();
+});
+
+it('requires current prepared authority for observation and rejects wider observation requests', async () => {
+  const f = await fixture('owner-password', false, false, true, true);
+  for (const arguments_ of [
+    { mode: 'observe', agentId: SID },
+    { mode: 'observe', agentId: WORKER, command: 'capture-pane' },
+  ]) {
+    expect((await f.rpc('tools/call', { name: 'supervisor_agent', arguments: arguments_ })).json().error).toBeDefined();
+  }
+  expect(f.management.observe).not.toHaveBeenCalled();
+  f.setReady(false);
+  expect(
+    (await f.rpc('tools/call', { name: 'supervisor_agent', arguments: { mode: 'observe', agentId: WORKER } })).json()
+      .error.code
+  ).toBe(-32001);
+  expect(f.management.observe).not.toHaveBeenCalled();
 });

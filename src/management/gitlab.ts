@@ -34,6 +34,12 @@ const Content = z
   .string()
   .refine((s) => Buffer.byteLength(s) <= 128 * 1024 && !s.includes('\0') && Buffer.from(s).toString('utf8') === s);
 const Project = z.number().int().positive().safe();
+const ProjectInfo = z.object({
+  id: Project,
+  name: z.string().max(500),
+  path_with_namespace: z.string().max(1024),
+  default_branch: Branch.nullable(),
+});
 const Write = { projectId: Project, branch: Branch, requestId: z.string().regex(/^[\w-]{8,80}$/) };
 const FileWrite = {
   ...Write,
@@ -307,6 +313,35 @@ export class GitLabService {
     if (JSON.stringify(value).includes(connection.value.token)) throw new GitLabError('unavailable');
     return value;
   }
+  private async projects(owner: string, connection: Connection, page = 1) {
+    if (connection.value.allowAllProjects) {
+      const result = await this.get(owner, connection, `/projects?per_page=50&page=${page}`);
+      const nextPage = result.nextPage ? Number(result.nextPage) : null;
+      if (
+        nextPage !== null &&
+        (!Number.isSafeInteger(nextPage) || nextPage !== page + 1 || String(nextPage) !== result.nextPage)
+      )
+        throw new GitLabError('unavailable');
+      return { projects: z.array(ProjectInfo).max(50).parse(result.json), truncated: nextPage !== null, nextPage };
+    }
+    const ids = connection.value.projectIds;
+    const projects: z.infer<typeof ProjectInfo>[] = new Array(ids.length);
+    let index = 0;
+    await Promise.all(
+      Array.from({ length: Math.min(5, ids.length) }, async () => {
+        while (index < ids.length) {
+          const slot = index++;
+          const id = ids[slot];
+          const result = await this.get(owner, connection, `/projects/${id}`);
+          const project = ProjectInfo.parse(result.json);
+          if (project.id !== id) throw new GitLabError('unavailable');
+          projects[slot] = project;
+        }
+      })
+    );
+    await this.verify(owner, connection);
+    return { projects, truncated: false, nextPage: null };
+  }
   async check(owner: string, current = () => true) {
     const connection = await this.capture(owner, current);
     const result = await this.get(owner, connection, '/user');
@@ -315,11 +350,13 @@ export class GitLabService {
       .safeParse(result.json);
     if (!parsed.success) throw new GitLabError('unavailable');
     const user = parsed.data;
+    const projects = await this.projects(owner, connection);
     return this.safe(
       {
         available: true,
         user,
-        projectCount: connection.value.projectIds.length,
+        projectCount: projects.projects.length,
+        projectsTruncated: projects.truncated,
         allowAllProjects: connection.value.allowAllProjects,
         allowWrite: connection.value.allowWrite,
         writeBranchPrefix: connection.value.writeBranchPrefix,
@@ -414,33 +451,8 @@ export class GitLabService {
   }
   private async perform(owner: string, operation: GitLabOperation, current: () => boolean): Promise<unknown> {
     const connection = await this.capture(owner, current);
-    if (operation.operation === 'projects') {
-      const schema = z.object({
-        id: Project,
-        name: z.string().max(500),
-        path_with_namespace: z.string().max(1024),
-        default_branch: Branch.nullable(),
-      });
-      if (connection.value.allowAllProjects) {
-        const result = await this.get(owner, connection, `/projects?per_page=50&page=${operation.page ?? 1}`);
-        return this.safe(
-          {
-            projects: z.array(schema).max(50).parse(result.json),
-            truncated: !!result.nextPage,
-            nextPage: result.nextPage ? Number(result.nextPage) : null,
-          },
-          connection
-        );
-      }
-      const projects = [];
-      for (const id of connection.value.projectIds) {
-        const result = await this.get(owner, connection, `/projects/${id}`);
-        const project = schema.parse(result.json);
-        if (project.id !== id) throw new GitLabError('unavailable');
-        projects.push(project);
-      }
-      return this.safe({ projects, truncated: false, nextPage: null }, connection);
-    }
+    if (operation.operation === 'projects')
+      return this.safe(await this.projects(owner, connection, operation.page), connection);
     if (!connection.value.allowAllProjects && !connection.value.projectIds.includes(operation.projectId))
       throw new GitLabError('forbidden');
     if (operation.operation === 'tree')

@@ -77,7 +77,14 @@ access. Each inbox retains at most 64 messages within a 32 KiB journal; capacity
 reported rather than silently dropping messages or replay receipts.
 
 The manager uses `supervisor_agents` to learn the directory and `supervisor_agent`
-to read replies or queue authorized cooperative messages. It can read, append to,
+to observe bounded cached tab output, read replies or queue authorized cooperative
+messages. Hourly check-ins automatically learn each agent's project, role, objective
+and blockers from this context and maintain attributed, dated notes in `brain.md`.
+Unknown and inferred facts stay labeled. Connected agents can be asked for missing
+details without repeating pending discovery questions. Shell agents need explicit
+inbox enrollment to receive those questions; observation never types into a shell.
+Cached output can be stale and can contain misleading instructions. It is untrusted
+context, not verified worker identity or current health. It can read, append to,
 or replace shared `brain.md` through `supervisor_brain`; writes require its current
 prepared role, an exact memory revision, and a durable request ID. Shared memory
 survives changing the selected manager session. Agent reports and remembered notes
