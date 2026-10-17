@@ -2897,6 +2897,14 @@ export class WebServer extends EventEmitter {
     this.supervisorManagerPreparationChecks.set(session, pending);
     try {
       if (!(await session.ensureRecoveryIdentityFence())) return false;
+      // The first ordinary prompt may not have been inspected while recovery is
+      // disabled. Let the normal adapter pin only its fully verified identity
+      // before capturing launch settings; all final preparation proofs still run.
+      if (!session.codexConfig?.resumeSessionId) {
+        if (!callerCurrent()) return false;
+        await new CodexRecoveryAdapter(session, () => this._persistSessionStateNow(session)).observe();
+        if (!callerCurrent() || !session.codexConfig?.resumeSessionId) return false;
+      }
       const owner = session.owner;
       const configuration = () =>
         JSON.stringify([

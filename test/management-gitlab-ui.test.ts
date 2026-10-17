@@ -89,6 +89,7 @@ describe('Owner-global GitLab connection UI', () => {
         body: {
           ifMatch: 'a'.repeat(64),
           url: 'https://gitlab.example.test',
+          allowInsecureHttp: false,
           projectIds: [12, 34],
           allowAllProjects: false,
           allowWrite: false,
@@ -98,6 +99,20 @@ describe('Owner-global GitLab connection UI', () => {
     ]);
     expect(get('managementGitlabToken').value).toBe('');
     expect(get('managementGitlabStatus').textContent).toContain('No repository write');
+  });
+  it('requires explicit HTTP consent and preserves it in saved configuration', async () => {
+    const { app, get } = harness();
+    await app.loadManagementSettings();
+    get('managementGitlabUrl').value = 'http://gitlab.example.test';
+    await app.saveManagementGitlab();
+    expect(app._apiJson).toHaveBeenCalledTimes(1);
+    get('managementGitlabInsecureHttp').checked = true;
+    app._apiJson.mockResolvedValueOnce({ ...config(), url: 'http://gitlab.example.test', allowInsecureHttp: true });
+    await app.saveManagementGitlab();
+    expect(app._apiJson.mock.calls.at(-1)[1].body).toMatchObject({
+      url: 'http://gitlab.example.test',
+      allowInsecureHttp: true,
+    });
   });
   it('requires an explicit saved grant and clears a replacement token after confirmation', async () => {
     const { app, get, dom } = harness();

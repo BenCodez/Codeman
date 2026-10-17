@@ -153,3 +153,14 @@ unchanged. Shorten roles/notes to fit the shared budget.
 GitLab file validation follows at most ten parent-directory pages (1,000 entries)
 within the operation deadline. Missing entries, malformed/nonsequential cursors,
 unsupported modes and exhausted budgets never authorize a write.
+
+GitLab defaults to HTTPS. For an existing HTTP GitLab server, explicitly select
+**Allow HTTP: the GitLab token and repository content travel unencrypted** before
+saving its origin. This opt-in does not encrypt traffic or disable TLS verification
+for HTTPS connections. Redirects remain refused.
+
+Terminal capability replies are accepted only for bounded, recently observed child
+queries. Unsolicited, expired or replayed replies and raw keyboard input retain the
+input-ownership veto. Updating Codeman never clears an existing pane's veto; an
+owner must explicitly restart that manager with its exact conversation to use a
+new broker.

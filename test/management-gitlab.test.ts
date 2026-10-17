@@ -165,6 +165,16 @@ describe('private direct GitLab connection', () => {
     expect(peak).toBeGreaterThan(1);
     expect(peak).toBeLessThanOrEqual(5);
   });
+  it('requires explicit consent for plaintext HTTP and retains the warning', async () => {
+    await expect(configure({ url: 'http://gitlab.example.invalid' })).rejects.toMatchObject({ code: 'forbidden' });
+    const saved = await configure({ url: 'http://gitlab.example.invalid', allowInsecureHttp: true });
+    expect(saved).toMatchObject({ allowInsecureHttp: true, credentialTransportPlaintext: true });
+    expect(await service.check('alice')).toMatchObject({ available: true });
+    expect(transport.mock.calls.every(([url]) => url.startsWith('http://gitlab.example.invalid/'))).toBe(true);
+    await expect(configure({ url: 'http://gitlab.example.invalid', allowInsecureHttp: false })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+  });
   it('finds a regular file on a later tree page for reads and guarded updates', async () => {
     await configure();
     const original = transport.getMockImplementation()!;
@@ -461,7 +471,7 @@ describe('private direct GitLab connection', () => {
         allowWrite: true,
       },
     });
-    expect(invalid.statusCode).toBe(400);
+    expect(invalid.statusCode).toBe(403);
     expect(invalid.body).not.toContain(secret);
     await app.close();
   });

@@ -1362,3 +1362,46 @@ os.write(1, ('FAKE_TTY_READY:%s:%s\\n' % (rows, cols)).encode())
     await fs.rm(root, { recursive: true, force: true });
   }
 });
+
+it('admits only bounded terminal replies paired with fresh child queries, including fragments', async () => {
+  const { broker, child, bytes } = await fixture(0, undefined, (source) =>
+    source.replace(
+      "os.write(1, b'FAKE_CHILD_READY\\n')",
+      "os.write(1, b'\\x1b[c\\x1b[6n\\x1b]11;?\\x07FAKE_CHILD_READY\\n')"
+    )
+  );
+  const replies = ['\x1b[?1;2c', '\x1b[12;4R', '\x1b]11;rgb:0000/1111/ffff\x1b\\'];
+  for (const reply of replies) {
+    child.stdin.write(reply.slice(0, 2));
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    child.stdin.write(reply.slice(2));
+  }
+  await eventually(async () => (await bytes()).toString() === replies.join(''));
+  expect(await broker.prove(child.pid!)).toMatchObject({ rawGeneration: 0 });
+  child.stdin.write(replies[0]); // A replay has no pending query.
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});
+
+it.each(['\x1b[12;4R', '/resume unsafe\r', '\x1b[?1;2c/resume unsafe\r'])(
+  'retains the raw-input veto for unpaired or mixed input %j',
+  async (data) => {
+    const { broker, child } = await fixture(0, undefined, (source) =>
+      source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[cFAKE_CHILD_READY\\n')")
+    );
+    child.stdin.write(data);
+    await eventually(async () => (await broker.readState())?.tainted === true);
+    expect(await broker.prove(child.pid!)).toBeUndefined();
+  }
+);
+
+it('does not accept a terminal reply after its query expires', async () => {
+  const { broker, child } = await fixture(
+    0,
+    (source) => source.replace('now + 2)', 'now - 1)'),
+    (source) => source.replace("os.write(1, b'FAKE_CHILD_READY\\n')", "os.write(1, b'\\x1b[cFAKE_CHILD_READY\\n')")
+  );
+  child.stdin.write('\x1b[?1;2c');
+  await eventually(async () => (await broker.readState())?.tainted === true);
+  expect(await broker.prove(child.pid!)).toBeUndefined();
+});

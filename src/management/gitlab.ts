@@ -76,7 +76,7 @@ const Origin = z
     try {
       const u = new URL(value);
       return (
-        u.protocol === 'https:' &&
+        (u.protocol === 'https:' || u.protocol === 'http:') &&
         !u.username &&
         !u.password &&
         u.pathname === '/' &&
@@ -98,6 +98,7 @@ export const GitLabConnectionSchema = z
   .object({
     ifMatch: z.string().regex(HASH),
     url: Origin,
+    allowInsecureHttp: z.boolean().default(false),
     token: z
       .string()
       .max(4096)
@@ -133,6 +134,7 @@ type Connection = {
 };
 const empty = (): Config => ({
   url: '',
+  allowInsecureHttp: false,
   token: '',
   projectIds: [],
   allowAllProjects: false,
@@ -144,6 +146,8 @@ const connectionHash = (value: Config) => digest(JSON.stringify({ ...value, rece
 const publicConfig = (value: Config, revision: string) => ({
   revision,
   url: value.url,
+  allowInsecureHttp: value.allowInsecureHttp,
+  credentialTransportPlaintext: value.url.startsWith('http:'),
   projectIds: value.projectIds,
   allowAllProjects: value.allowAllProjects,
   allowWrite: value.allowWrite,
@@ -190,6 +194,7 @@ export class GitLabService {
   }
   async configure(owner: string, input: unknown, current = () => true) {
     const parsed = GitLabConnectionSchema.parse(input);
+    if (parsed.url.startsWith('http:') && !parsed.allowInsecureHttp) throw new GitLabError('forbidden');
     const before = await this.load(owner, current);
     const token = parsed.token ?? before.value.token;
     const value: Config = {
@@ -213,6 +218,7 @@ export class GitLabService {
     const authority = () => current() === true && epoch === (this.epochs.get(owner) ?? 0);
     const snapshot = await this.load(owner, authority);
     if (!snapshot.value.url || !snapshot.value.token) throw new GitLabError('unavailable');
+    if (snapshot.value.url.startsWith('http:') && !snapshot.value.allowInsecureHttp) throw new GitLabError('forbidden');
     if (process.env.VITEST && !this.options.transport) throw new GitLabError('unavailable');
     return {
       ...snapshot,

@@ -586,6 +586,28 @@ describe('manager authority at the real server boundary', () => {
     }
   );
 
+  it.each([true, false])(
+    'establishes an uninspected manager identity only through adapter proof: %s',
+    async (verified) => {
+      await manager.pause();
+      await managerTask.update({ config: { enabled: false } });
+      process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';
+      Reflect.set(server, 'supervisorManagerAuthReady', true);
+      Reflect.set(managerSession, '_codexConfig', { ...managerSession.codexConfig, resumeSessionId: undefined });
+      observation = { ...observation, activity: 'completed', reason: 'turn-completed', safeToAct: false };
+      const observe = vi.mocked(CodexRecoveryAdapter.prototype.observe);
+      const original = observe.getMockImplementation()!;
+      observe.mockImplementation(async function () {
+        if (verified) managerSession.pinRecoveryConversation(MANAGER_THREAD);
+        return original.call(this);
+      });
+      const prepare = vi.spyOn(managerSession, 'prepareSupervisorManager').mockResolvedValue(true);
+      expect(await internals.prepareSupervisorManager(managerSession, () => true)).toBe(verified);
+      expect(observe).toHaveBeenCalled();
+      expect(prepare).toHaveBeenCalledTimes(verified ? 1 : 0);
+    }
+  );
+
   it('prepares only a verified idle manager with explicit request scope, retaining UUID and private startup evidence', async () => {
     await manager.pause();
     process.env.CODEMAN_PASSWORD = 'fixture-owner-auth';

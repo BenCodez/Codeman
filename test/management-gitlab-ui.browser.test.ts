@@ -56,7 +56,11 @@ describe('Management GitLab connection in Chromium', () => {
             url,
             method: options?.method,
             ...(options?.method === 'PUT'
-              ? { all: options.body.allowAllProjects, write: options.body.allowWrite }
+              ? {
+                  all: options.body.allowAllProjects,
+                  write: options.body.allowWrite,
+                  insecure: options.body.allowInsecureHttp,
+                }
               : {}),
           });
           if (url.endsWith('/check'))
@@ -87,7 +91,11 @@ describe('Management GitLab connection in Chromium', () => {
       expect(await page.locator('#managementGitlabAllProjects').isChecked()).toBe(true);
       expect(await page.locator('#managementGitlabAllowWrite').isChecked()).toBe(true);
       expect(await page.locator('#managementGitlabStatus').textContent()).toContain('Not connected');
-      await page.locator('#managementGitlabUrl').fill('https://gitlab.example.test');
+      await page
+        .locator('#managementGitlabUrl')
+        .fill(width === 390 ? 'http://gitlab.example.test' : 'https://gitlab.example.test');
+      expect(await page.locator('#managementGitlabInsecureHttp').isChecked()).toBe(false);
+      if (width === 390) await page.locator('#managementGitlabInsecureHttp').check();
       await page.locator('#managementGitlabToken').fill('synthetic-private-credential');
       await page.getByRole('button', { name: 'Save GitLab connection', exact: true }).click();
       await page.waitForFunction(() =>
@@ -101,7 +109,7 @@ describe('Management GitLab connection in Chromium', () => {
       expect(await page.locator('#managementGitlabStatus').textContent()).toContain('No write was performed');
       expect(await page.evaluate(() => (window as any).gitlabCalls)).toEqual([
         { url: '/api/management/gitlab' },
-        { url: '/api/management/gitlab', method: 'PUT', all: true, write: true },
+        { url: '/api/management/gitlab', method: 'PUT', all: true, write: true, insecure: width === 390 },
         { url: '/api/management/gitlab/check', method: 'POST' },
       ]);
       expect(await page.locator('#managementGitlabPanel').textContent()).not.toContain('synthetic-private-credential');

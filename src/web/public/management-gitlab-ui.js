@@ -1,8 +1,15 @@
 /** Owner-configured GitLab access. Credentials remain in a private input until saved or closed. */
-function managementGitlabOrigin(value) {
+function managementGitlabOrigin(value, allowInsecureHttp = false) {
   if (!value) return '';
   const url = new URL(value);
-  if (url.protocol !== 'https:' || url.username || url.password || url.pathname !== '/' || url.search || url.hash)
+  if (
+    (url.protocol !== 'https:' && !(allowInsecureHttp && url.protocol === 'http:')) ||
+    url.username ||
+    url.password ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.hash
+  )
     throw new Error('invalid-origin');
   return url.origin;
 }
@@ -24,7 +31,7 @@ function managementGitlabSnapshot(value) {
   )
     return false;
   try {
-    return managementGitlabOrigin(value.url) === value.url;
+    return managementGitlabOrigin(value.url, value.allowInsecureHttp === true) === value.url;
   } catch {
     return false;
   }
@@ -83,10 +90,15 @@ Object.assign(CodemanApp.prototype, {
       fields.append(holder);
       return control;
     };
-    input('managementGitlabUrl', 'GitLab HTTPS origin', 'url', 2048).placeholder = 'https://gitlab.example.com';
+    input('managementGitlabUrl', 'GitLab origin', 'url', 2048).placeholder = 'https://gitlab.example.com';
     input('managementGitlabAllProjects', 'All projects accessible to this credential', 'checkbox');
     input('managementGitlabProjects', 'Project IDs (comma separated; used when All projects is off)', 'text', 2000);
     input('managementGitlabAllowWrite', 'Allow management Codex to edit codeman/ feature branches', 'checkbox');
+    input(
+      'managementGitlabInsecureHttp',
+      'Allow HTTP: the GitLab token and repository content travel unencrypted',
+      'checkbox'
+    );
     const token = input(
       'managementGitlabToken',
       'Private GitLab access token (leave blank to keep the saved credential)',
@@ -145,6 +157,7 @@ Object.assign(CodemanApp.prototype, {
       !config.allowAllProjects &&
       !config.allowWrite;
     document.getElementById('managementGitlabUrl').value = config.url;
+    document.getElementById('managementGitlabInsecureHttp').checked = config.allowInsecureHttp === true;
     document.getElementById('managementGitlabProjects').value = config.projectIds.join(', ');
     // Requested defaults are only a draft. Saving remains an explicit owner action.
     document.getElementById('managementGitlabAllProjects').checked = config.allowAllProjects || pristine;
@@ -187,7 +200,8 @@ Object.assign(CodemanApp.prototype, {
     this._renderManagementGitlabBusy(view);
   },
   _managementGitlabDraft() {
-    const url = managementGitlabOrigin(document.getElementById('managementGitlabUrl').value.trim());
+    const allowInsecureHttp = document.getElementById('managementGitlabInsecureHttp').checked;
+    const url = managementGitlabOrigin(document.getElementById('managementGitlabUrl').value.trim(), allowInsecureHttp);
     const projectIds = managementGitlabProjectIds(document.getElementById('managementGitlabProjects').value);
     const allowAllProjects = document.getElementById('managementGitlabAllProjects').checked;
     const allowWrite = document.getElementById('managementGitlabAllowWrite').checked;
@@ -196,6 +210,7 @@ Object.assign(CodemanApp.prototype, {
     const clear = document.getElementById('managementGitlabClearToken').checked;
     return {
       url,
+      allowInsecureHttp,
       projectIds,
       allowAllProjects,
       allowWrite,
@@ -211,7 +226,7 @@ Object.assign(CodemanApp.prototype, {
       draft = this._managementGitlabDraft();
     } catch {
       this.showToast(
-        'Enter an HTTPS origin, up to 100 unique positive project IDs and a printable token of at most 4,096 characters.',
+        'Enter an HTTPS origin (or explicitly allow unencrypted HTTP), up to 100 unique positive project IDs and a printable token of at most 4,096 characters.',
         'warning'
       );
       return;
@@ -256,6 +271,7 @@ Object.assign(CodemanApp.prototype, {
       !draft ||
       'token' in draft ||
       draft.url !== saved.url ||
+      draft.allowInsecureHttp !== (saved.allowInsecureHttp === true) ||
       draft.allowWrite !== saved.allowWrite ||
       draft.allowAllProjects !== saved.allowAllProjects ||
       JSON.stringify(draft.projectIds) !== JSON.stringify(saved.projectIds)
